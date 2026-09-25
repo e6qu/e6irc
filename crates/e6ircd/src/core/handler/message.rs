@@ -335,7 +335,14 @@ pub(super) fn deliver_one_message(
         // framed as its response like any other echo.
         if state.sessions[&conn].caps.echo_message {
             let prefix = state.sessions[&conn].prefix();
-            let text = fit_relayed_text(&prefix, kind.wire(), target, text);
+            // A password or token sent to a service is not repeated back: the
+            // echo lands in whatever the client logs or buffers.
+            let shown = if crate::sanitize::sensitive_service_command(target, text) {
+                crate::sanitize::SENSITIVE_SERVICE_COMMAND_REDACTED
+            } else {
+                text
+            };
+            let text = fit_relayed_text(&prefix, kind.wire(), target, shown);
             let line = format!(":{prefix} {} {target} :{text}", kind.wire());
             let sender_account = state.sessions[&conn].account().map(str::to_owned);
             let sender_is_bot = state.sessions[&conn].bot;
@@ -628,7 +635,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
         }
     }
     let prefix = state.sessions[&conn].prefix();
-    let msgid = state.next_msgid();
+    let (now, msgid) = state.stamp();
     // The sender's account/bot state. TAGMSG carries `account` (for account-tag
     // recipients) and `bot` (for a bot sender) exactly like PRIVMSG/NOTICE — the
     // IRCv3 account-tag and bot-mode specs list TAGMSG among the messages that
@@ -636,20 +643,15 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     // otherwise silently lose typing/reaction attribution.
     let sender_account = state.sessions[&conn].account().map(str::to_owned);
     let sender_is_bot = state.sessions[&conn].bot;
-    let make_line = |server_time: Option<String>, account_tag: bool| {
-        let mut tags = vec![format!("msgid={msgid}")];
-        if let Some(t) = server_time {
-            tags.push(format!("time={t}"));
-        }
-        if account_tag && let Some(account) = &sender_account {
-            tags.push(format!(
-                "account={}",
-                e6irc_proto::message::escape_tag_value(account)
-            ));
-        }
-        if sender_is_bot {
-            tags.push("bot".to_string());
-        }
+    // TAGMSG only reaches message-tags clients, so `msgid` is always present.
+    let make_line = |caps: crate::core::state::Caps| {
+        let mut tags = crate::core::state::event_tags(
+            caps,
+            now,
+            Some(&msgid),
+            sender_account.as_deref(),
+            sender_is_bot,
+        );
         if !client_tags.is_empty() {
             tags.push(client_tags.to_string());
         }
@@ -690,20 +692,18 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
         vec![peer.recipient]
     };
 
-    let time = state.time_tag();
     for recipient in recipients {
         let caps = recipient.caps();
         if !caps.message_tags {
             continue; // spec: TAGMSG must not reach cap-less clients
         }
-        let line = make_line(caps.server_time.then(|| time.clone()), caps.account_tag);
+        let line = make_line(caps);
         // A delivery, not a response: bypass labeled-response capture.
         let bytes = bytes::Bytes::from(format!("{line}\r\n"));
         state.send_recipient_uncaptured(recipient, bytes);
     }
     if state.sessions[&conn].caps.echo_message {
-        let caps = state.sessions[&conn].caps;
-        let line = make_line(caps.server_time.then(|| time.clone()), caps.account_tag);
+        let line = make_line(state.sessions[&conn].caps);
         state.send(conn, &line); // echo is the labeled response
     }
 }
@@ -734,14 +734,13 @@ pub(super) fn tagmsg_on_owner(
     let recipients = channel.recipients_where(|member, modes| {
         member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
     });
-    let msgid = state.next_msgid();
-    let time = state.time_tag();
+    let (ts, msgid) = state.stamp();
     for recipient in recipients {
         let caps = recipient.caps();
         if caps.message_tags {
             state.send_recipient_uncaptured(
                 recipient,
-                render_tagmsg(&actor, &target, &client_tags, &msgid, &time, caps),
+                render_tagmsg(&actor, &target, &client_tags, &msgid, ts, caps),
             );
         }
     }
@@ -751,7 +750,7 @@ pub(super) fn tagmsg_on_owner(
             &target,
             &client_tags,
             &msgid,
-            &time,
+            ts,
             actor.recipient.caps(),
         )
     });
@@ -763,24 +762,11 @@ fn render_tagmsg(
     target: &str,
     client_tags: &str,
     msgid: &str,
-    time: &str,
+    ts: e6irc_proto::time::Millis,
     caps: crate::core::state::Caps,
 ) -> bytes::Bytes {
-    let mut tags = vec![format!("msgid={msgid}")];
-    if caps.server_time {
-        tags.push(format!("time={time}"));
-    }
-    if caps.account_tag
-        && let Some(account) = &actor.account
-    {
-        tags.push(format!(
-            "account={}",
-            e6irc_proto::message::escape_tag_value(account)
-        ));
-    }
-    if actor.bot {
-        tags.push("bot".to_string());
-    }
+    let mut tags =
+        crate::core::state::event_tags(caps, ts, Some(msgid), actor.account.as_deref(), actor.bot);
     if !client_tags.is_empty() {
         tags.push(client_tags.to_string());
     }
@@ -1067,7 +1053,6 @@ pub(super) fn deliver_multiline(
     let sender_account = state.sessions[&conn].account().map(str::to_owned);
     let sender_is_bot = state.sessions[&conn].bot;
     let (ts, msgid) = state.stamp();
-    let time = e6irc_proto::time::server_time(ts);
     let batch_ref = state.next_msgid();
 
     let echo_message = state.sessions[&conn].caps.echo_message;
@@ -1084,26 +1069,13 @@ pub(super) fn deliver_multiline(
     for (recipient, bypass) in audience {
         let caps = recipient.caps();
         // Tags every form carries, in the order the other delivery path uses.
-        let mut common: Vec<String> = Vec::new();
-        if caps.server_time {
-            common.push(format!("time={time}"));
-        }
-        if caps.account_tag
-            && let Some(account) = sender_account.as_deref()
-        {
-            // The account name is a nick or an OIDC-sanitized name, both of which
-            // can contain `\\` (a legal nick char) — a raw backslash in a tag value
-            // is an escape introducer, so a client would decode `a\\b` as `ab` and
-            // see a different account than the one that spoke. Escape it like any
-            // tag value.
-            common.push(format!(
-                "account={}",
-                e6irc_proto::message::escape_tag_value(account)
-            ));
-        }
-        if sender_is_bot && caps.message_tags {
-            common.push("bot".into());
-        }
+        let common = crate::core::state::event_tags(
+            caps,
+            ts,
+            None,
+            sender_account.as_deref(),
+            sender_is_bot,
+        );
         if caps.multiline && caps.batch {
             let mut open: Vec<String> = Vec::new();
             // Only the sender's own copy is the labeled response to its command.
@@ -1414,21 +1386,8 @@ fn render_multiline_lines(
 ) -> Vec<bytes::Bytes> {
     let target = &batch.target;
     let prefix = &actor.identity.prefix;
-    let mut common = Vec::new();
-    if caps.server_time {
-        common.push(format!("time={}", e6irc_proto::time::server_time(ts)));
-    }
-    if caps.account_tag
-        && let Some(account) = &actor.account
-    {
-        common.push(format!(
-            "account={}",
-            e6irc_proto::message::escape_tag_value(account)
-        ));
-    }
-    if actor.bot && caps.message_tags {
-        common.push("bot".into());
-    }
+    let common =
+        crate::core::state::event_tags(caps, ts, None, actor.account.as_deref(), actor.bot);
     let mut lines = Vec::new();
     if caps.multiline && caps.batch {
         let mut open = Vec::new();

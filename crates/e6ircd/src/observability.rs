@@ -935,10 +935,12 @@ const MAINTENANCE_DRAIN_PAUSE: Duration = Duration::from_millis(250);
 /// enabled. A fixed cadence plus bounded per-table batches prevents both
 /// expired credentials and durable history/audit data from growing forever; a
 /// tick whose batch fills keeps draining, bounded, before the next tick.
+/// Every read marker it deletes is handed to the core, whose mirror counts it.
 pub(crate) async fn run_storage_maintenance(
     pool: sqlx::PgPool,
     telemetry: std::sync::Arc<Telemetry>,
     settings: std::sync::Arc<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>,
+    core: crate::core::CoreIngress,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(300));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -975,7 +977,26 @@ pub(crate) async fn run_storage_maintenance(
             }
         };
         let started = Instant::now();
-        match crate::db::drain_storage_maintenance(&pool, retention, plan).await {
+        let mut outcome = crate::db::drain_storage_maintenance(&pool, retention, plan).await;
+        let expired_markers = match &mut outcome {
+            Ok(drain) => std::mem::take(&mut drain.totals.expired_read_markers),
+            Err(crate::db::DbError::MaintenanceFailed { completed, .. }) => {
+                std::mem::take(&mut completed.expired_read_markers)
+            }
+            Err(_) => Vec::new(),
+        };
+        if !expired_markers.is_empty()
+            && core
+                .broadcast_read_markers_expired(expired_markers.into())
+                .await
+                .is_err()
+        {
+            eprintln!(
+                "storage maintenance: the core is gone; expired read markers were not \
+                 dropped from its mirror"
+            );
+        }
+        match outcome {
             // One batch that did not fill is the quiet steady state.
             Ok(drain) if drain.batches_run == 1 && !drain.totals.saturated => {}
             Ok(drain) => {

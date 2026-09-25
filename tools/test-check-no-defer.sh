@@ -11,7 +11,7 @@ git config user.email test@example.test
 git config user.name test
 mkdir tools
 cp "$root/tools/check-no-defer.sh" tools/
-printf '%s\n' '# Bugs' '' '- [x] a closed entry' > BUGS.md
+cp "$root/BUGS.md" BUGS.md
 printf '%s\n' '# Plan' > PLAN.md
 git add . && git commit -qm base
 base=$(git rev-parse HEAD)
@@ -29,10 +29,16 @@ tools/check-no-defer.sh "$base" >/dev/null
 
 printf '%s\n' '- [ ] an open entry' >> BUGS.md
 expect_fail 'open BUGS.md entry'
+printf '%s\n' '- [x] a closed entry kept for the record' >> BUGS.md
+expect_fail 'closed BUGS.md entry'
+printf '%s\n' '' 'The parser drops a tag; revisit.' >> BUGS.md
+expect_fail 'prose added to BUGS.md'
 rm BUGS.md
 expect_fail 'BUGS.md deleted'
 printf '%s\n' 'The cleanup is deferred to a future sweep.' >> PLAN.md
 expect_fail 'deferral idiom added to PLAN.md'
+printf '%s\n' 'The rename is deferred to a later pass.' >> PLAN.md
+expect_fail 'deferred to a later pass added to PLAN.md'
 # A base that does not resolve leaves the PLAN.md additions unexamined; that
 # is a failed check, not a clean one. The same holds for the default base.
 expect_fail 'unresolvable base ref' refs/heads/no-such-branch

@@ -300,10 +300,8 @@ pub async fn verify_round_trip(
     }
 
     let expected_line = match provider {
-        Provider::Discord => {
-            ":alice!alice@discord PRIVMSG #general :hello from Discord".to_string()
-        }
-        Provider::Slack => ":Alice!Alice@slack PRIVMSG #general :hello from Slack".to_string(),
+        Provider::Discord => ":alice!user@discord PRIVMSG #general :hello from Discord".to_string(),
+        Provider::Slack => ":Alice!U1@slack PRIVMSG #general :hello from Slack".to_string(),
     };
     assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), driver_events.recv())
@@ -342,11 +340,11 @@ pub async fn verify_round_trip(
         }
         (_, event) => panic!("wrong provider REST event: {event:?}"),
     }
-    // The accepted post is echoed once, under the bot's own name — the line
-    // its dropped gateway copy would have been.
-    let host = match provider {
-        Provider::Discord => "discord",
-        Provider::Slack => "slack",
+    // The accepted post is echoed once, under the bot's own name and account
+    // id — the line its dropped gateway copy would have been.
+    let (user, host) = match provider {
+        Provider::Discord => ("bot", "discord"),
+        Provider::Slack => ("UBOT", "slack"),
     };
     let echo = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -368,7 +366,7 @@ pub async fn verify_round_trip(
     assert_eq!(echo.1, 0, "sent through the untracked handle");
     assert!(
         echo.0.ends_with(&format!(
-            " :{BOT_NAME}!{BOT_NAME}@{host} PRIVMSG #general :hello from IRC"
+            " :{BOT_NAME}!{user}@{host} PRIVMSG #general :hello from IRC"
         )),
         "{}",
         echo.0

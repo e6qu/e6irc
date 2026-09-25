@@ -213,6 +213,7 @@ pub(super) enum CreateNetwork {
     },
 }
 
+#[derive(Clone)]
 struct NetworkCreation {
     kind: crate::config::NetworkKind,
     name: String,
@@ -644,7 +645,7 @@ pub(super) async fn list_networks(
 pub(super) async fn get_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     let pool = pool_of(&state);
     let network = match crate::db::get_bnc_network(pool, &account, &name).await {
@@ -825,7 +826,7 @@ pub(super) async fn preflight_network_core(
 pub(super) async fn network_account_command(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(request): JsonBody<NetworkAccountCommand>,
 ) -> Response {
     let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
@@ -941,10 +942,10 @@ pub(super) async fn network_account_command(
             }),
         )
             .into_response(),
-        crate::bouncer::SendOutcome::Full => problem(
-            StatusCode::TOO_MANY_REQUESTS,
+        crate::bouncer::SendOutcome::Full => retry_later(
             "Upstream command queue is full",
-            Some("nothing was sent; wait for the upstream to recover and try again"),
+            "nothing was sent; retry after the interval in the Retry-After header",
+            retry_after_seconds(handle.full_queue_retry_after()),
         ),
         crate::bouncer::SendOutcome::Closed | crate::bouncer::SendOutcome::Unavailable => problem(
             StatusCode::CONFLICT,
@@ -1482,29 +1483,23 @@ fn stored_network_driver(
 /// toggling the network, not a create or edit authorized a moment before the
 /// suspension committed.
 struct ActiveOwnerLane<'a> {
-    registry: &'a crate::bouncer::Registry,
+    lane: &'a crate::bouncer::MutationLane,
     owner: &'a str,
-    _mutation: tokio::sync::MutexGuard<'a, ()>,
 }
 
 impl<'a> ActiveOwnerLane<'a> {
     async fn enter(
         state: &AppState,
-        registry: &'a crate::bouncer::Registry,
+        lane: &'a crate::bouncer::MutationLane,
         owner: &'a str,
     ) -> Result<Self, NetworkMutationError> {
-        let mutation = registry.mutation_guard().await;
         match crate::db::account_flags(pool_of(state), owner).await {
             Ok(Some(flags)) if flags.is_suspended() => Err(network_error(
                 StatusCode::CONFLICT,
                 "Owner suspended",
                 Some("a suspended account's networks cannot run; reactivate the account first"),
             )),
-            Ok(Some(_)) => Ok(Self {
-                registry,
-                owner,
-                _mutation: mutation,
-            }),
+            Ok(Some(_)) => Ok(Self { lane, owner }),
             Ok(None) => Err(network_error(
                 StatusCode::NOT_FOUND,
                 "No such network",
@@ -1523,24 +1518,39 @@ impl<'a> ActiveOwnerLane<'a> {
 
     /// Stop any predecessor, then start `driver` (create and edit).
     async fn supersede(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
-        self.registry.replace(Some(self.owner), name, driver).await;
+        self.lane.replace(Some(self.owner), name, driver).await;
     }
 
     /// Start `driver` unless a working one is already registered (enable).
     async fn ensure_running(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
-        self.registry
+        self.lane
             .ensure_running(Some(self.owner), name, driver)
             .await;
     }
 }
 
 /// Update all mutable configuration of one caller-owned network and replace its
-/// running driver. The registry mutation gate makes the database write and
-/// runtime transition one serialized control-plane operation.
-#[allow(clippy::too_many_arguments)]
+/// running driver. The registry mutation lane makes the database write and
+/// runtime transition one serialized control-plane operation, which runs to
+/// completion even if the request is abandoned.
 pub(super) async fn update_network_core(
+    state: &Arc<AppState>,
+    registry: &Arc<crate::bouncer::Registry>,
+    account: &str,
+    name: &str,
+    req: UpdateNetwork,
+) -> Result<(), NetworkMutationError> {
+    let (state, account, name) = (state.clone(), account.to_owned(), name.to_owned());
+    registry
+        .mutate(move |lane| async move {
+            update_network_in_lane(&state, &lane, &account, &name, req).await
+        })
+        .await
+}
+
+async fn update_network_in_lane(
     state: &AppState,
-    registry: &crate::bouncer::Registry,
+    lane: &crate::bouncer::MutationLane,
     account: &str,
     name: &str,
     req: UpdateNetwork,
@@ -1562,7 +1572,7 @@ pub(super) async fn update_network_core(
         realname.as_deref(),
         autojoin.as_slice(),
     );
-    let lane = ActiveOwnerLane::enter(state, registry, account).await?;
+    let lane = ActiveOwnerLane::enter(state, lane, account).await?;
     let pool = pool_of(state);
     let mut row = editable_network(state, account, name, "update").await?;
     let before = row.clone();
@@ -1775,9 +1785,25 @@ mod audit_detail_tests {
     }
 }
 
+/// Create a network: validated, stored and started as one unit on the registry
+/// mutation lane, which runs to completion even if the request is abandoned.
 async fn create_network_core(
+    state: &Arc<AppState>,
+    registry: &Arc<crate::bouncer::Registry>,
+    account: &str,
+    req: &NetworkCreation,
+) -> Result<(), NetworkMutationError> {
+    let (state, account, req) = (state.clone(), account.to_owned(), req.clone());
+    registry
+        .mutate(
+            move |lane| async move { create_network_in_lane(&state, &lane, &account, &req).await },
+        )
+        .await
+}
+
+async fn create_network_in_lane(
     state: &AppState,
-    registry: &crate::bouncer::Registry,
+    lane: &crate::bouncer::MutationLane,
     account: &str,
     req: &NetworkCreation,
 ) -> Result<(), NetworkMutationError> {
@@ -1949,7 +1975,7 @@ async fn create_network_core(
     // `create_bnc_network` (count + insert in one locked transaction), so
     // there is no racy list-then-insert here — two concurrent creates can't both
     // slip past cap-1 and each spawn an always-on driver.
-    let lane = ActiveOwnerLane::enter(state, registry, account).await?;
+    let lane = ActiveOwnerLane::enter(state, lane, account).await?;
     let detail = network_audit_detail(kind, "fields", &present_network_fields(&row));
     match crate::db::create_bnc_network(
         pool,
@@ -2022,7 +2048,7 @@ pub(super) const DEFAULT_BUFFER_READ_LIMIT: usize = 200;
 pub(super) async fn network_buffer(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     QueryParams(params): QueryParams<BufferQuery>,
 ) -> Response {
     if state.bnc_registry.is_none() {
@@ -2093,7 +2119,9 @@ pub(super) struct UpdateNetwork {
     pub(super) username: Option<String>,
     #[serde(default)]
     pub(super) realname: Option<String>,
-    #[serde(default)]
+    /// Required: `PUT` replaces the whole configuration, so an omitted list
+    /// cannot mean "keep" — and read as "none", it silently cleared the stored
+    /// channels. An empty list is how a replace says "join nothing".
     pub(super) autojoin: Vec<String>,
     pub(super) credentials: UpdateNetworkCredentials,
     /// Required for the same reason as `credentials`: an omitted field would
@@ -2133,7 +2161,7 @@ pub(super) enum UpdateNetworkCredentials {
 pub(super) async fn update_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(req): JsonBody<UpdateNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -2151,36 +2179,72 @@ pub(super) async fn update_network(
 /// database rollback. Disabling needs no active owner: stopping a suspended
 /// account's network is always allowed.
 pub(super) async fn set_network_enabled_core(
-    state: &AppState,
-    registry: &crate::bouncer::Registry,
+    state: &Arc<AppState>,
+    registry: &Arc<crate::bouncer::Registry>,
     actor: &str,
     account: &str,
     name: &str,
     enabled: bool,
 ) -> Result<String, NetworkMutationError> {
+    let toggle = NetworkToggle {
+        actor: actor.to_owned(),
+        account: account.to_owned(),
+        name: name.to_owned(),
+        enabled,
+    };
+    let state = state.clone();
+    registry
+        .mutate(move |lane| async move { set_network_enabled_in_lane(&state, &lane, toggle).await })
+        .await
+}
+
+/// Who turns which network on or off.
+struct NetworkToggle {
+    actor: String,
+    account: String,
+    name: String,
+    enabled: bool,
+}
+
+async fn set_network_enabled_in_lane(
+    state: &AppState,
+    lane: &crate::bouncer::MutationLane,
+    toggle: NetworkToggle,
+) -> Result<String, NetworkMutationError> {
+    let NetworkToggle {
+        actor,
+        account,
+        name,
+        enabled,
+    } = toggle;
+    let (actor, account, name) = (actor.as_str(), account.as_str(), name.as_str());
     let pool = pool_of(state);
     let audit = crate::db::NetworkAudit {
         actor,
         detail: if enabled { "enabled" } else { "disabled" },
     };
     let stored_name = if enabled {
-        let lane = ActiveOwnerLane::enter(state, registry, account).await?;
+        let owner_lane = ActiveOwnerLane::enter(state, lane, account).await?;
         let row = editable_network(state, account, name, "enable").await?;
         let driver = stored_network_driver(state, account, &row)?;
         require_network_updated(
             crate::db::set_bnc_network_enabled(pool, account, name, true, audit).await,
             "enable failed",
         )?;
-        lane.ensure_running(&row.name, driver).await;
+        owner_lane.ensure_running(&row.name, driver).await;
         row.name
     } else {
-        let _mutation = registry.mutation_guard().await;
         let row = editable_network(state, account, name, "disable").await?;
         require_network_updated(
             crate::db::set_bnc_network_enabled(pool, account, name, false, audit).await,
             "disable failed",
         )?;
-        registry.remove(Some(account), &row.name).await;
+        lane.remove(
+            Some(account),
+            &row.name,
+            crate::bouncer::UnwrittenLines::Store,
+        )
+        .await;
         row.name
     };
     Ok(stored_name)
@@ -2196,12 +2260,25 @@ pub(super) async fn set_network_enabled_core(
 /// than orphan). If the database then refuses the deletion, the network is
 /// restarted from its stored row, so a failed delete leaves it as it was.
 pub(super) async fn delete_network_core(
-    state: &AppState,
-    registry: &crate::bouncer::Registry,
+    state: &Arc<AppState>,
+    registry: &Arc<crate::bouncer::Registry>,
     account: &str,
     name: &str,
 ) -> Result<(), NetworkMutationError> {
-    let _mutation = registry.mutation_guard().await;
+    let (state, account, name) = (state.clone(), account.to_owned(), name.to_owned());
+    registry
+        .mutate(
+            move |lane| async move { delete_network_in_lane(&state, &lane, &account, &name).await },
+        )
+        .await
+}
+
+async fn delete_network_in_lane(
+    state: &AppState,
+    registry: &crate::bouncer::MutationLane,
+    account: &str,
+    name: &str,
+) -> Result<(), NetworkMutationError> {
     let row = editable_network(state, account, name, "delete").await?;
     // Built before anything stops, so a restart after a refused delete does
     // not depend on anything that could change meanwhile. A running network
@@ -2224,7 +2301,13 @@ pub(super) async fn delete_network_core(
     } else {
         None
     };
-    registry.remove(Some(account), &row.name).await;
+    registry
+        .remove(
+            Some(account),
+            &row.name,
+            crate::bouncer::UnwrittenLines::Discard,
+        )
+        .await;
     let deleted = crate::db::delete_bnc_network(
         pool_of(state),
         account,
@@ -2250,7 +2333,7 @@ pub(super) async fn delete_network_core(
 pub(super) async fn patch_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(req): JsonBody<PatchNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -2277,7 +2360,7 @@ pub(super) struct AdminNetworkPatch {
 pub(super) async fn patch_admin_network(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    Path((owner, name)): Path<(String, String)>,
+    PathParams((owner, name)): PathParams<(String, String)>,
     JsonBody(req): JsonBody<AdminNetworkPatch>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -2297,7 +2380,7 @@ pub(super) async fn patch_admin_network(
 pub(super) async fn delete_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
@@ -2420,14 +2503,21 @@ mod tests {
         assert!(json["last_error"].get("diagnostic").is_none(), "{json}");
 
         ends.emit(crate::bouncer::ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::NotRegistered,
-            ),
+            e6irc_client::RegistrationRejection::from_reply(
+                &e6irc_client::OwnedMessage::from(
+                    &e6irc_proto::message::Message::parse(
+                        "ERROR :Closing link: too many host connections",
+                    )
+                    .expect("a scripted reply parses"),
+                ),
+                e6irc_client::ServerPasswordSent::No,
+            )
+            .expect("a pre-welcome ERROR refuses registration"),
         ));
         let rejected = serde_json::to_value(runtime_response(&handle.runtime_snapshot()))
             .expect("runtime response is serializable");
         assert_eq!(
-            rejected["last_error"]["diagnostic"], "no detail from upstream",
+            rejected["last_error"]["diagnostic"], "Closing link: too many host connections",
             "the IRC parser's bounded owner-safe detail remains actionable: {rejected}"
         );
     }

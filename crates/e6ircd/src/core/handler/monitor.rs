@@ -39,7 +39,7 @@ pub(crate) fn monitor_notify(state: &mut ServerState, nick: &str, online: bool) 
 pub(crate) fn notify_event(
     state: &mut ServerState,
     subject: ConnId,
-    line: &str,
+    line: &EventLine,
     audience: crate::core::state::UserEventAudience,
     include_self: bool,
 ) {

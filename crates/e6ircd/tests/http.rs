@@ -909,6 +909,150 @@ async fn unknown_route_is_problem_json_404() {
     assert!(v["title"].as_str().is_some());
 }
 
+/// The problem document every refusal shares: its content type, and a body
+/// whose `status` member repeats the status line.
+fn assert_problem(status: u16, head: &str, body: &str, expected: u16) -> serde_json::Value {
+    assert_eq!(status, expected, "{head}\n{body}");
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: application/problem+json"),
+        "{head}"
+    );
+    let v: serde_json::Value = serde_json::from_str(body).expect("problem json");
+    assert_eq!(v["status"], expected, "{body}");
+    v
+}
+
+/// The seconds a `429` asks the client to wait, required to be present.
+fn retry_after(head: &str) -> u64 {
+    response_header(head, "retry-after")
+        .unwrap_or_else(|| panic!("a 429 without Retry-After: {head}"))
+        .parse()
+        .expect("numeric Retry-After")
+}
+
+#[tokio::test]
+async fn an_unserved_method_is_a_problem_json_405_that_keeps_allow() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    for (req, allow) in [
+        // A documented API route, a console page, and a probe — the probes
+        // are routed apart from the rest and must not escape the contract.
+        (
+            "DELETE /api/v1/server HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "GET,HEAD",
+        ),
+        (
+            "PUT /console HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "GET,HEAD",
+        ),
+        (
+            "POST /healthz HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "GET,HEAD",
+        ),
+    ] {
+        let (status, head, body) = request(http, req).await;
+        assert_problem(status, &head, &body, 405);
+        assert_eq!(
+            response_header(&head, "allow").map(|value| value.replace(' ', "")),
+            Some(allow.to_string()),
+            "{head}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_path_parameter_is_a_problem_json_400() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    // `%FF` is not UTF-8, so no `String` path parameter can hold it.
+    let (status, head, body) = request(http, &get("/api/v1/auth/oidc/%FF/start")).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Invalid path parameter", "{body}");
+}
+
+#[tokio::test]
+async fn a_plain_get_of_the_websocket_endpoint_is_a_problem_document() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let (status, head, body) = request(http, &get("/ws/irc")).await;
+    assert!((400..500).contains(&status), "{head}");
+    let v = assert_problem(status, &head, &body, status);
+    assert_eq!(v["title"], "Invalid WebSocket upgrade", "{body}");
+}
+
+#[tokio::test]
+async fn the_per_address_authentication_budget_says_when_to_retry() {
+    let mut config = test_config();
+    config.limits.auth_rate_burst = Some(1);
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let body = r#"{"account":"a","password":"p","label":"test"}"#;
+    let req = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    // The one token is spent on a refusal for want of a database.
+    let (status, _, _) = request(http, &req).await;
+    assert_eq!(status, 503);
+    let (status, head, body) = request(http, &req).await;
+    assert_problem(status, &head, &body, 429);
+    // One token refills over a sixty-second window at a burst of one.
+    let wait = retry_after(&head);
+    assert!((1..=60).contains(&wait), "{head}");
+}
+
+/// Send a WebSocket upgrade for `/ws/irc` and read only the response head, so
+/// an accepted connection stays open and keeps its per-address slot.
+async fn open_irc_websocket(addr: std::net::SocketAddr) -> (TcpStream, u16, String, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(
+            b"GET /ws/irc HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .expect("write");
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.expect("response head");
+        buf.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&buf).to_string();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    let length = response_header(&head, "content-length").map_or(0, |value| {
+        value.parse::<usize>().expect("numeric Content-Length")
+    });
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.expect("response body");
+    (
+        stream,
+        status,
+        head,
+        String::from_utf8_lossy(&body).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn the_websocket_connection_cap_says_when_to_retry() {
+    let mut config = test_config();
+    config.limits.max_connections_per_ip = Some(1);
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let (_held, status, head, _) = open_irc_websocket(http).await;
+    assert_eq!(status, 101, "{head}");
+    let (_, status, head, body) = open_irc_websocket(http).await;
+    assert_problem(status, &head, &body, 429);
+    // The soonest a slot is certain to free: the registration timeout.
+    assert_eq!(retry_after(&head), 30, "{head}");
+}
+
 #[tokio::test]
 async fn app_password_requires_database() {
     // Without a configured database the endpoint must fail loudly, not
@@ -1310,8 +1454,20 @@ async fn bnc_network_management_lifecycle() {
     assert_eq!(v["networks"][0]["name"], "work");
     assert_eq!(v["networks"][0]["has_sasl_password"], false);
 
-    // the driver started: alice can attach to it via the BNC port
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // the driver started: once the listing reports it connected, alice can
+    // attach to it via the BNC port
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let (_, _, body) = request(http, &list_req).await;
+            let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+            if v["networks"][0]["runtime"]["state"] == "connected" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the created network's driver never connected");
     let mut client = e6irc_client::Connection::connect(&bnc.to_string())
         .await
         .unwrap();
@@ -1418,6 +1574,37 @@ async fn bnc_network_management_lifecycle() {
         status, 400,
         "an omitted credential action must not silently preserve or clear"
     );
+
+    // PUT replaces the whole configuration, so an omitted autojoin list is
+    // refused rather than read as "none" -- which silently cleared it.
+    let no_autojoin = format!(
+        r#"{{"addr":"{up}","tls":false,"nick":"alice_updated","username":"alice_upda","realname":"Alice","credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"#
+    );
+    let no_autojoin_req = format!(
+        "PUT /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{no_autojoin}",
+        no_autojoin.len()
+    );
+    let (status, head, body) = request(http, &no_autojoin_req).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        head.to_lowercase().contains("application/problem+json"),
+        "{head}"
+    );
+    assert!(body.contains("autojoin"), "{body}");
+    let (status, _, detail) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{detail}");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail json");
+    assert_eq!(detail["autojoin"], serde_json::json!(["#other"]));
+
+    // An integer ID that is not one is the same problem document as every
+    // other refusal, not axum's plain-text rejection.
+    let bad_id = format!(
+        "DELETE /api/v1/me/tokens/not-a-number HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &bad_id).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Invalid path parameter", "{body}");
 
     // disable it: the flag flips and the driver stops (no live handle, so
     // `connected` is null), while the config row survives.
@@ -1647,7 +1834,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         "must refuse to store a server password unsealed"
     );
 
-    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
+    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":[],"credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
     let remove_req = format!(
         "PUT /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remove}",
@@ -3389,6 +3576,8 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
 /// same real form → validation/sealing → revision/audit → PostgreSQL path.
 /// This protects the controls that a scalar-only configuration test cannot
 /// cover and proves that rendered responses never disclose submitted secrets.
+/// It stores a network of every kind, so it needs every bridge built.
+#[cfg(all(feature = "matrix", feature = "discord", feature = "slack"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn console_configuration_manages_every_credential_collection() {
@@ -7607,6 +7796,31 @@ async fn device_authorization_grant_flow() {
     assert_eq!(status, 400);
     assert!(body.contains("invalid_grant"), "{body}");
 
+    // A device polling past expiry is told `expired_token` (RFC 8628 §3.5),
+    // even after another start has run the expired-grant pruning.
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    assert_eq!(status, 200, "{body}");
+    let lapsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let lapsed_code = lapsed["device_code"].as_str().unwrap().to_string();
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query(
+        "UPDATE device_grants SET expires_at = now() - interval '1 second'
+         WHERE device_code = $1",
+    )
+    .bind(&lapsed_code)
+    .execute(&pool)
+    .await
+    .expect("expire grant");
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    assert_eq!(status, 200, "{body}");
+    let lapsed_poll = format!(r#"{{"device_code":"{lapsed_code}"}}"#);
+    let (status, _, body) =
+        request(http, &post("/api/v1/auth/device/token", "", &lapsed_poll)).await;
+    assert_eq!(status, 400);
+    assert!(body.contains("expired_token"), "{body}");
+
     // A device token counts toward the per-account cap like any other. A grant
     // approved while a slot was free, then beaten to it, is denied once.
     let start_grant = || async {
@@ -10145,4 +10359,220 @@ async fn deleting_a_busy_network_or_account_leaves_no_backlog_behind() {
     );
     chatter.abort();
     drop(running);
+}
+
+/// Every HTTP surface that checks a password refuses an account name whose
+/// attempts are spent the same way: `429` with `Retry-After`. And a configured
+/// administrator's name cannot be created by an administrator or an
+/// invitation — only by OIDC provisioning or the bootstrap/recovery flows.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn throttled_logins_and_reserved_administrator_names() {
+    let url = support::test_db("throttled_logins_and_reserved_administrator_names").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "Alice", "primary", None)
+        .await
+        .expect("account");
+    let admin_token = issue_api_token(&pool, "alice", "admin")
+        .await
+        .expect("token");
+    let config = Config {
+        server_name: "irc.throttle.example".into(),
+        network_name: "ThrottleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("http://e6irc.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into(), "Root".into()],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    sqlx::query("INSERT INTO login_attempts (name_folded, attempts) VALUES ('alice', $1)")
+        .bind(e6ircd::db::LOGIN_ATTEMPT_LIMIT)
+        .execute(&pool)
+        .await
+        .expect("spend alice's attempts");
+
+    let (_, _, body) = request(http, &get("/login")).await;
+    let state = login_state_from_html(&body).to_string();
+    let form = format!("login_state={state}&account=Alice&password=primary");
+    let req = format!(
+        "POST /login HTTP/1.1\r\nHost: t\r\nCookie: e6irc_login_state={state}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{form}",
+        form.len()
+    );
+    let (status, headers, body) = request(http, &req).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        response_header(&headers, "retry-after")
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|seconds| seconds >= 1),
+        "{headers}"
+    );
+    assert!(body.contains("Too many failed login attempts"), "{body}");
+    assert!(!headers.contains("e6irc_session="), "{headers}");
+
+    let exchange = r#"{"account":"alice","password":"primary","label":"laptop"}"#;
+    let req = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{exchange}",
+        exchange.len()
+    );
+    let (status, headers, body) = request(http, &req).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        response_header(&headers, "retry-after").is_some(),
+        "{headers}"
+    );
+
+    for (path, body) in [
+        (
+            "/api/v1/admin/accounts",
+            r#"{"account":"rOOt","password":"chosen password"}"#,
+        ),
+        (
+            "/api/v1/admin/invitations",
+            r#"{"account":"rOOt","expires_in_days":1}"#,
+        ),
+    ] {
+        let (status, body) = post_json(http, path, &admin_token, body).await;
+        assert_eq!(status, 409, "{path}: {body}");
+        assert!(body.contains("configured administrator"), "{path}: {body}");
+    }
+    let (status, body) = post_json(
+        http,
+        "/api/v1/admin/invitations",
+        &admin_token,
+        r#"{"account":"bob","expires_in_days":1}"#,
+    )
+    .await;
+    assert_eq!(status, 201, "any other name is invited as before: {body}");
+}
+
+/// Front-channel logout is loadable by anyone with any `sid`, so it clears the
+/// browser's session cookie only when that cookie named a session the logout
+/// actually revoked; a visitor whose session it does not name stays signed in.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn frontchannel_logout_clears_only_a_revoked_sessions_cookie() {
+    use e6ircd::config::OidcProviderConfig;
+    let url = support::test_db("frontchannel_logout_clears_only_a_revoked_sessions_cookie").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let mut sessions = Vec::new();
+    for (account, sid) in [("alice", "alice-sid"), ("bob", "bob-sid")] {
+        e6ircd::db::create_account_with_contact(&pool, account, "pw", None)
+            .await
+            .expect("account");
+        sessions.push(
+            e6ircd::db::create_web_session_with_identity(
+                &pool,
+                account,
+                e6ircd::db::OidcSessionIdentity {
+                    id_token: Some("the.id.token"),
+                    provider: Some("shauth"),
+                    issuer: Some("https://auth.example"),
+                    subject: Some(account),
+                    sid: Some(sid),
+                    email: None,
+                    role: None,
+                },
+                None,
+            )
+            .await
+            .expect("session"),
+        );
+    }
+    let config = Config {
+        server_name: "irc.logout.example".into(),
+        network_name: "LogoutNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("http://e6irc.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        oidc_providers: vec![OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "x".repeat(32),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+        }],
+        application_release_revision: Some("0123456789ab".into()),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let logout = |sid: &str, session: &str| {
+        format!(
+            "GET /api/v1/auth/oidc/frontchannel-logout?iss=https%3A%2F%2Fauth.example&sid={sid} \
+             HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Bob's browser is made to load Alice's logout: Alice's session ends, and
+    // Bob keeps both his session and his cookie.
+    let (status, headers, _) = request(http, &logout("alice-sid", &sessions[1])).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(
+        !headers.to_ascii_lowercase().contains("set-cookie"),
+        "{headers}"
+    );
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &sessions[0])
+            .await
+            .expect("alice"),
+        None
+    );
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &sessions[1])
+            .await
+            .expect("bob")
+            .as_deref(),
+        Some("bob")
+    );
+    // Bob's own logout clears his cookie.
+    let (status, headers, _) = request(http, &logout("bob-sid", &sessions[1])).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(headers.contains("e6irc_session=;"), "{headers}");
 }

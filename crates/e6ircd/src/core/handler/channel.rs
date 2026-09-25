@@ -359,7 +359,7 @@ pub(super) fn join_on_owner(
                 topic_ops_only: true,
                 ..Default::default()
             },
-            now.as_secs(),
+            now,
         )
     });
     if chan.is_member(conn) {
@@ -419,7 +419,7 @@ pub(super) fn join_on_owner(
     let chan = state.channels.get_mut(&key).expect("just inserted");
     chan.add_member_with_profile(
         actor.recipient,
-        actor.profile,
+        actor.profile.clone(),
         actor.identity.clone(),
         MemberModes {
             op: (first && !registered) || is_founder || access_op,
@@ -429,18 +429,20 @@ pub(super) fn join_on_owner(
     chan.invited.remove(&conn); // an invite is consumed by the join it admitted
     let display = chan.name.clone();
 
-    let prefix = actor.identity.prefix;
-    let account = actor.account.unwrap_or_else(|| "*".into());
-    let realname = actor.realname;
-    let plain_join = format!(":{prefix} JOIN {display}");
-    let extended_join =
-        super::fitted_line(format!(":{prefix} JOIN {display} {account} :"), &realname);
+    let prefix = &actor.identity.prefix;
+    let account = actor.account.as_deref().unwrap_or("*");
+    let now = (state.config.clock)();
+    let plain_join = actor.line(now, format!(":{prefix} JOIN {display}"));
+    let extended_join = plain_join.with_body(super::fitted_line(
+        format!(":{prefix} JOIN {display} {account} :"),
+        &actor.realname,
+    ));
     // away-notify: an away joiner's status follows the JOIN. Built once, and
     // fitted like the AWAY broadcast itself (see `cmd_away`).
     let away_line = actor
         .away
         .as_deref()
-        .map(|away| super::fitted_line(format!(":{prefix} AWAY :"), away));
+        .map(|away| plain_join.with_body(super::fitted_line(format!(":{prefix} AWAY :"), away)));
     let members = state.channels[&key].recipients();
     for recipient in members.iter().copied() {
         let caps = recipient.caps();
@@ -450,13 +452,13 @@ pub(super) fn join_on_owner(
             &plain_join
         };
         if recipient.conn() != conn {
-            state.send_timed_recipient(recipient, line);
+            state.send_event_recipient(recipient, line);
         }
         if recipient.conn() != conn
             && caps.away_notify
             && let Some(away_line) = &away_line
         {
-            state.send_timed_recipient(recipient, away_line);
+            state.send_event_recipient(recipient, away_line);
         }
     }
 
@@ -480,13 +482,10 @@ pub(super) fn join_on_owner(
             letters.push('v');
             args.push_str(&format!(" {nick}"));
         }
-        let server = state.config.server_name.clone();
-        state.broadcast_channel(
-            &key,
-            &format!(":{server} MODE {display} {letters}{args}"),
-            Some(conn),
-        );
-        Some(format!(":{server} MODE {display} {letters}{args}"))
+        let server = &state.config.server_name;
+        let line = EventLine::by_server(now, format!(":{server} MODE {display} {letters}{args}"));
+        state.broadcast_channel(&key, &line, Some(conn));
+        Some(line)
     } else {
         None
     };
@@ -498,7 +497,7 @@ pub(super) fn join_on_owner(
     }
 
     let chan = &state.channels[&key];
-    ChannelJoinResult::Joined(ChannelJoinSuccess {
+    ChannelJoinResult::Joined(Box::new(ChannelJoinSuccess {
         key,
         display,
         topic: chan.topic.clone(),
@@ -513,7 +512,7 @@ pub(super) fn join_on_owner(
             plain_join
         },
         own_mode,
-    })
+    }))
 }
 
 pub(super) fn emit_join_result(
@@ -588,11 +587,9 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
             };
             session.channels.insert(join.key.clone());
             state.membership_join(conn, join.key.clone());
-            if !join.own_join.is_empty() {
-                state.send_timed(conn, &join.own_join);
-            }
+            state.send_event(conn, &join.own_join);
             if let Some(mode) = &join.own_mode {
-                state.send_timed(conn, mode);
+                state.send_event(conn, mode);
             }
             if let Some(topic) = &join.topic {
                 state.numeric(conn, RPL_TOPIC, &[&join.display], Some(&topic.text));
@@ -606,7 +603,7 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
             if state.sessions[&conn].caps.read_marker {
                 send_current_markread(state, conn, &join.key, &join.display);
             }
-            send_join_names(state, conn, join);
+            send_join_names(state, conn, *join);
         }
     }
 }
@@ -683,7 +680,7 @@ pub(super) fn part_on_owner(
         };
     }
     let display = channel.name.clone();
-    let prefix = actor.identity.prefix;
+    let prefix = actor.identity.prefix.clone();
     // A quieted or banned member can't broadcast a PART reason (which would
     // evade the quiet), unless op/voice — same speak-gate as messages.
     let exempt = state.channels[&key]
@@ -700,6 +697,7 @@ pub(super) fn part_on_owner(
         }
         _ => format!(":{prefix} PART {display}"),
     };
+    let line = actor.line((state.config.clock)(), line);
     state.broadcast_channel(&key, &line, Some(conn));
     let chan = state.channels.get_mut(&key).expect("checked");
     chan.remove_member(conn);
@@ -722,7 +720,7 @@ fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPart
     match result {
         ChannelPartResult::NotOnChannel { name } => state.err_notonchannel(conn, &name),
         ChannelPartResult::Parted { key, line } => {
-            state.send_timed(conn, &line);
+            state.send_event(conn, &line);
             if let Some(session) = state.sessions.get_mut(&conn) {
                 session.channels.remove(&key);
             }
@@ -942,24 +940,13 @@ pub(super) fn deliver_message(state: &mut ServerState, recipients: &[Recipient],
 }
 
 pub(super) fn render_delivery(caps: crate::core::state::Caps, d: &Delivery) -> bytes::Bytes {
-    let mut tags: Vec<String> = Vec::new();
-    if caps.message_tags {
-        tags.push(format!("msgid={}", d.msgid));
-    }
-    if caps.server_time {
-        tags.push(format!("time={}", e6irc_proto::time::server_time(d.ts)));
-    }
-    if caps.account_tag
-        && let Some(account) = d.sender_account
-    {
-        tags.push(format!(
-            "account={}",
-            e6irc_proto::message::escape_tag_value(account)
-        ));
-    }
-    if caps.message_tags && d.sender_is_bot {
-        tags.push("bot".to_string());
-    }
+    let mut tags = crate::core::state::event_tags(
+        caps,
+        d.ts,
+        Some(d.msgid),
+        d.sender_account,
+        d.sender_is_bot,
+    );
     if caps.message_tags && !d.client_tags.is_empty() {
         tags.push(d.client_tags.to_string());
     }
@@ -1067,7 +1054,7 @@ fn topic_set_on_owner(
         }
     }
     let new_text = truncate_chars(&raw_text, TOPICLEN);
-    let prefix = actor.identity.prefix;
+    let prefix = actor.identity.prefix.clone();
     // TOPICLEN bounds the topic itself; the *relayed* line also carries the
     // setter's prefix, which can push it past the wire limit. Fit against the
     // broadcast head and store the same fitted text, so the broadcast, 332
@@ -1094,7 +1081,7 @@ fn topic_set_on_owner(
     // this also orders a pipelined SET KEEPTOPIC and TOPIC correctly.
     if !state.is_registered(&key) && !state.channel_registration_pending(&key) {
         state.channels.get_mut(&key).expect("checked").topic = new_topic;
-        let line = format!(":{prefix} TOPIC {display} :{new_text}");
+        let line = actor.line(now, format!(":{prefix} TOPIC {display} :{new_text}"));
         state.broadcast_channel(&key, &line, Some(conn));
         return Some(crate::core::state::ChannelTopicResult::Set { line });
     }
@@ -1115,6 +1102,7 @@ fn topic_set_on_owner(
         channel: key.as_str().to_string(),
         display: display.clone(),
         prefix,
+        origin: actor.originator(),
         topic,
         revision,
         label,
@@ -1192,7 +1180,7 @@ fn emit_topic_result_now(
             }
             None => state.numeric(conn, RPL_NOTOPIC, &[&display], Some("No topic is set")),
         },
-        crate::core::state::ChannelTopicResult::Set { line } => state.send_timed(conn, &line),
+        crate::core::state::ChannelTopicResult::Set { line } => state.send_event(conn, &line),
         crate::core::state::ChannelTopicResult::NotOnChannel { target } => {
             state.err_notonchannel(conn, &target);
         }
@@ -1245,22 +1233,20 @@ pub(super) fn topic_persisted_on_owner(
             channel,
             display,
             prefix,
+            origin,
             topic,
             revision,
             retained,
             label,
         } => {
-            let line = format!(
-                ":{prefix} TOPIC {display} :{}",
-                topic.as_ref().map_or("", |t| &t.0)
-            );
-            channel_topic_set(
+            let line = channel_topic_set(
                 state,
                 conn,
                 AppliedChannelTopic {
                     channel,
                     display,
                     prefix,
+                    origin,
                     topic,
                     revision,
                     retained,
@@ -1306,6 +1292,7 @@ pub(super) struct AppliedChannelTopic {
     pub(super) channel: String,
     pub(super) display: String,
     pub(super) prefix: String,
+    pub(super) origin: crate::core::state::Originator,
     pub(super) topic: Option<(String, String, u64)>,
     pub(super) revision: u64,
     pub(super) retained: bool,
@@ -1316,11 +1303,12 @@ pub(super) fn channel_topic_set(
     state: &mut ServerState,
     conn: ConnId,
     applied: AppliedChannelTopic,
-) {
+) -> EventLine {
     let AppliedChannelTopic {
         channel,
         display,
         prefix,
+        origin,
         topic,
         revision,
         retained,
@@ -1347,16 +1335,21 @@ pub(super) fn channel_topic_set(
     }
 
     let text = new_topic.as_ref().map_or("", |topic| topic.text.as_str());
-    let line = format!(":{prefix} TOPIC {display} :{text}");
+    let line = EventLine::by(
+        origin,
+        (state.config.clock)(),
+        format!(":{prefix} TOPIC {display} :{text}"),
+    );
     if let Some(channel_state) = state.channels.get_mut(&key) {
         channel_state.topic = new_topic;
         state.broadcast_channel(&key, &line, Some(conn));
     }
     if state.sessions.contains_key(&conn) {
         state.emit_deferred_labeled(conn, label, |state| {
-            state.send_timed(conn, &line);
+            state.send_event(conn, &line);
         });
     }
+    line
 }
 
 /// Drop a pending topic write only if it is still the one this reply
@@ -1542,7 +1535,7 @@ pub(super) fn mode_query_on_owner(
         modes: chan
             .modes
             .to_string_with_args(chan.is_member(actor.recipient.conn())),
-        created: chan.created_at_secs.to_string(),
+        created: chan.created_at.as_secs().to_string(),
     }
 }
 
@@ -1640,13 +1633,7 @@ pub(super) fn mode_change_on_owner(
     let mut arguments = Vec::with_capacity(change.arguments.len() + 1);
     arguments.push(change.modes);
     arguments.extend(change.arguments);
-    channel_mode_with_prefix(
-        state,
-        actor.recipient.conn(),
-        &target,
-        &arguments,
-        &actor.identity.prefix,
-    );
+    channel_mode_by(state, actor.recipient.conn(), &target, &arguments, &actor);
     let lines = state.capture.take().expect("MODE capture installed").lines;
     crate::core::state::ChannelCommandReplies { lines }
 }
@@ -1766,7 +1753,7 @@ pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
         spec.push('-');
         spec.push_str(&off_changes);
     }
-    let line = format!(":ChanServ MODE {display} {spec}");
+    let line = state.server_line(format!(":ChanServ MODE {display} {spec}"));
     state.broadcast_channel(key, &line, None);
 }
 
@@ -1963,20 +1950,20 @@ fn emit_channel_list_rows(
 }
 
 pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
-    let prefix = state.sessions[&conn].prefix();
+    let actor = state.channel_actor(conn);
     let arguments: Vec<String> = rest
         .iter()
         .map(|argument| (*argument).to_string())
         .collect();
-    channel_mode_with_prefix(state, conn, target, &arguments, &prefix);
+    channel_mode_by(state, conn, target, &arguments, &actor);
 }
 
-fn channel_mode_with_prefix(
+fn channel_mode_by(
     state: &mut ServerState,
     conn: ConnId,
     target: &str,
     rest: &[String],
-    prefix: &str,
+    actor: &ChannelActor,
 ) {
     let casemap = state.casemap;
     let Some((key, chan)) = require_channel(state, conn, target) else {
@@ -1997,7 +1984,7 @@ fn channel_mode_with_prefix(
 
     if rest.is_empty() {
         let modes = chan.modes.to_string_with_args(is_member);
-        let created = chan.created_at_secs.to_string();
+        let created = chan.created_at.as_secs().to_string();
         state.numeric(conn, RPL_CHANNELMODEIS, &[&display, &modes], None);
         state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
         return;
@@ -2320,7 +2307,7 @@ fn channel_mode_with_prefix(
     }
 
     if !changes.is_empty() {
-        broadcast_mode_changes(state, &key, prefix, &display, &changes);
+        broadcast_mode_changes(state, &key, actor, &display, &changes);
     }
 }
 
@@ -2332,11 +2319,20 @@ fn channel_mode_with_prefix(
 fn broadcast_mode_changes(
     state: &mut ServerState,
     key: &ChanKey,
-    prefix: &str,
+    actor: &ChannelActor,
     display: &str,
     changes: &[(bool, char, Option<String>)],
 ) {
-    let base = format!(":{prefix} MODE {display} ");
+    let base = format!(":{} MODE {display} ", actor.identity.prefix);
+    let now = (state.config.clock)();
+    let line = |modes: &str, args: &[String]| {
+        let mut line = format!("{base}{modes}");
+        for a in args {
+            line.push(' ');
+            line.push_str(a);
+        }
+        actor.line(now, line)
+    };
     let mut modes = String::new();
     let mut args: Vec<String> = Vec::new();
     let mut last_sign = ' ';
@@ -2350,7 +2346,8 @@ fn broadcast_mode_changes(
         let prospective =
             base.len() + modes.len() + sign_cost + 1 + args_len + arg_cost + 2 /* CRLF */;
         if !modes.is_empty() && prospective > 512 {
-            flush_mode_line(state, key, &base, &modes, &args);
+            let line = line(&modes, &args);
+            state.broadcast_channel(key, &line, None);
             modes.clear();
             args.clear();
             last_sign = ' ';
@@ -2365,23 +2362,9 @@ fn broadcast_mode_changes(
         }
     }
     if !modes.is_empty() {
-        flush_mode_line(state, key, &base, &modes, &args);
+        let line = line(&modes, &args);
+        state.broadcast_channel(key, &line, None);
     }
-}
-
-fn flush_mode_line(
-    state: &mut ServerState,
-    key: &ChanKey,
-    base: &str,
-    modes: &str,
-    args: &[String],
-) {
-    let mut line = format!("{base}{modes}");
-    for a in args {
-        line.push(' ');
-        line.push_str(a);
-    }
-    state.broadcast_channel(key, &line, None);
 }
 
 pub(super) fn push_mode(applied: &mut String, last_sign: &mut char, adding: bool, c: char) {

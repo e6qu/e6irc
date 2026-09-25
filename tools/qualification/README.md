@@ -59,8 +59,9 @@ can never pass. A probe exit failure, missing report, or malformed report
 writes `not_run` for every applicable phase and a failed record. Use a new
 output path for every run.
 
-`public-irc-probe.sh` runs the ignored BNC-driver probe for Libera, OFTC, or
-Ergo targets. It makes two sequential TLS sessions to prove registration,
+`public-irc-probe.sh` runs the ignored BNC-driver probe and the ignored
+`tests/live_compat.rs` greeting/ISUPPORT probe for Libera, OFTC, or Ergo
+targets. Each makes two sequential TLS sessions to prove registration,
 reconnect, and cleanup. `scale-probe.sh`
 wraps `e6irc-load`; `qualify-linux.sh` writes `result.json`, `host.txt`, and
 `qualification.json` together. Scale evidence contains the digests of both raw

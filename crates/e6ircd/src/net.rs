@@ -491,6 +491,7 @@ fn spawn_bnc_listener(
                                             registry,
                                             &pool,
                                             &server_name,
+                                            &peer.ip().to_string(),
                                         )
                                         .await
                                     }
@@ -515,8 +516,14 @@ fn spawn_bnc_listener(
                                 }
                             }
                             None => {
-                                crate::bouncer::bnc_serve(stream, registry, &pool, &server_name)
-                                    .await
+                                crate::bouncer::bnc_serve(
+                                    stream,
+                                    registry,
+                                    &pool,
+                                    &server_name,
+                                    &peer.ip().to_string(),
+                                )
+                                .await
                             }
                         };
                         if let Err(e) = served {
@@ -834,6 +841,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             pool.clone(),
             telemetry.clone(),
             settings.clone(),
+            core_tx.clone(),
         ));
         listeners.push(supervise_listener(
             "storage maintenance",
@@ -924,6 +932,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             api_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             preflight_limiter: crate::http::PreflightLimiter::new(),
             ui_sockets: crate::http::UiSocketLimiter::new(),
+            account_exports: crate::http::AccountExportSlots::new(),
             conn_limiter: limiter.clone(),
             request_admission: Arc::new(crate::http::RequestAdmission::new(
                 trusted_proxies.clone(),
@@ -1011,6 +1020,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .map_err(io::Error::other)?,
         ),
         registration_burst: config.limits.registration_burst,
+        reserved_account_names: crate::identity::ReservedAccountNames::new(
+            config
+                .http
+                .iter()
+                .flat_map(|http| http.admin_accounts.iter().map(String::as_str)),
+        ),
     };
     let shard_count = core_tx.shard_count();
     let mut cores = (0..shard_count.len())
@@ -1057,6 +1072,20 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         let suspended = crate::db::list_suspended_accounts(pool)
             .await
             .map_err(io::Error::other)?;
+        let configured_administrators = config
+            .http
+            .as_ref()
+            .map_or(&[][..], |http| http.admin_accounts.as_slice());
+        for name in crate::db::unclaimed_account_names(pool, configured_administrators)
+            .await
+            .map_err(io::Error::other)?
+        {
+            eprintln!(
+                "e6ircd: configured administrator {name:?} has no account yet; only OIDC sign-in \
+                 or the bootstrap/recovery flows can create it (NickServ REGISTER and \
+                 invitations refuse the name)"
+            );
+        }
         for core in &mut cores {
             core.preload_founders(founders.clone());
             core.preload_topics(topics.clone());
@@ -1226,8 +1255,11 @@ impl HttpAdmission {
 /// without a timer: hyper then silently drops its header-read timeout, and a
 /// peer that sends half a header block — or holds a kept-alive connection idle
 /// — keeps its socket and task forever. Here every connection has a timer and
-/// [`HTTP_HEADER_READ_TIMEOUT`], and the per-address connection cap is applied
-/// at accept, before any work is spent on the peer.
+/// [`HTTP_HEADER_READ_TIMEOUT`], its writes are bounded by
+/// [`crate::peer_write::PEER_WRITE_DEADLINE`] (so a client that asks for a
+/// large response and stops reading loses the connection instead of holding
+/// it), and the per-address connection cap is applied at accept, before any
+/// work is spent on the peer.
 async fn serve_http(
     listener: TcpListener,
     router: axum::Router,
@@ -1274,6 +1306,7 @@ async fn serve_http(
             guard,
             refusals,
             telemetry.clone(),
+            crate::peer_write::PEER_WRITE_DEADLINE,
         ));
     }
 }
@@ -1285,6 +1318,7 @@ async fn serve_http_connection(
     _guard: Option<ConnGuard>,
     refusals: Arc<PeerRefusalLog>,
     telemetry: Arc<Telemetry>,
+    write_deadline: std::time::Duration,
 ) {
     use tower::ServiceExt;
     let client = ClientIp::new(peer.ip());
@@ -1313,7 +1347,13 @@ async fn serve_http_connection(
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
         .serve_connection(
-            hyper_util::rt::TokioIo::new(stream),
+            // Every write — a response body, an upgraded WebSocket's frames —
+            // fails once the peer has taken nothing for `write_deadline`,
+            // which ends the connection ([`crate::peer_write`]).
+            hyper_util::rt::TokioIo::new(crate::peer_write::DeadlineWriter::new(
+                stream,
+                write_deadline,
+            )),
             hyper_util::service::TowerToHyperService::new(service),
         )
         .with_upgrades()
@@ -1368,12 +1408,69 @@ impl ClientIp {
     pub(crate) fn ip(self) -> std::net::IpAddr {
         self.0
     }
+
+    /// The slot every per-address limiter charges this client to; see
+    /// [`PeerLimitKey`].
+    pub(crate) fn limit_key(self) -> PeerLimitKey {
+        PeerLimitKey::of(self.0)
+    }
 }
 
 impl std::fmt::Display for ClientIp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// What a per-address limit counts against: an IPv4 address, or the IPv6
+/// `/64` an address belongs to. One subscriber is routinely handed a whole
+/// `/64` (and SLAAC privacy addresses rotate through it), so a limiter keyed by
+/// the full 128 bits gives each client 2^64 fresh budgets for the asking. Every
+/// limiter — the per-address connection cap, the in-flight HTTP request bound,
+/// the HTTP authentication bucket, and the core's account-creation bucket —
+/// takes this type, and its only constructor applies the prefix, so no limiter
+/// can be keyed by a raw address. The raw [`ClientIp`] stays what is logged,
+/// shown, and matched by bans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PeerLimitKey(std::net::IpAddr);
+
+impl PeerLimitKey {
+    /// Leading IPv6 bits a limiter treats as one client.
+    pub(crate) const IPV6_PREFIX_BITS: u32 = 64;
+
+    fn of(address: std::net::IpAddr) -> Self {
+        match address.to_canonical() {
+            std::net::IpAddr::V4(v4) => Self(std::net::IpAddr::V4(v4)),
+            std::net::IpAddr::V6(v6) => {
+                let mask = u128::MAX << (128 - Self::IPV6_PREFIX_BITS);
+                Self(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    u128::from(v6) & mask,
+                )))
+            }
+        }
+    }
+
+    /// The key for a session opened with `host`: the host is the canonical
+    /// address text the listeners pass the core ([`ClientIp`]'s spelling), or
+    /// a name for an in-process session, which has no address and is counted
+    /// under its name.
+    pub(crate) fn for_session_host(host: &str) -> SessionLimitKey {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(address) => SessionLimitKey::Address(Self::of(address)),
+            Err(_) => SessionLimitKey::InProcess(host.to_string()),
+        }
+    }
+}
+
+/// Where a core session's per-address limits are charged, fixed when it opens:
+/// a later `SETHOST` changes what the session shows, never what it is counted
+/// against.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum SessionLimitKey {
+    Address(PeerLimitKey),
+    /// A session opened in-process (the bouncer's `local` driver) under a name
+    /// rather than an address.
+    InProcess(String),
 }
 
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
@@ -1506,7 +1603,7 @@ impl PeerRefusalLog {
 
 #[derive(Clone)]
 pub(crate) struct ConnLimiter {
-    counts: Arc<std::sync::Mutex<std::collections::HashMap<ClientIp, usize>>>,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<PeerLimitKey, usize>>>,
     max_per_ip: Option<usize>,
     /// Per-peer admission failures are summarised here rather than logged one
     /// line per attempt; it travels with the limiter because every listener
@@ -1528,8 +1625,10 @@ impl ConnLimiter {
         &self.refusals
     }
 
-    /// Reserve a slot for `ip`, or `None` if it is already at the cap.
-    pub(crate) fn try_acquire(&self, ip: ClientIp) -> Option<ConnGuard> {
+    /// Reserve a slot for `client`'s [`PeerLimitKey`], or `None` if that key
+    /// is already at the cap.
+    pub(crate) fn try_acquire(&self, client: ClientIp) -> Option<ConnGuard> {
+        let ip = client.limit_key();
         let Some(max) = self.max_per_ip else {
             return Some(ConnGuard { limiter: None, ip });
         };
@@ -1545,7 +1644,7 @@ impl ConnLimiter {
         })
     }
 
-    fn release(&self, ip: ClientIp) {
+    fn release(&self, ip: PeerLimitKey) {
         let mut counts = self.counts.lock().expect("conn limiter poisoned");
         if let Some(c) = counts.get_mut(&ip) {
             *c -= 1;
@@ -1559,7 +1658,7 @@ impl ConnLimiter {
 /// Releases its per-IP slot when the connection ends (on drop).
 pub(crate) struct ConnGuard {
     limiter: Option<ConnLimiter>,
-    ip: ClientIp,
+    ip: PeerLimitKey,
 }
 
 impl Drop for ConnGuard {
@@ -1671,7 +1770,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                             peer,
                             crate::core::ConnectionTransport::Tls,
                             core_tx,
-                            sendq,
+                            Outbound::with_sendq(sendq),
                             telemetry,
                         )
                         .await
@@ -1693,7 +1792,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     peer,
                     crate::core::ConnectionTransport::Tcp,
                     core_tx,
-                    sendq,
+                    Outbound::with_sendq(sendq),
                     telemetry,
                 )
                 .await
@@ -1702,13 +1801,29 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     });
 }
 
+/// The bounds on what a connection is sent: its SendQ capacity, and how long
+/// one write may wait for a client that has stopped reading.
+struct Outbound {
+    sendq: usize,
+    write_deadline: std::time::Duration,
+}
+
+impl Outbound {
+    fn with_sendq(sendq: usize) -> Self {
+        Self {
+            sendq,
+            write_deadline: crate::peer_write::PEER_WRITE_DEADLINE,
+        }
+    }
+}
+
 async fn serve_conn<S>(
     stream: S,
     conn: ConnId,
     peer: SocketAddr,
     transport: crate::core::ConnectionTransport,
     core_tx: CoreIngress,
-    sendq: usize,
+    outbound: Outbound,
     telemetry: Arc<Telemetry>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -1716,7 +1831,7 @@ async fn serve_conn<S>(
     let (read_half, write_half) = tokio::io::split(stream);
     let (out_tx, out_rx) = queue::<Output>(e6irc_queue::Config {
         name: "sendq",
-        capacity: sendq,
+        capacity: outbound.sendq,
         policy: Policy::Fifo,
     });
     if core_tx
@@ -1733,36 +1848,45 @@ async fn serve_conn<S>(
     {
         return; // core gone: shutting down
     }
+    let write_half = crate::peer_write::DeadlineWriter::new(write_half, outbound.write_deadline);
     let mut writer = tokio::spawn(write_loop(write_half, out_rx, telemetry.clone()));
-    tokio::select! {
-        // The client closed/errored, or the core queue is gone: the read side
-        // is done — stop the (possibly parked) writer.
-        () = read_loop(read_half, conn, &core_tx, &telemetry) => writer.abort(),
-        // The writer returned. Two causes: the core dropped this session's
-        // `Sender<Output>` (session already gone core-side), OR a *write error*
-        // on a still-present session (broken pipe / RST while output was queued).
-        // Cancelling the read future frees a dead peer's read task and per-IP
-        // ConnGuard now rather than at the OS TCP timeout — but it also cancels
-        // the only other path that would push `Input::Closed`, so we must push it
-        // here. `close` is idempotent, so the already-gone case is a harmless
-        // no-op; the write-error case is cleaned up now instead of lingering as a
-        // ghost session (silently black-holing messages sent to it) until the
-        // reaper collects it ~180s later.
-        reason = &mut writer => {
-            let reason = reason.unwrap_or("Write task panicked");
-            // Queue closure means the core has already removed all connection
-            // state, so there is no remaining observer for this close event.
-            drop(
-                core_tx
-                    .push(Input::Closed {
-                        conn,
-                        reason: reason.to_string(),
-                    })
-                    .await,
-            );
+    let reason = tokio::select! {
+        // The client closed its sending side (or errored), or the core queue is
+        // gone. `read_loop` has told the core, which answers what the client
+        // sent before closing — a pipelined `NICK`/`USER`/`QUIT` from a
+        // half-closing client is owed its welcome and its `ERROR` — and then
+        // drops this session's sendq. The writer delivers all of that and
+        // returns; it is aborted only if that takes longer than
+        // `HALF_CLOSE_DRAIN`.
+        () = read_loop(read_half, conn, &core_tx, &telemetry) => {
+            if tokio::time::timeout(HALF_CLOSE_DRAIN, &mut writer).await.is_err() {
+                writer.abort();
+            }
+            return;
         }
-    }
+        // The writer returned. Two causes: the core dropped this session's
+        // `Sender<Output>` (session already gone core-side), OR a write error
+        // or stall on a still-present session. Cancelling the read future frees
+        // the peer's read task and per-IP ConnGuard now, so the core must be
+        // told here; `close` is idempotent, so the already-gone case is a
+        // harmless no-op.
+        reason = &mut writer => reason.unwrap_or("Write task panicked"),
+    };
+    // Queue closure means the core has already removed all connection state,
+    // so there is no remaining observer for this close event.
+    drop(
+        core_tx
+            .push(Input::Closed {
+                conn,
+                reason: reason.to_string(),
+            })
+            .await,
+    );
 }
+
+/// How long a client that closed its sending side waits for the replies to
+/// what it sent before its connection is torn down regardless.
+const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn read_loop<R>(mut read_half: R, conn: ConnId, core_tx: &CoreIngress, telemetry: &Telemetry)
 where
@@ -1817,13 +1941,19 @@ where
         while let Some(e) = rx.try_pop() {
             batch.push(e.payload.0);
         }
-        if write_all_vectored(&mut write_half, &batch).await.is_err() {
+        let written = match write_all_vectored(&mut write_half, &batch).await {
+            Ok(()) => write_half.flush().await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
             telemetry.record_error(ErrorKind::Write);
-            return "Write error"; // broken pipe / RST: the session is still live
-        }
-        if write_half.flush().await.is_err() {
-            telemetry.record_error(ErrorKind::Write);
-            return "Write error";
+            // The session is still live core-side: a broken pipe / RST, or a
+            // peer that stopped reading while output was queued for it.
+            return if crate::peer_write::is_stalled(&error) {
+                "Write timeout"
+            } else {
+                "Write error"
+            };
         }
     }
 }
@@ -1888,6 +2018,46 @@ mod tests {
     use crate::core::Input;
     use e6irc_queue::Sender;
     use std::pin::Pin;
+
+    /// One subscriber's IPv6 `/64` is one client to every per-address limit;
+    /// IPv4 addresses, and an IPv4 client however the listener spells it, are
+    /// counted one address each.
+    #[test]
+    fn per_address_limits_count_an_ipv6_slash_64_as_one_client() {
+        let client = |text: &str| ClientIp::new(text.parse().unwrap());
+        let limiter = ConnLimiter::new(Some(1));
+        let _held = limiter
+            .try_acquire(client("2001:db8:1:2::1"))
+            .expect("the first connection");
+        assert!(
+            limiter
+                .try_acquire(client("2001:db8:1:2:ffff::2"))
+                .is_none(),
+            "another address in the same /64 shares the budget"
+        );
+        let _other = limiter
+            .try_acquire(client("2001:db8:1:3::1"))
+            .expect("the next /64 is another client");
+        let _v4 = limiter
+            .try_acquire(client("192.0.2.1"))
+            .expect("an IPv4 client");
+        assert!(limiter.try_acquire(client("::ffff:192.0.2.1")).is_none());
+        let _neighbour = limiter
+            .try_acquire(client("192.0.2.2"))
+            .expect("each IPv4 address is its own client");
+        assert_eq!(
+            client("2001:db8:1:2:aaaa:bbbb:cccc:dddd").limit_key(),
+            client("2001:db8:1:2::").limit_key()
+        );
+        assert_eq!(
+            PeerLimitKey::for_session_host("2001:db8:1:2::9"),
+            SessionLimitKey::Address(client("2001:db8:1:2::1").limit_key())
+        );
+        assert_eq!(
+            PeerLimitKey::for_session_host("local"),
+            SessionLimitKey::InProcess("local".to_string())
+        );
+    }
 
     #[test]
     fn peer_refusals_log_once_per_window_with_the_suppressed_count() {
@@ -2144,6 +2314,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A client that asks for a large response and never reads it held its
+    /// connection (and a slot of its address's connection cap) for as long as
+    /// it liked: nothing bounded a stalled body write. The connection now ends
+    /// once the client has taken nothing for the write deadline.
+    #[tokio::test]
+    async fn an_http_client_that_stops_reading_a_large_response_loses_the_connection() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        const BODY: usize = 32 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let client = tokio::net::TcpSocket::new_v4().expect("socket");
+        client.set_recv_buffer_size(4096).expect("receive buffer");
+        let mut client = client.connect(address).await.expect("connect");
+        let (stream, peer) = listener.accept().await.expect("accept");
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(4096)
+            .expect("send buffer");
+        let router =
+            axum::Router::new().route("/large", axum::routing::get(|| async { vec![b'x'; BODY] }));
+        let telemetry = Arc::new(Telemetry::new());
+        let served = tokio::spawn(serve_http_connection(
+            stream,
+            peer,
+            router,
+            None,
+            Arc::new(PeerRefusalLog::new(Duration::from_secs(60))),
+            telemetry,
+            Duration::from_millis(200),
+        ));
+        client
+            .write_all(b"GET /large HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .expect("request");
+        // The client never reads; the server's write stalls within the first
+        // few hundred kilobytes and must give up.
+        tokio::time::timeout(Duration::from_secs(20), served)
+            .await
+            .expect("a stalled response write ends the connection")
+            .expect("the connection task");
+        drop(client);
+    }
+
     #[tokio::test]
     async fn vectored_writer_advances_across_partial_chunk_boundaries() {
         let mut writer = PartialVectoredSink {
@@ -2257,10 +2472,72 @@ mod tests {
             peer,
             crate::core::ConnectionTransport::Tcp,
             CoreIngress::single(core_tx),
-            8,
+            Outbound::with_sendq(8),
             Arc::new(Telemetry::new()),
         ));
         (core_rx, served)
+    }
+
+    /// A client whose receive window is shut — it never reads — and whose
+    /// session the core has already ended (SendQ, KILL, KLINE) is torn down at
+    /// the write deadline. The writer used to park in the socket write forever,
+    /// never seeing its sendq close, and the socket, the task and the per-IP
+    /// slot leaked with it.
+    #[tokio::test]
+    async fn a_client_that_never_reads_is_torn_down_after_the_core_drops_it() {
+        // Fixed small buffers (an explicit size also stops the kernel growing
+        // them), inherited by the accepted socket.
+        let listening = tokio::net::TcpSocket::new_v4().expect("socket");
+        listening
+            .set_send_buffer_size(1024)
+            .expect("small send buffer");
+        listening
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("bind");
+        let listener = listening.listen(1).expect("listen");
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(1024).expect("small window");
+        let client = socket
+            .connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let (server, peer) = listener.accept().await.expect("accept");
+        let (core_tx, mut core_rx) = test_core_channel();
+        let served = tokio::spawn(serve_conn(
+            server,
+            ConnId(1),
+            peer,
+            crate::core::ConnectionTransport::Tcp,
+            CoreIngress::single(core_tx),
+            Outbound {
+                sendq: 4096,
+                write_deadline: std::time::Duration::from_millis(300),
+            },
+            Arc::new(Telemetry::new()),
+        ));
+        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+            panic!("expected Open");
+        };
+        // Far more than both kernel buffers hold: the writer parks mid-write.
+        let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
+        for _ in 0..4096 {
+            if tx.try_push(Output(line.clone())).is_err() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The core ends the session: its sender goes.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("a connection the core dropped must not outlive the write deadline")
+            .expect("serve_conn task");
+        let Input::Closed { reason, .. } = core_rx.pop().await.expect("Closed event").payload
+        else {
+            panic!("expected Closed");
+        };
+        assert_eq!(reason, "Write timeout");
+        drop(client);
     }
 
     #[tokio::test]
@@ -2340,6 +2617,7 @@ mod tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }
 

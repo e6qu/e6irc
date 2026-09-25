@@ -19,6 +19,10 @@ use std::future::Future;
 
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+mod bridged_senders;
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) use bridged_senders::{BridgedSenders, ProviderAccount};
 mod chathistory;
 #[cfg(feature = "discord")]
 mod discord;
@@ -41,6 +45,7 @@ pub use irc_driver::{
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
+pub(crate) use serve::{MutationLane, UnwrittenLines};
 pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
@@ -1792,6 +1797,23 @@ pub(crate) enum BridgeRead {
 /// Read the next frame from a bridge gateway socket: answer pings, skip
 /// non-text frames, and bound idle time. Shared by the two WebSocket bridges
 /// so the ping/idle discipline is written once, not kept in step by hand.
+/// Send one frame on a bridge's gateway socket, bounded like every other
+/// write to a peer ([`crate::peer_write`]): a gateway that stops reading fails
+/// the send instead of parking the session, which then could not see its stop
+/// signal or its heartbeat going unanswered.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn bridge_ws_send(
+    write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
+    frame: tokio_tungstenite::tungstenite::Message,
+) -> Result<(), crate::peer_write::SendFailure> {
+    use futures_util::SinkExt;
+    crate::peer_write::within_send_deadline(
+        crate::peer_write::PEER_WRITE_DEADLINE,
+        write.send(frame),
+    )
+    .await
+}
+
 #[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) async fn next_bridge_frame(
     read: &mut futures_util::stream::SplitStream<BridgeWs>,
@@ -1800,7 +1822,7 @@ pub(crate) async fn next_bridge_frame(
     tag: &str,
     transport: &str,
 ) -> BridgeRead {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message as Ws;
     let Some(frame) = silence.bound(read.next()).await else {
         eprintln!("{tag}: {transport} idle past timeout; reconnecting");
@@ -1810,7 +1832,7 @@ pub(crate) async fn next_bridge_frame(
     match frame {
         Some(Ok(Ws::Text(t))) => BridgeRead::Text(t.as_str().to_string()),
         Some(Ok(Ws::Ping(p))) => {
-            if write.send(Ws::Pong(p)).await.is_err() {
+            if bridge_ws_send(write, Ws::Pong(p)).await.is_err() {
                 BridgeRead::WriteFailed
             } else {
                 BridgeRead::Skip
@@ -2326,6 +2348,11 @@ pub struct AttachCaps {
     /// draft/read-marker: the client wants to set/query per-target read
     /// positions via MARKREAD.
     pub read_marker: bool,
+    /// cap-notify: implied by `CAP LS 302`, and then not switched off.
+    pub cap_notify: bool,
+    /// The client sent `CAP LS 302` (or later): capability values and
+    /// multi-line CAP replies are its to receive.
+    pub cap_302: bool,
 }
 
 /// Filter one serialized line to what the recipient negotiated. `TAGMSG` is
@@ -2544,16 +2571,65 @@ impl SessionChange {
     }
 }
 
+/// Most ISUPPORT tokens kept from one upstream, and the longest kept: the
+/// tokens are the upstream's to choose and are repeated to every attaching
+/// client, so a hostile upstream must not grow them without bound. Real
+/// networks advertise a few dozen short tokens.
+const MAX_UPSTREAM_ISUPPORT_TOKENS: usize = 128;
+const MAX_UPSTREAM_ISUPPORT_TOKEN_LEN: usize = 200;
+
+/// What the network told this session about itself in its registration burst:
+/// the `RPL_MYINFO` (004) mode lists and the `RPL_ISUPPORT` (005) tokens. An
+/// attaching client is welcomed with these, so it parses the network it is
+/// actually talking to — its prefixes, channel types, casemapping — rather
+/// than a fixed guess.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpstreamFeatures {
+    /// 004's parameters after the server name and version: user modes,
+    /// channel modes, and (optionally) channel modes taking a parameter.
+    pub myinfo_modes: Option<Vec<String>>,
+    /// 005 tokens in the order first advertised, the latest value of each.
+    pub isupport: Vec<String>,
+}
+
+impl UpstreamFeatures {
+    fn observe_isupport(&mut self, tokens: &[&str]) {
+        let key = |token: &str| token.split('=').next().unwrap_or(token).to_string();
+        for token in tokens {
+            if token.is_empty()
+                || token.starts_with(':')
+                || token.len() > MAX_UPSTREAM_ISUPPORT_TOKEN_LEN
+            {
+                continue;
+            }
+            // `-TOKEN` withdraws an earlier advertisement.
+            if let Some(withdrawn) = token.strip_prefix('-') {
+                self.isupport.retain(|kept| key(kept) != withdrawn);
+                continue;
+            }
+            let name = key(token);
+            let full = self.isupport.len() >= MAX_UPSTREAM_ISUPPORT_TOKENS;
+            match self.isupport.iter_mut().find(|kept| key(kept) == name) {
+                Some(kept) => *kept = (*token).to_string(),
+                None if !full => self.isupport.push((*token).to_string()),
+                None => {}
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct IrcSessionState {
     nick: Option<String>,
     channels: std::collections::HashMap<String, upstream_identity::ConfirmedChannel>,
+    features: UpstreamFeatures,
 }
 
 impl IrcSessionState {
     fn begin(&mut self, nick: String) -> IrcSessionSnapshot {
         self.nick = Some(nick);
         self.channels.clear();
+        self.features = UpstreamFeatures::default();
         self.snapshot().expect("a begun IRC session has a nick")
     }
 
@@ -2654,6 +2730,22 @@ impl IrcSessionState {
                 }
             }
             "QUIT" if is_us(source_nick) => self.channels.clear(),
+            // RPL_MYINFO: `004 <nick> <server> <version> <umodes> <cmodes> [<cmodes with param>]`.
+            "004" if is_us(message.params.first().copied()) && message.params.len() >= 5 => {
+                self.features.myinfo_modes = Some(
+                    message.params[3..]
+                        .iter()
+                        .take(3)
+                        .filter(|modes| !modes.is_empty() && !modes.starts_with(':'))
+                        .map(|modes| (*modes).to_string())
+                        .collect(),
+                );
+            }
+            // RPL_ISUPPORT: `005 <nick> <token>... :are supported by this server`.
+            "005" if is_us(message.params.first().copied()) && message.params.len() >= 3 => {
+                let tokens = &message.params[1..message.params.len() - 1];
+                self.features.observe_isupport(tokens);
+            }
             _ => {}
         }
         Ok(change)
@@ -3613,8 +3705,9 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
 }
 
 /// Render a bridged message as one or more IRC lines — `PRIVMSG`, a CTCP
-/// `ACTION`, or a `NOTICE`, as the [`Inbound`] says: the sender is reduced to
-/// a safe nick token and the body is split to fit the line limit.
+/// `ACTION`, or a `NOTICE`, as the [`Inbound`] says: the sender is shown as
+/// `who` (from the session's [`BridgedSenders`]) and the body is split to fit
+/// the line limit.
 ///
 /// The body is free-form remote text of arbitrary length — Slack alone allows
 /// 40,000 characters — while an IRC line is [`MAX_LINE_LEN`] bytes including
@@ -3632,13 +3725,11 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
 /// about it would be the silent drop this exists to prevent.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn render_bridged(
-    host: &str,
-    sender: &str,
+    who: &irc_driver::SelfIdentity,
     channel: &str,
     message: &Inbound,
 ) -> Vec<String> {
     use e6irc_proto::message::MAX_LINE_LEN;
-    let who = bridged_identity(host, sender);
     let (command, open, close) = match message.kind {
         InboundKind::Message => ("PRIVMSG", "", ""),
         #[cfg(any(feature = "matrix", feature = "slack"))]
@@ -3650,7 +3741,7 @@ pub(crate) fn render_bridged(
         ":{}!{}@{} {command} {channel} :{open}",
         who.nick, who.user, who.host
     );
-    // `nick_token` bounds the nick and `host` is one of three literals, so only
+    // The nick, user and host are bounded tokens (see `BridgedSenders`), so only
     // a pathologically long configured channel name can exhaust the line. The
     // floor keeps the split making progress if one ever does; the resulting
     // lines would still be over-long, which is a configuration error and not
@@ -3683,20 +3774,6 @@ pub(crate) fn render_bridged(
         }
     }
     out
-}
-
-/// How a bridge shows a provider account on IRC: `nick!nick@<platform>`, the
-/// nick reduced to a safe token. Every relayed post is prefixed from it, and so
-/// is the echo of our own — the line the provider's copy of the post would have
-/// been — so the two can never disagree about who the bridge's account is.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) fn bridged_identity(host: &str, name: &str) -> irc_driver::SelfIdentity {
-    let nick = crate::sanitize::nick_token(name);
-    irc_driver::SelfIdentity {
-        user: nick.clone(),
-        nick,
-        host: host.to_string(),
-    }
 }
 
 /// A `*bnc*` NOTICE to `channel` saying a message from `sender` of a kind the
@@ -3762,6 +3839,17 @@ impl NetworkHandle {
     /// core's SendQ uses — bound, then act, never silently block or drop).
     pub fn send(&self, line: &str) -> SendOutcome {
         self.send_from(0, line)
+    }
+
+    /// How long after a [`SendOutcome::Full`] the same send can be expected to
+    /// find room: a connected driver drains the queue or declares the upstream
+    /// dead within [`UPSTREAM_WRITE_DEADLINE`]; a reconnecting one drains
+    /// nothing before its next attempt, so that wait comes first.
+    pub fn full_queue_retry_after(&self) -> std::time::Duration {
+        let until_next_attempt = self.runtime_snapshot().next_retry_at.map_or(0, |at| {
+            at.as_millis().saturating_sub(epoch_millis().as_millis())
+        });
+        std::time::Duration::from_millis(until_next_attempt) + UPSTREAM_WRITE_DEADLINE
     }
 
     /// As [`NetworkHandle::send`], but the command carries the sending
@@ -3848,6 +3936,16 @@ impl NetworkHandle {
             .lock()
             .expect("IRC session state poisoned")
             .snapshot()
+    }
+
+    /// What the network's registration burst said about it (004/005), as of
+    /// the current session; empty before one has begun, or for a bridge.
+    pub fn upstream_features(&self) -> UpstreamFeatures {
+        self.irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .features
+            .clone()
     }
 
     /// Prepend older (oldest-first) lines to the front of the buffer,
@@ -4207,7 +4305,7 @@ impl DriverEnds {
 
     /// Begin a bridge's session and report the bridge connected, in one step:
     /// the session's nick is the provider account's, as `identity` (from
-    /// [`bridged_identity`]) names it, and its channels are the ones the
+    /// [`BridgedSenders::own`]) names it, and its channels are the ones the
     /// bridge maps. An attached client is welcomed under the session's nick
     /// and the echo of what it sends names `identity`, so the two are the same
     /// nick by construction — a client recognises its own echoes, and a
@@ -4771,7 +4869,8 @@ pub enum AttachEnd {
     ClientClosed,
     /// The client sent `QUIT`.
     ClientQuit,
-    /// The client fell too far behind the live stream to be resynchronised.
+    /// The client fell too far behind the live stream to be resynchronised,
+    /// or stopped taking what was written to it.
     ClientTooSlow,
     /// The client answered nothing for two liveness intervals.
     ClientUnresponsive,
@@ -4795,8 +4894,44 @@ pub enum AttachEnd {
 /// `liveness` is how long the client may stay silent before it is pinged, and
 /// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
 /// production).
+///
+/// Every write to the client is bounded by [`crate::peer_write`]: a client
+/// that stops reading ends its attachment as [`AttachEnd::ClientTooSlow`]
+/// rather than parking the relay, where it would see neither the network's
+/// removal nor its own silence.
 pub async fn attach<S>(
     stream: S,
+    input: ClientInput,
+    handle: &NetworkHandle,
+    caps: AttachCaps,
+    account: &str,
+    downstream_nick: &str,
+    liveness: std::time::Duration,
+) -> std::io::Result<AttachEnd>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let stream =
+        crate::peer_write::DeadlineWriter::new(stream, crate::peer_write::PEER_WRITE_DEADLINE);
+    match relay_attached(
+        stream,
+        input,
+        handle,
+        caps,
+        account,
+        downstream_nick,
+        liveness,
+    )
+    .await
+    {
+        Err(error) if crate::peer_write::is_stalled(&error) => Ok(AttachEnd::ClientTooSlow),
+        ended => ended,
+    }
+}
+
+/// [`attach`]'s relay, over a stream whose writes are already bounded.
+async fn relay_attached<S>(
+    stream: crate::peer_write::DeadlineWriter<S>,
     input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
@@ -5141,14 +5276,7 @@ where
                         chathistory::handle_chathistory(attachment.handle, write, *caps, &params)
                             .await?;
                     }
-                    "CHATHISTORY" => {
-                        write
-                            .write_all(
-                                b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
-                            )
-                            .await?;
-                        write.flush().await?;
-                    }
+                    "CHATHISTORY" => chathistory::refuse_without_cap(write).await?,
                     "MARKREAD" if caps.read_marker => {
                         chathistory::handle_markread(
                             attachment.handle,
@@ -5221,12 +5349,11 @@ where
                 }
             }
             // This relay is UTF-8, like the core ingest
-            // path; reject a non-UTF-8 line loudly rather
-            // than swallowing it.
-            Err(_) => {
-                write
-                    .write_all(b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n")
-                    .await?;
+            // path; reject a non-UTF-8 line loudly, with the
+            // same FAIL the core and the handshake answer.
+            Err(error) => {
+                let fail = crate::core::invalid_utf8_fail("*bnc*", error.as_bytes());
+                write.write_all(format!("{fail}\r\n").as_bytes()).await?;
                 write.flush().await?;
             }
         },
@@ -5486,45 +5613,17 @@ where
         .await?;
     if caps.read_marker {
         match handle.history() {
-            Some(history) => match crate::db::get_bnc_read_marker(
-                &history.pool,
-                account,
-                &history.network,
-                channel,
-            )
-            .await
-            {
-                Ok(Some(timestamp)) => {
-                    write
-                        .write_all(
-                            format!(":*bnc* MARKREAD {channel} timestamp={timestamp}\r\n")
-                                .as_bytes(),
-                        )
-                        .await?;
-                }
-                Ok(None) => {
-                    write
-                        .write_all(format!(":*bnc* MARKREAD {channel} *\r\n").as_bytes())
-                        .await?;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "bnc: read marker query failed for {account}/{}/{channel}: {error}",
-                        history.network
-                    );
-                    write
-                        .write_all(
-                            b":*bnc* FAIL MARKREAD TEMPORARY_FAILURE :read markers unavailable\r\n",
-                        )
-                        .await?;
-                }
-            },
+            Some(history) => {
+                chathistory::send_read_marker(write, &history, account, channel).await?;
+            }
             None => {
-                write
-                    .write_all(
-                        b":*bnc* FAIL MARKREAD UNAVAILABLE :read markers are not configured\r\n",
-                    )
-                    .await?;
+                let line = crate::core::HistoryFail::TemporarilyUnavailable.line(
+                    "*bnc*",
+                    "MARKREAD",
+                    &[channel],
+                    "read markers are not configured",
+                );
+                write.write_all(format!("{line}\r\n").as_bytes()).await?;
             }
         }
     }
@@ -5540,6 +5639,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rejection an upstream's pre-welcome `line` makes, read by the same
+    /// public table every driver reads.
+    fn refused_by(line: &str) -> e6irc_client::RegistrationRejection {
+        let parsed = e6irc_proto::message::Message::parse(line).expect("a scripted reply parses");
+        e6irc_client::RegistrationRejection::from_reply(
+            &e6irc_client::OwnedMessage::from(&parsed),
+            e6irc_client::ServerPasswordSent::No,
+        )
+        .expect("a scripted refusal")
+    }
+
+    /// A bridged account shown as `name!name@host`: the first account a fresh
+    /// session sees under a name no one else holds.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    fn shown(host: &str, name: &str) -> irc_driver::SelfIdentity {
+        BridgedSenders::new(ProviderAccount {
+            id: "the owner",
+            name: "the owner",
+            user: "the owner",
+            host,
+        })
+        .identity(ProviderAccount {
+            id: name,
+            name,
+            user: name,
+            host,
+        })
+    }
 
     fn driver_factory_error(
         kind: crate::config::NetworkKind,
@@ -5757,6 +5885,28 @@ mod tests {
     }
 
     #[test]
+    fn a_full_queue_retry_waits_for_the_next_attempt_and_the_write_deadline() {
+        let (handle, ends) = NetworkHandle::channels(16);
+        ends.begin_attempt();
+        ends.emit(ConnectionEvent::Connected);
+        assert_eq!(handle.full_queue_retry_after(), UPSTREAM_WRITE_DEADLINE);
+
+        handle.runtime.failed(
+            FailureDisposition::Retry {
+                next_attempt_in: Some(std::time::Duration::from_secs(20)),
+            },
+            NetworkFailure::ConnectionLost,
+            None,
+        );
+        let wait = handle.full_queue_retry_after();
+        assert!(
+            wait > UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(19)
+                && wait <= UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(20),
+            "{wait:?}"
+        );
+    }
+
+    #[test]
     fn runtime_snapshot_tracks_lifecycle_traffic_buffers_and_attachments() {
         let (handle, ends) = NetworkHandle::channels(16);
         ends.begin_attempt();
@@ -5824,17 +5974,15 @@ mod tests {
             NetworkLifecycle::AuthenticationFailed
         );
 
-        ends.emit(ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::InvalidNickname,
-            ),
-        ));
+        ends.emit(ConnectionEvent::RegistrationFailed(refused_by(
+            ":up 432 * bnc :Erroneous nickname",
+        )));
         let rejected = handle.runtime_snapshot();
         assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);
         assert_eq!(rejected.last_error, Some(NetworkFailure::InvalidNickname));
         assert_eq!(
             rejected.last_error_diagnostic.as_deref(),
-            Some("no detail from upstream")
+            Some("Erroneous nickname")
         );
         assert_eq!(failed.errors, 2);
         assert_eq!(rejected.buffer_lines, 5);
@@ -5845,7 +5993,7 @@ mod tests {
                 ":upstream PRIVMSG #room :hello".to_string(),
                 ":*bnc* NOTICE * :component reconnecting: The established upstream connection was lost. (connection_lost)".to_string(),
                 ":*bnc* NOTICE * :component authentication_failed: The upstream rejected the configured credentials. (authentication_rejected)".to_string(),
-                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: no detail from upstream".to_string(),
+                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: Erroneous nickname".to_string(),
             ]
         );
     }
@@ -6015,11 +6163,9 @@ mod tests {
             ":*bnc* NOTICE * :upstream reconnecting: The established upstream connection was lost. (connection_lost)"
         );
 
-        ends.emit(ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::InvalidNickname,
-            ),
-        ));
+        ends.emit(ConnectionEvent::RegistrationFailed(refused_by(
+            ":up 432 * bnc :Erroneous nickname",
+        )));
         assert_eq!(
             events.try_recv(),
             Ok(DriverEvent::Status {
@@ -6219,6 +6365,42 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).contains("network removed"),
             "the client gets a detach notice"
         );
+    }
+
+    /// An attached client that stops reading ends its attachment as too slow
+    /// at the write deadline. The relay used to park in the write, never seeing
+    /// the network's removal or the client's silence, and held the network
+    /// handle, its attached count and the connection slot for as long as the
+    /// client liked.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_client_that_stops_reading_is_detached_as_too_slow() {
+        let (handle, ends) = NetworkHandle::channels(16);
+        let (_client_side, server_side) = tokio::io::duplex(64);
+        let attached = attach(
+            server_side,
+            ClientInput::default(),
+            &handle,
+            AttachCaps::default(),
+            "testuser",
+            "testuser",
+            ATTACH_LIVENESS_INTERVAL,
+        );
+        let feed = async {
+            for n in 0..4 {
+                tokio::task::yield_now().await;
+                ends.emit_line(format!(":peer PRIVMSG #room :line {n} {}", "x".repeat(80)));
+            }
+            std::future::pending::<()>().await
+        };
+        let end = tokio::select! {
+            end = attached => end,
+            () = feed => unreachable!("the feed never ends"),
+        };
+        assert_eq!(
+            end.expect("a stall is an ending, not an error"),
+            AttachEnd::ClientTooSlow
+        );
+        assert_eq!(handle.runtime_snapshot().attached_clients, 0);
     }
 
     /// A multi-target line surfaces EVERY target's outcome, not just the last.
@@ -6451,7 +6633,7 @@ mod tests {
     /// One step a scripted driver session takes, for exercising
     /// [`run_with_backoff`] without a socket.
     enum ScriptedStep {
-        Refuse(e6irc_client::RegistrationRefusal),
+        Refuse(e6irc_client::RegistrationRejection),
         /// Hold the session for this long — having reached `Connected` or not —
         /// then drop it.
         Drop {
@@ -6480,9 +6662,9 @@ mod tests {
                 .push(tokio::time::Instant::now());
             let step = script.steps.lock().unwrap().pop_front();
             match step {
-                Some(ScriptedStep::Refuse(refusal)) => SessionOutcome::RegistrationRejected(
-                    e6irc_client::RegistrationRejection::without_diagnostic(refusal),
-                ),
+                Some(ScriptedStep::Refuse(rejection)) => {
+                    SessionOutcome::RegistrationRejected(rejection)
+                }
                 Some(ScriptedStep::Drop {
                     hold_for,
                     connected,
@@ -6522,13 +6704,26 @@ mod tests {
     /// A services outage is a run of refusals that never park. When it ends and
     /// the driver's own ghost still holds the nick, that first 433 is the first
     /// of *its* kind: it gets the refusal schedule, not an instant park.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn refusals_that_never_park_do_not_count_toward_parking_a_later_one() {
         use e6irc_client::RegistrationRefusal;
+        // The outage's refusal, from a real exchange: services gone, the
+        // upstream no longer offers the mechanism the driver speaks.
+        let Err(SessionOutcome::RegistrationRejected(unavailable)) =
+            irc_driver::tests::sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL")])
+                .await
+        else {
+            panic!("an upstream without the mechanism refuses registration");
+        };
+        assert_eq!(unavailable.refusal(), RegistrationRefusal::SaslUnavailable);
+        // The schedule itself runs on the paused clock.
+        tokio::time::pause();
         let mut steps: Vec<ScriptedStep> = (0..MAX_CONSECUTIVE_REGISTRATION_REJECTIONS)
-            .map(|_| ScriptedStep::Refuse(RegistrationRefusal::SaslUnavailable))
+            .map(|_| ScriptedStep::Refuse(unavailable.clone()))
             .collect();
-        steps.push(ScriptedStep::Refuse(RegistrationRefusal::NicknameInUse));
+        steps.push(ScriptedStep::Refuse(refused_by(
+            ":up 433 * bnc :Nickname is already in use",
+        )));
         steps.push(ScriptedStep::Stop);
         let (_, handle) = run_script(steps).await;
         let snapshot = handle.runtime_snapshot();
@@ -6724,7 +6919,7 @@ mod tests {
     fn a_bridge_session_is_the_account_in_its_channels_or_nothing() {
         let (handle, ends) = NetworkHandle::bridge_channels(4);
         let mut events = handle.subscribe();
-        let identity = bridged_identity("test", "my bot");
+        let identity = shown("test", "my bot");
         let refused = ends.begin_bridge_session(
             &identity,
             [&"#ok".to_string(), &"no spaces allowed".to_string()],
@@ -6782,7 +6977,7 @@ mod tests {
             origin: 9,
             line: "PRIVMSG #a,#b,#c :hi".to_string(),
         };
-        let identity = bridged_identity("test", "me");
+        let identity = shown("test", "me");
         let mut events = handle.subscribe();
         relay_routed(
             &ends,
@@ -6923,8 +7118,7 @@ mod tests {
         // client's framing discards it whole and the message is simply gone.
         let body = "x".repeat(40_000);
         let lines = render_bridged(
-            "slack",
-            "U1",
+            &shown("slack", "U1"),
             "#general",
             &Inbound::new(InboundKind::Message, &body),
         );
@@ -6991,8 +7185,7 @@ mod tests {
     fn inbound_text_drops_controls_and_wraps_actions() {
         assert_eq!(
             render_bridged(
-                "slack",
-                "U1",
+                &shown("slack", "U1"),
                 "#c",
                 &Inbound::new(InboundKind::Message, "\u{1}VERSION\u{1}\u{2}\t!")
             ),
@@ -7000,8 +7193,7 @@ mod tests {
         );
         assert_eq!(
             render_bridged(
-                "matrix",
-                "u",
+                &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Action, "waves\u{1}")
             ),
@@ -7009,8 +7201,7 @@ mod tests {
         );
         assert_eq!(
             render_bridged(
-                "matrix",
-                "u",
+                &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Notice, "a bot")
             ),
@@ -7018,8 +7209,7 @@ mod tests {
         );
         let long = "y".repeat(2_000);
         let lines = render_bridged(
-            "matrix",
-            "u",
+            &shown("matrix", "u"),
             "#c",
             &Inbound::new(InboundKind::Action, &long),
         );
@@ -7165,8 +7355,7 @@ mod tests {
         // A newline is a line break in the source medium. Left in, it is
         // flattened to a space downstream and the message reads as a run-on.
         let lines = render_bridged(
-            "discord",
-            "bob",
+            &shown("discord", "bob"),
             "#c",
             &Inbound::new(InboundKind::Message, "one\ntwo\r\nthree"),
         );
@@ -7193,8 +7382,7 @@ mod tests {
             };
             let body: String = std::iter::repeat_n(ch, 40_000).collect();
             let lines = render_bridged(
-                "matrix",
-                "u",
+                &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Message, &body),
             );
@@ -7213,7 +7401,11 @@ mod tests {
         // A message was sent. Emitting nothing would be the silent drop this
         // whole function exists to prevent.
         assert_eq!(
-            render_bridged("slack", "U1", "#c", &Inbound::new(InboundKind::Message, "")),
+            render_bridged(
+                &shown("slack", "U1"),
+                "#c",
+                &Inbound::new(InboundKind::Message, "")
+            ),
             vec![":U1!U1@slack PRIVMSG #c :"]
         );
     }
@@ -7265,6 +7457,45 @@ mod tests {
             "restored line still carries a break: {}",
             snapshot[0]
         );
+    }
+
+    /// An attaching client is welcomed with the network's own registration
+    /// burst facts — its 004 mode lists and 005 tokens as the upstream sent
+    /// them — plus only what the bouncer serves itself, and a complete
+    /// 001-004 so it knows it is registered.
+    #[test]
+    fn welcome_reflects_the_attached_networks_isupport() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        // Before any session: the bridge defaults, no CHATHISTORY (no store).
+        let (_, burst) = serve::welcome("bnc.test", "net", &handle, "alice".into());
+        let numerics: Vec<&str> = burst
+            .iter()
+            .map(|line| line.split(' ').nth(1).expect("numeric"))
+            .collect();
+        assert_eq!(numerics, ["001", "002", "003", "004", "005", "422"]);
+        assert!(burst[4].contains(" PREFIX=(qaohv)~&@%+ "), "{burst:#?}");
+        assert!(!burst[4].contains("CHATHISTORY"), "{burst:#?}");
+
+        ends.begin_irc_session("alice".to_string());
+        for line in [
+            ":up.example 004 alice up.example solanum-1 DQRSZaghilopsuwz CFILMPQSTbcefgijklmnopqrstuvz bkloveqjfI",
+            ":up.example 005 alice CASEMAPPING=ascii CHANTYPES=# PREFIX=(ov)@+ CHATHISTORY=50 :are supported by this server",
+            ":up.example 005 alice NETWORK=Up -CHANTYPES :are supported by this server",
+        ] {
+            ends.emit_session_line(line.to_string()).expect("tracked");
+        }
+        let (_, burst) = serve::welcome("bnc.test", "net", &handle, "alice".into());
+        assert_eq!(
+            burst[3],
+            ":bnc.test 004 alice bnc.test e6irc-bnc-".to_string()
+                + env!("CARGO_PKG_VERSION")
+                + " DQRSZaghilopsuwz CFILMPQSTbcefgijklmnopqrstuvz bkloveqjfI"
+        );
+        assert_eq!(
+            burst[4],
+            ":bnc.test 005 alice CASEMAPPING=ascii PREFIX=(ov)@+ NETWORK=Up :are supported by this server"
+        );
+        assert!(burst.iter().all(|line| line.len() + 2 <= 512));
     }
 
     #[test]

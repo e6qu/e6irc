@@ -934,8 +934,8 @@ fn echo_of(line: &str, to: Option<&str>, identity: &SelfIdentity) -> Option<Stri
                 return None;
             }
             let head = format!("{prefix} {command} {target} :");
-            let visible = if sensitive_nickserv_command(target, text) {
-                "[sensitive NickServ command redacted]"
+            let visible = if crate::sanitize::sensitive_service_command(target, text) {
+                crate::sanitize::SENSITIVE_SERVICE_COMMAND_REDACTED
             } else {
                 text
             };
@@ -1085,7 +1085,7 @@ impl RequestedNicks {
     }
 }
 
-/// The upstream's echo of our own message, with a NickServ command that can
+/// The upstream's echo of our own message, with a services command that can
 /// carry a secret replaced by the same redaction the synthesized echo uses:
 /// the backlog must never hold the password the upstream reflected back.
 fn redact_sensitive_echo(raw: String, message: &e6irc_client::OwnedMessage) -> String {
@@ -1094,7 +1094,7 @@ fn redact_sensitive_echo(raw: String, message: &e6irc_client::OwnedMessage) -> S
     };
     let command = message.command.to_ascii_uppercase();
     if !matches!(command.as_str(), "PRIVMSG" | "NOTICE")
-        || !sensitive_nickserv_command(target, text)
+        || !crate::sanitize::sensitive_service_command(target, text)
     {
         return raw;
     }
@@ -1104,40 +1104,10 @@ fn redact_sensitive_echo(raw: String, message: &e6irc_client::OwnedMessage) -> S
         .map(|(tags, _)| format!("@{tags} "))
         .unwrap_or_default();
     let source = message.source.as_deref().unwrap_or_default();
-    format!("{tags}:{source} {command} {target} :[sensitive NickServ command redacted]")
-}
-
-/// NickServ commands that can carry passwords, email addresses, recovery
-/// tokens, or verification codes. A downstream client still sends the exact
-/// command upstream, but the synthesized echo and persistent backlog must not
-/// retain it. The whole argument string is redacted because service dialects
-/// disagree about which position is secret.
-fn sensitive_nickserv_command(target: &str, text: &str) -> bool {
-    let service = target.split_once('@').map_or(target, |(name, _)| name);
-    if !service.eq_ignore_ascii_case("NickServ") && !service.eq_ignore_ascii_case("NS") {
-        return false;
-    }
-    let mut words = text.split_whitespace();
-    let command = words.next().unwrap_or_default();
-    if matches_ignore_ascii_case(
-        command,
-        &[
-            "REGISTER", "IDENTIFY", "GHOST", "RECOVER", "REGAIN", "RELEASE", "SENDPASS", "VERIFY",
-            "CONFIRM", "DROP", "GROUP",
-        ],
-    ) {
-        return true;
-    }
-    command.eq_ignore_ascii_case("SET")
-        && words.next().is_some_and(|setting| {
-            matches_ignore_ascii_case(setting, &["PASSWORD", "EMAIL", "PUBKEY"])
-        })
-}
-
-fn matches_ignore_ascii_case(candidate: &str, expected: &[&str]) -> bool {
-    expected
-        .iter()
-        .any(|value| candidate.eq_ignore_ascii_case(value))
+    format!(
+        "{tags}:{source} {command} {target} :{}",
+        crate::sanitize::SENSITIVE_SERVICE_COMMAND_REDACTED
+    )
 }
 
 /// Idle gap before the driver sends a keepalive PING (and again before it
@@ -1290,7 +1260,7 @@ pub(crate) fn validate_irc_upstream_addr(addr: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -1430,7 +1400,7 @@ mod tests {
     /// Register the real client, with SASL configured, against an upstream that
     /// answers each expected line prefix with its scripted reply, and return
     /// the driver's reading of how that ended.
-    async fn sasl_outcome_against(
+    pub(in crate::bouncer) async fn sasl_outcome_against(
         script: &'static [(&'static str, &'static str)],
     ) -> Result<String, super::super::SessionOutcome> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1601,11 +1571,16 @@ mod tests {
             "PRIVMSG nickserv@services.example :IDENTIFY alice correct-horse",
             "NOTICE NS :VERIFY REGISTER alice mail-token",
             "PRIVMSG NickServ :SET PASSWORD replacement-secret",
+            "PRIVMSG NickServ :SETPASS alice reset-code replacement-secret",
+            "PRIVMSG NickServ :RESETPASS alice reset-code",
+            "PRIVMSG Q@CServe.quakenet.org :AUTH alice correct-horse",
+            "PRIVMSG X@channels.undernet.org :LOGIN alice correct-horse",
+            "PRIVMSG AuthServ :AUTH alice correct-horse",
         ] {
             let echo = self_echo(line, &alice())
                 .expect("service message still has a visible redacted echo");
             assert!(
-                echo.contains("[sensitive NickServ command redacted]"),
+                echo.contains(crate::sanitize::SENSITIVE_SERVICE_COMMAND_REDACTED),
                 "{echo}"
             );
             for secret in [
@@ -1613,6 +1588,7 @@ mod tests {
                 "alice@example.test",
                 "mail-token",
                 "replacement-secret",
+                "reset-code",
             ] {
                 assert!(!echo.contains(secret), "{echo}");
             }

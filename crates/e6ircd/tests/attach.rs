@@ -87,10 +87,19 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
         .await
         .unwrap();
 
-    // let the driver receive & buffer it (attach replays the buffer, so
-    // we don't need to drain live events — a fresh subscription won't
-    // see pre-attach messages anyway)
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Wait until the driver has buffered it: attach replays the buffer, and a
+    // fresh subscription never sees a pre-attach message live.
+    tokio::time::timeout(deadline::HANG, async {
+        while !handle
+            .buffer_snapshot()
+            .iter()
+            .any(|line| line.contains("buffered before attach"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the driver never buffered the pre-attach message");
 
     // attach a downstream client over an in-memory duplex
     let (client_side, server_side) = tokio::io::duplex(64 * 1024);
@@ -201,8 +210,20 @@ async fn two_clients_attach_to_one_always_on_network() {
             .await;
         });
     }
-    // small delay so both attaches subscribe before the live message
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Both attaches must be subscribed before the live message. An attach
+    // subscribes before it writes anything, so its first line proves it.
+    let mut readers = Vec::new();
+    for client in [c1, c2] {
+        let (r, w) = tokio::io::split(client);
+        let mut br = BufReader::new(r);
+        let mut first = String::new();
+        tokio::time::timeout(deadline::HANG, br.read_line(&mut first))
+            .await
+            .expect("an attach never wrote its first line")
+            .expect("read the first line");
+        assert!(!first.is_empty(), "the attach closed before subscribing");
+        readers.push((br, w));
+    }
 
     // a peer posts; BOTH attached clients receive it
     let mut peer = e6irc_client::Connection::connect(&addr.to_string())
@@ -226,20 +247,8 @@ async fn two_clients_attach_to_one_always_on_network() {
         .await
         .unwrap();
 
-    for client in [c1, c2] {
-        let (r, _w) = tokio::io::split(client);
-        let mut br = BufReader::new(r);
-        let got = tokio::time::timeout(deadline::HANG, async {
-            loop {
-                let mut line = String::new();
-                br.read_line(&mut line).await.unwrap();
-                if line.contains("broadcast to all clients") {
-                    return line;
-                }
-            }
-        })
-        .await
-        .expect("a client missed the broadcast");
+    for (mut br, _w) in readers {
+        let got = read_until(&mut br, "broadcast to all clients").await;
         assert!(got.contains("PRIVMSG #multi"), "{got}");
     }
 }

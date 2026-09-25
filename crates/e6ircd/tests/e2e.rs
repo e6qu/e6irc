@@ -10,6 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 fn test_config() -> Config {
     Config {
         server_name: "irc.e2e.example".into(),
@@ -206,6 +209,31 @@ async fn quit_closes_the_socket() {
     assert!(eof.is_ok(), "socket not closed after QUIT");
 }
 
+/// A client that sends its whole session and then closes its sending side
+/// (`nc -N`, a scripted client) still reads every reply: the welcome and the
+/// closing `ERROR`. The connection used to be torn down the moment the read
+/// side saw EOF, discarding whatever the core had not yet written.
+#[tokio::test]
+async fn a_half_closing_client_reads_every_reply_to_what_it_sent() {
+    use tokio::io::AsyncReadExt;
+    let running = net::start(test_config()).await.expect("start");
+    let mut stream = TcpStream::connect(running.addrs[0]).await.expect("connect");
+    stream
+        .write_all(b"NICK halfclose\r\nUSER halfclose 0 * :half\r\nQUIT :bye\r\n")
+        .await
+        .expect("write");
+    stream.shutdown().await.expect("half-close");
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(10), stream.read_to_end(&mut received))
+        .await
+        .expect("the server closes once it has answered")
+        .expect("read");
+    let received = String::from_utf8_lossy(&received);
+    assert!(received.contains(" 001 halfclose "), "{received}");
+    assert!(received.contains(" 376 halfclose "), "{received}");
+    assert!(received.contains("ERROR :Closing Link"), "{received}");
+}
+
 #[tokio::test]
 async fn overlong_line_gets_417_and_connection_survives() {
     let running = net::start(test_config()).await.expect("start");
@@ -383,22 +411,31 @@ async fn per_ip_connection_limit_refuses_excess() {
         "third connection from the same IP must be refused"
     );
 
-    // Freeing a slot lets a new connection in again.
+    // Freeing a slot lets a new connection in again. The dropped connection's
+    // task releases its slot asynchronously; until it has, an attempt is still
+    // refused, so retry until one is admitted.
     held.pop();
-    // Give the dropped connection's task a moment to release its slot.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut again = e6irc_client::Connection::connect(&addr.to_string())
-        .await
-        .unwrap();
-    again
-        .register(&e6irc_client::Identity {
-            nick: "again",
-            username: "again",
-            realname: "a",
-            server_password: None,
-        })
-        .await
-        .expect("a freed slot should admit a new connection");
+    timeout(deadline::HANG, async {
+        loop {
+            let mut again = e6irc_client::Connection::connect(&addr.to_string())
+                .await
+                .unwrap();
+            let admitted = again
+                .register(&e6irc_client::Identity {
+                    nick: "again",
+                    username: "again",
+                    realname: "a",
+                    server_password: None,
+                })
+                .await;
+            if admitted.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a freed slot should admit a new connection");
 }
 
 #[tokio::test]

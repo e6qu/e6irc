@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -30,6 +30,7 @@ mod sessions;
 mod ws;
 
 use channels::*;
+pub(crate) use credentials::AccountExportSlots;
 use credentials::*;
 use device::*;
 use history::*;
@@ -144,7 +145,7 @@ pub struct AppState {
     /// auth rate limiting. The bucket refills to full over 60 seconds.
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
-    pub(crate) auth_buckets: Mutex<HashMap<crate::net::ClientIp, (f64, std::time::Instant)>>,
+    pub(crate) auth_buckets: Mutex<HashMap<crate::net::PeerLimitKey, (f64, std::time::Instant)>>,
     /// Per-account ordinary/administrator API token buckets. The boolean key
     /// distinguishes the smaller administrator budget.
     pub api_rate_burst: usize,
@@ -155,6 +156,8 @@ pub struct AppState {
     pub(crate) preflight_limiter: Arc<PreflightLimiter>,
     /// Live chat sockets open per account.
     pub(crate) ui_sockets: Arc<UiSocketLimiter>,
+    /// Account exports running at once.
+    pub(crate) account_exports: AccountExportSlots,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
@@ -569,22 +572,65 @@ fn account_mutation_pool(
     ))
 }
 
+/// A change to an account's lifecycle.
+#[derive(Clone, Copy)]
+enum AccountLifecycle {
+    Suspension { suspended: bool },
+    Deletion { allow_self: bool },
+}
+
+/// Apply `change` to the account — its database state, its networks and the
+/// live core — as one unit on the registry mutation lane. Account state and
+/// network CRUD share that lane, so an already-authorized network create
+/// cannot commit between the owner-wide stop and credential revocation and
+/// leave a suspended account's new driver running; and the unit runs to
+/// completion even if the request is abandoned, so a suspension or deletion
+/// that committed always reaches the core and the registry.
+async fn mutate_account_lifecycle(
+    state: &Arc<AppState>,
+    actor: &str,
+    account_id: i64,
+    change: AccountLifecycle,
+) -> Result<String, (StatusCode, String)> {
+    account_mutation_pool(state, account_id)?;
+    let registry = state.bnc_registry.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Network registry unavailable".into(),
+    ))?;
+    let (state, actor) = (state.clone(), actor.to_owned());
+    registry
+        .mutate(move |lane| async move {
+            match change {
+                AccountLifecycle::Suspension { suspended } => {
+                    account_suspension_in_lane(&state, &lane, &actor, account_id, suspended).await
+                }
+                AccountLifecycle::Deletion { allow_self } => {
+                    delete_account_in_lane(&state, &lane, &actor, account_id, allow_self).await
+                }
+            }
+        })
+        .await
+}
+
+/// Suspend or reactivate an account ([`mutate_account_lifecycle`]).
 pub(super) async fn mutate_account_suspension(
+    state: &Arc<AppState>,
+    actor: &str,
+    account_id: i64,
+    suspended: bool,
+) -> Result<String, (StatusCode, String)> {
+    let change = AccountLifecycle::Suspension { suspended };
+    mutate_account_lifecycle(state, actor, account_id, change).await
+}
+
+async fn account_suspension_in_lane(
     state: &AppState,
+    lane: &crate::bouncer::MutationLane,
     actor: &str,
     account_id: i64,
     suspended: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let registry = state.bnc_registry.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network registry unavailable".into(),
-    ))?;
-    // Account state and network CRUD share one mutation lane. Without this
-    // guard, an already-authorized network create could commit between the
-    // owner-wide stop and credential revocation, leaving a suspended
-    // account's new driver running.
-    let _network_mutation = registry.mutation_guard().await;
     let target_name = crate::db::account_name_by_id(pool, account_id)
         .await
         .map_err(|error| {
@@ -645,7 +691,9 @@ pub(super) async fn mutate_account_suspension(
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
-        let stopped_networks = registry.remove_owner(&change.folded).await;
+        let stopped_networks = lane
+            .remove_owner(&change.folded, crate::bouncer::UnwrittenLines::Store)
+            .await;
         core_action(
             state,
             crate::core::AdminRequest::SetAccountSuspended {
@@ -687,8 +735,7 @@ pub(super) async fn mutate_account_suspension(
         })?;
         let started_networks = prepared_networks.len();
         for (name, driver) in prepared_networks {
-            registry
-                .ensure_running(Some(&change.folded), &name, driver)
+            lane.ensure_running(Some(&change.folded), &name, driver)
                 .await;
         }
         Ok(format!(
@@ -736,6 +783,20 @@ pub(super) async fn mutate_account_administrator(
     })
 }
 
+/// Why an account-creation surface refused a configured administrator's name.
+pub(super) const RESERVED_ACCOUNT_NAME_DETAIL: &str = "The name is a configured administrator account; only OIDC sign-in or the \
+     bootstrap/recovery flows can create it.";
+
+impl AppState {
+    /// Whether `account` is a configured administrator's name, which only OIDC
+    /// provisioning and the bootstrap/recovery flows may create (see
+    /// [`crate::identity::ReservedAccountNames`]).
+    pub(super) fn account_name_reserved(&self, account: &str) -> bool {
+        self.configured_admin_accounts
+            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
+    }
+}
+
 pub(super) async fn create_account_lifecycle(
     state: &AppState,
     actor: &str,
@@ -752,6 +813,9 @@ pub(super) async fn create_account_lifecycle(
     }
     if let Some(detail) = password_input_error(password) {
         return Err((StatusCode::BAD_REQUEST, detail.into()));
+    }
+    if state.account_name_reserved(account) {
+        return Err((StatusCode::CONFLICT, RESERVED_ACCOUNT_NAME_DETAIL.into()));
     }
     let contact_email = contact_email
         .map(crate::identity::ContactEmail::parse)
@@ -790,18 +854,26 @@ fn account_invitation_url(public_url: &str, token: &str) -> String {
     format!("{}{path}", public_url.trim_end_matches('/'))
 }
 
+/// Delete an account permanently — the live gate, its networks and its rows
+/// ([`mutate_account_lifecycle`]).
 pub(super) async fn delete_account_lifecycle(
+    state: &Arc<AppState>,
+    actor: &str,
+    account_id: i64,
+    allow_self: bool,
+) -> Result<String, (StatusCode, String)> {
+    let change = AccountLifecycle::Deletion { allow_self };
+    mutate_account_lifecycle(state, actor, account_id, change).await
+}
+
+async fn delete_account_in_lane(
     state: &AppState,
+    registry: &crate::bouncer::MutationLane,
     actor: &str,
     account_id: i64,
     allow_self: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let registry = state.bnc_registry.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network registry unavailable".into(),
-    ))?;
-    let _network_mutation = registry.mutation_guard().await;
     let configured_administrators: Vec<String> =
         state.configured_admin_accounts.iter().cloned().collect();
     let target = crate::db::account_deletion_target(pool, account_id, &configured_administrators)
@@ -839,7 +911,9 @@ pub(super) async fn delete_account_lifecycle(
     // network's row no longer satisfies). Drivers for the running networks are
     // built first, so a deletion the database refuses restarts exactly them.
     let restart = owner_network_restart(state, pool, registry, &target).await;
-    let stopped_networks = registry.remove_owner(&target.folded).await;
+    let stopped_networks = registry
+        .remove_owner(&target.folded, crate::bouncer::UnwrittenLines::Discard)
+        .await;
     let deleted = match crate::db::delete_account_permanently(
         pool,
         account_id,
@@ -864,6 +938,23 @@ pub(super) async fn delete_account_lifecycle(
             return Err(account_deletion_error(error));
         }
     };
+    // The account's read markers cascaded away with its row; every core
+    // shard's mirror drops them too, or they would count against nothing
+    // until a restart. The live gate stays: the name is retired.
+    if state
+        .core_tx
+        .broadcast_account_deleted(&target.folded)
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Permanently deleted {}, but a live core shard is unavailable and still holds its read markers.",
+                deleted.name
+            ),
+        ));
+    }
     Ok(format!(
         "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account name is retired.",
         deleted.name
@@ -958,6 +1049,78 @@ async fn undo_account_deletion_gate(
             ),
         )
     })
+}
+
+/// The refusals axum would answer in its own shape are each given ours in one
+/// place; these tests keep them from being bypassed.
+#[cfg(test)]
+mod problem_contract_tests {
+    use super::*;
+
+    /// Every HTTP source file, read at build time so the guard sees what ships.
+    const SOURCES: &[(&str, &str)] = &[
+        ("channels.rs", include_str!("channels.rs")),
+        ("credentials.rs", include_str!("credentials.rs")),
+        ("device.rs", include_str!("device.rs")),
+        ("history.rs", include_str!("history.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+        ("networks.rs", include_str!("networks.rs")),
+        ("observation.rs", include_str!("observation.rs")),
+        ("oidc.rs", include_str!("oidc.rs")),
+        ("openapi.rs", include_str!("openapi.rs")),
+        ("preflight.rs", include_str!("preflight.rs")),
+        ("sessions.rs", include_str!("sessions.rs")),
+        ("ws.rs", include_str!("ws.rs")),
+    ];
+
+    fn occurrences(needle: &str) -> Vec<(&'static str, usize)> {
+        SOURCES
+            .iter()
+            .map(|(name, source)| (*name, source.matches(needle).count()))
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    /// A handler taking axum's `Path` answers a malformed segment in plain
+    /// text; only `PathParams`, which wraps it, may name it.
+    #[test]
+    fn only_path_params_names_the_raw_path_extractor() {
+        let needle = concat!("axum::extract::", "Path");
+        assert_eq!(occurrences(needle), vec![("oidc.rs", 3)]);
+        // However it is imported, taking it as a handler argument names its
+        // generic type.
+        assert_eq!(occurrences(concat!("Path", "<")), vec![("oidc.rs", 1)]);
+    }
+
+    /// `parse_form` is the one reader of a console form's rejection, so every
+    /// malformed form is answered with the same problem document. The OIDC
+    /// back-channel logout endpoint answers its own refusal for every
+    /// malformed request, a well-formed but invalid logout token included.
+    #[test]
+    fn only_parse_form_unwraps_a_form() {
+        assert_eq!(
+            occurrences(concat!("Form", "(")),
+            vec![("mod.rs", 1), ("oidc.rs", 1)]
+        );
+    }
+
+    /// `too_many_requests` (and `retry_later` through it) is the one builder
+    /// of a `429`, so none leaves without `Retry-After`.
+    #[test]
+    fn only_retry_later_builds_a_too_many_requests_answer() {
+        assert_eq!(
+            occurrences(concat!("TOO_MANY", "_REQUESTS")),
+            vec![("oidc.rs", 1)]
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_round_up_and_are_never_zero() {
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::from_secs(10)), 10);
+        assert_eq!(retry_after_seconds(Duration::from_millis(10_001)), 11);
+    }
 }
 
 #[cfg(test)]
@@ -1463,14 +1626,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(web::index))
         .route("/favicon.ico", get(web::favicon))
         .route("/assets/{*path}", get(web::asset));
-    let router = router.fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None));
+    // Both refusals of an unrouted request are problem documents like every
+    // other answer; axum's defaults are an empty 405 and a plain-text 404.
+    let router = router
+        .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .method_not_allowed_fallback(method_not_allowed);
     let router = admit_requests(
         router,
         state.request_admission.clone(),
         MAX_CONCURRENT_REQUESTS,
     );
     // Added after the admission bounds, so they bypass them.
-    let router = add_probe_routes(router);
+    // The fallback applies only to routes registered before it is set, so the
+    // probes added here are given it again.
+    let router = add_probe_routes(router).method_not_allowed_fallback(method_not_allowed);
     observed(
         bound_request(router, REQUEST_DEADLINE).layer(axum::middleware::from_fn(baseline_headers)),
         state.observation.clone(),
@@ -1548,13 +1717,15 @@ const MAX_CONCURRENT_REQUESTS: usize = 1024;
 /// How long the service works on one request before answering `408`.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The per-address in-flight request count, keyed by the client address the
-/// request resolves to ([`client_ip`]: the socket peer, or the forwarded client
-/// behind a trusted proxy).
+/// The per-address in-flight request count, keyed by the [`PeerLimitKey`] of
+/// the client address the request resolves to ([`client_ip`]: the socket peer,
+/// or the forwarded client behind a trusted proxy).
+///
+/// [`PeerLimitKey`]: crate::net::PeerLimitKey
 pub(crate) struct RequestAdmission {
     trusted_proxies: Vec<ipnet::IpNet>,
     limit: usize,
-    in_flight: Mutex<HashMap<crate::net::ClientIp, usize>>,
+    in_flight: Mutex<HashMap<crate::net::PeerLimitKey, usize>>,
 }
 
 impl RequestAdmission {
@@ -1567,6 +1738,7 @@ impl RequestAdmission {
     }
 
     fn admit(self: &Arc<Self>, client: crate::net::ClientIp) -> Option<InFlightRequest> {
+        let client = client.limit_key();
         let mut in_flight = self.in_flight.lock().expect("request admission lock");
         let count = in_flight.entry(client).or_insert(0);
         if *count >= self.limit {
@@ -1583,7 +1755,7 @@ impl RequestAdmission {
 /// One admitted request; its slot is released when the response is returned.
 struct InFlightRequest {
     admission: Arc<RequestAdmission>,
-    client: crate::net::ClientIp,
+    client: crate::net::PeerLimitKey,
 }
 
 impl Drop for InFlightRequest {
@@ -1713,6 +1885,7 @@ pub fn ws_irc_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(ws_irc))
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::middleware::from_fn(baseline_headers))
         .with_state(state)
 }
@@ -1794,7 +1967,7 @@ mod web {
         }
     }
 
-    pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    pub async fn asset(PathParams(path): PathParams<String>) -> Response {
         serve(&format!("assets/{path}"))
     }
 
@@ -2285,7 +2458,7 @@ mod pages {
 
     pub async fn account_invitation(
         State(state): State<Arc<AppState>>,
-        Path(token): Path<String>,
+        PathParams(token): PathParams<String>,
     ) -> Response {
         if !valid_invitation_token(&token) {
             return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
@@ -2317,7 +2490,7 @@ mod pages {
         State(state): State<Arc<AppState>>,
         _rate_limited: RateLimited,
         headers: axum::http::HeaderMap,
-        Path(token): Path<String>,
+        PathParams(token): PathParams<String>,
         form: Result<
             axum::Form<AccountInvitationAcceptanceForm>,
             axum::extract::rejection::FormRejection,
@@ -2499,6 +2672,22 @@ mod pages {
                         form.account,
                         Some("Invalid account or password.".into()),
                         StatusCode::UNAUTHORIZED,
+                    );
+                }
+                Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+                    eprintln!(
+                        "web: login refused for account {:?}: attempt limit reached",
+                        form.account
+                    );
+                    // The sign-in page again, with the reason, as a 429.
+                    return super::oidc::too_many_requests(
+                        login_response(
+                            &state,
+                            form.account,
+                            Some(retry_after.explanation()),
+                            StatusCode::UNAUTHORIZED,
+                        ),
+                        retry_after.seconds(),
                     );
                 }
                 Err(error) => {
@@ -3176,7 +3365,7 @@ mod pages {
     pub async fn console_network_detail(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
+        PathParams(name): PathParams<String>,
     ) -> Response {
         let actor = match page_actor(&state, &headers, false).await {
             Ok(actor) => actor,
@@ -3194,7 +3383,7 @@ mod pages {
     pub async fn owner_network_operations(
         State(state): State<Arc<AppState>>,
         Authenticated(account, _): Authenticated,
-        Path(name): Path<String>,
+        PathParams(name): PathParams<String>,
     ) -> Response {
         let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
             Ok(Some(network)) => network,
@@ -3384,7 +3573,7 @@ mod pages {
     /// resource before populating its typed provider fields.
     pub async fn console_edit_bridge(
         AdminPageActor(actor): AdminPageActor,
-        Path(name): Path<String>,
+        PathParams(name): PathParams<String>,
     ) -> Response {
         render_private(ConsoleBridgeEdit {
             shell: console_shell(actor, "integrations"),
@@ -3444,9 +3633,9 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
-        let axum::Form(fields) = match form {
-            Ok(f) => f,
-            Err(r) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&r.to_string())),
+        let fields = match parse_form(form) {
+            Ok(fields) => fields,
+            Err(response) => return response.into(),
         };
         if !state.csrf_valid(&session, &fields.csrf) {
             return problem(StatusCode::FORBIDDEN, "Bad CSRF token", None);
@@ -3750,6 +3939,17 @@ mod invitation_url_tests {
 mod client_ip_tests {
     use super::client_ip;
     use crate::net::ClientIp;
+
+    /// The in-flight request bound charges a client's whole IPv6 `/64`.
+    #[test]
+    fn request_admission_counts_an_ipv6_slash_64_as_one_client() {
+        let admission = std::sync::Arc::new(super::RequestAdmission::new(Vec::new(), 1));
+        let _held = admission
+            .admit(client("2001:db8::1"))
+            .expect("the first request");
+        assert!(admission.admit(client("2001:db8::2")).is_none());
+        assert!(admission.admit(client("2001:db8:0:1::1")).is_some());
+    }
 
     fn xff(value: &str) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();

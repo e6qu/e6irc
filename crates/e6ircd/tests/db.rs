@@ -142,7 +142,7 @@ async fn hist(
     target: &str,
     query: e6ircd::core::HistoryQuery,
 ) -> Vec<e6ircd::core::HistoryRow> {
-    db::query_history(pool, target, query)
+    db::query_history(pool, target, e6ircd::core::HistoryFloor::Whole, query)
         .await
         .expect("history query")
 }
@@ -157,7 +157,11 @@ async fn tgts(
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
 ) -> Vec<(String, e6irc_proto::time::Millis)> {
-    db::query_targets(pool, channels, Some(me), min_ts, max_ts, limit)
+    let channels: Vec<(String, e6ircd::core::HistoryFloor)> = channels
+        .iter()
+        .map(|channel| (channel.clone(), e6ircd::core::HistoryFloor::Whole))
+        .collect();
+    db::query_targets(pool, &channels, Some(me), min_ts, max_ts, limit)
         .await
         .expect("targets query")
 }
@@ -636,6 +640,10 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
         third.starts_with("HTTP/1.1 429"),
         "3rd should be limited: {third}"
     );
+    assert!(
+        third.to_ascii_lowercase().contains("\r\nretry-after: "),
+        "a 429 says when to retry: {third}"
+    );
 }
 
 #[tokio::test]
@@ -884,6 +892,7 @@ async fn history_worker_tells_an_unknown_msgid_from_an_empty_page() {
             .push(DbRequest::QueryHistory {
                 conn: e6ircd::core::ConnId(9),
                 target: "#here".into(),
+                floor: e6ircd::core::HistoryFloor::Whole,
                 display: "#here".into(),
                 batch_ref: "batch".into(),
                 caps: e6ircd::core::HistoryResponseCaps {
@@ -2054,13 +2063,15 @@ async fn expect_line(
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
-    // Regression: a channel that empties is dropped from memory; when re-created
-    // its ring is empty but PostgreSQL still holds the old rows. It must NOT be
-    // marked history-complete (which would make CHATHISTORY return an empty
-    // batch), and a labeled request's deferred DB batch must carry the label.
+async fn chathistory_recreated_channel_serves_only_its_own_incarnation_with_label() {
+    // A channel that empties is dropped from memory; when re-created its ring
+    // is empty while PostgreSQL still holds the old incarnation's rows. Those
+    // belong to whoever was there before: a member without a registered
+    // relationship to the channel reads only what was said since it was
+    // re-created — which, the ring being incomplete, is served from the
+    // database, and a labeled request's deferred batch carries the label.
     let url =
-        support::test_db("chathistory_recreated_channel_serves_persisted_history_with_label").await;
+        support::test_db("chathistory_recreated_channel_serves_only_its_own_incarnation").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
 
     let config = Config {
@@ -2116,6 +2127,20 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
     // Re-create the channel: its ring is empty, PG still holds m0..m4.
     w.write_all(b"JOIN #r\r\n").await.unwrap();
     expect_line(&mut reader, " 366 ").await;
+    w.write_all(b"PRIVMSG #r :since re-creation\r\nPING said\r\n")
+        .await
+        .unwrap();
+    expect_line(&mut reader, "PONG").await;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE target = '#r'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n == 6 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     // Labeled CHATHISTORY: the batch is served from PG (empty ring) and its
     // opening BATCH line must carry the label.
@@ -2150,12 +2175,11 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
             }
         }
     }
-    for i in 0..5 {
-        assert!(
-            bodies.contains(&format!("m{i}")),
-            "recreated channel lost persisted history: {bodies:?}"
-        );
-    }
+    assert_eq!(
+        bodies,
+        ["since re-creation"],
+        "the re-created channel serves its own incarnation only"
+    );
 }
 
 #[tokio::test]
@@ -6220,14 +6244,62 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         Err(db::DbError::ReplayedLogoutToken)
     ));
     assert_eq!(
-        db::revoke_oidc_frontchannel_sessions(&pool, "https://auth.example", "second-session")
-            .await
-            .expect("front-channel logout"),
-        1
+        db::revoke_oidc_frontchannel_sessions(
+            &pool,
+            "https://auth.example",
+            "second-session",
+            Some(&first),
+        )
+        .await
+        .expect("front-channel logout"),
+        db::FrontchannelRevocation {
+            revoked: 1,
+            presented_session_revoked: false,
+        },
+        "a cookie naming another session is not one this logout revoked"
     );
     assert_eq!(
         db::session_account(&pool, &second).await.expect("second"),
         None
+    );
+    let third = db::create_web_session_with_identity(
+        &pool,
+        "alice",
+        db::OidcSessionIdentity {
+            id_token: Some("third.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("third-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
+        None,
+    )
+    .await
+    .expect("third session");
+    assert_eq!(
+        db::revoke_oidc_frontchannel_sessions(
+            &pool,
+            "https://auth.example",
+            "third-session",
+            Some(&third),
+        )
+        .await
+        .expect("front-channel logout"),
+        db::FrontchannelRevocation {
+            revoked: 1,
+            presented_session_revoked: true,
+        }
+    );
+    assert_eq!(
+        db::revoke_oidc_frontchannel_sessions(&pool, "https://auth.example", "unknown-sid", None)
+            .await
+            .expect("front-channel logout"),
+        db::FrontchannelRevocation {
+            revoked: 0,
+            presented_session_revoked: false,
+        }
     );
 }
 
@@ -6298,10 +6370,11 @@ async fn device_grants_are_pruned_on_create() {
         db::connect_and_migrate(&support::test_db("device_grants_are_pruned_on_create").await)
             .await
             .expect("connect");
-    // An already-expired grant, as a never-approved /device/start flood leaves.
+    // A grant expired past the grace period, as a never-approved /device/start
+    // flood leaves.
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ('dead', 'DEADDEAD', now() - interval '1 minute')",
+         VALUES ('dead', 'DEADDEAD', now() - interval '1 day')",
     )
     .execute(&pool)
     .await
@@ -7448,10 +7521,12 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .execute(&pool)
     .await
     .expect("API tokens");
+    // An expired grant is kept for a grace period (a late poll is answered
+    // `expired_token`); one past it is pruned.
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
          VALUES
-           ('old-device', 'OLDDEV01', now() - interval '1 second'),
+           ('old-device', 'OLDDEV01', now() - interval '1 day'),
            ('new-device', 'NEWDEV01', now() + interval '1 day')",
     )
     .execute(&pool)
@@ -7550,6 +7625,15 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     assert_eq!(report.observability_samples, 1);
     // One from each marker table: the counter covers both.
     assert_eq!(report.read_markers, 2);
+    // The core's row is also returned, as deleted, for the core's mirror.
+    assert_eq!(
+        report
+            .expired_read_markers
+            .iter()
+            .map(|marker| (marker.account.as_str(), marker.target.as_str()))
+            .collect::<Vec<_>>(),
+        [("Alice", "#old")]
+    );
     assert!(!report.saturated);
     let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -7947,7 +8031,25 @@ async fn concurrent_mutual_demotion_keeps_one_administrator() {
     };
     let alice_demotes_bob = demote(bob_id, "Alice");
     let bob_demotes_alice = demote(alice_id, "Bob");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Release only once both are queued on the held rows; before that, one
+    // could simply run after the other.
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("lock waiters");
+            if waiting >= 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both demotions never queued on the held rows");
     gate.commit().await.expect("release");
 
     let outcomes = [
@@ -8705,12 +8807,17 @@ async fn a_password_change_waiting_for_argon2_does_not_block_the_account_row() {
     // Keep every Argon2 permit busy for the whole test.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut flood = tokio::task::JoinSet::new();
-    for _ in 0..12 {
+    for worker in 0..12 {
         let pool = pool.clone();
         let stop = stop.clone();
         flood.spawn(async move {
+            // A fresh name each time: one name's attempts are throttled before
+            // any Argon2 work, and the point here is to keep Argon2 busy.
+            let mut attempt = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = db::verify_credentials(&pool, "nobody", "guess").await;
+                attempt += 1;
+                let name = format!("nobody{worker}x{attempt}");
+                let _ = db::verify_credentials(&pool, &name, "guess").await;
             }
         });
     }
@@ -9560,5 +9667,530 @@ async fn maintenance_trims_buffers_over_the_backlog_cap() {
             .await
             .expect("second sweep"),
         0
+    );
+}
+
+/// Wait until some session of this test's database is blocked on a lock: the
+/// point an interleaving test has arranged for.
+async fn wait_for_lock_wait(pool: &sqlx::PgPool) {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("lock waits");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no session ever waited on a lock");
+}
+
+/// Alice (the administrator) and Bob, for the deletion interleavings below.
+async fn alice_and_bob(test: &str) -> (sqlx::PgPool, i64) {
+    let pool = db::connect_and_migrate(&support::test_db(test).await)
+        .await
+        .expect("connect");
+    db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let bob_id = db::create_account_with_contact(&pool, "Bob", "member password", None)
+        .await
+        .expect("Bob");
+    (pool, bob_id)
+}
+
+/// A founder transfer to an account being deleted, still uncommitted when the
+/// deletion counts founded channels, used to be invisible to that count while
+/// its foreign-key lock did not conflict with deletion's row lock: the DELETE
+/// then waited for the transfer to commit and its cascade removed the channel.
+/// Deletion now waits for the transfer before counting, and refuses.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_deletion_never_cascades_through_a_concurrent_founder_transfer() {
+    let (pool, bob_id) =
+        alice_and_bob("account_deletion_never_cascades_through_a_concurrent_founder_transfer")
+            .await;
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#room', '#room', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    let mut transfer = pool.begin().await.expect("transfer transaction");
+    sqlx::query("UPDATE channels SET founder_account_id = $1 WHERE name_folded = '#room'")
+        .bind(bob_id)
+        .execute(&mut *transfer)
+        .await
+        .expect("transfer to Bob");
+    let deletion = tokio::spawn({
+        let pool = pool.clone();
+        async move { db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await }
+    });
+    wait_for_lock_wait(&pool).await;
+    transfer.commit().await.expect("commit transfer");
+    let outcome = tokio::time::timeout(deadline::HANG, deletion)
+        .await
+        .expect("deletion finished")
+        .expect("deletion task");
+    assert!(
+        matches!(outcome, Err(db::DbError::AccountOwnsChannels(1))),
+        "{outcome:?}"
+    );
+    let founder: Option<String> = sqlx::query_scalar(
+        "SELECT a.name FROM channels c JOIN accounts a ON a.id = c.founder_account_id
+         WHERE c.name_folded = '#room'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("channel lookup");
+    assert_eq!(founder.as_deref(), Some("Bob"), "the channel must survive");
+}
+
+/// However the application counts, storage refuses to delete a founder: the
+/// founder reference restricts rather than cascading the channel away.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn storage_refuses_to_delete_a_channel_founder() {
+    let (pool, bob_id) = alice_and_bob("storage_refuses_to_delete_a_channel_founder").await;
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id) VALUES ('#bob', '#bob', $1)",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await
+    .expect("channel");
+    let error = sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(bob_id)
+        .execute(&pool)
+        .await
+        .expect_err("deleting a founder must fail");
+    // Named by constraint, not SQLSTATE: PostgreSQL 18 reports a RESTRICT
+    // violation as 23001 (restrict_violation) where earlier releases say 23503.
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.constraint()),
+        Some("channels_founder_account_id_fkey"),
+        "{error}"
+    );
+    let channels: i64 = sqlx::query_scalar("SELECT count(*) FROM channels")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(channels, 1);
+}
+
+async fn messages_naming_bob(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM messages
+         WHERE sender_account IN ('Bob', 'bob') OR dm_peers @> ARRAY['bob']",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count")
+}
+
+/// Write one message the way the database worker's batch does (a plain
+/// INSERT; the storage trigger is what decides).
+async fn log_message<'e, E>(executor: E, msgid: &str, sender: &str, dm_peers: Option<&[&str]>)
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+         VALUES ($1, '#test', $2 || '!u@h', $2, 'privmsg', 'late', now(), $3)",
+    )
+    .bind(msgid)
+    .bind(sender)
+    .bind(dm_peers)
+    .execute(executor)
+    .await
+    .expect("insert message");
+}
+
+/// Messages reach PostgreSQL asynchronously -- batched by the database worker,
+/// from shards that apply an account's suspension at their own pace -- so one
+/// naming an account could commit after deletion's purge. Storage now refuses
+/// every such row, whatever its timing: in flight when deletion starts (the
+/// purge waits for it and removes it), written while deletion holds the
+/// account (dropped), or after it committed (dropped).
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn messages_naming_a_deleted_account_never_outlive_the_purge() {
+    let (pool, bob_id) =
+        alice_and_bob("messages_naming_a_deleted_account_never_outlive_the_purge").await;
+
+    // While deletion holds the account row, a row naming it is not stored;
+    // once the lock is gone without a deletion, it is.
+    let mut deleting = pool.begin().await.expect("deletion stand-in");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(bob_id)
+        .execute(&mut *deleting)
+        .await
+        .expect("lock Bob");
+    log_message(&pool, "during", "Bob", None).await;
+    assert_eq!(messages_naming_bob(&pool).await, 0);
+    deleting.rollback().await.expect("release");
+    log_message(&pool, "kept", "Bob", None).await;
+    assert_eq!(messages_naming_bob(&pool).await, 1);
+
+    // A batch still uncommitted when deletion starts: deletion waits for it,
+    // and its purge removes the row.
+    let mut batch = pool.begin().await.expect("batch transaction");
+    log_message(&mut *batch, "in-flight", "Bob", None).await;
+    let deletion = tokio::spawn({
+        let pool = pool.clone();
+        async move { db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await }
+    });
+    wait_for_lock_wait(&pool).await;
+    batch.commit().await.expect("commit batch");
+    tokio::time::timeout(deadline::HANG, deletion)
+        .await
+        .expect("deletion finished")
+        .expect("deletion task")
+        .expect("delete")
+        .expect("Bob");
+    assert_eq!(messages_naming_bob(&pool).await, 0);
+
+    // After the deletion committed: neither as sender nor as a peer.
+    log_message(&pool, "late-sent", "Bob", None).await;
+    log_message(&pool, "late-dm", "Alice", Some(&["alice", "bob"])).await;
+    assert_eq!(messages_naming_bob(&pool).await, 0);
+    // Rows naming a live account, or a name no account ever held, are kept.
+    log_message(&pool, "alice", "Alice", None).await;
+    log_message(&pool, "service", "SomeService", None).await;
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 2);
+}
+
+/// RFC 8628 has a device that polls past expiry told `expired_token`, its cue
+/// to start over. Grants were pruned the moment they expired, so the poll
+/// found no row and answered as for an unknown code; they are now kept for a
+/// grace period, through both pruning paths.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_expired_device_grant_polls_as_expired_until_pruned() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("an_expired_device_grant_polls_as_expired_until_pruned").await,
+    )
+    .await
+    .expect("connect");
+    let (expired, _) = db::create_device_grant(&pool).await.expect("grant");
+    let (stale, _) = db::create_device_grant(&pool).await.expect("grant");
+    sqlx::query(
+        "UPDATE device_grants SET expires_at = CASE device_code
+             WHEN $1 THEN now() - interval '1 second'
+             ELSE now() - interval '1 day' END
+         WHERE device_code IN ($1, $2)",
+    )
+    .bind(&expired)
+    .bind(&stale)
+    .execute(&pool)
+    .await
+    .expect("expire");
+    // Both pruning paths: a new grant, and storage maintenance.
+    db::create_device_grant(&pool).await.expect("grant");
+    let report = db::run_storage_maintenance(
+        &pool,
+        db::StorageRetention {
+            history_days: 30,
+            audit_days: 365,
+            observability_hours: 1,
+        },
+    )
+    .await
+    .expect("maintenance");
+    assert_eq!(report.device_grants, 0, "the stale grant went at start");
+    assert_eq!(
+        db::poll_device_grant(&pool, &expired, "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Expired
+    );
+    assert_eq!(
+        db::poll_device_grant(&pool, &stale, "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Unknown,
+        "past the grace period the grant is pruned"
+    );
+}
+
+/// Password guessing against one account is bounded whatever addresses it
+/// comes from: past `LOGIN_ATTEMPT_LIMIT` attempts in the window every check —
+/// the correct password included — is refused unverified, on every path that
+/// checks a password, and the refusal is the same for a name no account holds.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn password_attempts_are_bounded_per_account_name() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("password_attempts_are_bounded_per_account_name").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "alice", "correct horse", None)
+        .await
+        .expect("alice");
+    db::create_account_with_contact(&pool, "bob", "bob password", None)
+        .await
+        .expect("bob");
+    // A verified password ends the window: a user who mistypes and then gets
+    // it right is not left counting towards a lockout.
+    for _ in 0..3 {
+        assert_eq!(
+            db::verify_credentials(&pool, "alice", "typo")
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    assert_eq!(
+        db::verify_local_password(&pool, "ALICE", "correct horse")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("alice")
+    );
+    for _ in 0..db::LOGIN_ATTEMPT_LIMIT {
+        assert_eq!(
+            db::verify_credentials(&pool, "alice", "guess")
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    let throttled = |result: Result<Option<String>, db::DbError>| match result {
+        Err(db::DbError::LoginThrottled(retry)) => {
+            assert!(
+                (1..=db::LOGIN_ATTEMPT_WINDOW.as_secs()).contains(&retry.seconds()),
+                "{retry:?}"
+            );
+            true
+        }
+        _ => false,
+    };
+    assert!(throttled(
+        db::verify_credentials(&pool, "Alice", "correct horse").await
+    ));
+    assert!(throttled(
+        db::verify_local_password(&pool, "alice", "correct horse").await
+    ));
+    assert!(matches!(
+        db::issue_app_password(&pool, "alice", "correct horse", "laptop").await,
+        Err(db::DbError::LoginThrottled(_))
+    ));
+    let session = db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    assert!(matches!(
+        db::change_local_password(&pool, "alice", "correct horse", "new password", &session).await,
+        Err(db::DbError::LoginThrottled(_))
+    ));
+    // Another account is untouched.
+    assert_eq!(
+        db::verify_credentials(&pool, "bob", "bob password")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("bob")
+    );
+    // A name no account holds is throttled the same way, so a refusal says
+    // nothing about which names exist.
+    for _ in 0..db::LOGIN_ATTEMPT_LIMIT {
+        assert_eq!(
+            db::verify_credentials(&pool, "nobody", "guess")
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    assert!(throttled(
+        db::verify_credentials(&pool, "nobody", "guess").await
+    ));
+    // Once the window has passed the account is admitted again.
+    sqlx::query(
+        "UPDATE login_attempts SET window_started_at = now() - interval '1 hour'
+         WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("age the window");
+    assert_eq!(
+        db::verify_credentials(&pool, "alice", "correct horse")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("alice")
+    );
+}
+
+/// A history read never reaches below its floor: not in a window, not through
+/// a pivot older than the floor, and not in the activity TARGETS reports.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn history_reads_stop_at_their_floor() {
+    use e6ircd::core::{HistoryFloor, HistoryQuery, SelectorBound};
+    let pool =
+        db::connect_and_migrate(&support::test_db("history_reads_stop_at_their_floor").await)
+            .await
+            .expect("connect");
+    for ts in [1000_i64, 2000, 3000, 4000, 5000] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, '#h', 'x!x@h', NULL, 'privmsg', $2,
+                     to_timestamp($3::double precision / 1000))",
+        )
+        .bind(format!("m{ts}"))
+        .bind(format!("b{ts}"))
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+    let millis = e6irc_proto::time::Millis::from_millis;
+    let floor = HistoryFloor::Since(millis(3000));
+    let read = |query: HistoryQuery| {
+        let pool = pool.clone();
+        async move {
+            db::query_history(&pool, "#h", floor, query)
+                .await
+                .expect("history")
+                .into_iter()
+                .map(|row| row.msgid)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        read(HistoryQuery::Latest { limit: 10 }).await,
+        ["m3000", "m4000", "m5000"]
+    );
+    assert_eq!(
+        read(HistoryQuery::Before {
+            before_ts: millis(5000),
+            limit: 10
+        })
+        .await,
+        ["m3000", "m4000"]
+    );
+    assert_eq!(
+        read(HistoryQuery::Around {
+            around_ts: millis(3000),
+            limit: 4
+        })
+        .await,
+        ["m3000", "m4000"]
+    );
+    assert_eq!(
+        read(HistoryQuery::BeforeMsgid {
+            msgid: "m4000".into(),
+            limit: 10
+        })
+        .await,
+        ["m3000"]
+    );
+    // A pivot from below the floor positions nothing.
+    for query in [
+        HistoryQuery::AfterMsgid {
+            msgid: "m1000".into(),
+            limit: 10,
+        },
+        HistoryQuery::BetweenSelectors {
+            first: SelectorBound::Msgid("m1000".into()),
+            second: SelectorBound::Timestamp(millis(9000)),
+            limit: 10,
+        },
+    ] {
+        assert!(read(query.clone()).await.is_empty(), "{query:?}");
+    }
+    assert_eq!(
+        read(HistoryQuery::BetweenSelectors {
+            first: SelectorBound::Timestamp(millis(0)),
+            second: SelectorBound::Timestamp(millis(9000)),
+            limit: 10,
+        })
+        .await,
+        ["m3000", "m4000", "m5000"]
+    );
+    // The whole record is still there for a reader who may see it.
+    assert_eq!(
+        db::query_history(
+            &pool,
+            "#h",
+            HistoryFloor::Whole,
+            HistoryQuery::Latest { limit: 10 }
+        )
+        .await
+        .expect("history")
+        .len(),
+        5
+    );
+    let targets = |floor: HistoryFloor| {
+        let pool = pool.clone();
+        async move {
+            db::query_targets(
+                &pool,
+                &[("#h".to_string(), floor)],
+                None,
+                millis(0),
+                millis(99_000),
+                10,
+            )
+            .await
+            .expect("targets")
+        }
+    };
+    assert_eq!(
+        targets(HistoryFloor::Since(millis(3000))).await,
+        [("#h".to_string(), millis(5000))]
+    );
+    assert!(
+        targets(HistoryFloor::Since(millis(6000))).await.is_empty(),
+        "a channel whose activity all predates the floor is not a buffer"
+    );
+}
+
+/// A configured administrator's name cannot be claimed by an invitation, even
+/// one issued before the name was configured; startup can name the configured
+/// administrators no account holds yet.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn configured_administrator_names_are_not_claimable_by_invitation() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("configured_administrator_names_are_not_claimable").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "pw", None)
+        .await
+        .expect("alice");
+    let token = db::issue_account_invitation(
+        &pool,
+        "Root",
+        None,
+        false,
+        e6ircd::identity::AccountInvitationLifetimeDays::new(1).expect("lifetime"),
+        "Alice",
+    )
+    .await
+    .expect("issued before the name was configured");
+    assert!(matches!(
+        db::accept_account_invitation(&pool, &token, "chosen password", &["root".to_string()])
+            .await,
+        Err(db::DbError::InvitationUnavailable)
+    ));
+    assert_eq!(
+        db::unclaimed_account_names(&pool, &["ALICE".to_string(), "Root".to_string()])
+            .await
+            .expect("unclaimed"),
+        ["Root"]
     );
 }

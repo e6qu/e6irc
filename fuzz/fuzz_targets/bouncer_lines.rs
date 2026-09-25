@@ -34,6 +34,8 @@ fuzz_target!(|data: &[u8]| {
         batch: false,
         chathistory: false,
         read_marker: false,
+        cap_notify: false,
+        cap_302: false,
     };
     let raw = String::from_utf8_lossy(data.get(1..).unwrap_or(&[])).into_owned();
 

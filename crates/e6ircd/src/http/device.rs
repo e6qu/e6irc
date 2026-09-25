@@ -304,7 +304,7 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
             user_code,
             verification_uri,
             interval: 5,
-            expires_in: 600,
+            expires_in: crate::db::DEVICE_GRANT_LIFETIME_SECONDS,
         }),
         Err(e) => {
             eprintln!("http: device start failed: {e}");
@@ -656,7 +656,7 @@ pub(super) enum AccountStateBody {
 pub(super) async fn admin_account_state(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(account_id): axum::extract::Path<i64>,
+    PathParams(account_id): PathParams<i64>,
     body: Result<axum::Json<AccountStateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = json_or_response!(body);
@@ -822,6 +822,13 @@ pub(super) async fn admin_create_account_invitation(
             Some("The account must be a valid IRC nickname of at most 64 bytes."),
         );
     }
+    if state.account_name_reserved(&body.account) {
+        return problem(
+            StatusCode::CONFLICT,
+            "Account name unavailable",
+            Some(super::RESERVED_ACCOUNT_NAME_DETAIL),
+        );
+    }
     let contact_email = match super::parse_optional_contact_email(body.contact_email.as_deref()) {
         Ok(ce) => ce,
         Err(msg) => return problem(StatusCode::BAD_REQUEST, "Invalid contact email", Some(&msg)),
@@ -873,7 +880,7 @@ pub(super) async fn admin_create_account_invitation(
 pub(super) async fn admin_revoke_account_invitation(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(invitation_id): axum::extract::Path<i64>,
+    PathParams(invitation_id): PathParams<i64>,
 ) -> Response {
     match crate::db::revoke_account_invitation(pool_of(&state), invitation_id, &actor).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -891,7 +898,7 @@ pub(super) struct AccountDeletionBody {
 pub(super) async fn admin_delete_account(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(account_id): axum::extract::Path<i64>,
+    PathParams(account_id): PathParams<i64>,
     body: Result<axum::Json<AccountDeletionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = json_or_response!(body);
@@ -1535,7 +1542,7 @@ pub(super) async fn admin_create_network(
 pub(super) async fn admin_delete_network(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    PathParams(name): PathParams<String>,
     body: Result<axum::Json<AdminNetworkDeleteBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = match parse_json(body) {
@@ -1649,7 +1656,7 @@ pub(super) async fn admin_create_oidc_provider(
 pub(super) async fn admin_delete_oidc_provider(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    PathParams(name): PathParams<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     delete_managed_configuration_item_api(
@@ -1697,7 +1704,7 @@ pub(super) async fn admin_create_oper(
 pub(super) async fn admin_delete_oper(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    PathParams(name): PathParams<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     delete_managed_configuration_item_api(state, actor, name, body, oper_configuration_item()).await
@@ -2030,7 +2037,7 @@ pub(super) async fn admin_create_server_ban(
 pub(super) async fn admin_delete_server_ban(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Path(id): axum::extract::Path<i64>,
+    PathParams(id): PathParams<i64>,
 ) -> Response {
     if id <= 0 {
         return problem(StatusCode::BAD_REQUEST, "Invalid server-ban id", None);

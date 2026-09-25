@@ -12,7 +12,14 @@ mod handler;
 mod state;
 mod timer;
 
-pub(crate) use handler::fit_trailing;
+pub(crate) use handler::{
+    HistoryFail, cap_reply_lines, cap_version_302, fit_trailing, invalid_utf8_fail,
+};
+
+/// How long an unregistered connection may hold its slot before the core
+/// closes it: the soonest a per-address connection slot is certain to free.
+pub(crate) const REGISTRATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(handler::REGISTRATION_TIMEOUT_MS);
 pub(crate) use timer::TimerWheel;
 
 pub use state::{
@@ -233,6 +240,27 @@ impl CoreIngress {
         self.broadcast(|| Input::Shutdown).await
     }
 
+    pub(crate) async fn broadcast_read_markers_expired(
+        &self,
+        markers: Arc<[ExpiredReadMarker]>,
+    ) -> Result<(), ()> {
+        self.broadcast(|| Input::ReadMarkersExpired {
+            markers: markers.clone(),
+        })
+        .await
+    }
+
+    /// Tell every shard that `account` was permanently deleted, so each drops
+    /// its read-marker mirror entries for it: the database rows cascaded away
+    /// with the account, and nothing would otherwise evict them before a
+    /// restart.
+    pub(crate) async fn broadcast_account_deleted(&self, account: &str) -> Result<(), ()> {
+        self.broadcast(|| Input::AccountDeleted {
+            account: account.to_owned(),
+        })
+        .await
+    }
+
     /// Offer every shard its copy. One closed shard does not excuse the rest:
     /// during shutdown the others still need theirs.
     async fn broadcast(&self, mut input: impl FnMut() -> Input) -> Result<(), ()> {
@@ -299,7 +327,10 @@ impl Input {
             Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
-            Input::Tick { .. } | Input::Shutdown => {
+            Input::Tick { .. }
+            | Input::Shutdown
+            | Input::ReadMarkersExpired { .. }
+            | Input::AccountDeleted { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
             }
             Input::ServerBanResult { requester, .. } => match requester {
@@ -494,6 +525,15 @@ impl std::fmt::Display for ConnectionIdExhausted {
 }
 
 impl std::error::Error for ConnectionIdExhausted {}
+
+/// One stored read marker that storage maintenance deleted: the account's
+/// display name as stored, the folded target, and the value deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredReadMarker {
+    pub account: String,
+    pub target: String,
+    pub marker_ms: e6irc_proto::time::Millis,
+}
 
 /// Events into the core worker.
 #[derive(Debug)]
@@ -703,6 +743,20 @@ pub enum Input {
     /// mass-close live connections or freeze.
     Tick {
         now: e6irc_proto::time::MonoMillis,
+    },
+    /// Read markers storage maintenance deleted as past the history
+    /// retention, broadcast to every shard so its mirror drops them too. The
+    /// mirror counts toward the per-account marker cap: a marker the database
+    /// no longer holds, still counted here, would refuse a new target the
+    /// database would admit.
+    ReadMarkersExpired {
+        markers: Arc<[ExpiredReadMarker]>,
+    },
+    /// An account was permanently deleted, broadcast to every shard so its
+    /// read-marker mirror drops the account's entries (their rows cascaded
+    /// away with the account row).
+    AccountDeleted {
+        account: String,
     },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply {
@@ -1223,6 +1277,7 @@ pub enum ChannelTopicPersistence {
         channel: String,
         display: String,
         prefix: String,
+        origin: state::Originator,
         topic: Option<(String, String, u64)>,
         revision: u64,
         retained: bool,
@@ -1388,6 +1443,8 @@ pub enum DbRequest {
         /// of two *accounts*. Never a conversation with an unauthenticated
         /// (`~nick`) party — those are not stored (see `record_history`).
         target: String,
+        /// The oldest history this reader may see.
+        floor: HistoryFloor,
         display: String,
         batch_ref: String,
         /// Request-time capabilities that affect history rendering.
@@ -1402,8 +1459,10 @@ pub enum DbRequest {
     /// [`Input::TargetsPage`].
     QueryTargets {
         conn: ConnId,
-        /// Casefolded channel targets the requester may see.
-        channels: Vec<String>,
+        /// Casefolded channel targets the requester may see, each with the
+        /// oldest history the requester may see of it: a channel whose only
+        /// activity is older is not the requester's buffer.
+        channels: Vec<(String, HistoryFloor)>,
         /// The requester's account identity, used to find the stored
         /// direct-message conversations they take part in. Their correspondents
         /// are buffers too, and a bouncer reconnecting needs them alongside
@@ -1451,6 +1510,8 @@ pub enum DbRequest {
         display: String,
         /// Prefix captured when the command was authorized.
         prefix: String,
+        /// The setter's originator tags, for the TOPIC line's tags.
+        origin: state::Originator,
         topic: Option<(String, String, u64)>,
         revision: u64,
         label: Option<String>,
@@ -1581,11 +1642,48 @@ pub enum CredentialOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryFault {
     /// The store failed; the window may well exist.
-    Unavailable,
+    Unavailable { subcommand: &'static str },
     /// The store answered, and holds no message with this id in the requested
     /// buffer. Not an empty page: a client resuming from a msgid that is gone
     /// would read "nothing newer" as "up to date".
     UnknownMsgid { subcommand: &'static str },
+}
+
+/// The oldest history a read may return, decided by who is reading. A
+/// channel's name outlives its occupants: once the last member leaves it is
+/// gone, and whoever joins the name next creates a new incarnation. The stored
+/// record of the old one is not theirs to read — only the founder and the
+/// access list of a registered channel keep the whole record, as over REST.
+/// Every history read takes one of these, so none can forget the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFloor {
+    /// The whole stored record: a conversation (its key is derived from the
+    /// reader), or a registered channel read by its founder or an access-list
+    /// member.
+    Whole,
+    /// Only messages stamped at or after this time: the current incarnation
+    /// of a channel, for everyone else.
+    Since(e6irc_proto::time::Millis),
+}
+
+impl HistoryFloor {
+    /// Whether a message stamped `ts` is readable under this floor.
+    pub fn admits(self, ts: e6irc_proto::time::Millis) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Since(since) => ts >= since,
+        }
+    }
+
+    /// The bound as the millisecond value the history queries compare `ts`
+    /// against (`ts >= to_timestamp(bound / 1000)`): the epoch for the whole
+    /// record, before which no message can be stamped.
+    pub fn millis(self) -> e6irc_proto::time::Millis {
+        match self {
+            Self::Whole => e6irc_proto::time::Millis::from_millis(0),
+            Self::Since(since) => since,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,6 +1901,12 @@ pub enum DbReply {
     },
     PasswordRejected {
         origin: CredentialOrigin,
+    },
+    /// The account name has spent its password attempts for the current
+    /// window; nothing was verified.
+    PasswordThrottled {
+        origin: CredentialOrigin,
+        retry_after: crate::db::LoginRetryAfter,
     },
     AccountCreated {
         account: String,
@@ -2648,6 +2752,8 @@ impl Core {
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
+            Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
+            Input::AccountDeleted { account } => self.state.forget_account_read_markers(&account),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,
@@ -2999,6 +3105,7 @@ mod ingress_tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }
 
@@ -3588,7 +3695,8 @@ mod ingress_tests {
             session: SessionOwner::new(ConnId(2), CoreShardId(0)),
             event: crate::core::state::ChannelSessionEvent::Invitation {
                 inviter_prefix: "alice!alice@host.test".into(),
-                inviter_account: None,
+                inviter: Default::default(),
+                ts: e6irc_proto::time::Millis::from_millis(0),
                 channel: "#chat".into(),
             },
         });
@@ -4271,6 +4379,34 @@ mod ingress_tests {
         assert_eq!(lines_with(&shards.drain(1), " NICK alicia").len(), 1);
         shards.line(2, "QUIT :bye");
         assert_eq!(lines_with(&shards.drain(1), " QUIT :").len(), 1);
+    }
+
+    /// A peer without `chghost` sharing channels owned by both shards is told
+    /// of a host change by one QUIT, then one rejoin per shared channel — the
+    /// QUIT first, whichever shard's report arrives first.
+    #[test]
+    fn a_host_change_rejoins_every_shared_channel_after_one_quit() {
+        let mut shards = alice_and_bob("");
+        let [here, there] = shards.owned;
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {here},{there}"));
+        }
+        shards.drain(1);
+        shards.line(1, "OPER root secret");
+        shards.drain(1);
+        shards.line(1, "SETHOST alice cloak.test");
+        let out = shards.drain(1);
+        let quits = lines_with(&out, " QUIT :Changing host");
+        assert_eq!(quits.len(), 1, "{out:#?}");
+        let quit_at = out
+            .iter()
+            .position(|line| line.contains(" QUIT :Changing host"));
+        for channel in [here, there] {
+            let join = format!("@cloak.test JOIN {channel}");
+            assert_eq!(lines_with(&out, &join).len(), 1, "{out:#?}");
+            let join_at = out.iter().position(|line| line.contains(&join));
+            assert!(quit_at < join_at, "the QUIT must come first: {out:#?}");
+        }
     }
 
     #[test]
@@ -5036,7 +5172,7 @@ mod ingress_tests {
             invite_only: true,
             ..ChanModes::default()
         };
-        let mut channel = Channel::new("#chat".into(), None, modes, 0);
+        let mut channel = Channel::for_test("#chat", modes);
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(0)),
@@ -5059,7 +5195,7 @@ mod ingress_tests {
             .state
             .channels
             .entry(other_key)
-            .or_insert(Channel::new(other.into(), None, ChanModes::default(), 0));
+            .or_insert(Channel::for_test(other, ChanModes::default()));
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
         let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
         second_tx
@@ -5389,7 +5525,7 @@ mod ingress_tests {
             line: b"USER sender 0 * :Sender".to_vec(),
         });
         let key = first.state.chan_key("#chat");
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(1), CoreShardId(1)),
@@ -5454,7 +5590,7 @@ mod ingress_tests {
             ConnectionTransport::Tcp,
         );
         let key = first.state.chan_key("#chat");
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(0)),

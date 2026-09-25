@@ -124,103 +124,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
   }
 
-  for (const button of document.querySelectorAll("[data-copy-target]")) {
-    button.addEventListener("click", async () => {
-      const target = document.getElementById(button.dataset.copyTarget);
-      if (!target) {
-        button.textContent = "Copy unavailable";
-        return;
-      }
-      try {
-        await navigator.clipboard.writeText(target.textContent);
-        button.textContent = "Copied";
-      } catch (_) {
-        button.textContent = "Select and copy manually";
-      }
-    });
-  }
-
   // A browser cannot focus an invalid field inside closed details, so it would
   // refuse the submission with nothing shown. `invalid` does not bubble.
   for (const details of document.querySelectorAll("form details")) {
     details.closest("form").addEventListener("invalid", (event) => {
       if (event.target instanceof Node && details.contains(event.target)) details.open = true;
     }, true);
-  }
-
-  for (const form of document.querySelectorAll("[data-network-form]")) {
-    const preset = form.querySelector("[data-network-preset]");
-    const name = form.querySelector("[data-network-name]");
-    const addr = form.querySelector("[data-network-addr]");
-    const tls = form.querySelector("[data-network-tls]");
-    if (
-      !(preset instanceof HTMLSelectElement) ||
-      !(name instanceof HTMLInputElement) ||
-      !(addr instanceof HTMLInputElement) ||
-      !(tls instanceof HTMLInputElement)
-    ) {
-      continue;
-    }
-
-    const advanced = form.querySelector("[data-network-advanced]");
-
-    preset.addEventListener("change", () => {
-      const option = preset.selectedOptions[0];
-      if (!option) return;
-      if (option.value === "custom") {
-        if (advanced instanceof HTMLDetailsElement) advanced.open = true;
-        return;
-      }
-      name.value = option.dataset.name || "";
-      addr.value = option.dataset.addr || "";
-      tls.checked = option.dataset.tls === "true";
-    });
-
-    const markCustom = () => {
-      if (preset.value !== "custom") preset.value = "custom";
-    };
-    name.addEventListener("input", markCustom);
-    addr.addEventListener("input", markCustom);
-    tls.addEventListener("change", markCustom);
-  }
-
-  // The server password's Remove, likewise: ticked, its box is cleared and
-  // disabled, since a value typed there would not be saved.
-  for (const clear of document.querySelectorAll("[data-server-password-clear]")) {
-    const password = clear.closest("form")?.querySelector("[data-server-password]");
-    if (!(clear instanceof HTMLInputElement) || !(password instanceof HTMLInputElement)) continue;
-    clear.addEventListener("change", () => {
-      if (clear.checked) password.value = "";
-      password.disabled = clear.checked;
-    });
-  }
-
-  for (const clear of document.querySelectorAll("[data-sasl-clear]")) {
-    const form = clear.closest("form");
-    const account = form?.querySelector("[data-sasl-account]");
-    const password = form?.querySelector("[data-sasl-password]");
-    if (
-      !(clear instanceof HTMLInputElement) ||
-      !(account instanceof HTMLInputElement) ||
-      !(password instanceof HTMLInputElement)
-    ) {
-      continue;
-    }
-    const accountUnavailable = account.disabled;
-    const passwordUnavailable = password.disabled;
-    clear.addEventListener("change", () => {
-      if (clear.checked) {
-        account.dataset.previousValue = account.value;
-        account.value = "";
-        password.value = "";
-        account.disabled = true;
-        password.disabled = true;
-      } else {
-        account.disabled = accountUnavailable;
-        account.value = account.dataset.previousValue || "";
-        password.disabled = passwordUnavailable;
-      }
-    });
   }
 
   for (const button of document.querySelectorAll("[data-refresh-target]")) {
@@ -280,7 +189,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (trigger instanceof HTMLButtonElement) {
       const label = trigger.getAttribute("aria-label") || trigger.textContent?.trim() || "Action";
       trigger.dataset.submitting = "true";
-      trigger.setAttribute("aria-label", `${label} — in progress`);
+      ariaName(trigger, `${label} — in progress`);
     }
 
     try {
@@ -293,10 +202,24 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (trigger instanceof HTMLButtonElement) {
         delete trigger.dataset.submitting;
         if (previousTriggerLabel === null) trigger.removeAttribute("aria-label");
-        else trigger.setAttribute("aria-label", previousTriggerLabel);
+        else ariaName(trigger, previousTriggerLabel);
       }
     }
   };
+
+  // A form's API mutation. It resolves to `{ value }` on success -- `value` is
+  // undefined for a 204, which is success too -- and to null when the request
+  // failed (reported through `report`) or the form was already submitting. A
+  // helper that returned the body made "no content" read as "failed", and a
+  // revoked invitation was reported as nothing at all.
+  const submitMutation = (form, method, url, body, report, trigger) => runFormSubmission(form, async () => {
+    try {
+      return { value: await apiRequest(form, apiMutation(method, url), body) };
+    } catch (error) {
+      report(error);
+      return null;
+    }
+  }, trigger);
 
   const apiRead = async (url) => {
     const operation = apiOperation("GET", url);
@@ -350,16 +273,20 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   // selection, and detaches the form a pending confirmation refers to -- after
   // which confirming submitted nothing, silently. So a tick is skipped while
   // the page is hidden, a confirmation is open, or the region is in use.
+  const backgroundRefreshTimers = [];
+  const stopBackgroundRefreshes = () => {
+    for (const timer of backgroundRefreshTimers.splice(0)) window.clearInterval(timer);
+  };
   const scheduleBackgroundRefresh = (region, refresh, seconds) => {
     if (!Number.isFinite(seconds) || seconds < 5) return;
-    window.setInterval(() => {
+    backgroundRefreshTimers.push(window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
       if (confirmationDialog instanceof HTMLDialogElement && confirmationDialog.open) return;
       if (region.contains(document.activeElement)) return;
       const selection = document.getSelection();
       if (selection && !selection.isCollapsed && region.contains(selection.anchorNode)) return;
       void refresh();
-    }, seconds * 1000);
+    }, seconds * 1000));
   };
 
   // A log is a sliding window of the newest lines. Updating it in place --
@@ -405,11 +332,62 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     for (const child of children) parent.append(child);
     return parent;
   };
+
+  // The generated markup's accessibility contract lives in these builders:
+  // tools/check-template-accessibility.py refuses a form control, a table or
+  // an aria-label created anywhere else in this file, so a control without a
+  // name or a table without a caption cannot be added by accident.
+  //
+  // A div or span has no role to carry a name, so naming one without giving
+  // it a role is refused rather than published as a name nothing reads.
+  const ariaName = (node, label) => {
+    if ((node instanceof HTMLDivElement || node instanceof HTMLSpanElement) && !node.hasAttribute("role")) {
+      throw new Error(`A ${node.localName} was named without a role.`);
+    }
+    node.setAttribute("aria-label", label);
+    return node;
+  };
+  const hiddenInput = (name, value) => {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = String(value ?? "");
+    return input;
+  };
+  // A visible control whose place in a row is its only visible label.
+  const namedControl = (tag, name, label) => {
+    const control = document.createElement(tag);
+    control.name = name;
+    return ariaName(control, label);
+  };
+  // A visible control inside the label that names it: the caption first, or,
+  // for a checkbox, after the box.
+  // The control is named by its caption alone (aria-labelledby), so whatever
+  // else later joins the label -- a Show/Hide button, a hint -- never becomes
+  // part of its accessible name.
+  let captionSequence = 0;
+  const labelledControl = (tag, name, text, className = "field") => {
+    const control = document.createElement(tag);
+    control.name = name;
+    if (tag === "input" && className === "check") control.type = "checkbox";
+    const caption = element("span", "", text);
+    caption.id = `control-caption-${++captionSequence}`;
+    control.setAttribute("aria-labelledby", caption.id);
+    const label = element("label", className);
+    if (className === "check") label.append(control, caption);
+    else label.append(caption, control);
+    return { label, control };
+  };
+  const captionedTable = (caption) => {
+    const table = document.createElement("table");
+    table.append(element("caption", "sr-only", caption));
+    return table;
+  };
   const scrollRegion = (label, child) => {
     const region = element("div", "scroll");
     region.tabIndex = 0;
     region.setAttribute("role", "region");
-    region.setAttribute("aria-label", label);
+    ariaName(region, label);
     region.append(child);
     return region;
   };
@@ -417,8 +395,63 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const region = element("div", "backlog");
     region.tabIndex = 0;
     region.setAttribute("role", "log");
-    region.setAttribute("aria-label", label);
+    ariaName(region, label);
     return region;
+  };
+  // Every password field gets a reveal control -- the server-rendered ones at
+  // startup, a generated one where it is built -- so a field added later is
+  // covered without anyone remembering to.
+  //
+  // A credential typed into this console is frequently pasted -- an upstream
+  // NickServ password, a bridge token -- and a masked field gives no way to
+  // check it before submitting. The failure that follows is a rejected
+  // authentication that reads as "wrong credentials" rather than "you typed it
+  // wrong", which is a long way to travel for a transposed character.
+  //
+  // This only ever reveals what is in the field right now. No stored secret is
+  // fetched: the API does not return one, and nothing here asks it to.
+  const addRevealControl = (field) => {
+    if (field.dataset.noReveal !== undefined || field.parentElement?.classList.contains("secret-input")) return;
+    if (!field.parentNode) throw new Error(`Password field ${field.name} has no place for its reveal control.`);
+    // The button joins the field's label; pin the field's name to the label's
+    // text first, or "Show password" would become part of it.
+    const owner = field.closest("label");
+    if (owner && !field.hasAttribute("aria-labelledby") && !field.hasAttribute("aria-label")) {
+      ariaName(field, owner.textContent.replace(/\s+/g, " ").trim());
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "reveal";
+    button.textContent = "Show";
+    button.setAttribute("aria-pressed", "false");
+    ariaName(button, "Show password");
+    button.addEventListener("click", () => {
+      const shown = field.type === "text";
+      field.type = shown ? "password" : "text";
+      button.textContent = shown ? "Show" : "Hide";
+      button.setAttribute("aria-pressed", String(!shown));
+      ariaName(button, shown ? "Show password" : "Hide password");
+      field.focus();
+    });
+    // Wrapped so the control sits with the input rather than after the label's
+    // hint text, which would put it in a different place on every form.
+    const wrap = document.createElement("span");
+    wrap.className = "secret-input";
+    field.parentNode.insertBefore(wrap, field);
+    wrap.append(field, button);
+  };
+  const copyButton = (value) => {
+    const copy = element("button", "", "Copy");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(value);
+        copy.textContent = "Copied";
+      } catch (_) {
+        copy.textContent = "Select and copy manually";
+      }
+    });
+    return copy;
   };
 
   const retryButton = (retry) => {
@@ -456,7 +489,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   const monitoringHealth = (view) => {
     const health = element("div", "health-strip");
-    health.setAttribute("aria-label", "Component health");
+    health.setAttribute("role", "group");
+    ariaName(health, "Component health");
     const states = [
       [view.core_ready ? "on" : "off", "IRC core", view.core_ready ? "Healthy" : "Stale"],
       [view.database_ready ? "on" : "off", "PostgreSQL", view.database_ready ? "Healthy" : "Unavailable"],
@@ -497,8 +531,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       section.append(monitoringEmpty("Waiting for the first historical sample."));
       return section;
     }
+    // An image of the series: its bars carry their values only as tooltips,
+    // so the chart is one named picture rather than a group of unnamed bars.
     const chart = element("div", "bar-chart");
-    chart.setAttribute("aria-label", ariaLabel);
+    chart.setAttribute("role", "img");
+    ariaName(chart, ariaLabel);
     for (const bar of bars) {
       const wrapper = element("div", kind === "single" ? "bar-single" : kind === "triplet" ? "bar-triplet" : "bar-pair");
       wrapper.title = bar.title;
@@ -695,7 +732,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   const networkOperationsHealth = (view) => {
     const health = element("div", "health-strip");
-    health.setAttribute("aria-label", "Network health");
+    health.setAttribute("role", "group");
+    ariaName(health, "Network health");
     const runtime = view.runtime;
     const state = !view.enabled ? "disabled" : runtime === null ? "not running" : runtime.state.replaceAll("_", " ");
     const states = [
@@ -728,7 +766,18 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return grid;
   };
 
-  const renderNetworkOperations = (panel, view) => {
+  // The whole stored log, as the "Load the full log" button reads it.
+  const readFullNetworkLog = async (name) => {
+    const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/buffer?limit=1000`);
+    const stored = apiCollection(result, "lines");
+    if (!Array.isArray(stored)) throw new Error("the stored log response carried no lines");
+    return stored;
+  };
+
+  // `fullLog` is the whole stored log once a person has asked for it, and null
+  // before: the live refresh then keeps showing all of it, where it used to put
+  // the newest hundred lines back ten seconds after the click.
+  const renderNetworkOperations = (panel, view, fullLog) => {
     const fragment = document.createDocumentFragment();
     const runtime = view.runtime;
     fragment.append(networkOperationsHealth(view), networkOperationsMetrics(runtime));
@@ -761,7 +810,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "IRC transcript"), element("p", "", "The newest stored IRC lines, oldest first, including NickServ replies and connection errors.")), element("span", "count", `${view.storage.lines} stored`)));
     // The live panel carries the newest hundred; the whole stored log is one
     // click away, in the same node, so there is no second page for it.
-    if (view.storage.lines > 0) {
+    if (fullLog === null && view.storage.lines > 0) {
       const whole = element("button", "", `Load the full log (${view.storage.lines} lines)`);
       whole.type = "button";
       whole.addEventListener("click", () => {
@@ -769,10 +818,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         whole.textContent = "Loading…";
         void (async () => {
           try {
-            const stored_name = panel.dataset.networkName || "";
-            const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(stored_name)}/buffer?limit=1000`);
-            const stored = apiCollection(result, "lines");
-            if (!Array.isArray(stored)) throw new Error("the stored log response carried no lines");
+            const stored = await readFullNetworkLog(panel.dataset.networkName || "");
+            panel.dataset.fullLog = "true";
             const lines = panel.querySelector('.backlog[aria-label="Recent raw IRC backlog"]');
             if (lines) {
               fillLog(lines, stored, "");
@@ -787,7 +834,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       });
       backlog.querySelector(".panel-head")?.append(whole);
     }
-    if (view.recent_lines.length === 0) {
+    const shownLines = fullLog ?? view.recent_lines;
+    if (shownLines.length === 0) {
       backlog.append(element("p", "empty", "No IRC output has been stored for this network."));
     } else {
       // Reuse the transcript's own node so a refresh does not throw the reader
@@ -799,7 +847,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       fragment.append(backlog);
       panel.replaceChildren(fragment);
       if (place !== null) lines.scrollTop = place;
-      fillLog(lines, view.recent_lines, "");
+      fillLog(lines, shownLines, "");
       if (place === null) lines.scrollTop = lines.scrollHeight;
       return;
     }
@@ -818,8 +866,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     try {
       const name = panel.dataset.networkName;
       if (!name) throw new Error("The network name is missing. Reload and try again.");
-      const view = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/operations`);
-      renderNetworkOperations(panel, view);
+      const [view, fullLog] = await Promise.all([
+        apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/operations`),
+        panel.dataset.fullLog === "true" ? readFullNetworkLog(name) : null,
+      ]);
+      renderNetworkOperations(panel, view, fullLog);
       if (status) status.textContent = "Live data refreshed.";
     } catch (error) {
       panel.replaceChildren(monitoringEmpty(`Live network operations failed (${error.message}). Use Refresh to retry.`));
@@ -900,7 +951,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     head.append(element("h2", "", `${title} `), Object.assign(element("a", "secondary-link", `Explore ${title.toLowerCase()}`), { href }));
     target.append(head);
     if (!rows.length) { target.append(element("p", "empty", `No ${title.toLowerCase()}.`)); return; }
-    const table = element("table");
+    const table = captionedTable(title);
     const thead = document.createElement("thead"); const header = document.createElement("tr");
     for (const label of headings) header.append(element("th", "", label));
     thead.append(header); table.append(thead);
@@ -958,6 +1009,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   };
 
   const fieldValue = (fields, name) => String(fields.get(name) || "").trim();
+  // A password or token exactly as typed. The server never trims one, so a
+  // trimmed value would set -- or check -- a different secret.
+  const secretValue = (fields, name) => String(fields.get(name) || "");
 
   const positiveInteger = (fields, name, label) => {
     const value = Number(fields.get(name));
@@ -1088,6 +1142,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const secret = name !== "sasl_account" || (requirements.secret ?? []).includes(name);
       input.type = secret ? "password" : "text";
       input.autocomplete = secret ? "new-password" : "off";
+      // A box masked only now (a Slack bot token) gets the reveal control the
+      // startup pass could not give it; one unmasked again has none to show.
+      if (secret) addRevealControl(input);
+      const reveal = input.parentElement?.classList.contains("secret-input") ? input.parentElement.querySelector(".reveal") : null;
+      if (reveal) reveal.hidden = !secret;
     }
     for (const name of ["addr", "nick", "username", "realname", "sasl_account", "sasl_password", "server_password"]) {
       const input = form.elements.namedItem(name);
@@ -1299,20 +1358,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return `${listener.addr} | ${listener.websocket ? "websocket" : "plain"}`;
   }).join("\n");
 
-  const configurationHidden = (name, value) => {
-    const input = document.createElement("input");
-    input.type = "hidden";
-    input.name = name;
-    input.value = String(value ?? "");
-    return input;
-  };
-
   const configurationDeleteForm = (kind, name, revision, csrf, owner) => {
     const form = document.createElement("form");
     form.method = "post";
     form.dataset.apiConfigurationDelete = kind;
-    form.append(configurationHidden("csrf", csrf), configurationHidden("revision", revision), configurationHidden("name", name));
-    if (owner !== undefined) form.append(configurationHidden("owner", owner));
+    form.append(hiddenInput("csrf", csrf), hiddenInput("revision", revision), hiddenInput("name", name));
+    if (owner !== undefined) form.append(hiddenInput("owner", owner));
     // Removing an identity provider locks out everyone who signs in through
     // it; an operator or a shared network is no smaller. Every other
     // destructive control on the console asks first -- so do these.
@@ -1341,24 +1392,24 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     target.append(list);
   };
 
-  const bindConfigurationDeletes = () => {
-    for (const form of document.querySelectorAll("[data-api-configuration-delete]")) {
-      form.addEventListener("submit", (event) => {
-        event.preventDefault();
-        const fields = new FormData(form);
-        const revision = Number(fields.get("revision"));
-        const name = String(fields.get("name") || "").trim();
-        if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
-          setConfigurationResult("The configuration revision or item name is missing. Reload and try again.", false);
-          return;
-        }
-        const kind = form.dataset.apiConfigurationDelete;
-        const route = kind === "network" ? "networks" : kind === "oper" ? "opers" : "oidc-providers";
-        const body = kind === "network" ? { revision, owner: optionalValue(String(fields.get("owner") || "")) } : { revision };
-        void mutateConfiguration(form, `/api/v1/admin/configuration/${route}/${encodeURIComponent(name)}`, "DELETE", body, `removed ${kind === "oidc" ? "OpenID Connect provider" : kind === "oper" ? "IRC operator" : "server network"} ${name}`);
-      });
+  // The configuration lists are rebuilt on every read, so their remove forms
+  // are delegated rather than bound to whichever rows existed at the time.
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-configuration-delete]")) return;
+    event.preventDefault();
+    const fields = new FormData(form);
+    const revision = Number(fields.get("revision"));
+    const name = String(fields.get("name") || "").trim();
+    if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
+      setConfigurationResult("The configuration revision or item name is missing. Reload and try again.", false);
+      return;
     }
-  };
+    const kind = form.dataset.apiConfigurationDelete;
+    const route = kind === "network" ? "networks" : kind === "oper" ? "opers" : "oidc-providers";
+    const body = kind === "network" ? { revision, owner: optionalValue(String(fields.get("owner") || "")) } : { revision };
+    void mutateConfiguration(form, `/api/v1/admin/configuration/${route}/${encodeURIComponent(name)}`, "DELETE", body, `removed ${kind === "oidc" ? "OpenID Connect provider" : kind === "oper" ? "IRC operator" : "server network"} ${name}`);
+  });
 
   const renderConfiguration = (root, view) => {
     const settings = view.settings;
@@ -1438,7 +1489,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     renderConfigurationList(providerTarget, providers, "No identity providers configured.");
     const providerWarning = configurationCredentialWarning(settings, "Credentials still come from bootstrap configuration. Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.");
     if (providerWarning) providerTarget.prepend(providerWarning);
-    bindConfigurationDeletes();
   };
 
   const configurationRoot = document.querySelector("[data-api-configuration-read]");
@@ -1504,14 +1554,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           form.action = `/api/v1/admin/bans/${ban.id}`;
           form.dataset.apiBanDelete = "";
           form.dataset.confirm = `Remove ${ban.kind} ${ban.mask}?`;
-          const csrf = document.createElement("input");
-          csrf.type = "hidden";
-          csrf.name = "csrf";
-          csrf.value = adminBanRows.dataset.csrf || "";
-          const id = document.createElement("input");
-          id.type = "hidden";
-          id.name = "id";
-          id.value = String(ban.id);
+          const csrf = hiddenInput("csrf", adminBanRows.dataset.csrf || "");
+          const id = hiddenInput("id", ban.id);
           const button = document.createElement("button");
           button.type = "submit";
           button.className = "danger";
@@ -1604,13 +1648,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const pagePath = own ? "/console/my-sessions" : "/console/sessions";
     const apiPath = own ? "/api/v1/me/connections" : "/api/v1/admin/connections";
 
-    const csrfInput = () => {
-      const input = document.createElement("input");
-      input.type = "hidden";
-      input.name = "csrf";
-      input.value = csrf || "";
-      return input;
-    };
+    const csrfInput = () => hiddenInput("csrf", csrf || "");
     const formButton = (label, className) => {
       const button = element("button", className, label);
       button.type = "submit";
@@ -1689,7 +1727,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         expires.dateTime = row.expires_at || "";
         body.append(append(element("tr"), element("td", "session-agent", row.user_agent || "Unknown browser"), element("td", "", sessionMethod(row)), element("td", "", created), element("td", "", expires), action));
       }
-      const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "Browser"), element("th", "", "Sign-in method"), element("th", "", "Created"), element("th", "", "Expires"), element("th", "", "Actions"))), body);
+      const table = append(captionedTable("Browser sessions"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "Browser"), element("th", "", "Sign-in method"), element("th", "", "Created"), element("th", "", "Expires"), element("th", "", "Actions"))), body);
       browserSessions.append(scrollRegion("Browser sessions", table));
     };
     const renderConnections = (data, query) => {
@@ -1714,11 +1752,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           const disconnect = document.createElement("form");
           disconnect.className = "cell-form";
           disconnect.dataset.confirm = `Disconnect connection ${row.id} (${row.nick})?`;
-          const reason = document.createElement("input");
-          reason.name = "reason";
+          const reason = namedControl("input", "reason", `Disconnect reason for connection ${row.id} (${row.nick})`);
           reason.maxLength = 300;
           reason.placeholder = "reason";
-          reason.setAttribute("aria-label", `Disconnect reason for connection ${row.id} (${row.nick})`);
           disconnect.append(csrfInput(), reason, formButton("Disconnect", "danger"));
           disconnect.addEventListener("submit", (event) => {
             event.preventDefault();
@@ -1728,7 +1764,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           });
           body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
         }
-        const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Connection type"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
+        const table = append(captionedTable(own ? "Your live IRC connections" : "Live IRC connections"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Connection type"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
         connections.append(scrollRegion("Live connections", table));
       }
       const pager = element("div", "pager");
@@ -1776,20 +1812,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     accountSecret.replaceChildren();
     const section = document.createElement("section");
     section.className = "secret-reveal";
-    const copy = document.createElement("button");
+    const copy = copyButton(value);
     const code = document.createElement("code");
     code.id = "issued-secret";
     code.textContent = value;
-    copy.type = "button";
-    copy.textContent = "Copy";
-    copy.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(value);
-        copy.textContent = "Copied";
-      } catch (_) {
-        copy.textContent = "Select and copy manually";
-      }
-    });
     const heading = document.createElement("h2");
     heading.textContent = kind;
     const valueBox = document.createElement("div");
@@ -1799,15 +1825,13 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     accountSecret.append(section);
   };
 
-  const mutateAccount = (form, method, body, failure) => runFormSubmission(form, async () => {
-    try {
-      const result = await apiRequest(form, apiMutation(method, form.action), body);
-      return result === undefined ? true : result;
-    } catch (error) {
-      setAccountResult(error instanceof Error ? error.message : failure, false);
-      return undefined;
-    }
-  });
+  const mutateAccount = (form, method, body, failure) => submitMutation(
+    form,
+    method,
+    form.action,
+    body,
+    (error) => setAccountResult(error instanceof Error ? error.message : failure, false),
+  );
 
   let refreshAccountAccess;
   let refreshContactEmail;
@@ -1821,19 +1845,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const identityList = accountRoot.querySelector("[data-api-account-identity-list]");
     const linkProviders = accountRoot.querySelector("[data-api-account-link-providers]");
     const csrf = accountRoot.dataset.csrf || "";
-    const bindDelete = (form) => form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
-        .then(async (result) => {
-          if (result === undefined) return;
-          try {
-            await refreshAfterMutation(refreshAccountAccess);
-            setAccountResult("Updated.", true);
-          } catch (error) {
-            setAccountResult(error instanceof Error ? error.message : "Account data failed to load.", false);
-          }
-        });
-    });
     const renderPassword = (hasLocalPassword) => {
       if (!(passwordPanel instanceof HTMLElement)) return;
       const title = hasLocalPassword ? "Primary password" : "Add a local password";
@@ -1844,13 +1855,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       form.method = "post";
       form.action = "/api/v1/me/password";
       form.dataset.apiAccountPassword = "";
-      const token = element("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf;
-      form.append(token);
+      form.append(hiddenInput("csrf", csrf));
       const passwordField = (label, name, autocomplete) => {
-        const field = element("label", "field");
-        const input = element("input");
-        input.type = "password"; input.name = name; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
-        append(field, element("span", "", label), input);
+        const { label: field, control: input } = labelledControl("input", name, label);
+        input.type = "password"; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
+        addRevealControl(input);
         return field;
       };
       if (hasLocalPassword) form.append(passwordField("Current password", "current_password", "current-password"));
@@ -1862,9 +1871,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         const fields = new FormData(form);
-        const current = fieldValue(fields, "current_password");
-        const next = fieldValue(fields, "new_password");
-        if (next !== fieldValue(fields, "confirm_password")) {
+        // Verbatim, like every secret: the server does not trim a password,
+        // so trimming here would set or check a different one.
+        const current = secretValue(fields, "current_password");
+        const next = secretValue(fields, "new_password");
+        if (next !== secretValue(fields, "confirm_password")) {
           setAccountResult("The new password and confirmation do not match.", false);
           return;
         }
@@ -1872,7 +1883,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (current) body.current_password = current;
         void mutateAccount(form, "PUT", body, "Password update failed.")
           .then((result) => {
-            if (result === undefined) return;
+            if (!result) return;
             setAccountResult(`${current ? "Local password changed." : "Local password added."} Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.`, true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
               const credentials = apiCollection(updated, "credentials", "credential directory");
@@ -1900,9 +1911,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const actions = element("td");
         if (credential.kind === "app_password") {
           const form = element("form", "cell-form"); form.method = "post"; form.action = `/api/v1/me/credentials/${encodeURIComponent(credential.id)}`; form.dataset.confirm = "Revoke this app password?";
-          const token = element("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf;
+          form.dataset.apiAccountAccessDelete = "";
           const button = element("button", "danger", "Revoke"); button.type = "submit";
-          form.append(token, button); bindDelete(form); actions.append(form);
+          form.append(hiddenInput("csrf", csrf), button); actions.append(form);
         } else actions.append(element("span", "meta", "Primary"));
         row.append(actions); credentialRows.append(row);
       }
@@ -1934,9 +1945,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         card.append(copy);
         if (identities.length > 1 || hasLocalPassword) {
           const form = element("form"); form.method = "post"; form.action = `/api/v1/me/identities/${encodeURIComponent(identity.id)}`; form.dataset.confirm = "Unlink this identity and revoke its browser sessions?";
-          const token = element("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf;
+          form.dataset.apiAccountAccessDelete = "";
           const button = element("button", "danger", "Unlink"); button.type = "submit";
-          form.append(token, button); bindDelete(form); card.append(form);
+          form.append(hiddenInput("csrf", csrf), button); card.append(form);
         } else card.append(element("span", "tag", "Last login method"));
         identityList.append(card);
       }
@@ -1969,7 +1980,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const email = fieldValue(new FormData(form), "contact_email");
       void mutateAccount(form, "PATCH", { contact_email: email || null }, "Profile update failed.")
         .then(async (result) => {
-          if (result === undefined) return;
+          if (!result) return;
           try {
             await refreshAfterMutation(refreshContactEmail);
             setAccountResult("Profile updated.", true);
@@ -2012,8 +2023,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       void mutateAccount(form, "POST", { label }, "App-password creation failed.")
         .then((result) => {
-          if (result === undefined) return;
-          showAccountSecret("App password", result.app_password);
+          if (!result) return;
+          showAccountSecret("App password", result.value.app_password);
           setAccountResult("App password created. Copy it now; it cannot be shown again.", true);
           void refreshAccountAccess?.();
         });
@@ -2035,8 +2046,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         scopes,
         expires_in_days: Number(fields.get("expires_in_days")),
       }, "Token creation failed.").then((result) => {
-        if (result === undefined) return;
-        showAccountSecret("Personal access token", result.token);
+        if (!result) return;
+        showAccountSecret("Personal access token", result.value.token);
         setAccountResult("Personal access token created. Copy it now; it cannot be shown again.", true);
         void refreshTokens?.();
       });
@@ -2075,12 +2086,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           form.className = "cell-form";
           form.method = "post";
           form.action = `/api/v1/me/tokens/${token.id}`;
-          form.dataset.apiAccountDelete = "";
+          form.dataset.apiAccountTokenDelete = "";
           form.dataset.confirm = "Revoke this personal access token?";
-          const csrf = document.createElement("input");
-          csrf.type = "hidden";
-          csrf.name = "csrf";
-          csrf.value = accountTokenRows.dataset.csrf || "";
+          const csrf = hiddenInput("csrf", accountTokenRows.dataset.csrf || "");
           const button = document.createElement("button");
           button.className = "danger";
           button.type = "submit";
@@ -2099,28 +2107,37 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     void refreshTokens();
   }
 
-  for (const form of document.querySelectorAll("[data-api-account-delete]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
-        .then(async (result) => {
-          if (result === undefined) return;
-          try {
-            await refreshAfterMutation(refreshTokens);
-            setAccountResult("Token revoked.", true);
-          } catch (error) {
-            setAccountResult(error instanceof Error ? error.message : "Token directory failed to load.", false);
-          }
-        });
-    });
-  }
+  // Credential, identity and token rows are built after their API reads
+  // complete, so their forms are delegated; a listener bound at startup found
+  // none, and the browser posted the form natively (a 405).
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const [refresh, success, failure] = form.matches("[data-api-account-token-delete]")
+      ? [refreshTokens, "Token revoked.", "Token directory failed to load."]
+      : form.matches("[data-api-account-access-delete]")
+        ? [refreshAccountAccess, "Updated.", "Account data failed to load."]
+        : [];
+    if (success === undefined) return;
+    event.preventDefault();
+    void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
+      .then(async (result) => {
+        if (!result) return;
+        try {
+          await refreshAfterMutation(refresh);
+          setAccountResult(success, true);
+        } catch (error) {
+          setAccountResult(error instanceof Error ? error.message : failure, false);
+        }
+      });
+  });
 
   for (const form of document.querySelectorAll("[data-api-account-delete-self]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const confirmation = fieldValue(new FormData(form), "confirmation");
       void mutateAccount(form, "DELETE", { confirmation }, "Account deletion failed.")
-        .then((result) => { if (result !== undefined) window.location.assign("/auth/signed-out"); });
+        .then((result) => { if (result) window.location.assign("/auth/signed-out"); });
     });
   }
 
@@ -2201,14 +2218,13 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     adminAccountResult.textContent = message;
     adminAccountResult.className = success ? "banner-success" : "banner-error";
   };
-  const mutateAdminAccount = (form, method, body, failure) => runFormSubmission(form, async () => {
-    try {
-      return await apiRequest(form, apiMutation(method, form.action), body);
-    } catch (error) {
-      setAdminAccountResult(error instanceof Error ? error.message : failure, false);
-      return undefined;
-    }
-  });
+  const mutateAdminAccount = (form, method, body, failure) => submitMutation(
+    form,
+    method,
+    form.action,
+    body,
+    (error) => setAdminAccountResult(error instanceof Error ? error.message : failure, false),
+  );
   const showInvitationSecret = (value) => {
     if (!adminAccountSecret) return;
     adminAccountSecret.replaceChildren();
@@ -2219,15 +2235,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const code = document.createElement("code");
     code.id = "issued-invitation";
     code.textContent = value;
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.textContent = "Copy";
-    copy.addEventListener("click", async () => { try { await navigator.clipboard.writeText(value); copy.textContent = "Copied"; } catch (_) { copy.textContent = "Select and copy manually"; } });
+    const copy = copyButton(value);
     section.append(title, code, copy);
     adminAccountSecret.append(section);
   };
   const refreshAdminAccountDirectory = async (result, success) => {
-    if (result === undefined) return;
+    if (!result) return;
     try {
       await refreshAfterMutation(refreshAdminAccounts);
       setAdminAccountResult(success, true);
@@ -2236,7 +2249,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   };
   for (const form of document.querySelectorAll("[data-api-admin-account-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), password: String(fields.get("password") || ""), contact_email: optionalValue(String(fields.get("contact_email") || "")), administrator: fields.has("administrator") }, "Account creation failed.").then((result) => refreshAdminAccountDirectory(result, "Account created.")); });
-  for (const form of document.querySelectorAll("[data-api-admin-invitation-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), contact_email: optionalValue(String(fields.get("contact_email") || "")), expires_in_days: Number(fields.get("expires_in_days")), administrator: fields.has("administrator") }, "Invitation creation failed.").then(async (result) => { if (!result) return; showInvitationSecret(result.invitation_url); try { await refreshAfterMutation(refreshAdminAccounts); setAdminAccountResult("Invitation issued. Copy the link now; it cannot be shown again.", true); } catch (error) { setAdminAccountResult(error instanceof Error ? error.message : "Invitation directory failed to load.", false); } }); });
+  for (const form of document.querySelectorAll("[data-api-admin-invitation-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), contact_email: optionalValue(String(fields.get("contact_email") || "")), expires_in_days: Number(fields.get("expires_in_days")), administrator: fields.has("administrator") }, "Invitation creation failed.").then(async (result) => { if (!result) return; showInvitationSecret(result.value.invitation_url); try { await refreshAfterMutation(refreshAdminAccounts); setAdminAccountResult("Invitation issued. Copy the link now; it cannot be shown again.", true); } catch (error) { setAdminAccountResult(error instanceof Error ? error.message : "Invitation directory failed to load.", false); } }); });
   document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement)) return; if (form.matches("[data-api-admin-invitation-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", undefined, "Invitation revocation failed.").then((result) => refreshAdminAccountDirectory(result, "Invitation revoked.")); } else if (form.matches("[data-api-admin-account-state]")) { event.preventDefault(); const fields = new FormData(form); const key = form.dataset.apiAdminAccountState === "suspension" ? "suspended" : "administrator"; void mutateAdminAccount(form, "PATCH", { [key]: fieldValue(fields, key) === "true" }, "Account state change failed.").then((result) => refreshAdminAccountDirectory(result, "Account state updated.")); } else if (form.matches("[data-api-admin-account-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", { confirmation: fieldValue(new FormData(form), "confirmation") }, "Account deletion failed.").then((result) => refreshAdminAccountDirectory(result, "Account deleted.")); } });
 
   const adminAccountsPage = document.querySelector("[data-api-admin-accounts-page]");
@@ -2245,18 +2258,18 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const invitationHost = adminAccountsPage.querySelector("[data-api-admin-invitations]");
     const accountHost = adminAccountsPage.querySelector("[data-api-admin-accounts]");
     const filters = adminAccountsPage.querySelector("[data-api-admin-accounts-filter]");
-    const capability = () => { const input = document.createElement("input"); input.type = "hidden"; input.name = "csrf"; input.value = csrf; return input; };
+    const capability = () => hiddenInput("csrf", csrf);
     const button = (text, className) => { const node = element("button", className, text); node.type = "submit"; return node; };
     const query = () => { const params = new URLSearchParams(window.location.search); if (!params.get("limit")) params.set("limit", "50"); return params; };
     const pager = (text, cursor, parameter) => { const wrapper = element("div", "pager"); wrapper.append(element("span", "meta", cursor ? "Showing an older page." : "Showing the newest page.")); if (cursor) { const link = element("a", "", text); const params = query(); params.set(parameter, String(cursor)); link.href = `/console/accounts?${params}`; wrapper.append(link); } return wrapper; };
     const renderInvitations = (data) => {
       if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = apiCollection(data, "invitations", "invitation directory");
-      if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Pending account invitations")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
+      if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = captionedTable("Pending account invitations"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
     };
     const renderAccounts = (data) => {
       if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
-      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
+      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = captionedTable("Account directory"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; form.append(capability(), hiddenInput(key === "suspension" ? "suspended" : "administrator", value), button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const { label: deletionLabel, control: confirmation } = labelledControl("input", "confirmation", `Type ${account.name} to delete`); confirmation.autocomplete = "off"; confirmation.required = true; deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
     refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); };
     if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
@@ -2294,8 +2307,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         form.method = "post";
         form.action = `/api/v1/admin/networks/${encodeURIComponent(network.owner)}/${encodeURIComponent(network.name)}`;
         form.dataset.apiAdminNetworkToggle = "";
-        const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminNetworkRows.dataset.csrf || "";
-        const enabled = document.createElement("input"); enabled.type = "hidden"; enabled.name = "enabled"; enabled.value = network.enabled ? "false" : "true";
+        const csrf = hiddenInput("csrf", adminNetworkRows.dataset.csrf || "");
+        const enabled = hiddenInput("enabled", !network.enabled);
         const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable";
         form.append(csrf, enabled, button); actions.append(form);
       }
@@ -2412,14 +2425,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       toggle.method = "post";
       toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       toggle.dataset.apiOwnerNetworkToggle = "";
-      const csrf = document.createElement("input");
-      csrf.type = "hidden";
-      csrf.name = "csrf";
-      csrf.value = ownerNetworkRows.dataset.csrf || "";
-      const nextEnabled = document.createElement("input");
-      nextEnabled.type = "hidden";
-      nextEnabled.name = "enabled";
-      nextEnabled.value = enabled ? "false" : "true";
+      const csrf = hiddenInput("csrf", ownerNetworkRows.dataset.csrf || "");
+      const nextEnabled = hiddenInput("enabled", !enabled);
       const toggleButton = document.createElement("button");
       toggleButton.type = "submit";
       toggleButton.textContent = enabled ? "Disable" : "Enable";
@@ -2508,47 +2515,30 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   };
 
-  // Build a request body; a refusal is shown on the form and yields undefined.
-  const ownerNetworkBody = (form, build) => {
-    try {
-      return build();
-    } catch (error) {
-      showOwnerNetworkFailure(form, error);
-      return undefined;
+  const mutateOwnerNetwork = async (form, url, method, body) => {
+    const result = await submitMutation(
+      form,
+      method,
+      url,
+      body,
+      (error) => showOwnerNetworkFailure(form, error),
+      form.querySelector('button[type="submit"]'),
+    );
+    if (!result) return;
+    // A network deleted from its own page has no page left to refresh: reading
+    // it again is a 404 shown as a failure, and its live panel would keep
+    // polling for it. Go to the directory it was removed from.
+    if (method === "DELETE" && form.closest("[data-api-owner-network-detail]")) {
+      stopBackgroundRefreshes();
+      window.location.assign("/console/networks");
+      return;
     }
-  };
-
-  const mutateOwnerNetwork = (
-    form,
-    url,
-    method,
-    body,
-    trigger = form.querySelector('button[type="submit"]'),
-  ) => runFormSubmission(form, async () => {
     try {
-      const result = await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(ownerNetworkRefresher(form));
       setOwnerNetworkResult("Updated.", true);
-      return result;
     } catch (error) {
       showOwnerNetworkFailure(form, error);
-      return undefined;
     }
-  }, trigger);
-
-  // The `USER` name, shown as the ident. The API requires one and never
-  // derives it. A blank box means the nickname, as the form says -- but only
-  // when the nickname is itself a legal user name; it is never rewritten to
-  // fit. A typed value is the server's to judge (and the input's `pattern`).
-  const USER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$/;
-  const userNameFor = (fields) => {
-    const typed = fieldValue(fields, "username");
-    const nick = fieldValue(fields, "nick");
-    if (typed || USER_NAME.test(nick)) return typed || nick;
-    throw Object.assign(
-      new Error(`Enter a username. The nickname ${nick} cannot double as one: letters, digits, - and _ only, starting with a letter or digit, at most 10 characters.`),
-      { field: "username" },
-    );
   };
 
   for (const form of document.querySelectorAll("[data-api-owner-bridge-create]")) {
@@ -2557,7 +2547,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const fields = new FormData(form);
       const name = fieldValue(fields, "name");
       const kind = fieldValue(fields, "kind");
-      const password = String(fields.get("sasl_password") || "");
+      const password = secretValue(fields, "sasl_password");
       if (!name || !kind || !password) {
         setOwnerNetworkResult("Enter every required bridge value.", false);
         return;
@@ -2566,86 +2556,37 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const body = kind === "matrix"
         ? { ...base, nick: fieldValue(fields, "nick") }
         : kind === "slack"
-          ? { ...base, sasl_account: fieldValue(fields, "sasl_account") }
+          ? { ...base, sasl_account: secretValue(fields, "sasl_account") }
           : base;
       void mutateOwnerNetwork(form, form.action, "POST", body);
     });
   }
 
-  // The credential action of a replace. Every field the contract declares is a
-  // string, so a blank one is omitted, never sent as null: `set` with the
-  // account alone keeps the sealed password, and a bridge's password alone
-  // replaces its token. A stored IRC account whose box was emptied is refused
-  // rather than sent as `keep`, because the box says the opposite of the body.
-  const ownerCredentialAction = (form, fields) => {
-    if (fields.has("clear_sasl")) {
-      // Typed credentials under a ticked Remove said two things at once; this
-      // used to answer "remove" and drop what was typed, reporting success.
-      if (String(fields.get("sasl_account") || "") || String(fields.get("sasl_password") || "")) {
-        throw Object.assign(
-          new Error("Remove is ticked, so the account and password boxes would be discarded. Clear them, or untick Remove to save what is typed."),
-          { field: "sasl_account" },
-        );
-      }
-      return { action: "remove" };
-    }
-    const password = String(fields.get("sasl_password") || "");
-    const account = optionalValue(String(fields.get("sasl_account") || ""));
-    if (!account && !password) {
-      const stored = form.dataset.storedSaslAccount || "";
-      if (stored) {
-        throw Object.assign(
-          new Error(`The NickServ account box was emptied but ${stored} is still stored. Enter the account to keep authenticating, or tick “Remove the stored account and password”.`),
-          { field: "sasl_account" },
-        );
-      }
-      return { action: "keep" };
-    }
-    return { action: "set", ...(account ? { account } : {}), ...(password ? { password } : {}) };
-  };
-
-  // The server password's action on a replace: an empty box keeps what is
-  // sealed, a typed one replaces it, Remove clears it. A bridge has none.
-  const ownerServerPasswordAction = (fields, bridge) => {
-    if (bridge) return { action: "keep" };
-    const password = String(fields.get("server_password") || "");
-    if (fields.has("clear_server_password")) {
-      if (password) {
-        throw Object.assign(
-          new Error("“Remove the stored server password” is ticked, so the typed server password would not be saved. Untick it to save it, or clear it to remove the stored one."),
-          { field: "server_password" },
-        );
-      }
-      return { action: "remove" };
-    }
-    return password ? { action: "set", password } : { action: "keep" };
-  };
-
-  const ownerNetworkUpdate = (form, bridge) => {
+  // A bridge replace. The console edits only bridges: an IRC network's one
+  // editor is the chat client's settings dialog. Every credential the contract
+  // declares is a string, so a blank box is omitted, never sent as null: the
+  // password alone replaces the token and keeps Slack's bot token (the account
+  // box), and both blank keep what is sealed. Both are tokens, kept verbatim.
+  const bridgeUpdate = (form) => {
     const fields = new FormData(form);
-    const credentials = ownerCredentialAction(form, fields);
-    const serverPassword = ownerServerPasswordAction(fields, bridge);
-    if (!bridge && (!fieldValue(fields, "addr") || !fieldValue(fields, "nick"))) {
-      throw new Error("Enter the server and nickname.");
-    }
-    const body = {
-      addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
+    const account = secretValue(fields, "sasl_account");
+    const password = secretValue(fields, "sasl_password");
+    return {
+      addr: fieldValue(fields, "addr"),
+      tls: true,
       nick: fieldValue(fields, "nick"),
-      // A bridge has no user name or real name and the contract declares both
-      // as strings, so neither is sent for one. An IRC network always has a
-      // real name: a blank box means the nickname, on edit exactly as on create.
-      ...(bridge ? {} : { username: userNameFor(fields), realname: fieldValue(fields, "realname") || fieldValue(fields, "nick") }),
-      autojoin: splitValues(String(fields.get("autojoin") || ""), bridge ? "," : /[\s,]+/), credentials,
-      server_password: serverPassword,
+      autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
+      credentials: account || password
+        ? { action: "set", ...(account ? { account } : {}), ...(password ? { password } : {}) }
+        : { action: "keep" },
+      server_password: { action: "keep" },
     };
-    return body;
   };
 
-  for (const form of document.querySelectorAll("[data-api-owner-network-update], [data-api-owner-bridge-update]")) {
+  for (const form of document.querySelectorAll("[data-api-owner-bridge-update]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      const body = ownerNetworkBody(form, () => ownerNetworkUpdate(form, form.hasAttribute("data-api-owner-bridge-update")));
-      if (body) void mutateOwnerNetwork(form, form.action, "PUT", body);
+      void mutateOwnerNetwork(form, form.action, "PUT", bridgeUpdate(form));
     });
   }
 
@@ -2662,7 +2603,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (count) count.textContent = String(entries.length);
         target.replaceChildren();
         if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
-        const table = document.createElement("table"); table.innerHTML = "<thead><tr><th>Status</th><th>Network</th><th>Owner</th><th>Actions</th></tr></thead>";
+        const table = captionedTable(`${kind[0].toUpperCase()}${kind.slice(1)} bridges`);
+        table.append(append(document.createElement("thead"), append(element("tr"), ...["Status", "Network", "Owner", "Actions"].map((heading) => element("th", "", heading)))));
         const body = document.createElement("tbody");
         for (const network of entries) {
           const row = document.createElement("tr"); const runtime = network.runtime;
@@ -2672,12 +2614,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           const actions = document.createElement("td"); actions.className = "row-actions";
           if (network.owner === account && network.shared !== true) {
             for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
-            const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = document.createElement("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf; const enabled = document.createElement("input"); enabled.type = "hidden"; enabled.name = "enabled"; enabled.value = network.enabled ? "false" : "true"; const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
-            const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = document.createElement("input"); removeToken.type = "hidden"; removeToken.name = "csrf"; removeToken.value = csrf; const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
+            const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = hiddenInput("csrf", csrf); const enabled = hiddenInput("enabled", !network.enabled); const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
+            const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = hiddenInput("csrf", csrf); const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
           } else actions.textContent = `Managed by ${network.owner}`;
           row.append(status, name, owner, actions); body.append(row);
         }
-        table.append(body); target.append(table);
+        table.append(body); target.append(scrollRegion(`${kind} bridges`, table));
       }
     };
     refreshIntegrations = async () => {
@@ -2816,7 +2758,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       event.preventDefault();
       const fields = new FormData(register);
       const email = fieldValue(fields, "email");
-      const password = fieldValue(fields, "password");
+      const password = secretValue(fields, "password");
       if (!email || !password) { setOwnerNetworkResult("Enter an email address and NickServ password.", false); return; }
       void accountCommand(register, { action: "register", email, password }, "NickServ REGISTER queued. Read the IRC transcript for the network's response, then check your email.");
     });
@@ -2843,7 +2785,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
-        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
+        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = hiddenInput("csrf", adminChannelRows.dataset.csrf || ""); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
       } catch (error) {
         tableLoadFailure(adminChannelRows, 7, error, () => void refreshAdminChannelDirectory());
         return false;
@@ -2933,12 +2875,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   const ownedChannelList = document.querySelector("[data-api-owned-channel-list]");
   if (ownedChannelList instanceof HTMLElement) {
     const csrf = ownedChannelList.dataset.csrf || "";
-    const input = (name, value = "") => { const node = element("input"); node.name = name; node.value = value; return node; };
     const form = (url, body) => {
       const node = element("form", "inline-control"); node.method = "post"; node.action = url;
-      const token = input("csrf", csrf); token.type = "hidden"; node.append(token);
+      node.append(hiddenInput("csrf", csrf));
       body(node);
-      node.addEventListener("submit", (event) => { event.preventDefault(); });
       return node;
     };
     const submit = (node, text, run, confirm) => {
@@ -2957,14 +2897,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const card = element("article", "panel channel-control");
         const access = apiCollection(channel, "access", "channel access");
         card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
-        const topic = form(url, (node) => { const field = element("label", "field"); const area = element("textarea"); area.name = "topic"; area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; append(field, element("span", "", "Retained topic"), area); node.append(field); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
-        const lock = form(url, (node) => { const field = element("label", "field"); append(field, element("span", "", "Mode lock"), input("mlock", channel.mlock || "")); node.append(field); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
-        const keep = form(url, (node) => { const select = element("select"); select.name = "enabled"; for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));
+        const topic = form(url, (node) => { const { label, control: area } = labelledControl("textarea", "topic", "Retained topic"); area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; node.append(label); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
+        const lock = form(url, (node) => { const { label, control } = labelledControl("input", "mlock", "Mode lock"); control.value = channel.mlock || ""; node.append(label); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
+        const keep = form(url, (node) => { const select = namedControl("select", "enabled", `Topic retention for ${channel.name}`); for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));
         const controls = element("div", "channel-control-grid"); controls.append(topic, lock, keep); card.append(controls);
         const grants = element("section", "control-block access-control"); grants.append(element("h3", "", "Channel access"));
-        for (const grant of access) { const row = element("div", "compact-list"); row.append(element("code", "", grant.account), element("span", "tag", `+${grant.flags}`)); const remove = form(`${url}/access/${encodeURIComponent(grant.account)}`, "remove", () => {}); submit(remove, "Remove", (node) => mutateChannel(node, node.action, "DELETE"), `Remove ${grant.account} from ${channel.name} access?`); row.append(remove); grants.append(row); }
-        const add = form(`${url}/access`, (node) => { node.append(input("account")); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) { const label = element("label", "check"); const box = input(name); box.type = "checkbox"; append(label, box, element("span", "", text)); node.append(label); } }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }); }); grants.append(add); card.append(grants);
-        const transfer = form(url, (node) => { node.append(input("account")); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
+        for (const grant of access) { const row = element("div", "compact-list"); row.append(element("code", "", grant.account), element("span", "tag", `+${grant.flags}`)); const remove = form(`${url}/access/${encodeURIComponent(grant.account)}`, () => {}); submit(remove, "Remove", (node) => mutateChannel(node, node.action, "DELETE"), `Remove ${grant.account} from ${channel.name} access?`); row.append(remove); grants.append(row); }
+        const add = form(`${url}/access`, (node) => { node.append(namedControl("input", "account", `Account to grant access on ${channel.name}`)); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) node.append(labelledControl("input", name, text, "check").label); }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }); }); grants.append(add); card.append(grants);
+        const transfer = form(url, (node) => { node.append(namedControl("input", "account", `New founder account for ${channel.name}`)); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
         const drop = form(url, () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE"), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
       }
     };
@@ -2986,110 +2926,15 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
   }
 
-  for (const form of document.querySelectorAll("[data-api-channel-patch]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      let body;
-      switch (form.dataset.apiChannelPatch) {
-        case "topic": {
-          const topic = fieldValue(fields, "topic");
-          body = { action: "set_topic", topic: topic || null };
-          break;
-        }
-        case "keeptopic":
-          body = { action: "set_keeptopic", enabled: fieldValue(fields, "enabled") === "on" };
-          break;
-        case "mlock": {
-          const mlock = fieldValue(fields, "mlock");
-          body = { action: "set_mlock", mlock: mlock || null };
-          break;
-        }
-        case "founder": {
-          const account = fieldValue(fields, "account");
-          if (!account) {
-            setChannelResult("Enter the new founder account.", false);
-            return;
-          }
-          body = { action: "transfer_founder", account };
-          break;
-        }
-        default:
-          setChannelResult("The channel operation is invalid. Reload and try again.", false);
-          return;
-      }
-      void mutateChannel(form, form.action, "PATCH", body);
-    });
-  }
+  // The registered-channel directory is populated after its API read
+  // completes, so its unregister forms are delegated; a listener bound at
+  // startup found none, and the browser posted the form natively (a 405).
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-admin-channel-drop]")) return;
+    event.preventDefault();
+    void mutateChannel(form, form.action, "DELETE");
+  });
 
-  for (const form of document.querySelectorAll("[data-api-channel-access]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const account = fieldValue(fields, "account");
-      const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"]
-        .filter(Boolean).join("");
-      if (!account || !flags) {
-        setChannelResult("Enter an account and select at least one access grant.", false);
-        return;
-      }
-      void mutateChannel(form, `${form.action}/${encodeURIComponent(account)}`, "PUT", { flags });
-    });
-  }
-
-  for (const form of document.querySelectorAll("[data-api-channel-access-delete]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void mutateChannel(form, form.action, "DELETE");
-    });
-  }
-
-  for (const form of document.querySelectorAll("[data-api-channel-drop]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void mutateChannel(form, form.action, "DELETE");
-    });
-  }
-
-  for (const form of document.querySelectorAll("[data-api-admin-channel-drop]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void mutateChannel(form, form.action, "DELETE");
-    });
-  }
-
-  // Every password field gets a reveal control, added here rather than in ten
-  // templates so a field added later is covered without anyone remembering to.
-  //
-  // A credential typed into this console is frequently pasted -- an upstream
-  // NickServ password, a bridge token -- and a masked field gives no way to
-  // check it before submitting. The failure that follows is a rejected
-  // authentication that reads as "wrong credentials" rather than "you typed it
-  // wrong", which is a long way to travel for a transposed character.
-  //
-  // This only ever reveals what is in the field right now. No stored secret is
-  // fetched: the API does not return one, and nothing here asks it to.
-  for (const field of document.querySelectorAll('input[type="password"]')) {
-    if (field.dataset.noReveal !== undefined) continue;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "reveal";
-    button.textContent = "Show";
-    button.setAttribute("aria-pressed", "false");
-    button.setAttribute("aria-label", "Show password");
-    button.addEventListener("click", () => {
-      const shown = field.type === "text";
-      field.type = shown ? "password" : "text";
-      button.textContent = shown ? "Show" : "Hide";
-      button.setAttribute("aria-pressed", String(!shown));
-      button.setAttribute("aria-label", shown ? "Show password" : "Hide password");
-      field.focus();
-    });
-    // Wrapped so the control sits with the input rather than after the label's
-    // hint text, which would put it in a different place on every form.
-    const wrap = document.createElement("span");
-    wrap.className = "secret-input";
-    field.parentNode.insertBefore(wrap, field);
-    wrap.append(field, button);
-  }
+  for (const field of document.querySelectorAll('input[type="password"]')) addRevealControl(field);
 })();

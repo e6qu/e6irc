@@ -60,7 +60,7 @@ pub struct Registry {
     /// A database update and `add`/`remove` are one logical transition: without
     /// this gate, a concurrent delete could remove the row, then lose a race to
     /// an older edit adding its driver back as an untracked live network.
-    mutations: tokio::sync::Mutex<()>,
+    mutations: Arc<tokio::sync::Mutex<()>>,
     pool: Option<PgPool>,
     telemetry: Option<Arc<crate::observability::Telemetry>>,
     /// The server's policy on upstreams inside its own network, applied to
@@ -104,8 +104,20 @@ pub struct NetworkStatus {
 
 /// A network's persistence task and the signal that ends it.
 struct Persistence {
-    stop: tokio::sync::oneshot::Sender<()>,
+    stop: tokio::sync::oneshot::Sender<UnwrittenLines>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// What a stopping network's persistence task does with the lines its driver
+/// said last, which it has received but not yet written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnwrittenLines {
+    /// Write them: the network's rows outlive the stop (an edit, a disable,
+    /// a suspension), and its backlog must not lose its last lines — the
+    /// driver's own goodbye among them.
+    Store,
+    /// Drop them: the network's rows are about to be deleted.
+    Discard,
 }
 
 impl Persistence {
@@ -114,10 +126,10 @@ impl Persistence {
     /// abort cancelled the task wherever it was — possibly with an INSERT
     /// already sent — so a caller deleting the network's rows next could race
     /// the task's last line.
-    async fn stop(self) {
+    async fn stop(self, unwritten: UnwrittenLines) {
         // A task that already ended (its event stream closed) cannot take
         // the signal; the join below still reports how it ended.
-        if self.stop.send(()).is_err() {
+        if self.stop.send(unwritten).is_err() {
             eprintln!("bnc: persistence task had already stopped");
         }
         if let Err(error) = self.task.await {
@@ -136,10 +148,10 @@ impl Slot {
     /// task then finishes the line it is writing and ends, so a caller that
     /// deletes the network's rows after this returns cannot be overtaken by a
     /// late line.
-    async fn stop(self) {
+    async fn stop(self, unwritten: UnwrittenLines) {
         self.handle.shutdown_and_wait().await;
         if let Some(persistence) = self.persistence {
-            persistence.stop().await;
+            persistence.stop(unwritten).await;
         }
     }
 }
@@ -176,7 +188,7 @@ impl Registry {
         use crate::config::NetworkKind;
         let registry = Self {
             networks: Mutex::new(HashMap::new()),
-            mutations: tokio::sync::Mutex::new(()),
+            mutations: Arc::new(tokio::sync::Mutex::new(())),
             pool,
             telemetry,
             internal_upstreams,
@@ -251,10 +263,40 @@ impl Registry {
         Ok(registry)
     }
 
-    /// Enter the one serialized control-plane mutation path. Callers hold this
-    /// guard across the database write and the matching registry transition.
-    pub(crate) async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.mutations.lock().await
+    /// Run `work` on the one serialized control-plane mutation path, to
+    /// completion: callers hold the lane across the database write and the
+    /// matching registry transition.
+    ///
+    /// The work runs as its own task, and the caller only awaits it. An HTTP
+    /// request abandoned at its deadline therefore abandons only the waiting,
+    /// never a transition half made — a driver stopped whose replacement never
+    /// starts, or an account suspended in the database whose sessions the core
+    /// never heard about. The registry's transitions exist only on the
+    /// [`MutationLane`] this hands to `work`, so none can be run anywhere else.
+    pub(crate) async fn mutate<T, F, Fut>(self: &Arc<Self>, work: F) -> T
+    where
+        F: FnOnce(MutationLane) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let registry = self.clone();
+        let mutation = tokio::spawn(async move {
+            let serialized = registry.mutations.clone().lock_owned().await;
+            work(MutationLane {
+                registry,
+                _serialized: serialized,
+            })
+            .await
+        });
+        match mutation.await {
+            Ok(done) => done,
+            Err(error) => match error.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(error) => {
+                    panic!("a registry mutation was cancelled by the runtime stopping: {error}")
+                }
+            },
+        }
     }
 
     /// Start a driver for `(owner, name)` and register it. With a database,
@@ -313,76 +355,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Replace one live driver of a stored network only after its predecessor
-    /// has disconnected.
-    pub async fn replace(
-        &self,
-        owner: Option<&str>,
-        name: &str,
-        driver: Box<dyn super::NetworkDriver>,
-    ) {
-        let old = self
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .remove(&NetworkKey::new(owner, name));
-        if let Some(old) = old {
-            old.stop().await;
-        }
-        self.add(owner, name, crate::db::BncNetworkDefinition::Stored, driver)
-            .expect("the mutation guard serializes registry writers");
-    }
-
-    /// Make the stored network `(owner, name)` run: start `driver` when nothing is registered,
-    /// supersede a driver the upstream parked, and leave a working or still
-    /// retrying one alone. Enabling an already-enabled network therefore never
-    /// drops a healthy upstream session. Returns whether `driver` was started.
-    pub async fn ensure_running(
-        &self,
-        owner: Option<&str>,
-        name: &str,
-        driver: Box<dyn super::NetworkDriver>,
-    ) -> bool {
-        let running = self
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .get(&NetworkKey::new(owner, name))
-            .map(|slot| slot.handle.runtime_snapshot().lifecycle);
-        match running {
-            Some(
-                super::NetworkLifecycle::Connecting
-                | super::NetworkLifecycle::Connected
-                | super::NetworkLifecycle::Reconnecting,
-            ) => false,
-            Some(
-                super::NetworkLifecycle::AuthenticationFailed
-                | super::NetworkLifecycle::RegistrationFailed,
-            )
-            | None => {
-                self.replace(owner, name, driver).await;
-                true
-            }
-        }
-    }
-
-    /// Remove `owner`'s network `name`, stopping its driver. Returns
-    /// whether a network was removed.
-    pub async fn remove(&self, owner: Option<&str>, name: &str) -> bool {
-        let removed = self
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .remove(&NetworkKey::new(owner, name));
-        match removed {
-            Some(slot) => {
-                slot.stop().await;
-                true
-            }
-            None => false,
-        }
-    }
-
     /// Stop every driver, all at once, for a process shutdown: each says its
     /// goodbye (`QUIT`) and releases its upstream, so the restarted daemon does
     /// not meet its own ghosts. Waits at most `deadline` for the slowest;
@@ -416,28 +388,6 @@ impl Registry {
             }
         }
         (released, running)
-    }
-
-    /// Stop every active upstream owned by one account while preserving its
-    /// durable definitions for possible reactivation.
-    pub async fn remove_owner(&self, owner: &str) -> usize {
-        let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner);
-        let removed: Vec<Slot> = {
-            let mut networks = self.networks.lock().expect("registry poisoned");
-            let keys: Vec<NetworkKey> = networks
-                .keys()
-                .filter(|key| key.owner.as_deref() == Some(owner.as_str()))
-                .cloned()
-                .collect();
-            keys.into_iter()
-                .filter_map(|key| networks.remove(&key))
-                .collect()
-        };
-        let count = removed.len();
-        for slot in removed {
-            slot.stop().await;
-        }
-        count
     }
 
     /// The account's OWN active network of that name, if any. Deliberately does
@@ -485,6 +435,130 @@ impl Registry {
     }
 }
 
+/// The registry's serialized mutation lane, held for one
+/// [`Registry::mutate`] unit of work: the only place its transitions run.
+pub(crate) struct MutationLane {
+    registry: Arc<Registry>,
+    _serialized: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl std::ops::Deref for MutationLane {
+    type Target = Registry;
+
+    fn deref(&self) -> &Registry {
+        &self.registry
+    }
+}
+
+impl MutationLane {
+    /// Replace one live driver of a stored network only after its predecessor
+    /// has disconnected.
+    pub(crate) async fn replace(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+        driver: Box<dyn super::NetworkDriver>,
+    ) {
+        let old = self
+            .registry
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .remove(&NetworkKey::new(owner, name));
+        if let Some(old) = old {
+            old.stop(UnwrittenLines::Store).await;
+        }
+        self.registry
+            .add(owner, name, crate::db::BncNetworkDefinition::Stored, driver)
+            .expect("the mutation lane serializes registry writers");
+    }
+
+    /// Make the stored network `(owner, name)` run: start `driver` when nothing is registered,
+    /// supersede a driver the upstream parked, and leave a working or still
+    /// retrying one alone. Enabling an already-enabled network therefore never
+    /// drops a healthy upstream session. Returns whether `driver` was started.
+    pub(crate) async fn ensure_running(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+        driver: Box<dyn super::NetworkDriver>,
+    ) -> bool {
+        let running = self
+            .registry
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .get(&NetworkKey::new(owner, name))
+            .map(|slot| slot.handle.runtime_snapshot().lifecycle);
+        match running {
+            Some(
+                super::NetworkLifecycle::Connecting
+                | super::NetworkLifecycle::Connected
+                | super::NetworkLifecycle::Reconnecting,
+            ) => false,
+            Some(
+                super::NetworkLifecycle::AuthenticationFailed
+                | super::NetworkLifecycle::RegistrationFailed,
+            )
+            | None => {
+                self.replace(owner, name, driver).await;
+                true
+            }
+        }
+    }
+
+    /// Remove `owner`'s network `name`, stopping its driver. Returns
+    /// whether a network was removed.
+    pub(crate) async fn remove(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+        unwritten: UnwrittenLines,
+    ) -> bool {
+        let removed = self
+            .registry
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .remove(&NetworkKey::new(owner, name));
+        match removed {
+            Some(slot) => {
+                slot.stop(unwritten).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Stop every active upstream owned by one account while preserving its
+    /// durable definitions for possible reactivation. The account's drivers
+    /// stop concurrently, as a process shutdown stops them, so one slow
+    /// goodbye does not hold up the rest.
+    pub(crate) async fn remove_owner(&self, owner: &str, unwritten: UnwrittenLines) -> usize {
+        let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner);
+        let removed: Vec<Slot> = {
+            let mut networks = self.registry.networks.lock().expect("registry poisoned");
+            let keys: Vec<NetworkKey> = networks
+                .keys()
+                .filter(|key| key.owner.as_deref() == Some(owner.as_str()))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| networks.remove(&key))
+                .collect()
+        };
+        let count = removed.len();
+        let mut stops = tokio::task::JoinSet::new();
+        for slot in removed {
+            stops.spawn(slot.stop(unwritten));
+        }
+        while let Some(stopped) = stops.join_next().await {
+            stopped.expect("a driver stop does not panic");
+        }
+        count
+    }
+}
+
 /// Restore a network's persisted backlog into its buffer, trim it to the
 /// cap, then persist every new upstream line until stopped. Subscribes before
 /// the backlog read so no line broadcast during the read is lost (up to the
@@ -497,14 +571,14 @@ fn spawn_persistence(
     handle: Arc<NetworkHandle>,
 ) -> Persistence {
     use super::DriverEvent;
-    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<UnwrittenLines>();
     let owner_key = owner.clone().unwrap_or_else(|| "*".to_string());
     // Subscribed before the task is spawned, not on its first poll: a
     // broadcast reaches only the receivers that exist when a line is sent, so
     // anything the driver emitted in between was kept in the ring and never
     // written to the backlog. The local driver reaches the in-process core
     // fast enough for that window to be real.
-    let mut events = handle.subscribe();
+    let events = handle.subscribe();
     let task = tokio::spawn(async move {
         match crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
             Ok(lines) => handle.preload_front(lines),
@@ -542,14 +616,14 @@ fn spawn_persistence(
         // Whether the last write failed, so an outage logs once, and its end
         // logs once.
         let mut storage_failing = false;
-        loop {
-            // A stop is honoured only here, between two writes: a write in
-            // progress always completes (or fails) before the task ends.
-            let event = tokio::select! {
-                biased;
-                _ = &mut stopped => break,
-                event = events.recv() => event,
-            };
+        let mut feed = PersistenceFeed {
+            events,
+            stopped,
+            draining: None,
+        };
+        // A stop is honoured only between two writes: a write in progress
+        // always completes (or fails) before the task ends.
+        while let Some(event) = feed.next().await {
             let (line, own_nick) = match event {
                 // A synthesized self-echo is part of the conversation record:
                 // persist it like an upstream line so a reattached client sees
@@ -614,6 +688,47 @@ fn spawn_persistence(
     Persistence { stop, task }
 }
 
+/// What a network's persistence task writes: the driver's events as they
+/// come, until a stop. A stop that keeps unwritten lines then yields exactly
+/// the events still queued at that moment — the driver has stopped by then, so
+/// that is everything it said, and the drain is finite — and one that discards
+/// them ends at once.
+struct PersistenceFeed {
+    events: tokio::sync::broadcast::Receiver<super::DriverEvent>,
+    stopped: tokio::sync::oneshot::Receiver<UnwrittenLines>,
+    /// After a keeping stop: how many of the queued events remain.
+    draining: Option<usize>,
+}
+
+impl PersistenceFeed {
+    async fn next(
+        &mut self,
+    ) -> Option<Result<super::DriverEvent, tokio::sync::broadcast::error::RecvError>> {
+        use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+        loop {
+            match &mut self.draining {
+                Some(0) => return None,
+                Some(left) => {
+                    *left -= 1;
+                    return match self.events.try_recv() {
+                        Ok(event) => Some(Ok(event)),
+                        Err(TryRecvError::Lagged(n)) => Some(Err(RecvError::Lagged(n))),
+                        Err(TryRecvError::Empty | TryRecvError::Closed) => None,
+                    };
+                }
+                None => tokio::select! {
+                    biased;
+                    stop = &mut self.stopped => match stop {
+                        Ok(UnwrittenLines::Store) => self.draining = Some(self.events.len()),
+                        Ok(UnwrittenLines::Discard) | Err(_) => return None,
+                    },
+                    event = self.events.recv() => return Some(event),
+                },
+            }
+        }
+    }
+}
+
 async fn persist_and_trim(
     pool: &PgPool,
     buffer: &crate::db::BncBuffer,
@@ -655,18 +770,23 @@ pub async fn bnc_serve<S>(
     registry: Arc<Registry>,
     pool: &PgPool,
     server_name: &str,
+    peer_host: &str,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut read, mut write) = tokio::io::split(stream);
+    let (mut read, write) = tokio::io::split(stream);
+    // Every write here is bounded like `attach`'s, so a client that stops
+    // reading during registration or its welcome is dropped at the deadline.
+    let mut write =
+        crate::peer_write::DeadlineWriter::new(write, crate::peer_write::PEER_WRITE_DEADLINE);
 
     // Bound the pre-attach handshake: a client that connects and never
     // completes registration (sends nothing, or authenticates but never ends
     // CAP negotiation) must not hold a task + socket indefinitely.
     let (account, network, requested_nick, caps, input) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        handshake(&mut read, &mut write, pool, server_name),
+        handshake(&mut read, &mut write, pool, server_name, peer_host),
     )
     .await
     {
@@ -756,7 +876,7 @@ where
     }
     write.flush().await?;
 
-    let joined = read.unsplit(write);
+    let joined = read.unsplit(write.into_inner());
     let end = attach(
         joined,
         input,
@@ -773,32 +893,106 @@ where
     Ok(())
 }
 
+/// The ISUPPORT a network is welcomed with when it has told the bouncer
+/// nothing of its own — a bridge, which has no registration burst, or an
+/// upstream whose burst has not arrived yet.
+const BRIDGE_ISUPPORT: &[&str] = &[
+    "CASEMAPPING=rfc1459",
+    "CHANTYPES=#&",
+    "CHANNELLEN=64",
+    "NICKLEN=30",
+    "PREFIX=(qaohv)~&@%+",
+];
+
+/// RPL_MYINFO's mode lists to go with [`BRIDGE_ISUPPORT`]: no user modes the
+/// bridge implements beyond invisibility, and the membership modes its
+/// `PREFIX` names (each takes a nick).
+const BRIDGE_MYINFO_MODES: &[&str] = &["i", "qaohv", "qaohv"];
+
+/// Tokens the bouncer answers for itself rather than the network: it serves
+/// CHATHISTORY from its own store, so the network's limits and reference
+/// types say nothing about what an attached client can page.
+const BOUNCER_OWNED_ISUPPORT: &[&str] = &["CHATHISTORY", "MSGREFTYPES"];
+
+/// The most ISUPPORT tokens one 005 line carries: with the nick and the
+/// trailing text that is the 15 parameters a message may hold.
+const ISUPPORT_TOKENS_PER_LINE: usize = 13;
+
 /// The nick an attaching client is welcomed under, and its registration
-/// burst: welcome, ISUPPORT and end-of-MOTD. The attach selector is
+/// burst: 001-004, ISUPPORT and end-of-MOTD. The attach selector is
 /// registration input, not the client's IRC identity: once the network has a
 /// session, 001 names the session's nick — an IRC upstream's, or a bridge's
 /// provider account — so the client classifies the JOIN, NICK and echoed
 /// traffic that follows as its own. Before then it is the nick the client
 /// asked for, and the session's arrives as a NICK when it begins.
+///
+/// The mode lists and ISUPPORT are the network's own, as its registration
+/// burst reported them (the local network's are the core's, read the same
+/// way), so the client parses the network it is actually on — its prefixes,
+/// channel types and casemapping. The bouncer adds only what it serves itself:
+/// CHATHISTORY and MSGREFTYPES, and those only when the network has a history
+/// store to page.
 pub(super) fn welcome(
     server_name: &str,
     network: &str,
     handle: &NetworkHandle,
     requested_nick: String,
-) -> (String, [String; 3]) {
+) -> (String, Vec<String>) {
     let nick = handle
         .irc_session_snapshot()
         .map_or(requested_nick, |session| session.nick);
-    let burst = [
+    let features = handle.upstream_features();
+    let modes = features
+        .myinfo_modes
+        .unwrap_or_else(|| BRIDGE_MYINFO_MODES.iter().map(|m| m.to_string()).collect());
+    let mut isupport = if features.isupport.is_empty() {
+        BRIDGE_ISUPPORT.iter().map(|t| t.to_string()).collect()
+    } else {
+        features.isupport
+    };
+    isupport.retain(|token| {
+        let key = token.split('=').next().unwrap_or(token);
+        !BOUNCER_OWNED_ISUPPORT.contains(&key)
+    });
+    if handle.history().is_some() {
+        isupport.push(format!(
+            "CHATHISTORY={}",
+            super::chathistory::CHATHISTORY_LIMIT_MAX
+        ));
+        isupport.push("MSGREFTYPES=timestamp,msgid".to_string());
+    }
+    let version = concat!("e6irc-bnc-", env!("CARGO_PKG_VERSION"));
+    let mut burst = vec![
         format!(":{server_name} 001 {nick} :Welcome to e6irc BNC, attached to '{network}'"),
+        format!(":{server_name} 002 {nick} :Your host is {server_name}, running version {version}"),
+        format!(":{server_name} 003 {nick} :This server was created at build time"),
         format!(
-            ":{server_name} 005 {nick} CASEMAPPING=rfc1459 CHANTYPES=#& \
-             CHANNELLEN=64 NICKLEN=30 PREFIX=(qaohv)~&@%+ CHATHISTORY={} \
-             MSGREFTYPES=timestamp,msgid :are supported by this server",
-            super::chathistory::CHATHISTORY_LIMIT_MAX,
+            ":{server_name} 004 {nick} {server_name} {version} {}",
+            modes.join(" ")
         ),
-        format!(":{server_name} 422 {nick} :MOTD is on the upstream network"),
     ];
+    let head = format!(":{server_name} 005 {nick}");
+    let tail = " :are supported by this server";
+    let mut line = head.clone();
+    let mut on_line = 0;
+    for token in &isupport {
+        if on_line == ISUPPORT_TOKENS_PER_LINE
+            || line.len() + 1 + token.len() + tail.len() + 2 > e6irc_proto::message::MAX_LINE_LEN
+        {
+            burst.push(format!("{line}{tail}"));
+            line = head.clone();
+            on_line = 0;
+        }
+        line.push(' ');
+        line.push_str(token);
+        on_line += 1;
+    }
+    if on_line > 0 {
+        burst.push(format!("{line}{tail}"));
+    }
+    burst.push(format!(
+        ":{server_name} 422 {nick} :MOTD is on the upstream network"
+    ));
     (nick, burst)
 }
 
@@ -810,6 +1004,7 @@ async fn handshake<R, W>(
     write: &mut W,
     pool: &PgPool,
     server_name: &str,
+    peer_host: &str,
 ) -> std::io::Result<Registered>
 where
     R: AsyncRead + Unpin,
@@ -822,6 +1017,7 @@ where
 
     let mut nick: Option<String> = None;
     let mut have_user = false;
+    let mut username: Option<String> = None;
     let mut cap_open = false;
     let mut awaiting_payload = false;
     // Accumulates 400-byte AUTHENTICATE continuation chunks until a short line
@@ -865,9 +1061,8 @@ where
                 continue;
             };
             let Ok(text) = std::str::from_utf8(&line) else {
-                write
-                    .write_all(b":*bnc* FAIL * INVALID_UTF8 :Message rejected, not valid UTF-8\r\n")
-                    .await?;
+                let fail = crate::core::invalid_utf8_fail("*bnc*", &line);
+                write.write_all(format!("{fail}\r\n").as_bytes()).await?;
                 continue;
             };
             let msg = match super::parse_client_line(text) {
@@ -918,6 +1113,7 @@ where
                         .await?;
                     } else {
                         have_user = true;
+                        username = Some(msg.params[0].to_string());
                     }
                 }
                 "CAP" => {
@@ -935,12 +1131,12 @@ where
                 }
                 "AUTHENTICATE" => {
                     if msg.params.len() != 1 {
-                        reject_sasl(write, server_name).await?;
+                        reject_sasl(write, server_name, nick.as_deref()).await?;
                         continue;
                     }
                     let arg = msg.params.first().copied().unwrap_or("");
                     if !caps.sasl {
-                        reject_sasl(write, server_name).await?;
+                        reject_sasl(write, server_name, nick.as_deref()).await?;
                         continue;
                     }
                     if account.is_some() {
@@ -970,12 +1166,23 @@ where
                         continue;
                     }
                     if !awaiting_payload {
-                        // Mechanism selection. Only PLAIN is offered.
-                        if arg.eq_ignore_ascii_case("PLAIN") {
+                        // Mechanism selection. Only PLAIN is offered; any
+                        // other is answered with the list (908) before the
+                        // failure (904), as the SASL spec orders them.
+                        if arg.eq_ignore_ascii_case(ATTACH_SASL_MECHANISMS) {
                             awaiting_payload = true;
                             write.write_all(b"AUTHENTICATE +\r\n").await?;
                         } else {
-                            reject_sasl(write, server_name).await?;
+                            handshake_numeric(
+                                write,
+                                server_name,
+                                nick.as_deref(),
+                                908,
+                                Some(ATTACH_SASL_MECHANISMS),
+                                "are available SASL mechanisms",
+                            )
+                            .await?;
+                            reject_sasl(write, server_name, nick.as_deref()).await?;
                         }
                     } else if arg == "*" {
                         // Client abort.
@@ -1000,7 +1207,7 @@ where
                         {
                             awaiting_payload = false;
                             sasl_buf.clear();
-                            reject_sasl(write, server_name).await?;
+                            reject_sasl(write, server_name, nick.as_deref()).await?;
                         } else {
                             sasl_buf.push_str(piece);
                             if arg.len() != e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN {
@@ -1014,28 +1221,59 @@ where
                                         eprintln!(
                                             "bnc: SASL authentication failed on the attach listener"
                                         );
-                                        reject_sasl(write, server_name).await?;
+                                        reject_sasl(write, server_name, nick.as_deref()).await?;
+                                    }
+                                    PlainVerification::Throttled(retry_after) => {
+                                        write
+                                            .write_all(
+                                                format!(
+                                                    ":{server_name} 904 * :{}\r\n",
+                                                    retry_after.explanation()
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await?;
                                     }
                                     PlainVerification::Unavailable => {
-                                        write
-                                            .write_all(
-                                                format!(
-                                                    ":{server_name} 904 * :SASL authentication temporarily unavailable\r\n"
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await?;
+                                        handshake_numeric(
+                                            write,
+                                            server_name,
+                                            nick.as_deref(),
+                                            904,
+                                            None,
+                                            "SASL authentication temporarily unavailable",
+                                        )
+                                        .await?;
                                     }
                                     PlainVerification::Accepted(acct, selected) => {
+                                        // RPL_LOGGEDIN names the client and
+                                        // its mask as far as they are known:
+                                        // the nick it gave, the user name
+                                        // from USER, the address it came from.
+                                        let mask = logged_in_mask(
+                                            nick.as_deref(),
+                                            username.as_deref(),
+                                            peer_host,
+                                        );
+                                        let target =
+                                            nick.as_deref().map_or("*", attach_reply_token);
                                         write
                                             .write_all(
                                                 format!(
-                                                    ":{server_name} 900 * * {acct} :You are now logged in as {acct}\r\n\
-                                                     :{server_name} 903 * :SASL authentication successful\r\n"
+                                                    ":{server_name} 900 {target} {mask} {acct} :You are now logged in as {acct}\r\n"
                                                 )
                                                 .as_bytes(),
                                             )
                                             .await?;
+                                        handshake_numeric(
+                                            write,
+                                            server_name,
+                                            nick.as_deref(),
+                                            903,
+                                            None,
+                                            "SASL authentication successful",
+                                        )
+                                        .await?;
                                         account = Some(acct);
                                         sasl_network = selected;
                                     }
@@ -1194,6 +1432,10 @@ fn attach_reply_token(token: &str) -> &str {
     }
 }
 
+/// The SASL mechanisms the attach listener accepts, as `sasl=` advertises
+/// them to a 302 client and RPL_SASLMECHS (908) lists them.
+const ATTACH_SASL_MECHANISMS: &str = "PLAIN";
+
 #[derive(Clone, Copy)]
 enum AttachCapability {
     Sasl,
@@ -1204,10 +1446,11 @@ enum AttachCapability {
     Batch,
     Chathistory,
     ReadMarker,
+    CapNotify,
 }
 
 impl AttachCapability {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Sasl,
         Self::ServerTime,
         Self::MessageTags,
@@ -1216,6 +1459,7 @@ impl AttachCapability {
         Self::Batch,
         Self::Chathistory,
         Self::ReadMarker,
+        Self::CapNotify,
     ];
 
     const fn name(self) -> &'static str {
@@ -1228,6 +1472,15 @@ impl AttachCapability {
             Self::Batch => "batch",
             Self::Chathistory => "draft/chathistory",
             Self::ReadMarker => "draft/read-marker",
+            Self::CapNotify => "cap-notify",
+        }
+    }
+
+    /// The CAP LS token: a 302 client is told the SASL mechanisms on offer.
+    fn ls_token(self, v302: bool) -> String {
+        match self {
+            Self::Sasl if v302 => format!("sasl={ATTACH_SASL_MECHANISMS}"),
+            other => other.name().to_string(),
         }
     }
 
@@ -1252,6 +1505,9 @@ impl AttachCapability {
             Self::Batch => caps.batch = enabled,
             Self::Chathistory => caps.chathistory = enabled,
             Self::ReadMarker => caps.read_marker = enabled,
+            // A 302 client's cap-notify is implied and stays on
+            // (capability negotiation 3.2); only an older client toggles it.
+            Self::CapNotify => caps.cap_notify = enabled || caps.cap_302,
         }
     }
 
@@ -1265,17 +1521,21 @@ impl AttachCapability {
             Self::Batch => caps.batch,
             Self::Chathistory => caps.chathistory,
             Self::ReadMarker => caps.read_marker,
+            Self::CapNotify => caps.cap_notify,
         }
     }
 }
 
-fn cap_names(caps: Option<super::AttachCaps>) -> String {
+/// The capabilities on offer (`caps: None`) or enabled, as CAP tokens.
+fn cap_names(caps: Option<super::AttachCaps>, v302: bool) -> Vec<String> {
     AttachCapability::ALL
         .into_iter()
         .filter(|capability| caps.is_none_or(|caps| capability.enabled(caps)))
-        .map(AttachCapability::name)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|capability| match caps {
+            None => capability.ls_token(v302),
+            Some(_) => capability.name().to_string(),
+        })
+        .collect()
 }
 
 fn cap_reply(server_name: &str, target: &str, verb: &str, request: &str) -> (bool, String) {
@@ -1307,23 +1567,26 @@ where
         .map(|s| s.to_ascii_uppercase())
         .as_deref()
     {
+        // The core's version rule and line splitting: `CAP LS 302` or later
+        // gets values, multi-line replies and cap-notify.
         Some("LS") => {
-            write
-                .write_all(
-                    format!(":{server_name} CAP {target} LS :{}\r\n", cap_names(None)).as_bytes(),
-                )
-                .await?;
+            let v302 = crate::core::cap_version_302(msg.params.get(1).copied());
+            if v302 {
+                caps.cap_302 = true;
+                caps.cap_notify = true;
+            }
+            let tokens = cap_names(None, v302);
+            for line in crate::core::cap_reply_lines(server_name, target, "LS", &tokens, v302) {
+                write.write_all(format!("{line}\r\n").as_bytes()).await?;
+            }
         }
         Some("LIST") => {
-            write
-                .write_all(
-                    format!(
-                        ":{server_name} CAP {target} LIST :{}\r\n",
-                        cap_names(Some(*caps))
-                    )
-                    .as_bytes(),
-                )
-                .await?;
+            let tokens = cap_names(Some(*caps), caps.cap_302);
+            for line in
+                crate::core::cap_reply_lines(server_name, target, "LIST", &tokens, caps.cap_302)
+            {
+                write.write_all(format!("{line}\r\n").as_bytes()).await?;
+            }
         }
         Some("REQ") => {
             let req = msg.params.get(1).copied().unwrap_or("");
@@ -1364,13 +1627,30 @@ where
     Ok(())
 }
 
-async fn reject_sasl<W>(write: &mut W, server_name: &str) -> std::io::Result<()>
+async fn reject_sasl<W>(write: &mut W, server_name: &str, nick: Option<&str>) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write
-        .write_all(format!(":{server_name} 904 * :SASL authentication failed\r\n").as_bytes())
-        .await
+    handshake_numeric(
+        write,
+        server_name,
+        nick,
+        904,
+        None,
+        "SASL authentication failed",
+    )
+    .await
+}
+
+/// `nick!user@host` for RPL_LOGGEDIN: the nick part of the attach selector
+/// (a `nick/network` selector names the nick first), the USER name, and the
+/// client's address — each `*` while not yet known.
+fn logged_in_mask(nick: Option<&str>, username: Option<&str>, host: &str) -> String {
+    let nick = nick
+        .map(|selector| selector.split_once('/').map_or(selector, |(nick, _)| nick))
+        .map_or("*", attach_reply_token);
+    let user = username.map_or("*", attach_reply_token);
+    format!("{nick}!{user}@{host}")
 }
 
 /// Verify a SASL PLAIN payload (`base64(authzid \0 authcid \0 passwd)`)
@@ -1380,6 +1660,8 @@ enum PlainVerification {
     /// (soju's `<account>/<network>`), if it carried one.
     Accepted(String, Option<String>),
     Rejected,
+    /// The account name has spent its password attempts for the window.
+    Throttled(crate::db::LoginRetryAfter),
     Unavailable,
     AttemptsExhausted,
 }
@@ -1414,6 +1696,9 @@ async fn verify_plain(
     match crate::db::verify_credentials(pool, account, &credentials.password).await {
         Ok(Some(name)) => PlainVerification::Accepted(name, network),
         Ok(None) => PlainVerification::Rejected,
+        Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+            PlainVerification::Throttled(retry_after)
+        }
         Err(e) => {
             eprintln!("bnc: credential check failed (database error): {e}");
             PlainVerification::Unavailable
@@ -1433,11 +1718,17 @@ mod cap_tests {
             let (parsed, enabled) = AttachCapability::parse(capability.name()).expect("known cap");
             parsed.set(&mut caps, enabled);
         }
-        assert_eq!(cap_names(Some(caps)), cap_names(None));
+        assert_eq!(cap_names(Some(caps), false), cap_names(None, false));
 
         let (capability, enabled) = AttachCapability::parse("-echo-message").expect("known cap");
         capability.set(&mut caps, enabled);
-        assert!(!cap_names(Some(caps)).contains("echo-message"));
+        assert!(!cap_names(Some(caps), false).contains(&"echo-message".to_string()));
+        // A 302 client is told the mechanisms, and cannot drop cap-notify.
+        assert!(cap_names(None, true).contains(&"sasl=PLAIN".to_string()));
+        caps.cap_302 = true;
+        let (capability, enabled) = AttachCapability::parse("-cap-notify").expect("known cap");
+        capability.set(&mut caps, enabled);
+        assert!(caps.cap_notify);
         assert!(AttachCapability::parse("unknown").is_none());
     }
 
@@ -1564,6 +1855,42 @@ mod handshake_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Run the handshake over `input` (then end of input); what it wrote, and
+    /// its verdict.
+    async fn handshake_replies(input: &[u8]) -> (String, Registered) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        let task = tokio::spawn(async move {
+            handshake(
+                &mut server_read,
+                &mut server_write,
+                &pool,
+                "bnc.example",
+                "192.0.2.1",
+            )
+            .await
+        });
+        client_write
+            .write_all(input)
+            .await
+            .expect("write handshake");
+        client_write.shutdown().await.expect("close input");
+        let mut replies = String::new();
+        client_read
+            .read_to_string(&mut replies)
+            .await
+            .expect("read replies");
+        let registered = task
+            .await
+            .expect("handshake task")
+            .expect("handshake result");
+        (replies, registered)
+    }
+
     #[test]
     fn attach_selector_uses_the_shared_bounded_network_name_language() {
         assert!(attach_selector_ok("alice/libera"));
@@ -1575,32 +1902,11 @@ mod handshake_tests {
 
     #[tokio::test]
     async fn attach_sasl_rejects_an_oversized_chunk_and_resets_the_attempt() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
-            .expect("lazy pool");
-        let (client, server) = tokio::io::duplex(16 * 1024);
-        let (mut client_read, mut client_write) = tokio::io::split(client);
-        let (mut server_read, mut server_write) = tokio::io::split(server);
-        let task = tokio::spawn(async move {
-            handshake(&mut server_read, &mut server_write, &pool, "bnc.example").await
-        });
-        client_write
-            .write_all(
-                format!(
+        let (replies, registered) = handshake_replies(format!(
                     "CAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE {}\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE *\r\nQUIT :done\r\n",
                     "x".repeat(e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN + 1)
                 )
-                .as_bytes(),
-            )
-            .await
-            .expect("write handshake");
-        client_write.shutdown().await.expect("close input");
-
-        let mut replies = String::new();
-        client_read
-            .read_to_string(&mut replies)
-            .await
-            .expect("read replies");
+                .as_bytes(),).await;
         assert!(
             replies.contains(" 905 * :SASL message too long\r\n"),
             "{replies}"
@@ -1614,12 +1920,58 @@ mod handshake_tests {
             replies.contains(" 906 * :SASL authentication aborted\r\n"),
             "{replies}"
         );
-        assert!(matches!(
-            task.await
-                .expect("handshake task")
-                .expect("handshake result"),
-            Registered::Closed
-        ));
+        assert!(matches!(registered, Registered::Closed));
+    }
+
+    /// The attach listener negotiates like the core: `CAP LS 302` gets the
+    /// mechanism list as `sasl=`'s value and cap-notify it cannot drop; an
+    /// unsupported mechanism is answered with RPL_SASLMECHS (908) before the
+    /// failure (904), addressed to the nick the client gave; a line that is
+    /// not UTF-8 is refused under the command it carried.
+    #[tokio::test]
+    async fn attach_negotiation_follows_the_302_and_sasl_specs() {
+        let (replies, registered) = handshake_replies(b"CAP LS 303\r\nNICK alice/libera\r\nCAP REQ :sasl -cap-notify\r\nCAP LIST\r\nAUTHENTICATE SCRAM-SHA-256\r\nPRIVMSG #c :caf\xe9\r\nQUIT :done\r\n").await;
+        let lines: Vec<&str> = replies.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with(":bnc.example CAP * LS :")
+                    && l.split(' ')
+                        .any(|t| t.trim_start_matches(':') == "sasl=PLAIN")),
+            "{lines:#?}"
+        );
+        let list = lines
+            .iter()
+            .find(|l| l.contains(" CAP alice/libera LIST ") || l.contains(" CAP * LIST "))
+            .expect("CAP LIST reply");
+        assert!(
+            list.contains("cap-notify") && list.contains("sasl"),
+            "{list}"
+        );
+        let mechs = lines.iter().position(|l| {
+            *l == ":bnc.example 908 alice/libera PLAIN :are available SASL mechanisms"
+        });
+        let failed = lines
+            .iter()
+            .position(|l| *l == ":bnc.example 904 alice/libera :SASL authentication failed");
+        assert!(
+            mechs.is_some() && mechs.map(|at| at + 1) == failed,
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&":*bnc* FAIL PRIVMSG INVALID_UTF8 :Message rejected, not valid UTF-8"),
+            "{lines:#?}"
+        );
+        assert!(matches!(registered, Registered::Closed));
+    }
+
+    #[test]
+    fn logged_in_mask_names_what_is_known() {
+        assert_eq!(
+            logged_in_mask(Some("alice/libera"), Some("al"), "192.0.2.1"),
+            "alice!al@192.0.2.1"
+        );
+        assert_eq!(logged_in_mask(None, None, "192.0.2.1"), "*!*@192.0.2.1");
     }
 
     #[tokio::test]
@@ -1642,33 +1994,13 @@ mod handshake_tests {
 
     #[tokio::test]
     async fn malformed_and_unknown_handshake_input_fails_loudly() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
-            .expect("lazy pool");
-        let (client, server) = tokio::io::duplex(16 * 1024);
-        let (mut client_read, mut client_write) = tokio::io::split(client);
-        let (mut server_read, mut server_write) = tokio::io::split(server);
-        let task = tokio::spawn(async move {
-            handshake(&mut server_read, &mut server_write, &pool, "bnc.example").await
-        });
         // The last PING carries a maximal token: `PING ` plus 505 bytes fills
         // the 510-byte input frame, and the `PONG :` echo is one byte longer.
         let long_token = "a".repeat(505);
-        client_write
-            .write_all(
-                format!(
+        let (replies, registered) = handshake_replies(format!(
                     "NICK alice/libera\r\nUSER only-one-param\r\nWAT value\r\nBAD\0LINE\r\nCAP SURPRISE\r\nPING :token\r\nPING {long_token}\r\nQUIT :done\r\n"
                 )
-                .as_bytes(),
-            )
-            .await
-            .expect("write handshake");
-        client_write.shutdown().await.expect("close input");
-        let mut replies = String::new();
-        client_read
-            .read_to_string(&mut replies)
-            .await
-            .expect("read replies");
+                .as_bytes(),).await;
         assert!(replies.contains(" 461 alice/libera USER :Not enough parameters\r\n"));
         assert!(replies.contains(" 421 alice/libera WAT :Unknown command\r\n"));
         assert!(replies.contains(" FAIL * INVALID_MESSAGE :Malformed line\r\n"));
@@ -1683,12 +2015,7 @@ mod handshake_tests {
             "PONG must fit the wire: {} bytes",
             long_pong.len() + 2
         );
-        assert!(matches!(
-            task.await
-                .expect("handshake task")
-                .expect("handshake result"),
-            Registered::Closed
-        ));
+        assert!(matches!(registered, Registered::Closed));
     }
 }
 
@@ -1724,7 +2051,7 @@ mod key_tests {
     fn empty_registry() -> Registry {
         Registry {
             networks: Mutex::new(HashMap::new()),
-            mutations: tokio::sync::Mutex::new(()),
+            mutations: Arc::new(tokio::sync::Mutex::new(())),
             pool: None,
             telemetry: None,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
@@ -1761,27 +2088,28 @@ mod key_tests {
         assert!(!*first.watch_shutdown().borrow());
     }
 
-    #[tokio::test]
-    async fn ensure_running_leaves_a_live_driver_alone_and_starts_an_absent_one() {
-        let registry = empty_registry();
-        assert!(
-            registry
-                .ensure_running(
+    /// Starts `(alice, libera)` through the mutation lane unless a working
+    /// driver already holds it; whether it started one.
+    async fn ensure_alice_libera(registry: &Arc<Registry>) -> bool {
+        registry
+            .mutate(|lane| async move {
+                lane.ensure_running(
                     Some("alice"),
                     "libera",
                     Box::new(crate::bouncer::LoopbackDriver::new(16)),
                 )
                 .await
-        );
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn ensure_running_leaves_a_live_driver_alone_and_starts_an_absent_one() {
+        let registry = Arc::new(empty_registry());
+        assert!(ensure_alice_libera(&registry).await);
         let first = registry.get_owned("alice", "libera").expect("started");
         assert!(
-            !registry
-                .ensure_running(
-                    Some("alice"),
-                    "libera",
-                    Box::new(crate::bouncer::LoopbackDriver::new(16)),
-                )
-                .await,
+            !ensure_alice_libera(&registry).await,
             "enabling an already-running network must not restart it"
         );
         let still = registry.get_owned("alice", "libera").expect("same driver");
@@ -1791,13 +2119,7 @@ mod key_tests {
 
     #[tokio::test]
     async fn remove_owner_stops_exactly_that_accounts_networks() {
-        let registry = Registry {
-            networks: Mutex::new(HashMap::new()),
-            mutations: tokio::sync::Mutex::new(()),
-            pool: None,
-            telemetry: None,
-            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
-        };
+        let registry = Arc::new(empty_registry());
         registry
             .add(
                 Some("Alice"),
@@ -1837,7 +2159,12 @@ mod key_tests {
         let bob = registry.get_owned("bob", "libera").expect("Bob network");
         let shared = registry.get_shared("shared").expect("shared network");
 
-        assert_eq!(registry.remove_owner("aLICE").await, 2);
+        let remove_owner = |owner: &'static str| {
+            registry.mutate(move |lane| async move {
+                lane.remove_owner(owner, UnwrittenLines::Store).await
+            })
+        };
+        assert_eq!(remove_owner("aLICE").await, 2);
         assert!(*alice_libera.watch_shutdown().borrow());
         assert!(*alice_oftc.watch_shutdown().borrow());
         assert!(!*bob.watch_shutdown().borrow());
@@ -1846,10 +2173,81 @@ mod key_tests {
         assert!(registry.get_owned("alice", "oftc").is_none());
         assert!(registry.get_owned("bob", "libera").is_some());
         assert!(registry.get_shared("shared").is_some());
-        assert_eq!(
-            registry.remove_owner("alice").await,
-            0,
-            "retries are idempotent"
-        );
+        assert_eq!(remove_owner("alice").await, 0, "retries are idempotent");
+    }
+
+    /// A mutation whose caller is dropped part-way — an HTTP request abandoned
+    /// at its deadline — still completes: the stop of the old driver and the
+    /// start of the new one are never separated.
+    #[tokio::test]
+    async fn a_mutation_whose_caller_is_dropped_still_completes() {
+        let registry = Arc::new(empty_registry());
+        assert!(ensure_alice_libera(&registry).await);
+        let first = registry.get_owned("alice", "libera").expect("started");
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed) = tokio::sync::oneshot::channel::<()>();
+        let caller = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .mutate(|lane| async move {
+                        entered_tx.send(()).expect("the test awaits entry");
+                        drop(proceed.await);
+                        lane.replace(
+                            Some("alice"),
+                            "libera",
+                            Box::new(crate::bouncer::LoopbackDriver::new(16)),
+                        )
+                        .await;
+                    })
+                    .await;
+            })
+        };
+        entered.await.expect("the mutation started");
+        // The caller goes away mid-transition, as a request past its deadline.
+        caller.abort();
+        drop(caller.await);
+        drop(proceed_tx);
+        // The lane is taken only once the abandoned work has finished.
+        let replaced = registry
+            .mutate(|lane| async move { lane.get_owned("alice", "libera") })
+            .await
+            .expect("the replacement started although its caller was gone");
+        assert!(!Arc::ptr_eq(&first, &replaced));
+        assert!(*first.watch_shutdown().borrow());
+    }
+
+    /// A stop that keeps the network's rows writes the lines its driver said
+    /// last; one ahead of a deletion drops them.
+    #[tokio::test]
+    async fn a_stop_that_keeps_the_rows_writes_what_was_still_queued() {
+        for (unwritten, kept) in [(UnwrittenLines::Store, 3), (UnwrittenLines::Discard, 0)] {
+            let (handle, ends) = super::super::NetworkHandle::channels(16);
+            let events = handle.subscribe();
+            for n in 0..3 {
+                ends.emit_line(format!(":peer PRIVMSG #room :last words {n}"));
+            }
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            stop.send(unwritten).expect("stop");
+            let mut feed = PersistenceFeed {
+                events,
+                stopped,
+                draining: None,
+            };
+            // Finite: the drain ends at what was queued, without waiting for
+            // a driver that will say nothing more.
+            let written = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut written = 0;
+                while let Some(event) = feed.next().await {
+                    event.expect("no lag");
+                    written += 1;
+                }
+                written
+            })
+            .await
+            .expect("the drain ends");
+            assert_eq!(written, kept, "{unwritten:?}");
+            drop(ends);
+        }
     }
 }

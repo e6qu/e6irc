@@ -17,35 +17,12 @@ const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 /// before deserialization while admitting every wire-sized composer command.
 const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
 
-/// How long one outbound frame may wait for the peer to take it.
-const SOCKET_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::peer_write::{PEER_WRITE_DEADLINE, SendFailure, within_send_deadline};
 
-/// Why an outbound frame was not delivered. Either way the connection is over.
-#[derive(Debug)]
-enum SendFailure {
-    Transport,
-    Stalled,
-}
-
-/// Write one frame, giving up on a peer that has stopped reading.
-///
-/// A peer that keeps the connection open but advertises a zero receive window
-/// parks a bare `send` forever. The task would then never observe its network
-/// being removed or its send queue being closed, and would hold the network
-/// handle and the per-IP connection slot for as long as the peer liked.
+/// Write one frame, giving up on a peer that has stopped reading
+/// ([`crate::peer_write`]).
 async fn send_frame(socket: &mut WebSocket, frame: WsMessage) -> Result<(), SendFailure> {
-    within_send_deadline(SOCKET_SEND_DEADLINE, socket.send(frame)).await
-}
-
-async fn within_send_deadline<E>(
-    deadline: std::time::Duration,
-    send: impl Future<Output = Result<(), E>>,
-) -> Result<(), SendFailure> {
-    match tokio::time::timeout(deadline, send).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(SendFailure::Transport),
-        Err(_) => Err(SendFailure::Stalled),
-    }
+    within_send_deadline(PEER_WRITE_DEADLINE, socket.send(frame)).await
 }
 
 /// Outbound WebSocket frame discipline, fixed for the connection by ircv3
@@ -63,11 +40,27 @@ pub(super) enum WsFrameMode {
     Auto,
 }
 
+/// A WebSocket upgrade request, rejected as a problem document rather than
+/// axum's plain-text default: a plain `GET /ws/irc` is a `400` (or `426` for a
+/// wrong version) in the same shape as every other refusal.
+pub(super) struct UpgradeRequest(WebSocketUpgrade);
+
+problem_extractor!(
+    UpgradeRequest => WebSocketUpgrade,
+    [],
+    |upgrade| UpgradeRequest(upgrade),
+    |rejection: &axum::extract::ws::rejection::WebSocketUpgradeRejection| problem(
+        rejection.status(),
+        "Invalid WebSocket upgrade",
+        Some(&rejection.body_text()),
+    ),
+);
+
 pub(super) async fn ws_irc(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
-    ws: WebSocketUpgrade,
+    UpgradeRequest(ws): UpgradeRequest,
 ) -> Response {
     // Enforce the same per-IP connection cap the raw IRC listeners apply,
     // keyed on the real client IP (X-Forwarded-For behind a trusted proxy) so
@@ -76,10 +69,13 @@ pub(super) async fn ws_irc(
     let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
     let Some(guard) = state.conn_limiter.try_acquire(ip) else {
         state.telemetry.record_connection_rejected();
-        return problem(
-            StatusCode::TOO_MANY_REQUESTS,
+        // A slot frees only when a connection closes, which nothing here can
+        // predict; the registration timeout is the soonest one held by a
+        // connection that never registered is reclaimed.
+        return retry_later(
             "Per-IP connection limit reached",
-            None,
+            "Close another connection from this address, or retry after the interval in the Retry-After header.",
+            retry_after_seconds(crate::core::REGISTRATION_TIMEOUT),
         );
     };
     // ircv3 WebSocket subprotocol negotiation: pick the client's first-offered
@@ -405,7 +401,7 @@ pub(super) async fn ws_ui(
     headers: axum::http::HeaderMap,
     Authenticated(account, credential): Authenticated,
     QueryParams(params): QueryParams<UiParams>,
-    ws: WebSocketUpgrade,
+    UpgradeRequest(ws): UpgradeRequest,
 ) -> Response {
     if let Err(refusal) = require_same_origin_upgrade(&state, &headers) {
         return refusal.into();
@@ -1486,23 +1482,6 @@ mod tests {
         assert_eq!(rejected["t"], "send-error");
         assert_eq!(rejected["v"], "a2");
         assert_eq!(rejected["message"], "not sent");
-    }
-}
-
-#[cfg(test)]
-mod send_deadline_tests {
-    use super::{SendFailure, within_send_deadline};
-
-    #[tokio::test]
-    async fn a_peer_that_never_takes_the_frame_ends_the_send() {
-        let deadline = std::time::Duration::from_millis(20);
-        let stalled =
-            within_send_deadline(deadline, std::future::pending::<Result<(), ()>>()).await;
-        assert!(matches!(stalled, Err(SendFailure::Stalled)));
-        let delivered = within_send_deadline(deadline, async { Ok::<(), ()>(()) }).await;
-        assert!(delivered.is_ok());
-        let failed = within_send_deadline(deadline, async { Err::<(), ()>(()) }).await;
-        assert!(matches!(failed, Err(SendFailure::Transport)));
     }
 }
 

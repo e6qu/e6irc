@@ -7,7 +7,7 @@ use super::BoundedJson;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio_tungstenite::tungstenite::Message as Ws;
 
 use super::{DriverEnds, NetworkDriver, NetworkHandle};
@@ -50,8 +50,7 @@ async fn send_gateway<T: serde::Serialize>(
         eprintln!("discord: could not encode {what}: {error}");
         Dropped(NetworkFailure::UpstreamProtocolFailed)
     })?;
-    write
-        .send(frame)
+    super::bridge_ws_send(write, frame)
         .await
         .map_err(|_| Dropped(NetworkFailure::UpstreamWriteFailed))
 }
@@ -208,7 +207,15 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
         Ok(me) => me,
         Err(error) => return error.into_outcome("discord bot user"),
     };
-    let identity = super::bridged_identity("discord", &me.username);
+    // Every sender is keyed by its user id: a username is not the account (a
+    // webhook posts under any name it likes, the bot's own included).
+    let mut senders = super::BridgedSenders::new(super::ProviderAccount {
+        id: &me.id,
+        name: &me.username,
+        user: &me.id,
+        host: "discord",
+    });
+    let identity = senders.own().clone();
 
     let resume = shared.resume_state();
     let gateway = match &resume {
@@ -375,8 +382,14 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                             continue;
                         };
                         if let Some(channel) = id_to_channel.get(&channel_id) {
+                            let who = senders.identity(super::ProviderAccount {
+                                id: &author_id,
+                                name: &author,
+                                user: &author_id,
+                                host: "discord",
+                            });
                             for line in super::render_bridged(
-                                "discord", &author, channel, &super::Inbound::message(&body),
+                                &who, channel, &super::Inbound::message(&body),
                             ) {
                                 ends.emit_line(line);
                             }
@@ -865,12 +878,22 @@ mod tests {
     fn renders_and_routes() {
         assert_eq!(
             crate::bouncer::render_bridged(
-                "discord",
-                "alice",
+                &crate::bouncer::BridgedSenders::new(crate::bouncer::ProviderAccount {
+                    id: "1",
+                    name: "bot",
+                    user: "1",
+                    host: "discord",
+                })
+                .identity(crate::bouncer::ProviderAccount {
+                    id: "7",
+                    name: "alice",
+                    user: "7",
+                    host: "discord",
+                }),
                 "#general",
                 &crate::bouncer::Inbound::message("hi there")
             ),
-            vec![":alice!alice@discord PRIVMSG #general :hi there"]
+            vec![":alice!7@discord PRIVMSG #general :hi there"]
         );
         // The map is keyed by the *folded* channel name (as the driver inserts).
         let mut map = HashMap::new();
@@ -1327,7 +1350,7 @@ mod tests {
             identify(&mut oracle, 0, 60_000).await;
             oracle.send(0, discord_message_frame(2, "\u{1}VERSION\u{1} \u{2}hi"));
             let line = line_containing(&mut events, "VERSION").await;
-            assert_eq!(line, ":alice!alice@discord PRIVMSG #general :VERSION hi");
+            assert_eq!(line, ":alice!user@discord PRIVMSG #general :VERSION hi");
         }
     }
 

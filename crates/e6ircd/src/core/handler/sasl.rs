@@ -31,8 +31,28 @@ fn sasl_unavailable(state: &mut ServerState, conn: ConnId) {
     );
 }
 
-/// A credential verification was denied — either a definitive rejection
-/// (`unavailable == false`) or a store fault (`unavailable == true`). Routed by
+/// Why a credential verification did not log the session in.
+#[derive(Clone, Copy)]
+enum Denial {
+    /// The store answered: wrong password or no such account.
+    Rejected,
+    /// The account name has spent its password attempts for the window, so
+    /// nothing was checked.
+    Throttled(crate::db::LoginRetryAfter),
+    /// The store could not answer.
+    Unavailable,
+}
+
+/// SASL refused because the account name's attempt window is spent: the same
+/// 904 a wrong password gets (the attempt failed and may be retried), with
+/// the wait in its text.
+fn sasl_throttled(state: &mut ServerState, conn: ConnId, retry_after: crate::db::LoginRetryAfter) {
+    state.sessions.get_mut(&conn).expect("checked").sasl = crate::core::state::SaslState::Idle;
+    let text = retry_after.explanation();
+    state.numeric(conn, ERR_SASLFAIL, &[], Some(&text));
+}
+
+/// A credential verification was denied, for the [`Denial`] reason. Routed by
 /// the verdict's own `origin` so a SASL denial fails the SASL attempt and a
 /// NickServ IDENTIFY denial answers NickServ, never the reverse. The session
 /// flag is consulted only for liveness: a denial for an attempt already aborted
@@ -41,15 +61,15 @@ fn verify_denied(
     state: &mut ServerState,
     conn: ConnId,
     origin: crate::core::CredentialOrigin,
-    unavailable: bool,
+    denial: Denial,
 ) {
     match origin {
         crate::core::CredentialOrigin::Sasl => {
             if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
-                if unavailable {
-                    sasl_unavailable(state, conn);
-                } else {
-                    sasl_fail(state, conn);
+                match denial {
+                    Denial::Rejected => sasl_fail(state, conn),
+                    Denial::Throttled(retry_after) => sasl_throttled(state, conn, retry_after),
+                    Denial::Unavailable => sasl_unavailable(state, conn),
                 }
             }
             // else: stale reply for an aborted SASL attempt — drop it.
@@ -58,14 +78,18 @@ fn verify_denied(
             let Some(label) = take_identify_label(state, conn) else {
                 return; // stale IDENTIFY reply (superseded/aborted)
             };
-            let text = if unavailable {
-                "Services are temporarily unavailable. Try again later.".to_string()
-            } else {
-                let nick = state.sessions[&conn]
-                    .nick()
-                    .map(String::from)
-                    .unwrap_or_else(|| "*".to_string());
-                format!("Invalid password for \x02{nick}\x02.")
+            let text = match denial {
+                Denial::Unavailable => {
+                    "Services are temporarily unavailable. Try again later.".to_string()
+                }
+                Denial::Throttled(retry_after) => retry_after.explanation(),
+                Denial::Rejected => {
+                    let nick = state.sessions[&conn]
+                        .nick()
+                        .map(String::from)
+                        .unwrap_or_else(|| "*".to_string());
+                    format!("Invalid password for \x02{nick}\x02.")
+                }
             };
             // Frame the failure under the IDENTIFY's label; unheld, like the
             // success path.
@@ -356,6 +380,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         reply,
         crate::core::DbReply::PasswordVerified { .. }
             | crate::core::DbReply::PasswordRejected { .. }
+            | crate::core::DbReply::PasswordThrottled { .. }
             | crate::core::DbReply::Unavailable { .. }
     );
     // A SASL verify reply (even one for an aborted attempt) clears the
@@ -369,6 +394,9 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             ..
         } | crate::core::DbReply::PasswordRejected {
             origin: crate::core::CredentialOrigin::Sasl,
+        } | crate::core::DbReply::PasswordThrottled {
+            origin: crate::core::CredentialOrigin::Sasl,
+            ..
         } | crate::core::DbReply::Unavailable {
             origin: crate::core::CredentialOrigin::Sasl,
         }
@@ -383,7 +411,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     if let crate::core::DbReply::PasswordVerified { account, origin } = &reply
         && state.is_account_suspended(account)
     {
-        verify_denied(state, conn, *origin, false);
+        verify_denied(state, conn, *origin, Denial::Rejected);
         return;
     }
     match reply {
@@ -448,10 +476,16 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             notify_account_change(state, conn, &account);
         }
         crate::core::DbReply::PasswordRejected { origin } => {
-            verify_denied(state, conn, origin, false);
+            verify_denied(state, conn, origin, Denial::Rejected);
+        }
+        crate::core::DbReply::PasswordThrottled {
+            origin,
+            retry_after,
+        } => {
+            verify_denied(state, conn, origin, Denial::Throttled(retry_after));
         }
         crate::core::DbReply::Unavailable { origin } => {
-            verify_denied(state, conn, origin, true);
+            verify_denied(state, conn, origin, Denial::Unavailable);
         }
         crate::core::DbReply::AccountRegisterUnavailable { origin } => {
             // A registration whose persist failed. Answer the way the client
@@ -555,7 +589,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     display,
                     label,
                 },
-                "TEMPORARILY_UNAVAILABLE",
+                HistoryFail::TemporarilyUnavailable,
                 "Read marker could not be persisted",
             );
         }
@@ -574,7 +608,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     display,
                     label,
                 },
-                "INVALID_PARAMS",
+                HistoryFail::InvalidParams,
                 "Too many read markers",
             );
         }
@@ -596,7 +630,7 @@ pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, accou
         return; // pre-registration SASL: peers cannot exist yet
     }
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} ACCOUNT {account}");
+    let line = state.user_line(conn, format!(":{prefix} ACCOUNT {account}"));
     notify_event(
         state,
         conn,

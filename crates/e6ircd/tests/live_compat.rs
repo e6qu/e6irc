@@ -2,7 +2,8 @@
 //! They register and read the greeting and ISUPPORT.
 //!
 //! They do not run in normal CI. Each test opens two brief sessions and QUITs.
-//! Run manually:
+//! The public-IRC qualification campaign runs them per target
+//! (`tools/qualification/public-irc-probe.sh`); by hand:
 //!
 //!   cargo test -p e6ircd --test live_compat -- --ignored --nocapture
 
@@ -54,11 +55,14 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
         }
         Ok::<(), std::io::Error>(())
     })
-    .await;
-    // Accept timeout after registration.
-    if let Ok(res) = outcome {
-        res?;
-    }
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the greeting never ended (no 376/422)",
+        )
+    })?;
+    outcome?;
     let _ = conn.send_line("QUIT :interop probe done").await;
     Ok((welcomed, isupport))
 }

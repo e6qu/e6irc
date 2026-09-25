@@ -182,7 +182,7 @@ pub(super) async fn oidc_start(
     // Each login start forces an outbound discovery fetch, so throttle the
     // unauthenticated flood per client IP.
     _rl: RateLimited,
-    Path(provider_name): Path<String>,
+    PathParams(provider_name): PathParams<String>,
 ) -> Response {
     oidc_authorize(&state, &provider_name, None, false).await
 }
@@ -197,7 +197,7 @@ pub(super) async fn oidc_start(
 pub(super) async fn oidc_sso_start(
     State(state): State<Arc<AppState>>,
     _rl: RateLimited,
-    Path(provider_name): Path<String>,
+    PathParams(provider_name): PathParams<String>,
 ) -> Response {
     oidc_authorize(&state, &provider_name, None, true).await
 }
@@ -215,7 +215,7 @@ pub(super) async fn oidc_link_start(
     // the account. A bearer admitted here could link its holder's own identity
     // and sign in as the owner, with nothing more than the `read` scope.
     BrowserSession(account, session): BrowserSession,
-    Path(provider_name): Path<String>,
+    PathParams(provider_name): PathParams<String>,
     // A cross-site top-level navigation carries the SameSite=Lax session
     // cookie, so without the session-bound value any page could start a link
     // flow in the owner's browser and, at a provider that auto-approves, attach
@@ -487,7 +487,7 @@ fn account_name_taken(claim_name: &str) -> Response {
 
 pub(super) async fn oidc_callback(
     State(state): State<Arc<AppState>>,
-    Path(provider_name): Path<String>,
+    PathParams(provider_name): PathParams<String>,
     headers: axum::http::HeaderMap,
     QueryParams(query): QueryParams<CallbackQuery>,
 ) -> Response {
@@ -1047,6 +1047,7 @@ pub(super) async fn oidc_backchannel_logout(
 
 pub(super) async fn oidc_frontchannel_logout(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     // Unlike the signed back-channel path, this endpoint has no token to verify —
     // it revokes a session by a guessable `sid`. Rate-limit per client IP so it
     // can't be used to brute-force sids and force-logout victims.
@@ -1073,29 +1074,45 @@ pub(super) async fn oidc_frontchannel_logout(
             None,
         );
     };
-    if let Err(error) =
-        crate::db::revoke_oidc_frontchannel_sessions(pool, &query.iss, &query.sid).await
+    let presented = session_token(&headers, state.secure_cookies);
+    let revocation = match crate::db::revoke_oidc_frontchannel_sessions(
+        pool,
+        &query.iss,
+        &query.sid,
+        presented.as_deref(),
+    )
+    .await
     {
-        eprintln!("oidc: front-channel session revocation failed: {error}");
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Session storage failed",
-            None,
-        );
-    }
-    (
+        Ok(revocation) => revocation,
+        Err(error) => {
+            eprintln!("oidc: front-channel session revocation failed: {error}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            );
+        }
+    };
+    let mut response = (
         StatusCode::OK,
         [
             (header::CACHE_CONTROL, "no-store".to_string()),
             (header::CONTENT_SECURITY_POLICY, frame_policy),
-            (
-                header::SET_COOKIE,
-                clear_session_cookie(state.secure_cookies),
-            ),
         ],
         "",
     )
-        .into_response()
+        .into_response();
+    // The cookie is cleared only when it named a session this logout revoked;
+    // a visitor whose own session the issuer/sid does not name keeps it.
+    if revocation.presented_session_revoked {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            clear_session_cookie(state.secure_cookies)
+                .parse()
+                .expect("generated cookie is a valid header"),
+        );
+    }
+    response
 }
 
 /// The front-channel logout answer's policy: nothing may load, and only the
@@ -1140,33 +1157,87 @@ where
     }
 }
 
+/// Declares `$wrapper` as axum's `$inner` extractor whose rejection is answered
+/// by `$refuse` — a problem document — instead of axum's plain-text (or empty)
+/// default. Every "axum would answer this in its own shape" wrapper is this one
+/// impl, so the shapes cannot drift apart.
+macro_rules! problem_extractor {
+    (
+        $wrapper:ty => $inner:ty,
+        [$($generics:tt)*],
+        |$value:pat_param| $unwrap:expr,
+        $refuse:expr $(,)?
+    ) => {
+        impl<$($generics)* S: Send + Sync> axum::extract::FromRequestParts<S> for $wrapper {
+            type Rejection = Response;
+
+            async fn from_request_parts(
+                parts: &mut axum::http::request::Parts,
+                state: &S,
+            ) -> Result<Self, Self::Rejection> {
+                <$inner as axum::extract::FromRequestParts<S>>::from_request_parts(parts, state)
+                    .await
+                    .map(|$value| $unwrap)
+                    .map_err(|rejection| $refuse(&rejection))
+            }
+        }
+    };
+}
+pub(crate) use problem_extractor;
+
 /// A query string, rejected as a problem document rather than axum's plain-text
 /// default. Every query struct is `deny_unknown_fields`, so a stray parameter
 /// is a `400` on every route; this is the one place that `400` takes its shape.
 pub(crate) struct QueryParams<T>(pub(crate) T);
 
-impl<T, S> axum::extract::FromRequestParts<S> for QueryParams<T>
-where
-    T: serde::de::DeserializeOwned,
-    S: Send + Sync,
-{
-    type Rejection = Response;
+problem_extractor!(
+    QueryParams<T> => Query<T>,
+    [T: serde::de::DeserializeOwned,],
+    |Query(value)| QueryParams(value),
+    |rejection: &axum::extract::rejection::QueryRejection| problem(
+        StatusCode::BAD_REQUEST,
+        "Invalid query",
+        Some(&rejection.body_text()),
+    ),
+);
 
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        match <Query<T> as axum::extract::FromRequestParts<S>>::from_request_parts(parts, state)
-            .await
-        {
-            Ok(Query(value)) => Ok(QueryParams(value)),
-            Err(rejection) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid query",
-                Some(&rejection.body_text()),
-            )),
-        }
+/// Path parameters, rejected as a problem document rather than axum's
+/// plain-text default. A `/tokens/abc` where an integer ID belongs, or a
+/// segment whose percent-encoding is not UTF-8, is a `400` in the same shape as
+/// every other refusal, so a client reads one error format for the whole API.
+/// Handlers ask for this, never `axum::extract::Path` directly.
+pub(crate) struct PathParams<T>(pub(crate) T);
+
+problem_extractor!(
+    PathParams<T> => axum::extract::Path<T>,
+    [T: serde::de::DeserializeOwned + Send,],
+    |axum::extract::Path(value)| PathParams(value),
+    path_rejection_problem,
+);
+
+/// The problem document for a path the extractor refused. A route matched
+/// but the extractor found no parameters is a server bug, not the client's
+/// input, so it is a `500`; everything else is the client's `400`.
+fn path_rejection_problem(rejection: &axum::extract::rejection::PathRejection) -> Response {
+    match rejection {
+        axum::extract::rejection::PathRejection::MissingPathParams(_) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Route parameters unavailable",
+            Some(&rejection.body_text()),
+        ),
+        _ => problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid path parameter",
+            Some(&rejection.body_text()),
+        ),
     }
+}
+
+/// The answer to a request whose path exists but whose method does not, in the
+/// same problem shape as every other refusal. Axum still adds the `Allow`
+/// header naming the methods the path does serve.
+pub(super) async fn method_not_allowed() -> Response {
+    problem(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed", None)
 }
 
 /// An authenticated account and the credential that proved it, extracted
@@ -1277,7 +1348,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
 
 /// A request that has spent one token from the per-IP auth-rate budget. Every
 /// unauthenticated, work-inducing route asks for this in its signature instead
-/// of opening with the `client_ip` + `auth_rate_ok` prologue (and pulling in
+/// of opening with the `client_ip` + `spend_auth_budget` prologue (and pulling in
 /// `ConnectInfo` + `HeaderMap`) by hand — so the throttle is declared in one
 /// visible place, a `_: RateLimited` argument, and a route that induces work
 /// without it is a conspicuous omission rather than a forgotten first line the
@@ -1303,15 +1374,15 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RateLimited {
             .map(|ci| ci.0.ip())
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let ip = client_ip(peer, &parts.headers, &state.trusted_proxies);
-        if auth_rate_ok(state, ip) {
-            Ok(RateLimited)
-        } else {
-            Err(problem(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many requests",
-                None,
-            ))
-        }
+        spend_auth_budget(state, ip)
+            .map(|()| RateLimited)
+            .map_err(|retry_after| {
+                retry_later(
+                    "Too many requests",
+                    "This address's authentication budget is spent. Retry after the interval in the Retry-After header.",
+                    retry_after,
+                )
+            })
     }
 }
 
@@ -1608,10 +1679,30 @@ pub(super) fn rate_limit_response(retry_after: u64) -> Response {
     )
 }
 
+/// A wait in whole `Retry-After` seconds, rounded up so a client that obeys it
+/// never retries early, and never zero.
+pub(super) fn retry_after_seconds(wait: std::time::Duration) -> u64 {
+    wait.as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0))
+        .max(1)
+}
+
 /// A `429` problem carrying the seconds after which the same request can
 /// succeed.
 pub(super) fn retry_later(title: &str, detail: &str, retry_after: u64) -> Response {
-    let mut response = problem(StatusCode::TOO_MANY_REQUESTS, title, Some(detail));
+    too_many_requests(
+        problem(RETRY_LATER_STATUS, title, Some(detail)),
+        retry_after,
+    )
+}
+
+const RETRY_LATER_STATUS: StatusCode = StatusCode::TOO_MANY_REQUESTS;
+
+/// Turn `response` into a `429` that says when to retry: the one place a
+/// `429` is made, so none leaves without `Retry-After`. [`retry_later`] is the
+/// problem-document form; a page (the sign-in form) passes its own document.
+pub(super) fn too_many_requests(mut response: Response, retry_after: u64) -> Response {
+    *response.status_mut() = RETRY_LATER_STATUS;
     response.headers_mut().insert(
         header::RETRY_AFTER,
         retry_after
@@ -1620,6 +1711,17 @@ pub(super) fn retry_later(title: &str, detail: &str, retry_after: u64) -> Respon
             .expect("numeric Retry-After is a valid header"),
     );
     response
+}
+
+/// A password check refused because the account name has spent its attempts
+/// for the window ([`crate::db::DbError::LoginThrottled`]): the same `429` and
+/// `Retry-After` from every endpoint that checks a password.
+pub(super) fn login_throttled(retry_after: crate::db::LoginRetryAfter) -> Response {
+    retry_later(
+        "Too many login attempts",
+        &retry_after.explanation(),
+        retry_after.seconds(),
+    )
 }
 
 /// The account and its durable posture, refused when suspended or gone.
@@ -1713,22 +1815,24 @@ fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
 /// all — the map would otherwise grow to ~request-rate × 60s. This cap bounds it.
 const MAX_AUTH_BUCKETS: usize = 4096;
 
-/// Spend one token from `ip`'s auth bucket. Returns `false` (rate-limited) when
-/// the bucket is empty; always `true` when `auth_rate_burst` is unset. The
-/// bucket refills to full over 60s; fully-refilled entries are pruned, and the
-/// map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow without bound even
-/// under a distinct-IP flood.
-pub(super) fn auth_rate_ok(state: &AppState, ip: crate::net::ClientIp) -> bool {
+/// Spend one token from `client`'s auth bucket, keyed by its
+/// [`PeerLimitKey`](crate::net::PeerLimitKey) (an IPv6 client's whole `/64`).
+/// A refusal is the whole seconds until the bucket holds a token again, for
+/// the `Retry-After` header; always `Ok` when `auth_rate_burst` is unset. The
+/// bucket refills to full over [`API_RATE_WINDOW`]; fully-refilled entries are
+/// pruned, and the map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow
+/// without bound even under a distinct-IP flood.
+pub(super) fn spend_auth_budget(state: &AppState, client: crate::net::ClientIp) -> Result<(), u64> {
     let Some(burst) = state.auth_rate_burst else {
-        return true;
+        return Ok(());
     };
-    let burst = burst as f64;
-    let refill_per_sec = burst / 60.0;
+    let ip = client.limit_key();
+    let refill_per_sec = burst as f64 / API_RATE_WINDOW.as_secs_f64();
     let now = std::time::Instant::now();
     let mut buckets = state.auth_buckets.lock().expect("poisoned");
     if buckets.len() > MAX_AUTH_BUCKETS {
         buckets.retain(|_, (tokens, last)| {
-            *tokens + now.duration_since(*last).as_secs_f64() * refill_per_sec < burst
+            *tokens + now.duration_since(*last).as_secs_f64() * refill_per_sec < burst as f64
         });
         // A distinct-IP flood leaves nothing for the retain to prune (every
         // entry is below full). Evict the least-recently-seen entry to make room
@@ -1744,15 +1848,7 @@ pub(super) fn auth_rate_ok(state: &AppState, ip: crate::net::ClientIp) -> bool {
             buckets.remove(&oldest);
         }
     }
-    let entry = buckets.entry(ip).or_insert((burst, now));
-    entry.0 = (entry.0 + now.duration_since(entry.1).as_secs_f64() * refill_per_sec).min(burst);
-    entry.1 = now;
-    if entry.0 >= 1.0 {
-        entry.0 -= 1.0;
-        true
-    } else {
-        false
-    }
+    spend_api_bucket(&mut buckets, ip, burst, now)
 }
 
 /// Whether two URLs share an origin (scheme + host + port).

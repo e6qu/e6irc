@@ -1107,9 +1107,8 @@ impl Connection {
     ///
     /// For callers that relay or store what they receive rather than acting on
     /// it — a bouncer's detached buffer, a logger. Re-serializing the parsed
-    /// message would be a second implementation of the wire format kept in step
-    /// with `Message::to_line` by hand, and it cannot be more faithful than the
-    /// bytes that arrived.
+    /// message would be a second implementation of the wire format, and it
+    /// cannot be more faithful than the bytes that arrived.
     pub async fn next_message_with_line(&mut self) -> io::Result<Option<(OwnedMessage, String)>> {
         loop {
             if let Some(event) = self.pending.pop_front() {
@@ -2495,14 +2494,6 @@ pub struct RegistrationRejection {
 }
 
 impl RegistrationRejection {
-    /// Classify a refusal for which the upstream did not supply a message.
-    pub fn without_diagnostic(refusal: RegistrationRefusal) -> Self {
-        Self {
-            refusal,
-            diagnostic: "no detail from upstream".to_string(),
-        }
-    }
-
     /// The server welcomed the connection, but under a nickname other than the
     /// one requested (a server truncating to its NICKLEN, say). Whether that is
     /// acceptable is the caller's decision — a bouncer's attach listener answers
