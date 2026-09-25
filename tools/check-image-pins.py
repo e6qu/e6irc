@@ -5,8 +5,8 @@ ci.yml's header names the images CI runs besides its own ("Service and tool
 images are pinned by digest"). A tag can be moved to other code; a digest
 cannot. So each non-comment reference to one of those images, in any tracked
 file other than documentation, must carry `@sha256:`, and every reference to
-one image must carry the same digest: a script that runs `postgres:18-alpine`
-bare, or pins a different digest than CI, tests against an image CI never
+one image must carry the same digest: a script that runs a listed image by
+its tag alone, or pins another digest than CI, tests against an image CI never
 qualified.
 """
 
