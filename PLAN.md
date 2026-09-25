@@ -726,6 +726,36 @@ account deletion passing founded channels to their successors in storage and
 in every shard's mirror. Operators read the server bans, private reasons
 included, with STATS k/d/x.
 
+A 2026-09-25 review of the HTTP, WebSocket and console surface found, and this
+change fixes:
+
+- **A live chat socket outlived its credential.** `/ws/ui` kept streaming and
+  sending after logout, session revocation, a password change, provider logout,
+  the session cap, token revocation or expiry. The credential tables announce
+  every change themselves (migration 0076); a listener closes the sockets a
+  change ends (1008), and expiry closes them too.
+- **A stored network secret followed an edited address.** Keeping a password
+  while pointing a network (or a bridge base) somewhere else sent it there; the
+  one function that applies credentials refuses it (409).
+- **Account activity showed other principals' rows.** Audit rows record the
+  kind of each name (migration 0077); an account's activity and export show
+  only rows naming it as an account, and an IRC ban's row names the operator.
+- **OpenID Connect.** A rotated key is followed at once (one throttled refresh);
+  a failed discovery is remembered for 30 s; the callback is rate-limited and a
+  flow is answered once; provider calls obey the egress rule within the
+  configured issuer's trust domain; an email names a new account only when
+  verified under a domain policy.
+- **Step-up re-authentication** guards the self-service changes that mint or
+  redirect lasting access (migration 0078), with a console confirm-and-retry.
+- **The session's CSRF value left URLs** (sign-out is a form post, linking a
+  POST); revoking one browser session refuses a bearer as the bulk revocation
+  does; administrator pages spend the administrator budget; the configuration
+  view is an allowlist.
+- **The contract.** Pre-handler statuses (429 for rate-limited handlers, 408,
+  413, the re-authentication 403) are derived from handler signatures; the body
+  limit's and the monitoring endpoint's refusals are problem documents; `/ws/ui`
+  is described; a REST topic is stored whole or refused.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
