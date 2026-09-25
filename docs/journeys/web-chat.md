@@ -92,9 +92,15 @@ survive process restart.
    position the ring has evicted — is answered with a typed `replay full`
    event and the whole ring, and the client starts its transcript over with one
    "history reloaded" note rather than guessing at an overlap.
-3. The client uses message identifiers and the exact ordered wire overlap at
-   the page boundary to deduplicate history/live overlap without conflating
-   distinct identical messages.
+3. Every row records the replay cursor before its line, and **Load earlier**
+   reads the buffer `through` the oldest row's cursor, so history holds only
+   lines older than the buffer and nothing is matched by content. When the
+   server cannot bound the read (the network restarted, or is stopped and its
+   lines are persisted history) it refuses the cursor with 409, and only then
+   does the client read the whole page and remove the exact ordered overlap at
+   the seam — matching wire lines, and its own lines against their local
+   echoes, past join/part notices — plus shared message identifiers, without
+   conflating distinct identical messages.
 4. Loading history expands the active buffer by one bounded page, so older
    context remains visible even when the normal live window was already full.
 5. Server-time determines presentation ordering where supplied; arrival order
@@ -177,7 +183,14 @@ current network and conversation selection.
    it; every composer frame it sends is rejected.
 4. Only `sent` creates local echo and sent-history. A rejection keeps the text
    available for retry, so displayed success means server-side queue
-   admission—not merely a browser socket write.
+   admission—not merely a browser socket write. The server never echoes a line
+   to the socket that sent it, so every accepted chat line is echoed where it
+   was addressed: plain text, `/me` in any letter case, `/msg`, `/notice`, and
+   a PRIVMSG or NOTICE typed raw (into the console, or with `/raw`/`/quote`),
+   routed by the same rule as a received line. A message longer than one IRC
+   line as the upstream relays it (510 bytes behind `:nick!user@host `) is
+   split on UTF-8 code point boundaries, preferring word breaks, into several
+   requests, each echoed once; the composer carries no misleading length cap.
 5. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
    labels, including comma-separated membership targets and multi-target KICK.
 6. Direct messages create query buffers. Closing a query removes only the
@@ -185,7 +198,14 @@ current network and conversation selection.
    STATUSMSG targets such as `@#ops` and `+#ops` route to `#ops`; persisted
    history uses this same routing policy, including the server-notice rule.
 7. Inactive conversations retain both unread traffic and unread direct-mention
-   counts, so attention-worthy traffic is distinguishable before switching.
+   counts, so attention-worthy traffic is distinguishable before switching. A
+   `/me` action naming the reader is a mention. The console's copy of each line
+   is not counted again, a full replay (first attach, or `replay full`) is the
+   backlog rather than unread traffic, and no replay raises a desktop
+   notification; the lines a resumed replay delivers were missed while the
+   page was away and count as unread. The conversation and member lists update
+   their existing entries in place, so a new line or a member change never
+   takes keyboard focus from the entry it is on.
 8. Errors from the driver or IRC server appear in the relevant status path.
    The **console**, the first entry in the conversations, holds the whole
    exchange: every exact safe inbound wire line beside e6irc's own notices, so

@@ -509,7 +509,12 @@ pub(super) async fn ws_ui_conn(
         Some(ReplayRequest::After(cursor)) => Some(cursor),
         Some(ReplayRequest::Unknown) | None => None,
     };
-    let (mut events, replay, session_snapshot) = handle.subscribe_with_replay_snapshot(after);
+    let crate::bouncer::AttachSnapshot {
+        mut events,
+        replay,
+        session: session_snapshot,
+        features,
+    } = handle.subscribe_with_replay_snapshot(after);
     // Every line event names the ring position after it, so a client that
     // loses this socket can hand back exactly where it stopped. A live event
     // that entered no ring keeps the position where it was.
@@ -540,6 +545,25 @@ pub(super) async fn ws_ui_conn(
         return;
     }
 
+    // The driver's authoritative identity, memberships and ISUPPORT, as of the
+    // same instant as the replay, before any replayed line: the client reads
+    // the replay as the nick it is now (a line of its own is its own, not a
+    // stranger's under the configured nick) with the network's own channel
+    // modes, even once the ring has evicted the 001 and 005 that said so. A
+    // bounded replay is history, not current state; the client holds this
+    // snapshot over whatever the replay says, so an aged-out JOIN or a stale
+    // PART cannot leave it attached to the wrong conversations.
+    if let Some(session) = session_snapshot
+        && send_frame(
+            &mut socket,
+            WsMessage::text(session_event(&session, &features)),
+        )
+        .await
+        .is_err()
+    {
+        return;
+    }
+
     // Playback: everything buffered while detached (or after the cursor), as
     // JSON line events.
     for entry in &replay.lines {
@@ -553,16 +577,6 @@ pub(super) async fn ws_ui_conn(
         {
             return;
         }
-    }
-    // A bounded replay is history, not current state. Reconcile the driver's
-    // authoritative identity and memberships after it so an aged-out JOIN or a
-    // stale PART cannot leave the browser attached to the wrong conversations.
-    if let Some(session) = session_snapshot
-        && send_frame(&mut socket, WsMessage::text(session_event(&session)))
-            .await
-            .is_err()
-    {
-        return;
     }
     // Delimit replay from live traffic. The browser waits for this typed
     // boundary before requesting authoritative NAMES snapshots, so old NAMES
@@ -624,7 +638,10 @@ pub(super) async fn ws_ui_conn(
                     }
                 }
                 Ok(DriverEvent::Session(session)) => {
-                    if send_frame(&mut socket, WsMessage::text(session_event(&session))).await
+                    // The features are read now, not carried by the event: a
+                    // newer value only repeats what the live 005 lines say.
+                    let features = handle.upstream_features();
+                    if send_frame(&mut socket, WsMessage::text(session_event(&session, &features))).await
                         .is_err()
                     {
                         break;
@@ -972,6 +989,10 @@ enum UiEvent<'a> {
     Session {
         nick: &'a str,
         channels: &'a [String],
+        /// The upstream's `RPL_ISUPPORT` tokens (empty before its 005, and
+        /// for a bridge), so channel-mode parsing survives the ring evicting
+        /// the 005 lines themselves.
+        isupport: &'a [String],
     },
     #[serde(rename = "status")]
     Status {
@@ -1107,10 +1128,14 @@ pub(super) fn replay_full_event() -> String {
     ui_event(UiEvent::Replay { v: "full" })
 }
 
-fn session_event(session: &crate::bouncer::IrcSessionSnapshot) -> String {
+fn session_event(
+    session: &crate::bouncer::IrcSessionSnapshot,
+    features: &crate::bouncer::UpstreamFeatures,
+) -> String {
     ui_event(UiEvent::Session {
         nick: &session.nick,
         channels: &session.channels,
+        isupport: &features.isupport,
     })
 }
 
@@ -1246,14 +1271,24 @@ mod tests {
                 serde_json::json!({ "t": "status", "v": "unavailable" }),
             ),
             (
-                session_event(&crate::bouncer::IrcSessionSnapshot {
-                    nick: "alice".to_string(),
-                    channels: vec!["#one".to_string(), "#two".to_string()],
-                }),
+                session_event(
+                    &crate::bouncer::IrcSessionSnapshot {
+                        nick: "alice".to_string(),
+                        channels: vec!["#one".to_string(), "#two".to_string()],
+                    },
+                    &crate::bouncer::UpstreamFeatures {
+                        myinfo_modes: None,
+                        isupport: vec![
+                            "PREFIX=(ov)@+".to_string(),
+                            "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz".to_string(),
+                        ],
+                    },
+                ),
                 serde_json::json!({
                     "t": "session",
                     "nick": "alice",
-                    "channels": ["#one", "#two"]
+                    "channels": ["#one", "#two"],
+                    "isupport": ["PREFIX=(ov)@+", "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz"]
                 }),
             ),
         ];

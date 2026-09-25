@@ -49,16 +49,19 @@ function eventFrom(value) {
       return Object.freeze({ type: "replay" });
     case "session":
       if (
-        !onlyKeys(value, ["t", "nick", "channels"]) ||
+        !onlyKeys(value, ["t", "nick", "channels", "isupport"]) ||
         typeof value.nick !== "string" ||
         value.nick.length === 0 ||
         !Array.isArray(value.channels) ||
-        !value.channels.every((channel) => typeof channel === "string" && channel.length > 0)
+        !value.channels.every((channel) => typeof channel === "string" && channel.length > 0) ||
+        !Array.isArray(value.isupport) ||
+        !value.isupport.every((token) => typeof token === "string" && token.length > 0)
       ) invalid();
       return Object.freeze({
         type: "session",
         nick: value.nick,
         channels: Object.freeze([...value.channels]),
+        isupport: Object.freeze([...value.isupport]),
       });
     case "status":
       if (!onlyKeys(value, ["t", "v", "reason"]) || typeof value.v !== "string") invalid();

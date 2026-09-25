@@ -1798,10 +1798,14 @@ fn operations() -> serde_json::Value {
                         { "name": "name", "in": "path", "required": true,
                             "schema": { "type": "string" } },
                         { "name": "limit", "in": "query", "required": false,
-                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": super::networks::DEFAULT_BUFFER_READ_LIMIT } }],
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": super::networks::DEFAULT_BUFFER_READ_LIMIT } },
+                        { "name": "through", "in": "query", "required": false,
+                            "description": "A `/ws/ui` replay cursor: only the running network's buffered lines at or before it, so a reader holding every line after it receives none twice.",
+                            "schema": { "type": "string", "minLength": 1 } }],
                     "responses": { "200": buffer_response["200"],
-                        "400": { "description": "limit outside 1–1000" },
-                        "404": { "description": "no such network" } } }
+                        "400": { "description": "limit outside 1–1000, or `through` is not a cursor (`field` names it)" },
+                        "404": { "description": "no such network" },
+                        "409": { "description": "`through` names no position of the running network's buffer (another buffer lifetime), or the network is stopped and its lines are persisted history without positions; read without `through`" } } }
             },
             "/api/v1/history": {
                 "get": { "summary": "Paged message history for the account", "security": authenticated,

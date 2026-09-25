@@ -2738,7 +2738,8 @@ history, storage, notification, and socket-protocol failures have visible,
 actionable states; an API failure is never rendered as an empty account. The
 member list is rank-ordered with sigils kept live from channel `MODE`, reading
 membership sigils and which modes take a parameter from the network's own
-`005 PREFIX` and `CHANMODES` (RFC-style defaults until they arrive), and the
+`005 PREFIX` and `CHANMODES` (carried by the session event, so they outlive
+the ring; RFC-style defaults until the network sends them), and the
 client offers a join-channel input and click-to-query on nicks. On phone widths
 the member list is a header-toggled panel mirroring the conversation rail. The
 sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
@@ -2746,8 +2747,16 @@ sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
 ### 13.2 Live chat over WebSocket
 
 The chat page opens one WS (`/ws/ui`, cookie-authenticated). The server pushes
-typed line, status, authoritative `session` (nick + joined channels), and
-`{"t":"snapshot","v":"complete"}` replay-boundary events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
+typed line, status, authoritative `session` (nick, joined channels, and the
+upstream's `RPL_ISUPPORT` tokens as `isupport`), and
+`{"t":"snapshot","v":"complete"}` replay-boundary events. The attach's
+`session` event is taken atomically with the replay and sent *before* the
+first replayed line: the client reads the replay as the nick the session has
+now (a replayed line of its own is its own, not a stranger's under the
+configured nick) and with the network's own PREFIX and CHANMODES even after the
+ring has evicted the 001 and 005 that said so, and it applies the same event
+again at the replay boundary, so replayed history cannot leave it believing an
+old nick, mode table or membership. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
 persisted timelines use the same clock and have stable overlap identity. The
 client applies the protocol parser's last-duplicate-tag rule, parses each line,
 routes it to the right buffer (channel / DM / server), with STATUSMSG targets
@@ -2755,7 +2764,17 @@ such as `@#ops` routed to the underlying channel,
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
-inject markup). Startup uses this atomic socket replay as its single initial
+inject markup). Bidirectional embedding, override and isolate controls
+(U+202A–U+202E, U+2066–U+2069) are removed from rendered text, and the
+sender, the text and each link are separate bidi isolates (a link laid out
+left to right), so a line cannot display a link as an address other than the
+one it opens. The transcript is `aria-busy` and `aria-live="off"` from each
+connect until the replay boundary, so a screen reader announces live traffic,
+not the replayed backlog. The conversation and member lists are reconciled in
+place, keyed by conversation and member, so a new line or a JOIN, PART or MODE
+never takes keyboard focus from the entry it is on. Unread and mention counts
+exclude the console's copy of each line and a full replay's backlog; no replay
+raises a desktop notification; a `/me` action naming the reader is a mention. Startup uses this atomic socket replay as its single initial
 backlog source rather than racing it against a duplicate REST snapshot. The
 replay boundary precedes live traffic; only after it does
 the client request authoritative NAMES snapshots, preventing stale detached
@@ -2781,15 +2800,28 @@ server validates as one complete IRC line and maps to the driver. CR/LF/NUL
 injection and an over-limit derived line reject the whole request; they are
 never cleaned or truncated into a different message. At most 64 sends await a
 result. The browser appends local echo and sent-history only after the server
-returns the matching `sent` event; `send-error`, queue refusal, replacement,
+returns the matching `sent` event, in the buffer the line was addressed to
+(`/msg`, `/notice`, `/me` in any letter case, and a raw PRIVMSG or NOTICE
+included), because the server echoes a line to every attached client but the
+one that sent it; a message longer than one relayed IRC line is split on UTF-8
+code point boundaries into several requests; `send-error`, queue refusal, replacement,
 and socket closure retain retryable text and cannot produce a false successful
 echo. This keeps the web client on the exact same multiplexer attach path as an
 IRC client — the web client *is* an attached client of the user's networks.
 Fetching persisted history prepends it without replacing live lines or local
-echoes that arrived while the request was in flight. Matching non-empty
-`msgid` values and the exact ordered wire overlap at the history/live boundary
-are deduplicated; content equality elsewhere is not identity because distinct
-IRC messages can have identical bodies. Explicit history expands the buffer's
+echoes that arrived while the request was in flight. Each row records the
+replay cursor before its line (a local echo, the cursor when its send was
+accepted), so every later ring line for that buffer is already a row, and
+history is read with `GET /api/v1/me/networks/{name}/buffer?through=<cursor>`
+— only the running ring's lines at or before the oldest row's position — so no
+line arrives twice and none is matched by content. A cursor the server cannot
+bound (another ring lifetime, or a stopped network whose lines are persisted
+history without positions) is refused with 409; only then is the page read
+whole, and matching non-empty `msgid` values and the exact ordered overlap at
+the seam are deduplicated, over wire lines and the client's own lines against
+their local echoes, skipping join/part notices history has no counterpart
+for; content equality elsewhere is not identity because distinct IRC messages
+can have identical bodies. Explicit history expands the buffer's
 bounded capacity by one API page, so loading older context remains effective
 even when the normal live window is full. Live and persisted PRIVMSG/NOTICE
 rows use the same routing function, so a status-target or server notice cannot
