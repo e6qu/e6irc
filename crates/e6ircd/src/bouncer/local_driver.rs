@@ -839,9 +839,14 @@ mod tests {
             handle.send_from(4, "PRIVMSG #room :again"),
             super::super::SendOutcome::Sent
         );
+        // The core answers a line only after hearing it: an echo written
+        // before the session has sent the message is an echo of nothing.
+        let (heard, barrier) = core_heard(&mut core_rx).await;
+        assert_eq!(heard, "PRIVMSG #room :again");
         let echo =
             "@time=2026-01-01T00:00:03.000Z;msgid=m3 :alice!ident@local PRIVMSG #room :again";
         core_says(&out_tx, echo).await;
+        core_says(&out_tx, &barrier).await;
         assert_eq!(next_echo(&mut events).await, (echo.to_string(), 4));
     }
 
