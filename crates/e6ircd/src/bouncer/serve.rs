@@ -623,11 +623,21 @@ fn spawn_persistence(
     // fast enough for that window to be real.
     let events = handle.subscribe();
     let task = tokio::spawn(async move {
-        match crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
+        match crate::db::recent_bnc_backlog(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
             Ok(lines) => handle.preload_front(lines),
             Err(e) => {
                 handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                 eprintln!("bnc: buffer restore failed for {owner_key}/{network}: {e}");
+            }
+        }
+        // Until the network says how it compares names, they are compared as
+        // its stored conversations were keyed, so CHATHISTORY finds them.
+        match crate::db::bnc_buffer_casemapping(&pool, &owner_key, &network).await {
+            Ok(Some(casemapping)) => handle.remember_casemapping(casemapping),
+            Ok(None) => {}
+            Err(e) => {
+                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                eprintln!("bnc: stored case mapping unreadable for {owner_key}/{network}: {e}");
             }
         }
         handle.history_restored();
@@ -656,6 +666,9 @@ fn spawn_persistence(
         // appends is what makes the amortized trim reach every network — see
         // `db::BNC_TRIM_INTERVAL`.
         let mut since_trim = 0u64;
+        // The case mapping every stored conversation is keyed under once
+        // this task has re-keyed what was not; `None` until it has.
+        let mut keyed_under = None;
         // Whether the last write failed, so an outage logs once, and its end
         // logs once.
         let mut storage_failing = false;
@@ -703,9 +716,28 @@ fn spawn_persistence(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            match persist_and_trim(&pool, &buffer, own_nick.as_deref(), &line, &mut since_trim)
+            let names = handle.names();
+            let stored = async {
+                // A conversation is keyed the network's way. When that way is
+                // not the one this buffer's rows were keyed under — the first
+                // line after a restart, or a network that changed its
+                // CASEMAPPING — they are re-keyed first, so a page never mixes
+                // the two.
+                if keyed_under != Some(names.casemapping()) {
+                    crate::db::rekey_bnc_targets(&pool, &buffer, names.casemapping()).await?;
+                    keyed_under = Some(names.casemapping());
+                }
+                persist_and_trim(
+                    &pool,
+                    &buffer,
+                    own_nick.as_deref(),
+                    &line,
+                    &names,
+                    &mut since_trim,
+                )
                 .await
-            {
+            };
+            match stored.await {
                 Err(e) => {
                     handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                     // One line per outage, not one per upstream message: a
@@ -777,9 +809,10 @@ async fn persist_and_trim(
     buffer: &crate::db::BncBuffer,
     own_nick: Option<&str>,
     line: &str,
+    names: &e6irc_client::NetworkNames,
     since_trim: &mut u64,
 ) -> Result<(), crate::db::DbError> {
-    crate::db::persist_bnc_line(pool, buffer, own_nick, line).await?;
+    crate::db::persist_bnc_line(pool, buffer, own_nick, line, names).await?;
     *since_trim += 1;
     if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
         *since_trim = 0;
@@ -936,26 +969,11 @@ where
     Ok(())
 }
 
-/// The ISUPPORT a network is welcomed with when it has told the bouncer
-/// nothing of its own — a bridge, which has no registration burst, or an
-/// upstream whose burst has not arrived yet.
-const BRIDGE_ISUPPORT: &[&str] = &[
-    "CASEMAPPING=rfc1459",
-    "CHANTYPES=#&",
-    "CHANNELLEN=64",
-    "NICKLEN=30",
-    "PREFIX=(qaohv)~&@%+",
-];
-
-/// RPL_MYINFO's mode lists to go with [`BRIDGE_ISUPPORT`]: no user modes the
+/// RPL_MYINFO's mode lists to go with [`super::BRIDGE_ISUPPORT`] (what a
+/// network that has said nothing of its own is welcomed with): no user modes the
 /// bridge implements beyond invisibility, and the membership modes its
 /// `PREFIX` names (each takes a nick).
 const BRIDGE_MYINFO_MODES: &[&str] = &["i", "qaohv", "qaohv"];
-
-/// Tokens the bouncer answers for itself rather than the network: it serves
-/// CHATHISTORY from its own store, so the network's limits and reference
-/// types say nothing about what an attached client can page.
-const BOUNCER_OWNED_ISUPPORT: &[&str] = &["CHATHISTORY", "MSGREFTYPES"];
 
 /// The most ISUPPORT tokens one 005 line carries: with the nick and the
 /// trailing text that is the 15 parameters a message may hold.
@@ -972,9 +990,11 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// The mode lists and ISUPPORT are the network's own, as its registration
 /// burst reported them (the local network's are the core's, read the same
 /// way), so the client parses the network it is actually on — its prefixes,
-/// channel types and casemapping. The bouncer adds only what it serves itself:
-/// CHATHISTORY and MSGREFTYPES, and those only when the network has a history
-/// store to page.
+/// channel types and casemapping. The bouncer answers for itself only what it
+/// decides ([`super::BOUNCER_OWNED_ISUPPORT`]): CHATHISTORY and MSGREFTYPES,
+/// and those only when the network has a history store to page; and
+/// CLIENTTAGDENY, which is `*` while the network cannot carry client-only
+/// tags.
 pub(super) fn welcome(
     server_name: &str,
     network: &str,
@@ -985,18 +1005,23 @@ pub(super) fn welcome(
         .irc_session_snapshot()
         .map_or(requested_nick, |session| session.nick);
     let features = handle.upstream_features();
+    let client_tag_deny = features.client_tag_deny();
     let modes = features
         .myinfo_modes
         .unwrap_or_else(|| BRIDGE_MYINFO_MODES.iter().map(|m| m.to_string()).collect());
     let mut isupport = if features.isupport.is_empty() {
-        BRIDGE_ISUPPORT.iter().map(|t| t.to_string()).collect()
+        super::BRIDGE_ISUPPORT
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
     } else {
         features.isupport
     };
     isupport.retain(|token| {
         let key = token.split('=').next().unwrap_or(token);
-        !BOUNCER_OWNED_ISUPPORT.contains(&key)
+        !super::BOUNCER_OWNED_ISUPPORT.contains(&key)
     });
+    isupport.extend(client_tag_deny);
     if handle.history().is_some() {
         isupport.push(format!(
             "CHATHISTORY={}",

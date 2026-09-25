@@ -31,6 +31,11 @@ type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 /// supports it.
 const METADATA_CAPABILITIES: [&str; 3] = ["server-time", "message-tags", "account-tag"];
 
+/// Capabilities that mean nothing without another: `labeled-response` answers
+/// a command with more than one line in a `batch` (IRCv3 labeled-response), so
+/// it is asked for only once `batch` is enabled.
+const CAPABILITY_PREREQUISITES: [(&str, &str); 1] = [("labeled-response", "batch")];
+
 /// Capabilities one server may advertise. `CAP LS` continues for as long as the
 /// server keeps sending `*` lines, so without a bound the peer decides how much
 /// this connection remembers. Real networks advertise a few dozen.
@@ -210,8 +215,12 @@ pub struct Connection {
     /// Capabilities to ask for during registration when the server offers
     /// them, each in a request of its own ([`Connection::request_when_offered`]).
     requested_when_offered: Vec<&'static str>,
-    /// Those of `requested_when_offered` the server acknowledged.
-    enabled_when_offered: Vec<&'static str>,
+    /// Every capability the server has acknowledged and not since withdrawn
+    /// (`CAP DEL`) — what is enabled on this connection now.
+    enabled: Vec<String>,
+    /// Capabilities requested after registration whose verdict has not
+    /// arrived, so a repeated `CAP NEW` does not ask twice.
+    awaiting_verdict: Vec<&'static str>,
     /// The network's `CASEMAPPING` and `CHANTYPES`, from every 005 read on
     /// this connection (whichever read path read it).
     names: NetworkNames,
@@ -296,6 +305,13 @@ impl AdvertisedCapabilities {
 
     fn offers(&self, capability: &str) -> bool {
         self.0.contains_key(capability)
+    }
+
+    /// Forget what a `CAP DEL` withdrew.
+    fn withdraw(&mut self, list: &str) {
+        for name in list.split_whitespace() {
+            self.0.remove(name);
+        }
     }
 
     /// The advertised SASL mechanism list, or `None` when the server named no
@@ -1046,7 +1062,8 @@ impl Connection {
         Self {
             transport,
             requested_when_offered: Vec::new(),
-            enabled_when_offered: Vec::new(),
+            enabled: Vec::new(),
+            awaiting_verdict: Vec::new(),
             names: NetworkNames::default(),
             reader,
             writer,
@@ -1193,6 +1210,7 @@ impl Connection {
                         let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
                         if let Some(message) = &parsed {
                             self.names.adopt_isupport(message);
+                            self.observe_capability_change(message);
                         }
                         return Ok(Some(RelayEvent::Line {
                             message: parsed,
@@ -1362,7 +1380,8 @@ impl Connection {
             }
         }
         // Each in a request of its own: a server that refuses one must not
-        // take the others, or the metadata above, down with it.
+        // take the others, or the metadata above, down with it. In order, so
+        // a prerequisite asked for earlier is enabled before what needs it.
         let optional: Vec<&'static str> = self
             .requested_when_offered
             .iter()
@@ -1370,11 +1389,83 @@ impl Connection {
             .filter(|capability| self.advertised.offers(capability))
             .collect();
         for capability in optional {
-            if self.request_capabilities(&[capability]).await? == CapabilityVerdict::Acknowledged {
-                self.enabled_when_offered.push(capability);
+            if self.prerequisite_enabled(capability) {
+                self.request_capabilities(&[capability]).await?;
             }
         }
         Ok(())
+    }
+
+    /// Whether whatever `capability` depends on ([`CAPABILITY_PREREQUISITES`])
+    /// is enabled.
+    fn prerequisite_enabled(&self, capability: &str) -> bool {
+        CAPABILITY_PREREQUISITES
+            .iter()
+            .filter(|(dependent, _)| *dependent == capability)
+            .all(|(_, prerequisite)| self.enabled(prerequisite))
+    }
+
+    /// Follow a capability change the server announces after registration:
+    /// `CAP NEW` adds to what it offers, `CAP DEL` withdraws an offer and
+    /// whatever of it was enabled, and `CAP ACK`/`NAK` answer a request made
+    /// after [`Connection::capabilities_to_request`]. Read by
+    /// [`Connection::next_line_relayable`], so a relay's view of what is
+    /// enabled is never older than the line it is handling.
+    fn observe_capability_change(&mut self, message: &OwnedMessage) {
+        if message.command != "CAP" {
+            return;
+        }
+        let list = message.params.last().map(String::as_str).unwrap_or("");
+        match message.params.get(1).map(String::as_str) {
+            Some("NEW") => {
+                // Past the bound the server is only not listened to further;
+                // what the connection already has is unaffected.
+                drop(self.advertised.record(list));
+            }
+            Some("DEL") => {
+                self.advertised.withdraw(list);
+                self.enabled
+                    .retain(|enabled| !list.split_whitespace().any(|name| name == enabled));
+            }
+            Some(verdict @ ("ACK" | "NAK")) => {
+                for token in list.split_whitespace() {
+                    let (name, on) = match token.strip_prefix('-') {
+                        Some(name) => (name, false),
+                        None => (token, true),
+                    };
+                    self.awaiting_verdict.retain(|awaiting| *awaiting != name);
+                    if verdict == "ACK" {
+                        self.set_enabled(name, on);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_enabled(&mut self, capability: &str, on: bool) {
+        self.enabled.retain(|enabled| enabled != capability);
+        if on {
+            self.enabled.push(capability.to_owned());
+        }
+    }
+
+    /// The capabilities this connection wants that the server now offers but
+    /// has not enabled — after a `CAP NEW`, say — each for a `CAP REQ` of its
+    /// own. Each is returned once until its verdict arrives.
+    pub fn capabilities_to_request(&mut self) -> Vec<&'static str> {
+        let wanted: Vec<&'static str> = METADATA_CAPABILITIES
+            .into_iter()
+            .chain(self.requested_when_offered.iter().copied())
+            .filter(|capability| {
+                self.advertised.offers(capability)
+                    && !self.enabled(capability)
+                    && !self.awaiting_verdict.contains(capability)
+                    && self.prerequisite_enabled(capability)
+            })
+            .collect();
+        self.awaiting_verdict.extend(wanted.iter().copied());
+        wanted
     }
 
     /// Ask for `capability` during registration when the server offers it,
@@ -1386,10 +1477,10 @@ impl Connection {
         }
     }
 
-    /// Whether a capability asked for with [`Connection::request_when_offered`]
-    /// was acknowledged during registration.
+    /// Whether `capability` is enabled on this connection now: acknowledged
+    /// during registration or since, and not withdrawn by a `CAP DEL`.
     pub fn enabled(&self, capability: &str) -> bool {
-        self.enabled_when_offered.contains(&capability)
+        self.enabled.iter().any(|enabled| enabled == capability)
     }
 
     /// Request `capabilities` atomically and consume exactly their verdict.
@@ -1405,6 +1496,11 @@ impl Connection {
                 return Err(err);
             }
             if let Some(verdict) = capability_verdict(&msg, capabilities)? {
+                if verdict == CapabilityVerdict::Acknowledged {
+                    for capability in capabilities {
+                        self.set_enabled(capability, true);
+                    }
+                }
                 return Ok(verdict);
             }
             self.answer_ping(&msg).await?;
@@ -3149,6 +3245,60 @@ mod tests {
         Expect("CAP END"),
         Send(":srv 001 nick :Welcome"),
     ];
+
+    /// What is enabled is what the server acknowledged — a prerequisite
+    /// refused keeps what depends on it from being asked for — and it follows
+    /// `CAP DEL` and `CAP NEW` after registration, each capability asked for
+    /// once until its verdict arrives.
+    #[tokio::test]
+    async fn enabled_capabilities_follow_acknowledgements_and_later_changes() {
+        let mut steps = after_discovery(
+            ":srv CAP * LS :server-time echo-message batch labeled-response",
+            vec![
+                Expect("CAP REQ :server-time"),
+                Send(":srv CAP * ACK :server-time"),
+                Expect("CAP REQ :echo-message"),
+                Send(":srv CAP * ACK :echo-message"),
+                Expect("CAP REQ :batch"),
+                Send(":srv CAP * NAK :batch"),
+            ],
+        );
+        steps.extend(IDENTITY_THEN_WELCOME);
+        steps.extend([
+            Send(":srv CAP nick DEL :echo-message"),
+            Send(":srv CAP nick NEW :message-tags batch"),
+            Send(":srv CAP nick ACK :message-tags"),
+            Send(":srv NOTICE nick :done"),
+        ]);
+        let (mut connection, server) = scripted(steps);
+        for capability in ["echo-message", "batch", "labeled-response"] {
+            connection.request_when_offered(capability);
+        }
+        connection
+            .register(&TEST_IDENTITY)
+            .await
+            .expect("registered");
+        assert!(connection.enabled("server-time") && connection.enabled("echo-message"));
+        assert!(!connection.enabled("batch") && !connection.enabled("labeled-response"));
+        connection.next_line_relayable().await.unwrap();
+        assert!(!connection.enabled("echo-message"), "withdrawn by CAP DEL");
+        assert!(!connection.offers("echo-message"));
+        connection.next_line_relayable().await.unwrap();
+        assert_eq!(
+            connection.capabilities_to_request(),
+            vec!["message-tags", "batch"],
+            "labeled-response waits for batch"
+        );
+        assert!(
+            connection.capabilities_to_request().is_empty(),
+            "each is asked for once"
+        );
+        connection.next_line_relayable().await.unwrap();
+        assert!(connection.enabled("message-tags"));
+        connection.next_line_relayable().await.unwrap();
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
 
     #[tokio::test]
     async fn sasl_stops_before_authenticate_when_the_mechanism_is_not_advertised() {

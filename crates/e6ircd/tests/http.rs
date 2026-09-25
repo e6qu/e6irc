@@ -3027,6 +3027,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         .expect("open buffer"),
         Some("alice"),
         ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("seed hostile backlog line");
@@ -8331,6 +8332,7 @@ async fn network_buffer_read() {
             .expect("open buffer"),
             Some("alice"),
             line,
+            &e6irc_client::NetworkNames::default(),
         )
         .await
         .expect("seed");

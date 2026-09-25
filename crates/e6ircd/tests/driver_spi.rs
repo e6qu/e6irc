@@ -14,6 +14,17 @@ use e6ircd::bouncer::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::Receiver;
 
+/// `line` as the driver emitted it: the bouncer stamps each line it takes in
+/// that carries no `time` with one, in a tag section of its own.
+fn untimed(line: &str) -> &str {
+    match line.strip_prefix("@time=") {
+        Some(tagged) if !tagged.contains(';') => {
+            tagged.split_once(' ').map_or(line, |(_, body)| body)
+        }
+        _ => line,
+    }
+}
+
 async fn wait_for(events: &mut Receiver<DriverEvent>, pred: impl Fn(&DriverEvent) -> bool) -> bool {
     tokio::time::timeout(deadline::HANG, async {
         loop {
@@ -60,7 +71,7 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     assert!(
         wait_for(
             &mut events,
-            |e| matches!(e, DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }) if l == "hello world")
+            |e| matches!(e, DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }) if untimed(l) == "hello world")
         )
         .await,
         "{kind}: command was not surfaced as a line"
@@ -69,7 +80,11 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     // The line is also recorded to the detached buffer for playback.
     let buffered = tokio::time::timeout(deadline::HANG, async {
         loop {
-            if handle.buffer_snapshot().iter().any(|l| l == "hello world") {
+            if handle
+                .buffer_snapshot()
+                .iter()
+                .any(|l| untimed(l) == "hello world")
+            {
                 return true;
             }
             tokio::task::yield_now().await;
@@ -95,7 +110,11 @@ async fn attach_relays_over_the_loopback_driver() {
     assert_eq!(handle.send("earlier"), SendOutcome::Sent);
     let buffered = tokio::time::timeout(deadline::HANG, async {
         loop {
-            if handle.buffer_snapshot().iter().any(|l| l == "earlier") {
+            if handle
+                .buffer_snapshot()
+                .iter()
+                .any(|l| untimed(l) == "earlier")
+            {
                 return true;
             }
             tokio::task::yield_now().await;

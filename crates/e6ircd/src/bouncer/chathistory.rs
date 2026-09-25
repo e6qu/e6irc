@@ -107,9 +107,10 @@ pub(crate) async fn handle_markread(
         .await;
     };
     let (network, pool) = (&history.network, &history.pool);
+    let casemapping = handle.names().casemapping();
     match params.get(1) {
         // `MARKREAD <target>` queries one marker.
-        None => send_read_marker(write, &history, account, target).await?,
+        None => send_read_marker(write, &history, casemapping, account, target).await?,
         // `MARKREAD <target> <timestamp>` sets the position and acknowledges.
         Some(raw) => {
             let timestamp = match normalize_timestamp(raw) {
@@ -124,31 +125,37 @@ pub(crate) async fn handle_markread(
                     .await;
                 }
             };
-            let stored =
-                match crate::db::set_bnc_read_marker(pool, account, network, target, &timestamp)
-                    .await
-                {
-                    Ok(crate::db::BncReadMarkerWrite::Stored(stored)) => stored,
-                    Ok(crate::db::BncReadMarkerWrite::LimitReached) => {
-                        return fail_markread(
-                            write,
-                            HistoryFail::InvalidParams,
-                            target,
-                            "too many read marker targets",
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        eprintln!("bnc: read marker write failed for {account}/{network}: {e}");
-                        return fail_markread(
-                            write,
-                            HistoryFail::TemporarilyUnavailable,
-                            target,
-                            "read markers unavailable",
-                        )
-                        .await;
-                    }
-                };
+            let stored = match crate::db::set_bnc_read_marker(
+                pool,
+                account,
+                network,
+                target,
+                casemapping,
+                &timestamp,
+            )
+            .await
+            {
+                Ok(crate::db::BncReadMarkerWrite::Stored(stored)) => stored,
+                Ok(crate::db::BncReadMarkerWrite::LimitReached) => {
+                    return fail_markread(
+                        write,
+                        HistoryFail::InvalidParams,
+                        target,
+                        "too many read marker targets",
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    eprintln!("bnc: read marker write failed for {account}/{network}: {e}");
+                    return fail_markread(
+                        write,
+                        HistoryFail::TemporarilyUnavailable,
+                        target,
+                        "read markers unavailable",
+                    )
+                    .await;
+                }
+            };
             write_marker(write, target, &stored).await?;
             handle.publish_read_marker(account, target, &stored, origin);
         }
@@ -159,14 +166,25 @@ pub(crate) async fn handle_markread(
 
 /// Send `target`'s current read marker (`*` when none is set), or the
 /// `TEMPORARILY_UNAVAILABLE` FAIL when the store cannot answer. The MARKREAD
-/// query form and the replay after a JOIN both answer through here.
+/// query form and the replay after a JOIN both answer through here. A marker
+/// is keyed by its target folded the network's way (`casemapping`), as the
+/// backlog it marks is.
 pub(crate) async fn send_read_marker(
     write: &mut (impl AsyncWrite + Unpin),
     history: &NetworkHistory,
+    casemapping: e6irc_proto::casemap::CaseMapping,
     account: &str,
     target: &str,
 ) -> std::io::Result<()> {
-    match crate::db::get_bnc_read_marker(&history.pool, account, &history.network, target).await {
+    match crate::db::get_bnc_read_marker(
+        &history.pool,
+        account,
+        &history.network,
+        target,
+        casemapping,
+    )
+    .await
+    {
         Ok(Some(ts)) => write_marker(write, target, &ts).await,
         Ok(None) => write_marker(write, target, "*").await,
         Err(e) => {
@@ -295,6 +313,7 @@ async fn paged(
         &history.owner,
         &history.network,
         target,
+        handle.names().casemapping(),
         paging,
         crate::db::BncHistoryScope::for_message_tags(caps.message_tags),
         &selector,
@@ -516,30 +535,12 @@ fn history_replay_line(row: &crate::db::BncHistoryLine, caps: AttachCaps) -> Opt
     if !caps.server_time {
         return Some(filtered);
     }
-    let without_time = remove_tag(&filtered, "time");
+    let without_time = super::without_tag(&filtered, "time");
     match without_time.strip_prefix('@') {
         Some(rest) => format!("@time={};{rest}", row.sent_at),
         None => format!("@time={} {without_time}", row.sent_at),
     }
     .into()
-}
-
-fn remove_tag(line: &str, key_to_remove: &str) -> String {
-    let Some(rest) = line.strip_prefix('@') else {
-        return line.to_string();
-    };
-    let Some((tags, body)) = rest.split_once(' ') else {
-        return String::new();
-    };
-    let kept: Vec<&str> = tags
-        .split(';')
-        .filter(|tag| tag.split('=').next() != Some(key_to_remove))
-        .collect();
-    if kept.is_empty() {
-        body.to_string()
-    } else {
-        format!("@{} {body}", kept.join(";"))
-    }
 }
 
 /// `MARKREAD <target> <timestamp>` reply line.
@@ -617,15 +618,20 @@ fn parse_limit(raw: &str) -> Option<i64> {
     (n > 0 && n <= CHATHISTORY_LIMIT_MAX).then_some(n)
 }
 
+/// Whether `target` can name one conversation of an external network. Its
+/// channel types, nick grammar and lengths are the network's (Ergo's Unicode
+/// nicks, IRCnet's `!` channels, a `NICKLEN` of 32), and the conversations
+/// the bouncer files are named as the network named them, so the check is
+/// structural: one parameter, one name, no longer than any channel name
+/// (RFC 1459's 200 bytes, which bounds every nick a network accepts too).
 fn valid_target(target: &str) -> bool {
-    if target.starts_with(['#', '&']) {
-        return target.len() > 1
-            && target.len() <= 64
-            && !target.bytes().any(|byte| {
-                byte.is_ascii_whitespace() || matches!(byte, b'\0' | b',' | b':' | 0x07)
-            });
-    }
-    crate::sanitize::valid_nick(target, 30)
+    !target.is_empty()
+        && target != "*"
+        && target.len() <= super::ConfirmedChannel::MAX_BYTES
+        && !target.starts_with(':')
+        && !target
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ',')
 }
 
 /// Normalize a required `timestamp=` MARKREAD position before storage.
@@ -656,14 +662,22 @@ mod tests {
         for invalid in ["0", "501", "-1", "not-a-number"] {
             assert_eq!(parse_limit(invalid), None, "{invalid}");
         }
-        assert!(valid_target("#room"));
-        assert!(valid_target("&local"));
-        assert!(valid_target("SomeNick"));
-        assert!(!valid_target(""));
-        assert!(!valid_target(&"x".repeat(65)));
-        assert!(!valid_target("bad,target"));
-        assert!(!valid_target("!!!"));
-        assert!(!valid_target("*"));
+        // Whatever the network names: Unicode and long nicks, `!` channels.
+        for valid in [
+            "#room",
+            "&local",
+            "SomeNick",
+            "zoë",
+            "!ABCDEchan",
+            "a-thirty-two-byte-nick-on-ergo-x",
+            &"x".repeat(200),
+        ] {
+            assert!(valid_target(valid), "{valid}");
+        }
+        for invalid in ["", "*", ":colon", "bad,target", "two words", "bell\u{7}"] {
+            assert!(!valid_target(invalid), "{invalid:?}");
+        }
+        assert!(!valid_target(&"x".repeat(201)));
         assert!(matches!(
             HistorySelector::parse("msgid=opaque"),
             Ok(HistorySelector::Msgid(_))

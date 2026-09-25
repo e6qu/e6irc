@@ -7710,20 +7710,24 @@ pub async fn open_bnc_buffer(
 }
 
 /// Append one upstream line to a network's persisted buffer, extracting the
-/// conversation target for CHATHISTORY queries.
+/// conversation target for CHATHISTORY queries: classified and keyed by the
+/// network's own naming rules (`names`), with its name kept as the network
+/// spelled it.
 pub async fn persist_bnc_line(
     pool: &PgPool,
     buffer: &BncBuffer,
     own_nick: Option<&str>,
     line: &str,
+    names: &e6irc_client::NetworkNames,
 ) -> Result<(), DbError> {
-    let target =
-        bnc_line_target(line, own_nick).map(|target| CaseMapping::Rfc1459.casefold(&target));
+    let display = bnc_line_target(line, own_nick, names);
+    let target = display.as_deref().map(|display| names.fold(display));
     let msgid = bnc_line_msgid(line);
     let sent_at = bnc_line_sent_at(line);
     sqlx::query(
-        "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at,
+                                 target_display, target_casemapping)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&buffer.key.owner)
     .bind(&buffer.key.network)
@@ -7732,27 +7736,94 @@ pub async fn persist_bnc_line(
     .bind(target)
     .bind(msgid)
     .bind(sent_at)
+    .bind(display)
+    .bind(names.casemapping().isupport_token())
     .execute(pool)
     .await
     .map_err(query_error)?;
     Ok(())
 }
 
-/// The conversation target of a stored raw IRC line, for CHATHISTORY paging:
-/// the channel or nick a PRIVMSG/NOTICE/TAGMSG was addressed to. Non-message
-/// lines (JOIN, NICK, numerics) return `None` so they are excluded from
-/// target-filtered history without an extra predicate.
-fn bnc_line_target(line: &str, own_nick: Option<&str>) -> Option<String> {
+/// Re-key every stored conversation of one buffer that was folded under
+/// another case mapping than `casemapping` — rows stored before the network
+/// said how it compares names, or before it changed — from the name as the
+/// network spelled it, so what was stored is found under the keys the network
+/// now uses. Returns how many rows were re-keyed.
+pub async fn rekey_bnc_targets(
+    pool: &PgPool,
+    buffer: &BncBuffer,
+    casemapping: CaseMapping,
+) -> Result<u64, DbError> {
+    // The fold as a `translate()`: every byte the mapping lowers, and what to.
+    let (upper, lower): (String, String) = (0u8..128)
+        .filter(|byte| casemapping.lower(*byte) != *byte)
+        .map(|byte| (char::from(byte), char::from(casemapping.lower(byte))))
+        .unzip();
+    sqlx::query(
+        "UPDATE bnc_buffer
+         SET target = translate(target_display, $3, $4), target_casemapping = $5
+         WHERE owner = $1 AND network = $2
+           AND target_display IS NOT NULL AND target_casemapping <> $5",
+    )
+    .bind(&buffer.key.owner)
+    .bind(&buffer.key.network)
+    .bind(upper)
+    .bind(lower)
+    .bind(casemapping.isupport_token())
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(query_error)
+}
+
+/// The case mapping the newest stored conversation of `(owner, network)` was
+/// keyed under: what the network last said, remembered across a restart
+/// until it says it again.
+pub async fn bnc_buffer_casemapping(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+) -> Result<Option<CaseMapping>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT target_casemapping FROM bnc_buffer
+         WHERE id = (SELECT max(id) FROM bnc_buffer
+                     WHERE owner = $1 AND network = $2 AND target IS NOT NULL)",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(stored.as_deref().and_then(CaseMapping::from_isupport_token))
+}
+
+/// The conversation a stored raw IRC line belongs to, for CHATHISTORY paging,
+/// as the network spelled it: the channel a PRIVMSG/NOTICE/TAGMSG was
+/// addressed to (a STATUSMSG's channel), or for a direct message the other
+/// party — so both directions share one conversation. What is a channel, a
+/// STATUSMSG and the same nick is the network's to say (`names`). A line
+/// addressed to several targets at once is no one conversation, and
+/// non-message lines (JOIN, NICK, numerics) have none: `None` keeps them out
+/// of target-filtered history without an extra predicate.
+pub(crate) fn bnc_line_target(
+    line: &str,
+    own_nick: Option<&str>,
+    names: &e6irc_client::NetworkNames,
+) -> Option<String> {
     let msg = e6irc_proto::message::Message::parse(line).ok()?;
     match msg.command.to_ascii_uppercase().as_str() {
         "PRIVMSG" | "NOTICE" | "TAGMSG" => {
-            let addressed = crate::bouncer::conversation_target(msg.params.first()?);
-            if addressed.starts_with(['#', '&']) {
+            let addressed = names.conversation(msg.params.first()?);
+            if addressed.is_empty() || addressed.contains(',') {
+                return None;
+            }
+            if names.is_channel(addressed) {
                 return Some(addressed.to_string());
             }
             let source = msg.source.as_ref()?;
             let own_nick = own_nick?;
-            if CaseMapping::Rfc1459.eq(source.name, own_nick) {
+            if names.eq(source.name, own_nick) {
                 Some(addressed.to_string())
             } else if source.user.is_some() || source.host.is_some() {
                 Some(source.name.to_string())
@@ -7855,13 +7926,33 @@ pub async fn recent_bnc_lines(
     network: &str,
     limit: i64,
 ) -> Result<Vec<String>, DbError> {
+    Ok(recent_bnc_backlog(pool, owner, network, limit)
+        .await?
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect())
+}
+
+/// [`recent_bnc_lines`], each with the time it was stored under (its `time`
+/// tag, or its arrival), for a ring restored from storage.
+pub async fn recent_bnc_backlog(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>, DbError> {
     let key = BncBufferKey::new(owner, network);
     // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
     // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
     // backward and filters out every other buffer's newer lines, so a quiet
-    // buffer's replay cost grew with everyone else's traffic.
-    sqlx::query_scalar(
-        "SELECT line FROM bnc_buffer
+    // buffer's replay cost grew with everyone else's traffic. A row from
+    // before `sent_at` existed has its arrival.
+    sqlx::query_as(
+        "SELECT line,
+                coalesce(sent_at,
+                         to_char(created_at AT TIME ZONE 'UTC',
+                                 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))
+         FROM bnc_buffer
          WHERE id = ANY(ARRAY(
              SELECT id FROM bnc_buffer
              WHERE owner = $1 AND network = $2
@@ -8027,6 +8118,7 @@ pub async fn bnc_history_window(
     owner: &str,
     network: &str,
     target: &str,
+    casemapping: CaseMapping,
     paging: BncHistoryPaging,
     scope: BncHistoryScope,
     first: &BncHistorySelector,
@@ -8034,7 +8126,7 @@ pub async fn bnc_history_window(
     limit: i64,
 ) -> Result<Result<Vec<BncHistoryLine>, UnknownBncMsgid>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    let target = CaseMapping::Rfc1459.casefold(target);
+    let target = casemapping.casefold(target);
     // Where a selector sits: `after` bounds the lines strictly after it,
     // `before` the lines strictly before it. A message id names one row; a
     // timestamp sorts before (`before`) or after (`after`) every row carrying
@@ -8171,9 +8263,11 @@ pub async fn bnc_history_window(
 }
 
 /// The distinct conversation targets that still have backlog for one network,
-/// oldest-active first, with each target's newest `sent_at` (CHATHISTORY
-/// TARGETS; the timestamp lets a client resume each target from its end).
-/// Both bounds are exclusive, matching draft/chathistory's BETWEEN semantics.
+/// oldest-active first, each named as the network last spelled it, with its
+/// newest `sent_at` (CHATHISTORY TARGETS; the timestamp lets a client resume
+/// each target from its end). The name is never the folded key: on another
+/// network's case mapping that key can be a different conversation. Both
+/// bounds are exclusive, matching draft/chathistory's BETWEEN semantics.
 pub async fn bnc_history_targets(
     pool: &PgPool,
     owner: &str,
@@ -8190,7 +8284,8 @@ pub async fn bnc_history_targets(
     // scope varies the text and sqlx accepts only literal SQL otherwise --
     // the varying part is a constant of this module, never input.
     let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT target, max(sent_at) FROM bnc_buffer WHERE owner = ",
+        "SELECT (array_agg(coalesce(target_display, target) ORDER BY id DESC))[1], max(sent_at)
+         FROM bnc_buffer WHERE owner = ",
     );
     query
         .push_bind(&key.owner)
@@ -8214,15 +8309,18 @@ pub async fn bnc_history_targets(
 // ---- BNC read markers -----------------------------------------------------
 
 /// Get one per-network, per-target read marker, or `None` if unset.
+///
+/// `target` is folded under the network's `casemapping`, as its backlog is.
 pub async fn get_bnc_read_marker(
     pool: &PgPool,
     account: &str,
     network: &str,
     target: &str,
+    casemapping: CaseMapping,
 ) -> Result<Option<String>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
-    let target_folded = CaseMapping::Rfc1459.casefold(target);
+    let target_folded = casemapping.casefold(target);
     sqlx::query_scalar(
         "SELECT timestamp FROM bnc_read_markers
          WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
@@ -8232,6 +8330,25 @@ pub async fn get_bnc_read_marker(
     .bind(&net_folded)
     .bind(&target_folded)
     .fetch_optional(pool)
+    .await
+    .map_err(query_error)
+}
+
+/// Every read marker `account` keeps on `network`, as (folded target,
+/// timestamp): where an attaching client's replay of each conversation starts.
+pub async fn bnc_read_markers(
+    pool: &PgPool,
+    account: &str,
+    network: &str,
+) -> Result<Vec<(String, String)>, DbError> {
+    sqlx::query_as(
+        "SELECT target, timestamp FROM bnc_read_markers
+         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
+           AND network = $2",
+    )
+    .bind(CaseMapping::Rfc1459.casefold(account))
+    .bind(CaseMapping::Rfc1459.casefold(network))
+    .fetch_all(pool)
     .await
     .map_err(query_error)
 }
@@ -8252,11 +8369,12 @@ pub async fn set_bnc_read_marker(
     account: &str,
     network: &str,
     target: &str,
+    casemapping: CaseMapping,
     timestamp: &str,
 ) -> Result<BncReadMarkerWrite, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
-    let target_folded = CaseMapping::Rfc1459.casefold(target);
+    let target_folded = casemapping.casefold(target);
     let mut tx = pool.begin().await.map_err(query_error)?;
     // Lock the durable account row while checking and consuming marker
     // capacity. This both serializes concurrent writers for the same account
@@ -9412,56 +9530,92 @@ mod history_sql_tests {
         }
     }
 
+    /// The naming rules of a network that says `tokens`.
+    fn network(tokens: &[&str]) -> e6irc_client::NetworkNames {
+        let mut names = e6irc_client::NetworkNames::default();
+        names.adopt_tokens(tokens.iter().copied());
+        names
+    }
+
     #[test]
     fn bnc_direct_messages_share_the_peer_target_in_both_directions() {
+        let names = network(&[]);
         assert_eq!(
-            bnc_line_target(":alice!u@h PRIVMSG Bob :outbound", Some("ALICE"),),
+            bnc_line_target(":alice!u@h PRIVMSG Bob :outbound", Some("ALICE"), &names),
             Some("Bob".to_string())
         );
         assert_eq!(
-            bnc_line_target(":Bob!u@h PRIVMSG alice :inbound", Some("Alice")),
+            bnc_line_target(":Bob!u@h PRIVMSG alice :inbound", Some("Alice"), &names),
             Some("Bob".to_string())
         );
         assert_eq!(
-            bnc_line_target(":server.example NOTICE alice :maintenance", Some("alice")),
+            bnc_line_target(
+                ":server.example NOTICE alice :maintenance",
+                Some("alice"),
+                &names
+            ),
             None,
             "server notices are not direct-message conversations"
         );
         assert_eq!(
-            bnc_line_target(":Bob!u@h PRIVMSG #Room :channel", Some("alice")),
+            bnc_line_target(":Bob!u@h PRIVMSG #Room :channel", Some("alice"), &names),
             Some("#Room".to_string())
         );
     }
 
     /// A STATUSMSG is channel conversation with a narrower audience. Filed
     /// under its sender it became a direct message from someone who never sent
-    /// one, and vanished from the channel history it belongs to.
+    /// one, and vanished from the channel history it belongs to. Which sigils
+    /// and channel types exist is the network's to say: Ergo's halfops get a
+    /// `%#dev`, IRCnet has `!` channels.
     #[test]
     fn bnc_statusmsg_lines_belong_to_their_channel() {
+        let names = network(&["STATUSMSG=~&@%+", "CHANTYPES=#&!"]);
         for (addressed, channel) in [
             ("@#Room", "#Room"),
             ("+#Room", "#Room"),
             ("@&local", "&local"),
+            ("%#dev", "#dev"),
+            ("&#dev", "#dev"),
+            ("!ABCDEchan", "!ABCDEchan"),
         ] {
             assert_eq!(
                 bnc_line_target(
                     &format!(":Bob!u@h PRIVMSG {addressed} :ops only"),
-                    Some("alice")
+                    Some("alice"),
+                    &names
                 ),
                 Some(channel.to_string()),
                 "{addressed}"
             );
         }
         assert_eq!(
-            bnc_line_target(":alice!u@h NOTICE @#Room :from us", Some("alice")),
+            bnc_line_target(":alice!u@h NOTICE @#Room :from us", Some("alice"), &names),
             Some("#Room".to_string())
         );
         assert_eq!(
             bnc_line_target(
                 ":Bob!u@h PRIVMSG +alice :a nick, not a STATUSMSG",
-                Some("+alice")
+                Some("+alice"),
+                &names
             ),
             Some("Bob".to_string())
+        );
+        assert_eq!(
+            bnc_line_target(":alice!u@h PRIVMSG #a,#b :to both", Some("alice"), &names),
+            None,
+            "a target list is no one conversation"
+        );
+    }
+
+    /// On an `ascii` network `dev[m]` is not `dev{m}`: a message from one is
+    /// not ours when we are the other.
+    #[test]
+    fn bnc_own_nick_is_compared_the_networks_way() {
+        let names = network(&["CASEMAPPING=ascii"]);
+        assert_eq!(
+            bnc_line_target(":dev{m}!u@h PRIVMSG dev[m] :hi", Some("dev[m]"), &names),
+            Some("dev{m}".to_string())
         );
     }
 

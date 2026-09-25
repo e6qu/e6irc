@@ -1,8 +1,9 @@
-//! How one network names things: which targets are channels (`CHANTYPES`)
-//! and when two names are the same (`CASEMAPPING`), as its `RPL_ISUPPORT`
-//! (005) declares them. Every native client compares names and classifies
-//! targets through one [`NetworkNames`], so none of them hard-codes RFC 1459
-//! and `#&` while the network says otherwise.
+//! How one network names things: which targets are channels (`CHANTYPES`),
+//! which sigils narrow a channel message to its ranks (`STATUSMSG`), and when
+//! two names are the same (`CASEMAPPING`), as its `RPL_ISUPPORT` (005)
+//! declares them. Every native client, and the bouncer, compares names and
+//! classifies targets through one [`NetworkNames`], so none of them hard-codes
+//! RFC 1459, `#&` and `@+` while the network says otherwise.
 
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::isupport::IsupportToken;
@@ -25,6 +26,9 @@ pub const DEFAULT_CHANTYPES: &str = "#&";
 pub struct NetworkNames {
     casemapping: CaseMapping,
     chantypes: String,
+    /// The `STATUSMSG` sigils: none until the network advertises some, since a
+    /// network that does not cannot be sent a message addressed through one.
+    statusmsg: String,
     unrecognised_casemapping: Option<String>,
 }
 
@@ -33,6 +37,7 @@ impl Default for NetworkNames {
         Self {
             casemapping: CaseMapping::Rfc1459,
             chantypes: DEFAULT_CHANTYPES.to_owned(),
+            statusmsg: String::new(),
             unrecognised_casemapping: None,
         }
     }
@@ -46,9 +51,26 @@ pub struct NamesChanged {
     pub casemapping: bool,
     /// The channel prefixes differ from before.
     pub chantypes: bool,
+    /// The STATUSMSG sigils differ from before.
+    pub statusmsg: bool,
 }
 
 impl NetworkNames {
+    /// The defaults, comparing names under `casemapping`: what a store that
+    /// recorded only the mapping it keyed its names with knows of a network
+    /// before the network has said anything this session.
+    pub fn with_casemapping(casemapping: CaseMapping) -> Self {
+        Self {
+            casemapping,
+            ..Self::default()
+        }
+    }
+
+    /// The case mapping names are compared (and keyed) under.
+    pub fn casemapping(&self) -> CaseMapping {
+        self.casemapping
+    }
+
     /// The `CASEMAPPING` value the network declared when it is not one this
     /// crate knows; names are then compared as `ascii`.
     pub fn unrecognised_casemapping(&self) -> Option<&str> {
@@ -62,6 +84,26 @@ impl NetworkNames {
             .chars()
             .next()
             .is_some_and(|first| self.chantypes.contains(first))
+    }
+
+    /// The conversation a message `target` belongs to: a STATUSMSG target
+    /// (`@#chan`, `%#chan` where the network advertises those sigils) is its
+    /// channel's conversation with a narrower audience, so its sigils come
+    /// off; anything else is already the conversation. Sigils in front of
+    /// something that is not a channel are part of a nickname.
+    ///
+    /// A sigil can also be a channel type (`&` on Ergo and InspIRCd), so the
+    /// fewest sigils that leave a channel are taken off: `@&local` is the
+    /// local channel `&local`'s, `&#dev` is `#dev`'s.
+    pub fn conversation<'t>(&self, target: &'t str) -> &'t str {
+        let mut rest = target;
+        while let Some(sigil) = rest.chars().next().filter(|c| self.statusmsg.contains(*c)) {
+            rest = &rest[sigil.len_utf8()..];
+            if self.is_channel(rest) {
+                return rest;
+            }
+        }
+        target
     }
 
     /// Whether `a` and `b` are the same name on this network.
@@ -78,22 +120,30 @@ impl NetworkNames {
     /// message changes nothing. Tokens sit between the nick and the trailing
     /// "are supported by this server".
     pub fn adopt_isupport(&mut self, message: &OwnedMessage) -> NamesChanged {
+        if message.command != "005" {
+            return NamesChanged::default();
+        }
+        let tokens = message
+            .params
+            .get(1..message.params.len().saturating_sub(1))
+            .unwrap_or_default();
+        self.adopt_tokens(tokens.iter().map(String::as_str))
+    }
+
+    /// Adopt what these raw 005 tokens (`CASEMAPPING=ascii`, `-CHANTYPES`, …)
+    /// say; tokens about anything else change nothing.
+    pub fn adopt_tokens<'a>(&mut self, tokens: impl IntoIterator<Item = &'a str>) -> NamesChanged {
         let before = self.clone();
-        if message.command == "005" {
-            let tokens = message
-                .params
-                .get(1..message.params.len().saturating_sub(1))
-                .unwrap_or_default();
-            for token in tokens
-                .iter()
-                .filter_map(|raw| IsupportToken::parse(raw).ok())
-            {
-                self.adopt_token(&token);
-            }
+        for token in tokens
+            .into_iter()
+            .filter_map(|raw| IsupportToken::parse(raw).ok())
+        {
+            self.adopt_token(&token);
         }
         NamesChanged {
             casemapping: self.casemapping != before.casemapping,
             chantypes: self.chantypes != before.chantypes,
+            statusmsg: self.statusmsg != before.statusmsg,
         }
     }
 
@@ -117,6 +167,8 @@ impl NetworkNames {
             ("CHANTYPES", true) => DEFAULT_CHANTYPES.clone_into(&mut self.chantypes),
             // `CHANTYPES=` (or a bare `CHANTYPES`): the network has no channels.
             ("CHANTYPES", false) => value.clone_into(&mut self.chantypes),
+            ("STATUSMSG", true) => self.statusmsg.clear(),
+            ("STATUSMSG", false) => value.clone_into(&mut self.statusmsg),
             _ => {}
         }
     }
@@ -172,6 +224,23 @@ mod tests {
         assert_eq!(names.unrecognised_casemapping(), Some("rfc7613"));
         names.adopt_isupport(&isupport("-CASEMAPPING"));
         assert_eq!(names, NetworkNames::default());
+    }
+
+    /// A STATUSMSG target files under its channel only with the sigils the
+    /// network declared, and only in front of one of its channel types.
+    #[test]
+    fn statusmsg_sigils_come_from_the_network() {
+        let mut names = NetworkNames::default();
+        assert_eq!(names.conversation("@#dev"), "@#dev", "no STATUSMSG yet");
+        let changed = names.adopt_isupport(&isupport("STATUSMSG=~&@%+ CHANTYPES=#"));
+        assert!(changed.statusmsg);
+        assert_eq!(names.conversation("%#dev"), "#dev");
+        assert_eq!(names.conversation("@%#dev"), "#dev");
+        assert_eq!(names.conversation("&#dev"), "#dev");
+        assert_eq!(names.conversation("+nick"), "+nick", "not a channel");
+        assert_eq!(names.conversation("#dev"), "#dev");
+        names.adopt_isupport(&isupport("-STATUSMSG"));
+        assert_eq!(names.conversation("%#dev"), "%#dev");
     }
 
     #[test]

@@ -726,6 +726,42 @@ account deletion passing founded channels to their successors in storage and
 in every shard's mirror. Operators read the server bans, private reasons
 included, with STATS k/d/x.
 
+A review of the bouncer as a client of its upstream and a server to its
+attached clients found, and this change fixes:
+
+- **One client's replies went to every client and into the history.** A
+  `/LIST` reached every attached client, overran their shared broadcast and
+  detached them, and evicted the stored conversation; a `WHO` on join filled
+  the backlog. Replies are routed to the attachment whose command they answer —
+  by `labeled-response` when the upstream has it, by reply order otherwise —
+  live, on a bounded route of its own, and never retained or stored.
+- **Client-only tags and `TAGMSG` reached upstreams that cannot carry them**,
+  answered by a 421 in front of every client (or, on a server that does not
+  parse tags, losing the message behind a fake echo). They are stripped, with
+  `CLIENTTAGDENY=*` advertised, and a `TAGMSG` is answered to its sender alone.
+- **Names were compared under RFC 1459 whatever the network said.** Another
+  user's `NICK` or `JOIN` could be taken for ours on an `ascii` network, and
+  two channels shared one history. The session, rejoin set, echo matching and
+  history filing read the network's `CASEMAPPING`, `CHANTYPES` and
+  `STATUSMSG`; stored conversations keep their spelling and are keyed and
+  re-keyed under the network's mapping (migration 0076), and TARGETS names them
+  as spelled.
+- **Replay and CHATHISTORY disagreed on time** on networks without
+  `server-time`: every line is stamped when it is taken in.
+- **Echoes**: a message to several targets is echoed per target, an echo the
+  upstream truncated still matches, and a labelled echo is routed by its label.
+- **The upstream's registration burst** (its own ISUPPORT, the MOTD) was replayed
+  over the bouncer's welcome; it is read, not relayed or retained.
+- **Rejoin**: a refused rejoin is dropped instead of retried forever, a client's
+  `PART` removes a channel the session is not in, and keyed channels are
+  rejoined with their keys.
+- **Reconnects** left no mark in the ring (a replay showed two JOINs without the
+  PART between); `CAP NEW`/`CAP DEL` mid-session were ignored; bouncer-made
+  lines could exceed the line limit.
+- **Attach**: a synthesized JOIN is followed by the channel's real topic and
+  member list, asked of the upstream for that client alone, and a raw client's
+  replay starts each conversation at its account's read marker.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

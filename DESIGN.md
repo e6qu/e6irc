@@ -227,6 +227,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     The IRC driver also derives reconnect-intent deltas from this one tracker;
     attach state and the next rejoin set cannot parse the same upstream line
     with two subtly different membership rules.
+  - `ReplyRouter` — every upstream line a driver reads passes one classifier
+    that decides whether it is the session's (retained, broadcast, stored) or
+    the answer to one attachment's command (delivered to that attachment's own
+    bounded route, live only). A `/LIST` of a large network used to be
+    broadcast to every attached client, overrun their shared 1,024-event
+    channel and detach them, and fill the ring and the stored history; a
+    reply now has no way into the broadcast or the ring.
   - `subscribe_with_replay_snapshot` — buffered emitters retain the IRC-session
     and buffer locks through broadcast publication, while each raw/browser
     attach subscribes and snapshots both under those same locks. The
@@ -1916,15 +1923,42 @@ above the trait, provides for every network kind:
 - **Always-on presence**: driver stays up while zero clients are attached.
 - **Multi-client attach/detach**: any number of the user's IRC connections
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
-  are mirrored to all attached clients. A sender's own messages reach the
+  are mirrored to all attached clients. What answers one client's command is
+  that client's alone (`bouncer/replies.rs`): the replies to its `WHO`,
+  `WHOIS`, `LIST`, `NAMES`, `MODE` and `TOPIC` queries, its `INVITE` and
+  `AWAY` confirmations, and the error numerics and `FAIL`/`WARN`/`NOTE`
+  standard replies to anything it sent reach that attachment only, live, and
+  never enter the ring, the stored backlog or CHATHISTORY. With
+  `labeled-response` (plus `batch` and `message-tags`) enabled upstream, every
+  forwarded line carries a `label` and the upstream's labelled answer names its
+  attachment; the labelled batch is unwrapped. Otherwise the upstream answers
+  in order, so each forwarded command waits in a queue: a query's reply
+  numerics go to the oldest query that expects them (the one about the reply's
+  subject, when one is — a remote `WHOIS nick nick` answers after later
+  commands) until its end-of-reply numeric, an error goes to the oldest
+  command it names (by command, for 421/461/263, or by target), a command that
+  can end with no reply is closed by the answer to a correlation `PING`
+  written after it (one in flight, so a paste costs two), and anything still
+  waiting after 60 s is forgotten. What answers no pending command is the
+  session's, as before: conversation, membership, a numeric the upstream sent
+  unasked, and the topic and member list after our own `JOIN`, which are the
+  channel's state for every client. Each attachment's route holds 1,024
+  lines; a reply read more slowly than the network sends it loses the rest,
+  for that client alone, and it is told how many. The `/ws/ui` socket has a
+  route like a raw attach. A sender's own messages reach the
   stream exactly once. When the upstream offers `echo-message`, the driver
   requests it and relays the upstream's echo, which arrives only for a line the
   upstream accepted — a refused line (404, 486) is answered by the refusal
   alone, so a client that waits for its echo (as `e6irc send` does) learns the
-  truth; the echo is routed to the attachment that sent the line by matching
-  command, target and text against the lines awaiting one (at most 256; a
-  refused line's entry ages out). An upstream without `echo-message` gets the
-  echo synthesized when the line is written. Either way the originator
+  truth; the echo is routed to the attachment that sent the line by its label,
+  or by matching command, one target and text against the lines awaiting one
+  (at most 256; a refused line's entry ages out). A message to several targets
+  waits for, and is echoed as, one line per target — it is never filed as a
+  conversation named `#a,#b` — and an echo whose text the upstream cut to fit
+  its line with our prefix still matches the line it came from. An upstream
+  without `echo-message` gets the echo synthesized, per target, when the line
+  is written; the driver follows the upstream's `CAP DEL echo-message` (and
+  asks for what a `CAP NEW` offers) mid-session. Either way the originator
   receives its echo only when it negotiated `echo-message` on attach, the same
   contract a real server has, and a NickServ command that can carry a secret
   is redacted in the upstream's echo exactly as in a synthesized one. A bridge
@@ -1937,6 +1971,19 @@ above the trait, provides for every network kind:
   Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
+  Attached clients are always offered `message-tags` (the bouncer's own
+  CHATHISTORY, read markers and batches ride tags), but a network that cannot
+  carry client-only tags — an IRC upstream without `message-tags`, and the
+  in-process `local` session, which negotiates no capabilities — is described
+  to them with `CLIENTTAGDENY=*` (IRCv3 message-tags; in the welcome, and as a
+  live 005 when it changes): the tags are stripped before the line is
+  written, since a server that does not parse tags would read the tag section
+  as the command, and a `TAGMSG` is answered by the bouncer to its sender alone
+  with `FAIL TAGMSG CLIENT_TAGS_UNSUPPORTED` rather than refused with a 421 in
+  front of every client. The echo is made from the stripped line, so it never
+  shows a tag the network did not carry. soju strips the same way; offering
+  `message-tags` only when the upstream has it would take the bouncer's own
+  tag-borne features away from every client of such a network.
   What belongs to the attachment itself never reaches the upstream: a client's
   `PING` is answered locally (so lag checks work while the upstream is
   reconnecting or parked, and its `PONG`s do not fill the backlog), a `PONG` is
@@ -1961,7 +2008,21 @@ above the trait, provides for every network kind:
   attachment ends as too slow, where a parked write used to hide the network's
   removal and the client's silence from the relay for good.
 - **Detached buffering**: events accumulate in a per-network ring persisted
-  to PostgreSQL. A lifecycle notice is buffered and persisted once per
+  to PostgreSQL. Every line is stamped at ingest with the time it arrived when
+  it carries no valid `time` of its own — the upstream's lines on a network
+  without `server-time` (EFnet, IRCnet, QuakeNet), and the bouncer's own
+  notices — so the ring's replay, the stored `sent_at` and CHATHISTORY read one
+  time for it; a line restored from storage is stamped with its stored time.
+  The upstream's registration burst after `001` (002–005, the LUSERS numerics,
+  the MOTD, up to its end) is read — its 004/005 become the network's features
+  — and neither relayed nor retained, and a burst an older build stored is not
+  restored; a 005 later in the session is told to attached clients live, less
+  the tokens the bouncer answers for itself (§10.4). Where a new upstream
+  session begins the ring holds a session boundary with the session's state as
+  it began, and a raw attach replaying past it reconciles its client to it
+  exactly as a client attached then was (the old session's channels parted,
+  then the new session's JOINs), so a replay never shows a second JOIN without
+  the PART between. A lifecycle notice is buffered and persisted once per
   *transition* (lifecycle plus failure code); repeats are delivered live only.
   An upstream that is down all weekend would otherwise fill the ring, and then
   the stored backlog, with identical "reconnecting" lines and evict the very
@@ -1969,8 +2030,19 @@ above the trait, provides for every network kind:
   read markers (`bnc_read_markers`, served over `MARKREAD`); they are
   separate from the ircd core's per-account markers (§11) because a BNC
   target lives on an external network the core knows nothing about.
-- **Playback**: attaching clients receive the full detached ring,
-  tag-filtered by their negotiated caps. Subscription plus buffer snapshot is
+- **Playback**: attaching clients receive the detached ring,
+  tag-filtered by their negotiated caps. A raw IRC client presents no cursor,
+  so its account's read markers (`bnc_read_markers`, the `draft/read-marker`
+  positions it set with `MARKREAD`) are its position, conversation by
+  conversation: a message of a conversation the account has a marker for is
+  replayed only when it is newer than the marker (its `time`, which every
+  retained line carries), a conversation without one is replayed whole, and
+  lines that belong to no conversation — membership, nick changes, notices —
+  are always replayed, so the client's view of its session is complete. The
+  client is told how many messages it had already read were left to
+  CHATHISTORY, and told when the markers could not be read (the whole ring is
+  then replayed). The `/ws/ui` browser resumes from its own ring cursor
+  instead. Subscription plus buffer snapshot is
   one mutex-ordered boundary with publication, so a line is replayed or live,
   never both. A retained-event overrun is visible and terminal; reconnecting
   establishes a new authoritative boundary instead of continuing with possibly
@@ -2002,8 +2074,19 @@ above the trait, provides for every network kind:
 - **Authoritative attach state**: replay is followed by an
   `IrcSessionSnapshot` containing the current upstream nick and confirmed
   memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
-  reach it. A synthesized JOIN includes a minimal NAMES reply, with the
-  account's MARKREAD position before end-of-NAMES when negotiated. `/ws/ui`
+  reach it. A synthesized JOIN (the real one aged out of the ring) is followed,
+  on an IRC network, by the channel's real topic and member list: the bouncer
+  sends `TOPIC` and `NAMES` for the channel on the attaching client's behalf,
+  and the answers reach that client alone (§10.1's reply routing), as a
+  server's own answer to a JOIN would; the account's MARKREAD position follows
+  the JOIN, before the end of that list, when negotiated. A bridge, whose
+  provider has no member list to ask, and an upstream that cannot be asked
+  right now (its queue full, or parked — said in a notice) get a minimal
+  NAMES reply naming the session alone. Every line
+  the bouncer makes from the upstream's names fits one IRC line: a prefix
+  drops its user and host, or a PART its reason, when the names need the room,
+  and a line no shortening fits is replaced by a bounded notice saying what
+  could not be shown, never sent past the limit for the client to discard. `/ws/ui`
   sends the typed snapshot before its replay boundary; the browser separates
   current membership from transcript retention, so reconnect reconciliation
   marks a past channel instead of erasing its visible messages.
@@ -2031,8 +2114,18 @@ upstream's.
 
 - Full IRCv3 *client* implementation reusing `e6irc-proto` + the same SASL
   machinery; requests `server-time`, `message-tags`, and `account-tag`
-  from upstream when available (Libera: yes), and `echo-message`, in a
-  capability request of its own, when the upstream offers it (§10.1). An
+  from upstream when available (Libera: yes), and `echo-message`, `batch` and
+  `labeled-response` (the last only once `batch` is enabled), each in a
+  capability request of its own, when the upstream offers them (§10.1). What
+  is enabled follows the upstream's `CAP NEW` and `CAP DEL` for the whole
+  session: the connection tracks it, and the driver asks for a wanted
+  capability a `CAP NEW` offers and re-reads how it writes (echoes,
+  client-only tags, reply correlation) after every change. Names are compared
+  and classified the network's way everywhere — its 005 `CASEMAPPING`,
+  `CHANTYPES` and `STATUSMSG`, read through the client crate's
+  `NetworkNames` — in the session tracker, the rejoin set, echo matching,
+  requested-nick confirmation and history filing; only the welcome, which
+  arrives before any 005, is compared under RFC 1459. An
   upstream's SASL password or server password crosses only TLS, or a plaintext
   connection to a loopback address *literal* under
   `internal_upstreams = "allow"` (the test harness): every ingress refuses
@@ -2149,7 +2242,17 @@ upstream's.
   before the drop — comma-joined within the 510-byte line, so a heavy user's
   hundred channels are a handful of lines rather than a burst Solanum's flood
   limit answers with "Excess Flood" (runtime JOIN/PART/KICK are tracked as they
-  are acknowledged upstream). Tracked membership is bounded at 512 channels, per session and in
+  are acknowledged upstream). A keyed channel is rejoined with its key, keyed
+  channels first on each line so every key lands on its channel: the key a
+  client's `JOIN` offered once the upstream confirms that channel, then any
+  `+k`/`-k` the channel sees (read with the network's `CHANMODES` and
+  `PREFIX`). A key is a secret of the channel's members: it is held in memory
+  beside the reconnect intent only, and its `Debug` is redacted. A channel
+  whose rejoin the upstream refuses (403, 471, 473, 474, 475) is dropped from
+  the intent, with a `*bnc*` notice, rather than retried and refused after
+  every reconnect; and a client's `PART` of a channel the intent holds but the
+  session is not in drops it too, answered by a `*bnc*` notice before the
+  upstream's own 442. Tracked membership is bounded at 512 channels, per session and in
   the reconnect intent: the names come from the upstream, which a tenant may
   point at a server of their own, so an unbounded set was a memory and
   reconnect-flood lever on the shared daemon. Past the bound the session ends
@@ -2289,7 +2392,12 @@ are the core's, read the same way; bounded in number and length, `-TOKEN`
 honoured), or a bridge's fixed set when the network has reported none. The
 bouncer adds only what it serves itself — `CHATHISTORY` and `MSGREFTYPES`, and
 only when the network has a history store — replacing the network's own, whose
-limits say nothing about paging the bouncer's store.
+limits say nothing about paging the bouncer's store; and `CLIENTTAGDENY`, which
+is `*` while the network cannot carry client-only tags (§10.1) and the
+network's own value otherwise. Because the network's registration burst is
+never relayed or replayed (§10.1), no later line can put the network's own
+values of these back; a 005 the network sends later in the session reaches
+attached clients live with them removed.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 
@@ -2566,9 +2674,22 @@ Design constraints recorded now:
   this rule.
   The BNC persistence path applies the same symmetry to raw external-network
   lines: an inbound direct message is keyed by its source and a synthesized
-  outbound echo by its recipient, both RFC1459-folded. TARGETS and paging
-  therefore expose one peer buffer containing both directions, including after
-  restart or a nick change between emission and persistence.
+  outbound echo by its recipient. What is a channel, which STATUSMSG sigils
+  file a message under its channel, and when two names are the same are the
+  network's own (`CHANTYPES`, `STATUSMSG`, `CASEMAPPING`): a conversation's key
+  is its name folded the network's way (`target`, with the mapping in
+  `target_casemapping`), and the name as the network spelled it is kept
+  beside it (`target_display`, migration 0076). Rows keyed under another
+  mapping — stored before the network said, or before it changed — are
+  re-keyed from their spelling by the persistence task before it writes, and
+  a restarted network compares names under the mapping its newest rows were
+  keyed with until the network says again. TARGETS names each conversation as
+  spelled, never by its key, which on another mapping can name someone else;
+  CHATHISTORY accepts any target structurally (one parameter of at most 200
+  bytes), since nick grammar, channel types and lengths are the network's.
+  TARGETS and paging therefore expose one peer buffer containing both
+  directions, including after restart or a nick change between emission and
+  persistence.
 - **11.2 Query surface**: IRCv3 `CHATHISTORY` (BEFORE/AFTER/AROUND/BETWEEN/
   LATEST/TARGETS) for IRC clients; `GET /api/v1/history/...` for the web
   client and API consumers — both hit the same query layer, including direct
