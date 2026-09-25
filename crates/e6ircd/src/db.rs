@@ -8897,7 +8897,8 @@ pub async fn get_bnc_read_marker(
 ) -> Result<Option<String>, DbError> {
     let net_folded = CaseMapping::Rfc1459.casefold(network);
     let mut tx = pool.begin().await.map_err(query_error)?;
-    let Some(account_id) = lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    let Some(account_id) =
+        lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
     else {
         return Ok(None);
     };
@@ -8926,7 +8927,8 @@ pub async fn bnc_read_markers(
 ) -> Result<Vec<(String, String)>, DbError> {
     let net_folded = CaseMapping::Rfc1459.casefold(network);
     let mut tx = pool.begin().await.map_err(query_error)?;
-    let Some(account_id) = lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    let Some(account_id) =
+        lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
     else {
         return Ok(Vec::new());
     };
@@ -8968,7 +8970,8 @@ pub async fn set_bnc_read_marker(
     // The account row lock taken here serializes concurrent writers for the
     // same account, so two attaches cannot both see 255 rows and commit the
     // 256th/257th.
-    let Some(account_id) = lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    let Some(account_id) =
+        lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
     else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };

@@ -3626,8 +3626,14 @@ async fn bnc_read_markers_follow_the_networks_case_mapping() {
         [
             ("#a[".to_string(), "2026-01-01T00:00:03.000Z".to_string()),
             ("#a{".to_string(), "2026-01-01T00:00:04.000Z".to_string()),
-            ("#dev[m]".to_string(), "2026-01-01T00:00:01.000Z".to_string()),
-            ("guest\\~".to_string(), "2026-01-01T00:00:02.000Z".to_string()),
+            (
+                "#dev[m]".to_string(),
+                "2026-01-01T00:00:01.000Z".to_string()
+            ),
+            (
+                "guest\\~".to_string(),
+                "2026-01-01T00:00:02.000Z".to_string()
+            ),
         ]
     );
     // Back to RFC 1459: `#a[` and `#a{` are one channel, read to the later
@@ -3640,8 +3646,14 @@ async fn bnc_read_markers_follow_the_networks_case_mapping() {
         listed,
         [
             ("#a{".to_string(), "2026-01-01T00:00:04.000Z".to_string()),
-            ("#dev{m}".to_string(), "2026-01-01T00:00:01.000Z".to_string()),
-            ("guest|^".to_string(), "2026-01-01T00:00:02.000Z".to_string()),
+            (
+                "#dev{m}".to_string(),
+                "2026-01-01T00:00:01.000Z".to_string()
+            ),
+            (
+                "guest|^".to_string(),
+                "2026-01-01T00:00:02.000Z".to_string()
+            ),
         ]
     );
     assert_eq!(

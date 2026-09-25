@@ -1237,19 +1237,47 @@ async fn local_driver_presents_the_in_process_network() {
                         && m.params.get(1).map(String::as_str)
                             == Some("hi from the main listener") =>
                 {
-                    return true;
+                    return Some(m);
                 }
                 Some(_) => {}
-                None => return false,
+                None => return None,
             }
         }
     })
     .await
-    .expect("timeout");
-    assert!(
-        got,
-        "local network did not relay in-process channel traffic"
-    );
+    .expect("timeout")
+    .expect("local network did not relay in-process channel traffic");
+    // The in-process session negotiated `message-tags` and `server-time` with
+    // the core: the message carries the core's msgid and time, and a reaction
+    // naming that msgid, and a typing indicator, reach the other client with
+    // their client-only tags.
+    let msgid = got.tag("msgid").expect("the core's msgid").to_string();
+    assert!(got.tag("time").is_some(), "{got:?}");
+    for (line, tag, value) in [
+        (
+            "@+typing=active TAGMSG #local".to_string(),
+            "+typing",
+            "active".to_string(),
+        ),
+        (
+            format!("@+draft/react=\u{1f44d};+draft/reply={msgid} TAGMSG #local"),
+            "+draft/reply",
+            msgid.clone(),
+        ),
+    ] {
+        client.send_line(&line).await.unwrap();
+        let tagged = tokio::time::timeout(deadline::HANG, async {
+            loop {
+                let m = peer.next_message().await.unwrap().expect("peer open");
+                if m.command == "TAGMSG" {
+                    return m;
+                }
+            }
+        })
+        .await
+        .expect("the TAGMSG reaches the other client");
+        assert_eq!(tagged.tag(tag), Some(value.as_str()), "{tagged:?}");
+    }
 }
 
 /// The persistence task must actually reach the trim. Driven through the real

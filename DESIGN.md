@@ -2228,15 +2228,14 @@ above the trait, provides for every network kind:
   dropped, and each target the provider accepted is echoed once instead —
   under the bridge account's IRC identity, the prefix that copy would have
   carried — while a refused one is answered by its undelivered notice alone.
-  The `local` driver's synthesized echo shows the session as the core does,
-  the `USER` name verbatim.
+  The `local` driver negotiates `echo-message` with the core (§10.2), so its
+  echo is the core's, routed the same way.
   Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
   Attached clients are always offered `message-tags` (the bouncer's own
   CHATHISTORY, read markers and batches ride tags), but a network that cannot
-  carry client-only tags — an IRC upstream without `message-tags`, and the
-  in-process `local` session, which negotiates no capabilities — is described
+  carry client-only tags — an IRC upstream without `message-tags` — is described
   to them with `CLIENTTAGDENY=*` (IRCv3 message-tags; in the welcome, and as a
   live 005 when it changes): the tags are stripped before the line is
   written, since a server that does not parse tags would read the tag section
@@ -2370,7 +2369,19 @@ mean "assumed": the driver waits for the core's 001 (bounded by a 30 s
 `WELCOME_DEADLINE`, so a wedged core is a reported failure rather than a silent
 wait) and treats a refusal — the nickname is held by another session, or the
 welcome names a different one — exactly as the `irc` driver treats an
-upstream's.
+upstream's. Before registering it asks the core, in one all-or-nothing
+`CAP REQ`, for what makes the local network carry what any upstream offering
+them does: `message-tags` (an attached client's client-only tags — typing,
+reactions, replies — and its `TAGMSG` reach the core, and each message comes
+back with the `msgid` a reaction names), `server-time` (the backlog files and
+replays a line at the core's time), `echo-message` (our own message returns with
+the core's `msgid` and time, and only when the core accepted it — a synthesized
+echo had neither, so a reaction to one's own message named a message the
+backlog did not hold) and `account-tag` (offered to attached clients, as the
+`irc` driver asks every upstream for). Replies are told apart by order, which
+the core answers in, so `batch` and `labeled-response` are not asked for. The
+core is this binary: a refusal, or a welcome without the answer, is an
+`upstream_protocol_failed` drop, never a session that silently lacks them.
 
 ### 10.3 `irc` driver — external networks (ZNC/soju-style)
 

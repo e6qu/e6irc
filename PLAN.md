@@ -635,7 +635,11 @@ A sweep of the bouncer found, and this change fixes:
   confirmation of a client's own `NICK` counted as `renamed_by_upstream`.
 - **The local driver.** A stop during registration left the half-registered
   core session to the reaper, and its synthesized echo showed `~nick` where
-  the core shows the `USER` name.
+  the core shows the `USER` name. It also negotiated no capabilities with the
+  core, so the local network stripped client-only tags (`CLIENTTAGDENY=*`):
+  no typing indicators, no reactions, and an echo without the core's `msgid`.
+  It now asks the core for `message-tags`, `server-time`, `echo-message` and
+  `account-tag`, and relays the core's own echo.
 - **Lines sent with `CAP END` were refused.** The attach handshake answered
   lines arriving in the same read as `CAP END` with 421, and dropped the half
   of a line it had framed; both now reach the attached session.

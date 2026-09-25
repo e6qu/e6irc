@@ -758,7 +758,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"
         ));
     }
-    let mut pending_echoes = PendingEchoes::default();
+    let mut echoes = UpstreamEchoes::default();
     let mut requested_nicks = RequestedNicks::default();
     let mut router = ReplyRouter::default();
 
@@ -881,23 +881,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                             if let Some((channel, key)) = key_change(&message, ends) {
                                 shared.joined.set_key(&channel, key);
                             }
-                            // Our own message, echoed by the upstream: the echo
-                            // of the line an attachment sent, routed to it — by
-                            // its label, or by what it says.
-                            let echo = upstream
-                                .echoes
-                                .then(|| EchoKey::of_upstream_echo(&message, &identity.nick, conn.names()))
-                                .flatten();
-                            let emitted = match echo {
-                                Some((key, head)) => {
-                                    let origin = origin.or_else(|| pending_echoes.take(&key, head));
-                                    let line = redact_sensitive_echo(line, &message);
-                                    match origin {
-                                        Some(origin) => ends.emit_session_echo(line, origin),
-                                        None => ends.emit_session_line(line),
-                                    }
-                                }
-                                None => ends.emit_session_line(line),
+                            let emitted = if upstream.echoes {
+                                echoes.publish(ends, &message, line, origin, &identity.nick, conn.names())
+                            } else {
+                                ends.emit_session_line(line)
                             };
                             if track(ends, shared, &mut identity, &mut requested_nicks, emitted).is_err() {
                                 return dropped(super::NetworkFailure::ChannelLimitExceeded);
@@ -972,9 +959,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     requested_nicks.observe(&line);
                     if upstream.echoes {
                         if upstream.correlation == Correlation::Order {
-                            for key in EchoKey::of_client_line(&line, conn.names()) {
-                                pending_echoes.push(key, cmd.origin);
-                            }
+                            echoes.sent(&line, cmd.origin, conn.names());
                         }
                     } else {
                         for echo in self_echoes(&line, &identity) {
@@ -1454,6 +1439,47 @@ impl PendingEchoes {
                     .position(|(pending, _)| echo.is_truncation_of(pending, head))
             })?;
         self.0.remove(position).map(|(_, origin)| origin)
+    }
+}
+
+/// The echoes of an upstream with `echo-message`: its echo of our own message
+/// is relayed as the one echo of the line, routed to the attachment that sent
+/// it — by its label, or, when replies are told apart by order, by matching it
+/// against the lines awaiting one. The `irc` and `local` drivers route them
+/// here alike.
+#[derive(Default)]
+pub(super) struct UpstreamEchoes(PendingEchoes);
+
+impl UpstreamEchoes {
+    /// Await the echo of `line`, which attachment `origin` sent, once per
+    /// target it names.
+    pub(super) fn sent(&mut self, line: &str, origin: u64, names: &NetworkNames) {
+        for key in EchoKey::of_client_line(line, names) {
+            self.0.push(key, origin);
+        }
+    }
+
+    /// Publish a session line of the upstream, as the echo of an attachment's
+    /// line when it is one (`origin` is its label's attachment, when it had
+    /// one), with a services command that can carry a secret redacted.
+    pub(super) fn publish(
+        &mut self,
+        ends: &DriverEnds,
+        message: &OwnedMessage,
+        line: String,
+        origin: Option<u64>,
+        own_nick: &str,
+        names: &NetworkNames,
+    ) -> Result<super::SessionChange, super::ChannelLimitExceeded> {
+        let Some((key, head)) = EchoKey::of_upstream_echo(message, own_nick, names) else {
+            return ends.emit_session_line(line);
+        };
+        let origin = origin.or_else(|| self.0.take(&key, head));
+        let line = redact_sensitive_echo(line, message);
+        match origin {
+            Some(origin) => ends.emit_session_echo(line, origin),
+            None => ends.emit_session_line(line),
+        }
     }
 }
 
