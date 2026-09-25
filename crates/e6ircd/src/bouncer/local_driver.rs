@@ -147,8 +147,13 @@ async fn await_welcome(
         match message.command.as_str() {
             "001" => {
                 let welcomed = message.params.first().cloned().unwrap_or_default();
-                let nick = super::irc_driver::configured_nick_was_granted(&session.nick, welcomed)
-                    .map_err(RegistrationRejected)?;
+                // Before its 005, a network's names compare as RFC 1459 says.
+                let nick = super::irc_driver::configured_nick_was_granted(
+                    &e6irc_client::NetworkNames::default(),
+                    &session.nick,
+                    welcomed,
+                )
+                .map_err(RegistrationRejected)?;
                 return Ok(Welcome { nick, line });
             }
             "PING" => {
@@ -247,16 +252,27 @@ async fn drive_session(
     // the in-process session is a registered non-oper client of the core, so
     // one JOIN per channel would spend the command-flood burst on a long
     // autojoin list and be closed with Excess Flood before it finished.
-    for line in super::irc_driver::join_lines(&session.autojoin) {
+    let autojoin: Vec<(String, Option<super::upstream_identity::ChannelKey>)> = session
+        .autojoin
+        .iter()
+        .map(|channel| (channel.clone(), None))
+        .collect();
+    for line in super::irc_driver::join_lines(&autojoin) {
         if !say(core, conn, line).await {
             return Stopped;
         }
     }
+    // The in-process session negotiates no capabilities with the core, which
+    // gives a client without `message-tags` no tags and no `TAGMSG`.
+    ends.set_client_tags(super::ClientTags::Denied);
     ends.begin_irc_session(welcome.nick);
     ends.emit(ConnectionEvent::Connected);
     if ends.emit_session_line(welcome.line).is_err() {
         return super::SessionOutcome::Dropped(super::NetworkFailure::ChannelLimitExceeded);
     }
+    // The core answers each attached client's commands on this one session,
+    // in order, like any server; see `super::replies`.
+    let mut router = super::replies::ReplyRouter::default();
 
     loop {
         tokio::select! {
@@ -291,10 +307,43 @@ async fn drive_session(
                         }
                         continue;
                     }
-                    if ends.emit_session_line(line).is_err() {
-                        return super::SessionOutcome::Dropped(
-                            super::NetworkFailure::ChannelLimitExceeded,
-                        );
+                    let classified = match e6irc_proto::message::Message::parse(&line) {
+                        Ok(parsed) => {
+                            let message = e6irc_client::OwnedMessage::from(&parsed);
+                            let own_nick = ends
+                                .irc_session_snapshot()
+                                .map(|snapshot| snapshot.nick)
+                                .unwrap_or_default();
+                            router.classify(
+                                &message,
+                                line,
+                                &ends.names(),
+                                &own_nick,
+                                std::time::Instant::now(),
+                            )
+                        }
+                        Err(_) => super::replies::Upstream::Session { line, origin: None },
+                    };
+                    match classified {
+                        // A correlation PING's answer: the commands sent since
+                        // want one of their own.
+                        super::replies::Upstream::Consumed => {
+                            if let Some(barrier) = router.barrier_due()
+                                && !say(core, conn, barrier).await
+                            {
+                                return Stopped;
+                            }
+                        }
+                        super::replies::Upstream::Reply { line, origin } => {
+                            ends.emit_reply(origin, line);
+                        }
+                        super::replies::Upstream::Session { line, .. } => {
+                            if ends.emit_session_line(line).is_err() {
+                                return super::SessionOutcome::Dropped(
+                                    super::NetworkFailure::ChannelLimitExceeded,
+                                );
+                            }
+                        }
                     }
                 }
                 // Core closed our session: reconnect with a fresh ConnId (and
@@ -306,12 +355,15 @@ async fn drive_session(
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
+                    let Some(line) = super::carriable(&cmd, super::ClientTags::Denied, ends) else {
+                        continue;
+                    };
                     // The core shows this session as it registered it: the
                     // `USER` name verbatim (there is no identd to answer) at
                     // the host the session was opened with.
-                    let echo = ends.irc_session_snapshot().and_then(|snapshot| {
-                        super::irc_driver::self_echo(
-                            &cmd.line,
+                    let echoes = ends.irc_session_snapshot().map_or_else(Vec::new, |snapshot| {
+                        super::irc_driver::self_echoes(
+                            &line,
                             &super::irc_driver::SelfIdentity {
                                 nick: snapshot.nick,
                                 user: session.username.clone(),
@@ -319,16 +371,19 @@ async fn drive_session(
                             },
                         )
                     });
-                    if session
-                        .core
-                        .core_tx
-                        .push(Input::Line { conn, line: cmd.line.into_bytes() })
-                        .await
-                        .is_err()
-                    {
-                        return Stopped;
+                    let written = router.forward(
+                        cmd.origin,
+                        &line,
+                        super::replies::Correlation::Order,
+                        &ends.names(),
+                        std::time::Instant::now(),
+                    );
+                    for line in std::iter::once(written).chain(router.barrier_due()) {
+                        if !say(core, conn, line).await {
+                            return Stopped;
+                        }
                     }
-                    if let Some(echo) = echo {
+                    for echo in echoes {
                         ends.emit_echo(echo, cmd.origin);
                     }
                 }

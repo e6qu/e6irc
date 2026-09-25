@@ -514,7 +514,11 @@ pub(super) async fn ws_ui_conn(
         replay,
         session: session_snapshot,
         features,
+        ..
     } = handle.subscribe_with_replay_snapshot(after);
+    // The answers to this socket's own commands (the NAMES it asks for after
+    // the boundary, a WHOIS) reach it here, and only here.
+    let mut replies = handle.route_replies(attach_id);
     // Every line event names the ring position after it, so a client that
     // loses this socket can hand back exactly where it stopped. A live event
     // that entered no ring keeps the position where it was.
@@ -599,6 +603,14 @@ pub(super) async fn ws_ui_conn(
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
                     send_unavailable(&mut socket).await;
+                    break;
+                }
+            }
+            // A reply takes no ring position, so the cursor stays where it is.
+            line = replies.recv() => {
+                if send_frame(&mut socket, WsMessage::text(line_event(&line, cursor))).await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1282,6 +1294,7 @@ mod tests {
                             "PREFIX=(ov)@+".to_string(),
                             "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz".to_string(),
                         ],
+                        client_tags: crate::bouncer::ClientTags::Relayed,
                     },
                 ),
                 serde_json::json!({

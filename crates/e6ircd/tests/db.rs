@@ -2986,6 +2986,7 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         .expect("open buffer"),
         None,
         ":s NOTICE * :backlog",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("persist case variant");
@@ -3113,6 +3114,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
             .expect("open buffer"),
             Some("mc"),
             &format!(":s PRIVMSG #x :m{i}"),
+            &e6irc_client::NetworkNames::default(),
         )
         .await
         .expect("persist");
@@ -3122,6 +3124,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         "MixedCase",
         "libera",
         "#x",
+        e6irc_proto::casemap::CaseMapping::Rfc1459,
         "2026-01-01T00:00:00.000Z",
     )
     .await
@@ -3190,6 +3193,7 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
                 "alice",
                 "net",
                 &format!("#new{index}"),
+                e6irc_proto::casemap::CaseMapping::Rfc1459,
                 "2026-01-02T00:00:00.000Z",
             )
             .await
@@ -3238,9 +3242,15 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
                 "@msgid=m{id};time=2026-01-01T00:00:{id:02}.000Z;+typing=active :n!u@h TAGMSG #room"
             )
         };
-        db::persist_bnc_line(&pool, &buffer, Some("alice"), &line)
-            .await
-            .expect("persist");
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            Some("alice"),
+            &line,
+            &e6irc_client::NetworkNames::default(),
+        )
+        .await
+        .expect("persist");
     }
     let page = async |scope, limit| {
         db::bnc_history_window(
@@ -3248,6 +3258,7 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
             "alice",
             "libera",
             "#room",
+            e6irc_proto::casemap::CaseMapping::Rfc1459,
             db::BncHistoryPaging::Latest,
             scope,
             &db::BncHistorySelector::Star,
@@ -3285,6 +3296,7 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
         &buffer,
         Some("alice"),
         "@msgid=m11;time=2026-01-01T00:00:11.000Z :n!u@h PRIVMSG #room :TAGMSG is a command",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("persist");
@@ -3296,6 +3308,7 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
         &buffer,
         Some("alice"),
         "@msgid=t1;time=2026-01-01T00:00:12.000Z;+typing=active :n!u@h TAGMSG #quiet",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("persist");
@@ -3314,6 +3327,111 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
     assert_eq!(targets(db::BncHistoryScope::ExceptTagOnly).await, ["#room"]);
 }
 
+/// A stored conversation is keyed the way its network folds names, and is
+/// named as the network spelled it. On an `ascii` network `#a[` and `#a{` are
+/// two channels and `dev[m]` is not `dev{m}`: two histories, and TARGETS names
+/// each as it was spelled — never a folded key that names someone else there.
+/// Rows keyed under another mapping (before the network said, or before it
+/// changed) are re-keyed from their spelling, and the mapping is remembered.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_conversations_are_keyed_the_networks_way_and_named_as_spelled() {
+    let pool = db::connect_and_migrate(&support::test_db("bnc_history_casemapping").await)
+        .await
+        .expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("alice"),
+        "unreal",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    let rfc1459 = e6irc_client::NetworkNames::default();
+    let mut ascii = e6irc_client::NetworkNames::default();
+    ascii.adopt_tokens(["CASEMAPPING=ascii"]);
+    // Stored before the network said how it compares names.
+    db::persist_bnc_line(
+        &pool,
+        &buffer,
+        Some("dev[m]"),
+        "@time=2026-01-01T00:00:01.000Z :Alice[m]!u@h PRIVMSG dev[m] :hello",
+        &rfc1459,
+    )
+    .await
+    .expect("persist");
+    assert_eq!(
+        db::rekey_bnc_targets(&pool, &buffer, ascii.casemapping())
+            .await
+            .expect("rekey"),
+        1
+    );
+    for (time, line) in [
+        (2, ":x!u@h PRIVMSG #a[ :square"),
+        (3, ":x!u@h PRIVMSG #a{ :curly"),
+        (4, ":dev[m]!u@h PRIVMSG Alice[m] :back"),
+    ] {
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            Some("dev[m]"),
+            &format!("@time=2026-01-01T00:00:0{time}.000Z {line}"),
+            &ascii,
+        )
+        .await
+        .expect("persist");
+    }
+    let page = async |target: &str| {
+        db::bnc_history_window(
+            &pool,
+            "alice",
+            "unreal",
+            target,
+            ascii.casemapping(),
+            db::BncHistoryPaging::Latest,
+            db::BncHistoryScope::EveryLine,
+            &db::BncHistorySelector::Star,
+            &db::BncHistorySelector::Star,
+            50,
+        )
+        .await
+        .expect("query")
+        .expect("LATEST * has no msgid to miss")
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(page("#A[").await.len(), 1);
+    assert!(page("#a[").await[0].ends_with(":square"));
+    assert!(page("#a{").await[0].ends_with(":curly"));
+    assert_eq!(page("ALICE[M]").await.len(), 2, "both directions, one peer");
+    assert!(
+        page("alice{m}").await.is_empty(),
+        "another person on this network"
+    );
+    let targets: Vec<String> = db::bnc_history_targets(
+        &pool,
+        "alice",
+        "unreal",
+        db::BncHistoryScope::EveryLine,
+        "0000",
+        "9999",
+        50,
+    )
+    .await
+    .expect("targets")
+    .into_iter()
+    .map(|(target, _)| target)
+    .collect();
+    assert_eq!(targets, ["#a[", "#a{", "Alice[m]"]);
+    assert_eq!(
+        db::bnc_buffer_casemapping(&pool, "alice", "unreal")
+            .await
+            .expect("stored mapping"),
+        Some(e6irc_proto::casemap::CaseMapping::Ascii)
+    );
+}
+
 /// Every retained line of one alice/libera target, oldest first.
 async fn history_latest(
     pool: &sqlx::PgPool,
@@ -3324,6 +3442,7 @@ async fn history_latest(
         "alice",
         "libera",
         target,
+        e6irc_proto::casemap::CaseMapping::Rfc1459,
         db::BncHistoryPaging::Latest,
         db::BncHistoryScope::EveryLine,
         &db::BncHistorySelector::Star,
@@ -3353,6 +3472,7 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
         .expect("open buffer"),
         Some("alice"),
         "@msgid=shared :a!u@h PRIVMSG #one :first",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("persist first target");
@@ -3368,6 +3488,7 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
         .expect("open buffer"),
         Some("alice"),
         "@msgid=shared :a!u@h PRIVMSG #two :second",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("persist second target");
@@ -3405,6 +3526,7 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
             .expect("open buffer"),
             Some("alice"),
             line,
+            &e6irc_client::NetworkNames::default(),
         )
         .await
         .expect("persist direct message");
@@ -6653,6 +6775,7 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
                 .expect("open buffer"),
                 None,
                 &format!("line {i}"),
+                &e6irc_client::NetworkNames::default(),
             )
             .await
             .expect("persist");
@@ -9554,6 +9677,7 @@ async fn every_bouncer_history_window_has_the_specified_boundary_and_direction()
             &buffer,
             Some("alice"),
             &format!("@msgid=m{id};time=2026-01-01T00:00:0{id}.000Z :n!u@h PRIVMSG #room :{id}"),
+            &e6irc_client::NetworkNames::default(),
         )
         .await
         .expect("persist");
@@ -9565,6 +9689,7 @@ async fn every_bouncer_history_window_has_the_specified_boundary_and_direction()
                 "alice",
                 "libera",
                 "#ROOM",
+                e6irc_proto::casemap::CaseMapping::Rfc1459,
                 paging,
                 db::BncHistoryScope::EveryLine,
                 &first,

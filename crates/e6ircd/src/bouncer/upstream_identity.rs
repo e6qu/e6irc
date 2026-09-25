@@ -244,6 +244,13 @@ fn channel_shape(value: &str) -> Result<(), &'static str> {
     if !value.starts_with(['#', '&', '+', '!']) {
         return Err("names must begin with #, &, + or !");
     }
+    one_channel_word(value)
+}
+
+/// The shape every channel name in a `JOIN` line has, whatever its prefix:
+/// something after the prefix, and nothing that ends the parameter or the
+/// list.
+fn one_channel_word(value: &str) -> Result<(), &'static str> {
     if value.chars().count() < 2 {
         return Err("names need at least one character after the prefix");
     }
@@ -271,10 +278,15 @@ impl ConfirmedChannel {
     /// RFC 1459 section 1.3: a channel name is at most 200 characters.
     pub(crate) const MAX_BYTES: usize = 200;
 
-    /// `None` when no IRC server could have meant `value` as one channel.
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        (value.len() <= Self::MAX_BYTES && channel_shape(value).is_ok())
-            .then(|| Self(value.to_string()))
+    /// `None` when the network whose naming rules `names` holds could not
+    /// have meant `value` as one channel: it must start with one of the
+    /// network's own channel types (its `CHANTYPES`, which is what excludes
+    /// `0`).
+    pub(crate) fn parse(value: &str, names: &e6irc_client::NetworkNames) -> Option<Self> {
+        (value.len() <= Self::MAX_BYTES
+            && names.is_channel(value)
+            && one_channel_word(value).is_ok())
+        .then(|| Self(value.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -282,9 +294,51 @@ impl ConfirmedChannel {
     }
 }
 
+/// The key of a keyed channel (`+k`), as a client joined it with or the
+/// channel was since set to, so the driver can rejoin it after a reconnect.
+/// A secret of the channel's members: it is kept in memory only, beside the
+/// reconnect intent, and never shown — its `Debug` is redacted, so no log or
+/// panic message can carry it.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ChannelKey(String);
+
+impl ChannelKey {
+    /// The longest key kept: longer than any server's `KEYLEN`.
+    const MAX_BYTES: usize = 100;
+
+    /// `None` for what cannot be one key parameter of a `JOIN` line.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        (!value.is_empty()
+            && value.len() <= Self::MAX_BYTES
+            && !value.starts_with(':')
+            && !value.chars().any(|c| breaks_a_parameter(c) || c == ','))
+        .then(|| Self(value.to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ChannelKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ChannelKey(<redacted>)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_channel_key_is_one_parameter_and_never_shown() {
+        let key = ChannelKey::parse("hunter2").expect("a key");
+        assert_eq!(key.as_str(), "hunter2");
+        assert!(!format!("{key:?}").contains("hunter2"));
+        for bad in ["", "two words", "a,b", ":colon", "bell\u{7}"] {
+            assert_eq!(ChannelKey::parse(bad), None, "{bad:?}");
+        }
+    }
 
     /// The very nicknames whose derived user names got networks refused are
     /// what this grammar turns away, along with everything per-server.
@@ -450,21 +504,34 @@ mod tests {
 
     #[test]
     fn a_confirmed_channel_has_the_configured_shape_and_the_protocol_length() {
+        let names = e6irc_client::NetworkNames::default();
         let long = format!("#{}", "c".repeat(199));
         assert_eq!(
-            ConfirmedChannel::parse(&long)
+            ConfirmedChannel::parse(&long, &names)
                 .expect("RFC 1459 length")
                 .as_str(),
             long
         );
         assert!(long.parse::<UpstreamChannel>().is_err());
         for bad in ["0", "", "#", "nick", "#a,#b", "#a key", "#bell\u{7}"] {
-            assert_eq!(ConfirmedChannel::parse(bad), None, "{bad:?}");
+            assert_eq!(ConfirmedChannel::parse(bad, &names), None, "{bad:?}");
         }
         assert_eq!(
-            ConfirmedChannel::parse(&format!("#{}", "c".repeat(200))),
+            ConfirmedChannel::parse(&format!("#{}", "c".repeat(200)), &names),
             None
         );
+    }
+
+    /// Which names are channels is the network's to say: IRCnet's `!` channels
+    /// are channels there, and `&` is not one on a network whose CHANTYPES is
+    /// `#` alone.
+    #[test]
+    fn a_confirmed_channel_starts_with_one_of_the_networks_channel_types() {
+        let mut names = e6irc_client::NetworkNames::default();
+        assert_eq!(ConfirmedChannel::parse("!ABCDEchan", &names), None);
+        names.adopt_tokens(["CHANTYPES=#!"]);
+        assert!(ConfirmedChannel::parse("!ABCDEchan", &names).is_some());
+        assert_eq!(ConfirmedChannel::parse("&local", &names), None);
     }
 
     #[test]
