@@ -2253,11 +2253,14 @@ impl Config {
                         )));
                     }
                 }
-                // In production (secure cookies) the issuer must be HTTPS:
-                // discovery and JWKS are fetched from it, so plaintext lets an
-                // on-path attacker inject signing keys and forge ID tokens. A dev
-                // setup (secure_cookies = false) may still use http for a local
-                // provider.
+                // In production (secure cookies) every provider endpoint must
+                // be HTTPS: discovery and JWKS are fetched from the issuer, so
+                // plaintext lets an on-path attacker inject signing keys and
+                // forge ID tokens, and the browser is sent to the end-session
+                // endpoint with the ID token. A dev setup (secure_cookies =
+                // false) may still use http for a local provider. The endpoints
+                // a discovery document advertises are held to the same rule
+                // when it is fetched (`http::oidc_provider::EndpointSchemes`).
                 let require_https = self.http.as_ref().is_some_and(|h| h.secure_cookies);
                 for (field, value) in [
                     ("issuer_url", Some(provider.issuer_url.as_str())),
@@ -2277,13 +2280,10 @@ impl Config {
                             provider.name
                         )));
                     }
-                    if field == "issuer_url"
-                        && require_https
-                        && parsed.is_some_and(|url| url.scheme() != "https")
-                    {
+                    if require_https && parsed.is_some_and(|url| url.scheme() != "https") {
                         return Err(ConfigError::Invalid(format!(
-                            "OIDC provider '{}' issuer_url must be https when secure_cookies is set \
-                             (plaintext discovery/JWKS is forgeable by an on-path attacker)",
+                            "OIDC provider '{}' {field} must be https when secure_cookies is set \
+                             (plaintext provider traffic is forgeable by an on-path attacker)",
                             provider.name
                         )));
                     }
@@ -4159,13 +4159,26 @@ mod tests {
         // and JWKS are forgeable over http by an on-path attacker.
         // oidc_config sets secure_cookies = true.
         let config = oidc_config("dex", "http://auth.example", None);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("issuer_url must be https"), "{error}");
+        // The browser is sent to the end-session endpoint with the ID token.
+        let config = oidc_config(
+            "dex",
+            "https://auth.example",
+            Some("http://auth.example/logout"),
+        );
+        let error = config.validate().unwrap_err().to_string();
         assert!(
-            config.validate().unwrap_err().to_string().contains("https"),
-            "http issuer must be rejected under secure_cookies"
+            error.contains("end_session_endpoint must be https"),
+            "{error}"
         );
         // A dev setup (secure_cookies = false, http public_url) may still use
         // http locally.
-        let mut dev = oidc_config("dex", "http://127.0.0.1:5556/dex", None);
+        let mut dev = oidc_config(
+            "dex",
+            "http://127.0.0.1:5556/dex",
+            Some("http://127.0.0.1:5556/dex/logout"),
+        );
         dev.http.as_mut().unwrap().secure_cookies = false;
         dev.http.as_mut().unwrap().public_url = Some("http://127.0.0.1:8080".into());
         dev.validate().expect("http issuer allowed in dev");

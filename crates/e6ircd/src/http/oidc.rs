@@ -111,7 +111,7 @@ async fn discover_client_or_bad_gateway(
     state: &AppState,
     provider: &OidcProviderConfig,
 ) -> ResponseResult<ProviderClient> {
-    super::oidc_provider::discover(state.internal_upstreams, provider)
+    super::oidc_provider::discover(state.provider_rules(), provider)
         .await
         .and_then(|discovery| client_from_discovery(state, provider, discovery))
         .map_err(|error| provider_unavailable(&error))
@@ -125,7 +125,7 @@ async fn refreshed_client_or_bad_gateway(
     state: &AppState,
     provider: &OidcProviderConfig,
 ) -> ResponseResult<ProviderClient> {
-    super::oidc_provider::refresh(state.internal_upstreams, provider)
+    super::oidc_provider::refresh(state.provider_rules(), provider)
         .await
         .and_then(|discovery| client_from_discovery(state, provider, discovery))
         .map_err(|error| provider_unavailable(&error))
@@ -1252,7 +1252,7 @@ pub(super) enum LogoutVerification {
 /// keys again (throttled, one fetch at a time) and verifies once more before
 /// the token is refused.
 pub(super) async fn verify_logout_token(
-    policy: crate::egress::InternalUpstreams,
+    rules: super::oidc_provider::ProviderRules,
     provider: &OidcProviderConfig,
     raw: &str,
     now: i64,
@@ -1266,12 +1266,12 @@ pub(super) async fn verify_logout_token(
             now,
         )
     };
-    let discovery = super::oidc_provider::discover(policy, provider)
+    let discovery = super::oidc_provider::discover(rules, provider)
         .await
         .map_err(LogoutVerification::Unreachable)?;
     match verify(&discovery) {
         Err(LogoutTokenRejection::Signature) => {
-            let refreshed = super::oidc_provider::refresh(policy, provider)
+            let refreshed = super::oidc_provider::refresh(rules, provider)
                 .await
                 .map_err(LogoutVerification::Unreachable)?;
             verify(&refreshed).map_err(LogoutVerification::Rejected)
@@ -1317,7 +1317,7 @@ pub(super) async fn oidc_backchannel_logout(
         .expect("system time before Unix epoch")
         .as_secs() as i64;
     let claims = match verify_logout_token(
-        state.internal_upstreams,
+        state.provider_rules(),
         provider,
         form.logout_token.trim(),
         now,

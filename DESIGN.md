@@ -1643,7 +1643,18 @@ provider-verified email claim.
   may only advertise endpoints outside, so neither the provider nor whoever
   controls its discovery document can aim this server's token and key
   requests at internal infrastructure. A literal address is judged before each
-  request and every resolved address at connect time. First login
+  request and every resolved address at connect time. When the server's
+  cookies are `Secure` (`secure_cookies`, which also requires an `https`
+  public URL) every provider endpoint is HTTPS: configuration validation
+  refuses an `http` `issuer_url` or `end_session_endpoint`, a discovery
+  document that advertises a plaintext `authorization_endpoint`,
+  `token_endpoint`, `jwks_uri` or `userinfo_endpoint` is refused as a whole
+  (the login answers `502`, and the refusal is cached like any failed
+  discovery), and each provider call judges its URL's scheme again before it
+  is sent. Plaintext there would let an on-path attacker supply signing keys
+  and forge ID tokens, or read authorization codes and the client secret. A
+  development server (`secure_cookies = false`) may talk to a local provider
+  over `http`. First login
   auto-provisions an account named exactly by the provider's configured
   claim (`preferred_username`, or an email's local part); a name already in
   use or retired is a `409` (§12) — the server never picks or invents a name,
