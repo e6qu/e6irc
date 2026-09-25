@@ -3479,19 +3479,21 @@ async fn handle_request(
             caps,
             label,
         } => {
-            let targets = query_targets(pool, &channels, me.as_deref(), min_ts, max_ts, limit)
-                .await
-                .map(|mut targets| {
-                    // Same order and bound as the query: oldest activity first.
-                    targets.extend(session_only);
-                    targets.sort_by_key(|(_, latest)| *latest);
-                    targets.truncate(limit);
-                    targets
-                })
-                .map_err(|e| {
-                    record_database_error(telemetry);
-                    eprintln!("db: targets query failed: {e}");
-                });
+            let scope = crate::core::HistoryScope::from(caps);
+            let targets =
+                query_targets(pool, &channels, me.as_deref(), scope, min_ts, max_ts, limit)
+                    .await
+                    .map(|mut targets| {
+                        // Same order and bound as the query: oldest activity first.
+                        targets.extend(session_only);
+                        targets.sort_by_key(|(_, latest)| *latest);
+                        targets.truncate(limit);
+                        targets
+                    })
+                    .map_err(|e| {
+                        record_database_error(telemetry);
+                        eprintln!("db: targets query failed: {e}");
+                    });
             core_tx
                 .push(Input::TargetsPage {
                     conn,
@@ -4235,6 +4237,26 @@ struct HistoryDbRow {
     client_tags: String,
 }
 
+/// Expand `$build!(@ <kind predicate>, <dm_conversations column>; ...)` once
+/// per [`crate::core::HistoryScope`] and pick the statement for `$scope`.
+///
+/// What a scope means in SQL is written here and nowhere else: a reader that
+/// cannot receive a TAGMSG has `messages` rows of that kind cut (before any
+/// `LIMIT`, so it counts only rows the reader is sent), and reads the
+/// `dm_conversations` time that ignores them (migration 0085). Every
+/// scope-dependent statement is built through this, so a page, a window and
+/// TARGETS cannot disagree about what a scope admits.
+macro_rules! by_history_scope {
+    ($scope:expr, $build:ident ! ( $($args:tt)* )) => {
+        match $scope {
+            crate::core::HistoryScope::TextAndTags => $build!(@ "", "latest_ts"; $($args)*),
+            crate::core::HistoryScope::Text => {
+                $build!(@ "AND kind <> 'tagmsg' ", "latest_text_ts"; $($args)*)
+            }
+        }
+    };
+}
+
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
 ///
 /// The column list is a contract between eleven query variants and one row
@@ -4248,31 +4270,25 @@ struct HistoryDbRow {
 /// interpolated string would not.
 macro_rules! history_select {
     ($scope:expr, $rest:literal) => {
-        match $scope {
-            crate::core::HistoryScope::TextAndTags => concat!(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-                 sender_account, kind, body, sender_is_bot, multiline, client_tags FROM messages ",
-                history_where!(""),
-                $rest
-            ),
-            crate::core::HistoryScope::Text => concat!(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-                 sender_account, kind, body, sender_is_bot, multiline, client_tags FROM messages ",
-                history_where!("AND kind <> 'tagmsg' "),
-                $rest
-            ),
-        }
+        by_history_scope!($scope, history_select!($rest))
+    };
+    (@ $kind:literal, $dm_latest:literal; $rest:literal) => {
+        concat!(
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
+             sender_account, kind, body, sender_is_bot, multiline, client_tags FROM messages ",
+            history_where!($kind),
+            $rest
+        )
     };
 }
 
 /// The predicate every history statement starts with: the target (`$1`), the
-/// reader's floor (`$2`), and — for a reader that cannot receive a TAGMSG — the
-/// scope, applied before the `LIMIT` so it counts only rows the reader is sent.
+/// reader's floor (`$2`), and the scope's kind predicate.
 macro_rules! history_where {
-    ($scope:literal) => {
+    ($kind:literal) => {
         concat!(
             "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ",
-            $scope
+            $kind
         )
     };
 }
@@ -4282,25 +4298,20 @@ macro_rules! history_where {
 /// carries `ts`/`id` for that ordering.
 macro_rules! history_window {
     ($scope:expr, $older:literal, $newer:literal) => {
-        match $scope {
-            crate::core::HistoryScope::TextAndTags => history_window!(@ "", $older, $newer),
-            crate::core::HistoryScope::Text => {
-                history_window!(@ "AND kind <> 'tagmsg' ", $older, $newer)
-            }
-        }
+        by_history_scope!($scope, history_window!($older, $newer))
     };
-    (@ $scope:literal, $older:literal, $newer:literal) => {
+    (@ $kind:literal, $dm_latest:literal; $older:literal, $newer:literal) => {
         concat!(
             "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
              client_tags FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
              body, sender_is_bot, multiline, client_tags, ts, id FROM messages ",
-            history_where!($scope),
+            history_where!($kind),
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
              sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts, id \
              FROM messages ",
-            history_where!($scope),
+            history_where!($kind),
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
         )
@@ -4694,11 +4705,68 @@ struct HistoryTargetRow {
     latest: i64,
 }
 
-/// Return visible targets with latest activity in the requested window.
+/// The CHATHISTORY TARGETS statement, in a scope's fragments.
+///
+/// A channel's newest entry in scope is one backward scan of
+/// `messages_target_ts_id_idx` per requested channel (a LATERAL `max(ts)`
+/// becomes `Index Scan Backward ... Limit 1`, stepping over the TAGMSG rows a
+/// text-scope reader cannot be sent); grouping
+/// `WHERE target = ANY(..)` instead read every row of every joined channel to
+/// find each maximum. A direct-message conversation's newest entry in each
+/// scope is kept in `dm_conversations` by triggers on `messages` (migrations
+/// 0080 and 0085), so that half reads at most `limit` rows of the index on
+/// the scope's column.
+macro_rules! targets_select {
+    ($scope:expr) => {
+        by_history_scope!($scope, targets_select!())
+    };
+    (@ $kind:literal, $dm_latest:literal;) => {
+        concat!(
+            "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
+                 SELECT requested.name, newest.latest
+                 FROM unnest($1::text[], $6::bigint[]) AS requested(name, floor)
+                 CROSS JOIN LATERAL (
+                     SELECT max(ts) AS latest FROM messages
+                     WHERE target = requested.name
+                       AND ts >= to_timestamp(requested.floor::double precision / 1000) ",
+            $kind,
+            ") newest
+                 WHERE newest.latest IS NOT NULL
+                 UNION ALL
+                 (SELECT peer AS name, ",
+            $dm_latest,
+            " AS latest
+                  FROM dm_conversations
+                  WHERE account = $5
+                    AND ",
+            $dm_latest,
+            " > to_timestamp($2::double precision / 1000)
+                    AND ",
+            $dm_latest,
+            " < to_timestamp($3::double precision / 1000)
+                  ORDER BY ",
+            $dm_latest,
+            " ASC
+                  LIMIT $4)
+             ) buffers
+             GROUP BY name
+             HAVING MAX(latest) > to_timestamp($2::double precision / 1000)
+                AND MAX(latest) < to_timestamp($3::double precision / 1000)
+             ORDER BY latest ASC
+             LIMIT $4"
+        )
+    };
+}
+
+/// Return visible targets whose latest activity in the reader's `scope` falls
+/// in the requested window, dated by that activity: a buffer whose only
+/// activity is entries the reader cannot be sent (TAGMSGs, for a reader
+/// without `message-tags`) is not its buffer.
 pub async fn query_targets(
     pool: &PgPool,
     channels: &[(String, crate::core::HistoryFloor)],
     me: Option<&str>,
+    scope: crate::core::HistoryScope,
     min_ts: e6irc_proto::time::Millis,
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
@@ -4714,47 +4782,15 @@ pub async fn query_targets(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .unzip();
-    let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(
-        // A channel's newest message is one backward probe of
-        // `messages_target_ts_id_idx` per requested channel (a LATERAL
-        // `max(ts)` becomes `Index Only Scan Backward ... Limit 1`); grouping
-        // `WHERE target = ANY(..)` instead read every row of every joined
-        // channel to find each maximum. A direct-message conversation's newest
-        // message is kept in `dm_conversations` by triggers on `messages`
-        // (migration 0080), so that half reads at most `limit` rows of
-        // `dm_conversations_account_latest_idx`.
-        "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
-             SELECT requested.name, newest.latest
-             FROM unnest($1::text[], $6::bigint[]) AS requested(name, floor)
-             CROSS JOIN LATERAL (
-                 SELECT max(ts) AS latest FROM messages
-                 WHERE target = requested.name
-                   AND ts >= to_timestamp(requested.floor::double precision / 1000)
-             ) newest
-             WHERE newest.latest IS NOT NULL
-             UNION ALL
-             (SELECT peer AS name, latest_ts AS latest
-              FROM dm_conversations
-              WHERE account = $5
-                AND latest_ts > to_timestamp($2::double precision / 1000)
-                AND latest_ts < to_timestamp($3::double precision / 1000)
-              ORDER BY latest_ts ASC
-              LIMIT $4)
-         ) buffers
-         GROUP BY name
-         HAVING MAX(latest) > to_timestamp($2::double precision / 1000)
-            AND MAX(latest) < to_timestamp($3::double precision / 1000)
-         ORDER BY latest ASC
-         LIMIT $4",
-    )
-    .bind(names)
-    .bind(min_ts as f64)
-    .bind(max_ts as f64)
-    .bind(limit as i64)
-    .bind(me)
-    .bind(floors)
-    .fetch_all(pool)
-    .await;
+    let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(targets_select!(scope))
+        .bind(names)
+        .bind(min_ts as f64)
+        .bind(max_ts as f64)
+        .bind(limit as i64)
+        .bind(me)
+        .bind(floors)
+        .fetch_all(pool)
+        .await;
     rows.map_err(query_error)?
         .into_iter()
         .map(|row| {

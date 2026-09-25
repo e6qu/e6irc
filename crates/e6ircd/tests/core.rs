@@ -7359,6 +7359,94 @@ fn chathistory_targets_lists_conversations_and_orders_oldest_first() {
     );
 }
 
+thread_local! {
+    /// The wall-clock time [`set_wall`] reads, per test thread.
+    static WALL_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(1_000_000_000) };
+}
+
+/// A wall clock a test moves with [`advance_wall`].
+fn set_wall() -> Millis {
+    Millis::from_millis(WALL_NOW.with(std::cell::Cell::get))
+}
+
+fn advance_wall(to: u64) {
+    WALL_NOW.with(|now| now.set(to));
+}
+
+/// The `(target, time)` pairs of a TARGETS reply.
+fn listed_targets(out: &[String]) -> Vec<(String, String)> {
+    out.iter()
+        .filter(|l| l.contains("CHATHISTORY TARGETS "))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace().skip(4);
+            Some((words.next()?.to_string(), words.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// TARGETS dates a buffer by its newest entry the requester can be sent, from
+/// the rings (no database): a reader without `message-tags` has TAGMSGs
+/// ignored — a buffer is dated by its newest text, and one holding only
+/// TAGMSGs is not listed — while a reader with it is dated by the TAGMSG.
+#[test]
+fn chathistory_targets_dates_buffers_in_the_readers_scope() {
+    const TEXT_AT: &str = "1970-01-12T13:46:40.000Z";
+    const REACTION_AT: &str = "1970-01-12T13:46:45.000Z";
+    advance_wall(1_000_000_000);
+    let mut s = TestServer::configured(false, set_wall, |_| {});
+    let tags = "batch draft/chathistory message-tags server-time";
+    let alice = register_with_caps(&mut s, 1, "alice", tags);
+    let bob = register_with_caps(&mut s, 2, "bob", tags);
+    let carol = register_with_caps(&mut s, 3, "carol", "batch draft/chathistory server-time");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #text");
+        s.line(c, "JOIN #tags");
+    }
+    s.line(alice, "PRIVMSG #text :hello");
+    s.line(alice, "PRIVMSG carol :hello");
+    advance_wall(1_000_005_000);
+    s.line(alice, "@+draft/react=x TAGMSG #text");
+    s.line(alice, "@+draft/react=x TAGMSG #tags");
+    s.line(alice, "@+draft/react=x TAGMSG carol");
+    s.line(bob, "@+draft/react=x TAGMSG carol");
+    for c in [alice, bob, carol] {
+        s.drain(c);
+    }
+    let targets = "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z \
+                   timestamp=2262-01-01T00:00:00.000Z 10";
+    let pair = |name: &str, at: &str| (name.to_string(), at.to_string());
+
+    s.line(carol, targets);
+    let out = s.drain(carol);
+    assert_eq!(
+        listed_targets(&out),
+        [pair("#text", TEXT_AT), pair("alice", TEXT_AT)],
+        "{out:#?}"
+    );
+
+    s.line(bob, targets);
+    let mut listed = listed_targets(&s.drain(bob));
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            pair("#tags", REACTION_AT),
+            pair("#text", REACTION_AT),
+            pair("carol", REACTION_AT)
+        ]
+    );
+
+    // The window bounds the reader's own time: carol's buffers were last
+    // active, for her, before it.
+    s.line(
+        carol,
+        "CHATHISTORY TARGETS timestamp=1970-01-12T13:46:41.000Z \
+         timestamp=2262-01-01T00:00:00.000Z 10",
+    );
+    let out = s.drain(carol);
+    assert!(listed_targets(&out).is_empty(), "{out:#?}");
+}
+
 #[test]
 fn chathistory_around_msgid() {
     let mut s = TestServer::new_no_persistence();

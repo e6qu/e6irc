@@ -149,7 +149,7 @@ async fn hist(
 }
 
 /// `query_targets` likewise now returns `Result`; unwrap for the happy-path
-/// tests (a query error is a test failure).
+/// tests (a query error is a test failure). A reader with `message-tags`.
 async fn tgts(
     pool: &sqlx::PgPool,
     channels: &[String],
@@ -158,11 +158,31 @@ async fn tgts(
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
 ) -> Vec<(String, e6irc_proto::time::Millis)> {
+    tgts_in(
+        pool,
+        channels,
+        me,
+        e6ircd::core::HistoryScope::TextAndTags,
+        (min_ts, max_ts),
+        limit,
+    )
+    .await
+}
+
+/// [`tgts`] for a reader in `scope`.
+async fn tgts_in(
+    pool: &sqlx::PgPool,
+    channels: &[String],
+    me: &str,
+    scope: e6ircd::core::HistoryScope,
+    (min_ts, max_ts): (e6irc_proto::time::Millis, e6irc_proto::time::Millis),
+    limit: usize,
+) -> Vec<(String, e6irc_proto::time::Millis)> {
     let channels: Vec<(String, e6ircd::core::HistoryFloor)> = channels
         .iter()
         .map(|channel| (channel.clone(), e6ircd::core::HistoryFloor::Whole))
         .collect();
-    db::query_targets(pool, &channels, Some(me), min_ts, max_ts, limit)
+    db::query_targets(pool, &channels, Some(me), scope, min_ts, max_ts, limit)
         .await
         .expect("targets query")
 }
@@ -10668,6 +10688,7 @@ async fn history_reads_stop_at_their_floor() {
                 &pool,
                 &[("#h".to_string(), floor)],
                 None,
+                e6ircd::core::HistoryScope::Text,
                 millis(0),
                 millis(99_000),
                 10,
@@ -11582,6 +11603,43 @@ async fn insert_message(
     .expect("insert message");
 }
 
+/// Insert one stored reaction (a TAGMSG, migration 0081) as the history flush
+/// does.
+async fn insert_reaction(
+    pool: &sqlx::PgPool,
+    msgid: &str,
+    target: &str,
+    peers: Option<&[&str]>,
+    ts_millis: i64,
+) {
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts,
+                               dm_peers, client_tags)
+         VALUES ($1, $2, 'x!x@h', NULL, 'tagmsg', '',
+                 to_timestamp($3::double precision / 1000), $4, '+draft/react=x')",
+    )
+    .bind(msgid)
+    .bind(target)
+    .bind(ts_millis)
+    .bind(peers.map(|peers| peers.iter().map(|p| p.to_string()).collect::<Vec<_>>()))
+    .execute(pool)
+    .await
+    .expect("insert reaction");
+}
+
+/// Every conversation summary row with both of its times: of any entry, and of
+/// the newest text entry (NULL while the conversation holds none).
+async fn dm_summary_scoped(pool: &sqlx::PgPool) -> Vec<(String, String, i64, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT account, peer, (EXTRACT(EPOCH FROM latest_ts) * 1000)::bigint,
+                (EXTRACT(EPOCH FROM latest_text_ts) * 1000)::bigint
+         FROM dm_conversations ORDER BY account, peer",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("summary")
+}
+
 async fn dm_summary(pool: &sqlx::PgPool) -> Vec<(String, String, i64)> {
     sqlx::query_as(
         "SELECT account, peer, (EXTRACT(EPOCH FROM latest_ts) * 1000)::bigint
@@ -11707,6 +11765,156 @@ async fn dm_conversation_summary_is_backfilled_from_stored_history() {
             ("bob".to_string(), millis(2000)),
             ("alice".into(), millis(4000))
         ]
+    );
+}
+
+/// TARGETS dates a buffer by its newest entry the reader can be sent: a
+/// reader without `message-tags` has channels' and conversations' TAGMSGs
+/// ignored, and a buffer holding only TAGMSGs is not listed for it. Both
+/// summary times follow every insert and delete, including the recompute when
+/// the newest entry in either scope is deleted.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn targets_are_dated_in_the_readers_scope() {
+    use e6ircd::core::HistoryScope::{Text, TextAndTags};
+    let pool =
+        db::connect_and_migrate(&support::test_db("targets_are_dated_in_the_readers_scope").await)
+            .await
+            .expect("connect");
+    let ab: &[&str] = &["alice", "bob"];
+    insert_message(&pool, "r1", "#room", None, 500).await;
+    insert_reaction(&pool, "r2", "#room", None, 4000).await;
+    insert_reaction(&pool, "q1", "#quiet", None, 600).await;
+    insert_message(&pool, "ab1", "alice!bob", Some(ab), 1000).await;
+    insert_message(&pool, "ab2", "alice!bob", Some(ab), 1500).await;
+    insert_reaction(&pool, "ab3", "alice!bob", Some(ab), 3000).await;
+    insert_reaction(&pool, "ac1", "alice!carol", Some(&["alice", "carol"]), 2000).await;
+    let channels = ["#room".to_string(), "#quiet".to_string()];
+    let window = (millis(0), millis(9999));
+    assert_eq!(
+        tgts_in(&pool, &channels, "alice", TextAndTags, window, 10).await,
+        [
+            ("#quiet".to_string(), millis(600)),
+            ("carol".into(), millis(2000)),
+            ("bob".into(), millis(3000)),
+            ("#room".into(), millis(4000)),
+        ]
+    );
+    assert_eq!(
+        tgts_in(&pool, &channels, "alice", Text, window, 10).await,
+        [
+            ("#room".to_string(), millis(500)),
+            ("bob".into(), millis(1500))
+        ]
+    );
+    // The window bounds the scope's time: bob's newest text is before it.
+    assert!(
+        tgts_in(
+            &pool,
+            &channels,
+            "alice",
+            Text,
+            (millis(1600), millis(9999)),
+            10
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        dm_summary_scoped(&pool).await,
+        [
+            ("alice".to_string(), "bob".to_string(), 3000, Some(1500)),
+            ("alice".into(), "carol".into(), 2000, None),
+            ("bob".into(), "alice".into(), 3000, Some(1500)),
+            ("carol".into(), "alice".into(), 2000, None),
+        ]
+    );
+    // Deleting the newest text entry recomputes only the text time.
+    sqlx::query("DELETE FROM messages WHERE msgid = 'ab2'")
+        .execute(&pool)
+        .await
+        .expect("delete newest text");
+    assert_eq!(
+        tgts_in(&pool, &[], "bob", Text, window, 10).await,
+        [("alice".to_string(), millis(1000))]
+    );
+    assert_eq!(
+        tgts_in(&pool, &[], "bob", TextAndTags, window, 10).await,
+        [("alice".to_string(), millis(3000))]
+    );
+    // Deleting the newest entry, a TAGMSG, recomputes the other.
+    sqlx::query("DELETE FROM messages WHERE msgid = 'ab3'")
+        .execute(&pool)
+        .await
+        .expect("delete newest entry");
+    assert_eq!(
+        tgts_in(&pool, &[], "bob", TextAndTags, window, 10).await,
+        [("alice".to_string(), millis(1000))]
+    );
+    // A later TAGMSG advances only the time of its scope; the last text entry
+    // gone leaves a conversation of TAGMSGs, which only that scope lists.
+    insert_reaction(&pool, "ab4", "alice!bob", Some(ab), 5000).await;
+    sqlx::query("DELETE FROM messages WHERE msgid = 'ab1'")
+        .execute(&pool)
+        .await
+        .expect("delete last text");
+    assert_eq!(
+        dm_summary_scoped(&pool).await[0],
+        ("alice".to_string(), "bob".to_string(), 5000, None)
+    );
+    assert!(
+        tgts_in(&pool, &[], "bob", Text, window, 10)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        tgts_in(&pool, &[], "bob", TextAndTags, window, 10).await,
+        [("alice".to_string(), millis(5000))]
+    );
+    // A text entry older than the newest TAGMSG gives the text scope its time
+    // without moving the other.
+    insert_message(&pool, "ab5", "alice!bob", Some(ab), 4500).await;
+    assert_eq!(
+        dm_summary_scoped(&pool).await[0],
+        ("alice".to_string(), "bob".to_string(), 5000, Some(4500))
+    );
+}
+
+/// Migration 0085 gives every summarized conversation its newest text time
+/// from the direct messages already stored, and none to a conversation of
+/// TAGMSGs only.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn dm_conversation_text_time_is_backfilled_from_stored_history() {
+    let url = support::test_db("dm_conversation_text_time_is_backfilled").await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    MIGRATIONS
+        .run_to(81, &pool)
+        .await
+        .expect("migrate through 0081");
+    insert_message(&pool, "ab1", "alice!bob", Some(&["alice", "bob"]), 1000).await;
+    insert_reaction(&pool, "ab2", "alice!bob", Some(&["alice", "bob"]), 4000).await;
+    insert_reaction(&pool, "bb1", "bob!bob", Some(&["bob"]), 2000).await;
+    MIGRATIONS.run(&pool).await.expect("migrate current");
+    assert_eq!(
+        dm_summary_scoped(&pool).await,
+        [
+            ("alice".to_string(), "bob".to_string(), 4000, Some(1000)),
+            ("bob".into(), "alice".into(), 4000, Some(1000)),
+            ("bob".into(), "bob".into(), 2000, None),
+        ]
+    );
+    assert_eq!(
+        tgts_in(
+            &pool,
+            &[],
+            "bob",
+            e6ircd::core::HistoryScope::Text,
+            (millis(0), millis(9999)),
+            10
+        )
+        .await,
+        [("alice".to_string(), millis(1000))]
     );
 }
 

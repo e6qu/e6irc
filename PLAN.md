@@ -870,7 +870,11 @@ fixes:
 
 Maintainer decision implemented on top: history keeps client-only tags and
 `TAGMSG` reactions (migration 0081), replayed to `message-tags` readers; typing
-indicators are never stored, on the server or the bouncer.
+indicators are never stored, on the server or the bouncer. CHATHISTORY TARGETS
+answers in the reader's scope, as the bouncer's does: for a reader without
+`message-tags` a buffer is dated by its newest text and one with only
+`TAGMSG`s in the window is not listed (ring times per scope, a second
+`dm_conversations` time, migration 0085).
 
 ## Remaining qualification
 

@@ -635,14 +635,19 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     let me = state.conn_identity(conn);
     let batch_ref = state.next_msgid();
     let response_caps = crate::core::HistoryResponseCaps::from(caps);
+    // A buffer is dated by its newest entry the requester can be sent: one
+    // whose only activity is TAGMSGs has nothing to replay to a client without
+    // `message-tags`, so naming it would promise a page that comes back empty
+    // (the scope a page is cut in, and the bouncer's TARGETS).
+    let scope = crate::core::HistoryScope::from(response_caps);
 
-    // A buffer qualifies on its *latest* message falling inside the window,
+    // A buffer qualifies on its *latest* entry falling inside the window,
     // not on merely containing one: newer activity means the client has
     // already moved past it.
     let latest_in_window = |state: &ServerState,
                             key: &crate::core::state::HistoryKey|
      -> Option<e6irc_proto::time::Millis> {
-        let latest = state.history.get(key)?.latest()?;
+        let latest = state.history.get(key)?.latest().in_scope(scope)?;
         (latest > min_ts && latest < max_ts).then_some(latest)
     };
     // Conversations: every hot conversation listing the requester as a
@@ -702,7 +707,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     // depend on where the channel lives.
     targets.extend(
         keys.iter()
-            .filter_map(|key| state.channel_activity(key))
+            .filter_map(|key| state.channel_activity(key, scope))
             .filter(|(_, latest)| *latest > min_ts && *latest < max_ts),
     );
     targets.append(&mut conversations);
