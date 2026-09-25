@@ -2,7 +2,9 @@
 
 use sqlx::Row;
 
-use super::{DbError, decode_managed_settings, insert_audit_log_with, stored_network_kind};
+use super::{
+    AuditPrincipal, DbError, decode_managed_settings, insert_audit_log_with, stored_network_kind,
+};
 
 /// Counts from one atomic database-wide master-key rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,9 +187,9 @@ pub async fn rotate_database_secrets(
 
     insert_audit_log_with(
         &mut *transaction,
-        actor,
+        &AuditPrincipal::host(actor),
         "SECRET_ROTATE",
-        "server",
+        &AuditPrincipal::server(),
         &format!(
             "re-sealed {managed_config_secrets} managed and \
              {account_network_secrets} account-network secrets"

@@ -46,35 +46,21 @@ pub(super) type OidcClient = openidconnect::core::CoreClient<
     openidconnect::EndpointMaybeSet,
 >;
 
-pub(super) fn oidc_http_client() -> openidconnect::reqwest::Client {
-    // No redirect following: token endpoints must answer directly. Timeouts
-    // bound each outbound call so an unresponsive IdP (reached from
-    // unauthenticated login/discovery/back-channel paths) can't pin a task.
-    openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("reqwest client")
+/// A relying-party client for one provider, built from its discovery
+/// document, with the HTTP client its calls must go through.
+pub(super) struct ProviderClient {
+    pub(super) client: OidcClient,
+    pub(super) http: super::oidc_provider::ProviderHttp,
 }
 
-fn discovery_error(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    message
-}
-
-pub(super) async fn discover_client(
+/// The client for `provider` from a discovery answer.
+fn client_from_discovery(
     state: &AppState,
     provider: &OidcProviderConfig,
-) -> Result<OidcClient, String> {
+    discovery: super::oidc_provider::ProviderDiscovery,
+) -> Result<ProviderClient, String> {
     use openidconnect::{ClientId, ClientSecret, RedirectUrl};
-    let metadata = discover_metadata(provider).await?;
+    let super::oidc_provider::ProviderDiscovery { metadata, http } = discovery;
     let token_endpoint = metadata
         .token_endpoint()
         .cloned()
@@ -97,84 +83,52 @@ pub(super) async fn discover_client(
             openidconnect::AuthType::RequestBody
         }
     };
-    Ok(openidconnect::core::CoreClient::from_provider_metadata(
+    let client = openidconnect::core::CoreClient::from_provider_metadata(
         metadata,
         ClientId::new(provider.client_id.clone()),
         Some(ClientSecret::new(provider.client_secret.clone())),
     )
     .set_token_uri(token_endpoint)
     .set_redirect_uri(redirect)
-    .set_auth_type(auth_type))
+    .set_auth_type(auth_type);
+    Ok(ProviderClient { client, http })
 }
 
-/// Discover the client, or answer `BAD_GATEWAY` when the IdP is unreachable or
-/// its discovery document cannot support the authorization-code flow — the
-/// shared failure shape of the start and callback handlers.
+/// The shared failure shape of the start and callback handlers: the provider
+/// is unreachable or its discovery document cannot support the
+/// authorization-code flow.
+fn provider_unavailable(error: &str) -> ResponseRejection {
+    eprintln!("oidc: {error}");
+    ResponseRejection::from(problem(
+        StatusCode::BAD_GATEWAY,
+        "OIDC provider unavailable",
+        Some("The identity provider is unreachable or its discovery document is unusable."),
+    ))
+}
+
+/// Discover the client, or answer `BAD_GATEWAY`.
 async fn discover_client_or_bad_gateway(
     state: &AppState,
     provider: &OidcProviderConfig,
-) -> ResponseResult<OidcClient> {
-    discover_client(state, provider).await.map_err(|e| {
-        eprintln!("oidc: {e}");
-        ResponseRejection::from(problem(
-            StatusCode::BAD_GATEWAY,
-            "OIDC provider unavailable",
-            Some("The identity provider is unreachable or its discovery document is unusable."),
-        ))
-    })
+) -> ResponseResult<ProviderClient> {
+    super::oidc_provider::discover(state.internal_upstreams, provider)
+        .await
+        .and_then(|discovery| client_from_discovery(state, provider, discovery))
+        .map_err(|error| provider_unavailable(&error))
 }
 
-/// TTL for a cached OIDC discovery document (and its JWKS). Bounds outbound
-/// fetches so an unauthenticated flood of login/logout requests can't amplify
-/// into one IdP round-trip each.
-pub(super) const DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(900);
-
-#[allow(clippy::type_complexity)]
-pub(super) fn discovery_cache() -> &'static std::sync::Mutex<
-    HashMap<
-        String,
-        (
-            std::time::Instant,
-            openidconnect::core::CoreProviderMetadata,
-        ),
-    >,
-> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            HashMap<
-                String,
-                (
-                    std::time::Instant,
-                    openidconnect::core::CoreProviderMetadata,
-                ),
-            >,
-        >,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-pub(super) async fn discover_metadata(
+/// The client rebuilt from the provider's keys fetched again, after a token
+/// failed signature verification against the cached ones (the provider
+/// rotated its keys). Throttled and single-flight in
+/// [`super::oidc_provider::refresh`].
+async fn refreshed_client_or_bad_gateway(
+    state: &AppState,
     provider: &OidcProviderConfig,
-) -> Result<openidconnect::core::CoreProviderMetadata, String> {
-    use openidconnect::IssuerUrl;
-    let key = provider.issuer_url.clone();
-    // Serve a fresh cached document (which already carries the JWKS) without
-    // an outbound fetch.
-    if let Some((at, meta)) = discovery_cache().lock().expect("poisoned").get(&key)
-        && at.elapsed() < DISCOVERY_TTL
-    {
-        return Ok(meta.clone());
-    }
-    let issuer = IssuerUrl::new(key.clone()).map_err(|e| e.to_string())?;
-    let meta =
-        openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
-            .await
-            .map_err(|error| format!("discovery failed: {}", discovery_error(&error)))?;
-    discovery_cache()
-        .lock()
-        .expect("poisoned")
-        .insert(key, (std::time::Instant::now(), meta.clone()));
-    Ok(meta)
+) -> ResponseResult<ProviderClient> {
+    super::oidc_provider::refresh(state.internal_upstreams, provider)
+        .await
+        .and_then(|discovery| client_from_discovery(state, provider, discovery))
+        .map_err(|error| provider_unavailable(&error))
 }
 
 pub(super) async fn oidc_start(
@@ -184,7 +138,7 @@ pub(super) async fn oidc_start(
     _rl: RateLimited,
     PathParams(provider_name): PathParams<String>,
 ) -> Response {
-    oidc_authorize(&state, &provider_name, None, false).await
+    oidc_authorize(&state, &provider_name, FlowPurpose::SignIn).await
 }
 
 /// Silently check for an existing SSO session at the provider
@@ -199,33 +153,56 @@ pub(super) async fn oidc_sso_start(
     _rl: RateLimited,
     PathParams(provider_name): PathParams<String>,
 ) -> Response {
-    oidc_authorize(&state, &provider_name, None, true).await
+    oidc_authorize(&state, &provider_name, FlowPurpose::SilentSignIn).await
 }
 
 /// Begin an OIDC flow that *links* the resulting identity to the
 /// authenticated caller's account rather than logging in. The account is
 /// sealed into the flow cookie; the shared callback attaches the identity when
 /// the provider returns.
+///
+/// A `POST` whose session carries its `X-E6IRC-CSRF` header like every other
+/// unsafe API method; the answer names the provider URL the page navigates
+/// to, so the session-bound CSRF value never travels in a URL (history,
+/// proxy logs). Whoever finishes the flow at the provider becomes a login
+/// identity of the account, so a bearer is refused and the session must have
+/// proved its person recently.
 pub(super) async fn oidc_link_start(
     State(state): State<Arc<AppState>>,
     // Authenticated, so not an unauthenticated vector, but each call forces a
     // discovery fetch — gated for parity with its siblings.
     _rl: RateLimited,
-    // Whoever finishes this flow at the provider becomes a login identity of
-    // the account. A bearer admitted here could link its holder's own identity
-    // and sign in as the owner, with nothing more than the `read` scope.
-    BrowserSession(account, session): BrowserSession,
+    RecentlyAuthenticated(account, _session): RecentlyAuthenticated,
     PathParams(provider_name): PathParams<String>,
-    // A cross-site top-level navigation carries the SameSite=Lax session
-    // cookie, so without the session-bound value any page could start a link
-    // flow in the owner's browser and, at a provider that auto-approves, attach
-    // whichever provider identity that browser is signed in to.
-    QueryParams(query): QueryParams<CsrfQuery>,
 ) -> Response {
-    if !query.admits(&state, &session) {
-        return csrf_refusal();
+    match authorization_request(&state, &provider_name, FlowPurpose::Link { account }).await {
+        Ok(request) => request.into_json(),
+        Err(response) => response.into(),
     }
-    oidc_authorize(&state, &provider_name, Some(account), false).await
+}
+
+/// Begin an OIDC flow that proves the browser session's person again (the
+/// step-up re-authentication an account without a primary password — or one
+/// that prefers its provider — uses). The provider is asked to authenticate
+/// afresh (`prompt=login`, `max_age=0`); the callback accepts only an identity
+/// linked to this account whose authentication time is recent, and marks this
+/// session re-authenticated.
+pub(super) async fn oidc_reauthenticate_start(
+    State(state): State<Arc<AppState>>,
+    _rl: RateLimited,
+    SessionMutation(account, _session): SessionMutation,
+    PathParams(provider_name): PathParams<String>,
+) -> Response {
+    match authorization_request(
+        &state,
+        &provider_name,
+        FlowPurpose::Reauthenticate { account },
+    )
+    .await
+    {
+        Ok(request) => request.into_json(),
+        Err(response) => response.into(),
+    }
 }
 
 /// How long a browser may take between leaving for the provider and coming
@@ -259,12 +236,23 @@ struct OidcFlow {
     nonce: String,
     /// Seconds since the Unix epoch after which the flow is refused.
     expires_at: u64,
-    /// When set, the callback links the resulting identity to this account
-    /// instead of logging in / auto-provisioning.
-    link_account: Option<String>,
+    /// What the callback does with the identity the provider returns.
+    purpose: FlowPurpose,
+}
+
+/// What an authorization flow is for — one of four, so no flow can be both a
+/// link and a re-authentication, or a silent probe that links.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FlowPurpose {
+    /// Sign in (provisioning a first account).
+    SignIn,
     /// A silent (`prompt=none`) SSO probe: on `login_required` the callback
     /// bounces to `/?sso=none` instead of returning an error.
-    silent: bool,
+    SilentSignIn,
+    /// Link the returned identity to this account.
+    Link { account: String },
+    /// Prove this account's browser session's person again.
+    Reauthenticate { account: String },
 }
 
 /// Why a callback's flow cookie was not admitted.
@@ -275,6 +263,8 @@ enum FlowRefusal {
     Unbound,
     Expired,
     WrongProvider,
+    /// The flow has already been answered: a replayed copy of its cookie.
+    Spent,
 }
 
 impl FlowRefusal {
@@ -283,6 +273,7 @@ impl FlowRefusal {
             Self::Unbound => "Login state not bound to this browser",
             Self::Expired => "Unknown or expired login state",
             Self::WrongProvider => "Login state mismatch",
+            Self::Spent => "Login state already used",
         };
         problem(StatusCode::UNAUTHORIZED, title, None)
     }
@@ -334,20 +325,30 @@ impl OidcFlow {
         Ok(flow)
     }
 
-    /// The browser's flow for this callback, read from its state cookie.
+    /// The browser's flow for this callback, read from its state cookie, and
+    /// spent: a flow is answered once, so a kept copy of the cookie cannot
+    /// make this server call the provider again.
     fn from_callback(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         provider: &str,
         returned_state: &str,
     ) -> Result<Self, FlowRefusal> {
-        Self::open(
+        let now = unix_now();
+        let flow = Self::open(
             &state.oidc_flow_key,
             cookie_value(headers, oidc_state_cookie_name(state.secure_cookies)).as_deref(),
             provider,
             returned_state,
-            unix_now(),
-        )
+            now,
+        )?;
+        if !state
+            .spent_oidc_flows
+            .spend(&flow.state, flow.expires_at, now)
+        {
+            return Err(FlowRefusal::Spent);
+        }
+        Ok(flow)
     }
 }
 
@@ -372,15 +373,55 @@ fn spending_flow(state: &AppState, mut response: Response) -> Response {
     response
 }
 
-/// Shared authorization-request builder for login, link, and silent-SSO
-/// flows. `silent` adds `prompt=none` so the provider returns without any
-/// UI (used for the SSO-session probe).
-pub(super) async fn oidc_authorize(
+/// An authorization request ready for the browser: the provider URL to
+/// navigate to, and the flow cookie that binds the provider's answer to this
+/// browser.
+struct AuthorizationRequest {
+    url: String,
+    flow_cookie: String,
+}
+
+impl AuthorizationRequest {
+    /// Send the browser there now (sign-in navigations).
+    fn into_redirect(self) -> Response {
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [
+                (header::LOCATION, self.url),
+                (header::SET_COOKIE, self.flow_cookie),
+            ],
+        )
+            .into_response()
+    }
+
+    /// Name the URL for a page that asked with its session's CSRF header, and
+    /// set the flow cookie on the same answer.
+    fn into_json(self) -> Response {
+        let mut response = json_no_store(serde_json::json!({ "authorization_url": self.url }));
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            self.flow_cookie.parse().expect("cookie header value"),
+        );
+        response
+    }
+}
+
+/// Shared authorization-request builder for sign-in, silent-SSO, link and
+/// re-authentication flows. A silent probe adds `prompt=none` so the provider
+/// returns without any UI; a re-authentication adds `prompt=login` and
+/// `max_age=0` so the provider authenticates its person afresh.
+async fn oidc_authorize(state: &AppState, provider_name: &str, purpose: FlowPurpose) -> Response {
+    match authorization_request(state, provider_name, purpose).await {
+        Ok(request) => request.into_redirect(),
+        Err(response) => response.into(),
+    }
+}
+
+async fn authorization_request(
     state: &AppState,
     provider_name: &str,
-    link_account: Option<String>,
-    silent: bool,
-) -> Response {
+    purpose: FlowPurpose,
+) -> ResponseResult<AuthorizationRequest> {
     use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge, Scope};
     let Some(provider) = state
         .oidc_providers
@@ -388,12 +429,11 @@ pub(super) async fn oidc_authorize(
         .find(|p| p.name == provider_name)
         .cloned()
     else {
-        return problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None);
+        return Err(problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None).into());
     };
-    let client = match discover_client_or_bad_gateway(state, &provider).await {
-        Ok(c) => c,
-        Err(resp) => return resp.into(),
-    };
+    let client = discover_client_or_bad_gateway(state, &provider)
+        .await?
+        .client;
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client
         .authorize_url(
@@ -407,8 +447,14 @@ pub(super) async fn oidc_authorize(
     for scope in requested_scopes(&provider) {
         request = request.add_scope(Scope::new(scope));
     }
-    if silent {
-        request = request.add_extra_param("prompt", "none");
+    match purpose {
+        FlowPurpose::SilentSignIn => request = request.add_extra_param("prompt", "none"),
+        FlowPurpose::Reauthenticate { .. } => {
+            request = request
+                .add_extra_param("prompt", "login")
+                .add_extra_param("max_age", "0");
+        }
+        FlowPurpose::SignIn | FlowPurpose::Link { .. } => {}
     }
     let (auth_url, csrf, nonce) = request.url();
     let flow = OidcFlow {
@@ -417,8 +463,7 @@ pub(super) async fn oidc_authorize(
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
         expires_at: unix_now() + OIDC_FLOW_TTL.as_secs(),
-        link_account,
-        silent,
+        purpose,
     };
     // Bind the flow to this browser: the callback admits only a response whose
     // `state` matches the sealed flow in this cookie, so a login response
@@ -426,22 +471,15 @@ pub(super) async fn oidc_authorize(
     // plant the attacker's session (login CSRF / session fixation).
     // SameSite=Lax still rides the top-level redirect back from the provider.
     let secure = if state.secure_cookies { "; Secure" } else { "" };
-    (
-        StatusCode::TEMPORARY_REDIRECT,
-        [
-            (header::LOCATION, auth_url.to_string()),
-            (
-                header::SET_COOKIE,
-                format!(
-                    "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
-                    oidc_state_cookie_name(state.secure_cookies),
-                    flow.seal(&state.oidc_flow_key),
-                    OIDC_FLOW_TTL.as_secs(),
-                ),
-            ),
-        ],
-    )
-        .into_response()
+    Ok(AuthorizationRequest {
+        url: auth_url.to_string(),
+        flow_cookie: format!(
+            "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
+            oidc_state_cookie_name(state.secure_cookies),
+            flow.seal(&state.oidc_flow_key),
+            OIDC_FLOW_TTL.as_secs(),
+        ),
+    })
 }
 
 fn requested_scopes(provider: &OidcProviderConfig) -> Vec<String> {
@@ -487,6 +525,10 @@ fn account_name_taken(claim_name: &str) -> Response {
 
 pub(super) async fn oidc_callback(
     State(state): State<Arc<AppState>>,
+    // A callback can make this server call the provider's token endpoint with
+    // its client secret; unthrottled, it made the server an amplifier against
+    // the provider.
+    _rl: RateLimited,
     PathParams(provider_name): PathParams<String>,
     headers: axum::http::HeaderMap,
     QueryParams(query): QueryParams<CallbackQuery>,
@@ -521,7 +563,7 @@ pub(super) async fn oidc_callback(
         // A silent SSO probe (`prompt=none`) with no upstream session comes
         // back as `login_required`; that is expected — bounce to interactive
         // login rather than erroring.
-        if flow.silent {
+        if flow.purpose == FlowPurpose::SilentSignIn {
             // `consent_required` is not `login_required`: the browser *does*
             // have a provider session, it has simply never authorized this
             // client. OpenID Connect answers a silent probe that way on a
@@ -533,7 +575,7 @@ pub(super) async fn oidc_callback(
             // consent that is missing can never be recorded by probing. The
             // new flow's cookie replaces this one.
             if err == "consent_required" {
-                return oidc_authorize(&state, &provider_name, None, false).await;
+                return oidc_authorize(&state, &provider_name, FlowPurpose::SignIn).await;
             }
             return spending_flow(&state, Redirect::to("/?sso=none").into_response());
         }
@@ -577,14 +619,15 @@ async fn complete_flow(
             None,
         );
     };
-    let client = match discover_client_or_bad_gateway(state, provider).await {
-        Ok(c) => c,
-        Err(resp) => return resp.into(),
-    };
+    let ProviderClient { client, http } =
+        match discover_client_or_bad_gateway(state, provider).await {
+            Ok(provider_client) => provider_client,
+            Err(resp) => return resp.into(),
+        };
     let token_response = match client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier))
-        .request_async(&oidc_http_client())
+        .request_async(&http)
         .await
     {
         Ok(t) => t,
@@ -596,7 +639,20 @@ async fn complete_flow(
     let Some(id_token) = token_response.id_token() else {
         return problem(StatusCode::UNAUTHORIZED, "Provider sent no ID token", None);
     };
-    let claims = match id_token.claims(&client.id_token_verifier(), &Nonce::new(flow.nonce)) {
+    let nonce = Nonce::new(flow.nonce);
+    let verified = match id_token.claims(&client.id_token_verifier(), &nonce) {
+        // Signed by a key the cached set does not hold: the provider may have
+        // rotated its keys since they were fetched. Fetch them again (at most
+        // once per interval, one fetch at a time) and verify once more.
+        Err(openidconnect::ClaimsVerificationError::SignatureVerification(_)) => {
+            match refreshed_client_or_bad_gateway(state, provider).await {
+                Ok(refreshed) => id_token.claims(&refreshed.client.id_token_verifier(), &nonce),
+                Err(resp) => return resp.into(),
+            }
+        }
+        verified => verified,
+    };
+    let claims = match verified {
         Ok(c) => c,
         Err(e) => {
             eprintln!("oidc: id token rejected: {e}");
@@ -634,7 +690,21 @@ async fn complete_flow(
     let sid = token_claims.as_ref().and_then(|claims| claims.sid.clone());
     // Link flow: attach this identity to the account that started it,
     // rather than logging in / provisioning a new account.
-    if let Some(account) = &flow.link_account {
+    if let FlowPurpose::Reauthenticate { account } = &flow.purpose {
+        return reauthenticated(
+            state,
+            &pool,
+            headers,
+            ProvenIdentity {
+                account,
+                issuer,
+                subject,
+                authenticated_at: claims.auth_time().map(|at| at.timestamp()),
+            },
+        )
+        .await;
+    }
+    if let FlowPurpose::Link { account } = &flow.purpose {
         return match crate::db::link_oidc_identity(&pool, account, issuer, subject).await {
             Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => {
                 (StatusCode::SEE_OTHER, [(header::LOCATION, "/?linked=1")]).into_response()
@@ -659,27 +729,33 @@ async fn complete_flow(
             }
         };
     }
-    let (account_name, detail) = match provider.account_claim {
-        crate::config::OidcAccountClaim::PreferredUsername => (
+    // A returning identity signs in to the account it is linked to, whatever
+    // its claims now say; only a first sign-in derives a name.
+    let linked = match crate::db::oidc_linked_account(&pool, issuer, subject).await {
+        Ok(linked) => linked,
+        Err(e) => {
+            eprintln!("oidc: identity lookup failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Account storage failed",
+                None,
+            );
+        }
+    };
+    let preferred = match linked {
+        Some(account) => account,
+        None => match provisioned_account_name(
+            provider,
             claims
                 .preferred_username()
-                .and_then(|value| crate::sanitize::account_name(value.as_str())),
-            "The configured preferred_username claim must contain an IRC-safe account name.",
-        ),
-        crate::config::OidcAccountClaim::Email => (
-            claims
-                .email()
-                .and_then(|value| crate::identity::ContactEmail::parse(value.as_str()).ok())
-                .and_then(|email| crate::sanitize::account_name(email.local_part())),
-            "The configured email claim must be a valid email with an IRC-safe local part.",
-        ),
-    };
-    let Some(preferred) = account_name else {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "Provider sent no usable account claim",
-            Some(detail),
-        );
+                .map(|value| value.as_str().to_string())
+                .as_deref(),
+            email.as_deref(),
+            claims.email_verified() == Some(true),
+        ) {
+            Ok(name) => name,
+            Err(refusal) => return refusal.response(),
+        },
     };
     // Only stored roles reach the database.
     let role = token_claims
@@ -756,6 +832,173 @@ async fn complete_flow(
         ],
     )
         .into_response()
+}
+
+/// Why a first sign-in may not provision an account.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProvisioningRefusal {
+    /// The configured claim is absent or not an IRC-safe account name.
+    UnusableClaim(&'static str),
+    /// The email claim names accounts, but the provider has not verified the
+    /// address: anyone could have typed it at a provider that lets people
+    /// register.
+    UnverifiedEmail,
+    /// The email claim names accounts, but no domain policy says whose
+    /// addresses they are: without one, `alice@anywhere` would become the
+    /// account `alice`, whoever holds that mailbox.
+    NoDomainPolicy,
+}
+
+impl ProvisioningRefusal {
+    pub(super) fn response(&self) -> Response {
+        match self {
+            Self::UnusableClaim(detail) => problem(
+                StatusCode::UNAUTHORIZED,
+                "Provider sent no usable account claim",
+                Some(detail),
+            ),
+            Self::UnverifiedEmail => problem(
+                StatusCode::FORBIDDEN,
+                "Account provisioning refused",
+                Some(
+                    "This provider names new accounts by email, and it has not verified this \
+                     identity's address. Verify the address with the provider, or ask an \
+                     administrator to create the account and link this identity to it.",
+                ),
+            ),
+            Self::NoDomainPolicy => problem(
+                StatusCode::FORBIDDEN,
+                "Account provisioning refused",
+                Some(
+                    "This provider names new accounts by the local part of an email address, \
+                     which is only a name when the provider's allowed email domains say whose \
+                     addresses they are, and it has none. Ask an administrator to configure \
+                     the provider's allowed email domains, or to create the account and link \
+                     this identity to it.",
+                ),
+            ),
+        }
+    }
+}
+
+/// The account a first sign-in provisions, named by the provider's
+/// configured claim. An email names an account only when the provider
+/// verified it and a domain policy admits it (the policy itself is enforced
+/// for every sign-in by [`email_domain_admitted`]); the local part of an
+/// address anyone could claim never becomes a name. There is no fallback to
+/// another claim: the administrator chose this one.
+pub(super) fn provisioned_account_name(
+    provider: &OidcProviderConfig,
+    preferred_username: Option<&str>,
+    email: Option<&str>,
+    email_verified: bool,
+) -> Result<String, ProvisioningRefusal> {
+    match provider.account_claim {
+        crate::config::OidcAccountClaim::PreferredUsername => preferred_username
+            .and_then(crate::sanitize::account_name)
+            .ok_or(ProvisioningRefusal::UnusableClaim(
+                "The configured preferred_username claim must contain an IRC-safe account name.",
+            )),
+        crate::config::OidcAccountClaim::Email => {
+            let unusable = ProvisioningRefusal::UnusableClaim(
+                "The configured email claim must be a valid email with an IRC-safe local part.",
+            );
+            let email = email
+                .and_then(|value| crate::identity::ContactEmail::parse(value).ok())
+                .ok_or(unusable)?;
+            if !email_verified {
+                return Err(ProvisioningRefusal::UnverifiedEmail);
+            }
+            if provider.allowed_email_domains.is_empty() {
+                return Err(ProvisioningRefusal::NoDomainPolicy);
+            }
+            crate::sanitize::account_name(email.local_part()).ok_or(
+                ProvisioningRefusal::UnusableClaim(
+                    "The configured email claim must be a valid email with an IRC-safe local part.",
+                ),
+            )
+        }
+    }
+}
+
+/// Who a re-authentication flow's provider says signed in, and when.
+struct ProvenIdentity<'a> {
+    /// The account the flow was started for.
+    account: &'a str,
+    issuer: &'a str,
+    subject: &'a str,
+    /// The ID token's `auth_time`, in Unix seconds.
+    authenticated_at: Option<i64>,
+}
+
+/// Finish a re-authentication: the returned identity must be linked to the
+/// account that asked, the provider must say its person authenticated just
+/// now (the request asked for `max_age=0`), and the browser's own session must
+/// be that account's. Then this session counts as recently authenticated.
+async fn reauthenticated(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    proven: ProvenIdentity<'_>,
+) -> Response {
+    let refused = |detail: &str| {
+        problem(
+            StatusCode::FORBIDDEN,
+            "Re-authentication refused",
+            Some(detail),
+        )
+    };
+    let linked = match crate::db::oidc_linked_account(pool, proven.issuer, proven.subject).await {
+        Ok(linked) => linked,
+        Err(e) => {
+            eprintln!("oidc: identity lookup failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Account storage failed",
+                None,
+            );
+        }
+    };
+    let fold = |name: &str| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name);
+    if linked.as_deref().map(fold) != Some(fold(proven.account)) {
+        return refused("The identity you signed in with is not linked to this account.");
+    }
+    let now = i64::try_from(unix_now()).expect("the Unix time fits in i64");
+    let window = i64::try_from(crate::db::STEP_UP_WINDOW.as_secs()).expect("a small window");
+    if !proven
+        .authenticated_at
+        .is_some_and(|at| at <= now + 60 && now - at <= window)
+    {
+        return refused(
+            "The identity provider did not report a fresh sign-in. Sign in at the provider again.",
+        );
+    }
+    let Some(session) = session_token(headers, state.secure_cookies) else {
+        return refused("This browser is not signed in.");
+    };
+    match crate::db::mark_session_reauthenticated(
+        pool,
+        proven.account,
+        &session,
+        crate::db::Reauthentication::IdentityProvider,
+    )
+    .await
+    {
+        Ok(true) => (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, "/console/account?reauthenticated=1")],
+        )
+            .into_response(),
+        Ok(false) => refused("This browser's session is not this account's."),
+        Err(e) => {
+            eprintln!("oidc: re-authentication failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            )
+        }
+    }
 }
 
 fn email_domain_admitted(
@@ -890,13 +1133,37 @@ fn jwt_string_claims(raw: &str) -> Result<JwtStringClaims, String> {
         .map_err(|_| "JWT payload is not JSON".into())
 }
 
+/// Why a logout token was refused.
+#[derive(Debug)]
+pub(super) enum LogoutTokenRejection {
+    /// Exactly one key of the set must verify the signature, and none (or
+    /// more than one) did. A key the set does not hold yet — the provider
+    /// rotated its keys — looks like this, so the caller fetches the keys
+    /// again and verifies once more.
+    Signature,
+    /// Anything else about the token is wrong; new keys would not change it.
+    Invalid(String),
+}
+
+impl From<String> for LogoutTokenRejection {
+    fn from(reason: String) -> Self {
+        Self::Invalid(reason)
+    }
+}
+
+impl From<&str> for LogoutTokenRejection {
+    fn from(reason: &str) -> Self {
+        Self::Invalid(reason.to_string())
+    }
+}
+
 pub(super) fn verify_logout_token_with_metadata(
     raw: &str,
     provider: &OidcProviderConfig,
     supported_algorithms: &[openidconnect::core::CoreJwsSigningAlgorithm],
     keys: &[openidconnect::core::CoreJsonWebKey],
     now: i64,
-) -> Result<BackchannelLogoutClaims, String> {
+) -> Result<BackchannelLogoutClaims, LogoutTokenRejection> {
     use openidconnect::JsonWebKey;
 
     let segments: Vec<&str> = raw.split('.').collect();
@@ -930,7 +1197,7 @@ pub(super) fn verify_logout_token_with_metadata(
         })
         .count();
     if valid_keys != 1 {
-        return Err("logout token signature is invalid or ambiguous".into());
+        return Err(LogoutTokenRejection::Signature);
     }
     let mut claims: BackchannelLogoutClaims =
         serde_json::from_slice(&base64url_decode(segments[1])?)
@@ -969,14 +1236,60 @@ pub(super) fn verify_logout_token_with_metadata(
     Ok(claims)
 }
 
+/// Why a back-channel logout token was not verified.
+#[derive(Debug)]
+pub(super) enum LogoutVerification {
+    /// The provider's discovery document or keys could not be fetched.
+    Unreachable(String),
+    Rejected(LogoutTokenRejection),
+}
+
+/// Verify a back-channel logout token against the provider's keys.
+///
+/// A provider treats a `400` as final, so a token signed by a key this server
+/// has not fetched yet — the provider rotated its keys — would never end the
+/// session it names. A signature no cached key verifies therefore fetches the
+/// keys again (throttled, one fetch at a time) and verifies once more before
+/// the token is refused.
+pub(super) async fn verify_logout_token(
+    policy: crate::egress::InternalUpstreams,
+    provider: &OidcProviderConfig,
+    raw: &str,
+    now: i64,
+) -> Result<BackchannelLogoutClaims, LogoutVerification> {
+    let verify = |discovery: &super::oidc_provider::ProviderDiscovery| {
+        verify_logout_token_with_metadata(
+            raw,
+            provider,
+            discovery.metadata.id_token_signing_alg_values_supported(),
+            discovery.metadata.jwks().keys(),
+            now,
+        )
+    };
+    let discovery = super::oidc_provider::discover(policy, provider)
+        .await
+        .map_err(LogoutVerification::Unreachable)?;
+    match verify(&discovery) {
+        Err(LogoutTokenRejection::Signature) => {
+            let refreshed = super::oidc_provider::refresh(policy, provider)
+                .await
+                .map_err(LogoutVerification::Unreachable)?;
+            verify(&refreshed).map_err(LogoutVerification::Rejected)
+        }
+        verified => verified.map_err(LogoutVerification::Rejected),
+    }
+}
+
 // Deliberately NOT `RateLimited` (unlike its front-channel sibling): this
 // endpoint is called server-to-server by the IdP, from a single source IP, and a
 // mass-logout event legitimately bursts many tokens at once — a per-IP limit
 // would DROP real logout notifications (leaving sessions alive that should end),
 // a worse outcome than the marginal DoS it would prevent. The work an unsigned
 // request induces is already bounded: signature verification is fast, discovery
-// is cached (900s), and a DB row is written only for a validly-signed token an
-// attacker cannot forge. See the front-channel handler for the contrasting case.
+// is cached (900s, a failure 30s), a key refresh for an unknown signing key runs
+// at most once per 30s, and a DB row is written only for a validly-signed token
+// an attacker cannot forge. See the front-channel handler for the contrasting
+// case.
 pub(super) async fn oidc_backchannel_logout(
     State(state): State<Arc<AppState>>,
     form: Result<Form<BackchannelLogoutForm>, axum::extract::rejection::FormRejection>,
@@ -999,26 +1312,31 @@ pub(super) async fn oidc_backchannel_logout(
     else {
         return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None);
     };
-    let metadata = match discover_metadata(provider).await {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("oidc: logout metadata discovery failed: {error}");
-            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
-        }
-    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time before Unix epoch")
         .as_secs() as i64;
-    let claims = match verify_logout_token_with_metadata(
-        form.logout_token.trim(),
+    let claims = match verify_logout_token(
+        state.internal_upstreams,
         provider,
-        metadata.id_token_signing_alg_values_supported(),
-        metadata.jwks().keys(),
+        form.logout_token.trim(),
         now,
-    ) {
+    )
+    .await
+    {
         Ok(value) => value,
-        Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
+        Err(LogoutVerification::Unreachable(error)) => {
+            eprintln!("oidc: logout metadata discovery failed: {error}");
+            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
+        }
+        Err(LogoutVerification::Rejected(rejection)) => {
+            let reason = match &rejection {
+                LogoutTokenRejection::Signature => "no key of the provider's set verifies it",
+                LogoutTokenRejection::Invalid(reason) => reason,
+            };
+            eprintln!("oidc: back-channel logout token refused: {reason}");
+            return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None);
+        }
     };
     match crate::db::consume_oidc_backchannel_logout(
         pool,
@@ -1148,11 +1466,7 @@ where
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(JsonBody(value)),
-            Err(e) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON",
-                Some(&e.to_string()),
-            )),
+            Err(e) => Err(body_rejection(e.status(), "Invalid JSON", &e.to_string())),
         }
     }
 }
@@ -1315,6 +1629,57 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for SessionMutation {
     }
 }
 
+/// A [`SessionMutation`] whose session proved its person within
+/// [`crate::db::STEP_UP_WINDOW`]: signed in, or re-authenticated
+/// (`POST /api/v1/me/reauthenticate`), that recently.
+///
+/// The operations that mint or redirect lasting authority over the account —
+/// an API token, an app password, a device approval, a linked identity, a
+/// first password, the recovery email, deleting the account — ask for this.
+/// A stolen session cookie alone would otherwise turn into a credential that
+/// outlives the session: an app password survives a password change and
+/// "sign out everywhere". A session that has not proved itself recently is
+/// refused with the typed [`super::REAUTHENTICATION_REQUIRED`] problem, which
+/// the console answers by asking the person to confirm and retrying.
+pub(crate) struct RecentlyAuthenticated(pub(crate) String, pub(crate) String);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for RecentlyAuthenticated {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let SessionMutation(account, session) =
+            SessionMutation::from_request_parts(parts, state).await?;
+        require_recent_authentication(state, &session)
+            .await
+            .map_err(Response::from)?;
+        Ok(RecentlyAuthenticated(account, session))
+    }
+}
+
+/// Refuse unless the browser session proved its person within
+/// [`crate::db::STEP_UP_WINDOW`].
+pub(super) async fn require_recent_authentication(
+    state: &AppState,
+    session: &str,
+) -> ResponseResult<()> {
+    match crate::db::session_recently_authenticated(pool_of(state), session).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(super::reauthentication_required().into()),
+        Err(e) => {
+            eprintln!("http: session age lookup failed: {e}");
+            Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+            .into())
+        }
+    }
+}
+
 /// The authenticated account of an **admin**. Same idea as [`Authenticated`],
 /// one rung up: a handler that asks for this in its signature cannot be reached
 /// by a non-admin, and — the point — an admin route cannot *forget* the check,
@@ -1437,7 +1802,11 @@ pub(crate) enum RequestCredential {
     /// must prove possession of the session-bound CSRF value.
     Session(String),
     /// Tokens carry only the explicit grant checked for the requested method.
-    ApiToken(crate::identity::ApiTokenScopes),
+    ApiToken {
+        scopes: crate::identity::ApiTokenScopes,
+        /// The stored token, so a socket it opens can end when it does.
+        credential: crate::db::RevocableCredential,
+    },
 }
 
 impl RequestCredential {
@@ -1446,7 +1815,16 @@ impl RequestCredential {
     pub(crate) fn browser_session(&self) -> Option<&str> {
         match self {
             Self::Session(session) => Some(session),
-            Self::ApiToken(_) => None,
+            Self::ApiToken { .. } => None,
+        }
+    }
+
+    /// The stored credential behind this request, which a long-lived socket
+    /// watches so it ends when the credential does.
+    pub(crate) fn revocable(&self) -> crate::db::RevocableCredential {
+        match self {
+            Self::Session(session) => crate::db::RevocableCredential::browser_session(session),
+            Self::ApiToken { credential, .. } => credential.clone(),
         }
     }
 
@@ -1455,7 +1833,7 @@ impl RequestCredential {
     pub(crate) fn grants_write(&self) -> bool {
         match self {
             Self::Session(_) => true,
-            Self::ApiToken(scopes) => scopes.contains(crate::identity::ApiTokenScope::Write),
+            Self::ApiToken { scopes, .. } => scopes.contains(crate::identity::ApiTokenScope::Write),
         }
     }
 }
@@ -1490,7 +1868,10 @@ async fn authenticate_principal(
                     .await
                     .map(|(account, flags)| RequestPrincipal {
                         account,
-                        credential: RequestCredential::ApiToken(principal.scopes),
+                        credential: RequestCredential::ApiToken {
+                            scopes: principal.scopes,
+                            credential: crate::db::RevocableCredential::api_token(bearer),
+                        },
                         flags,
                     })
             }
@@ -1552,7 +1933,7 @@ fn authorize_api_request(
     parts: &axum::http::request::Parts,
     administrator_route: bool,
 ) -> Result<(), ApiAuthorizationDenial> {
-    let RequestCredential::ApiToken(scopes) = credential else {
+    let RequestCredential::ApiToken { scopes, .. } = credential else {
         if parts.method != axum::http::Method::GET && parts.method != axum::http::Method::HEAD {
             let RequestCredential::Session(session) = credential else {
                 unreachable!("closed request credential set")
@@ -2078,8 +2459,9 @@ mod domain_policy_tests {
             pkce_verifier: "verifier".into(),
             nonce: "nonce".into(),
             expires_at,
-            link_account: Some("alice".into()),
-            silent: true,
+            purpose: FlowPurpose::Link {
+                account: "alice".into(),
+            },
         }
     }
 
@@ -2093,8 +2475,12 @@ mod domain_policy_tests {
             .expect("the browser's own flow");
         assert_eq!(opened.pkce_verifier, "verifier");
         assert_eq!(opened.nonce, "nonce");
-        assert_eq!(opened.link_account.as_deref(), Some("alice"));
-        assert!(opened.silent);
+        assert_eq!(
+            opened.purpose,
+            FlowPurpose::Link {
+                account: "alice".into()
+            }
+        );
 
         let open = |cookie: Option<&str>, provider: &str, state: &str, now: u64| {
             OidcFlow::open(&key, cookie, provider, state, now).err()

@@ -18,7 +18,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The server-level policy on upstream addresses inside the host's own network.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalUpstreams {
     /// Loopback, RFC 1918, carrier-grade NAT and unique-local addresses are
@@ -229,6 +231,44 @@ fn is_loopback_literal(addr: &str) -> bool {
             url::Host::Domain(_) => Some(false),
         })
         .unwrap_or(false)
+}
+
+/// A name resolver for an outbound HTTP client that hands the connector only
+/// the addresses `policy` permits, so a name that resolves — now or after a
+/// rebind — to a refused address is refused at connect time. A name with no
+/// permitted address is an error, never a fall-through to the system resolver.
+/// It sees only names: a URL whose host is an address literal is dialled
+/// directly, so a client built with it judges literals before each request.
+pub(crate) struct VettingResolver(InternalUpstreams);
+
+impl VettingResolver {
+    pub(crate) fn new(policy: InternalUpstreams) -> Self {
+        Self(policy)
+    }
+}
+
+impl openidconnect::reqwest::dns::Resolve for VettingResolver {
+    fn resolve(
+        &self,
+        name: openidconnect::reqwest::dns::Name,
+    ) -> openidconnect::reqwest::dns::Resolving {
+        let policy = self.0;
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let permitted: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|address| policy.permits(address.ip()))
+                .collect();
+            if permitted.is_empty() {
+                return Err(format!(
+                    "{host}: no permitted address (every resolved address is internal or \
+                     never a network)"
+                )
+                .into());
+            }
+            Ok(Box::new(permitted.into_iter()) as openidconnect::reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// RFC 6598 shared address space, `100.64.0.0/10`: the inside of a carrier or

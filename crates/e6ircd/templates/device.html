@@ -29,6 +29,14 @@
             required
           />
         </label>
+        {% if confirm %}
+        <label class="device-code">Your e6irc password
+          <input type="password" name="password" autocomplete="current-password" required />
+        </label>
+        <p class="lede">Approving a device creates a token for it, and you signed in more than 10
+          minutes ago, so confirm it is you. An account that signs in only through an identity
+          provider confirms on its <a href="/console/account">account page</a> first.</p>
+        {% endif %}
         <button class="primary-action" type="submit">Approve</button>
       </form>
       </section>

@@ -15,8 +15,12 @@ const root = new URL("../../", import.meta.url);
 const templates = new URL("crates/e6ircd/templates/", root);
 
 // Pages whose form IS the e6irc account: signing in, creating the first
-// administrator, accepting an invitation, and changing the account password.
-const E6IRC_LOGIN_PAGES = new Set(["login.html", "bootstrap.html", "invite.html", "console_account.html", "device.html"]);
+// administrator, accepting an invitation, changing the account password, and
+// confirming the login again before a change that needs a recent sign-in.
+const E6IRC_LOGIN_PAGES = new Set([
+  "login.html", "bootstrap.html", "invite.html", "console_account.html", "device.html",
+  "reauthenticate_dialog.html",
+]);
 
 async function documents() {
   const found = [["web/index.html", await readFile(new URL("web/index.html", root), "utf8")]];

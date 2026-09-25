@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -67,7 +67,11 @@ fn authorized(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
 }
 
 fn unauthorized() -> Response {
-    let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    let mut response = problem(
+        StatusCode::UNAUTHORIZED,
+        "Monitoring token required",
+        Some("Present the deployment's monitoring token as a Bearer credential."),
+    );
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         "Bearer realm=\"e6irc-monitoring\""
@@ -219,6 +223,22 @@ mod tests {
         assert!(!authorized(&headers, Some(&expected)));
         assert!(!authorized(&HeaderMap::new(), Some(&expected)));
         assert!(!authorized(&headers, None));
+    }
+
+    #[tokio::test]
+    async fn a_refused_monitoring_request_is_a_problem_document_with_a_challenge() {
+        let response = unauthorized();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        assert_eq!(problem["status"], 401);
     }
 
     #[test]

@@ -1549,10 +1549,35 @@ provider-verified email claim.
   option). A non-empty domain policy admits only a syntactically valid,
   provider-verified email whose canonical domain exactly matches an entry;
   parent/subdomain relationships never become implicit wildcards. Discovery +
-  JWKS cached with proper refresh. First login
-  auto-provisions an account (nick derived from `preferred_username`,
-  conflict → user picks). Subsequent logins match on (issuer, subject),
-  never on email.
+  JWKS cached with proper refresh: a document is served from the cache for 15
+  minutes and a failed discovery for 30 seconds (an unreachable provider is not
+  dialled again by every unauthenticated start, callback, or back-channel
+  POST); an ID token or logout token that no cached key verifies fetches the
+  keys again — one fetch at a time, at most once per 30 seconds per provider —
+  and is verified once more, so a provider that rotates its signing key is
+  followed at once and a logout signed with the new key still ends the
+  session (a provider treats the `400` it would otherwise get as final). Every
+  provider call — discovery, keys, token exchange — goes through the egress
+  rule (§10.3): addresses that are never a network are refused always, and
+  the configured issuer's own position decides the rest. An administrator
+  may run the provider inside the server's network (a self-hosted provider
+  usually is), and then its endpoints may be inside too; a provider outside
+  may only advertise endpoints outside, so neither the provider nor whoever
+  controls its discovery document can aim this server's token and key
+  requests at internal infrastructure. A literal address is judged before each
+  request and every resolved address at connect time. First login
+  auto-provisions an account named exactly by the provider's configured
+  claim (`preferred_username`, or an email's local part); a name already in
+  use or retired is a `409` (§12) — the server never picks or invents a name,
+  and the person is not asked to pick one either. An email names an account
+  only when the provider marked it verified *and* the provider has an
+  allowed-domain policy that admits it: without a policy, `alice@anywhere`
+  would become `alice` for whoever registered that mailbox at a provider that
+  lets people register — a configured administrator's name among them. Such a
+  first sign-in is refused with a `403` saying what the administrator must
+  configure; there is no fallback to another claim the administrator did not
+  choose. Subsequent logins match on (issuer, subject), never on email, and
+  are not re-judged by these rules.
 - An in-flight OIDC authorization is held by the browser, not the server:
   `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
   verifier, nonce, ten-minute expiry, link target, and silent flag into the
@@ -1564,14 +1589,25 @@ provider-verified email claim.
   provider, before its expiry. An anonymous flood of starts therefore holds no
   server capacity a real login needs — the earlier bounded in-memory table
   refused every login with a 503 once 4096 anonymous starts filled it.
-  Replay is bounded without server state: the authorization code is
-  single-use at the provider and bound to the flow's PKCE verifier, every
-  callback that proves the binding clears the cookie, and a restart ends
-  every flow. A refused callback leaves the cookie alone, so an attacker who
-  learns a victim's `state` cannot burn the victim's login.
-- Linking an identity is a cookie-authenticated top-level GET (a provider
-  redirect cannot carry the CSRF header), so it requires the session-bound
-  CSRF value as its `csrf` query parameter, as RP-initiated logout does.
+  Replay is bounded twice: the authorization code is single-use at the
+  provider and bound to the flow's PKCE verifier, and every callback that
+  proves the binding clears the cookie *and* records the flow's `state` as
+  spent until the flow would have expired, so a kept copy of the cookie is
+  refused rather than making this server call the token endpoint with its
+  client secret again. The record is bounded (65,536 flows; past that, the one
+  closest to its own expiry is forgotten first), so no volume of logins can
+  fill it or refuse a real one, and a restart ends every flow. The callback
+  spends the per-address authentication budget like the start. A refused
+  callback leaves the cookie alone, so an attacker who learns a victim's
+  `state` cannot burn the victim's login.
+- The session-bound CSRF value never travels in a URL, where it would reach
+  browser history and proxy access logs for the session's lifetime. Linking an
+  identity is a `POST` carrying the `X-E6IRC-CSRF` header like every other
+  unsafe API method; it answers the provider URL, and the page navigates
+  there. Signing out is a form `POST` (the value in its body) that the browser
+  follows as a navigation to the provider's end-session endpoint; a script may
+  send the header instead. The `GET` forms of both, which took the value as a
+  `csrf` query parameter, are gone.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
   per-IP authentication rate limit and the per-account attempt limit (§15),
@@ -1579,9 +1615,12 @@ provider-verified email claim.
   short-lived `HttpOnly; SameSite=Strict` browser cookie to prevent login
   CSRF/session planting.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
-  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
-  server-rendered forms carry a per-session HMAC token in the request body and
-  reject a missing or invalid token before mutation. Each login records a
+  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: every unsafe
+  cookie-authenticated request proves a per-session HMAC value before
+  mutation — REST methods (and the console's scripts) in the `X-E6IRC-CSRF`
+  header at the shared authentication boundary (§9.4), and the few
+  server-rendered form posts that cannot set a header (`/device`, sign-out)
+  in their body. Each login records a
   bounded, display-safe user agent and a separate stable resource id; neither
   the opaque token nor its hash is exposed by session inventory.
 - Local and OpenID Connect login cannot issue a session for a suspended
@@ -1596,7 +1635,7 @@ provider-verified email claim.
   a local login page. The application shell exposed the authenticated account
   and a top-level logout navigation.
 - Coordinated logout: the session retained its OIDC issuer, subject, session
-  ID, provider, and ID token. `GET /api/v1/auth/logout` performed
+  ID, provider, and ID token. `POST /api/v1/auth/logout` performed
   RP-initiated logout through the provider `end_session_endpoint` with the ID
   token, client ID, and registered post-logout URI. The provider called
   `POST /api/v1/auth/oidc/backchannel-logout` with a signed logout token, or
@@ -1642,10 +1681,43 @@ mint a broader replacement. Every unsafe cookie-authenticated REST method
 requires that same header at the shared authentication boundary. The web
 session cookie remains the browser credential, with the CSRF rules above.
 
+Step-up: the self-service operations that mint or redirect lasting authority
+over the account — minting a personal access token or an app password,
+approving a device (which mints a token), linking a login identity, setting a
+first primary password, changing the recovery email, and deleting the account
+— need a session whose person proved themselves within the last ten minutes
+(`STEP_UP_WINDOW`). Otherwise a cookie stolen from a browser, whose CSRF value
+`GET /api/v1/me` hands to whoever holds it, would become an app password that
+survives a password change and "sign out everywhere". A session records when
+its person last proved themselves (`web_sessions.authenticated_at`, migration
+0079): at sign-in, and at each re-authentication — `POST
+/api/v1/me/reauthenticate` with the primary password (the login's own
+throttles), or `POST /api/v1/me/reauthenticate/oidc/{provider}`, a fresh
+provider sign-in (`prompt=login`, `max_age=0`) whose identity must be linked to
+the account and whose `auth_time` must be recent. Handlers ask for the
+`RecentlyAuthenticated` extractor, and the contract derives the refusal it can
+answer from the handler signature, like `RateLimited`'s `429`. A refused
+request is a `403` problem document of type
+`urn:e6irc:problem:reauthentication-required`; the console answers it by asking
+the person to confirm (their password, or a provider sign-in, which returns to
+the account page) and retries a password-confirmed change once. A password
+rotation proves the person by the current password it verifies, so only a
+first password needs the recent sign-in; `/device`, a server-rendered page,
+asks for the password with the code. Every re-authentication is audited
+(`ACCOUNT_REAUTHENTICATE`). Administrator actions on other accounts are not
+under this rule.
+
+Browser sessions are managed by browser sessions: revoking one
+(`DELETE /api/v1/me/sessions/{id}`) refuses a bearer exactly as revoking all
+but the current one does, so a token cannot sign its owner out of every
+browser one session at a time where the bulk operation would refuse it.
+Listing them stays readable by a `read` token.
+
 Authenticated API requests share a per-account token bucket across browser
 sessions and personal access tokens (240 requests per minute by default).
-Administrator operations use a separate, smaller per-account bucket (60 per
-minute by default). Both are UI-managed, bounded in memory, and fail closed
+Administrator operations — `/api/v1/admin/*` and the administrator console
+pages alike — use a separate, smaller per-account bucket (60 per minute by
+default); the pages used to spend the ordinary one. Both are UI-managed, bounded in memory, and fail closed
 when the bucket registry cannot admit another active account. The HTTP service
 also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
 limit, and 30-second request deadline before work can consume unbounded
@@ -1724,6 +1796,24 @@ browser can read a close frame but not a refused upgrade — which the chat
 client shows once and does not retry by itself. A silent peer is sent a
 WebSocket Ping after `ATTACH_LIVENESS_INTERVAL` (120 s) and detached after a
 second silent interval, the same rule as an attached IRC client (§10.1).
+A chat socket also ends with the credential that opened it. The browser
+session or personal access token is authorized once, at the upgrade, but the
+socket lives for hours, so it holds a lease on that credential and is closed
+with code 1008 ("Your sign-in ended…"; the client does not retry) when the
+credential is revoked or reaches its expiry. Revocation has many paths —
+logout, single and bulk session revocation, a password change, identity
+unlink, provider front- and back-channel logout, the 32-session cap, token
+revocation, suspension, host recovery, account deletion by cascade — and some
+run in another process, so no path announces it: `web_sessions` and
+`api_tokens` do (migration 0077), with a trigger that notifies
+`e6irc_credential_changed` on every committed delete or update. One listener
+per process, on its own connection, re-reads each announced credential that a
+socket holds; after its connection is lost it re-reads every held credential,
+because what was announced in between was not heard. A credential that cannot
+be re-read (the database is unavailable) closes its sockets with 1013 instead,
+which the client retries, authenticating again. `/ws/irc` is not such a
+socket: it carries no HTTP credential, and its SASL login is an IRC session's,
+with the same lifetime as one on a TCP listener.
 The account directory also projects effective administrator authority, its
 durable/configuration sources, and suspension posture.
 `PATCH /api/v1/admin/accounts/{id}` and matching CSRF-protected console forms
@@ -1771,6 +1861,19 @@ digests, plaintext bearer values, provider identity tokens/session IDs, device
 codes, and sealed upstream credentials are absent. Credential, token, identity,
 browser-session, login/logout, provider-logout, invitation, account-state, and
 deletion transitions emit redacted account-visible audit events.
+An audit row records which namespace its actor and its target belong to
+(`actor_kind`/`target_kind`, migration 0078: account, operator, nick, channel,
+network, mask, server, provider, host, invitation), because the same spelling
+can be an account, a configured operator block, a nick anyone may hold, or a
+name an invitation reserves. The account's activity and export select only
+rows naming it *as an account*; registering `root` shows nothing the operator
+`root` did, and a KILL or SETHOST of the nick `eve` is not the account `eve`'s.
+Every writer states the kind through a typed `AuditPrincipal`, whose account
+constructor folds the name. Rows written before 0078 were classified where the
+writing code proves the kind; a name it cannot prove — the actor of an older
+KILL or K/D/X-line (IRC wrote the operator's name or nick, HTTP the
+administrator's account, under one action) or a `CONFIG` by `bootstrap` — is
+`legacy`, shown to administrators as before and never to an account.
 
 `/console/accounts` additionally owns immediate local account creation,
 single-use invitation issuance/revocation, and permanent deletion with exact
@@ -1795,7 +1898,11 @@ server-level networks, and the BNC attach address. The rule for a console-owned
 setting the bootstrap configuration also states is stated once, in §18
 ("Operational configuration").
 Credential-bearing values are sealed before entering PostgreSQL and are never
-rendered back. Existing
+rendered back: `GET /api/v1/admin/configuration` serves a projection that
+names every field of every section — passing each public one through and
+clearing each secret — with no catch-all, so a field added to the
+configuration later does not compile until it is classified, and a new
+credential cannot be served by default. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
 supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.
@@ -2884,7 +2991,15 @@ Surface (initial):
   that cannot travel in one `PASS` line is a 400 naming `server_password`, and
   responses report `has_server_password`, never the value. The tagged actions
   refuse stray fields, so a password typed beside `keep` is refused rather than
-  silently dropped. Both browser clients omit a blank credential field rather
+  silently dropped. A stored secret never follows the network somewhere else:
+  when the destination changes — the IRC host or port, TLS turned off, a
+  bridge's API base or homeserver moved to another origin — a secret carried
+  over unchanged (by `keep`, or by replacing only the other half of a pair) is
+  a `409` naming `credentials` or `server_password`, so whoever may edit a
+  network cannot point it at their own listener and have the server send them
+  a password the API never reveals. The rule lives in the one function that
+  applies both credential actions, comparing the stored row with the edited
+  one. Both browser clients omit a blank credential field rather
   than sending null; an
   account box emptied against a stored account, or a value typed under a
   ticked Remove, is refused at the box rather than resolved one way or the
@@ -2899,7 +3014,12 @@ Surface (initial):
   value.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
-  canonical MLOCK, access flags, founder transfer, unregister)
+  canonical MLOCK, access flags, founder transfer, unregister). A topic is
+  stored whole or refused: TOPICLEN bounds it, and so does the TOPIC line that
+  carries it, whose head (the server's and the channel's names) can leave
+  less room than TOPICLEN; a topic that does not fit is a `400` naming how
+  much fits, never a shortened topic answered as success. (IRC `TOPIC` keeps
+  IRC's own rule, truncation, because an IRC client expects it.)
 - `history`: paged queries per §11.2
 - `admin`: bounded, exact-filtered/stable-cursor account posture, registered
   channel policy, global K/D/X-line policy, and audit log; server stats;
@@ -2919,7 +3039,18 @@ The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
 dependency). Its method/path inventory and path/query parameter declarations
 are checked against the Axum API router; a mismatch is a unit-test failure and
-the endpoint refuses to serve a plausible but incomplete contract.
+the endpoint refuses to serve a plausible but incomplete contract. The
+statuses a request can meet before its handler runs are derived, not listed:
+the route table records each handler's argument types, so every operation
+whose handler takes `RateLimited` documents its `429`, every account-
+authenticated one the admission statuses, and every operation the service's
+own bounds (`408` deadline, `413` body limit, and — except the probes — the
+per-address in-flight `429`); the validator refuses a document that drops
+one. The body limit's refusal is a problem document like every other: the
+limit layer's plain-text answer to a declared oversize length and an
+extractor's to a streamed one pass through one `payload_too_large`. The live
+chat socket `/ws/ui` is in the contract too, as the `GET` it is (an upgrade
+answered `101`), with its query, its refusals, and its close codes.
 
 ---
 
@@ -3426,7 +3557,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   each channel succession) and server bans; an upstream account command is recorded before it is sent,
   and a 503 answers when it cannot be. OPER, KILL and SETHOST are recorded under
   the operator name and refused with a NOTICE when the audit row cannot be
-  queued; an HTTP disconnect whose audit cannot be written is a 503. A
+  queued; an IRC-issued K/D/X-line's row is recorded under the operator name
+  too (the `set_by` STATS shows stays the nick); an HTTP disconnect whose audit
+  cannot be written is a 503. A
   suspension's disconnect is not refusable, because `ACCOUNT_SUSPEND` has
   already committed.
 - Administrator authority is read from the account row on every request

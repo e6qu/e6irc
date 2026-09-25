@@ -379,7 +379,7 @@ routable IPv6 where the host offers it.
 - `GET /api/v1/auth/oidc/shauth/start` — interactive login
 - `GET /api/v1/auth/oidc/shauth/sso` — silent `prompt=none` session probe
 - `GET /api/v1/auth/oidc/shauth/callback` — registered authorization callback
-- `GET /api/v1/auth/logout` — RP-initiated logout (ends the Shauth session too)
+- `POST /api/v1/auth/logout` — RP-initiated logout (ends the Shauth session too); the sign-out control is a form post carrying the session's CSRF value in its body
 - `GET /healthz` — liveness: process up and every core shard fresh (Shauth catalog health URL)
 
 The Shauth client registered `E6IRC_PUBLIC_URL` as its post-logout return and

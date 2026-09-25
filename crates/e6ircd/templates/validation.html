@@ -19,9 +19,10 @@
           <div><dt>Role</dt><dd data-testid="validation-role">{{ role }}</dd></div>
           <div><dt>Release</dt><dd><code data-testid="validation-release">{{ release }}</code></dd></div>
         </dl>
-        <div class="actions">
-          <a class="primary-action" data-shauth-sign-out href="{{ logout_url }}">Sign out</a>
-        </div>
+        <form class="actions" method="post" action="/api/v1/auth/logout">
+          <input type="hidden" name="csrf" value="{{ csrf }}" />
+          <button class="primary-action" type="submit" data-shauth-sign-out>Sign out</button>
+        </form>
       </section>
     </main>
   </body>

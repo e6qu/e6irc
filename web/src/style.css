@@ -140,6 +140,10 @@ body {
 #user-nav { margin-left: auto; display: flex; gap: 0.9rem; align-items: center; }
 #user-nav a { color: var(--chrome-fg); text-decoration-color: var(--chrome-border); text-underline-offset: 0.2em; white-space: nowrap; }
 #user-nav a:hover { text-decoration-color: var(--route); }
+#logout-form { display: contents; }
+#logout-link { padding: 0; border: 0; background: none; color: var(--chrome-fg); font: inherit; white-space: nowrap;
+  text-decoration: underline; text-decoration-color: var(--chrome-border); text-underline-offset: 0.2em; cursor: pointer; }
+#logout-link:hover { text-decoration-color: var(--route); }
 .user-role { color: var(--chrome-muted); font: 0.72rem/1 var(--font-mono); margin-left: 0.3rem; text-transform: uppercase; }
 .status {
   font: 0.72rem/1.2 var(--font-mono);

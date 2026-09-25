@@ -6,7 +6,7 @@ const { expect, test } = playwrightTest;
 
 const identity = {
   account: "visual-test", email: "visual@example.test", role: "operator", csrf_token: "session-bound-token",
-  logout_url: "/api/v1/auth/logout?csrf=session-bound-token",
+  logout_url: "/api/v1/auth/logout",
 };
 const presets = [
   { id: "libera", label: "Libera Chat", name: "libera", addr: "irc.libera.chat:6697", tls: true },
@@ -1566,10 +1566,12 @@ test("the sign-out link exists only once its CSRF-bearing URL is known", async (
   await page.goto("/");
   const signOut = page.locator("#logout-link");
   await expect(signOut).toBeHidden();
-  await expect(signOut).not.toHaveAttribute("href");
   release();
   await expect(signOut).toBeVisible();
-  await expect(signOut).toHaveAttribute("href", "/api/v1/auth/logout?csrf=session-bound-token");
+  // A form post: the session's token rides in the body, never in a URL.
+  await expect(page.locator("#logout-form")).toHaveAttribute("action", "/api/v1/auth/logout");
+  await expect(page.locator("#logout-form")).toHaveAttribute("method", "post");
+  await expect(page.locator("#logout-csrf")).toHaveValue("session-bound-token");
 });
 
 test("the add-network dialog's catalog does not type over what was typed while it loaded", async ({ page }) => {
