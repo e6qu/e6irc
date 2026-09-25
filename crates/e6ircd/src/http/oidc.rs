@@ -46,35 +46,21 @@ pub(super) type OidcClient = openidconnect::core::CoreClient<
     openidconnect::EndpointMaybeSet,
 >;
 
-pub(super) fn oidc_http_client() -> openidconnect::reqwest::Client {
-    // No redirect following: token endpoints must answer directly. Timeouts
-    // bound each outbound call so an unresponsive IdP (reached from
-    // unauthenticated login/discovery/back-channel paths) can't pin a task.
-    openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("reqwest client")
+/// A relying-party client for one provider, built from its discovery
+/// document, with the HTTP client its calls must go through.
+pub(super) struct ProviderClient {
+    pub(super) client: OidcClient,
+    pub(super) http: super::oidc_provider::ProviderHttp,
 }
 
-fn discovery_error(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    message
-}
-
-pub(super) async fn discover_client(
+/// The client for `provider` from a discovery answer.
+fn client_from_discovery(
     state: &AppState,
     provider: &OidcProviderConfig,
-) -> Result<OidcClient, String> {
+    discovery: super::oidc_provider::ProviderDiscovery,
+) -> Result<ProviderClient, String> {
     use openidconnect::{ClientId, ClientSecret, RedirectUrl};
-    let metadata = discover_metadata(provider).await?;
+    let super::oidc_provider::ProviderDiscovery { metadata, http } = discovery;
     let token_endpoint = metadata
         .token_endpoint()
         .cloned()
@@ -97,84 +83,52 @@ pub(super) async fn discover_client(
             openidconnect::AuthType::RequestBody
         }
     };
-    Ok(openidconnect::core::CoreClient::from_provider_metadata(
+    let client = openidconnect::core::CoreClient::from_provider_metadata(
         metadata,
         ClientId::new(provider.client_id.clone()),
         Some(ClientSecret::new(provider.client_secret.clone())),
     )
     .set_token_uri(token_endpoint)
     .set_redirect_uri(redirect)
-    .set_auth_type(auth_type))
+    .set_auth_type(auth_type);
+    Ok(ProviderClient { client, http })
 }
 
-/// Discover the client, or answer `BAD_GATEWAY` when the IdP is unreachable or
-/// its discovery document cannot support the authorization-code flow — the
-/// shared failure shape of the start and callback handlers.
+/// The shared failure shape of the start and callback handlers: the provider
+/// is unreachable or its discovery document cannot support the
+/// authorization-code flow.
+fn provider_unavailable(error: &str) -> ResponseRejection {
+    eprintln!("oidc: {error}");
+    ResponseRejection::from(problem(
+        StatusCode::BAD_GATEWAY,
+        "OIDC provider unavailable",
+        Some("The identity provider is unreachable or its discovery document is unusable."),
+    ))
+}
+
+/// Discover the client, or answer `BAD_GATEWAY`.
 async fn discover_client_or_bad_gateway(
     state: &AppState,
     provider: &OidcProviderConfig,
-) -> ResponseResult<OidcClient> {
-    discover_client(state, provider).await.map_err(|e| {
-        eprintln!("oidc: {e}");
-        ResponseRejection::from(problem(
-            StatusCode::BAD_GATEWAY,
-            "OIDC provider unavailable",
-            Some("The identity provider is unreachable or its discovery document is unusable."),
-        ))
-    })
+) -> ResponseResult<ProviderClient> {
+    super::oidc_provider::discover(state.internal_upstreams, provider)
+        .await
+        .and_then(|discovery| client_from_discovery(state, provider, discovery))
+        .map_err(|error| provider_unavailable(&error))
 }
 
-/// TTL for a cached OIDC discovery document (and its JWKS). Bounds outbound
-/// fetches so an unauthenticated flood of login/logout requests can't amplify
-/// into one IdP round-trip each.
-pub(super) const DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(900);
-
-#[allow(clippy::type_complexity)]
-pub(super) fn discovery_cache() -> &'static std::sync::Mutex<
-    HashMap<
-        String,
-        (
-            std::time::Instant,
-            openidconnect::core::CoreProviderMetadata,
-        ),
-    >,
-> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            HashMap<
-                String,
-                (
-                    std::time::Instant,
-                    openidconnect::core::CoreProviderMetadata,
-                ),
-            >,
-        >,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-pub(super) async fn discover_metadata(
+/// The client rebuilt from the provider's keys fetched again, after a token
+/// failed signature verification against the cached ones (the provider
+/// rotated its keys). Throttled and single-flight in
+/// [`super::oidc_provider::refresh`].
+async fn refreshed_client_or_bad_gateway(
+    state: &AppState,
     provider: &OidcProviderConfig,
-) -> Result<openidconnect::core::CoreProviderMetadata, String> {
-    use openidconnect::IssuerUrl;
-    let key = provider.issuer_url.clone();
-    // Serve a fresh cached document (which already carries the JWKS) without
-    // an outbound fetch.
-    if let Some((at, meta)) = discovery_cache().lock().expect("poisoned").get(&key)
-        && at.elapsed() < DISCOVERY_TTL
-    {
-        return Ok(meta.clone());
-    }
-    let issuer = IssuerUrl::new(key.clone()).map_err(|e| e.to_string())?;
-    let meta =
-        openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
-            .await
-            .map_err(|error| format!("discovery failed: {}", discovery_error(&error)))?;
-    discovery_cache()
-        .lock()
-        .expect("poisoned")
-        .insert(key, (std::time::Instant::now(), meta.clone()));
-    Ok(meta)
+) -> ResponseResult<ProviderClient> {
+    super::oidc_provider::refresh(state.internal_upstreams, provider)
+        .await
+        .and_then(|discovery| client_from_discovery(state, provider, discovery))
+        .map_err(|error| provider_unavailable(&error))
 }
 
 pub(super) async fn oidc_start(
@@ -275,6 +229,8 @@ enum FlowRefusal {
     Unbound,
     Expired,
     WrongProvider,
+    /// The flow has already been answered: a replayed copy of its cookie.
+    Spent,
 }
 
 impl FlowRefusal {
@@ -283,6 +239,7 @@ impl FlowRefusal {
             Self::Unbound => "Login state not bound to this browser",
             Self::Expired => "Unknown or expired login state",
             Self::WrongProvider => "Login state mismatch",
+            Self::Spent => "Login state already used",
         };
         problem(StatusCode::UNAUTHORIZED, title, None)
     }
@@ -334,20 +291,30 @@ impl OidcFlow {
         Ok(flow)
     }
 
-    /// The browser's flow for this callback, read from its state cookie.
+    /// The browser's flow for this callback, read from its state cookie, and
+    /// spent: a flow is answered once, so a kept copy of the cookie cannot
+    /// make this server call the provider again.
     fn from_callback(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         provider: &str,
         returned_state: &str,
     ) -> Result<Self, FlowRefusal> {
-        Self::open(
+        let now = unix_now();
+        let flow = Self::open(
             &state.oidc_flow_key,
             cookie_value(headers, oidc_state_cookie_name(state.secure_cookies)).as_deref(),
             provider,
             returned_state,
-            unix_now(),
-        )
+            now,
+        )?;
+        if !state
+            .spent_oidc_flows
+            .spend(&flow.state, flow.expires_at, now)
+        {
+            return Err(FlowRefusal::Spent);
+        }
+        Ok(flow)
     }
 }
 
@@ -391,7 +358,7 @@ pub(super) async fn oidc_authorize(
         return problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None);
     };
     let client = match discover_client_or_bad_gateway(state, &provider).await {
-        Ok(c) => c,
+        Ok(provider_client) => provider_client.client,
         Err(resp) => return resp.into(),
     };
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -487,6 +454,10 @@ fn account_name_taken(claim_name: &str) -> Response {
 
 pub(super) async fn oidc_callback(
     State(state): State<Arc<AppState>>,
+    // A callback can make this server call the provider's token endpoint with
+    // its client secret; unthrottled, it made the server an amplifier against
+    // the provider.
+    _rl: RateLimited,
     PathParams(provider_name): PathParams<String>,
     headers: axum::http::HeaderMap,
     QueryParams(query): QueryParams<CallbackQuery>,
@@ -577,14 +548,15 @@ async fn complete_flow(
             None,
         );
     };
-    let client = match discover_client_or_bad_gateway(state, provider).await {
-        Ok(c) => c,
-        Err(resp) => return resp.into(),
-    };
+    let ProviderClient { client, http } =
+        match discover_client_or_bad_gateway(state, provider).await {
+            Ok(provider_client) => provider_client,
+            Err(resp) => return resp.into(),
+        };
     let token_response = match client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier))
-        .request_async(&oidc_http_client())
+        .request_async(&http)
         .await
     {
         Ok(t) => t,
@@ -596,7 +568,20 @@ async fn complete_flow(
     let Some(id_token) = token_response.id_token() else {
         return problem(StatusCode::UNAUTHORIZED, "Provider sent no ID token", None);
     };
-    let claims = match id_token.claims(&client.id_token_verifier(), &Nonce::new(flow.nonce)) {
+    let nonce = Nonce::new(flow.nonce);
+    let verified = match id_token.claims(&client.id_token_verifier(), &nonce) {
+        // Signed by a key the cached set does not hold: the provider may have
+        // rotated its keys since they were fetched. Fetch them again (at most
+        // once per interval, one fetch at a time) and verify once more.
+        Err(openidconnect::ClaimsVerificationError::SignatureVerification(_)) => {
+            match refreshed_client_or_bad_gateway(state, provider).await {
+                Ok(refreshed) => id_token.claims(&refreshed.client.id_token_verifier(), &nonce),
+                Err(resp) => return resp.into(),
+            }
+        }
+        verified => verified,
+    };
+    let claims = match verified {
         Ok(c) => c,
         Err(e) => {
             eprintln!("oidc: id token rejected: {e}");
@@ -890,13 +875,37 @@ fn jwt_string_claims(raw: &str) -> Result<JwtStringClaims, String> {
         .map_err(|_| "JWT payload is not JSON".into())
 }
 
+/// Why a logout token was refused.
+#[derive(Debug)]
+pub(super) enum LogoutTokenRejection {
+    /// Exactly one key of the set must verify the signature, and none (or
+    /// more than one) did. A key the set does not hold yet — the provider
+    /// rotated its keys — looks like this, so the caller fetches the keys
+    /// again and verifies once more.
+    Signature,
+    /// Anything else about the token is wrong; new keys would not change it.
+    Invalid(String),
+}
+
+impl From<String> for LogoutTokenRejection {
+    fn from(reason: String) -> Self {
+        Self::Invalid(reason)
+    }
+}
+
+impl From<&str> for LogoutTokenRejection {
+    fn from(reason: &str) -> Self {
+        Self::Invalid(reason.to_string())
+    }
+}
+
 pub(super) fn verify_logout_token_with_metadata(
     raw: &str,
     provider: &OidcProviderConfig,
     supported_algorithms: &[openidconnect::core::CoreJwsSigningAlgorithm],
     keys: &[openidconnect::core::CoreJsonWebKey],
     now: i64,
-) -> Result<BackchannelLogoutClaims, String> {
+) -> Result<BackchannelLogoutClaims, LogoutTokenRejection> {
     use openidconnect::JsonWebKey;
 
     let segments: Vec<&str> = raw.split('.').collect();
@@ -930,7 +939,7 @@ pub(super) fn verify_logout_token_with_metadata(
         })
         .count();
     if valid_keys != 1 {
-        return Err("logout token signature is invalid or ambiguous".into());
+        return Err(LogoutTokenRejection::Signature);
     }
     let mut claims: BackchannelLogoutClaims =
         serde_json::from_slice(&base64url_decode(segments[1])?)
@@ -969,14 +978,60 @@ pub(super) fn verify_logout_token_with_metadata(
     Ok(claims)
 }
 
+/// Why a back-channel logout token was not verified.
+#[derive(Debug)]
+pub(super) enum LogoutVerification {
+    /// The provider's discovery document or keys could not be fetched.
+    Unreachable(String),
+    Rejected(LogoutTokenRejection),
+}
+
+/// Verify a back-channel logout token against the provider's keys.
+///
+/// A provider treats a `400` as final, so a token signed by a key this server
+/// has not fetched yet — the provider rotated its keys — would never end the
+/// session it names. A signature no cached key verifies therefore fetches the
+/// keys again (throttled, one fetch at a time) and verifies once more before
+/// the token is refused.
+pub(super) async fn verify_logout_token(
+    policy: crate::egress::InternalUpstreams,
+    provider: &OidcProviderConfig,
+    raw: &str,
+    now: i64,
+) -> Result<BackchannelLogoutClaims, LogoutVerification> {
+    let verify = |discovery: &super::oidc_provider::ProviderDiscovery| {
+        verify_logout_token_with_metadata(
+            raw,
+            provider,
+            discovery.metadata.id_token_signing_alg_values_supported(),
+            discovery.metadata.jwks().keys(),
+            now,
+        )
+    };
+    let discovery = super::oidc_provider::discover(policy, provider)
+        .await
+        .map_err(LogoutVerification::Unreachable)?;
+    match verify(&discovery) {
+        Err(LogoutTokenRejection::Signature) => {
+            let refreshed = super::oidc_provider::refresh(policy, provider)
+                .await
+                .map_err(LogoutVerification::Unreachable)?;
+            verify(&refreshed).map_err(LogoutVerification::Rejected)
+        }
+        verified => verified.map_err(LogoutVerification::Rejected),
+    }
+}
+
 // Deliberately NOT `RateLimited` (unlike its front-channel sibling): this
 // endpoint is called server-to-server by the IdP, from a single source IP, and a
 // mass-logout event legitimately bursts many tokens at once — a per-IP limit
 // would DROP real logout notifications (leaving sessions alive that should end),
 // a worse outcome than the marginal DoS it would prevent. The work an unsigned
 // request induces is already bounded: signature verification is fast, discovery
-// is cached (900s), and a DB row is written only for a validly-signed token an
-// attacker cannot forge. See the front-channel handler for the contrasting case.
+// is cached (900s, a failure 30s), a key refresh for an unknown signing key runs
+// at most once per 30s, and a DB row is written only for a validly-signed token
+// an attacker cannot forge. See the front-channel handler for the contrasting
+// case.
 pub(super) async fn oidc_backchannel_logout(
     State(state): State<Arc<AppState>>,
     form: Result<Form<BackchannelLogoutForm>, axum::extract::rejection::FormRejection>,
@@ -999,26 +1054,31 @@ pub(super) async fn oidc_backchannel_logout(
     else {
         return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None);
     };
-    let metadata = match discover_metadata(provider).await {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("oidc: logout metadata discovery failed: {error}");
-            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
-        }
-    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time before Unix epoch")
         .as_secs() as i64;
-    let claims = match verify_logout_token_with_metadata(
-        form.logout_token.trim(),
+    let claims = match verify_logout_token(
+        state.internal_upstreams,
         provider,
-        metadata.id_token_signing_alg_values_supported(),
-        metadata.jwks().keys(),
+        form.logout_token.trim(),
         now,
-    ) {
+    )
+    .await
+    {
         Ok(value) => value,
-        Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
+        Err(LogoutVerification::Unreachable(error)) => {
+            eprintln!("oidc: logout metadata discovery failed: {error}");
+            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
+        }
+        Err(LogoutVerification::Rejected(rejection)) => {
+            let reason = match &rejection {
+                LogoutTokenRejection::Signature => "no key of the provider's set verifies it",
+                LogoutTokenRejection::Invalid(reason) => reason,
+            };
+            eprintln!("oidc: back-channel logout token refused: {reason}");
+            return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None);
+        }
     };
     match crate::db::consume_oidc_backchannel_logout(
         pool,

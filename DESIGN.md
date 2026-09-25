@@ -1484,7 +1484,23 @@ provider-verified email claim.
   option). A non-empty domain policy admits only a syntactically valid,
   provider-verified email whose canonical domain exactly matches an entry;
   parent/subdomain relationships never become implicit wildcards. Discovery +
-  JWKS cached with proper refresh. First login
+  JWKS cached with proper refresh: a document is served from the cache for 15
+  minutes and a failed discovery for 30 seconds (an unreachable provider is not
+  dialled again by every unauthenticated start, callback, or back-channel
+  POST); an ID token or logout token that no cached key verifies fetches the
+  keys again — one fetch at a time, at most once per 30 seconds per provider —
+  and is verified once more, so a provider that rotates its signing key is
+  followed at once and a logout signed with the new key still ends the
+  session (a provider treats the `400` it would otherwise get as final). Every
+  provider call — discovery, keys, token exchange — goes through the egress
+  rule (§10.3): addresses that are never a network are refused always, and
+  the configured issuer's own position decides the rest. An administrator
+  may run the provider inside the server's network (a self-hosted provider
+  usually is), and then its endpoints may be inside too; a provider outside
+  may only advertise endpoints outside, so neither the provider nor whoever
+  controls its discovery document can aim this server's token and key
+  requests at internal infrastructure. A literal address is judged before each
+  request and every resolved address at connect time. First login
   auto-provisions an account (nick derived from `preferred_username`,
   conflict → user picks). Subsequent logins match on (issuer, subject),
   never on email.
@@ -1499,11 +1515,17 @@ provider-verified email claim.
   provider, before its expiry. An anonymous flood of starts therefore holds no
   server capacity a real login needs — the earlier bounded in-memory table
   refused every login with a 503 once 4096 anonymous starts filled it.
-  Replay is bounded without server state: the authorization code is
-  single-use at the provider and bound to the flow's PKCE verifier, every
-  callback that proves the binding clears the cookie, and a restart ends
-  every flow. A refused callback leaves the cookie alone, so an attacker who
-  learns a victim's `state` cannot burn the victim's login.
+  Replay is bounded twice: the authorization code is single-use at the
+  provider and bound to the flow's PKCE verifier, and every callback that
+  proves the binding clears the cookie *and* records the flow's `state` as
+  spent until the flow would have expired, so a kept copy of the cookie is
+  refused rather than making this server call the token endpoint with its
+  client secret again. The record is bounded (65,536 flows; past that, the one
+  closest to its own expiry is forgotten first), so no volume of logins can
+  fill it or refuse a real one, and a restart ends every flow. The callback
+  spends the per-address authentication budget like the start. A refused
+  callback leaves the cookie alone, so an attacker who learns a victim's
+  `state` cannot burn the victim's login.
 - Linking an identity is a cookie-authenticated top-level GET (a provider
   redirect cannot carry the CSRF header), so it requires the session-bound
   CSRF value as its `csrf` query parameter, as RP-initiated logout does.

@@ -1004,6 +1004,33 @@ async fn the_per_address_authentication_budget_says_when_to_retry() {
     assert!((1..=60).contains(&wait), "{head}");
 }
 
+/// A callback can make the server call the provider's token endpoint, so it
+/// spends the same per-address budget as the flow's start.
+#[tokio::test]
+async fn the_oidc_callback_spends_the_authentication_budget() {
+    let mut config = test_config();
+    config.limits.auth_rate_burst = Some(1);
+    config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
+        name: "corp".into(),
+        issuer_url: "https://idp.invalid".into(),
+        client_id: "e6irc".into(),
+        client_secret: "secret".into(),
+        account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+        scopes: vec![],
+        allowed_email_domains: vec![],
+        end_session_endpoint: None,
+        token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+    }];
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let callback = get("/api/v1/auth/oidc/corp/callback?code=stolen&state=kept");
+    // The one token is spent on a refusal for want of a flow cookie.
+    let (status, _, _) = request(http, &callback).await;
+    assert_eq!(status, 401);
+    let (status, head, body) = request(http, &callback).await;
+    assert_problem(status, &head, &body, 429);
+}
+
 /// Send a WebSocket upgrade for `/ws/irc` and read only the response head, so
 /// an accepted connection stays open and keeps its per-address slot.
 async fn open_irc_websocket(addr: std::net::SocketAddr) -> (TcpStream, u16, String, String) {

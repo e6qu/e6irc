@@ -24,6 +24,7 @@ mod history;
 pub(crate) mod networks;
 mod observation;
 mod oidc;
+mod oidc_provider;
 mod openapi;
 mod preflight;
 mod revocation;
@@ -38,6 +39,7 @@ use history::*;
 use networks::*;
 use observation::*;
 use oidc::*;
+pub(crate) use oidc_provider::SpentFlows;
 use openapi::*;
 pub(crate) use preflight::PreflightLimiter;
 use preflight::PreflightPermit;
@@ -109,6 +111,9 @@ pub struct AppState {
     /// only short-lived browser state and is not derived from the optional
     /// at-rest `secret_key`: a restart ends flows begun before it.
     pub oidc_flow_key: crate::secret::SecretKey,
+    /// Authorization flows whose callback has been answered, so a kept copy
+    /// of a flow cookie cannot be answered again.
+    pub(crate) spent_oidc_flows: SpentFlows,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: crate::core::CoreIngress,
     /// Shared connection-id allocator (with every other ingress transport).
@@ -4029,6 +4034,59 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
 
     fn logout_token(payload: serde_json::Value) -> (String, openidconnect::core::CoreJsonWebKey) {
         logout_token_with_type(payload, Some("logout+jwt"))
+    }
+
+    /// A provider rotates its signing key and at once sends a logout token
+    /// signed by the new one. The cached key set cannot verify it, and a `400`
+    /// is final to the provider, so the keys are fetched again — once per
+    /// interval, not once per token — and the token verified with them.
+    #[tokio::test]
+    async fn a_logout_token_signed_by_a_rotated_key_verifies_after_one_refresh() {
+        use super::oidc_provider::tests::{age_for_refresh, provider, provider_config};
+        let policy = crate::egress::InternalUpstreams::Refuse;
+        let key_set = |kid: &str, key: &openidconnect::core::CoreJsonWebKey| {
+            let mut key = serde_json::to_value(key).expect("key JSON");
+            key["kid"] = serde_json::Value::String(kid.into());
+            serde_json::json!({ "keys": [key] })
+        };
+        let keys = Arc::new(std::sync::Mutex::new(serde_json::json!({ "keys": [] })));
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let issuer = provider(keys.clone(), fetches.clone(), true).await;
+        let config = provider_config(&issuer);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        let (raw, key) = logout_token(serde_json::json!({
+            "iss": issuer,
+            "aud": "e6irc",
+            "sid": "session-1",
+            "iat": now,
+            "exp": now + 600,
+            "jti": "rotated-1",
+            "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
+        }));
+        *keys.lock().expect("keys") = key_set("previous-key", &key);
+
+        // Fetched just now: the refresh a failed signature forces is
+        // throttled, so the token is refused rather than fetching again.
+        assert!(matches!(
+            verify_logout_token(policy, &config, &raw, now).await,
+            Err(LogoutVerification::Rejected(
+                LogoutTokenRejection::Signature
+            ))
+        ));
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The provider now publishes the key it signed with, and the interval
+        // has passed: one refresh, and the token verifies.
+        *keys.lock().expect("keys") = key_set("logout-key", &key);
+        age_for_refresh(&issuer, policy);
+        let claims = verify_logout_token(policy, &config, &raw, now)
+            .await
+            .expect("verified after the refresh");
+        assert_eq!(claims.sid.as_deref(), Some("session-1"));
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn logout_test_provider() -> OidcProviderConfig {

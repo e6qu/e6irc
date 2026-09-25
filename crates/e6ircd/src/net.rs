@@ -1006,6 +1006,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             application_release_revision: config.application_release_revision.clone(),
             monitoring_token_digest,
             oidc_flow_key: crate::secret::SecretKey::generate(),
+            spent_oidc_flows: crate::http::SpentFlows::new(),
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),
             sendq: config.sendq,
