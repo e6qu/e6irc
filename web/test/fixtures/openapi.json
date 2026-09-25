@@ -3927,6 +3927,14 @@
                                 "type": "string"
                               },
                               "autojoin": {
+                                "description": "The channels (or bridge rooms) joined, without their keys.",
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "autojoin_keyed": {
+                                "description": "The channels among autojoin that have a key stored. The key is stored sealed and never returned.",
                                 "items": {
                                   "type": "string"
                                 },
@@ -4192,6 +4200,7 @@
                               "username",
                               "realname",
                               "autojoin",
+                              "autojoin_keyed",
                               "sasl_account",
                               "has_sasl_account",
                               "has_sasl_password",
@@ -7795,7 +7804,7 @@
     },
     "/api/v1/me/network-preflight": {
       "post": {
-        "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, optional SASL registration, and configured channel-join path. The connection closes after the probe.",
+        "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, and optional SASL registration path. The autojoin list (keys included) is validated as a save would validate it, but no channel is joined. The connection says QUIT after the probe.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -7808,9 +7817,11 @@
                     "type": "string"
                   },
                   "autojoin": {
+                    "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none.",
                     "items": {
                       "type": "string"
                     },
+                    "maxItems": 64,
                     "type": "array"
                   },
                   "nick": {
@@ -7992,6 +8003,14 @@
                             "type": "string"
                           },
                           "autojoin": {
+                            "description": "The channels (or bridge rooms) joined, without their keys.",
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "autojoin_keyed": {
+                            "description": "The channels among autojoin that have a key stored. The key is stored sealed and never returned.",
                             "items": {
                               "type": "string"
                             },
@@ -8253,6 +8272,7 @@
                           "username",
                           "realname",
                           "autojoin",
+                          "autojoin_keyed",
                           "sasl_account",
                           "has_sasl_account",
                           "has_sasl_password",
@@ -8308,7 +8328,7 @@
         "summary": "List the account's BNC networks with live upstream status"
       },
       "post": {
-        "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin, with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
+        "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin (each entry `#channel`, or `#channel key` for a keyed channel, whose key is stored sealed and never returned), with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -8321,9 +8341,11 @@
                         "type": "string"
                       },
                       "autojoin": {
+                        "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none.",
                         "items": {
                           "type": "string"
                         },
+                        "maxItems": 64,
                         "type": "array"
                       },
                       "kind": {
@@ -8648,6 +8670,14 @@
                       "type": "string"
                     },
                     "autojoin": {
+                      "description": "The channels (or bridge rooms) joined, without their keys.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "autojoin_keyed": {
+                      "description": "The channels among autojoin that have a key stored. The key is stored sealed and never returned.",
                       "items": {
                         "type": "string"
                       },
@@ -8909,6 +8939,7 @@
                     "username",
                     "realname",
                     "autojoin",
+                    "autojoin_keyed",
                     "sasl_account",
                     "has_sasl_account",
                     "has_sasl_password",
@@ -9058,7 +9089,7 @@
         "summary": "Enable or disable a BNC network (start/stop its driver)"
       },
       "put": {
-        "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise). A stored secret never follows the network to a new destination: when the IRC host or port changes, TLS is turned off, or a bridge's API base or homeserver moves to another origin, a secret carried over unchanged (by `keep`, or by replacing only the other half of a pair) is a 409 naming `credentials` or `server_password`; enter it again or remove it.",
+        "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise). The channel keys are write-only as well: an autojoin entry `#channel key` sets that channel's key, a channel named in `autojoin_keys.keep` (and listed without a new key) keeps the key stored for it, and every other channel has none; keeping a key the channel does not have, for a channel not listed, or beside a new key is a 400 with field=autojoin. A stored secret never follows the network to a new destination: when the IRC host or port changes, TLS is turned off, or a bridge's API base or homeserver moves to another origin, a secret carried over unchanged (by `keep`, or by replacing only the other half of a pair) is a 409 naming `credentials`, `server_password`, or `autojoin` (a kept channel key); enter it again or remove it.",
         "parameters": [
           {
             "in": "path",
@@ -9079,11 +9110,29 @@
                     "type": "string"
                   },
                   "autojoin": {
-                    "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing.",
+                    "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing. An IRC entry `#channel key` sets that channel's key.",
                     "items": {
                       "type": "string"
                     },
+                    "maxItems": 64,
                     "type": "array"
+                  },
+                  "autojoin_keys": {
+                    "additionalProperties": false,
+                    "description": "Which stored channel keys carry over. Required: a key is write-only, so an entry listed without one could otherwise mean either keep or remove it.",
+                    "properties": {
+                      "keep": {
+                        "description": "Channels, listed in autojoin without a new key, that keep their stored key. Every other channel's stored key is removed.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "keep"
+                    ],
+                    "type": "object"
                   },
                   "credentials": {
                     "oneOf": [
@@ -9199,6 +9248,7 @@
                   "tls",
                   "nick",
                   "autojoin",
+                  "autojoin_keys",
                   "credentials",
                   "server_password"
                 ],
