@@ -1403,6 +1403,15 @@
                                 "null"
                               ]
                             },
+                            "require_sasl": {
+                              "type": "boolean"
+                            },
+                            "require_sasl_from": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
                             "trusted_proxies": {
                               "items": {
                                 "type": "string"
@@ -1896,6 +1905,15 @@
                               "integer",
                               "null"
                             ]
+                          },
+                          "require_sasl": {
+                            "type": "boolean"
+                          },
+                          "require_sasl_from": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
                           },
                           "trusted_proxies": {
                             "items": {
