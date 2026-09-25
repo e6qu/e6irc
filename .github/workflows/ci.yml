@@ -64,6 +64,7 @@ jobs:
       - run: tools/test-check-no-defer.sh
       - run: tools/test-check-dead-pub.sh
       - run: tools/test-check-locked-builds.sh
+      - run: tools/test-check-noops.sh
       - run: python3 vendor/tests/irctest/test_check_skips.py
       # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions,
       # and current for fuzz/Cargo.toml (`cargo fuzz` has no `--locked`, and
@@ -115,6 +116,7 @@ jobs:
       # Journey guard: every user-facing outcome carries the same complete
       # contract and has exactly one row using the defined evidence vocabulary.
       - run: python3 tools/check-journeys.py
+      - run: python3 tools/test-check-journeys.py
       - run: python3 tools/check-client-capabilities.py
       # Structural server-rendered accessibility: every data table keeps an
       # accessible caption and every navigation landmark keeps a name.

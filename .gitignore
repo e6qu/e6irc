@@ -8,6 +8,10 @@ node_modules/
 # `cargo build --features embed-web`).
 /web/dist
 /web/test-results
+# Visual-regression renders from platforms other than macOS, whose renders are
+# the committed baselines (web/playwright.visual.config.js).
+/web/test/__snapshots__/*/linux/
+/web/test/__snapshots__/*/win32/
 # Failure diagnostics from tools/test-oidc-browser.mjs when
 # E6IRC_BROWSER_ARTIFACTS_DIR is given relative to the repository root.
 /test-results

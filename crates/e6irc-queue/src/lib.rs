@@ -1014,13 +1014,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "capacity must be > 0")]
     fn zero_capacity_is_a_loud_construction_error() {
         let _ = fifo(0);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "watermarks must satisfy low < high <= capacity")]
     fn inverted_watermarks_are_a_loud_construction_error() {
         let _ = queue::<u32>(Config {
             name: "bad",

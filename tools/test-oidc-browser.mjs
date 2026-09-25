@@ -242,7 +242,7 @@ try {
     // "… due to access control checks." rejection in addition to the response
     // diagnostic; the response handler above already records the real status,
     // so this engine artifact is noise, not a page error.
-    if (error.message.includes("due to access control checks")) return;
+    if (browserName === "webkit" && error.message.includes("due to access control checks")) return;
     if (isApplicationURL(page.url())) applicationErrors.push(error.message);
   });
   page.on("requestfailed", (request) => {
