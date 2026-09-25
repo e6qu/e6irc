@@ -221,7 +221,10 @@ jobs:
 
   db-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Every PostgreSQL suite runs here single-threaded, one after another
+    # (about 13 minutes in total as of sweep 4); the bound leaves room for
+    # the suites to grow without cutting off the last step mid-run.
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
