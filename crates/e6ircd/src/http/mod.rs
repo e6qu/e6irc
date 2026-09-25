@@ -443,7 +443,15 @@ struct ProblemResponse<'a> {
     /// sentence onto it.
     #[serde(skip_serializing_if = "Option::is_none")]
     field: Option<&'a str>,
+    /// The RFC 9457 problem type, for the one refusal a client must act on by
+    /// kind rather than show: [`REAUTHENTICATION_REQUIRED`].
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    problem_type: Option<&'a str>,
 }
+
+/// The problem type of a refusal that asks the browser session's person to
+/// prove themselves again (`POST /api/v1/me/reauthenticate`) and retry.
+pub(crate) const REAUTHENTICATION_REQUIRED: &str = "urn:e6irc:problem:reauthentication-required";
 
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
     problem_at_field(status, title, detail, None)
@@ -455,16 +463,40 @@ fn problem_at_field(
     detail: Option<&str>,
     field: Option<&str>,
 ) -> Response {
-    let mut response = (
+    problem_document(
         status,
-        axum::Json(ProblemResponse {
+        ProblemResponse {
             status: status.as_u16(),
             title,
             detail,
             field,
-        }),
+            problem_type: None,
+        },
     )
-        .into_response();
+}
+
+/// The refusal of an operation that mints or redirects lasting authority over
+/// the account when the browser session has not proved its person within
+/// [`crate::db::STEP_UP_WINDOW`].
+pub(super) fn reauthentication_required() -> Response {
+    problem_document(
+        StatusCode::FORBIDDEN,
+        ProblemResponse {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            title: "Re-authentication required",
+            detail: Some(
+                "This change creates or redirects lasting access to the account, so it needs a \
+                 sign-in from the last 10 minutes. Confirm your password or sign in with your \
+                 identity provider again (POST /api/v1/me/reauthenticate), then retry.",
+            ),
+            field: None,
+            problem_type: Some(REAUTHENTICATION_REQUIRED),
+        },
+    )
+}
+
+fn problem_document(status: StatusCode, body: ProblemResponse<'_>) -> Response {
+    let mut response = (status, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/problem+json"),
@@ -933,11 +965,14 @@ mod problem_contract_tests {
     /// malformed form is answered with the same problem document. The OIDC
     /// back-channel logout endpoint answers its own refusal for every
     /// malformed request, a well-formed but invalid logout token included.
+    /// Sign-out reads its form only as one of two places the CSRF value may
+    /// be (a script sends the header and no body), and answers a request
+    /// that proves it in neither with the CSRF refusal.
     #[test]
     fn only_parse_form_unwraps_a_form() {
         assert_eq!(
             occurrences(concat!("Form", "(")),
-            vec![("mod.rs", 1), ("oidc.rs", 1)]
+            vec![("device.rs", 1), ("mod.rs", 1), ("oidc.rs", 1)]
         );
     }
 
@@ -971,6 +1006,7 @@ mod query_limit_tests {
             title: "Not Found",
             detail: None,
             field: None,
+            problem_type: None,
         })
         .expect("problem response");
         assert_eq!(bare, r#"{"status":404,"title":"Not Found"}"#);
@@ -980,6 +1016,7 @@ mod query_limit_tests {
             title: "Invalid IRC identity",
             detail: Some("nick must be one word"),
             field: Some("nick"),
+            problem_type: None,
         })
         .expect("problem response");
         assert_eq!(
@@ -1404,17 +1441,19 @@ documented_routes! {
     "/api/v1/auth/app-passwords" => { post: create_app_password },
     "/api/v1/auth/oidc/{provider}/start" => { get: oidc_start },
     "/api/v1/auth/oidc/{provider}/sso" => { get: oidc_sso_start },
-    "/api/v1/auth/oidc/{provider}/link" => { get: oidc_link_start },
+    "/api/v1/auth/oidc/{provider}/link" => { post: oidc_link_start },
     "/api/v1/auth/oidc/{provider}/callback" => { get: oidc_callback },
     "/api/v1/auth/oidc/backchannel-logout" => { post: oidc_backchannel_logout },
     "/api/v1/auth/oidc/frontchannel-logout" => { get: oidc_frontchannel_logout },
-    "/api/v1/auth/logout" => { get: logout_sso, post: logout },
+    "/api/v1/auth/logout" => { post: logout },
     "/api/v1/auth/device/start" => { post: device_start },
     "/api/v1/auth/device/token" => { post: device_token },
     "/api/v1/auth/device/approve" => { post: device_approve },
     "/api/v1/me" => { get: me },
     "/api/v1/me/profile" => { get: me_profile, patch: update_me_profile },
     "/api/v1/me/account" => { delete: delete_own_account },
+    "/api/v1/me/reauthenticate" => { post: reauthenticate_with_password },
+    "/api/v1/me/reauthenticate/oidc/{provider}" => { post: oidc_reauthenticate_start },
     "/api/v1/me/export" => { get: export_me },
     "/api/v1/me/security-activity" => { get: me_security_activity },
     "/api/v1/me/identities" => { get: me_identities },
@@ -2111,7 +2150,8 @@ mod pages {
         email: String,
         role: String,
         release: String,
-        logout_url: String,
+        /// The session-bound value the sign-out form posts.
+        csrf: String,
     }
 
     fn login_response(
@@ -2742,7 +2782,7 @@ mod pages {
             email,
             role,
             release,
-            logout_url: format!("/api/v1/auth/logout?csrf={}", state.csrf_token(&token)),
+            csrf: state.csrf_token(&token),
         })
     }
 
@@ -2834,9 +2874,11 @@ mod pages {
     /// console is the one place a read-scoped token of an administrator must
     /// never be able to reach. A visitor with no session, or a session that
     /// has ended, goes to `/login`; a suspended account and an unavailable
-    /// database are reported as the problem they are, and the same per-account
-    /// budget every JSON read spends is spent here. With `admin_only`, a
-    /// signed-in non-administrator gets 403.
+    /// database are reported as the problem they are, and the per-account
+    /// budget the matching JSON routes spend is spent here: an administrator
+    /// page spends the separate, smaller administrator budget, as
+    /// `/api/v1/admin/*` does, and any other page the ordinary one. With
+    /// `admin_only`, a signed-in non-administrator gets 403.
     async fn page_actor(
         state: &AppState,
         headers: &axum::http::HeaderMap,
@@ -2849,7 +2891,7 @@ mod pages {
         if admin_only && !admin {
             return Err(problem(StatusCode::FORBIDDEN, "Admin only", None).into());
         }
-        spend_api_budget(state, &principal.account, false)
+        spend_api_budget(state, &principal.account, admin_only)
             .map_err(|retry_after| ResponseRejection::from(rate_limit_response(retry_after)))?;
         Ok(PageActor {
             account: principal.account,
@@ -3553,6 +3595,25 @@ mod pages {
         outcome: Option<String>,
         /// Styles the outcome as success vs failure.
         approved: bool,
+        /// The session has not proved its person within the step-up window,
+        /// so the form asks for the password with the code.
+        confirm: bool,
+    }
+
+    /// Whether the page's session needs to prove its person before it may
+    /// approve a device (the approval mints a token).
+    async fn device_needs_confirmation(state: &AppState, session: &str) -> ResponseResult<bool> {
+        crate::db::session_recently_authenticated(pool_of(state), session)
+            .await
+            .map(|recent| !recent)
+            .map_err(|e| {
+                eprintln!("http: session age lookup failed: {e}");
+                ResponseRejection::from(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ))
+            })
     }
 
     /// The RFC 8628 verification page `device_start` advertises as
@@ -3567,10 +3628,15 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
+        let confirm = match device_needs_confirmation(&state, &actor.session).await {
+            Ok(confirm) => confirm,
+            Err(response) => return response.into(),
+        };
         render_auth(Device {
             csrf: actor.csrf,
             outcome: None,
             approved: false,
+            confirm,
         })
     }
 
@@ -3580,6 +3646,10 @@ mod pages {
     pub struct DeviceFormFields {
         user_code: String,
         csrf: String,
+        /// The account's password, when the session must prove its person
+        /// before approving (the approval mints a token).
+        #[serde(default)]
+        password: Option<String>,
     }
 
     /// Approve a device code from the verification page's form; re-renders
@@ -3603,6 +3673,54 @@ mod pages {
         };
         if !state.csrf_valid(&session, &fields.csrf) {
             return problem(StatusCode::FORBIDDEN, "Bad CSRF token", None);
+        }
+        let refuse = |outcome: &str| {
+            render_auth(Device {
+                csrf: state.csrf_token(&session),
+                outcome: Some(outcome.to_string()),
+                approved: false,
+                confirm: true,
+            })
+        };
+        match device_needs_confirmation(&state, &session).await {
+            Ok(false) => {}
+            Err(response) => return response.into(),
+            Ok(true) => {
+                let Some(password) = fields.password.as_deref().filter(|p| !p.is_empty()) else {
+                    return refuse(
+                        "You signed in more than 10 minutes ago. Enter your password to approve \
+                         a device.",
+                    );
+                };
+                match crate::db::verify_local_password(pool_of(&state), &account, password).await {
+                    Ok(Some(_)) => {
+                        if let Err(e) = crate::db::mark_session_reauthenticated(
+                            pool_of(&state),
+                            &account,
+                            &session,
+                            crate::db::Reauthentication::Password,
+                        )
+                        .await
+                        {
+                            eprintln!("http: re-authentication failed: {e}");
+                            return refuse(
+                                "Approval storage is temporarily unavailable — try again.",
+                            );
+                        }
+                    }
+                    Ok(None) => return refuse("That password is not correct."),
+                    Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+                        return refuse(&format!(
+                            "Too many password attempts. Try again in {} seconds.",
+                            retry_after.seconds()
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("http: device re-authentication failed: {e}");
+                        return refuse("Approval storage is temporarily unavailable — try again.");
+                    }
+                }
+            }
         }
         let (outcome, approved) =
             match super::device::approve_user_code(&state, &account, &fields.user_code).await {
@@ -3628,6 +3746,7 @@ mod pages {
             csrf: state.csrf_token(&session),
             outcome: Some(outcome.to_string()),
             approved,
+            confirm: false,
         })
     }
 

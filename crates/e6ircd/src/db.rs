@@ -8979,6 +8979,79 @@ pub async fn session_account(pool: &PgPool, token: &str) -> Result<Option<String
         .map_err(query_error)
 }
 
+/// How recently a browser session's person must have proved themselves
+/// (signed in, or re-authenticated) for an operation that mints or redirects
+/// lasting authority over the account (DESIGN §9.4).
+pub const STEP_UP_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Whether the browser session `token` proved its person within
+/// [`STEP_UP_WINDOW`].
+pub async fn session_recently_authenticated(pool: &PgPool, token: &str) -> Result<bool, DbError> {
+    sqlx::query_scalar(
+        "SELECT authenticated_at > now() - make_interval(secs => $2)
+         FROM web_sessions WHERE token_hash = $1 AND expires_at > now()",
+    )
+    .bind(token_hash(token))
+    .bind(STEP_UP_WINDOW.as_secs_f64())
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)
+    .map(|recent| recent.unwrap_or(false))
+}
+
+/// How a browser session's person proved themselves again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reauthentication {
+    /// The account's primary password.
+    Password,
+    /// A fresh sign-in at a linked identity provider.
+    IdentityProvider,
+}
+
+/// Record that the person behind `account`'s browser session `token` has just
+/// proved themselves ([`Reauthentication`]), with an audit row. `false` when
+/// the session is not `account`'s (or has ended).
+pub async fn mark_session_reauthenticated(
+    pool: &PgPool,
+    account: &str,
+    token: &str,
+    how: Reauthentication,
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let updated = sqlx::query(
+        "UPDATE web_sessions s SET authenticated_at = now()
+         FROM accounts a
+         WHERE s.token_hash = $1 AND s.expires_at > now()
+           AND a.id = s.account_id AND a.name_folded = $2",
+    )
+    .bind(token_hash(token))
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    if updated.rows_affected() == 0 {
+        return Ok(false);
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&folded),
+        "ACCOUNT_REAUTHENTICATE",
+        &AuditPrincipal::account(&folded),
+        match how {
+            Reauthentication::Password => {
+                "browser session re-authenticated with the primary password"
+            }
+            Reauthentication::IdentityProvider => {
+                "browser session re-authenticated through OpenID Connect"
+            }
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
+}
+
 /// Delete a session (logout). Deleting an unknown token is not an
 /// error: logout must be idempotent.
 pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbError> {

@@ -62,8 +62,9 @@ async function endApplicationSession(request) {
   assert.equal(identity.status(), 200, await identity.text());
   const logout = await request.post(`${applicationOrigin}/api/v1/auth/logout`, {
     headers: { "X-E6IRC-CSRF": (await identity.json()).csrf_token },
+    maxRedirects: 0,
   });
-  assert.equal(logout.status(), 204, await logout.text());
+  assert.equal(logout.status(), 303, await logout.text());
 }
 
 async function waitForConfigurationServerName(page, value) {

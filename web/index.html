@@ -40,10 +40,14 @@
             <span id="account-name" aria-live="polite">signed in</span>
             <span id="account-role" class="user-role" aria-live="polite"></span>
           </a>
-          <!-- Signing out needs the session's CSRF token, which arrives with
-               /api/v1/me. Until then there is no link: one without the token
-               only lands on a CSRF refusal page. -->
-          <a id="logout-link" data-shauth-sign-out hidden>Sign out</a>
+          <!-- Signing out posts the session's CSRF token, which arrives with
+               /api/v1/me. Until then there is no control: one without the
+               token only lands on a CSRF refusal page. The token rides in the
+               form body, never in a URL. -->
+          <form id="logout-form" method="post" hidden>
+            <input id="logout-csrf" type="hidden" name="csrf" />
+            <button id="logout-link" type="submit" data-shauth-sign-out>Sign out</button>
+          </form>
         </nav>
       </header>
 

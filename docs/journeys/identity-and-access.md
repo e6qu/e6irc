@@ -112,7 +112,8 @@ after an unlink.
 
 1. **Account & access** lists linked identities without provider secrets.
 2. **Link** starts a fresh provider flow marked as a link operation. The
-   navigation carries the session's CSRF value as its `csrf` query parameter;
+   request is a `POST` carrying the session's CSRF header (the value never
+   travels in a URL) and answers the provider URL the page navigates to;
    a cross-site link, which carries only the cookie, is refused.
 3. The callback applies the provider's verified exact-email-domain policy,
    then attaches the validated `(issuer, subject)` to the initiating account

@@ -1535,9 +1535,14 @@ provider-verified email claim.
   spends the per-address authentication budget like the start. A refused
   callback leaves the cookie alone, so an attacker who learns a victim's
   `state` cannot burn the victim's login.
-- Linking an identity is a cookie-authenticated top-level GET (a provider
-  redirect cannot carry the CSRF header), so it requires the session-bound
-  CSRF value as its `csrf` query parameter, as RP-initiated logout does.
+- The session-bound CSRF value never travels in a URL, where it would reach
+  browser history and proxy access logs for the session's lifetime. Linking an
+  identity is a `POST` carrying the `X-E6IRC-CSRF` header like every other
+  unsafe API method; it answers the provider URL, and the page navigates
+  there. Signing out is a form `POST` (the value in its body) that the browser
+  follows as a navigation to the provider's end-session endpoint; a script may
+  send the header instead. The `GET` forms of both, which took the value as a
+  `csrf` query parameter, are gone.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
   per-IP authentication rate limit and the per-account attempt limit (§15),
@@ -1545,9 +1550,12 @@ provider-verified email claim.
   short-lived `HttpOnly; SameSite=Strict` browser cookie to prevent login
   CSRF/session planting.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
-  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
-  server-rendered forms carry a per-session HMAC token in the request body and
-  reject a missing or invalid token before mutation. Each login records a
+  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: every unsafe
+  cookie-authenticated request proves a per-session HMAC value before
+  mutation — REST methods (and the console's scripts) in the `X-E6IRC-CSRF`
+  header at the shared authentication boundary (§9.4), and the few
+  server-rendered form posts that cannot set a header (`/device`, sign-out)
+  in their body. Each login records a
   bounded, display-safe user agent and a separate stable resource id; neither
   the opaque token nor its hash is exposed by session inventory.
 - Local and OpenID Connect login cannot issue a session for a suspended
@@ -1562,7 +1570,7 @@ provider-verified email claim.
   a local login page. The application shell exposed the authenticated account
   and a top-level logout navigation.
 - Coordinated logout: the session retained its OIDC issuer, subject, session
-  ID, provider, and ID token. `GET /api/v1/auth/logout` performed
+  ID, provider, and ID token. `POST /api/v1/auth/logout` performed
   RP-initiated logout through the provider `end_session_endpoint` with the ID
   token, client ID, and registered post-logout URI. The provider called
   `POST /api/v1/auth/oidc/backchannel-logout` with a signed logout token, or
@@ -1608,10 +1616,43 @@ mint a broader replacement. Every unsafe cookie-authenticated REST method
 requires that same header at the shared authentication boundary. The web
 session cookie remains the browser credential, with the CSRF rules above.
 
+Step-up: the self-service operations that mint or redirect lasting authority
+over the account — minting a personal access token or an app password,
+approving a device (which mints a token), linking a login identity, setting a
+first primary password, changing the recovery email, and deleting the account
+— need a session whose person proved themselves within the last ten minutes
+(`STEP_UP_WINDOW`). Otherwise a cookie stolen from a browser, whose CSRF value
+`GET /api/v1/me` hands to whoever holds it, would become an app password that
+survives a password change and "sign out everywhere". A session records when
+its person last proved themselves (`web_sessions.authenticated_at`, migration
+0078): at sign-in, and at each re-authentication — `POST
+/api/v1/me/reauthenticate` with the primary password (the login's own
+throttles), or `POST /api/v1/me/reauthenticate/oidc/{provider}`, a fresh
+provider sign-in (`prompt=login`, `max_age=0`) whose identity must be linked to
+the account and whose `auth_time` must be recent. Handlers ask for the
+`RecentlyAuthenticated` extractor, and the contract derives the refusal it can
+answer from the handler signature, like `RateLimited`'s `429`. A refused
+request is a `403` problem document of type
+`urn:e6irc:problem:reauthentication-required`; the console answers it by asking
+the person to confirm (their password, or a provider sign-in, which returns to
+the account page) and retries a password-confirmed change once. A password
+rotation proves the person by the current password it verifies, so only a
+first password needs the recent sign-in; `/device`, a server-rendered page,
+asks for the password with the code. Every re-authentication is audited
+(`ACCOUNT_REAUTHENTICATE`). Administrator actions on other accounts are not
+under this rule.
+
+Browser sessions are managed by browser sessions: revoking one
+(`DELETE /api/v1/me/sessions/{id}`) refuses a bearer exactly as revoking all
+but the current one does, so a token cannot sign its owner out of every
+browser one session at a time where the bulk operation would refuse it.
+Listing them stays readable by a `read` token.
+
 Authenticated API requests share a per-account token bucket across browser
 sessions and personal access tokens (240 requests per minute by default).
-Administrator operations use a separate, smaller per-account bucket (60 per
-minute by default). Both are UI-managed, bounded in memory, and fail closed
+Administrator operations — `/api/v1/admin/*` and the administrator console
+pages alike — use a separate, smaller per-account bucket (60 per minute by
+default); the pages used to spend the ordinary one. Both are UI-managed, bounded in memory, and fail closed
 when the bucket registry cannot admit another active account. The HTTP service
 also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
 limit, and 30-second request deadline before work can consume unbounded
@@ -1792,7 +1833,11 @@ server-level networks, and the BNC attach address. The rule for a console-owned
 setting the bootstrap configuration also states is stated once, in §18
 ("Operational configuration").
 Credential-bearing values are sealed before entering PostgreSQL and are never
-rendered back. Existing
+rendered back: `GET /api/v1/admin/configuration` serves a projection that
+names every field of every section — passing each public one through and
+clearing each secret — with no catch-all, so a field added to the
+configuration later does not compile until it is classified, and a new
+credential cannot be served by default. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
 supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.

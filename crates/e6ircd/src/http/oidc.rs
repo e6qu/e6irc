@@ -138,7 +138,7 @@ pub(super) async fn oidc_start(
     _rl: RateLimited,
     PathParams(provider_name): PathParams<String>,
 ) -> Response {
-    oidc_authorize(&state, &provider_name, None, false).await
+    oidc_authorize(&state, &provider_name, FlowPurpose::SignIn).await
 }
 
 /// Silently check for an existing SSO session at the provider
@@ -153,33 +153,56 @@ pub(super) async fn oidc_sso_start(
     _rl: RateLimited,
     PathParams(provider_name): PathParams<String>,
 ) -> Response {
-    oidc_authorize(&state, &provider_name, None, true).await
+    oidc_authorize(&state, &provider_name, FlowPurpose::SilentSignIn).await
 }
 
 /// Begin an OIDC flow that *links* the resulting identity to the
 /// authenticated caller's account rather than logging in. The account is
 /// sealed into the flow cookie; the shared callback attaches the identity when
 /// the provider returns.
+///
+/// A `POST` whose session carries its `X-E6IRC-CSRF` header like every other
+/// unsafe API method; the answer names the provider URL the page navigates
+/// to, so the session-bound CSRF value never travels in a URL (history,
+/// proxy logs). Whoever finishes the flow at the provider becomes a login
+/// identity of the account, so a bearer is refused and the session must have
+/// proved its person recently.
 pub(super) async fn oidc_link_start(
     State(state): State<Arc<AppState>>,
     // Authenticated, so not an unauthenticated vector, but each call forces a
     // discovery fetch — gated for parity with its siblings.
     _rl: RateLimited,
-    // Whoever finishes this flow at the provider becomes a login identity of
-    // the account. A bearer admitted here could link its holder's own identity
-    // and sign in as the owner, with nothing more than the `read` scope.
-    BrowserSession(account, session): BrowserSession,
+    RecentlyAuthenticated(account, _session): RecentlyAuthenticated,
     PathParams(provider_name): PathParams<String>,
-    // A cross-site top-level navigation carries the SameSite=Lax session
-    // cookie, so without the session-bound value any page could start a link
-    // flow in the owner's browser and, at a provider that auto-approves, attach
-    // whichever provider identity that browser is signed in to.
-    QueryParams(query): QueryParams<CsrfQuery>,
 ) -> Response {
-    if !query.admits(&state, &session) {
-        return csrf_refusal();
+    match authorization_request(&state, &provider_name, FlowPurpose::Link { account }).await {
+        Ok(request) => request.into_json(),
+        Err(response) => response.into(),
     }
-    oidc_authorize(&state, &provider_name, Some(account), false).await
+}
+
+/// Begin an OIDC flow that proves the browser session's person again (the
+/// step-up re-authentication an account without a primary password — or one
+/// that prefers its provider — uses). The provider is asked to authenticate
+/// afresh (`prompt=login`, `max_age=0`); the callback accepts only an identity
+/// linked to this account whose authentication time is recent, and marks this
+/// session re-authenticated.
+pub(super) async fn oidc_reauthenticate_start(
+    State(state): State<Arc<AppState>>,
+    _rl: RateLimited,
+    SessionMutation(account, _session): SessionMutation,
+    PathParams(provider_name): PathParams<String>,
+) -> Response {
+    match authorization_request(
+        &state,
+        &provider_name,
+        FlowPurpose::Reauthenticate { account },
+    )
+    .await
+    {
+        Ok(request) => request.into_json(),
+        Err(response) => response.into(),
+    }
 }
 
 /// How long a browser may take between leaving for the provider and coming
@@ -213,12 +236,23 @@ struct OidcFlow {
     nonce: String,
     /// Seconds since the Unix epoch after which the flow is refused.
     expires_at: u64,
-    /// When set, the callback links the resulting identity to this account
-    /// instead of logging in / auto-provisioning.
-    link_account: Option<String>,
+    /// What the callback does with the identity the provider returns.
+    purpose: FlowPurpose,
+}
+
+/// What an authorization flow is for — one of four, so no flow can be both a
+/// link and a re-authentication, or a silent probe that links.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FlowPurpose {
+    /// Sign in (provisioning a first account).
+    SignIn,
     /// A silent (`prompt=none`) SSO probe: on `login_required` the callback
     /// bounces to `/?sso=none` instead of returning an error.
-    silent: bool,
+    SilentSignIn,
+    /// Link the returned identity to this account.
+    Link { account: String },
+    /// Prove this account's browser session's person again.
+    Reauthenticate { account: String },
 }
 
 /// Why a callback's flow cookie was not admitted.
@@ -339,15 +373,55 @@ fn spending_flow(state: &AppState, mut response: Response) -> Response {
     response
 }
 
-/// Shared authorization-request builder for login, link, and silent-SSO
-/// flows. `silent` adds `prompt=none` so the provider returns without any
-/// UI (used for the SSO-session probe).
-pub(super) async fn oidc_authorize(
+/// An authorization request ready for the browser: the provider URL to
+/// navigate to, and the flow cookie that binds the provider's answer to this
+/// browser.
+struct AuthorizationRequest {
+    url: String,
+    flow_cookie: String,
+}
+
+impl AuthorizationRequest {
+    /// Send the browser there now (sign-in navigations).
+    fn into_redirect(self) -> Response {
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [
+                (header::LOCATION, self.url),
+                (header::SET_COOKIE, self.flow_cookie),
+            ],
+        )
+            .into_response()
+    }
+
+    /// Name the URL for a page that asked with its session's CSRF header, and
+    /// set the flow cookie on the same answer.
+    fn into_json(self) -> Response {
+        let mut response = json_no_store(serde_json::json!({ "authorization_url": self.url }));
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            self.flow_cookie.parse().expect("cookie header value"),
+        );
+        response
+    }
+}
+
+/// Shared authorization-request builder for sign-in, silent-SSO, link and
+/// re-authentication flows. A silent probe adds `prompt=none` so the provider
+/// returns without any UI; a re-authentication adds `prompt=login` and
+/// `max_age=0` so the provider authenticates its person afresh.
+async fn oidc_authorize(state: &AppState, provider_name: &str, purpose: FlowPurpose) -> Response {
+    match authorization_request(state, provider_name, purpose).await {
+        Ok(request) => request.into_redirect(),
+        Err(response) => response.into(),
+    }
+}
+
+async fn authorization_request(
     state: &AppState,
     provider_name: &str,
-    link_account: Option<String>,
-    silent: bool,
-) -> Response {
+    purpose: FlowPurpose,
+) -> ResponseResult<AuthorizationRequest> {
     use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge, Scope};
     let Some(provider) = state
         .oidc_providers
@@ -355,12 +429,11 @@ pub(super) async fn oidc_authorize(
         .find(|p| p.name == provider_name)
         .cloned()
     else {
-        return problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None);
+        return Err(problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None).into());
     };
-    let client = match discover_client_or_bad_gateway(state, &provider).await {
-        Ok(provider_client) => provider_client.client,
-        Err(resp) => return resp.into(),
-    };
+    let client = discover_client_or_bad_gateway(state, &provider)
+        .await?
+        .client;
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client
         .authorize_url(
@@ -374,8 +447,14 @@ pub(super) async fn oidc_authorize(
     for scope in requested_scopes(&provider) {
         request = request.add_scope(Scope::new(scope));
     }
-    if silent {
-        request = request.add_extra_param("prompt", "none");
+    match purpose {
+        FlowPurpose::SilentSignIn => request = request.add_extra_param("prompt", "none"),
+        FlowPurpose::Reauthenticate { .. } => {
+            request = request
+                .add_extra_param("prompt", "login")
+                .add_extra_param("max_age", "0");
+        }
+        FlowPurpose::SignIn | FlowPurpose::Link { .. } => {}
     }
     let (auth_url, csrf, nonce) = request.url();
     let flow = OidcFlow {
@@ -384,8 +463,7 @@ pub(super) async fn oidc_authorize(
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
         expires_at: unix_now() + OIDC_FLOW_TTL.as_secs(),
-        link_account,
-        silent,
+        purpose,
     };
     // Bind the flow to this browser: the callback admits only a response whose
     // `state` matches the sealed flow in this cookie, so a login response
@@ -393,22 +471,15 @@ pub(super) async fn oidc_authorize(
     // plant the attacker's session (login CSRF / session fixation).
     // SameSite=Lax still rides the top-level redirect back from the provider.
     let secure = if state.secure_cookies { "; Secure" } else { "" };
-    (
-        StatusCode::TEMPORARY_REDIRECT,
-        [
-            (header::LOCATION, auth_url.to_string()),
-            (
-                header::SET_COOKIE,
-                format!(
-                    "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
-                    oidc_state_cookie_name(state.secure_cookies),
-                    flow.seal(&state.oidc_flow_key),
-                    OIDC_FLOW_TTL.as_secs(),
-                ),
-            ),
-        ],
-    )
-        .into_response()
+    Ok(AuthorizationRequest {
+        url: auth_url.to_string(),
+        flow_cookie: format!(
+            "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
+            oidc_state_cookie_name(state.secure_cookies),
+            flow.seal(&state.oidc_flow_key),
+            OIDC_FLOW_TTL.as_secs(),
+        ),
+    })
 }
 
 fn requested_scopes(provider: &OidcProviderConfig) -> Vec<String> {
@@ -492,7 +563,7 @@ pub(super) async fn oidc_callback(
         // A silent SSO probe (`prompt=none`) with no upstream session comes
         // back as `login_required`; that is expected — bounce to interactive
         // login rather than erroring.
-        if flow.silent {
+        if flow.purpose == FlowPurpose::SilentSignIn {
             // `consent_required` is not `login_required`: the browser *does*
             // have a provider session, it has simply never authorized this
             // client. OpenID Connect answers a silent probe that way on a
@@ -504,7 +575,7 @@ pub(super) async fn oidc_callback(
             // consent that is missing can never be recorded by probing. The
             // new flow's cookie replaces this one.
             if err == "consent_required" {
-                return oidc_authorize(&state, &provider_name, None, false).await;
+                return oidc_authorize(&state, &provider_name, FlowPurpose::SignIn).await;
             }
             return spending_flow(&state, Redirect::to("/?sso=none").into_response());
         }
@@ -619,7 +690,21 @@ async fn complete_flow(
     let sid = token_claims.as_ref().and_then(|claims| claims.sid.clone());
     // Link flow: attach this identity to the account that started it,
     // rather than logging in / provisioning a new account.
-    if let Some(account) = &flow.link_account {
+    if let FlowPurpose::Reauthenticate { account } = &flow.purpose {
+        return reauthenticated(
+            state,
+            &pool,
+            headers,
+            ProvenIdentity {
+                account,
+                issuer,
+                subject,
+                authenticated_at: claims.auth_time().map(|at| at.timestamp()),
+            },
+        )
+        .await;
+    }
+    if let FlowPurpose::Link { account } = &flow.purpose {
         return match crate::db::link_oidc_identity(&pool, account, issuer, subject).await {
             Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => {
                 (StatusCode::SEE_OTHER, [(header::LOCATION, "/?linked=1")]).into_response()
@@ -831,6 +916,86 @@ pub(super) fn provisioned_account_name(
                 ProvisioningRefusal::UnusableClaim(
                     "The configured email claim must be a valid email with an IRC-safe local part.",
                 ),
+            )
+        }
+    }
+}
+
+/// Who a re-authentication flow's provider says signed in, and when.
+struct ProvenIdentity<'a> {
+    /// The account the flow was started for.
+    account: &'a str,
+    issuer: &'a str,
+    subject: &'a str,
+    /// The ID token's `auth_time`, in Unix seconds.
+    authenticated_at: Option<i64>,
+}
+
+/// Finish a re-authentication: the returned identity must be linked to the
+/// account that asked, the provider must say its person authenticated just
+/// now (the request asked for `max_age=0`), and the browser's own session must
+/// be that account's. Then this session counts as recently authenticated.
+async fn reauthenticated(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    proven: ProvenIdentity<'_>,
+) -> Response {
+    let refused = |detail: &str| {
+        problem(
+            StatusCode::FORBIDDEN,
+            "Re-authentication refused",
+            Some(detail),
+        )
+    };
+    let linked = match crate::db::oidc_linked_account(pool, proven.issuer, proven.subject).await {
+        Ok(linked) => linked,
+        Err(e) => {
+            eprintln!("oidc: identity lookup failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Account storage failed",
+                None,
+            );
+        }
+    };
+    let fold = |name: &str| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name);
+    if linked.as_deref().map(fold) != Some(fold(proven.account)) {
+        return refused("The identity you signed in with is not linked to this account.");
+    }
+    let now = i64::try_from(unix_now()).expect("the Unix time fits in i64");
+    let window = i64::try_from(crate::db::STEP_UP_WINDOW.as_secs()).expect("a small window");
+    if !proven
+        .authenticated_at
+        .is_some_and(|at| at <= now + 60 && now - at <= window)
+    {
+        return refused(
+            "The identity provider did not report a fresh sign-in. Sign in at the provider again.",
+        );
+    }
+    let Some(session) = session_token(headers, state.secure_cookies) else {
+        return refused("This browser is not signed in.");
+    };
+    match crate::db::mark_session_reauthenticated(
+        pool,
+        proven.account,
+        &session,
+        crate::db::Reauthentication::IdentityProvider,
+    )
+    .await
+    {
+        Ok(true) => (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, "/console/account?reauthenticated=1")],
+        )
+            .into_response(),
+        Ok(false) => refused("This browser's session is not this account's."),
+        Err(e) => {
+            eprintln!("oidc: re-authentication failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
             )
         }
     }
@@ -1461,6 +1626,57 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for SessionMutation {
         let BrowserSession(account, session) =
             BrowserSession::from_request_parts(parts, state).await?;
         Ok(SessionMutation(account, session))
+    }
+}
+
+/// A [`SessionMutation`] whose session proved its person within
+/// [`crate::db::STEP_UP_WINDOW`]: signed in, or re-authenticated
+/// (`POST /api/v1/me/reauthenticate`), that recently.
+///
+/// The operations that mint or redirect lasting authority over the account —
+/// an API token, an app password, a device approval, a linked identity, a
+/// first password, the recovery email, deleting the account — ask for this.
+/// A stolen session cookie alone would otherwise turn into a credential that
+/// outlives the session: an app password survives a password change and
+/// "sign out everywhere". A session that has not proved itself recently is
+/// refused with the typed [`super::REAUTHENTICATION_REQUIRED`] problem, which
+/// the console answers by asking the person to confirm and retrying.
+pub(crate) struct RecentlyAuthenticated(pub(crate) String, pub(crate) String);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for RecentlyAuthenticated {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let SessionMutation(account, session) =
+            SessionMutation::from_request_parts(parts, state).await?;
+        require_recent_authentication(state, &session)
+            .await
+            .map_err(Response::from)?;
+        Ok(RecentlyAuthenticated(account, session))
+    }
+}
+
+/// Refuse unless the browser session proved its person within
+/// [`crate::db::STEP_UP_WINDOW`].
+pub(super) async fn require_recent_authentication(
+    state: &AppState,
+    session: &str,
+) -> ResponseResult<()> {
+    match crate::db::session_recently_authenticated(pool_of(state), session).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(super::reauthentication_required().into()),
+        Err(e) => {
+            eprintln!("http: session age lookup failed: {e}");
+            Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+            .into())
+        }
     }
 }
 
@@ -2246,8 +2462,9 @@ mod domain_policy_tests {
             pkce_verifier: "verifier".into(),
             nonce: "nonce".into(),
             expires_at,
-            link_account: Some("alice".into()),
-            silent: true,
+            purpose: FlowPurpose::Link {
+                account: "alice".into(),
+            },
         }
     }
 
@@ -2261,8 +2478,12 @@ mod domain_policy_tests {
             .expect("the browser's own flow");
         assert_eq!(opened.pkce_verifier, "verifier");
         assert_eq!(opened.nonce, "nonce");
-        assert_eq!(opened.link_account.as_deref(), Some("alice"));
-        assert!(opened.silent);
+        assert_eq!(
+            opened.purpose,
+            FlowPurpose::Link {
+                account: "alice".into()
+            }
+        );
 
         let open = |cookie: Option<&str>, provider: &str, state: &str, now: u64| {
             OidcFlow::open(&key, cookie, provider, state, now).err()

@@ -2800,11 +2800,12 @@ async function boot() {
     el("account-link").dataset.shauthUser = me.account;
     el("account-name").title = me.email || "";
     el("account-role").textContent = me.role || "";
-    // The sign-out URL carries the session's CSRF token; the link exists only
-    // once it is known, so an early click cannot land on a CSRF refusal.
-    if (me.logoutURL) {
-      el("logout-link").href = me.logoutURL;
-      el("logout-link").hidden = false;
+    // Signing out posts the session's CSRF token; the control exists only once
+    // it is known, so an early click cannot land on a CSRF refusal.
+    if (me.logoutURL && me.csrfToken) {
+      el("logout-form").action = me.logoutURL;
+      el("logout-csrf").value = me.csrfToken;
+      el("logout-form").hidden = false;
     }
     clearAlert("identity");
   } catch (error) {

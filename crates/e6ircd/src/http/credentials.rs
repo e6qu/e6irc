@@ -124,7 +124,7 @@ pub(super) async fn me_profile(
 /// that could hand the account to someone else.
 pub(super) async fn update_me_profile(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account, _): SessionMutation,
+    RecentlyAuthenticated(account, _): RecentlyAuthenticated,
     JsonBody(request): JsonBody<ProfileRequest>,
 ) -> Response {
     let contact_email = match super::parse_optional_contact_email(request.contact_email.as_deref())
@@ -550,7 +550,7 @@ pub(super) struct SessionAppPasswordRequest {
 /// API rather than a rendered mutation handler.
 pub(super) async fn create_session_app_password(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account, _): SessionMutation,
+    RecentlyAuthenticated(account, _): RecentlyAuthenticated,
     JsonBody(request): JsonBody<SessionAppPasswordRequest>,
 ) -> Response {
     if let Some(response) = validate_label(&request.label) {
@@ -617,7 +617,13 @@ pub(super) async fn change_password(
             )
             .await
         }
+        // A first password proves nothing about who asks, so the session must
+        // have proved its person recently; a rotation proves it by the
+        // current password it verifies.
         None => {
+            if let Err(response) = require_recent_authentication(&state, &session).await {
+                return response.into();
+            }
             crate::db::set_local_password(pool_of(&state), &account, &req.new_password, &session)
                 .await
         }
@@ -668,7 +674,7 @@ pub(super) async fn list_credentials(
 }
 
 /// List the OIDC identities linked to the caller's account. New ones are
-/// added via `GET /api/v1/auth/oidc/{provider}/link`.
+/// added via `POST /api/v1/auth/oidc/{provider}/link`.
 pub(super) async fn me_identities(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
@@ -823,7 +829,7 @@ pub(super) struct DeleteOwnAccountRequest {
 
 pub(super) async fn delete_own_account(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account, _): SessionMutation,
+    RecentlyAuthenticated(account, _): RecentlyAuthenticated,
     JsonBody(request): JsonBody<DeleteOwnAccountRequest>,
 ) -> Response {
     if request.confirmation != account {

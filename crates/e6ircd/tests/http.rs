@@ -179,6 +179,21 @@ fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// A sign-out form post: the session cookie, and the CSRF value in the form
+/// body when one is given — never in the URL.
+fn logout_form(cookie: Option<&str>, csrf: Option<&str>) -> String {
+    let cookie_header = cookie
+        .map(|value| format!("Cookie: e6irc_session={value}\r\n"))
+        .unwrap_or_default();
+    let body = csrf.map(|csrf| format!("csrf={csrf}")).unwrap_or_default();
+    format!(
+        "POST /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\n{cookie_header}\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 fn csrf_from_html(html: &str) -> &str {
     html.split("name=\"csrf\" value=\"")
         .nth(1)
@@ -2704,7 +2719,10 @@ async fn openapi_spec_is_served() {
         ("/api/v1/me/password", "put"),
         ("/api/v1/me/credentials", "post"),
         ("/api/v1/me/identities/{id}", "delete"),
-        ("/api/v1/auth/oidc/{provider}/link", "get"),
+        ("/api/v1/me/sessions/{id}", "delete"),
+        ("/api/v1/auth/oidc/{provider}/link", "post"),
+        ("/api/v1/me/reauthenticate", "post"),
+        ("/api/v1/me/reauthenticate/oidc/{provider}", "post"),
         ("/api/v1/me/tokens", "post"),
         ("/api/v1/auth/device/approve", "post"),
     ] {
@@ -2749,12 +2767,12 @@ async fn openapi_spec_is_served() {
             "OIDC callback lacks {status}"
         );
     }
-    for path in [
-        "/api/v1/auth/oidc/{provider}/start",
-        "/api/v1/auth/oidc/{provider}/sso",
-        "/api/v1/auth/oidc/{provider}/link",
+    for (path, method) in [
+        ("/api/v1/auth/oidc/{provider}/start", "get"),
+        ("/api/v1/auth/oidc/{provider}/sso", "get"),
+        ("/api/v1/auth/oidc/{provider}/link", "post"),
     ] {
-        let responses = &v["paths"][path]["get"]["responses"];
+        let responses = &v["paths"][path][method]["responses"];
         assert!(responses["502"].is_object(), "{path} lacks 502");
         assert!(responses["429"].is_object(), "{path} lacks 429");
     }
@@ -2767,14 +2785,38 @@ async fn openapi_spec_is_served() {
             "{path}: no server-held login capacity exists to run out of"
         );
     }
-    assert!(
-        v["paths"]["/api/v1/auth/oidc/{provider}/link"]["get"]["parameters"]
-            .as_array()
-            .expect("link parameters")
-            .iter()
-            .any(|parameter| parameter["name"] == "csrf" && parameter["required"] == true),
-        "linking documents its required CSRF query value"
-    );
+    // No operation takes the session's CSRF value in its URL.
+    for (path, item) in v["paths"].as_object().expect("paths") {
+        for (method, operation) in item.as_object().expect("path item") {
+            assert!(
+                !operation["parameters"]
+                    .as_array()
+                    .is_some_and(|parameters| parameters
+                        .iter()
+                        .any(|parameter| parameter["name"] == "csrf")),
+                "{method} {path} takes the CSRF value in its URL"
+            );
+        }
+    }
+    // Every operation that mints or redirects lasting authority says it can
+    // ask for a recent sign-in, by the problem type the console acts on.
+    for (path, method) in [
+        ("/api/v1/me/tokens", "post"),
+        ("/api/v1/me/credentials", "post"),
+        ("/api/v1/auth/oidc/{provider}/link", "post"),
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/account", "delete"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/auth/device/approve", "post"),
+    ] {
+        assert!(
+            v["paths"][path][method]["responses"]["403"]["description"]
+                .as_str()
+                .is_some_and(|description| description
+                    .contains("urn:e6irc:problem:reauthentication-required")),
+            "{method} {path}"
+        );
+    }
     assert_eq!(
         v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["parameters"][1]["schema"]["default"],
         200
@@ -8738,8 +8780,8 @@ async fn rp_initiated_logout_redirects_to_provider() {
         );
     }
 
-    // The logout GET now requires the session's CSRF token (anti-forced-logout);
-    // fetch it from the account page the way a browser would.
+    // Signing out requires the session's CSRF token (anti-forced-logout), in
+    // the form body; fetch it from the account page the way a browser would.
     let (_, _, page) = request(
         http,
         &format!(
@@ -8748,21 +8790,22 @@ async fn rp_initiated_logout_redirects_to_provider() {
     )
     .await;
     let csrf = csrf_from_html(&page).to_string();
-    // Without the token, the destructive logout GET is refused (a cross-site
-    // navigation can't forge it): anti-forced-logout CSRF.
-    let (no_csrf, _, _) = request(
+    // Without the token, the destructive sign-out is refused (a cross-site
+    // form can't forge it): anti-forced-logout CSRF. The old GET that took the
+    // token in its URL is gone.
+    let (no_csrf, _, _) = request(http, &logout_form(Some(&session), None)).await;
+    assert_eq!(no_csrf, 403, "logout without CSRF token must be refused");
+    let (get_status, _, _) = request(
         http,
         &format!(
-            "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
-    assert_eq!(no_csrf, 403, "logout without CSRF token must be refused");
-    // A GET logout on an OIDC session redirects to the provider's end-session
+    assert_eq!(get_status, 405, "the CSRF value never travels in a URL");
+    // Signing out of an OIDC session redirects to the provider's end-session
     // endpoint with an id_token_hint and post_logout_redirect_uri.
-    let req = format!(
-        "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
+    let req = logout_form(Some(&session), Some(&csrf));
     let (status, headers, _) = request(http, &req).await;
     assert_eq!(status, 303, "{headers}");
     let location = headers
@@ -8857,12 +8900,9 @@ async fn rp_initiated_logout_redirects_to_provider() {
     // Local-account and already-signed-out browser navigations use the same
     // app-local landing, and stale cookies are expired idempotently.
     for cookie in [Some(local_session.as_str()), None] {
-        let cookie_header = cookie
-            .map(|value| format!("Cookie: e6irc_session={value}\r\n"))
-            .unwrap_or_default();
         // A session-bearing logout carries its CSRF token; a cookieless
-        // navigation has no session to protect and needs none.
-        let csrf_q = match cookie {
+        // request has no session to protect and needs none.
+        let csrf = match cookie {
             Some(value) => {
                 let (_, _, page) = request(
                     http,
@@ -8871,14 +8911,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
                     ),
                 )
                 .await;
-                let token = csrf_from_html(&page);
-                format!("?csrf={token}")
+                Some(csrf_from_html(&page).to_string())
             }
-            None => String::new(),
+            None => None,
         };
-        let logout = format!(
-            "GET /api/v1/auth/logout{csrf_q} HTTP/1.1\r\nHost: t\r\n{cookie_header}Connection: close\r\n\r\n"
-        );
+        let logout = logout_form(cookie, csrf.as_deref());
         let (status, headers, _) = request(http, &logout).await;
         assert_eq!(status, 303, "{headers}");
         assert!(
@@ -9056,9 +9093,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
     )
     .await;
     let csrf = csrf_from_html(&page).to_string();
-    let logout = format!(
-        "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
+    let logout = logout_form(Some(&session), Some(&csrf));
     let (status, _, body) = request(http, &logout).await;
     assert_eq!(status, 503, "{body}");
 
@@ -9233,6 +9268,57 @@ async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running
     net::start(config).await.expect("start")
 }
 
+/// Administrator console pages spend the separate administrator budget that
+/// `/api/v1/admin/*` spends (DESIGN §9.4), not the ordinary one: with a budget
+/// of one, the second administrator page is refused while an ordinary page
+/// still answers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn administrator_pages_spend_the_administrator_budget() {
+    let url = support::test_db("administrator_pages_spend_the_administrator_budget").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(&pool, "root", None)
+        .await
+        .expect("session");
+    let mut config = test_config();
+    config.limits.administrator_api_rate_burst = 1;
+    let http = net::start(Config {
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["root".into()],
+            hsts_include_subdomains: false,
+        }),
+        ..config
+    })
+    .await
+    .expect("start")
+    .http_addr
+    .expect("http");
+    let page = |path: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    let (status, _, _) = request(http, &page("/console/audit")).await;
+    assert_eq!(status, 200);
+    let (status, head, body) = request(http, &page("/console/accounts")).await;
+    assert_problem(status, &head, &body, 429);
+    let (status, _, _) = request(http, &page("/console/account")).await;
+    assert_eq!(status, 200, "the ordinary budget is separate");
+}
+
 /// One request line plus the credential headers a caller chose, with an
 /// optional JSON body.
 fn api_request(method: &str, path: &str, credential_headers: &str, body: Option<&str>) -> String {
@@ -9334,7 +9420,7 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
     let (status, _, body) = request(
         http,
         &api_request(
-            "GET",
+            "POST",
             "/api/v1/auth/oidc/any/link",
             &bearer_headers(&token),
             None,
@@ -9359,30 +9445,20 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
 
     // The owner's browser session keeps every one of those abilities.
     let owner = session_headers(http, &session).await;
-    // Linking is a top-level navigation and cannot carry the CSRF header, so
-    // the session's value rides the query. The owner's cookie alone — all a
-    // cross-site link sends — is refused before any flow begins.
+    // Linking is a POST carrying the session's CSRF header like every other
+    // unsafe method (the answer names where to navigate). The owner's cookie
+    // alone — all a cross-site form sends — is refused before any flow begins.
     let cookie_only = format!("Cookie: e6irc_session={session}\r\n");
     let (status, _, body) = request(
         http,
-        &api_request("GET", "/api/v1/auth/oidc/any/link", &cookie_only, None),
+        &api_request("POST", "/api/v1/auth/oidc/any/link", &cookie_only, None),
     )
     .await;
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("Invalid or missing CSRF token"), "{body}");
-    let csrf = owner
-        .split("X-E6IRC-CSRF: ")
-        .nth(1)
-        .expect("CSRF header")
-        .trim_end();
     let (status, _, body) = request(
         http,
-        &api_request(
-            "GET",
-            &format!("/api/v1/auth/oidc/any/link?csrf={csrf}"),
-            &cookie_only,
-            None,
-        ),
+        &api_request("POST", "/api/v1/auth/oidc/any/link", &owner, None),
     )
     .await;
     assert_eq!(status, 404, "the checked link reaches the provider: {body}");
@@ -9980,8 +10056,14 @@ async fn logout_post_requires_the_session_csrf_value() {
         &api_request("POST", "/api/v1/auth/logout", &owner, None),
     )
     .await;
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 303, "{body}");
     assert!(headers.contains("e6irc_session=;"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("location: /auth/signed-out"),
+        "{headers}"
+    );
     assert_eq!(
         e6ircd::db::session_account(&pool, &session)
             .await
@@ -9993,7 +10075,150 @@ async fn logout_post_requires_the_session_csrf_value() {
     // that is left to do.
     let (status, _, body) =
         request(http, &api_request("POST", "/api/v1/auth/logout", "", None)).await;
+    assert_eq!(status, 303, "{body}");
+}
+
+/// Minting or redirecting lasting access to an account needs a sign-in from
+/// the last ten minutes. A session cookie stolen an hour after its sign-in
+/// cannot mint a token, an app password, or a device approval, set a first
+/// password, move the recovery email, link an identity, or delete the account
+/// until its holder proves the password again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn changes_that_mint_lasting_access_need_a_recent_sign_in() {
+    let url = support::test_db("changes_that_mint_lasting_access_need_a_recent_sign_in").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "correct-horse", None)
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .expect("an hour-old sign-in");
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+    let owner = session_headers(http, &session).await;
+
+    for (method, path, body) in [
+        ("POST", "/api/v1/me/tokens", Some(r#"{"label":"stolen"}"#)),
+        (
+            "POST",
+            "/api/v1/me/credentials",
+            Some(r#"{"label":"stolen"}"#),
+        ),
+        (
+            "PATCH",
+            "/api/v1/me/profile",
+            Some(r#"{"contact_email":"attacker@example.test"}"#),
+        ),
+        (
+            "DELETE",
+            "/api/v1/me/account",
+            Some(r#"{"confirmation":"alice"}"#),
+        ),
+        (
+            "POST",
+            "/api/v1/auth/device/approve",
+            Some(r#"{"user_code":"ABCD-EFGH"}"#),
+        ),
+        ("POST", "/api/v1/auth/oidc/any/link", None),
+    ] {
+        let (status, _, response) = request(http, &api_request(method, path, &owner, body)).await;
+        assert_eq!(status, 403, "{method} {path}: {response}");
+        let problem: serde_json::Value = serde_json::from_str(&response).expect("problem");
+        assert_eq!(
+            problem["type"], "urn:e6irc:problem:reauthentication-required",
+            "{method} {path}"
+        );
+    }
+    assert!(
+        e6ircd::db::list_api_tokens(&pool, "alice")
+            .await
+            .expect("tokens")
+            .is_empty()
+    );
+
+    // A wrong password proves nothing; the right one admits the change.
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/reauthenticate",
+            &owner,
+            Some(r#"{"password":"wrong"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/reauthenticate",
+            &owner,
+            Some(r#"{"password":"correct-horse"}"#),
+        ),
+    )
+    .await;
     assert_eq!(status, 204, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/tokens",
+            &owner,
+            Some(r#"{"label":"mine"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'ACCOUNT_REAUTHENTICATE'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1);
+
+    // The device page asks for the password with the code, and approves only
+    // once it is right.
+    sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .expect("an hour-old sign-in again");
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "GET /device HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(page.contains(r#"name="password""#), "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+    let device_form = |password: &str| {
+        let body = format!("user_code=ABCD-EFGH&csrf={csrf}&password={password}");
+        format!(
+            "POST /device HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (_, _, page) = request(http, &device_form("wrong")).await;
+    assert!(page.contains("That password is not correct."), "{page}");
+    let (_, _, page) = request(http, &device_form("correct-horse")).await;
+    assert!(
+        page.contains("No pending device with that code"),
+        "the confirmed request reached the approval: {page}"
+    );
 }
 
 /// An identity provider that serves only its discovery document (and an empty

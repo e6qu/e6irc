@@ -101,6 +101,21 @@ fn merge_path_parameter_responses(spec: &mut serde_json::Value) {
     });
 }
 
+/// What an operation whose handler requires a recent sign-in
+/// (`RecentlyAuthenticated`) adds to its `403`.
+const REAUTHENTICATION_RESPONSE: &str = "the session has not signed in within the last 10 minutes: problem type urn:e6irc:problem:reauthentication-required; re-authenticate (POST /api/v1/me/reauthenticate) and retry";
+
+/// Whether a documented operation's handler takes `extractor`, read from its
+/// signature ([`super::documented_route_arguments`]).
+fn operations_extracting<T: 'static>() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+    let extractor = std::any::TypeId::of::<T>();
+    super::documented_route_arguments()
+        .into_iter()
+        .filter(|(_, _, arguments)| arguments.contains(&extractor))
+        .map(|(path, method, _)| (path, method))
+        .collect()
+}
+
 /// What an operation whose handler spends the per-address authentication
 /// budget (`RateLimited`) answers when it is spent.
 const RATE_LIMITED_RESPONSE: &str =
@@ -129,15 +144,9 @@ fn service_wide_responses(admitted: bool) -> serde_json::Map<String, serde_json:
     responses
 }
 
-/// Whether a documented operation's handler takes `RateLimited`, read from
-/// its signature ([`super::documented_route_arguments`]).
+/// Whether a documented operation's handler takes `RateLimited`.
 fn rate_limited_operations() -> std::collections::BTreeSet<(&'static str, &'static str)> {
-    let rate_limited = std::any::TypeId::of::<RateLimited>();
-    super::documented_route_arguments()
-        .into_iter()
-        .filter(|(_, _, arguments)| arguments.contains(&rate_limited))
-        .map(|(path, method, _)| (path, method))
-        .collect()
+    operations_extracting::<RateLimited>()
 }
 
 /// The operation `method` on `path`, when the document has it.
@@ -163,6 +172,19 @@ fn merge_service_responses(spec: &mut serde_json::Value) {
             responses
                 .entry("429")
                 .or_insert_with(|| serde_json::json!({ "description": RATE_LIMITED_RESPONSE }));
+        }
+    }
+    for (path, method) in operations_extracting::<RecentlyAuthenticated>() {
+        if let Some(responses) = operation_mut(spec, path, method) {
+            let forbidden = responses
+                .entry("403")
+                .or_insert_with(|| serde_json::json!({ "description": "" }));
+            let described = forbidden["description"].as_str().unwrap_or_default();
+            forbidden["description"] = serde_json::Value::String(if described.is_empty() {
+                REAUTHENTICATION_RESPONSE.to_string()
+            } else {
+                format!("{described}; or {REAUTHENTICATION_RESPONSE}")
+            });
         }
     }
     for &(path, method) in super::DOCUMENTED_ROUTE_OPERATIONS {
@@ -247,6 +269,13 @@ fn operations() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["app_password", "label", "note"],
             "properties": { "app_password": { "type": "string", "minLength": 1 }, "label": { "type": "string" }, "note": { "type": "string" } }
+        }),
+    );
+    let authorization_url_response = json_response(
+        "the provider URL for the page to navigate to; the sealed flow cookie is set on this answer",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["authorization_url"],
+            "properties": { "authorization_url": { "type": "string", "format": "uri" } }
         }),
     );
     let token_created_response = json_response_status(
@@ -1220,8 +1249,8 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/sessions/{id}": {
                 "delete": {
                     "summary": "Revoke one of your browser sessions",
-                    "description": "The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
-                    "security": authenticated,
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header: browser sessions are managed by browser sessions, one at a time or all but the current one alike, so a bearer cannot sign its owner out of every browser. The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
+                    "security": browser_session_only,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer", "format": "int64", "minimum": 1 } }],
                     "responses": {
@@ -1300,19 +1329,42 @@ fn operations() -> serde_json::Value {
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/logout": {
-                "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
-                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed. A request that carries a session cookie must also carry that session's CSRF value as the `csrf` query parameter.",
-                    "parameters": [{ "name": "csrf", "in": "query", "required": false,
+                "post": { "summary": "Sign out: end the e6irc session and, for a provider session, the provider's SSO session",
+                    "description": "Ends the browser session named by the session cookie, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) when an identity provider asserted the session, so the provider's SSO session is ended too; a local session goes to /auth/signed-out. Incomplete OIDC logout configuration fails closed and keeps the session. A request that carries a session cookie must prove its session's CSRF value in the `X-E6IRC-CSRF` header (a script) or the `csrf` form field (a sign-out form, which the browser then follows as a navigation); never in the URL. A request with no session has nothing to end.",
+                    "requestBody": { "required": false, "content": {
+                        "application/x-www-form-urlencoded": { "schema": {
+                            "type": "object", "additionalProperties": false, "required": ["csrf"],
+                            "properties": { "csrf": { "type": "string" } }
+                        } }
+                    } },
+                    "responses": { "303": { "description": "session cleared (or none was presented): redirect to the provider's end-session endpoint, or to /auth/signed-out" },
+                        "403": { "description": "session cookie presented without its CSRF value" },
+                        "503": { "description": "database unavailable, or the OIDC provider or public URL is not configured for coordinated logout" } } }
+            },
+            "/api/v1/me/reauthenticate": {
+                "post": { "summary": "Prove the browser session's person again with the primary password",
+                    "description": "Step-up re-authentication: operations that mint or redirect lasting access to the account (tokens, app passwords, device approval, identity linking, a first password, the recovery email, deleting the account) need a sign-in from the last 10 minutes and are otherwise refused 403 with problem type `urn:e6irc:problem:reauthentication-required`. This records one for the calling session. The password check is the login's (per-address budget, per-account attempt throttle). An account without a primary password uses `POST /api/v1/me/reauthenticate/oidc/{provider}`.",
+                    "security": browser_session_only,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "additionalProperties": false,
+                            "required": ["password"],
+                            "properties": { "password": { "type": "string", "minLength": 1, "maxLength": 512, "writeOnly": true } } }
+                    } } },
+                    "responses": { "204": { "description": "this session counts as recently authenticated for the next 10 minutes" },
+                        "400": { "description": "the password is empty or longer than 512 bytes (`field` names it)" },
+                        "401": { "description": "the password is incorrect (`field` names it), or not signed in" },
+                        "429": { "description": "the account has spent its password attempts for the window, or this address its authentication budget; Retry-After says when to try again" } } }
+            },
+            "/api/v1/me/reauthenticate/oidc/{provider}": {
+                "post": { "summary": "Prove the browser session's person again at an identity provider",
+                    "description": "Answers the provider URL to navigate to, and sets the sealed flow cookie. The provider is asked to authenticate afresh (`prompt=login`, `max_age=0`); its callback accepts only an identity linked to this account whose `auth_time` is within the last 10 minutes, marks this session recently authenticated, and returns to /console/account?reauthenticated=1.",
+                    "security": browser_session_only,
+                    "parameters": [{ "name": "provider", "in": "path", "required": true,
                         "schema": { "type": "string" } }],
-                    "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" },
-                        "400": { "description": "the query has an unknown parameter" },
-                        "403": { "description": "session cookie presented without its CSRF value" },
-                        "503": { "description": "database unavailable, or the OIDC provider or public URL is not configured for coordinated logout" } } },
-                "post": { "summary": "Local logout: clear the e6irc session only",
-                    "description": "Ends the browser session named by the session cookie. A request that carries a session cookie must also carry that session's `X-E6IRC-CSRF` value, as every cookie-authenticated unsafe method does; a request with no session has nothing to end and answers 204.",
-                    "responses": { "204": { "description": "session cleared, or no session was presented" },
-                        "403": { "description": "session cookie presented without its CSRF value" },
-                        "503": { "description": "database unavailable" } } }
+                    "responses": {
+                        "200": authorization_url_response["200"],
+                        "404": { "description": "unknown provider" },
+                        "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/oidc/backchannel-logout": {
                 "post": {
@@ -1350,20 +1402,16 @@ fn operations() -> serde_json::Value {
                 }
             },
             "/api/v1/auth/oidc/{provider}/link": {
-                "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
-                    "description": "Requires a cookie-authenticated browser session: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it. Because it is a top-level navigation it cannot carry the X-E6IRC-CSRF header, so the session's CSRF value is required as the `csrf` query parameter instead; without it any site could start a link in the owner's browser.",
+                "post": { "summary": "Link an OIDC identity to your account",
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it. Answers the provider URL for the page to navigate to and sets the sealed flow cookie, so the session's CSRF value never travels in a URL. The callback attaches the returned identity and redirects to /?linked=1.",
                     "security": browser_session_only,
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
-                        "schema": { "type": "string" } },
-                        { "name": "csrf", "in": "query", "required": true,
                         "schema": { "type": "string" } }],
-                    "responses": { "307": { "description": "redirect into the provider" },
-                        "400": { "description": "the query has an unknown parameter" },
+                    "responses": {
+                        "200": authorization_url_response["200"],
                         "401": { "description": "browser session required" },
-                        "403": { "description": "invalid or missing CSRF token" },
                         "404": { "description": "unknown provider" },
                         "409": { "description": "identity already linked to another account (on return)" },
-                        "429": { "description": "the client's authentication rate limit is spent; Retry-After gives the seconds until it holds a token again" },
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/me/identities": {
@@ -1495,6 +1543,7 @@ fn operations() -> serde_json::Value {
                         }))["200"],
                         "400": { "description": "password is empty or exceeds 512 bytes" },
                         "401": { "description": "current primary password is incorrect" },
+                        "403": { "description": "current_password omitted (a first password) and the session has not signed in within the last 10 minutes: problem type urn:e6irc:problem:reauthentication-required; re-authenticate and retry. Also a suspended account or a missing X-E6IRC-CSRF value" },
                         "409": { "description": "current_password omitted but a primary password already exists" },
                         "429": { "description": "the account has spent its password attempts for the window; Retry-After says when to try again" },
                         "503": { "description": "database unavailable" }
@@ -2310,6 +2359,7 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
     // the contract should see the whole list, not one entry per attempt.
     let mut undocumented_statuses = Vec::new();
     let rate_limited = rate_limited_operations();
+    let recently_authenticated = operations_extracting::<RecentlyAuthenticated>();
     let patterns = expected.iter().map(|(path, _)| *path).collect();
     if let Some((left, right)) = colliding_route_patterns(&patterns) {
         return Err(format!(
@@ -2437,6 +2487,22 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
                         method.to_ascii_uppercase()
                     ));
                 }
+            }
+            if recently_authenticated
+                .iter()
+                .any(|&(gated, verb)| gated == path && verb == method)
+                && !responses
+                    .get("403")
+                    .and_then(|response| response["description"].as_str())
+                    .is_some_and(|description| {
+                        description.contains(super::REAUTHENTICATION_REQUIRED)
+                    })
+            {
+                undocumented_statuses.push(format!(
+                    "{} {path} requires a recent sign-in but its 403 does not name {}",
+                    method.to_ascii_uppercase(),
+                    super::REAUTHENTICATION_REQUIRED
+                ));
             }
             if rate_limited
                 .iter()
