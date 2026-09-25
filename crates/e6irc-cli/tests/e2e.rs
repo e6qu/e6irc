@@ -990,6 +990,11 @@ async fn cli_sends_a_server_password_first_and_reports_its_rejection() {
             .write_all(b":up 464 * :Password incorrect\r\n")
             .await
             .unwrap();
+        // Read on until the client leaves. Dropping the socket here, while
+        // the client still writes NICK/USER, answers those writes with a
+        // reset, and Windows discards the unread 464 along with it: the client
+        // then sees "connection aborted", not the refusal under test.
+        while let Ok(Some(_)) = lines.next_line().await {}
         first
     });
     let bin = env!("CARGO_BIN_EXE_e6irc");
