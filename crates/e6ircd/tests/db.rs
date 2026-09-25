@@ -4111,6 +4111,13 @@ async fn channel_keeptopic_persist_and_load() {
             .expect("missing option row"),
         Err(db::ChannelRefusal::ChannelMissing)
     );
+    // Only the founder may change it: the check runs with the row locked.
+    assert_eq!(
+        db::set_channel_keeptopic(&pool, "#c", false, None, "mallory")
+            .await
+            .expect("not founder"),
+        Err(db::ChannelRefusal::NotFounder)
+    );
     assert_eq!(
         db::set_channel_topic(&pool, "#missing", None)
             .await
@@ -11100,4 +11107,557 @@ async fn nickserv_and_chanserv_services_over_a_real_server() {
     carol.send("PRIVMSG NickServ :INFO dave").await;
     carol.expect("\x02dave\x02 is not registered.").await;
     running.shutdown.run().await;
+}
+
+/// Insert one stored message the way the history flush does, `peers` naming a
+/// direct message's folded participants (`None` for a channel's).
+async fn insert_message(
+    pool: &sqlx::PgPool,
+    msgid: &str,
+    target: &str,
+    peers: Option<&[&str]>,
+    ts_millis: i64,
+) {
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+         VALUES ($1, $2, 'x!x@h', NULL, 'privmsg', 'hi',
+                 to_timestamp($3::double precision / 1000), $4)
+         ON CONFLICT (msgid) DO NOTHING",
+    )
+    .bind(msgid)
+    .bind(target)
+    .bind(ts_millis)
+    .bind(peers.map(|peers| peers.iter().map(|p| p.to_string()).collect::<Vec<_>>()))
+    .execute(pool)
+    .await
+    .expect("insert message");
+}
+
+async fn dm_summary(pool: &sqlx::PgPool) -> Vec<(String, String, i64)> {
+    sqlx::query_as(
+        "SELECT account, peer, (EXTRACT(EPOCH FROM latest_ts) * 1000)::bigint
+         FROM dm_conversations ORDER BY account, peer",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("summary")
+}
+
+fn millis(value: u64) -> e6irc_proto::time::Millis {
+    e6irc_proto::time::Millis::from_millis(value)
+}
+
+/// CHATHISTORY TARGETS' direct-message half reads the conversation summary,
+/// which every writer of `messages` keeps exact: inserts advance it, a
+/// duplicate msgid does not, deleting a conversation's newest message
+/// recomputes it, deleting the whole conversation or an account forgets it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn direct_message_targets_come_from_a_summary_every_writer_keeps() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("direct_message_targets_come_from_a_summary").await,
+    )
+    .await
+    .expect("connect");
+    let carol_id = db::create_account_with_contact(&pool, "carol", "pw", None)
+        .await
+        .expect("carol");
+    insert_message(&pool, "c1", "#room", None, 500).await;
+    insert_message(&pool, "ab1", "alice!bob", Some(&["alice", "bob"]), 1000).await;
+    insert_message(&pool, "ab2", "alice!bob", Some(&["alice", "bob"]), 3000).await;
+    insert_message(&pool, "ac1", "alice!carol", Some(&["alice", "carol"]), 2000).await;
+    insert_message(&pool, "aa1", "alice!alice", Some(&["alice"]), 2500).await;
+    // A replayed msgid is not stored, so it cannot advance the summary.
+    insert_message(&pool, "ac1", "alice!carol", Some(&["alice", "carol"]), 9000).await;
+    assert_eq!(
+        dm_summary(&pool).await,
+        [
+            ("alice".to_string(), "alice".to_string(), 2500),
+            ("alice".into(), "bob".into(), 3000),
+            ("alice".into(), "carol".into(), 2000),
+            ("bob".into(), "alice".into(), 3000),
+            ("carol".into(), "alice".into(), 2000),
+        ]
+    );
+    assert_eq!(
+        tgts(&pool, &[], "alice", millis(0), millis(9999), 10).await,
+        [
+            ("carol".to_string(), millis(2000)),
+            ("alice".into(), millis(2500)),
+            ("bob".into(), millis(3000)),
+        ]
+    );
+    // The limit and the window bound the summary read itself.
+    assert_eq!(
+        tgts(&pool, &[], "alice", millis(0), millis(9999), 2).await,
+        [
+            ("carol".to_string(), millis(2000)),
+            ("alice".into(), millis(2500))
+        ]
+    );
+    assert_eq!(
+        tgts(&pool, &[], "alice", millis(2000), millis(2600), 10).await,
+        [("alice".to_string(), millis(2500))]
+    );
+    // Retention removes the oldest rows, a purge the rest.
+    sqlx::query("DELETE FROM messages WHERE msgid = 'ab2'")
+        .execute(&pool)
+        .await
+        .expect("delete newest");
+    assert_eq!(
+        tgts(&pool, &[], "bob", millis(0), millis(9999), 10).await,
+        [("alice".to_string(), millis(1000))]
+    );
+    sqlx::query("DELETE FROM messages WHERE target = 'alice!bob'")
+        .execute(&pool)
+        .await
+        .expect("delete conversation");
+    assert!(
+        tgts(&pool, &[], "bob", millis(0), millis(9999), 10)
+            .await
+            .is_empty()
+    );
+    db::delete_account_permanently(&pool, carol_id, "admin", &[])
+        .await
+        .expect("delete carol")
+        .expect("carol existed");
+    assert_eq!(
+        dm_summary(&pool).await,
+        [("alice".to_string(), "alice".to_string(), 2500)]
+    );
+}
+
+/// Migration 0080 builds the summary from the direct messages already stored,
+/// leaving out a conversation with an unauthenticated `~` party.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn dm_conversation_summary_is_backfilled_from_stored_history() {
+    let url = support::test_db("dm_conversation_summary_is_backfilled").await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    MIGRATIONS
+        .run_to(75, &pool)
+        .await
+        .expect("migrate through 0075");
+    insert_message(&pool, "ab1", "alice!bob", Some(&["alice", "bob"]), 1000).await;
+    insert_message(&pool, "ab2", "alice!bob", Some(&["alice", "bob"]), 4000).await;
+    insert_message(&pool, "bb1", "bob!bob", Some(&["bob"]), 2000).await;
+    insert_message(&pool, "anon", "~x!alice", Some(&["~x", "alice"]), 3000).await;
+    insert_message(&pool, "c1", "#room", None, 5000).await;
+    MIGRATIONS.run(&pool).await.expect("migrate through 0080");
+    assert_eq!(
+        dm_summary(&pool).await,
+        [
+            ("alice".to_string(), "bob".to_string(), 4000),
+            ("bob".into(), "alice".into(), 4000),
+            ("bob".into(), "bob".into(), 2000),
+        ]
+    );
+    assert_eq!(
+        tgts(&pool, &[], "bob", millis(0), millis(9999), 10).await,
+        [
+            ("bob".to_string(), millis(2000)),
+            ("alice".into(), millis(4000))
+        ]
+    );
+}
+
+/// Accounts `names`, each founding `founded` channels named `#<name><n>`.
+async fn accounts_founding(pool: &sqlx::PgPool, names: &[&str], founded: i64) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for name in names {
+        let id = db::create_account_with_contact(pool, name, "password", None)
+            .await
+            .expect("account");
+        sqlx::query(
+            "INSERT INTO channels (name, name_folded, founder_account_id)
+             SELECT '#' || $1 || n, '#' || $1 || n, $2 FROM generate_series(1, $3) n",
+        )
+        .bind(name)
+        .bind(id)
+        .bind(founded)
+        .execute(pool)
+        .await
+        .expect("founded channels");
+        ids.push(id);
+    }
+    ids
+}
+
+/// The per-account founder cap holds where every shard's writes meet: two
+/// concurrent registrations one below it cannot both pass, and no founder
+/// transfer — ChanServ SET FOUNDER, the owner console's, or a deletion's
+/// succession — takes the receiving account past it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn founder_cap_is_held_by_storage_for_registrations_and_transfers() {
+    use e6ircd::core::{ChannelControlResult, ChannelRegistrationResult, PersistedChannelMutation};
+    let pool = db::connect_and_migrate(&support::test_db("founder_cap_is_held_by_storage").await)
+        .await
+        .expect("connect");
+    let limit = db::CHANNEL_FOUNDER_LIMIT;
+    let bob_id = accounts_founding(&pool, &["bob"], limit - 1).await[0];
+    let alice_id = accounts_founding(&pool, &["alice"], 0).await[0];
+
+    // Two shards' registrations, one slot left: exactly one is stored.
+    let (first, second) = tokio::join!(
+        db::persist_channel_registration(&pool, "#race1", "bob", &None),
+        db::persist_channel_registration(&pool, "#race2", "bob", &None),
+    );
+    let mut verdicts = [first.expect("first"), second.expect("second")];
+    verdicts.sort_by_key(|verdict| format!("{verdict:?}"));
+    assert_eq!(
+        verdicts,
+        [
+            ChannelRegistrationResult::LimitReached,
+            ChannelRegistrationResult::Registered
+        ]
+    );
+    let founded = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM channels WHERE founder_account_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    assert_eq!(founded(bob_id).await, limit);
+
+    // Transfers to an account at the cap are refused, and change nothing.
+    assert_eq!(
+        db::persist_channel_registration(&pool, "#mine", "alice", &None)
+            .await
+            .expect("register"),
+        ChannelRegistrationResult::Registered
+    );
+    assert_eq!(
+        db::set_channel_founder(&pool, "#mine", "bob", "alice")
+            .await
+            .expect("chanserv transfer"),
+        db::FounderTransfer::LimitReached
+    );
+    assert_eq!(
+        db::persist_owned_channel_mutation(
+            &pool,
+            "#mine",
+            "alice",
+            &PersistedChannelMutation::TransferFounder {
+                account: "bob".into()
+            },
+        )
+        .await
+        .expect("console transfer"),
+        ChannelControlResult::FounderLimitReached
+    );
+    assert_eq!(founded(alice_id).await, 1);
+    // A transfer to the founder the channel already has moves nothing.
+    assert!(matches!(
+        db::set_channel_founder(&pool, "#bob1", "bob", "bob")
+            .await
+            .expect("self transfer"),
+        db::FounderTransfer::Transferred { .. }
+    ));
+
+    // A deletion whose succession would take bob past the cap is refused,
+    // before the gate and in the transaction, naming the channel.
+    assert!(matches!(
+        db::set_channel_successor(&pool, "#mine", Some("bob"), "alice")
+            .await
+            .expect("successor"),
+        db::SuccessorChange::Applied { .. }
+    ));
+    let refused = |outcome: Result<(), db::DbError>| match outcome {
+        Err(db::DbError::SuccessorChannelLimit(channels)) => channels,
+        other => panic!("deletion was not refused at the founder cap: {other:?}"),
+    };
+    assert_eq!(
+        refused(
+            db::account_deletion_target(&pool, alice_id, &[])
+                .await
+                .map(|_| ())
+        ),
+        ["#mine"]
+    );
+    let error = db::delete_account_permanently(&pool, alice_id, "alice", &[])
+        .await
+        .map(|_| ());
+    assert!(
+        error
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("#mine")),
+        "the refusal names the channel: {error:?}"
+    );
+    assert_eq!(refused(error), ["#mine"]);
+    assert_eq!(
+        founded(alice_id).await,
+        1,
+        "a refused deletion moved nothing"
+    );
+
+    // With a slot free, the same deletion passes the channel on.
+    sqlx::query("DELETE FROM channels WHERE name_folded = '#bob1'")
+        .execute(&pool)
+        .await
+        .expect("free a slot");
+    let deleted = db::delete_account_permanently(&pool, alice_id, "alice", &[])
+        .await
+        .expect("delete")
+        .expect("alice existed");
+    assert_eq!(
+        deleted.successions,
+        [db::ChannelSuccession {
+            channel: "#mine".into(),
+            founder: "bob".into()
+        }]
+    );
+    assert_eq!(founded(bob_id).await, limit);
+}
+
+/// An expired personal access token authenticates nothing and is not counted
+/// by the account directory; it does not hold one of the account's slots.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn expired_api_tokens_do_not_count_against_the_cap() {
+    let url = support::test_db("expired_api_tokens_do_not_count_against_the_cap").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "tcap", "pw", None)
+        .await
+        .expect("create");
+    for i in 0..32 {
+        issue_api_token(&pool, "tcap", &format!("cli{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("token {i} should succeed: {e}"));
+    }
+    sqlx::query(
+        "UPDATE api_tokens
+         SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'
+         WHERE id = (SELECT min(id) FROM api_tokens)",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire one");
+    issue_api_token(&pool, "tcap", "replacement")
+        .await
+        .expect("an expired token frees its slot");
+    assert!(matches!(
+        issue_api_token(&pool, "tcap", "one too many").await,
+        Err(db::DbError::TooManyCredentials)
+    ));
+}
+
+/// Recording a credential's use is part of verifying it, on both password
+/// paths: a failed write fails the check instead of being logged past.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_failed_credential_use_record_fails_both_password_checks() {
+    let url = support::test_db("a_failed_credential_use_record_fails_both").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "user", "primary-pw", None)
+        .await
+        .expect("create");
+    let app_password = db::issue_app_password(&pool, "user", "primary-pw", "client")
+        .await
+        .expect("app password");
+    sqlx::query(
+        "CREATE FUNCTION refuse_use_record() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'last_used_at is not writable'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_use_record BEFORE UPDATE OF last_used_at ON account_credentials
+         FOR EACH ROW EXECUTE FUNCTION refuse_use_record()",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger");
+    let failed_write = |outcome: Result<Option<String>, db::DbError>| matches!(outcome, Err(error) if error.to_string().contains("last_used_at is not writable"));
+    assert!(
+        failed_write(db::verify_credentials(&pool, "user", &app_password).await),
+        "an app-password login reported success past a failed write"
+    );
+    assert!(
+        failed_write(db::verify_local_password(&pool, "user", "primary-pw").await),
+        "a primary-password check reported success past a failed write"
+    );
+}
+
+/// Storage refuses what the application's writers never produce but its
+/// comparisons depend on: a BNC network name outside the folded-token charset,
+/// and a non-canonical bouncer timestamp. The dead invitation column and the
+/// redundant network index are gone.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn storage_constrains_bnc_names_and_timestamps() {
+    let url = support::test_db("storage_constrains_bnc_names_and_timestamps").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let account = db::create_account_with_contact(&pool, "alice", "pw", None)
+        .await
+        .expect("create");
+    // Which check refused a write (`None`: it was stored).
+    let refused_by = |result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| match result {
+        Ok(_) => None,
+        Err(sqlx::Error::Database(error)) => error.constraint().map(str::to_string),
+        Err(other) => panic!("unexpected failure: {other}"),
+    };
+    let network = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO bnc_networks (account_id, name, addr, nick, username, kind)
+                 VALUES ($1, $2, 'irc.example:6697', 'alice', 'alice', 'irc')",
+            )
+            .bind(account)
+            .bind(name)
+            .execute(&pool)
+            .await
+        }
+    };
+    for name in ["net[", "net{", ".", "..", "", "has space"] {
+        assert_eq!(
+            refused_by(network(name).await).as_deref(),
+            Some("bnc_networks_name_token"),
+            "network name {name:?}"
+        );
+    }
+    assert_eq!(refused_by(network("Libera.Chat_2-x").await), None);
+    let line = |stamp: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO bnc_buffer (owner, network, line, sent_at)
+                 VALUES ('alice', 'libera', ':s NOTICE a :x', $1)",
+            )
+            .bind(stamp)
+            .execute(&pool)
+            .await
+        }
+    };
+    let marker = |stamp: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+                 VALUES ($1, 'libera', $2, $2)",
+            )
+            .bind(account)
+            .bind(stamp)
+            .execute(&pool)
+            .await
+        }
+    };
+    for stamp in [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01 00:00:00.000Z",
+        "yesterday",
+    ] {
+        assert_eq!(
+            refused_by(line(stamp).await).as_deref(),
+            Some("bnc_buffer_sent_at_canonical"),
+            "bnc_buffer.sent_at {stamp:?}"
+        );
+        assert_eq!(
+            refused_by(marker(stamp).await).as_deref(),
+            Some("bnc_read_markers_timestamp_canonical"),
+            "bnc_read_markers.timestamp {stamp:?}"
+        );
+    }
+    assert_eq!(refused_by(line("2026-01-01T00:00:00.000Z").await), None);
+    assert_eq!(refused_by(marker("2026-01-01T00:00:00.000Z").await), None);
+    let accepted_account_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'account_invitations'
+                          AND column_name = 'accepted_account_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("columns");
+    assert!(!accepted_account_column);
+    let redundant_index: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'bnc_networks_account_idx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("indexes");
+    assert!(!redundant_index);
+}
+
+/// Migration 0080 brings existing bouncer rows onto the canonical timestamp
+/// form (a line is rebased onto its arrival time, an unorderable marker is
+/// removed) and refuses, naming it, a network name it cannot rewrite safely.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
+    let url = support::test_db("storage_constraint_migration_normalizes").await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    MIGRATIONS
+        .run_to(75, &pool)
+        .await
+        .expect("migrate through 0075");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('alice', 'alice') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, target, sent_at, created_at)
+         VALUES ('alice', 'libera', ':s PRIVMSG #rust :old', '#rust', '2026-01-01T00:00:00Z',
+                 '2026-01-02T03:04:05.678Z'),
+                ('alice', 'libera', ':s PRIVMSG #rust :ok', '#rust', '2026-02-01T00:00:00.000Z',
+                 '2026-02-01T00:00:00.000Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("buffer");
+    sqlx::query(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00Z'),
+                ($1, 'libera', '#ok', '2026-02-01T00:00:00.000Z')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("markers");
+    sqlx::query(
+        "INSERT INTO bnc_networks (account_id, name, addr, nick, username, kind)
+         VALUES ($1, 'net[', 'irc.example:6697', 'alice', 'alice', 'irc')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("hand-written network");
+
+    let refused = MIGRATIONS
+        .run(&pool)
+        .await
+        .expect_err("an unsafe name refuses");
+    assert!(
+        refused.to_string().contains("'net['"),
+        "the refusal names the row: {refused}"
+    );
+    sqlx::query("UPDATE bnc_networks SET name = 'net' WHERE name = 'net['")
+        .execute(&pool)
+        .await
+        .expect("operator renames it");
+    MIGRATIONS.run(&pool).await.expect("migrate through 0080");
+
+    let sent_at: Vec<String> = sqlx::query_scalar("SELECT sent_at FROM bnc_buffer ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("buffer");
+    assert_eq!(
+        sent_at,
+        ["2026-01-02T03:04:05.678Z", "2026-02-01T00:00:00.000Z"]
+    );
+    let markers: Vec<String> =
+        sqlx::query_scalar("SELECT target FROM bnc_read_markers ORDER BY target")
+            .fetch_all(&pool)
+            .await
+            .expect("markers");
+    assert_eq!(markers, ["#ok"]);
 }

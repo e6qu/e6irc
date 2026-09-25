@@ -219,9 +219,9 @@ impl AccountDeletion {
 
 fn deletion_error(error: crate::db::DbError) -> AccountDeletionError {
     match error {
-        crate::db::DbError::AccountOwnsChannels(_) | crate::db::DbError::LastAdministrator => {
-            AccountDeletionError::Refused(error.to_string())
-        }
+        crate::db::DbError::AccountOwnsChannels(_)
+        | crate::db::DbError::SuccessorChannelLimit(_)
+        | crate::db::DbError::LastAdministrator => AccountDeletionError::Refused(error.to_string()),
         _ => {
             eprintln!("account deletion failed: {error}");
             AccountDeletionError::Unavailable("Database unavailable".into())

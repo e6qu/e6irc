@@ -3314,6 +3314,74 @@ fn chanserv_register_flow() {
     );
 }
 
+/// The founder cap is held in storage, where every shard's registrations meet;
+/// its refusal reaches ChanServ as the cap's own answer and registers nothing.
+#[test]
+fn chanserv_register_reports_the_storage_founder_cap() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #mine");
+    s.drain(alice);
+    s.db_requests();
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
+    let req = s.db_requests();
+    s.channel_registration_persisted(req, e6ircd::core::ChannelRegistrationResult::LimitReached);
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with(":ChanServ!") && l.contains("too many channels")),
+        "{out:#?}"
+    );
+    // The refusal released the in-flight reservation: a retry is queued again.
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
+    assert!(
+        matches!(
+            s.db_requests().as_slice(),
+            [e6ircd::core::DbRequest::RegisterChannel { .. }]
+        ),
+        "a refused registration still holds its reservation"
+    );
+}
+
+/// A transfer storage refused because the receiving account is at the founder
+/// cap is reported as that, and ownership stays where it was.
+#[test]
+fn chanserv_set_founder_reports_the_storage_founder_cap() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER alice");
+    s.db_requests();
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::FounderLimitReached {
+            display: "#room".to_string(),
+            label: None,
+        },
+    );
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|l| l.contains("Could not transfer")
+            && l.contains(&format!(
+                "maximum of {} channels",
+                e6ircd::db::CHANNEL_FOUNDER_LIMIT
+            ))),
+        "{out:#?}"
+    );
+    // boss still founds #room: another transfer is queued, not refused.
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER carol");
+    assert!(
+        s.db_requests().iter().any(|r| matches!(
+            r,
+            e6ircd::core::DbRequest::SetChannelFounder { new_founder, .. } if new_founder == "carol"
+        )),
+        "the refused transfer moved ownership"
+    );
+}
+
 #[test]
 fn channel_registration_persists_its_initial_topic_atomically() {
     let mut s = TestServer::new();

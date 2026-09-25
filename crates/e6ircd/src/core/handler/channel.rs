@@ -76,9 +76,11 @@ pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = crate::db::READ_MARKER_LI
 /// are reloaded into RAM at boot — and, unlike account REGISTER, it runs no
 /// argon2 so the per-connection credential budget never throttles it. Without a
 /// cap one authenticated account could register channels in a loop (JOIN → CS
-/// REGISTER → PART) and grow those maps without bound, forever. Enforced in the
-/// ChanServ REGISTER handler against the count the account already founds.
-pub(super) const MAX_CHANNELS_PER_ACCOUNT: usize = 200;
+/// REGISTER → PART) and grow those maps without bound, forever. Checked by
+/// ChanServ REGISTER and the owner console against the count this shard knows
+/// (founded plus its own in-flight registrations) as a fast path; the database
+/// holds the cap where every shard's registrations and founder transfers meet.
+pub(super) const MAX_CHANNELS_PER_ACCOUNT: usize = crate::db::CHANNEL_FOUNDER_LIMIT as usize;
 
 /// Cap on a session's pending-invite set, bounding INVITE-driven growth.
 pub(super) const INVITE_LIMIT: usize = 100;

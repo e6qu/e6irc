@@ -1083,6 +1083,9 @@ pub enum ChannelControlResult {
     MissingOrNotOwner,
     AccountMissing,
     AccessLimitReached,
+    /// The transfer's receiving account already founds
+    /// [`crate::db::CHANNEL_FOUNDER_LIMIT`] channels.
+    FounderLimitReached,
     KeeptopicDisabled,
     Unavailable,
 }
@@ -1092,6 +1095,9 @@ pub enum ChannelRegistrationResult {
     Registered,
     Exists,
     AccountMissing,
+    /// The founder already founds [`crate::db::CHANNEL_FOUNDER_LIMIT`]
+    /// channels — counted where every shard's registrations meet.
+    LimitReached,
     Unavailable,
 }
 
@@ -1362,6 +1368,12 @@ pub enum ChannelServicePersistence {
     },
     FounderUnavailable {
         channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    /// The named account already founds [`crate::db::CHANNEL_FOUNDER_LIMIT`]
+    /// channels; the channel was not transferred.
+    FounderLimitReached {
         display: String,
         label: Option<String>,
     },

@@ -179,7 +179,7 @@ fn begin_owned_channel_registration(
     if state.channels_founded_by(&actor) >= super::channel::MAX_CHANNELS_PER_ACCOUNT {
         let _ = reply.send(channel_error(
             crate::core::ChannelControlError::Conflict,
-            "too many registered channels; unregister one before adding another",
+            TOO_MANY_REGISTERED_CHANNELS,
         ));
         return;
     }
@@ -301,6 +301,11 @@ fn queue_channel_control(
     );
     true
 }
+
+/// The refusal of a registration past the founder cap, from the core's fast
+/// path and from storage's authoritative count alike.
+const TOO_MANY_REGISTERED_CHANNELS: &str =
+    "too many registered channels; unregister one before adding another";
 
 fn channel_error(kind: crate::core::ChannelControlError, message: impl Into<String>) -> AdminReply {
     AdminReply::ChannelErr {
@@ -1020,6 +1025,13 @@ pub(crate) fn channel_control_result(
             ChannelControlError::Conflict,
             "the channel access list is full; remove an entry before adding another",
         ),
+        ChannelControlResult::FounderLimitReached => channel_error(
+            ChannelControlError::Conflict,
+            format!(
+                "the target account already founds the maximum of {} channels",
+                crate::db::CHANNEL_FOUNDER_LIMIT
+            ),
+        ),
         ChannelControlResult::KeeptopicDisabled => channel_error(
             ChannelControlError::Conflict,
             "turn KEEPTOPIC on before setting a retained topic",
@@ -1072,6 +1084,9 @@ pub(crate) fn owned_channel_registration_result(
             ChannelControlError::NotFound,
             "the founder account is no longer registered",
         ),
+        ChannelRegistrationResult::LimitReached => {
+            channel_error(ChannelControlError::Conflict, TOO_MANY_REGISTERED_CHANNELS)
+        }
         ChannelRegistrationResult::Unavailable => channel_error(
             ChannelControlError::Unavailable,
             "persistence unavailable; channel was not registered",

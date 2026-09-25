@@ -1134,6 +1134,9 @@ pub(crate) fn channel_registration_persisted(
         crate::core::ChannelRegistrationResult::Exists => {
             crate::core::state::ChanServRegisterResult::Exists
         }
+        crate::core::ChannelRegistrationResult::LimitReached => {
+            crate::core::state::ChanServRegisterResult::RegistrationLimit
+        }
         crate::core::ChannelRegistrationResult::AccountMissing
         | crate::core::ChannelRegistrationResult::Unavailable => {
             crate::core::state::ChanServRegisterResult::Unavailable
@@ -2390,6 +2393,14 @@ pub(crate) fn channel_service_result(
         crate::core::ChannelServicePersistence::FounderMissing { display, label, .. } => (
             label,
             format!("Could not transfer \x02{display}\x02 — no such account."),
+        ),
+        crate::core::ChannelServicePersistence::FounderLimitReached { display, label } => (
+            label,
+            format!(
+                "Could not transfer \x02{display}\x02 — that account already founds the \
+                 maximum of {} channels.",
+                crate::db::CHANNEL_FOUNDER_LIMIT
+            ),
         ),
         crate::core::ChannelServicePersistence::FounderUnavailable { display, label, .. } => {
             return channel_field_unavailable(state, conn, display, label, "FOUNDER");
