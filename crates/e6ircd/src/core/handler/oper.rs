@@ -82,7 +82,7 @@ pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Gate an oper-only command: reply `ERR_NOPRIVILEGES` and report `false`
 /// when the connection is not an IRC operator.
-fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
+pub(super) fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
     if state.sessions[&conn].oper.is_some() {
         return true;
     }

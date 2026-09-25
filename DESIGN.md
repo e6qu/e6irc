@@ -1069,7 +1069,11 @@ subset's exact behavior.
   D-line must be an IP address, CIDR range or address glob (anything else is
   refused) and matches only that address; so a SETHOST lifts neither. A
   reason `public|private` shows the banned user and their peers only the
-  public part; the operator listing and the audit trail keep both.
+  public part; the operator listing and the audit trail keep both. `STATS k`,
+  `STATS d` and `STATS x` (either case) are that operator listing in Solanum's
+  numerics — `216 K <host> * <user>`, `225 D <address>`, `247 X 0 <mask>`,
+  each with the whole reason, then 219; a non-operator gets 481 and the 219
+  terminator, as Solanum's stats access table answers.
 - **Integrated services** (no separate Atheme process): `NickServ` and
   `ChanServ` pseudo-clients whose command surfaces
   (`REGISTER`, `IDENTIFY`, `GHOST`, `ACCESS`/`FLAGS`, `OP`, topic retention,

@@ -941,7 +941,7 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "STATS <letter>",
-            "Server statistics query (letters are documented in the reply to an unknown letter).",
+            "Server statistics: u (uptime); for operators, k (K-lines), d (D-lines), x (X-lines).",
         ],
     },
     HelpTopic {

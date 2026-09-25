@@ -2266,6 +2266,64 @@ fn stats_uptime_and_terminator() {
     );
 }
 
+/// STATS k/d/x list the server bans for an operator with the whole reason —
+/// the operators' note after `|` included — in Solanum's numerics, and refuse
+/// everyone else with 481 before the terminator.
+#[test]
+fn stats_lists_server_bans_to_operators_only() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "KLINE Baddie@evil.example :spamming|ticket 42");
+    commit_server_ban(&mut s);
+    s.line(op, "DLINE 192.0.2.7 :bad netblock|seen on 3 nets");
+    commit_server_ban(&mut s);
+    s.line(op, "XLINE *spambot* :no bots");
+    commit_server_ban(&mut s);
+    s.drain(op);
+
+    s.line(op, "STATS k");
+    let out = s.drain(op);
+    assert_eq!(
+        out,
+        vec![
+            ":irc.test.example 216 god K evil.example * Baddie :spamming|ticket 42".to_string(),
+            ":irc.test.example 219 god k :End of /STATS report".to_string(),
+        ]
+    );
+    s.line(op, "STATS d");
+    let out = s.drain(op);
+    assert_eq!(
+        out,
+        vec![
+            ":irc.test.example 225 god D 192.0.2.7 :bad netblock|seen on 3 nets".to_string(),
+            ":irc.test.example 219 god d :End of /STATS report".to_string(),
+        ]
+    );
+    s.line(op, "STATS X");
+    let out = s.drain(op);
+    assert_eq!(
+        out,
+        vec![
+            ":irc.test.example 247 god X 0 *spambot* :no bots".to_string(),
+            ":irc.test.example 219 god X :End of /STATS report".to_string(),
+        ]
+    );
+
+    let plain = s.register(2, "plain");
+    for letter in ["k", "K", "d", "D", "x"] {
+        s.line(plain, &format!("STATS {letter}"));
+        let out = s.drain(plain);
+        assert_eq!(out.len(), 2, "{out:#?}");
+        assert!(out[0].contains(" 481 plain "), "{out:#?}");
+        assert!(
+            out[1].contains(&format!(" 219 plain {letter} ")),
+            "{out:#?}"
+        );
+    }
+}
+
 #[test]
 fn nick_to_exact_same_nick_is_a_silent_noop() {
     let mut s = TestServer::new();
