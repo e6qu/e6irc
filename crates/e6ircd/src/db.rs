@@ -95,6 +95,9 @@ pub enum DbError {
     /// An account must transfer every founded channel that has no successor
     /// before deletion.
     AccountOwnsChannels(usize),
+    /// Passing these channels (folded names) to their successors would take a
+    /// successor past [`CHANNEL_FOUNDER_LIMIT`]; nothing was deleted.
+    SuccessorChannelLimit(Vec<String>),
     /// An administrator already holds the maximum number of live invitations.
     TooManyInvitations,
     /// A bearer invitation is unknown, expired, revoked, or already consumed —
@@ -174,6 +177,13 @@ impl std::fmt::Display for DbError {
                      name a successor, or unregister them first"
                 )
             }
+            Self::SuccessorChannelLimit(channels) => write!(
+                f,
+                "the successor of {} already founds the maximum of {CHANNEL_FOUNDER_LIMIT} \
+                 channels; name another successor, transfer, or unregister {} first",
+                channels.join(", "),
+                if channels.len() == 1 { "it" } else { "them" }
+            ),
             Self::TooManyInvitations => {
                 write!(
                     f,
@@ -1689,16 +1699,11 @@ pub async fn accept_account_invitation(
     .await?
     .ok_or(DbError::InvitationUnavailable)?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
-    sqlx::query(
-        "UPDATE account_invitations
-         SET consumed_at = now(), accepted_account_id = $2
-         WHERE id = $1",
-    )
-    .bind(invitation_id)
-    .bind(account_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(query_error)?;
+    sqlx::query("UPDATE account_invitations SET consumed_at = now() WHERE id = $1")
+        .bind(invitation_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
         &AuditPrincipal::account(&folded),
@@ -1991,6 +1996,26 @@ pub async fn account_deletion_target(
             usize::try_from(founded_channels).unwrap_or(usize::MAX),
         ));
     }
+    // What the deletion's succession would give each successor, so a refusal
+    // the transaction would reach anyway is answered before the account is
+    // gated and its networks stopped. The transaction re-checks under locks.
+    let over_limit: Vec<String> = sqlx::query_scalar(
+        "SELECT c.name_folded FROM channels c
+         WHERE c.founder_account_id = $1 AND c.successor_account_id IS NOT NULL
+           AND (SELECT count(*) FROM channels founded
+                WHERE founded.founder_account_id = c.successor_account_id
+                   OR (founded.founder_account_id = $1
+                       AND founded.successor_account_id = c.successor_account_id)) > $2
+         ORDER BY c.name_folded",
+    )
+    .bind(account_id)
+    .bind(CHANNEL_FOUNDER_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    if !over_limit.is_empty() {
+        return Err(DbError::SuccessorChannelLimit(over_limit));
+    }
     if flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded) {
         require_other_active_administrator(pool, account_id, configured_administrators).await?;
     }
@@ -2064,6 +2089,43 @@ pub async fn delete_account_permanently(
     .fetch_all(&mut *transaction)
     .await
     .map_err(query_error)?;
+    // A succession is a founder transfer, so it is held to the same cap under
+    // the same lock: each successor's row is locked (in id order, after the
+    // channel rows, the order a transfer takes them in) and its founded
+    // channels — the ones it just received included — counted. A successor
+    // the deletion would take past the cap refuses the deletion, naming the
+    // channels, as an unsuccessored channel does.
+    let passed: Vec<&str> = successions
+        .iter()
+        .map(|(channel, _)| channel.as_str())
+        .collect();
+    // Locked by its own statement: the count must be read by a later one,
+    // whose snapshot includes whatever committed while this one waited.
+    sqlx::query(
+        "SELECT a.id FROM accounts a
+         WHERE a.id IN (SELECT founder_account_id FROM channels WHERE name_folded = ANY($1))
+         ORDER BY a.id
+         FOR NO KEY UPDATE",
+    )
+    .bind(&passed)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    let over_limit: Vec<String> = sqlx::query_scalar(
+        "SELECT c.name_folded FROM channels c
+         WHERE c.name_folded = ANY($1)
+           AND (SELECT count(*) FROM channels founded
+                WHERE founded.founder_account_id = c.founder_account_id) > $2
+         ORDER BY c.name_folded",
+    )
+    .bind(&passed)
+    .bind(CHANNEL_FOUNDER_LIMIT)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    if !over_limit.is_empty() {
+        return Err(DbError::SuccessorChannelLimit(over_limit));
+    }
     let founded_channels: i64 =
         sqlx::query_scalar("SELECT count(*) FROM channels WHERE founder_account_id = $1")
             .bind(account_id)
@@ -3071,7 +3133,8 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         Vec::with_capacity(n),
     );
     // A channel message stores NULL here; a direct message stores its
-    // casefolded participants, which is what CHATHISTORY TARGETS searches.
+    // casefolded participants, from which the `dm_conversations` triggers keep
+    // the summary CHATHISTORY TARGETS reads.
     // Bound as the joined form and split back into an array in SQL: a
     // conversation has one or two participants, and Postgres arrays passed
     // through UNNEST must be rectangular, which a ragged nesting is not.
@@ -3330,6 +3393,9 @@ async fn handle_request(
                         display,
                         label,
                     }
+                }
+                Ok(FounderTransfer::LimitReached) => {
+                    crate::core::ChannelServicePersistence::FounderLimitReached { display, label }
                 }
                 Ok(FounderTransfer::Refused(refusal)) => {
                     crate::core::ChannelServicePersistence::Refused {
@@ -4589,7 +4655,10 @@ pub async fn query_targets(
         // `messages_target_ts_id_idx` per requested channel (a LATERAL
         // `max(ts)` becomes `Index Only Scan Backward ... Limit 1`); grouping
         // `WHERE target = ANY(..)` instead read every row of every joined
-        // channel to find each maximum.
+        // channel to find each maximum. A direct-message conversation's newest
+        // message is kept in `dm_conversations` by triggers on `messages`
+        // (migration 0080), so that half reads at most `limit` rows of
+        // `dm_conversations_account_latest_idx`.
         "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
              SELECT requested.name, newest.latest
              FROM unnest($1::text[], $6::bigint[]) AS requested(name, floor)
@@ -4600,15 +4669,13 @@ pub async fn query_targets(
              ) newest
              WHERE newest.latest IS NOT NULL
              UNION ALL
-             SELECT COALESCE(
-                        (SELECT p FROM UNNEST(dm_peers) p WHERE p <> $5 LIMIT 1),
-                        $5
-                    ) AS name,
-                    MAX(ts) AS latest
-             FROM messages
-             WHERE dm_peers @> ARRAY[$5::text]
-               AND NOT EXISTS (SELECT 1 FROM UNNEST(dm_peers) p WHERE left(p, 1) = '~')
-             GROUP BY name
+             (SELECT peer AS name, latest_ts AS latest
+              FROM dm_conversations
+              WHERE account = $5
+                AND latest_ts > to_timestamp($2::double precision / 1000)
+                AND latest_ts < to_timestamp($3::double precision / 1000)
+              ORDER BY latest_ts ASC
+              LIMIT $4)
          ) buffers
          GROUP BY name
          HAVING MAX(latest) > to_timestamp($2::double precision / 1000)
@@ -4882,14 +4949,10 @@ pub async fn persist_owned_channel_mutation(
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let Ok(ChannelMutationOwnerRow {
-        channel_id,
-        keeptopic,
-        ..
-    }) = lock_channel_as_founder(&mut transaction, &channel_folded, actor).await?
-    else {
+    let Ok(owner) = lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? else {
         return Ok(ChannelControlResult::MissingOrNotOwner);
     };
+    let (channel_id, keeptopic) = (owner.channel_id, owner.keeptopic);
     // The account an access change or transfer named, as resolved.
     let mut resolved = None;
 
@@ -5003,7 +5066,13 @@ pub async fn persist_owned_channel_mutation(
             let Some(founder) = resolve_account(&mut *transaction, account).await? else {
                 return Ok(ChannelControlResult::AccountMissing);
             };
-            transfer_channel_founder(&mut transaction, channel_id, founder.id).await?;
+            match transfer_channel_founder(&mut transaction, &owner, founder.id).await? {
+                FounderWrite::Transferred => {}
+                FounderWrite::AccountMissing => return Ok(ChannelControlResult::AccountMissing),
+                FounderWrite::LimitReached => {
+                    return Ok(ChannelControlResult::FounderLimitReached);
+                }
+            }
             resolved = Some(founder.name);
             ("CHANNEL_FOUNDER", founder.name_folded)
         }
@@ -5068,31 +5137,53 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
     .map_err(query_error)
 }
 
-/// Make `founder_id` the founder of the locked channel `channel_id`: the one
-/// founder transfer both ChanServ and the owner console run. A transfer clears
-/// the successor — the outgoing founder picked the heir, and the new founder
-/// names their own (maintainer decision; succession by account deletion clears
-/// it too, through migration 0075's trigger). A transfer to the founder the
-/// channel already has changes nothing.
+/// What a founder transfer on a locked channel did.
+enum FounderWrite {
+    Transferred,
+    /// The receiving account was deleted after its name was resolved.
+    AccountMissing,
+    /// The receiving account already founds [`CHANNEL_FOUNDER_LIMIT`] channels.
+    LimitReached,
+}
+
+/// Make `founder_id` the founder of the locked channel `channel`: the one
+/// founder transfer both ChanServ and the owner console run. The receiving
+/// account's row is locked and its founded channels counted first, as a
+/// registration does, so no transfer can take an account past
+/// [`CHANNEL_FOUNDER_LIMIT`]. A transfer clears the successor — the outgoing
+/// founder picked the heir, and the new founder names their own (maintainer
+/// decision; succession by account deletion clears it too, through migration
+/// 0075's trigger). A transfer to the founder the channel already has changes
+/// nothing.
 async fn transfer_channel_founder(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    channel_id: i64,
+    channel: &ChannelMutationOwnerRow,
     founder_id: i64,
-) -> Result<(), DbError> {
+) -> Result<FounderWrite, DbError> {
+    if channel.founder_id == founder_id {
+        return Ok(FounderWrite::Transferred);
+    }
+    let locked: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(founder_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(query_error)?;
+    if locked.is_none() {
+        return Ok(FounderWrite::AccountMissing);
+    }
+    if let FounderCapacity::LimitReached = founder_capacity(transaction, founder_id).await? {
+        return Ok(FounderWrite::LimitReached);
+    }
     sqlx::query(
-        "UPDATE channels
-         SET founder_account_id = $2,
-             successor_account_id = CASE
-                 WHEN founder_account_id = $2 THEN successor_account_id
-             END
-         WHERE id = $1",
+        "UPDATE channels SET founder_account_id = $2, successor_account_id = NULL WHERE id = $1",
     )
-    .bind(channel_id)
+    .bind(channel.channel_id)
     .bind(founder_id)
     .execute(&mut **transaction)
     .await
-    .map(|_| ())
-    .map_err(query_error)
+    .map_err(query_error)?;
+    Ok(FounderWrite::Transferred)
 }
 
 /// What ChanServ `SET FOUNDER` did.
@@ -5104,6 +5195,8 @@ pub enum FounderTransfer {
     },
     /// No account has that name or nick.
     AccountMissing,
+    /// That account already founds [`CHANNEL_FOUNDER_LIMIT`] channels.
+    LimitReached,
     Refused(ChannelRefusal),
 }
 
@@ -5127,7 +5220,11 @@ pub async fn set_channel_founder(
     let Some(founder) = resolve_account(&mut *transaction, new_founder).await? else {
         return Ok(FounderTransfer::AccountMissing);
     };
-    transfer_channel_founder(&mut transaction, channel.channel_id, founder.id).await?;
+    match transfer_channel_founder(&mut transaction, &channel, founder.id).await? {
+        FounderWrite::Transferred => {}
+        FounderWrite::AccountMissing => return Ok(FounderTransfer::AccountMissing),
+        FounderWrite::LimitReached => return Ok(FounderTransfer::LimitReached),
+    }
     audit_channel_service(
         &mut transaction,
         actor,
@@ -6248,53 +6345,83 @@ pub async fn persist_channel_registration(
         None => (None, None, None),
     };
     let mut transaction = pool.begin().await.map_err(query_error)?;
+    let Some(founder_id) = lock_account_id(&mut transaction, &founder_folded).await? else {
+        return Ok(ChannelRegistrationResult::AccountMissing);
+    };
+    if let FounderCapacity::LimitReached = founder_capacity(&mut transaction, founder_id).await? {
+        return Ok(ChannelRegistrationResult::LimitReached);
+    }
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO channels (
              name, name_folded, founder_account_id,
              topic, topic_setter, topic_set_at
          )
-         SELECT $1, $2, a.id, $4, $5,
-                CASE WHEN $6::double precision IS NULL
-                     THEN NULL
-                     ELSE to_timestamp($6::double precision)
-                END
-         FROM accounts a WHERE a.name_folded = $3
+         VALUES ($1, $2, $3, $4, $5,
+                 CASE WHEN $6::double precision IS NULL
+                      THEN NULL
+                      ELSE to_timestamp($6::double precision)
+                 END)
          ON CONFLICT (name_folded) DO NOTHING RETURNING id",
     )
     .bind(channel)
     .bind(&chan_folded)
-    .bind(&founder_folded)
+    .bind(founder_id)
     .bind(topic_text)
     .bind(topic_setter)
     .bind(topic_set_at)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(query_error)?;
-    let result = if inserted.is_some() {
-        insert_audit_log_with(
-            &mut *transaction,
-            &AuditPrincipal::account(&founder_folded),
-            "CHANNEL_REGISTER",
-            &AuditPrincipal::channel(&chan_folded),
-            "",
-        )
-        .await?;
-        ChannelRegistrationResult::Registered
-    } else {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM channels WHERE name_folded = $1)")
-                .bind(&chan_folded)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-        if exists {
-            ChannelRegistrationResult::Exists
-        } else {
-            ChannelRegistrationResult::AccountMissing
-        }
-    };
+    if inserted.is_none() {
+        return Ok(ChannelRegistrationResult::Exists);
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&founder_folded),
+        "CHANNEL_REGISTER",
+        &AuditPrincipal::channel(&chan_folded),
+        "",
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(result)
+    Ok(ChannelRegistrationResult::Registered)
+}
+
+/// Most registered channels one account may found. A registered channel is a
+/// permanent `registered_founders` (and possibly `registered_topics`) entry
+/// every core shard reloads at boot, and registering one runs no Argon2, so
+/// without a cap one account could grow those maps without bound. Each core
+/// shard checks it as a fast path, but a shard sees only its own in-flight
+/// registrations and no shard sees a founder transfer's receiving side: the
+/// database, where every registration and transfer lands, holds the cap, under
+/// the receiving account's row lock.
+pub const CHANNEL_FOUNDER_LIMIT: i64 = 200;
+
+/// Whether the account whose row the caller has locked (`FOR NO KEY UPDATE`)
+/// may found one more channel.
+enum FounderCapacity {
+    Available,
+    LimitReached,
+}
+
+/// Count the channels `account_id` founds. The caller holds that account's row
+/// lock, which every registration and founder transfer to the account also
+/// takes first, so two of them cannot both pass a count of one below the cap.
+async fn founder_capacity(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<FounderCapacity, DbError> {
+    let founded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM channels WHERE founder_account_id = $1")
+            .bind(account_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(query_error)?;
+    Ok(if founded >= CHANNEL_FOUNDER_LIMIT {
+        FounderCapacity::LimitReached
+    } else {
+        FounderCapacity::Available
+    })
 }
 
 /// The three outcomes of a credential check, before an origin is attached.
@@ -6651,7 +6778,7 @@ pub async fn query_account_directory(
                  WHERE c.account_id = a.id AND c.kind = 'app_password') AS app_passwords,
                 (SELECT count(*) FROM api_tokens t
                  WHERE t.account_id = a.id
-                   AND (t.expires_at IS NULL OR t.expires_at > now())) AS api_tokens,
+                   AND t.expires_at > now()) AS api_tokens,
                 (SELECT count(*) FROM oidc_identities i
                  WHERE i.account_id = a.id) AS oidc_identities,
                 (SELECT count(*) FROM web_sessions s
@@ -7034,17 +7161,22 @@ async fn verify_any_credential(
     let (Some(display_name), Some(id)) = (display_name, matched_id) else {
         return Ok(None);
     };
-    // Record the use so the credential list can show it. Best-effort: a
-    // failure here must not fail an otherwise-successful authentication, so it
-    // is logged, not propagated.
-    if let Err(e) = sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
-        .bind(id)
+    record_credential_use(pool, id).await?;
+    Ok(Some(display_name))
+}
+
+/// Record that credential `credential_id` just verified, for the credential
+/// list's "last used". Both password checks end here. A failure is the
+/// verification's failure: the database that could not record the use is the
+/// one the login is about to depend on, and a success reported past a failed
+/// write is the "log and continue" DESIGN §2 rules out.
+async fn record_credential_use(pool: &PgPool, credential_id: i64) -> Result<(), DbError> {
+    sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
+        .bind(credential_id)
         .execute(pool)
         .await
-    {
-        eprintln!("db: failed to record credential use: {e}");
-    }
-    Ok(Some(display_name))
+        .map(|_| ())
+        .map_err(query_error)
 }
 
 /// Verify only an account's primary password.
@@ -7099,11 +7231,7 @@ async fn verify_primary_password(
     )
     .await?;
     if matched.is_some() {
-        sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
-            .bind(credential_id)
-            .execute(pool)
-            .await
-            .map_err(query_error)?;
+        record_credential_use(pool, credential_id).await?;
         Ok(Some(display_name))
     } else {
         Ok(None)
@@ -9505,17 +9633,22 @@ pub async fn issue_scoped_api_token(
     Ok(token)
 }
 
-/// How many personal access tokens `account_id` holds. Meaningful as a cap
-/// check only while the caller's transaction holds the account row's lock.
+/// How many unexpired personal access tokens `account_id` holds. Meaningful as
+/// a cap check only while the caller's transaction holds the account row's
+/// lock. An expired token authenticates nothing and the account directory does
+/// not count it, so it does not hold a slot while it waits for maintenance to
+/// delete it.
 async fn api_token_count(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
 ) -> Result<i64, DbError> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(query_error)
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_tokens WHERE account_id = $1 AND expires_at > now()",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(query_error)
 }
 
 /// The one way a personal access token comes to exist: mint it for `account`
@@ -9562,7 +9695,7 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
         "SELECT a.name FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
-           AND (t.expires_at IS NULL OR t.expires_at > now())
+           AND t.expires_at > now()
            AND 'irc' = ANY(t.scopes)
            AND (a.flags & $2) = 0",
     )

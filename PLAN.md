@@ -823,6 +823,31 @@ change fixes:
   limit's and the monitoring endpoint's refusals are problem documents; `/ws/ui`
   is described; a REST topic is stored whole or refused.
 
+A review of the database layer found, and this change (migration 0080) fixes,
+each with a test that failed before:
+
+- **CHATHISTORY TARGETS read every stored direct message of the requester** on
+  the serial database worker, so one account with a large DM history could
+  stall every other client's history. A `dm_conversations` summary kept by
+  triggers on `messages` (backfilled by the migration) answers the
+  conversation half in at most the request's limit of rows.
+- **The 200-channel founder cap was per core shard, and transfers bypassed
+  it.** Registration, ChanServ `SET FOUNDER`, the owner console's transfer and
+  deletion succession count the receiving account's channels under its row
+  lock; a transfer past the cap is refused, and so is a deletion whose
+  succession would take a successor past it, naming the channels.
+- **Expired personal access tokens held cap slots** until maintenance swept
+  them; only unexpired tokens are counted, as the account directory counts.
+- **The two password checks treated a failed "last used" write oppositely**;
+  one helper records it for both, and its failure fails the check.
+- **Storage did not hold the forms the code relies on**: BNC network names are
+  constrained to the token language on which `lower()` equals the RFC 1459
+  fold, and bouncer line and read-marker timestamps to the canonical
+  millisecond form their lexical comparisons need.
+- `account_invitations.accepted_account_id` (written, never read) and the
+  redundant `bnc_networks_account_idx` are dropped; DESIGN §8 now matches the
+  schema (the `messages` index, canonical `sent_at`, `login_attempts`).
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

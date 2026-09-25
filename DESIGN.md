@@ -1255,16 +1255,27 @@ Principal tables (columns abridged):
   delete, while a storage trigger makes a future unwrapped account insert reject
   a retired name independently of application routing.
 - `account_invitations` (opaque token digest, proposed account/contact/
-  authority, issuer, creation/expiry, consumption/accepted-account metadata).
+  authority, issuer, creation/expiry, consumption time).
   A partial unique index admits at most one live invitation per folded name;
-  bearer plaintext is returned once and never stored.
+  bearer plaintext is returned once and never stored. A consumed invitation is
+  deleted by the next storage-maintenance cycle; the audit log's
+  `ACCOUNT_INVITATION_ACCEPT` event is the durable record of the acceptance
+  (migration 0080 dropped the never-read `accepted_account_id`).
+- `login_attempts` (folded name, attempt count, window start) — the
+  per-account-name password throttle (migration 0074): every password check
+  reserves an attempt here first, keyed by the name whether or not an account
+  holds it; a verified password deletes the row. It is pruned by the next
+  reservation (rows whose window has passed), not by storage maintenance, so it
+  holds at most the names tried within one window.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
   revocable, shown once at creation
 - `oidc_identities` (issuer, subject) → account_id, UNIQUE(issuer, subject)
 - `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
   creation/expiry, bounded user agent, optional OIDC identity/session metadata)
-- `api_tokens` (hashed PATs, scopes, expiry)
+- `api_tokens` (hashed PATs, scopes, expiry) — at most 32 unexpired tokens per
+  account, counted under the account-row lock; an expired token holds no slot
+  while it waits for storage maintenance to delete it.
 - `channels` (registered channels: founder, successor, flags, topic
   retention, mlock). The founder reference is `ON DELETE RESTRICT` (migration
   0071): a channel is never account-owned data, so no account deletion can
@@ -1272,14 +1283,20 @@ Principal tables (columns abridged):
   counted. The successor reference (migration 0075) sets NULL when the
   successor's account is deleted, a check keeps it off the founder, and a
   trigger clears it when a founder change promotes it. Every other
-  reference to `accounts` cascades (or, for an accepted invitation, sets NULL):
-  each is data about the account itself.
+  reference to `accounts` cascades: each is data about the account itself.
+  An account founds at most 200 channels (`CHANNEL_FOUNDER_LIMIT`). Each core
+  shard checks that against what it knows as a fast path, but a shard sees only
+  its own in-flight registrations and no shard sees a transfer's receiving
+  side, so PostgreSQL holds the cap: registration and every founder change —
+  ChanServ `SET FOUNDER`, the owner console's transfer, and a deletion's
+  succession — lock the receiving account's row and count its channels in the
+  same transaction, and a refusal is a typed verdict each surface reports.
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS;
   `account_id` has its own index (migration 0073) for the deletion cascade and
   per-account lookups, since the primary key leads with `channel_id`.
 - `messages` — append-only history log; columns (id, msgid, target,
-  sender_prefix, sender_account, kind, body, ts), indexed `(target, ts)`
-  and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
+  sender_prefix, sender_account, kind, body, ts, dm_peers), indexed
+  `(target, ts, id)` (migration 0027) and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
   the direct-message peers index makes the account-message predicate (account
   deletion and export) a BitmapOr of two index scans. Migration 0064 dropped the
   unused BRIN on `ts`. The live storage policy retains 1–3650 days
@@ -1291,10 +1308,26 @@ Principal tables (columns abridged):
   trigger (migration 0072) refuses any row naming — as sender or direct-message
   peer — an account that is retired or being deleted, so an asynchronously
   written message can never outlive account deletion's purge (§9.1).
+- `dm_conversations` (account, peer, latest_ts) — one row per participant of
+  each stored direct-message conversation (folded identities; a conversation
+  with oneself is `(me, me)`), holding its newest message time, indexed
+  `(account, latest_ts)`. CHATHISTORY TARGETS reads its conversation half here,
+  at most the request's limit of rows (§11.1.1). It is a function of
+  `messages` kept by that table's statement triggers (migration 0080): an insert
+  advances it, and a delete that removed a conversation's newest message
+  recomputes it from what remains or forgets the conversation. Every writer —
+  the history flush, retention, account deletion's purge — therefore keeps it
+  exact without knowing it exists.
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
   server master key (§15), `server_password_sealed` (IRC only, a table CHECK;
-  sealed like the SASL password), enabled)
+  sealed like the SASL password), enabled). A CHECK (migration 0080) holds
+  `name` to `sanitize::valid_network_name`'s token language
+  (`[A-Za-z0-9._-]{1,64}`, not `.`/`..`), on which PostgreSQL's `lower()` and
+  the RFC 1459 fold agree — the equivalence the case-insensitive name index and
+  every folded buffer key rely on. The unique `(account_id, lower(name))` index
+  also serves every per-account read and the cascade; 0080 dropped the
+  redundant `(account_id)` index.
 - `bnc_buffer` (id, owner, network, network_id, line, created_at, target,
   msgid, sent_at) — persisted
   detached-buffer lines replayed on attach after a restart; `owner` is `*`
@@ -1305,9 +1338,15 @@ Principal tables (columns abridged):
   other IRC identifier and a case-mismatched attach cannot fall through to an
   operator's shared network of the same name (§2); display casing is preserved.
   `target` is the conversation the line belongs to, `msgid` the upstream
-  `msgid=` tag when present, and `sent_at` the effective ISO-8601 instant
-  (the `time=` tag verbatim, else bouncer arrival time) — the three columns
-  the attach listener's CHATHISTORY paging and TARGETS scan over.
+  `msgid=` tag when present, and `sent_at` the effective instant — the
+  `time=` tag when it parses, else bouncer arrival time — always written in the
+  one canonical `YYYY-MM-DDTHH:MM:SS.mmmZ` form (`server_time`; migration 0054
+  rebased older rows onto it). These are the three columns the attach
+  listener's CHATHISTORY paging and TARGETS scan over, and the paging, the
+  MARKREAD `GREATEST` over `bnc_read_markers.timestamp`, and the retention
+  comparison order that text lexically, which is correct only because it is
+  canonical rather than verbatim; a CHECK on both columns (migration 0080)
+  makes the form a fact of the schema.
   Both ways into a network's buffer — a live line
   from a driver and restored backlog from this table — remove CR/LF/NUL and
   cap one entry to the IRC wire limit. A replay cannot inject a second line or
@@ -1496,9 +1535,12 @@ unavailable response.
 Permanent deletion is a succession operation rather than a cascading accident.
 Every registered channel the target founds passes to its successor (ChanServ
 `SET SUCCESSOR`) in the deletion's transaction, audited as
-`CHANNEL_SUCCESSION`; the target must found no registered channel without one
-and cannot be the last active effective administrator, including authority
-supplied by deployment configuration. The console's two deletion controls and
+`CHANNEL_SUCCESSION`; the target must found no registered channel without one,
+no successor may be taken past the 200-channel founder cap (§8; a succession
+is a founder transfer, so the refusal names the channels whose successor would
+exceed it, and the founder names another successor or transfers them first),
+and the target cannot be the last active effective administrator, including
+authority supplied by deployment configuration. The console's two deletion controls and
 NickServ `DROP` run this one procedure (`account_deletion`). The shared account/network mutation lane first installs a
 folded authentication deny key in the ordered core, then stops the account's
 drivers, so no persistence task can write backlog behind the deletion (they
@@ -2832,7 +2874,9 @@ Design constraints recorded now:
   release. An authenticated participant keeps such a conversation for
   exactly as long as the other party holds the nick; CHATHISTORY TARGETS finds
   each channel's newest message with one backward index probe (LATERAL
-  `max(ts)`), and lists
+  `max(ts)`) and each stored conversation's from `dm_conversations` (§8), reading
+  at most the request's limit of summary rows rather than every stored direct
+  message of the requester, and lists
   it from the ring alongside what the database returns. Only a conversation
   between two accounts is stored, and a stored conversation is always addressed
   by one exact key. Migration 0058 deleted the `~` conversations stored before
