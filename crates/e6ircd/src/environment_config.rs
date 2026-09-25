@@ -31,8 +31,8 @@
 //!                method belongs to the client registration, so discovery
 //!                cannot report it)
 //!
-//! `E6IRC_SECRET_KEY` and `E6IRC_PREVIOUS_SECRET_KEYS` are read by the
-//! configuration itself, whichever way it was stated.
+//! `E6IRC_SECRET_KEY` and `E6IRC_PREVIOUS_SECRET_KEYS` are read by the same rule,
+//! by the configuration itself, whichever way it was stated.
 //!
 //! A variable that is set but empty is unset, as it was for the shell. No
 //! refusal ever prints a value: every one of them may be a secret.
@@ -602,5 +602,52 @@ mod tests {
             );
             assert!(error.to_string().contains("unset it"), "{error}");
         }
+    }
+
+    /// Every environment read in the daemon goes through [`process_environment`]
+    /// and [`optional`]: a second reader with its own rule is how
+    /// `E6IRC_SECRET_KEY=` came to mean "a key" to one reader and "unset" to
+    /// the rest. The daemon's sources may name `std::env`'s variable readers
+    /// only in this module.
+    #[test]
+    fn only_this_module_reads_the_process_environment() {
+        fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("read the source directory") {
+                let path = entry.expect("a source entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = root.join("environment_config.rs");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        assert!(
+            files.contains(&this_module),
+            "the walk sees the daemon's sources"
+        );
+        let readers = ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("];
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|path| **path != this_module)
+            .flat_map(|path| {
+                let text = std::fs::read_to_string(path).expect("read a source file");
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, line)| readers.iter().any(|reader| line.contains(reader)))
+                    .map(|(number, line)| {
+                        format!("{}:{}: {}", path.display(), number + 1, line.trim())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "read the environment through environment_config::optional:\n{}",
+            offenders.join("\n")
+        );
     }
 }

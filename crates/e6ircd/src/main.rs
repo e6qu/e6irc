@@ -166,10 +166,22 @@ fn probe(
     }
 }
 
+/// Judge the configuration by everything the server's start checks short of
+/// reaching the network or the database: parse and validation
+/// ([`Config::load`]), then what start reads beside the document
+/// ([`net::check_offline`]).
 fn check_config(args: &[String]) -> ExitCode {
-    match load_config_or_fail(args, "e6ircd check-config") {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(code) => code,
+    const CONTEXT: &str = "e6ircd check-config";
+    let config = match load_config_or_fail(args, CONTEXT) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    match net::check_offline(&config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{CONTEXT}: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -418,8 +430,10 @@ fn seal(args: &[String]) -> ExitCode {
 fn load_seal_key(args: &[String]) -> Result<SecretKey, String> {
     match args {
         [] => {
-            let v = std::env::var("E6IRC_SECRET_KEY")
-                .map_err(|_| "no --key-file and E6IRC_SECRET_KEY is unset".to_string())?;
+            let v = e6ircd::config::EnvironmentSecretKeys::from_process()
+                .map_err(|e| e.to_string())?
+                .primary
+                .ok_or_else(|| "no --key-file and E6IRC_SECRET_KEY is unset".to_string())?;
             SecretKey::from_base64_text(v).map_err(|e| format!("E6IRC_SECRET_KEY: {e}"))
         }
         [flag, path] if flag == "--key-file" => {

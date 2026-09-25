@@ -582,13 +582,16 @@ impl EnvironmentSecretKeys {
     const PRIMARY_VARIABLE: &'static str = "E6IRC_SECRET_KEY";
     const PREVIOUS_VARIABLE: &'static str = "E6IRC_PREVIOUS_SECRET_KEYS";
 
+    /// Read by the environment's one rule (`environment_config::optional`): a
+    /// variable set but empty is unset, so `E6IRC_SECRET_KEY=` beside a
+    /// `[secrets].key_file` is no conflict and is no key either.
     pub fn from_process() -> Result<Self, ConfigError> {
-        let read = |variable: &str| match std::env::var(variable) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid(format!(
-                "{variable} is not valid UTF-8"
-            ))),
+        let read = |variable: &'static str| {
+            crate::environment_config::optional(
+                &crate::environment_config::process_environment,
+                variable,
+            )
+            .map_err(|error| ConfigError::Invalid(error.to_string()))
         };
         Ok(Self {
             primary: read(Self::PRIMARY_VARIABLE)?,

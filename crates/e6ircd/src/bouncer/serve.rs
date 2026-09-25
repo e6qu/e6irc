@@ -127,15 +127,52 @@ impl Persistence {
     /// already sent — so a caller deleting the network's rows next could race
     /// the task's last line.
     async fn stop(self, unwritten: UnwrittenLines) {
+        report_persistence_end(self.signal(unwritten).await);
+    }
+
+    /// [`Persistence::stop`] bounded by `deadline`, for a process shutdown:
+    /// the task writes what it still holds until then, and only a task still
+    /// writing at the deadline (a wedged database) is aborted. `true` when it
+    /// finished before the deadline.
+    async fn stop_by(self, unwritten: UnwrittenLines, deadline: tokio::time::Instant) -> bool {
+        let mut task = self.signal(unwritten);
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(ended) => {
+                report_persistence_end(ended);
+                true
+            }
+            Err(_elapsed) => {
+                task.abort();
+                false
+            }
+        }
+    }
+
+    /// Send the stop and hand back the task to join.
+    fn signal(self, unwritten: UnwrittenLines) -> tokio::task::JoinHandle<()> {
         // A task that already ended (its event stream closed) cannot take
-        // the signal; the join below still reports how it ended.
+        // the signal; the join still reports how it ended.
         if self.stop.send(unwritten).is_err() {
             eprintln!("bnc: persistence task had already stopped");
         }
-        if let Err(error) = self.task.await {
-            eprintln!("bnc: persistence task ended abnormally: {error}");
-        }
+        self.task
     }
+}
+
+fn report_persistence_end(ended: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = ended {
+        eprintln!("bnc: persistence task ended abnormally: {error}");
+    }
+}
+
+/// How a process shutdown's stop of every driver went: of `running` networks,
+/// how many released their upstream, and how many wrote their last backlog
+/// lines, before the shutdown deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverStops {
+    pub running: usize,
+    pub released: usize,
+    pub backlog_written: usize,
 }
 
 impl Slot {
@@ -357,10 +394,13 @@ impl Registry {
 
     /// Stop every driver, all at once, for a process shutdown: each says its
     /// goodbye (`QUIT`) and releases its upstream, so the restarted daemon does
-    /// not meet its own ghosts. Waits at most `deadline` for the slowest;
-    /// returns how many had released their upstream by then, out of how many
-    /// were running. The registry is empty afterwards either way.
-    pub async fn stop_all_within(&self, deadline: std::time::Duration) -> (usize, usize) {
+    /// not meet its own ghosts, and its persistence task then writes the lines
+    /// the driver said last — the rows outlive the process, so the backlog must
+    /// not lose them. Both steps share one `deadline`; only a persistence task
+    /// still writing when it passes is aborted. The registry is empty
+    /// afterwards either way.
+    pub async fn stop_all_within(&self, deadline: std::time::Duration) -> DriverStops {
+        let deadline = tokio::time::Instant::now() + deadline;
         let slots: Vec<Slot> = self
             .networks
             .lock()
@@ -368,26 +408,29 @@ impl Registry {
             .drain()
             .map(|(_, slot)| slot)
             .collect();
-        let running = slots.len();
         let mut stops = tokio::task::JoinSet::new();
         for slot in slots {
             stops.spawn(async move {
-                let released = slot.handle.shutdown_and_wait_within(deadline).await;
-                // The process is exiting and nothing deletes rows after this,
-                // so the task need not finish its line.
-                if let Some(persistence) = slot.persistence {
-                    persistence.task.abort();
-                }
-                released
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let released = slot.handle.shutdown_and_wait_within(remaining).await;
+                let written = match slot.persistence {
+                    Some(persistence) => persistence.stop_by(UnwrittenLines::Store, deadline).await,
+                    None => true,
+                };
+                (released, written)
             });
         }
-        let mut released = 0;
+        let mut report = DriverStops {
+            running: stops.len(),
+            released: 0,
+            backlog_written: 0,
+        };
         while let Some(outcome) = stops.join_next().await {
-            if outcome.expect("a driver stop does not panic") {
-                released += 1;
-            }
+            let (released, written) = outcome.expect("a driver stop does not panic");
+            report.released += usize::from(released);
+            report.backlog_written += usize::from(written);
         }
-        (released, running)
+        report
     }
 
     /// The account's OWN active network of that name, if any. Deliberately does
@@ -2215,6 +2258,111 @@ mod key_tests {
             .expect("the replacement started although its caller was gone");
         assert!(!Arc::ptr_eq(&first, &replaced));
         assert!(*first.watch_shutdown().borrow());
+    }
+
+    /// A slot whose persistence task is `persist`, fed by a network that said
+    /// `said` lines and has already released its upstream.
+    fn slot_with_persistence<F, Fut>(said: usize, persist: F) -> Slot
+    where
+        F: FnOnce(PersistenceFeed) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (handle, ends) = super::super::NetworkHandle::channels(16);
+        let events = handle.subscribe();
+        for n in 0..said {
+            ends.emit_line(format!(":peer PRIVMSG #room :last words {n}"));
+        }
+        drop(ends);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(persist(PersistenceFeed {
+            events,
+            stopped,
+            draining: None,
+        }));
+        Slot {
+            handle: Arc::new(handle),
+            persistence: Some(Persistence { stop, task }),
+            kind: "loopback",
+        }
+    }
+
+    /// A process shutdown keeps the network's rows, so the lines the driver
+    /// said last reach the backlog even when writing them is slow — they used
+    /// to be lost to an abort the moment the driver released its upstream.
+    #[tokio::test]
+    async fn a_process_shutdown_writes_the_last_backlog_lines() {
+        let registry = empty_registry();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slot = slot_with_persistence(3, {
+            let written = written.clone();
+            |mut feed| async move {
+                while let Some(event) = feed.next().await {
+                    // A database write takes time; the shutdown waits for it.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if let Ok(super::super::DriverEvent::Line(line)) = event {
+                        written.lock().expect("written").push(line.line);
+                    }
+                }
+            }
+        });
+        registry
+            .networks
+            .lock()
+            .expect("registry")
+            .insert(NetworkKey::new(Some("alice"), "libera"), slot);
+        let stops = registry
+            .stop_all_within(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            stops,
+            DriverStops {
+                running: 1,
+                released: 1,
+                backlog_written: 1,
+            }
+        );
+        assert_eq!(written.lock().expect("written").len(), 3);
+    }
+
+    /// A persistence task that cannot finish (a wedged database) is ended at
+    /// the shutdown deadline, and the report says its lines were not written.
+    #[tokio::test]
+    async fn a_wedged_backlog_write_is_aborted_at_the_shutdown_deadline() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let registry = empty_registry();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slot = slot_with_persistence(1, {
+            let guard = Dropped(dropped.clone());
+            |_feed| async move {
+                let _held = guard;
+                std::future::pending::<()>().await;
+            }
+        });
+        registry
+            .networks
+            .lock()
+            .expect("registry")
+            .insert(NetworkKey::new(None, "shared"), slot);
+        let stops = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry.stop_all_within(std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("the stop returns at its deadline");
+        assert_eq!(stops.backlog_written, 0);
+        assert_eq!(stops.released, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the wedged task was aborted");
     }
 
     /// A stop that keeps the network's rows writes the lines its driver said

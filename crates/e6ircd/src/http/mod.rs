@@ -163,6 +163,8 @@ pub struct AppState {
     pub(crate) conn_limiter: crate::net::ConnLimiter,
     /// The per-address in-flight request bound ([`RequestAdmission`]).
     pub(crate) request_admission: Arc<RequestAdmission>,
+    /// `/readyz`'s shared database probe ([`DatabaseReadiness`]).
+    pub(crate) database_readiness: DatabaseReadiness,
     /// Request identifiers, HSTS, and the request counter/latency, applied as
     /// the outermost layer of the service (see [`RequestObservation`]).
     pub(crate) observation: Arc<RequestObservation>,
@@ -1285,19 +1287,58 @@ fn liveness(telemetry: &crate::observability::Telemetry, maximum_age: Duration) 
     }
 }
 
+/// How long one database readiness answer is reused by `/readyz`. Far below
+/// any orchestrator's probe period, so an outage or a recovery shows on the
+/// next probe; far above a flood's inter-request gap.
+const READINESS_DATABASE_FRESHNESS: Duration = Duration::from_secs(1);
+
+/// The database half of `/readyz`: probed by one request at a time, and the
+/// answer reused while fresh. The route is unauthenticated and outside the
+/// admission bounds — an orchestrator must reach it however loaded the service
+/// is — so a probe per request let a flood of `/readyz` hold every pool
+/// connection. Now any number of concurrent requests share at most one.
+#[derive(Default)]
+pub(crate) struct DatabaseReadiness {
+    last: tokio::sync::Mutex<Option<(tokio::time::Instant, bool)>>,
+}
+
+impl DatabaseReadiness {
+    /// The fresh answer if there is one; otherwise `probe`'s, which a request
+    /// arriving meanwhile waits for rather than probing beside it.
+    async fn answer<F: std::future::Future<Output = bool>>(
+        &self,
+        probe: impl FnOnce() -> F,
+    ) -> bool {
+        let mut last = self.last.lock().await;
+        if let Some((at, ready)) = *last
+            && at.elapsed() < READINESS_DATABASE_FRESHNESS
+        {
+            return ready;
+        }
+        let ready = probe().await;
+        *last = Some((tokio::time::Instant::now(), ready));
+        ready
+    }
+}
+
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let core_ready = state.telemetry.core_is_fresh(CORE_HEARTBEAT_FRESHNESS);
     let database_ready = match &state.pool {
         Some(pool) => {
-            let started = Instant::now();
-            let ready = database_is_ready(pool).await;
-            state.telemetry.record_database_request(started.elapsed());
-            if !ready {
-                state
-                    .telemetry
-                    .record_error(crate::observability::ErrorKind::Database);
-            }
-            ready
+            state
+                .database_readiness
+                .answer(|| async {
+                    let started = Instant::now();
+                    let ready = database_is_ready(pool).await;
+                    state.telemetry.record_database_request(started.elapsed());
+                    if !ready {
+                        state
+                            .telemetry
+                            .record_error(crate::observability::ErrorKind::Database);
+                    }
+                    ready
+                })
+                .await
         }
         None => true,
     };
@@ -4483,6 +4524,55 @@ mod request_bound_tests {
         assert_eq!(
             second.await.expect("second request"),
             StatusCode::NO_CONTENT
+        );
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::DatabaseReadiness;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// However many readiness requests arrive together, one database probe —
+    /// one pool connection — answers them all; the next probe runs only once
+    /// that answer has gone stale.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_readiness_requests_share_one_database_probe() {
+        let readiness = Arc::new(DatabaseReadiness::default());
+        let probes = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let request = || {
+            let (readiness, probes, in_flight) =
+                (readiness.clone(), probes.clone(), in_flight.clone());
+            tokio::spawn(async move {
+                readiness
+                    .answer(|| async {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(
+                            in_flight.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "one probe at a time"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        true
+                    })
+                    .await
+            })
+        };
+        let flood: Vec<_> = (0..64).map(|_| request()).collect();
+        for answer in flood {
+            assert!(answer.await.expect("a readiness request"));
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(super::READINESS_DATABASE_FRESHNESS).await;
+        assert!(request().await.expect("a readiness request"));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "a stale answer is probed again"
         );
     }
 }

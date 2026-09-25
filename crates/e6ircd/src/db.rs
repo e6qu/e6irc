@@ -8756,6 +8756,37 @@ mod pool_size_tests {
 }
 
 #[cfg(test)]
+mod startup_budget_tests {
+    use super::{MIGRATION_LOCK_ATTEMPTS, MIGRATION_LOCK_TIMEOUT};
+
+    /// The image's `HEALTHCHECK` start period covers the longest a default
+    /// start can spend before `/healthz` is bound: the default database wait,
+    /// then every migration attempt waiting out its lock timeout with the
+    /// doubling pauses between them. A shorter period marked a container that
+    /// was starting as it should unhealthy.
+    #[test]
+    fn the_container_start_period_outlasts_the_startup_database_budget() {
+        let pauses = (1u64 << (MIGRATION_LOCK_ATTEMPTS - 1)) - 1;
+        let budget = crate::config::DEFAULT_STARTUP_WAIT_SECONDS
+            + u64::from(MIGRATION_LOCK_ATTEMPTS) * MIGRATION_LOCK_TIMEOUT.as_secs()
+            + pauses;
+        let dockerfile =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Dockerfile"))
+                .expect("read the Dockerfile");
+        let period: u64 = dockerfile
+            .split("--start-period=")
+            .nth(1)
+            .and_then(|rest| rest.split_once('s'))
+            .and_then(|(seconds, _)| seconds.parse().ok())
+            .expect("the HEALTHCHECK states --start-period=<seconds>s");
+        assert!(
+            period > budget,
+            "--start-period={period}s must exceed the {budget}s startup database budget"
+        );
+    }
+}
+
+#[cfg(test)]
 mod credential_verification_plan_tests {
     use super::{StoredCredential, app_password_lookup, plan_credential_verification};
 
