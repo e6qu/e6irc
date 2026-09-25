@@ -1208,11 +1208,7 @@ where
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(JsonBody(value)),
-            Err(e) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON",
-                Some(&e.to_string()),
-            )),
+            Err(e) => Err(body_rejection(e.status(), "Invalid JSON", &e.to_string())),
         }
     }
 }

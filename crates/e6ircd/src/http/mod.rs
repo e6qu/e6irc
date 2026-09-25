@@ -428,12 +428,7 @@ pub(super) fn parse_json<T>(
 ) -> ResponseResult<T> {
     match body {
         Ok(axum::Json(b)) => Ok(b),
-        Err(e) => Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid request body",
-            Some(&e.to_string()),
-        )
-        .into()),
+        Err(e) => Err(body_rejection(e.status(), "Invalid request body", &e.to_string()).into()),
     }
 }
 
@@ -1316,6 +1311,41 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
 // bounds (the service-wide concurrency permit, the per-address in-flight cap),
 // so an orchestrator's liveness and readiness checks are never queued behind —
 // or refused by — the work they exist to watch.
+/// The argument types of a handler function, for [`handler_argument_types`].
+pub(super) trait HandlerArguments<Arguments> {
+    fn argument_types() -> Vec<std::any::TypeId>;
+}
+
+macro_rules! handler_arguments {
+    ($($argument:ident),*) => {
+        impl<Handler, Output, $($argument: 'static,)*> HandlerArguments<($($argument,)*)> for Handler
+        where
+            Handler: FnOnce($($argument),*) -> Output,
+        {
+            fn argument_types() -> Vec<std::any::TypeId> {
+                vec![$(std::any::TypeId::of::<$argument>()),*]
+            }
+        }
+    };
+}
+
+handler_arguments!();
+handler_arguments!(A1);
+handler_arguments!(A1, A2);
+handler_arguments!(A1, A2, A3);
+handler_arguments!(A1, A2, A3, A4);
+handler_arguments!(A1, A2, A3, A4, A5);
+handler_arguments!(A1, A2, A3, A4, A5, A6);
+handler_arguments!(A1, A2, A3, A4, A5, A6, A7);
+handler_arguments!(A1, A2, A3, A4, A5, A6, A7, A8);
+
+/// The types a handler function takes, in order.
+pub(super) fn handler_argument_types<Arguments, Handler: HandlerArguments<Arguments>>(
+    _: &Handler,
+) -> Vec<std::any::TypeId> {
+    Handler::argument_types()
+}
+
 macro_rules! documented_routes {
     (
         probes: { $( $probe_path:literal => { $( $probe_method:ident : $probe_handler:expr ),+ $(,)? } ),+ $(,)? }
@@ -1325,6 +1355,21 @@ macro_rules! documented_routes {
             $( $(($probe_path, stringify!($probe_method))),+ ),+ ,
             $( $(($path, stringify!($method))),+ ),+
         ];
+
+        /// The probes, which bypass the admission bounds.
+        pub(super) const PROBE_PATHS: &[&str] = &[$($probe_path),+];
+
+        /// Every documented operation with the argument types of its handler,
+        /// read from the handler's signature: what a handler extracts (the
+        /// per-address authentication budget, say) is what it can answer, so
+        /// the contract derives those answers instead of repeating them.
+        pub(super) fn documented_route_arguments(
+        ) -> Vec<(&'static str, &'static str, Vec<std::any::TypeId>)> {
+            vec![
+                $( $(($probe_path, stringify!($probe_method), handler_argument_types(&$probe_handler))),+ ),+ ,
+                $( $(($path, stringify!($method), handler_argument_types(&$handler))),+ ),+
+            ]
+        }
 
         fn add_probe_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
             router$(
@@ -1409,6 +1454,7 @@ documented_routes! {
     "/api/v1/me/networks/{name}/account-registration" => { post: network_account_command },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
+    "/ws/ui" => { get: ws_ui },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },
     "/api/v1/admin/accounts/{id}" => {
         patch: admin_account_state,
@@ -1495,9 +1541,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         );
-    let router = add_documented_routes(router)
-        .route("/ws/irc", get(ws_irc))
-        .route("/ws/ui", get(ws_ui));
+    let router = add_documented_routes(router).route("/ws/irc", get(ws_irc));
     // With the `embed-web` feature the built web client (web/dist) is
     // baked into the binary and served at `/` and `/assets/*`; otherwise
     // the assets live on S3/CDN and only the API + WebSocket paths are
@@ -1730,10 +1774,54 @@ where
     S: Clone + Send + Sync + 'static,
 {
     router
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            MAX_REQUEST_BODY_BYTES,
+        ))
+        .layer(axum::middleware::from_fn(body_limit_problem))
         .layer(axum::middleware::from_fn(move |request, next| {
             request_deadline(deadline, request, next)
         }))
+}
+
+/// The largest request body the service reads.
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// The body limit's refusal as the problem document every other refusal is.
+/// The limit layer answers a declared oversize length itself, in plain text,
+/// and an extractor that hits the limit mid-stream answers `413` in its own
+/// shape; this is the one place both become the same document.
+async fn body_limit_problem(request: Request<axum::body::Body>, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value == "application/problem+json")
+    {
+        return response;
+    }
+    payload_too_large()
+}
+
+/// The refusal of a request body over [`MAX_REQUEST_BODY_BYTES`], whichever
+/// layer or extractor noticed it.
+pub(super) fn payload_too_large() -> Response {
+    problem(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Request body too large",
+        Some(&format!(
+            "The server reads at most {MAX_REQUEST_BODY_BYTES} bytes of a request body."
+        )),
+    )
+}
+
+/// A body extractor's refusal: the body limit is its own answer (`413`),
+/// anything else about the body is the client's `400` under `title`.
+pub(super) fn body_rejection(status: StatusCode, title: &str, detail: &str) -> Response {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return payload_too_large();
+    }
+    problem(StatusCode::BAD_REQUEST, title, Some(detail))
 }
 
 /// Abandon a request at the deadline with the same problem document every
@@ -3417,12 +3505,7 @@ mod pages {
     ) -> ResponseResult<T> {
         match form {
             Ok(axum::Form(f)) => Ok(f),
-            Err(e) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid form",
-                Some(&e.to_string()),
-            )
-            .into()),
+            Err(e) => Err(body_rejection(e.status(), "Invalid form", &e.to_string()).into()),
         }
     }
 

@@ -101,10 +101,85 @@ fn merge_path_parameter_responses(spec: &mut serde_json::Value) {
     });
 }
 
+/// What an operation whose handler spends the per-address authentication
+/// budget (`RateLimited`) answers when it is spent.
+const RATE_LIMITED_RESPONSE: &str =
+    "this address's authentication budget is spent; Retry-After gives the seconds to wait";
+
+/// The responses the service's own bounds produce, before any handler runs:
+/// the request deadline (`408`) and body limit (`413`) for every request, and
+/// the per-address in-flight bound (`429`) for every request the admission
+/// bounds see — all but the probes.
+fn service_wide_responses(admitted: bool) -> serde_json::Map<String, serde_json::Value> {
+    let mut responses = serde_json::Map::new();
+    responses.insert(
+        "408".into(),
+        serde_json::json!({ "description": "the request passed the 30-second deadline (a problem document)" }),
+    );
+    responses.insert(
+        "413".into(),
+        serde_json::json!({ "description": "the request body is larger than 1 MiB (a problem document)" }),
+    );
+    if admitted {
+        responses.insert(
+            "429".into(),
+            serde_json::json!({ "description": "this address has 32 requests in flight; Retry-After gives the seconds to wait" }),
+        );
+    }
+    responses
+}
+
+/// Whether a documented operation's handler takes `RateLimited`, read from
+/// its signature ([`super::documented_route_arguments`]).
+fn rate_limited_operations() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+    let rate_limited = std::any::TypeId::of::<RateLimited>();
+    super::documented_route_arguments()
+        .into_iter()
+        .filter(|(_, _, arguments)| arguments.contains(&rate_limited))
+        .map(|(path, method, _)| (path, method))
+        .collect()
+}
+
+/// The operation `method` on `path`, when the document has it.
+fn operation_mut<'a>(
+    spec: &'a mut serde_json::Value,
+    path: &str,
+    method: &str,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    spec["paths"]
+        .get_mut(path)?
+        .get_mut(method)?
+        .get_mut("responses")?
+        .as_object_mut()
+}
+
+/// Give every operation whose handler spends the authentication budget its
+/// `429`, and every operation the service's bounds apply to theirs, keeping
+/// any the operation already states. Derived from the handlers and the router,
+/// so a new rate-limited route cannot be served without saying it can refuse.
+fn merge_service_responses(spec: &mut serde_json::Value) {
+    for (path, method) in rate_limited_operations() {
+        if let Some(responses) = operation_mut(spec, path, method) {
+            responses
+                .entry("429")
+                .or_insert_with(|| serde_json::json!({ "description": RATE_LIMITED_RESPONSE }));
+        }
+    }
+    for &(path, method) in super::DOCUMENTED_ROUTE_OPERATIONS {
+        let admitted = !super::PROBE_PATHS.contains(&path);
+        if let Some(responses) = operation_mut(spec, path, method) {
+            for (status, response) in service_wide_responses(admitted) {
+                responses.entry(status).or_insert(response);
+            }
+        }
+    }
+}
+
 fn document() -> serde_json::Value {
     let mut spec = operations();
     merge_standard_authenticated_responses(&mut spec);
     merge_path_parameter_responses(&mut spec);
+    merge_service_responses(&mut spec);
     spec
 }
 
@@ -992,7 +1067,7 @@ fn operations() -> serde_json::Value {
                     "security": [{ "monitoringBearer": [] }],
                     "responses": {
                         "200": application_observation_response["200"],
-                        "401": { "description": "missing or invalid monitoring bearer token" }
+                        "401": { "description": "missing or invalid monitoring bearer token (a problem document; WWW-Authenticate names the Bearer realm)" }
                     }
                 }
             },
@@ -1039,6 +1114,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "201": { "description": "the app password (shown once)" },
                         "400": { "description": "invalid account, password, or label" },
                         "401": { "description": "bad credentials" },
+                        "409": { "description": "the account already holds the most app passwords allowed; revoke one first" },
                         "429": { "description": "the account name has spent its password attempts for the window, or this address its authentication budget; Retry-After says when to try again" },
                         "503": { "description": "no database configured" } }
                 }
@@ -1324,6 +1400,7 @@ fn operations() -> serde_json::Value {
                         }
                     } } },
                     "responses": { "200": { "description": "access_token once approved" },
+                        "503": { "description": "no database configured, or the database is unavailable" },
                         "400": { "description": "RFC 8628 error: authorization_pending, expired_token, invalid_grant, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
             },
             "/api/v1/auth/device/approve": {
@@ -1807,6 +1884,26 @@ fn operations() -> serde_json::Value {
                         "404": { "description": "no such network" },
                         "409": { "description": "`through` names no position of the running network's buffer (another buffer lifetime), or the network is stopped and its lines are persisted history without positions; read without `through`" } } }
             },
+            "/ws/ui": {
+                "get": { "summary": "The web client's live chat socket for one of your networks",
+                    "description": "A WebSocket upgrade (RFC 6455): send `Connection: Upgrade`, `Upgrade: websocket`, and the handshake headers. A browser's `Origin` must be this application's (the configured public URL, else the `Host` it addressed). The socket first sends the network's status, its session snapshot, the replayed lines (after `after`, when that cursor is still in the ring), and a snapshot boundary, then live events; every server frame is one JSON event. A client frame is a composer request `{\"id\", \"target\", \"message\"}` answered by a `sent` or `send-error` event; sending needs the `write` scope or a browser session. The socket closes with code 1008 and a reason when policy refuses it — the account already holds 32 live sockets, or the session or token that opened it was revoked or expired (the client should not retry by itself) — and with 1013 when that credential could not be re-checked (reconnecting authenticates again).",
+                    "security": authenticated,
+                    "parameters": [
+                        { "name": "network", "in": "query", "required": true,
+                            "description": "One of your networks, by name.",
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "after", "in": "query", "required": false,
+                            "description": "The replay cursor of the last line the client holds; replay continues after it, or says it cannot.",
+                            "schema": { "type": "string", "minLength": 1 } }
+                    ],
+                    "responses": {
+                        "101": { "description": "Switching Protocols: the live chat socket (see the description for its events and close codes)" },
+                        "400": { "description": "not a valid WebSocket upgrade, or an invalid query (a problem document)" },
+                        "403": { "description": "the Origin is not this application's, or the credential is refused as for any authenticated read" },
+                        "404": { "description": "no such network of yours, or the bouncer is not enabled" },
+                        "426": { "description": "the WebSocket version is not supported (a problem document)" }
+                    } }
+            },
             "/api/v1/history": {
                 "get": { "summary": "Paged message history for the account", "security": authenticated,
                     "parameters": [
@@ -2212,6 +2309,7 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
     // Every response-status omission is reported together: an author fixing
     // the contract should see the whole list, not one entry per attempt.
     let mut undocumented_statuses = Vec::new();
+    let rate_limited = rate_limited_operations();
     let patterns = expected.iter().map(|(path, _)| *path).collect();
     if let Some((left, right)) = colliding_route_patterns(&patterns) {
         return Err(format!(
@@ -2331,6 +2429,25 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
                 .get("responses")
                 .and_then(serde_json::Value::as_object)
                 .ok_or_else(|| format!("OpenAPI {method} {path} has no responses"))?;
+            let admitted = !super::PROBE_PATHS.contains(&path.as_str());
+            for status in service_wide_responses(admitted).keys() {
+                if !responses.contains_key(status) {
+                    undocumented_statuses.push(format!(
+                        "{} {path} does not document the service-wide {status}",
+                        method.to_ascii_uppercase()
+                    ));
+                }
+            }
+            if rate_limited
+                .iter()
+                .any(|&(limited, verb)| limited == path && verb == method)
+                && !responses.contains_key("429")
+            {
+                undocumented_statuses.push(format!(
+                    "{} {path} spends the authentication budget but does not document 429",
+                    method.to_ascii_uppercase()
+                ));
+            }
             if operation_authenticates_an_account(operation) {
                 for status in standard_authenticated_responses().keys() {
                     if !responses.contains_key(status) {
@@ -2489,6 +2606,69 @@ mod tests {
     fn openapi_covers_every_documented_router_operation_exactly() {
         let spec = super::document();
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
+
+    /// Which operations spend the authentication budget is read from their
+    /// handlers' signatures, so the contract says so for each without anyone
+    /// listing them — and a document that drops one is refused.
+    #[test]
+    fn every_rate_limited_operation_documents_its_429() {
+        let limited = super::rate_limited_operations();
+        for operation in [
+            ("/api/v1/auth/oidc/{provider}/callback", "get"),
+            ("/api/v1/auth/oidc/frontchannel-logout", "get"),
+            ("/api/v1/auth/device/start", "post"),
+            ("/api/v1/auth/device/token", "post"),
+            ("/api/v1/auth/app-passwords", "post"),
+        ] {
+            assert!(limited.contains(&operation), "{operation:?} not detected");
+        }
+        assert!(!limited.contains(&("/api/v1/me", "get")));
+        let spec = super::document();
+        for (path, method) in &limited {
+            let responses = &spec["paths"][path][method]["responses"];
+            assert!(responses["429"].is_object(), "{method} {path}");
+            assert!(responses["408"].is_object() && responses["413"].is_object());
+        }
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/device/start"]["post"]["responses"]["429"]["description"],
+            super::RATE_LIMITED_RESPONSE
+        );
+        let mut dropped = spec.clone();
+        dropped["paths"]["/api/v1/auth/oidc/{provider}/callback"]["get"]["responses"]
+            .as_object_mut()
+            .expect("responses")
+            .remove("429");
+        let error = super::validate_documented_operations(&dropped).expect_err("dropped 429");
+        assert!(error.contains("callback"), "{error}");
+    }
+
+    /// The service's own bounds answer before any handler: every operation
+    /// can meet the deadline and the body limit, and every one the admission
+    /// bounds see can meet the per-address in-flight bound.
+    #[test]
+    fn every_operation_documents_the_service_wide_statuses() {
+        let spec = super::document();
+        for &(path, method) in super::super::DOCUMENTED_ROUTE_OPERATIONS {
+            let responses = &spec["paths"][path][method]["responses"];
+            for status in ["408", "413"] {
+                assert!(
+                    responses[status].is_object(),
+                    "{method} {path} lacks {status}"
+                );
+            }
+            assert_eq!(
+                responses["429"].is_object(),
+                !super::super::PROBE_PATHS.contains(&path),
+                "{method} {path}"
+            );
+        }
+        let mut dropped = spec.clone();
+        dropped["paths"]["/api/v1/server"]["get"]["responses"]
+            .as_object_mut()
+            .expect("responses")
+            .remove("413");
+        assert!(super::validate_documented_operations(&dropped).is_err());
     }
 
     #[test]

@@ -1004,6 +1004,34 @@ async fn the_per_address_authentication_budget_says_when_to_retry() {
     assert!((1..=60).contains(&wait), "{head}");
 }
 
+/// The body limit answers before any handler, in the same shape as every
+/// other refusal (DESIGN §12: problem documents, all of them).
+#[tokio::test]
+async fn a_body_over_the_limit_is_a_problem_json_413() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    let declared = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{{}}",
+        2 * 1024 * 1024
+    );
+    let (status, head, body) = request(http, &declared).await;
+    assert_problem(status, &head, &body, 413);
+    let chunk = "x".repeat(64 * 1024);
+    // A body that declares no length is refused once it passes the limit.
+    let mut streamed = String::from(
+        "POST /api/v1/auth/device/token HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    for _ in 0..20 {
+        streamed.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    streamed.push_str("0\r\n\r\n");
+    let (status, head, body) = request(http, &streamed).await;
+    assert_problem(status, &head, &body, 413);
+}
+
 /// A callback can make the server call the provider's token endpoint, so it
 /// spends the same per-address budget as the flow's start.
 #[tokio::test]

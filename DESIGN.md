@@ -2801,7 +2801,18 @@ The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
 dependency). Its method/path inventory and path/query parameter declarations
 are checked against the Axum API router; a mismatch is a unit-test failure and
-the endpoint refuses to serve a plausible but incomplete contract.
+the endpoint refuses to serve a plausible but incomplete contract. The
+statuses a request can meet before its handler runs are derived, not listed:
+the route table records each handler's argument types, so every operation
+whose handler takes `RateLimited` documents its `429`, every account-
+authenticated one the admission statuses, and every operation the service's
+own bounds (`408` deadline, `413` body limit, and — except the probes — the
+per-address in-flight `429`); the validator refuses a document that drops
+one. The body limit's refusal is a problem document like every other: the
+limit layer's plain-text answer to a declared oversize length and an
+extractor's to a streamed one pass through one `payload_too_large`. The live
+chat socket `/ws/ui` is in the contract too, as the `GET` it is (an upgrade
+answered `101`), with its query, its refusals, and its close codes.
 
 ---
 
