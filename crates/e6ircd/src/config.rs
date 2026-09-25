@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 fn default_nicklen() -> usize {
     16
 }
+
+/// Shortest `nicklen` a server may advertise: NickServ nick protection renames
+/// a user who does not identify to `Guest` and five digits, which must be a
+/// valid nick.
+pub const MIN_NICKLEN: usize = 10;
 /// Most core shards. Each is a task with its own `core_queue`-slot inbound
 /// queue, and every broadcast (a tick, a channel event with members elsewhere)
 /// is one message per shard, so shards past the machine's cores only add cost.
@@ -2041,6 +2046,12 @@ impl Config {
                 "nicklen must be at most 64 (it rides every relayed line's prefix)".into(),
             ));
         }
+        if self.nicklen < MIN_NICKLEN {
+            return Err(ConfigError::Invalid(format!(
+                "nicklen must be at least {MIN_NICKLEN} (nick protection renames to a Guest \
+                 nick of that length)"
+            )));
+        }
         if self.max_hot_channels == 0 {
             return Err(ConfigError::Invalid(
                 "max_hot_channels must be nonzero (0 retains no channel history)".into(),
@@ -3811,6 +3822,22 @@ mod tests {
             cfg.validate().is_err(),
             "max_connections_per_ip=0 refuses every connection and must be rejected"
         );
+    }
+
+    #[test]
+    fn a_nicklen_too_short_for_a_guest_nick_is_rejected() {
+        let short = Config {
+            listeners: vec![listener()],
+            nicklen: MIN_NICKLEN - 1,
+            ..Config::default()
+        };
+        assert!(short.validate().is_err());
+        let shortest = Config {
+            listeners: vec![listener()],
+            nicklen: MIN_NICKLEN,
+            ..Config::default()
+        };
+        assert!(shortest.validate().is_ok());
     }
 
     #[test]

@@ -155,9 +155,9 @@ pub(crate) fn channel_command(
             services::chanserv_register_on_owner(state, command)
                 .map(crate::core::state::ChannelCommandResult::ChanServRegister)
         }
-        crate::core::state::ChannelCommandOperation::ChanServOp { .. } => {
-            Some(crate::core::state::ChannelCommandResult::ChanServOp(
-                services::chanserv_op_on_owner(state, command),
+        crate::core::state::ChannelCommandOperation::ChanServStatus { .. } => {
+            Some(crate::core::state::ChannelCommandResult::ChanServStatus(
+                services::chanserv_status_on_owner(state, command),
             ))
         }
         crate::core::state::ChannelCommandOperation::Names => {
@@ -212,9 +212,9 @@ pub(crate) fn channel_command_result(
         crate::core::state::ChannelCommandResult::ChanServRegister(result) => {
             services::emit_chanserv_register_result(state, conn, result, label)
         }
-        crate::core::state::ChannelCommandResult::ChanServOp(result) => state
+        crate::core::state::ChannelCommandResult::ChanServStatus(result) => state
             .emit_deferred_labeled(conn, label, |state| {
-                services::emit_chanserv_op_result(state, conn, result)
+                services::emit_chanserv_status_result(state, conn, result)
             }),
         crate::core::state::ChannelCommandResult::Names(result) => {
             channel::emit_channel_command_replies(state, conn, result, label)

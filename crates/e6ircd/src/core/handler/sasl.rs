@@ -369,6 +369,9 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             crate::core::DbReply::ReadMarkerStored { .. }
                 | crate::core::DbReply::ReadMarkerUnavailable { .. }
                 | crate::core::DbReply::ReadMarkerLimitReached { .. }
+                | crate::core::DbReply::NickGroup { .. }
+                | crate::core::DbReply::NickUngroup { .. }
+                | crate::core::DbReply::NickEnforce { .. }
         )
     {
         return; // client vanished while the DB worked; nothing to do
@@ -573,6 +576,13 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             label,
         } => {
             read_marker_stored(state, conn, account, target, display, marker_ms, label);
+        }
+        reply @ (crate::core::DbReply::NickGroup { .. }
+        | crate::core::DbReply::NickUngroup { .. }
+        | crate::core::DbReply::NickEnforce { .. }
+        | crate::core::DbReply::AccountInfo { .. }
+        | crate::core::DbReply::AccountDrop { .. }) => {
+            super::services::nickserv_db_reply(state, conn, reply);
         }
         crate::core::DbReply::ReadMarkerUnavailable {
             account,

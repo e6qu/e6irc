@@ -978,7 +978,8 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "/msg NickServ <command>",
-            "Account service: REGISTER, IDENTIFY, GHOST, LOGOUT, HELP.",
+            "Account service: REGISTER, IDENTIFY, LOGOUT, GHOST, REGAIN, GROUP, UNGROUP, INFO, \
+             SET ENFORCE, DROP, HELP.",
         ],
     },
     HelpTopic {
@@ -986,7 +987,8 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "/msg ChanServ <command>",
-            "Channel registration service: REGISTER, DROP, FLAGS, OP, SET (FOUNDER, KEEPTOPIC, MLOCK), HELP.",
+            "Channel registration service: REGISTER, DROP, FLAGS, ACCESS, OP, DEOP, VOICE, DEVOICE, \
+             SET (FOUNDER, SUCCESSOR, KEEPTOPIC, MLOCK), HELP.",
         ],
     },
     HelpTopic {

@@ -4,6 +4,7 @@
 // whose nesting exceeds the default macro recursion limit.
 #![recursion_limit = "512"]
 
+pub(crate) mod account_deletion;
 pub mod bouncer;
 pub(crate) mod certificate;
 pub mod config;

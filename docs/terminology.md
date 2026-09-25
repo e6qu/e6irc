@@ -131,15 +131,33 @@ transient [nick](#irc-and-ircv3). A client authenticates to an account via
 [SASL](#authentication-accounts-and-single-sign-on) or NickServ.
 
 **NickServ** — the service for account registration and identification;
-`GHOST` disconnects a stale session holding a nick you own.
+`GHOST` disconnects a stale session holding a nick you own, `REGAIN` renames
+that session to a [Guest nick](#services-nickserv-chanserv-oper) and gives you
+the nick, and `DROP` permanently deletes your account (after a confirmation
+key, through the same deletion the account console performs).
+
+**Grouped nick** — a nick added to an account with NickServ `GROUP` (removed
+with `UNGROUP`). An account owns the nick spelled like its name and its
+grouped nicks, at most five in all; a nick is registered to at most one
+account. Any of them identifies to the account.
+
+**Nick protection** (NickServ `SET ENFORCE`) — an account's choice to have
+its nicks enforced: a user who takes one without identifying to the account
+is warned, and after the enforcement delay (30 seconds) renamed to a
+**Guest nick** — `Guest` and a number, unique on the network.
 
 **ChanServ** — the service for channel ownership. A channel's **founder**
 owns it; **access flags** grant per-account privileges (auto-op `o`,
-auto-voice `v`).
+auto-voice `v`). `ACCESS` edits the same entries by **role**: **AOP**
+(auto-op) or **VOP** (auto-voice).
+
+**Successor** — the account a registered channel passes to when its
+founder's account is deleted (`ChanServ SET <#channel> SUCCESSOR`). A founder
+with a channel that has no successor cannot be deleted.
 
 **SET options** — founder-set channel options via `ChanServ SET`:
-**FOUNDER** (transfer ownership), **KEEPTOPIC** (retain the topic across
-empty periods), **MLOCK** (mode lock).
+**FOUNDER** (transfer ownership), **SUCCESSOR** (who inherits the channel),
+**KEEPTOPIC** (retain the topic across empty periods), **MLOCK** (mode lock).
 
 **MLOCK** (mode lock) — a locked set of channel modes (e.g. `+nt-i`)
 enforced on a registered channel: a mode change the wrong way is refused,

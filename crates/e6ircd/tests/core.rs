@@ -124,7 +124,8 @@ impl TestServer {
                 e6ircd::core::DbRequest::SetChannelFounder { owner, session, .. }
                 | e6ircd::core::DbRequest::SetChannelKeeptopic { owner, session, .. }
                 | e6ircd::core::DbRequest::SetChannelMlock { owner, session, .. }
-                | e6ircd::core::DbRequest::SetChannelAccess { owner, session, .. } => {
+                | e6ircd::core::DbRequest::SetChannelAccess { owner, session, .. }
+                | e6ircd::core::DbRequest::SetChannelSuccessor { owner, session, .. } => {
                     self.channel_service_route = Some((owner.clone(), *session));
                 }
                 e6ircd::core::DbRequest::SetChannelTopic { owner, session, .. } => {
@@ -3194,6 +3195,7 @@ fn channel_access_reply_for_unregistered_channel_is_not_phantom_inserted() {
             account: "bob".into(),
             flags: Some("o".into()),
             applied: true,
+            frontend: e6ircd::core::AccessFrontend::Flags,
             label: None,
         },
     });
@@ -8542,6 +8544,758 @@ fn history_logmessage_gated_on_database() {
     );
 }
 
+// NickServ nick protection, grouping, REGAIN, INFO, SET and DROP (DESIGN §7.6).
+
+fn tick_after(s: &mut TestServer, millis: u64) {
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(test_mono().as_millis() + millis),
+    });
+}
+
+/// Answer the NickServ request the core just queued with `reply`.
+fn nickserv_verdict(s: &mut TestServer, conn: ConnId, reply: e6ircd::core::DbReply) {
+    s.db_requests();
+    s.core.handle(Input::DbReply { conn, reply });
+}
+
+fn notices(lines: &[String]) -> Vec<&str> {
+    lines
+        .iter()
+        .filter(|line| line.contains(" NOTICE "))
+        .filter_map(|line| line.split_once(" :").map(|(_, text)| text))
+        .collect()
+}
+
+/// `alice` protects her nicks; the account's owner is on the nick `owner`.
+fn protected_alice(s: &mut TestServer) -> ConnId {
+    let owner = s.register(1, "owner");
+    identify(s, owner, "alice");
+    s.line(owner, "PRIVMSG NickServ :SET ENFORCE ON");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetNickEnforce { account, enforce: true, .. }]
+                if account == "alice"
+        ),
+        "{queued:?}"
+    );
+    s.core.handle(Input::DbReply {
+        conn: owner,
+        reply: e6ircd::core::DbReply::NickEnforce {
+            account: "alice".into(),
+            enforce: true,
+            outcome: Some(e6ircd::db::NickEnforceChange::Changed),
+            label: None,
+        },
+    });
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["The \x02ENFORCE\x02 flag has been set for account \x02alice\x02."]
+    );
+    owner
+}
+
+#[test]
+fn an_unidentified_user_of_a_protected_nick_is_warned_then_renamed_to_a_guest_nick() {
+    let mut s = TestServer::new();
+    let _owner = protected_alice(&mut s);
+    let intruder = s.register(2, "intruder");
+    s.line(intruder, "NICK alice");
+    let out = s.drain(intruder);
+    assert_eq!(
+        notices(&out),
+        [
+            "This nickname is registered. Please choose a different nickname, or identify via \
+             \x02/msg NickServ IDENTIFY alice <password>\x02.",
+            "You have 30 seconds to identify to your nickname before it is changed.",
+        ],
+        "{out:#?}"
+    );
+
+    tick_after(&mut s, 29_000);
+    assert!(
+        s.drain(intruder).is_empty(),
+        "renamed before the delay ran out"
+    );
+
+    tick_after(&mut s, 30_000);
+    let out = s.drain(intruder);
+    assert_eq!(
+        notices(&out),
+        ["You failed to identify in time for the nickname alice"]
+    );
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with(":alice!") && line.contains(" NICK Guest2")),
+        "not renamed to a Guest nick: {out:#?}"
+    );
+    // The protected nick is free again, and the Guest nick is held.
+    let newcomer = s.register(3, "alice");
+    s.line(newcomer, "WHOIS Guest2");
+    assert!(
+        s.drain(newcomer).iter().any(|line| line.contains(" 311 ")),
+        "the Guest nick is not held"
+    );
+}
+
+#[test]
+fn identifying_within_the_delay_cancels_the_rename() {
+    let mut s = TestServer::new();
+    let _owner = protected_alice(&mut s);
+    let second = s.register(2, "second");
+    s.line(second, "NICK alice");
+    s.drain(second);
+    identify(&mut s, second, "alice");
+    tick_after(&mut s, 60_000);
+    let out = s.drain(second);
+    assert!(
+        !out.iter().any(|line| line.contains(" NICK ")),
+        "an identified owner was renamed: {out:#?}"
+    );
+
+    // Identifying to some other account does not count.
+    let third = s.register(3, "third");
+    identify(&mut s, third, "mallory");
+    s.line(third, "PRIVMSG NickServ :GHOST alice");
+    s.drain(third);
+    s.line(second, "NICK other");
+    s.drain(second);
+    s.line(third, "NICK alice");
+    assert_eq!(notices(&s.drain(third)).len(), 2, "no warning");
+    tick_after(&mut s, 30_000);
+    assert!(
+        s.drain(third)
+            .iter()
+            .any(|line| line.contains(" NICK Guest3")),
+        "identified to another account, yet kept the protected nick"
+    );
+}
+
+#[test]
+fn a_nick_without_protection_draws_no_warning() {
+    let mut s = TestServer::new();
+    let owner = s.register(1, "owner");
+    identify(&mut s, owner, "alice");
+    let other = s.register(2, "other");
+    s.line(other, "NICK alice");
+    let out = s.drain(other);
+    assert!(notices(&out).is_empty(), "{out:#?}");
+    tick_after(&mut s, 60_000);
+    assert!(!s.drain(other).iter().any(|line| line.contains(" NICK ")));
+}
+
+#[test]
+fn a_protected_nick_taken_at_connection_is_warned_after_the_welcome() {
+    let mut s = TestServer::new();
+    let _owner = protected_alice(&mut s);
+    let conn = s.connect(2);
+    s.line(conn, "NICK alice");
+    s.line(conn, "USER a 0 * :A");
+    let out = s.drain(conn);
+    let welcome = out.iter().position(|line| line.contains(" 001 "));
+    let warning = out
+        .iter()
+        .position(|line| line.contains("This nickname is registered"));
+    assert!(
+        welcome.is_some() && warning > welcome,
+        "no warning after the welcome burst: {out:#?}"
+    );
+}
+
+#[test]
+fn nickserv_group_and_ungroup_follow_the_database_verdict() {
+    let mut s = TestServer::new();
+    let owner = protected_alice(&mut s);
+    s.line(owner, "NICK alice_away");
+    s.drain(owner);
+    s.line(owner, "PRIVMSG NickServ :GROUP");
+    assert!(
+        s.drain(owner).is_empty(),
+        "GROUP answered before PostgreSQL"
+    );
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::GroupNick { account, nick, .. }]
+                if account == "alice" && nick == "alice_away"
+        ),
+        "{queued:?}"
+    );
+    s.core.handle(Input::DbReply {
+        conn: owner,
+        reply: e6ircd::core::DbReply::NickGroup {
+            account: "alice".into(),
+            nick: "alice_away".into(),
+            outcome: Some(e6ircd::db::NickGroupOutcome::Grouped),
+            label: None,
+        },
+    });
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["Nick \x02alice_away\x02 is now registered to your account."]
+    );
+
+    // The grouped nick is protected like the account's name, and GHOST
+    // reaches it.
+    s.line(owner, "NICK owner");
+    s.drain(owner);
+    let intruder = s.register(2, "intruder");
+    s.line(intruder, "NICK Alice_Away");
+    assert_eq!(notices(&s.drain(intruder)).len(), 2);
+    s.line(owner, "PRIVMSG NickServ :GHOST alice_away");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["\x02alice_away\x02 has been ghosted."]
+    );
+
+    // UNGROUP of a nick the account does not hold is refused on the spot;
+    // the account's own name cannot be removed.
+    s.line(owner, "PRIVMSG NickServ :UNGROUP someone");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["Nick \x02someone\x02 is not registered to your account."]
+    );
+    s.line(owner, "PRIVMSG NickServ :UNGROUP alice");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["Nick \x02alice\x02 is your account name; you may not remove it."]
+    );
+    s.line(owner, "PRIVMSG NickServ :UNGROUP alice_away");
+    nickserv_verdict(
+        &mut s,
+        owner,
+        e6ircd::core::DbReply::NickUngroup {
+            account: "alice".into(),
+            nick: "alice_away".into(),
+            removed: Some(true),
+            label: None,
+        },
+    );
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["Nick \x02alice_away\x02 has been removed from your account."]
+    );
+    // No longer the account's: no protection, and GHOST refuses it.
+    let later = s.register(3, "later");
+    s.line(later, "NICK alice_away");
+    assert!(notices(&s.drain(later)).is_empty());
+    s.line(owner, "PRIVMSG NickServ :GHOST alice_away");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["You do not own \x02alice_away\x02."]
+    );
+}
+
+#[test]
+fn a_grouped_nick_is_mirrored_from_the_boot_load() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_nick_registrations(e6ircd::db::NickRegistrations {
+            grouped: vec![("bob_".into(), "bob".into())],
+            enforced: vec!["bob".into()],
+        });
+    let intruder = s.register(1, "intruder");
+    s.line(intruder, "NICK BOB_");
+    assert_eq!(notices(&s.drain(intruder)).len(), 2);
+    // The account's own name is protected by the same flag.
+    s.line(intruder, "NICK bob");
+    assert_eq!(notices(&s.drain(intruder)).len(), 2);
+    tick_after(&mut s, 30_000);
+    assert!(
+        s.drain(intruder)
+            .iter()
+            .any(|line| line.contains(" NICK Guest")),
+        "not renamed"
+    );
+}
+
+#[test]
+fn nickserv_regain_renames_the_holder_and_hands_over_the_nick() {
+    let mut s = TestServer::new();
+    let holder = s.register(1, "alice");
+    let owner = s.register(2, "owner");
+    identify(&mut s, owner, "alice");
+    s.drain(holder);
+    s.line(owner, "PRIVMSG NickServ :REGAIN alice");
+    let out = s.drain(owner);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with(":owner!") && line.ends_with(" NICK alice")),
+        "the owner did not get the nick: {out:#?}"
+    );
+    assert_eq!(notices(&out), ["\x02alice\x02 has been regained."]);
+    let out = s.drain(holder);
+    assert_eq!(
+        notices(&out),
+        ["owner!owner@host2.example has regained your nickname."]
+    );
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with(":alice!") && line.ends_with(" NICK Guest1")),
+        "the holder was not renamed: {out:#?}"
+    );
+
+    // Only a nick one owns, and not one's own session.
+    s.line(owner, "PRIVMSG NickServ :REGAIN alice");
+    assert_eq!(notices(&s.drain(owner)), ["You may not regain yourself."]);
+    s.line(owner, "PRIVMSG NickServ :REGAIN Guest1");
+    assert_eq!(notices(&s.drain(owner)), ["You do not own \x02Guest1\x02."]);
+}
+
+#[test]
+fn nickserv_info_shows_nicks_to_the_owner_and_opers_only() {
+    let mut s = TestServer::new();
+    let owner = s.register(1, "owner");
+    identify(&mut s, owner, "alice");
+    let info = e6ircd::db::NickServAccountInfo {
+        name: "Alice".into(),
+        // 1_000_000_000 ms is the test clock: registered 1d 2h 3m before it.
+        registered_at: Millis::from_millis(1_000_000_000 - (86_400 + 7_380) * 1000),
+        nicks: vec!["Alice".into(), "alice_away".into()],
+        enforce: true,
+    };
+    s.line(owner, "PRIVMSG NickServ :INFO alice_away");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::AccountInfo { target, .. }] if target == "alice_away"
+        ),
+        "{queued:?}"
+    );
+    let answer = |info: &e6ircd::db::NickServAccountInfo| e6ircd::core::DbReply::AccountInfo {
+        target: "alice_away".into(),
+        info: Ok(Some(info.clone())),
+        label: None,
+    };
+    s.core.handle(Input::DbReply {
+        conn: owner,
+        reply: answer(&info),
+    });
+    assert_eq!(
+        notices(&s.drain(owner)),
+        [
+            "Information on \x02alice_away\x02 (account \x02Alice\x02):",
+            "Registered : Jan 11 11:43:40 1970 (1d 2h 3m ago)",
+            "Last seen  : now",
+            "Nicks      : Alice alice_away",
+            "Flags      : Enforce",
+            "*** \x02End of Info\x02 ***",
+        ]
+    );
+
+    // Someone else sees no nicks, and no "last seen" once the account is
+    // offline.
+    let other = s.register(2, "other");
+    s.line(owner, "QUIT");
+    s.line(other, "PRIVMSG NickServ :INFO alice_away");
+    nickserv_verdict(&mut s, other, answer(&info));
+    let out = s.drain(other);
+    assert!(!notices(&out).iter().any(|line| line.starts_with("Nicks")));
+    assert!(
+        !notices(&out)
+            .iter()
+            .any(|line| line.starts_with("Last seen"))
+    );
+    // An operator does see them.
+    s.line(other, "OPER god letmein");
+    s.drain(other);
+    s.line(other, "PRIVMSG NickServ :INFO alice_away");
+    nickserv_verdict(&mut s, other, answer(&info));
+    assert!(notices(&s.drain(other)).contains(&"Nicks      : Alice alice_away"));
+
+    s.line(other, "PRIVMSG NickServ :INFO nobody");
+    nickserv_verdict(
+        &mut s,
+        other,
+        e6ircd::core::DbReply::AccountInfo {
+            target: "nobody".into(),
+            info: Ok(None),
+            label: None,
+        },
+    );
+    assert_eq!(
+        notices(&s.drain(other)),
+        ["\x02nobody\x02 is not registered."]
+    );
+}
+
+#[test]
+fn nickserv_drop_needs_the_confirmation_key_before_it_asks_the_database() {
+    let mut s = TestServer::new();
+    let owner = s.register(1, "owner");
+    identify(&mut s, owner, "alice");
+    s.line(owner, "PRIVMSG NickServ :DROP bob hunter2");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["You may only drop the account you are identified to, \x02alice\x02."]
+    );
+    s.line(owner, "PRIVMSG NickServ :DROP alice hunter2 wrongkey");
+    assert_eq!(notices(&s.drain(owner)), ["Invalid key for \x02alice\x02."]);
+    assert!(s.db_requests().is_empty());
+
+    s.line(owner, "PRIVMSG NickServ :DROP Alice hunter2");
+    let out = s.drain(owner);
+    let reminder = notices(&out);
+    assert_eq!(reminder.len(), 2, "{out:#?}");
+    let key = reminder[1]
+        .trim_end_matches('\x02')
+        .rsplit(' ')
+        .next()
+        .expect("key")
+        .to_string();
+    assert!(!reminder[1].contains("hunter2"), "the password was echoed");
+    assert!(s.db_requests().is_empty(), "dropped before confirmation");
+
+    s.line(
+        owner,
+        &format!("PRIVMSG NickServ :DROP alice hunter2 {key}"),
+    );
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::DropAccount { account, password, .. }]
+                if account == "alice" && password == "hunter2"
+        ),
+        "{queued:?}"
+    );
+    s.core.handle(Input::DbReply {
+        conn: owner,
+        reply: e6ircd::core::DbReply::AccountDrop {
+            account: "alice".into(),
+            outcome: e6ircd::core::AccountDropOutcome::Refused(
+                "account still founds 1 channel(s) with no successor".into(),
+            ),
+            label: None,
+        },
+    });
+    assert_eq!(
+        notices(&s.drain(owner)),
+        [
+            "\x02alice\x02 cannot be dropped: account still founds 1 channel(s) with no \
+             successor."
+        ]
+    );
+    // The key was spent.
+    s.line(
+        owner,
+        &format!("PRIVMSG NickServ :DROP alice hunter2 {key}"),
+    );
+    assert_eq!(notices(&s.drain(owner)), ["Invalid key for \x02alice\x02."]);
+}
+
+#[test]
+fn nickserv_help_lists_every_command() {
+    let mut s = TestServer::new();
+    let conn = s.register(1, "user");
+    s.line(conn, "PRIVMSG NickServ :HELP");
+    let out = s.drain(conn);
+    for command in [
+        "REGISTER",
+        "IDENTIFY",
+        "LOGOUT",
+        "GHOST",
+        "REGAIN",
+        "GROUP",
+        "UNGROUP",
+        "INFO",
+        "SET ENFORCE",
+        "DROP",
+    ] {
+        assert!(
+            notices(&out).iter().any(|line| line.starts_with(command)),
+            "HELP omits {command}: {out:#?}"
+        );
+    }
+    s.line(conn, "PRIVMSG ChanServ :HELP");
+    let out = s.drain(conn);
+    for command in [
+        "REGISTER",
+        "DROP",
+        "FLAGS",
+        "ACCESS",
+        "OP|DEOP",
+        "VOICE|DEVOICE",
+        "SET <#channel> SUCCESSOR",
+    ] {
+        assert!(
+            notices(&out).iter().any(|line| line.starts_with(command)),
+            "HELP omits {command}: {out:#?}"
+        );
+    }
+}
+
+// ChanServ ACCESS, DEOP/VOICE/DEVOICE, SET SUCCESSOR (DESIGN §7.6).
+
+#[test]
+fn chanserv_access_lists_roles_and_edits_the_flags_store() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core.preload_access(vec![
+        ("#chan".into(), "carol".into(), "v".into()),
+        ("#chan".into(), "bob".into(), "o".into()),
+    ]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan LIST");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        [
+            "Entry Nickname/Host          Role",
+            "----- ---------------------- ----",
+            "1     boss                   Founder",
+            "2     bob                    AOP",
+            "3     carol                  VOP",
+            "----- ---------------------- ----",
+            "End of \x02#chan\x02 ACCESS listing.",
+        ]
+    );
+    // Someone on the list may read it; a stranger may not.
+    let carol = s.register(2, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "PRIVMSG ChanServ :ACCESS #chan LIST");
+    assert_eq!(notices(&s.drain(carol)).len(), 7);
+    let mallory = s.register(3, "mallory");
+    identify(&mut s, mallory, "mallory");
+    s.line(mallory, "PRIVMSG ChanServ :ACCESS #chan LIST");
+    assert_eq!(
+        notices(&s.drain(mallory)),
+        ["You are not authorized to view the access list of \x02#chan\x02."]
+    );
+    // Only the founder changes it.
+    s.line(carol, "PRIVMSG ChanServ :ACCESS #chan ADD mallory");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["You are not the founder of \x02#chan\x02."]
+    );
+
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD dave aop");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { account, flags: Some(flags), .. }]
+                if account == "dave" && flags == "o"
+        ),
+        "{queued:?}"
+    );
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "dave".into(),
+        flags: Some("o".into()),
+        applied: true,
+        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "AOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02dave\x02 was added with the \x02AOP\x02 role in \x02#chan\x02."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD erin SOP");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["The role \x02SOP\x02 does not exist. Roles: AOP (auto-op), VOP (auto-voice)."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD erin");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::SetChannelAccess { flags: Some(flags), .. }] if flags == "v"
+    ));
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "erin".into(),
+        flags: Some("v".into()),
+        applied: false,
+        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+        label: None,
+    });
+    assert_eq!(notices(&s.drain(boss)), ["\x02erin\x02 is not registered."]);
+
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan DEL nobody");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02nobody\x02 was not found on the access list of \x02#chan\x02."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan DEL carol");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { account, flags: None, frontend, .. }]
+                if account == "carol"
+                    && *frontend == e6ircd::core::AccessFrontend::AccessDel { role: "VOP" }
+        ),
+        "{queued:?}"
+    );
+}
+
+#[test]
+fn chanserv_deop_voice_and_devoice_are_gated_on_access() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core
+        .preload_access(vec![("#chan".into(), "carol".into(), "v".into())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #chan");
+    let carol = s.register(2, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "JOIN #chan");
+    s.drain(boss);
+    s.drain(carol);
+
+    // A voice-access holder (auto-voiced on join) may devoice and voice,
+    // but not op.
+    s.line(carol, "PRIVMSG ChanServ :VOICE #chan");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["\x02carol\x02 is already voiced."]
+    );
+    s.line(carol, "PRIVMSG ChanServ :DEVOICE #chan carol");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|line| line.ends_with("MODE #chan -v carol"))
+    );
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["Devoiced \x02carol\x02 on \x02#chan\x02."]
+    );
+    s.line(carol, "PRIVMSG ChanServ :VOICE #chan");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|line| line.ends_with("MODE #chan +v carol"))
+    );
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["Voiced \x02carol\x02 on \x02#chan\x02."]
+    );
+    s.line(carol, "PRIVMSG ChanServ :OP #chan");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["You do not have op access on \x02#chan\x02."]
+    );
+    s.line(carol, "PRIVMSG ChanServ :DEOP #chan boss");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["You do not have op access on \x02#chan\x02."]
+    );
+    // The founder may deop.
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :DEOP #chan boss");
+    assert_eq!(
+        notices(&s.drain(boss))
+            .into_iter()
+            .filter(|n| n.starts_with("Deopped \x02boss\x02"))
+            .count(),
+        1
+    );
+    s.line(boss, "PRIVMSG ChanServ :DEOP #chan boss");
+    assert_eq!(notices(&s.drain(boss)), ["\x02boss\x02 is not opped."]);
+    // Nobody without access may voice.
+    let mallory = s.register(3, "mallory");
+    identify(&mut s, mallory, "mallory");
+    s.line(mallory, "PRIVMSG ChanServ :VOICE #chan");
+    assert_eq!(
+        notices(&s.drain(mallory)),
+        ["You do not have voice access on \x02#chan\x02."]
+    );
+}
+
+#[test]
+fn chanserv_set_successor_is_persisted_and_answered_by_its_verdict() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR boss");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02boss\x02 is the founder of \x02#room\x02 and cannot also be its successor."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR Carol");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelSuccessor { successor: Some(successor), actor, .. }]
+                if successor == "carol" && actor == "boss"
+        ),
+        "{queued:?}"
+    );
+    assert!(s.drain(boss).is_empty(), "answered before PostgreSQL");
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied),
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02carol\x02 is now the successor of \x02#room\x02."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR OFF");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::SetChannelSuccessor {
+            successor: None,
+            ..
+        }]
+    ));
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: None,
+        outcome: None,
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["Could not update SUCCESSOR for \x02#room\x02 — services are temporarily unavailable."]
+    );
+}
+
+/// An account deletion that passed a channel to its successor moves the
+/// founder in every shard's mirror: the successor is opped on join and holds
+/// the founder's ChanServ rights.
+#[test]
+fn a_deleted_founders_channel_follows_its_successor_in_the_mirror() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    s.core.handle(Input::AccountDeleted {
+        account: "boss".into(),
+        successions: vec![e6ircd::db::ChannelSuccession {
+            channel: "#room".into(),
+            founder: "carol".into(),
+        }],
+    });
+    let carol = s.register(1, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
+    let boss = s.register(2, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["You are not the founder of \x02#room\x02."]
+    );
+}
+
 // NickServ GHOST + ChanServ DROP (DESIGN §7.6).
 
 #[test]
@@ -9063,6 +9817,7 @@ fn chanserv_flags_auto_ops_on_join() {
         account: "alice".to_string(),
         flags: Some("o".to_string()),
         applied: true,
+        frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
     assert!(
@@ -9126,6 +9881,7 @@ fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
         account: "ghost".to_string(),
         flags: Some("o".to_string()),
         applied: false,
+        frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
     assert!(
@@ -9191,6 +9947,7 @@ fn account_deletion_drops_its_hot_history_and_channel_access() {
         account: "alice".to_string(),
         flags: Some("o".to_string()),
         applied: true,
+        frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
     s.drain(boss);
@@ -9219,6 +9976,7 @@ fn account_deletion_drops_its_hot_history_and_channel_access() {
     });
     s.core.handle(Input::AccountDeleted {
         account: "ALICE".into(),
+        successions: Vec::new(),
     });
 
     s.line(boss, "CHATHISTORY LATEST #chan * 1");
@@ -9276,6 +10034,7 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
         account: "alice".to_string(),
         flags: Some("o".to_string()),
         applied: true,
+        frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
     s.drain(boss);
@@ -9295,6 +10054,7 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
         account: "alice".to_string(),
         flags: None,
         applied: true,
+        frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
 
@@ -11913,6 +12673,7 @@ fn labeled_chanserv_flags_is_one_labeled_response_that_orders_later_output() {
         account: "alice".to_string(),
         flags: Some("o".to_string()),
         applied: true,
+        frontend: e6ircd::core::AccessFrontend::Flags,
         label: Some("f1".to_string()),
     });
     let out = s.drain(boss);
@@ -13196,6 +13957,7 @@ fn a_deleted_accounts_read_markers_leave_the_mirror() {
 
     s.core.handle(Input::AccountDeleted {
         account: "ALICE".into(),
+        successions: Vec::new(),
     });
 
     let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");

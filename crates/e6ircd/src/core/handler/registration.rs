@@ -36,19 +36,11 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let (registered, prefix, old_key, old_nick_display) = {
-        let session = &state.sessions[&conn];
-        (
-            session.is_registered(),
-            session.is_registered().then(|| session.prefix()),
-            session.nick().as_ref().map(|o| state.nick_key(o)),
-            session.nick().map(String::from),
-        )
-    };
+    let registered = state.sessions[&conn].is_registered();
     // NICK to the *exact* current nick (identical bytes, not merely the same
     // casefold) is a no-op: no rename, no broadcast, no reply. A case change
     // (alice→Alice) is a real change and falls through.
-    if registered && old_nick_display.as_deref() == Some(nick) {
+    if registered && state.sessions[&conn].nick() == Some(nick) {
         return;
     }
     // A plain member banned or quieted in a channel may not change nick: the
@@ -74,6 +66,42 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    change_claimed_nick(state, conn, nick, key);
+}
+
+/// Rename `conn` to `nick` because services said so (NickServ REGAIN, or the
+/// Guest rename of nick protection): no ban-change check applies, only that
+/// nobody else holds the nick. Returns whether the rename happened.
+pub(super) fn force_nick(state: &mut ServerState, conn: ConnId, nick: &str) -> bool {
+    let key = state.nick_key(nick);
+    if state.sessions[&conn].nick() == Some(nick) {
+        return true;
+    }
+    if !state.claim_nick(key.clone(), conn) {
+        return false;
+    }
+    change_claimed_nick(state, conn, nick, key);
+    true
+}
+
+/// Give `conn` the nick it has just claimed in the nick directory: release
+/// the old one, and for a registered session tell it and its peers, and check
+/// the new nick against nick protection.
+fn change_claimed_nick(
+    state: &mut ServerState,
+    conn: ConnId,
+    nick: &str,
+    key: crate::core::state::NickKey,
+) {
+    let (registered, prefix, old_key, old_nick_display) = {
+        let session = &state.sessions[&conn];
+        (
+            session.is_registered(),
+            session.is_registered().then(|| session.prefix()),
+            session.nick().as_ref().map(|o| state.nick_key(o)),
+            session.nick().map(String::from),
+        )
+    };
     // A pure case change keeps the same monitor/nick key.
     let case_change_only = old_key.as_ref() == Some(&key);
     if registered && !case_change_only {
@@ -106,6 +134,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
             monitor_notify(state, nick, true);
         }
+        check_nick_protection(state, conn);
     } else {
         maybe_complete_registration(state, conn);
     }

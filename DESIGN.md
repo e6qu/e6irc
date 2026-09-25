@@ -1081,7 +1081,36 @@ subset's exact behavior.
   this is what users' muscle memory and client scripts expect. Accounts
   created via NickServ and via web/OIDC are the same account rows (§9.1).
   `SASL` and `IDENTIFY` set the same account state; `account-notify`/WHOIS
-  reflect it identically to Libera.
+  reflect it identically to Libera. Each command's `HELP` line lists it.
+  - NickServ: `REGISTER`, `IDENTIFY`, `LOGOUT`; `GROUP`/`UNGROUP` add the
+    current nick to the identified account or remove a grouped one (an account
+    holds at most five nicks, its name included — Atheme's `maxnicks`; a nick
+    is registered to at most one account, a storage invariant, and a new
+    account cannot take a grouped nick). Any of an account's nicks identifies
+    to it, over SASL too, and spends the one attempt budget its name has.
+    `GHOST` disconnects, and `REGAIN` renames to a Guest nick and then takes,
+    a session holding a nick the caller owns, wherever its shard. `INFO` shows
+    an account's registration time, `Last seen : now` while it is logged in
+    (last-seen times are not recorded), its flags, and — to the account and to
+    operators only — its nicks. `SET ENFORCE ON|OFF` is nick protection: a
+    user who takes a protected nick without being identified to its account is
+    warned with Atheme's notices, and renamed to `Guest` plus a number after 30
+    seconds (on the first reaper tick at or past the deadline) unless they
+    identify to that account or leave the nick first; identifying to another
+    account does not count. `NICKLEN` is at least 10, so a Guest nick always
+    fits. `DROP <account> <password>` answers with a confirmation key and
+    deletes the account when repeated with it, after verifying the primary
+    password, through the same deletion procedure as the console (§9.1) — so
+    the account's sessions, the dropping one included, are disconnected by
+    its live gate.
+  - ChanServ: `REGISTER`, `DROP`, `FLAGS`; `ACCESS <#channel> LIST|ADD|DEL` is
+    the role front end over the same access entries (`AOP` = `+o`, `VOP` = `+v`,
+    `VOP` by default); anyone on the list may `LIST` it, only the founder
+    changes it. `OP`/`DEOP` need op access and `VOICE`/`DEVOICE` voice or op
+    access (the founder has both). `SET` takes `FOUNDER`, `SUCCESSOR`,
+    `KEEPTOPIC` and `MLOCK`; the successor is the account the channel passes to
+    when the founder's account is deleted (§9.1), is never the founder, and is
+    cleared when it becomes founder or its own account is deleted.
 
 ### 7.7 Libera.Chat compatibility contract
 
@@ -1153,10 +1182,15 @@ typed database failure instead of parking an HTTP or worker caller indefinitely.
 
 Principal tables (columns abridged):
 
-- `accounts` (id, name/casefolded, private contact email, created_at, flags).
-  The closed flag bits are durable administrator authority and suspension; a
-  database constraint rejects every other value. At least one effective
-  durable-or-configured administrator remains active across HTTP deletion.
+- `accounts` (id, name/casefolded, private contact email, created_at, flags,
+  `nick_enforce`). The closed flag bits are durable administrator authority
+  and suspension; a database constraint rejects every other value. At least
+  one effective durable-or-configured administrator remains active across
+  HTTP deletion. `nick_enforce` is NickServ `SET ENFORCE` (migration 0075).
+- `account_nicks` (casefolded nick, display nick, account_id, registered_at) —
+  NickServ `GROUP`, cascading with the account (migration 0075). Two triggers,
+  under the per-name lock account creation and deletion take, keep a nick from
+  being both an account's name (or a retired name) and another's grouped nick.
 - `retired_account_names` (casefolded name, deletion time) permanently reserves
   deleted identities. The account-name transaction lock serializes create and
   delete, while a storage trigger makes a future unwrapped account insert reject
@@ -1172,10 +1206,13 @@ Principal tables (columns abridged):
 - `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
   creation/expiry, bounded user agent, optional OIDC identity/session metadata)
 - `api_tokens` (hashed PATs, scopes, expiry)
-- `channels` (registered channels: founder, flags, topic retention, mlock).
-  The founder reference is `ON DELETE RESTRICT` (migration 0071): a channel is
-  never account-owned data, so no account deletion can remove one — deleting a
-  founder fails in PostgreSQL whatever the application counted. Every other
+- `channels` (registered channels: founder, successor, flags, topic
+  retention, mlock). The founder reference is `ON DELETE RESTRICT` (migration
+  0071): a channel is never account-owned data, so no account deletion can
+  remove one — deleting a founder fails in PostgreSQL whatever the application
+  counted. The successor reference (migration 0075) sets NULL when the
+  successor's account is deleted, a check keeps it off the founder, and a
+  trigger clears it when a founder change promotes it. Every other
   reference to `accounts` cascades (or, for an accepted invitation, sets NULL):
   each is data about the account itself.
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS;
@@ -1388,9 +1425,12 @@ revoked, consumed, and unknown bearers deliberately share one public
 unavailable response.
 
 Permanent deletion is a succession operation rather than a cascading accident.
-The target must found no registered channel and cannot be the last active
-effective administrator, including authority supplied by deployment
-configuration. The shared account/network mutation lane first installs a
+Every registered channel the target founds passes to its successor (ChanServ
+`SET SUCCESSOR`) in the deletion's transaction, audited as
+`CHANNEL_SUCCESSION`; the target must found no registered channel without one
+and cannot be the last active effective administrator, including authority
+supplied by deployment configuration. The console's two deletion controls and
+NickServ `DROP` run this one procedure (`account_deletion`). The shared account/network mutation lane first installs a
 folded authentication deny key in the ordered core, then stops the account's
 drivers, so no persistence task can write backlog behind the deletion (they
 are restarted only if the database refuses). The final transaction locks the
@@ -1412,7 +1452,9 @@ event and retirement commit together. On database failure the HTTP boundary
 removes the live deny key before returning the error; success stops owned
 drivers and clears live administrator authority, and the commit is broadcast
 to every core shard, which drops the account's read-marker mirror entries (their
-rows cascaded away; a write still in flight keeps its slot until its reply). No shipped creation path—or
+rows cascaded away; a write still in flight keeps its slot until its reply), its
+hot history, access entries and grouped nicks, and moves the founder of each
+channel that passed to its successor. No shipped creation path—or
 the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
@@ -1512,7 +1554,7 @@ provider-verified email claim.
 |---|---|---|
 | SASL **PLAIN** | every existing IRC client | password = local password **or** an app password generated in the web UI. |
 | SASL **OAUTHBEARER** (RFC 7628) | e6irc-cli/tui and OAuth-capable clients | client obtains a token via the provider's **device authorization grant**; server validates signature/claims via cached JWKS (or introspection if configured) and maps (iss, sub) → account. |
-| NickServ `IDENTIFY` | legacy clients without SASL | same credential check as PLAIN. |
+| NickServ `IDENTIFY` | legacy clients without SASL | same credential check as PLAIN. Like PLAIN, it takes the account name or any nick grouped to the account. |
 
 CERTFP is explicitly out of scope for v1 (not selected).
 
@@ -3196,8 +3238,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   no Argon2 computation runs while a row lock is held; account- and
   channel-row locks taken only to serialize a cap are `FOR NO KEY UPDATE`.
 - Audit rows are written inside the mutation's own transaction for network
-  create/update/toggle/delete, ChanServ DROP/SET FOUNDER/FLAGS/KEEPTOPIC/MLOCK
-  and server bans; an upstream account command is recorded before it is sent,
+  create/update/toggle/delete, ChanServ DROP/SET FOUNDER/SUCCESSOR/FLAGS/ACCESS/
+  KEEPTOPIC/MLOCK, NickServ GROUP/UNGROUP/SET ENFORCE, account deletion (with
+  each channel succession) and server bans; an upstream account command is recorded before it is sent,
   and a 503 answers when it cannot be. OPER, KILL and SETHOST are recorded under
   the operator name and refused with a NOTICE when the audit row cannot be
   queued; an HTTP disconnect whose audit cannot be written is a 503. A

@@ -186,6 +186,12 @@ pub(crate) fn session_action(
             state.send(conn, &format!("ERROR :Closing Link: {server} ({reason})"));
             state.close(conn, &reason);
         }
+        crate::core::state::SessionAction::Regain { nick, by, by_mask } => {
+            super::services::regain_nick_from(state, conn, nick, by, &by_mask);
+        }
+        crate::core::state::SessionAction::TakeNick { nick } => {
+            super::services::take_regained_nick(state, conn, &nick);
+        }
         crate::core::state::SessionAction::SetHost {
             host,
             oper,
