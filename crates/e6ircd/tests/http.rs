@@ -7637,7 +7637,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         .expect("matrix row");
     assert_eq!(matrix.addr, "https://matrix.new.example");
     assert_eq!(matrix.nick, "@alice:new.example");
-    assert_eq!(matrix.autojoin, ["!one:new.example", "!two:new.example"]);
+    assert_eq!(
+        matrix.autojoin,
+        [
+            e6ircd::db::BncAutojoin::from("!one:new.example"),
+            e6ircd::db::BncAutojoin::from("!two:new.example")
+        ]
+    );
     assert_eq!(
         secret_key
             .open(
@@ -7655,7 +7661,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         .expect("discord read")
         .expect("discord row");
     assert_eq!(discord.addr, "https://discord-api.example/v10/");
-    assert_eq!(discord.autojoin, ["200", "201"]);
+    assert_eq!(
+        discord.autojoin,
+        [
+            e6ircd::db::BncAutojoin::from("200"),
+            e6ircd::db::BncAutojoin::from("201")
+        ]
+    );
     assert_eq!(
         secret_key
             .open(
@@ -7676,7 +7688,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         slack.sasl_account.as_deref(),
         Some(slack_bot_token.as_str())
     );
-    assert_eq!(slack.autojoin, ["C200", "C201"]);
+    assert_eq!(
+        slack.autojoin,
+        [
+            e6ircd::db::BncAutojoin::from("C200"),
+            e6ircd::db::BncAutojoin::from("C201")
+        ]
+    );
     assert_eq!(
         secret_key
             .open(

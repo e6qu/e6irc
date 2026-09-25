@@ -174,10 +174,13 @@ mistake, before a single line changes.
 
 - [ ] Builds green (default **and** every feature: `embed-web`, and `matrix`,
       `discord`, `slack` each on its own, as CI does).
-- [ ] `cargo test --locked --workspace` passes; PG/feature-gated suites run where
-      the environment allows.
-- [ ] `cargo clippy --locked --workspace --all-targets` clean in each feature
-      config; `cargo fmt --all --check` clean.
+- [ ] `cargo test --locked --workspace --all-features` passes (CI tests the
+      union; some tests are gated on every feature together, e.g. `embed-web`
+      with the bridges, and no narrower set compiles them); PG/feature-gated
+      suites run where the environment allows.
+- [ ] `cargo clippy --locked --workspace --all-targets` clean with
+      `--all-features` and in each feature config; `cargo fmt --all --check`
+      clean.
 - [ ] `cargo deny check` clean.
 - [ ] `tools/check-noops.sh` clean (no deferred-work markers or unmessaged
       panics in shipped source).
