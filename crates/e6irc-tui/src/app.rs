@@ -78,7 +78,9 @@ pub const SERVER_BUFFER: &str = "*server*";
 pub struct Buffer {
     pub name: String,
     pub kind: BufferKind,
-    pub log: Vec<LogLine>,
+    /// Oldest first. A deque: once full, every new line drops the oldest,
+    /// which must cost one line, not a shift of the whole scrollback.
+    pub log: std::collections::VecDeque<LogLine>,
     seen_msgids: std::collections::HashSet<String>,
     msgid_order: std::collections::VecDeque<String>,
     latest_time: Option<String>,
@@ -98,7 +100,7 @@ impl Buffer {
         Self {
             name,
             kind,
-            log: Vec::new(),
+            log: std::collections::VecDeque::new(),
             seen_msgids: std::collections::HashSet::new(),
             msgid_order: std::collections::VecDeque::new(),
             latest_time: None,
@@ -110,13 +112,12 @@ impl Buffer {
     }
 
     fn push(&mut self, line: LogLine) {
-        self.log.push(line);
+        self.log.push_back(line);
         // Scrollback is bounded: every line here came from the server, so an
         // unbounded log is a remote party deciding how much memory this client
         // uses. Oldest lines go first, which is what a scrollback is.
         if self.log.len() > SCROLLBACK_LINES {
-            let excess = self.log.len() - SCROLLBACK_LINES;
-            self.log.drain(..excess);
+            self.log.pop_front();
             // `scroll` is an offset from the *end*, so dropping lines off the
             // front does not move the view and must not adjust it. Only the
             // push below did, and that is what the fixup accounts for.
@@ -167,7 +168,7 @@ impl Buffer {
 
     /// The window of lines to render for a pane `height` rows tall, when
     /// each line takes one row.
-    pub fn visible(&self, height: usize) -> &[LogLine] {
+    pub fn visible(&self, height: usize) -> std::collections::vec_deque::Iter<'_, LogLine> {
         self.visible_rows(height, |_| 1)
     }
 
@@ -175,7 +176,11 @@ impl Buffer {
     /// line takes `rows(line)` rows (a long line wraps): the lines ending at
     /// the scroll position whose rows fill the pane. The first may be taller
     /// than what is left of the pane; the renderer shows its end.
-    pub fn visible_rows(&self, height: usize, rows: impl Fn(&LogLine) -> usize) -> &[LogLine] {
+    pub fn visible_rows(
+        &self,
+        height: usize,
+        rows: impl Fn(&LogLine) -> usize,
+    ) -> std::collections::vec_deque::Iter<'_, LogLine> {
         let end = self.log.len().saturating_sub(self.scroll);
         let mut start = end;
         let mut filled = 0;
@@ -183,7 +188,7 @@ impl Buffer {
             start -= 1;
             filled += rows(&self.log[start]).max(1);
         }
-        &self.log[start..end]
+        self.log.range(start..end)
     }
 }
 
@@ -1092,7 +1097,7 @@ mod tests {
         // live tail would be worse than one that grew.
         assert!(
             buf.log
-                .last()
+                .back()
                 .expect("a line")
                 .text
                 .as_str()
@@ -1100,7 +1105,7 @@ mod tests {
         );
         assert!(
             buf.log
-                .first()
+                .front()
                 .expect("a line")
                 .text
                 .as_str()
@@ -1122,7 +1127,6 @@ mod tests {
         app.scroll_up(10);
         let before: Vec<String> = app.buffers[idx]
             .visible(5)
-            .iter()
             .map(|l| l.text.as_str().to_string())
             .collect();
         // Now push past the cap, so every new line drains one from the front.
@@ -1132,7 +1136,6 @@ mod tests {
         let buf = &app.buffers[idx];
         let after: Vec<String> = buf
             .visible(5)
-            .iter()
             .map(|l| l.text.as_str().to_string())
             .collect();
         // The user is looking at the same lines. Without the `scroll` fixup the
@@ -1179,7 +1182,7 @@ mod tests {
         let index = app.buffer_index(buffer).expect("buffer");
         app.buffers[index]
             .log
-            .last()
+            .back()
             .map(|line| line.text.to_string())
             .unwrap_or_default()
     }
@@ -1321,7 +1324,7 @@ mod tests {
         assert_eq!(outbound.line(), "PRIVMSG #c :ho");
         assert!(app.current().log.is_empty(), "no echo before admission");
         app.outbound_accepted(&outbound);
-        assert_eq!(app.current().log.last().unwrap().text, "ho");
+        assert_eq!(app.current().log.back().unwrap().text, "ho");
     }
 
     #[test]
@@ -1390,7 +1393,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("/msg nick text"))
         );
 
@@ -1401,7 +1404,7 @@ mod tests {
         assert_eq!(literal.line(), "PRIVMSG #c :/join is message text");
         app.outbound_accepted(&literal);
         assert_eq!(
-            app.current().log.last().unwrap().text,
+            app.current().log.back().unwrap().text,
             "/join is message text"
         );
 
@@ -1412,7 +1415,7 @@ mod tests {
         assert_eq!(direct.line(), "PRIVMSG Alice :hello there");
         assert_eq!(app.current().name, "Alice");
         app.outbound_accepted(&direct);
-        assert_eq!(app.current().log.last().unwrap().text, "hello there");
+        assert_eq!(app.current().log.back().unwrap().text, "hello there");
 
         app.input = "/raw WHOIS Alice".into();
         let Action::Send(raw) = app.on_enter() else {
@@ -1448,7 +1451,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("exceeds an IRC wire budget"))
         );
 
@@ -1542,7 +1545,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .unwrap()
                 .text
                 .as_str()
@@ -1743,7 +1746,7 @@ mod tests {
     fn actions_and_formatting_render_as_meant() {
         let mut app = App::new("#home".into(), "me".into());
         app.on_message(&msg(":alice!u@h PRIVMSG #home :\x01ACTION waves\x01"));
-        let line = app.current().log.last().expect("a line").clone();
+        let line = app.current().log.back().expect("a line").clone();
         assert_eq!(line.from, "* alice");
         assert_eq!(line.text, "waves");
         app.on_message(&msg(
@@ -1771,7 +1774,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("more unread lines"))
         );
         assert_eq!(
@@ -1816,7 +1819,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("paste of 2 lines"))
         );
         app.on_char('x');

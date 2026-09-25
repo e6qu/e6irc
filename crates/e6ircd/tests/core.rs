@@ -9113,6 +9113,94 @@ fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
     );
 }
 
+/// A permanently deleted account's rows are purged from the database (its
+/// messages) or cascade away (its channel access). Every shard's hot copy must
+/// follow: CHATHISTORY must not keep serving the account's lines, or its
+/// conversations, and FLAGS must not keep listing it.
+#[test]
+fn account_deletion_drops_its_hot_history_and_channel_access() {
+    const TARGETS: &str = "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z \
+                           timestamp=2999-01-01T00:00:00.000Z 10";
+    // No database: the rings are the whole record, so CHATHISTORY answers
+    // from exactly what the core holds.
+    let mut s = TestServer::new_no_persistence();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = register_with_caps(&mut s, 1, "boss", "batch draft/chathistory");
+    identify(&mut s, boss, "boss");
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "alice");
+    for conn in [boss, alice] {
+        s.line(conn, "JOIN #chan");
+        s.drain(conn);
+    }
+    s.line(boss, "PRIVMSG #chan :from boss");
+    s.line(alice, "PRIVMSG #chan :from alice");
+    s.line(alice, "PRIVMSG boss :private to boss");
+    s.drain(alice);
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".to_string(),
+        display: "#chan".to_string(),
+        account: "alice".to_string(),
+        flags: Some("o".to_string()),
+        applied: true,
+        label: None,
+    });
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan");
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("alice +o")),
+        "access granted before the deletion"
+    );
+    // A limit the ring can fill is answered from the ring, not the database.
+    s.line(boss, "CHATHISTORY LATEST #chan * 1");
+    let before = s.drain(boss);
+    assert!(
+        before.iter().any(|l| l.ends_with(":from alice")),
+        "{before:#?}"
+    );
+    s.line(boss, TARGETS);
+    let before = s.drain(boss);
+    assert!(
+        before.iter().any(|l| l.contains("TARGETS alice ")),
+        "{before:#?}"
+    );
+
+    s.core.handle(Input::Closed {
+        conn: alice,
+        reason: "Account permanently deleted".into(),
+    });
+    s.core.handle(Input::AccountDeleted {
+        account: "ALICE".into(),
+    });
+
+    s.line(boss, "CHATHISTORY LATEST #chan * 1");
+    let channel = s.drain(boss);
+    assert!(
+        !channel.iter().any(|l| l.contains("from alice")),
+        "the deleted account's channel line is still served: {channel:#?}"
+    );
+    assert!(
+        channel.iter().any(|l| l.ends_with(":from boss")),
+        "everyone else's lines stay: {channel:#?}"
+    );
+    s.line(boss, TARGETS);
+    let targets = s.drain(boss);
+    assert!(
+        !targets.iter().any(|l| l.contains("TARGETS alice ")),
+        "the deleted account's conversation is still listed: {targets:#?}"
+    );
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan");
+    let flags = s.drain(boss);
+    assert!(
+        !flags.iter().any(|l| l.contains("alice")),
+        "the deleted account is still on the access list: {flags:#?}"
+    );
+}
+
 /// A FLAGS revocation whose requester disconnects during the DB round-trip
 /// must still be applied to the hot access map — the DB has already committed
 /// the DELETE, and dropping the reply would leave the revoked account with

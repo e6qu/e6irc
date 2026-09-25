@@ -1519,11 +1519,12 @@ pub(super) fn version() -> &'static str {
 
 pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
     // Server-wide, whichever shards the users and channels live on.
-    let everyone = state.registered_users();
-    let users = everyone.len();
-    let invisible = everyone.iter().filter(|user| user.invisible).count();
+    let crate::core::state::UserCounts {
+        users,
+        invisible,
+        opers,
+    } = state.user_counts();
     let visible = users - invisible;
-    let opers = everyone.iter().filter(|user| user.oper).count();
     let (connections, channels, max) = state.census();
     let unknown = connections.saturating_sub(users);
     state.numeric(

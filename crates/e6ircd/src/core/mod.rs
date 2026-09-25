@@ -9,6 +9,7 @@
 //! session state and its assigned channel state.
 
 mod handler;
+mod hot_history;
 mod state;
 mod timer;
 
@@ -251,9 +252,10 @@ impl CoreIngress {
     }
 
     /// Tell every shard that `account` was permanently deleted, so each drops
-    /// its read-marker mirror entries for it: the database rows cascaded away
-    /// with the account, and nothing would otherwise evict them before a
-    /// restart.
+    /// what it mirrors of the rows that went with it — read markers, hot
+    /// history lines and conversations, channel access entries: the database
+    /// purged or cascaded them away, and nothing would otherwise evict them
+    /// before a restart.
     pub(crate) async fn broadcast_account_deleted(&self, account: &str) -> Result<(), ()> {
         self.broadcast(|| Input::AccountDeleted {
             account: account.to_owned(),
@@ -752,9 +754,9 @@ pub enum Input {
     ReadMarkersExpired {
         markers: Arc<[ExpiredReadMarker]>,
     },
-    /// An account was permanently deleted, broadcast to every shard so its
-    /// read-marker mirror drops the account's entries (their rows cascaded
-    /// away with the account row).
+    /// An account was permanently deleted, broadcast to every shard so it
+    /// drops its mirror of the account's rows: read markers, hot history,
+    /// channel access (see [`state::ServerState::forget_deleted_account`]).
     AccountDeleted {
         account: String,
     },
@@ -2753,7 +2755,7 @@ impl Core {
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
-            Input::AccountDeleted { account } => self.state.forget_account_read_markers(&account),
+            Input::AccountDeleted { account } => self.state.forget_deleted_account(&account),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,
