@@ -318,7 +318,15 @@ fn audit_nick_action(state: &mut ServerState, conn: ConnId, action: &str, nick: 
         .map(str::to_owned)
         .expect("a NickServ action on an owned nick comes from an identified session");
     let target = state.nick_key(nick);
-    if super::oper::queue_audit(state, &account, action, target.as_str(), "").is_err() {
+    if super::oper::queue_audit(
+        state,
+        &crate::db::AuditPrincipal::account(&account),
+        action,
+        &crate::db::AuditPrincipal::nick(target.as_str()),
+        "",
+    )
+    .is_err()
+    {
         services_unavailable(state, conn, "NickServ");
         return false;
     }
@@ -995,9 +1003,9 @@ fn enforce_rename(
 ) {
     if super::oper::queue_audit(
         state,
-        protector.as_str(),
+        &crate::db::AuditPrincipal::account(protector.as_str()),
         "NICK_GUEST_RENAME",
-        key.as_str(),
+        &crate::db::AuditPrincipal::nick(key.as_str()),
         "",
     )
     .is_err()
@@ -1778,9 +1786,9 @@ pub(crate) fn chanserv_status_on_owner(
     // It acts on someone else's session: audited, and not made unless it is.
     if super::oper::queue_audit(
         state,
-        &account,
+        &crate::db::AuditPrincipal::account(&account),
         change.audit_action(),
-        key.as_str(),
+        &crate::db::AuditPrincipal::channel(key.as_str()),
         &format!("nick={target_nick}"),
     )
     .is_err()

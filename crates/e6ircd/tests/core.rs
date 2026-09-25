@@ -8802,7 +8802,9 @@ fn returning_to_a_protected_nick_after_its_deadline_renames_at_once() {
     assert!(s.db_requests().iter().any(|request| matches!(
         request,
         e6ircd::core::DbRequest::AuditLog { actor, action, target, .. }
-            if actor == "alice" && action == "NICK_GUEST_RENAME" && target == "alice"
+            if *actor == e6ircd::db::AuditPrincipal::account("alice")
+                && action == "NICK_GUEST_RENAME"
+                && *target == e6ircd::db::AuditPrincipal::nick("alice")
     )));
 }
 
@@ -8833,7 +8835,8 @@ fn services_actions_on_other_sessions_are_audited() {
     let mut s = TestServer::new();
     s.core
         .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
-    let audits = |s: &mut TestServer| -> Vec<(String, String, String, String)> {
+    use e6ircd::db::AuditPrincipal;
+    let audits = |s: &mut TestServer| -> Vec<(AuditPrincipal, String, AuditPrincipal, String)> {
         s.db_requests()
             .into_iter()
             .filter_map(|request| match request {
@@ -8847,11 +8850,11 @@ fn services_actions_on_other_sessions_are_audited() {
             })
             .collect()
     };
-    let row = |actor: &str, action: &str, target: &str, detail: &str| {
+    let row = |actor: &str, action: &str, target: AuditPrincipal, detail: &str| {
         (
-            actor.to_string(),
+            AuditPrincipal::account(actor),
             action.to_string(),
-            target.to_string(),
+            target,
             detail.to_string(),
         )
     };
@@ -8859,11 +8862,17 @@ fn services_actions_on_other_sessions_are_audited() {
     let boss = s.register(2, "boss_");
     identify(&mut s, boss, "BOSS");
     s.line(boss, "PRIVMSG NickServ :GHOST Boss");
-    assert_eq!(audits(&mut s), [row("boss", "NICK_GHOST", "boss", "")]);
+    assert_eq!(
+        audits(&mut s),
+        [row("boss", "NICK_GHOST", AuditPrincipal::nick("boss"), "")]
+    );
     s.drain(stale);
     let holder = s.register(3, "boss");
     s.line(boss, "PRIVMSG NickServ :REGAIN boss");
-    assert_eq!(audits(&mut s), [row("boss", "NICK_REGAIN", "boss", "")]);
+    assert_eq!(
+        audits(&mut s),
+        [row("boss", "NICK_REGAIN", AuditPrincipal::nick("boss"), "")]
+    );
     s.drain(holder);
 
     let carol = s.register(4, "carol");
@@ -8880,7 +8889,12 @@ fn services_actions_on_other_sessions_are_audited() {
         s.line(boss, &format!("PRIVMSG ChanServ :{command} #chan CAROL"));
         assert_eq!(
             audits(&mut s),
-            [row("boss", action, "#chan", "nick=carol")],
+            [row(
+                "boss",
+                action,
+                AuditPrincipal::channel("#chan"),
+                "nick=carol"
+            )],
             "{command}"
         );
     }
