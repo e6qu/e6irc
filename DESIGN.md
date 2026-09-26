@@ -2498,7 +2498,11 @@ core is this binary: a refusal, or a welcome without the answer, is an
   is enabled follows the upstream's `CAP NEW` and `CAP DEL` for the whole
   session: the connection tracks it, and the driver asks for a wanted
   capability a `CAP NEW` offers and re-reads how it writes (echoes,
-  client-only tags, reply correlation) after every change. Names are compared
+  client-only tags, reply correlation) after every change. A `CAP ACK` or
+  `NAK` counts only for a name the connection asked for and is still waiting
+  on; the enabled set holds the program's own capability names
+  (`&'static str`), so an upstream streaming acknowledgements of names nobody
+  requested cannot enable anything or grow it. Names are compared
   and classified the network's way everywhere — its 005 `CASEMAPPING`,
   `CHANTYPES` and `STATUSMSG`, read through the client crate's
   `NetworkNames` — in the session tracker, the rejoin set, echo matching,
@@ -2651,7 +2655,15 @@ core is this binary: a refusal, or a welcome without the answer, is an
   offered once on the same connection. A failed SCRAM (a 904 on the proof, a
   forged or malformed server message, a credential SASLprep cannot carry) is
   never retried as PLAIN: that would hand the password to the server that just
-  failed to prove itself. SCRAM's iteration count is bounded at 1,000,000. A network may also carry a server
+  failed to prove itself. A mechanism the network refuses *before* any
+  credential is sent — Libera answers SCRAM's first message with
+  `e=other-error` for an account whose stored password predates SCRAM — is
+  followed by the next weaker one it offers, on the same connection, and never
+  silently: every consumer of `e6irc_client::Connection::sasl_notes` says which
+  was refused and what was offered instead (a `:*bnc*` notice here, stderr in
+  the CLI, a status line in the TUI). It hands the server nothing it could not
+  have asked for by not advertising SCRAM, so it is not opt-in; a failure after
+  a credential was sent is still final. SCRAM's iteration count is bounded at 1,000,000. A network may also carry a server
   password — the `PASS` a private server requires before `CAP LS`, `NICK` and
   `USER`; the driver and the connection test send it as the first line
   through the one `register()`. It is a `ServerPassword` (at most 504 bytes,
@@ -3599,6 +3611,14 @@ it bounds each HTTP request of `api` and `login` too. Those two open no IRC
 connection, so an IRC-only global option given to them (`--server`, `--nick`,
 `--tls`, the SASL and server-password options, ...) is an argument error
 naming it, not a silently ignored flag.
+A capability a command requires is asked for while the welcome burst is
+still arriving, and that burst is read the way the steady-state stream is
+(`Connection::require_capabilities` hands each line back): a Latin-1 MOTD
+line cannot fail `history` or `send`. `history --count` is cut to the
+server's 005 `CHATHISTORY` limit with a warning on stderr, instead of being
+sent and refused. A SASL mechanism the server refused before any credential,
+and the one offered instead (`Connection::sasl_notes`), is a warning on
+stderr.
 `send` confirms delivery: it requires `echo-message` and, without it, fails
 with "delivery cannot be confirmed" before sending anything; it gets past the
 registration burst with a PING round trip and exits 0 only on its own echo,
@@ -3698,13 +3718,19 @@ are never retried (the client stops with a final status, as the bouncer's
 driver parks) — a SCRAM server-final `e=invalid-proof`, `e=unknown-user`,
 `e=invalid-encoding` or `e=invalid-username-encoding` is a credential rejection
 exactly like a 904 answering the proof — and any other failure backs off exponentially from
-`--reconnect-delay` to five minutes. A refused channel is dropped from the
+`--reconnect-delay` to five minutes. Registering is not success: the backoff
+starts afresh only after a session stayed up for one liveness window, so a
+server that welcomes the client and drops it at once is answered with the
+same growing waits as one that refuses the connection. A refused channel is dropped from the
 session with a status line instead of failing the whole connect. A refusal is
 any error numeric or `FAIL JOIN` about that channel, not a list of known
 numerics: one this client never heard of (479, 489, 520, ...) would otherwise
 leave the join waiting out its deadline and the client reconnecting forever.
 Messages to a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
-server's `005 STATUSMSG` declares) are shown in the channel's buffer.
+server's `005 STATUSMSG` declares, and none before it declares any) are shown
+in the channel's buffer. The UI takes the connection's `NetworkNames` on
+connect and on every reconnect, so it names things as the network does from
+its first line, and nothing from a previous server survives a reconnect.
 Which targets are channels and which names are the same are the network's:
 every native client (CLI, TUI, and the `e6irc-client` join/refusal matching)
 reads `005 CASEMAPPING` and `CHANTYPES` through one
@@ -3730,10 +3756,23 @@ closed: malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
-uses, rejoins every channel confirmed for the client, pages `CHATHISTORY AFTER`
+uses — reading the rest of the welcome burst on the way as the steady-state
+stream is read, so a Latin-1 MOTD line cannot fail the connect, and showing
+that burst (MOTD, 005) in `*server*` — rejoins every channel confirmed for
+the client, pages `CHATHISTORY AFTER`
 the server's marker forward (by msgid, else time) until a short page — at most
 ten pages and never more than the scrollback — or loads the latest bounded
-window, and coalesces shared read-marker writes as buffer focus advances. A
+window, and coalesces shared read-marker writes as buffer focus advances.
+No page asks for more than the server's 005 `CHATHISTORY` limit: a page the
+server cut to its own limit would read as short, and a short page is taken
+to mean every unread line is loaded. A `FAIL CHATHISTORY` costs that channel
+its history, never the connection: the channel is joined, the refusal is said
+beside it, and when unread lines may remain its read marker is held as below.
+Read markers are sent only when the connection has `draft/read-marker`
+enabled — a fact of the connection handed to the UI with each session, not
+the `--no-read-markers` setting, so the two cannot drift into `MARKREAD`
+lines the server answers with 421. A SASL mechanism refused before any
+credential, and the one offered instead, is said on connect. A
 channel with unread lines beyond what was loaded says "more unread lines were
 not loaded", and its read marker is held at the last contiguously loaded line
 until a later session loads every unread line: loading the oldest page and

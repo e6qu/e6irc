@@ -14,16 +14,23 @@
 //! — `visible` slices the log against a caller-supplied height, which is where
 //! an off-by-one becomes a panic rather than a wrong pixel.
 
-use e6irc_client::OwnedMessage;
+use e6irc_client::{NetworkNames, OwnedMessage};
 use e6irc_proto::message::Message;
-use e6irc_tui::app::App;
+use e6irc_tui::app::{App, SessionStart};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
-    let mut app = App::new("#chan".to_string(), "nick".to_string());
+    let mut app = App::new(
+        "#chan".to_string(),
+        SessionStart {
+            nick: "nick".to_string(),
+            names: NetworkNames::default(),
+            read_markers: true,
+        },
+    );
     for line in text.split('\n').take(256) {
         let Ok(parsed) = Message::parse(line) else {
             continue;
