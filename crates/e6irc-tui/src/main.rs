@@ -14,10 +14,10 @@ use e6irc_client::credentials::{
 };
 use e6irc_client::liveness::{Heard, LIVENESS_WINDOW, Liveness};
 use e6irc_client::{
-    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, HistoryCoverage, JoinRefusal,
-    NetworkNames, OwnedMessage, Registered, TerminalSafe,
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, HistoryCoverage,
+    HistoryRefusal, JoinRefusal, NetworkNames, OwnedMessage, Registered, TerminalSafe,
 };
-use e6irc_tui::app::{App, LogLine, SCROLLBACK_LINES};
+use e6irc_tui::app::{App, LogLine, SCROLLBACK_LINES, SessionStart};
 use e6irc_tui::keys::{self, KeyOutcome};
 use e6irc_tui::reconnect::{AfterFailure, ReconnectPolicy};
 use ratatui::Terminal;
@@ -113,15 +113,18 @@ struct Cli {
     /// confirm each JOIN with its history, before the attempt is abandoned.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
     response_timeout: u64,
-    /// Lines asked for per history request for each joined channel. With the
-    /// server's shared read marker these are the lines after it, paged forward
-    /// until a short page, for at most ten pages (and never more than the
-    /// scrollback holds); a channel with unread lines beyond that says so, and
-    /// its read marker stays at the last line loaded. Without a marker they
-    /// are the latest lines. Zero disables history.
+    /// Lines asked for per history request for each joined channel, and never
+    /// more than the server's CHATHISTORY limit. With the server's shared read
+    /// marker these are the lines after it, paged forward until a short page,
+    /// for at most ten pages (and never more than the scrollback holds); a
+    /// channel with unread lines beyond that says so, and its read marker
+    /// stays at the last line loaded. Without a marker they are the latest
+    /// lines. A channel whose history the server refuses is joined without
+    /// it, and says so. Zero disables history.
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(0..=1000))]
     history_lines: u64,
-    /// Disable draft/read-marker synchronization for servers without the cap.
+    /// Do not ask for draft/read-marker, for servers without it: read
+    /// positions are then neither loaded nor sent.
     #[arg(long)]
     no_read_markers: bool,
 }
@@ -146,9 +149,14 @@ const QUIT_GRACE: Duration = Duration::from_secs(2);
 /// Events the render loop consumes.
 enum Ev {
     Net(ClientEvent),
-    /// A new session is registered under this server-confirmed nickname.
-    Connected(String),
+    /// A new session is registered.
+    Connected(SessionStart),
+    /// What SASL did on the way that its user should know: a mechanism the
+    /// server refused before any credential, and the one offered instead.
+    SaslNote(String),
     JoinRefused(JoinRefusal),
+    /// The server refused this channel's history; the channel is joined.
+    HistoryRefused(String, HistoryRefusal),
     /// This channel's unread history did not all load.
     HistoryGap(String),
     /// Every unread line of this channel loaded: a gap left by an earlier
@@ -243,10 +251,8 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     let mut joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
     let Session {
         connection: conn,
-        nick: confirmed_nick,
-        bootstrap,
-        refused,
-        coverage,
+        start,
+        events,
     } = connect_and_join(
         &connection_options,
         &mut joined_channels,
@@ -254,6 +260,7 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         read_markers,
     )
     .await?;
+    let confirmed_nick = start.nick.clone();
 
     // Bounded: the server decides how fast this fills, and the render loop
     // only drains it between draws. A full queue makes the reader task wait,
@@ -272,7 +279,10 @@ async fn async_main(cli: Cli) -> io::Result<()> {
             options: connection_options.clone(),
             history,
             read_markers,
-            policy: ReconnectPolicy::new(Duration::from_secs(cli.reconnect_delay)),
+            policy: ReconnectPolicy::new(
+                Duration::from_secs(cli.reconnect_delay),
+                std::time::Instant::now(),
+            ),
         },
     ));
 
@@ -282,14 +292,8 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     let mut signalled = quit_on_signal()?;
     let mut terminal = ratatui::init();
     restore_paste_on_panic();
-    let mut app = App::new(cli.channel, confirmed_nick);
-    for refusal in refused {
-        apply(&mut app, Ev::JoinRefused(refusal));
-    }
-    for event in bootstrap {
-        apply(&mut app, Ev::Net(event));
-    }
-    for event in coverage.into_iter().filter_map(coverage_event) {
+    let mut app = App::new(cli.channel, start);
+    for event in events {
         apply(&mut app, event);
     }
     let result = match crossterm::execute!(io::stdout(), event::EnableBracketedPaste) {
@@ -448,6 +452,7 @@ impl HistoryWindow {
 struct Reconnect {
     options: ConnectionOptions,
     history: HistoryWindow,
+    /// Whether `draft/read-marker` is asked for.
     read_markers: bool,
     policy: ReconnectPolicy,
 }
@@ -524,7 +529,7 @@ async fn network_task(
             return;
         }
 
-        let mut delay = policy.first_delay();
+        let mut delay = policy.session_ended(std::time::Instant::now());
         let mut stale = Stale::default();
         loop {
             // Lines that raced the disconnect notification are not delivered
@@ -561,20 +566,21 @@ async fn network_task(
                     }
                 },
             };
-            policy.connected();
+            policy.connected(std::time::Instant::now());
             // Right before the new connection is handed to the relay: a line
             // admitted after the last drain was typed against the old one.
             stale.drain(&mut out_rx);
             if !stale.report(&net_tx).await {
                 return;
             }
-            conn = session.connection;
-            own_nick = session.nick.clone();
-            let mut events = vec![Ev::Connected(session.nick)];
-            events.extend(session.refused.into_iter().map(Ev::JoinRefused));
-            events.extend(session.bootstrap.into_iter().map(Ev::Net));
-            events.extend(session.coverage.into_iter().filter_map(coverage_event));
-            for event in events {
+            let Session {
+                connection,
+                start,
+                events,
+            } = session;
+            conn = connection;
+            own_nick.clone_from(&start.nick);
+            for event in std::iter::once(Ev::Connected(start)).chain(events) {
                 if net_tx.send(event).await.is_err() {
                     return;
                 }
@@ -680,17 +686,18 @@ async fn finish(conn: &mut Connection, out_rx: &mut mpsc::Receiver<Queued>) -> S
 /// A registered connection and everything the UI starts a session from.
 struct Session {
     connection: Connection,
-    /// The nickname the server confirmed, which is not always the one asked for.
-    nick: String,
-    bootstrap: Vec<ClientEvent>,
-    refused: Vec<JoinRefusal>,
-    /// How much history each joined channel loaded.
-    coverage: Vec<(String, HistoryCoverage)>,
+    /// What the connection is: the nickname the server confirmed (not always
+    /// the one asked for), the network's naming rules, and whether it keeps
+    /// read markers.
+    start: SessionStart,
+    /// Everything read and learned on the way, in order: the welcome burst,
+    /// each join with its history, refusals, and SASL's notes.
+    events: Vec<Ev>,
 }
 
 /// What the UI must know about a channel's history: whether the read marker
 /// is to be held short of a gap, or released because none remains.
-fn coverage_event((channel, coverage): (String, HistoryCoverage)) -> Option<Ev> {
+fn coverage_event(channel: String, coverage: HistoryCoverage) -> Option<Ev> {
     match coverage {
         HistoryCoverage::UnreadBeyondLoaded => Some(Ev::HistoryGap(channel)),
         HistoryCoverage::AllUnread => Some(Ev::HistoryCaughtUp(channel)),
@@ -701,6 +708,7 @@ fn coverage_event((channel, coverage): (String, HistoryCoverage)) -> Option<Ev> 
 /// Register and join `channels`. A channel the server refuses is taken out of
 /// the set and reported: one closed channel must not fail the whole session,
 /// or every reconnect registers, is refused the same channel, and drops again.
+/// A channel whose history the server refuses is joined without it, and said.
 async fn connect_and_join(
     options: &ConnectionOptions,
     channels: &mut std::collections::BTreeSet<String>,
@@ -711,6 +719,11 @@ async fn connect_and_join(
         mut connection,
         nick,
     } = options.connect_registered().await?;
+    let mut events: Vec<Ev> = connection
+        .sasl_notes()
+        .iter()
+        .map(|note| Ev::SaslNote(note.clone()))
+        .collect();
     let mut capabilities = Vec::new();
     if history.page_lines > 0 {
         capabilities.extend(["batch", "draft/chathistory", "server-time"]);
@@ -718,34 +731,43 @@ async fn connect_and_join(
     if read_markers {
         capabilities.push("draft/read-marker");
     }
-    connection.require_capabilities(&capabilities).await?;
-    let mut bootstrap = Vec::new();
-    let mut refused = Vec::new();
-    let mut coverage = Vec::new();
+    // The welcome burst is still arriving: its MOTD and 005 are the UI's.
+    connection
+        .require_capabilities(&capabilities, |event| {
+            events.push(Ev::Net(event.into()));
+            Ok(())
+        })
+        .await?;
     for channel in channels.clone() {
         match connection
             .join_with_history(&channel, history.page_lines, history.max_lines)
             .await
         {
             Ok(joined) => {
-                bootstrap.extend(joined.events);
-                coverage.push((channel, joined.coverage));
+                events.extend(joined.events.into_iter().map(Ev::Net));
+                if let Some(refusal) = joined.refusal {
+                    events.push(Ev::HistoryRefused(channel.clone(), refusal));
+                }
+                events.extend(coverage_event(channel, joined.coverage));
             }
             Err(error) => {
                 let Some(refusal) = JoinRefusal::from_error(&error) else {
                     return Err(error);
                 };
                 channels.remove(&channel);
-                refused.push(refusal);
+                events.push(Ev::JoinRefused(refusal));
             }
         }
     }
+    let start = SessionStart {
+        nick,
+        names: connection.names().clone(),
+        read_markers: connection.enabled("draft/read-marker"),
+    };
     Ok(Session {
         connection,
-        nick,
-        bootstrap,
-        refused,
-        coverage,
+        start,
+        events,
     })
 }
 
@@ -870,13 +892,17 @@ fn apply(app: &mut App, event: Ev) {
         Ev::Net(ClientEvent::Rejected(rejected)) => {
             app.status(format!("server input rejected: {rejected}"));
         }
-        Ev::Connected(nick) => {
-            app.set_nick(&nick);
-            app.set_connected(true);
-            app.status(format!("reconnected as {nick}"));
+        Ev::Connected(start) => {
+            let status = format!("reconnected as {}", start.nick);
+            app.begin_session(start);
+            app.status(status);
         }
+        Ev::SaslNote(note) => app.status(format!("SASL: {note}")),
         Ev::JoinRefused(refusal) => {
             app.status(format!("{refusal}; it will not be rejoined"));
+        }
+        Ev::HistoryRefused(channel, refusal) => {
+            app.history_refused(&channel, &format!("{refusal}; joined without it"));
         }
         Ev::HistoryGap(channel) => app.hold_read_marker(&channel),
         Ev::HistoryCaughtUp(channel) => app.release_read_marker(&channel),
@@ -1194,6 +1220,19 @@ mod tests {
     use clap::Parser;
     use ratatui::backend::TestBackend;
 
+    /// An app on a connection with the default naming rules that keeps read
+    /// markers.
+    fn test_app(channel: &str, nick: &str) -> App {
+        App::new(
+            channel.to_owned(),
+            SessionStart {
+                nick: nick.to_owned(),
+                names: NetworkNames::default(),
+                read_markers: true,
+            },
+        )
+    }
+
     fn parses(arguments: &[&str]) -> bool {
         Cli::try_parse_from(
             [
@@ -1277,7 +1316,7 @@ mod tests {
 
     #[test]
     fn conversation_rail_keeps_the_active_buffer_first_and_exposes_unread() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         app.on_message(&message(":alice!u@h PRIVMSG #other :hello"));
         assert_eq!(
             conversation_rail_text(&app),
@@ -1305,7 +1344,7 @@ mod tests {
     /// character just before it: the cursor is never a column off the text.
     #[test]
     fn the_composer_cursor_follows_its_text_across_wide_characters() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         for character in "a界界界".chars() {
             app.on_char(character);
         }
@@ -1323,7 +1362,7 @@ mod tests {
 
     #[test]
     fn tiny_terminals_render_without_panicking() {
-        let app = App::new("#home".into(), "me".into());
+        let app = test_app("#home", "me");
         for (width, height) in [(1, 1), (10, 3), (24, 5)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -1334,7 +1373,7 @@ mod tests {
     /// A line longer than the pane wraps; its end is on screen, not clipped.
     #[test]
     fn a_long_line_wraps_so_its_last_word_is_shown() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         let long = format!("{} finalword", "x".repeat(189));
         app.on_message(&message(&format!(":alice!u@h PRIVMSG #home :{long}")));
         let backend = TestBackend::new(40, 10);
@@ -1368,7 +1407,7 @@ mod tests {
     #[test]
     fn a_read_marker_waits_out_a_disconnect_instead_of_being_lost() {
         let (out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.set_connected(false);
         app.on_message(&message(
             "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :hi",
@@ -1403,7 +1442,7 @@ mod tests {
         let mut stale = Stale::default();
         stale.drain(&mut out_rx);
         assert!(stale.report(&net_tx).await);
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         while let Ok(event) = net_rx.try_recv() {
             apply(&mut app, event);
         }
@@ -1619,16 +1658,21 @@ mod tests {
         let session = connect_and_join(&options, &mut channels, HistoryWindow::new(0), false)
             .await
             .expect("a refused channel does not fail the session");
-        assert_eq!(session.nick, "upstream");
+        assert_eq!(session.start.nick, "upstream");
         assert_eq!(
             channels,
             std::collections::BTreeSet::from(["#open".to_owned()])
         );
-        assert_eq!(session.refused.len(), 1);
+        let refused = session
+            .events
+            .into_iter()
+            .filter(|event| matches!(event, Ev::JoinRefused(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(refused.len(), 1);
 
-        let mut app = App::new("#open".into(), session.nick);
-        for refusal in session.refused {
-            apply(&mut app, Ev::JoinRefused(refusal));
+        let mut app = App::new("#open".into(), session.start);
+        for event in refused {
+            apply(&mut app, event);
         }
         let shown = app.current().log.back().expect("status").text.to_string();
         assert_eq!(
@@ -1641,6 +1685,113 @@ mod tests {
             Ev::Stopped("the server banned this connection".into()),
         );
         assert!(app.gave_up() && !app.connected());
+    }
+
+    /// The welcome burst is still arriving when the client asks for its
+    /// capabilities. A Latin-1 MOTD line in it must not fail the connect, and
+    /// the burst is the UI's: the MOTD is shown, and the 005 decides how the
+    /// UI names things from the first line on. A history page larger than the
+    /// server's CHATHISTORY limit is never asked for, and a history request
+    /// the server refuses costs the channel its history, not the connection.
+    #[tokio::test]
+    async fn the_welcome_burst_reaches_the_ui_and_a_refused_history_keeps_the_join() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let mut seen = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply: &[u8] = match line.as_str() {
+                    "CAP LS 302" => {
+                        b":srv CAP * LS :batch draft/chathistory server-time draft/read-marker\r\n"
+                    }
+                    "CAP END" => {
+                        b":srv 001 me :Welcome\r\n\
+                          :srv 005 me CASEMAPPING=ascii STATUSMSG=@ CHATHISTORY=5 \
+                          :are supported by this server\r\n\
+                          :srv 372 me :- caf\xe9 au lait\r\n"
+                    }
+                    "CAP REQ :server-time" => b":srv CAP * ACK :server-time\r\n",
+                    "CAP REQ :batch draft/chathistory server-time draft/read-marker" => {
+                        b":srv CAP me ACK :batch draft/chathistory server-time draft/read-marker\r\n"
+                    }
+                    "JOIN #open" => b":me!u@h JOIN #open\r\n:srv 366 me #open :End of NAMES\r\n",
+                    "CHATHISTORY LATEST #open * 5" => {
+                        b":srv FAIL CHATHISTORY MESSAGE_ERROR #open :history store unavailable\r\n"
+                    }
+                    _ => b"",
+                };
+                seen.push(line);
+                writer.write_all(reply).await.unwrap();
+            }
+            seen
+        });
+        let options = ConnectionOptions {
+            address,
+            tls: false,
+            tls_server_name: None,
+            nick: "me".into(),
+            username: "ident".into(),
+            realname: "real".into(),
+            authentication: e6irc_client::Authentication::None,
+            response_deadline: Duration::from_secs(5),
+            cleartext_credentials: CleartextCredentials::Refuse,
+            server_password: None,
+        };
+        let mut channels = std::collections::BTreeSet::from(["#open".to_owned()]);
+        let session = connect_and_join(&options, &mut channels, HistoryWindow::new(50), true)
+            .await
+            .expect("a Latin-1 MOTD line and a refused history do not fail the connect");
+        assert!(session.start.read_markers);
+        assert!(!session.start.names.eq("#a[", "#a{"), "CASEMAPPING=ascii");
+        let Session {
+            connection,
+            start,
+            events,
+        } = session;
+        drop(connection);
+        let seen = server.await.unwrap();
+        assert!(
+            seen.iter()
+                .any(|line| line == "CHATHISTORY LATEST #open * 5"),
+            "the page fits the server's limit: {seen:?}"
+        );
+
+        let mut app = App::new("#open".into(), start);
+        for event in events {
+            apply(&mut app, event);
+        }
+        let shown = |app: &App, name: &str| -> Vec<String> {
+            app.buffers
+                .iter()
+                .filter(|buffer| buffer.name == name)
+                .flat_map(|buffer| buffer.log.iter().map(|line| line.text.to_string()))
+                .collect()
+        };
+        assert!(
+            shown(&app, "*server*")
+                .iter()
+                .any(|text| text.contains("caf\u{fffd} au lait")),
+            "the MOTD is shown: {:?}",
+            shown(&app, "*server*")
+        );
+        assert!(
+            shown(&app, "#open")
+                .iter()
+                .any(|text| text.contains("history store unavailable")),
+            "the refused history is said beside its channel: {:?}",
+            shown(&app, "#open")
+        );
+        // STATUSMSG came from the connection's 005: `@#open` is #open's.
+        app.on_message(&message(":op!o@h PRIVMSG @#open :ops only"));
+        assert_eq!(
+            shown(&app, "#open").last().map(String::as_str),
+            Some("ops only")
+        );
     }
 
     /// A half-open connection reads as nothing forever. The client asks after

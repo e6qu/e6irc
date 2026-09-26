@@ -977,6 +977,34 @@ decoding):
   turn them into the rejection notice. `core_dispatch` now also fuzzes with
   accounts enabled.
 
+A review of the client library, the TUI and the CLI found, and this change
+fixes, each with a test that failed before:
+
+- **A server could grow the connection's capability state without end.**
+  Every name in every `CAP ACK` was enabled, requested or not, each by a
+  linear scan: a peer streaming acknowledgements (an upstream network the
+  bouncer connects to included) cost unbounded memory and quadratic time. A
+  verdict now counts only for a name awaiting one, and the enabled set holds
+  the program's own names, so the server cannot add one.
+- **One Latin-1 line in the welcome burst failed the TUI's connect and
+  `e6irc history`**, and the TUI never saw the MOTD or the 005 read while its
+  capabilities were requested. That request now reads the burst as the
+  steady-state stream does and hands every line back; the TUI shows it and
+  takes the connection's naming rules (CASEMAPPING, CHANTYPES, STATUSMSG) on
+  every connect, and its second copy of the STATUSMSG sigils is gone.
+- **`--history-lines` above the server's limit broke every connect**, and a
+  server that cut pages to its own limit made the client mark unread lines
+  read everywhere. Pages fit the 005 `CHATHISTORY` limit, a refused history
+  request costs only that channel's history, and `history --count` is cut to
+  the limit with a warning.
+- **`--no-read-markers` still sent `MARKREAD`**: markers now follow whether
+  the connection has `draft/read-marker` enabled.
+- **A server that dropped the TUI right after welcoming it was reconnected to
+  every two seconds forever**: the backoff starts afresh only after a session
+  stays up for one liveness window.
+- **The SCRAM-to-PLAIN step after a refusal before any credential was said
+  only by the bouncer**; the TUI and the CLI now say it too.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
