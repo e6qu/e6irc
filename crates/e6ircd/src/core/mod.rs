@@ -17,7 +17,8 @@ mod state;
 mod timer;
 
 pub(crate) use handler::{
-    HistoryFail, cap_reply_lines, cap_version_302, fit_trailing, invalid_utf8_fail,
+    HistoryFail, cap_reply_lines, cap_version_302, fail_line, fit_trailing, fitted_line,
+    invalid_utf8_fail, server_notice,
 };
 
 /// How long an unregistered connection may hold its slot before the core
@@ -2584,13 +2585,7 @@ impl CoreWorker {
             // A LIST or WHO reply being paced out needs a turn once its
             // client has read some of it, even if nothing else happens
             // meanwhile.
-            let pacing = !self.core.state.paced_replies.is_empty()
-                || self
-                    .core
-                    .state
-                    .channel_lists
-                    .values()
-                    .any(list::ListProgress::is_sending);
+            let pacing = !self.core.state.pacing.is_empty();
             let pace = tokio::time::sleep(PACE_INTERVAL);
             let mut paced = false;
             let popped = tokio::select! {
@@ -3364,8 +3359,7 @@ impl Core {
         }
         // Any event is a chance for a paced LIST or WHO reply to use the room
         // its client's send queue has made since.
-        handler::pace_channel_lists(&mut self.state);
-        handler::pace_who_replies(&mut self.state);
+        handler::pace_replies(&mut self.state);
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
         // overflows someone else's queue — hence the loop). Dropping the
@@ -5537,6 +5531,249 @@ mod ingress_tests {
         assert!(
             shards.cores[1].state.channels.get(&key).is_none(),
             "the channel is held open by a member whose session is gone"
+        );
+    }
+
+    /// A WHO or LIST answered by another shard after the asking connection
+    /// closed finds no session to send to or pace for: the answer goes with
+    /// the session, and the shard goes on serving everyone else.
+    #[test]
+    fn a_remote_who_or_list_answered_after_its_session_closed_is_dropped() {
+        let mut shards = Shards::new();
+        let here = shards.owned[0];
+        shards.client(2, "alice", "");
+        shards.line(2, &format!("JOIN {here}"));
+        shards.client(1, "bob", "batch labeled-response");
+        shards.push_line(1, &format!("WHO {here}"));
+        shards.push_line(1, &format!("@label=w1 WHO {here}"));
+        shards.push_line(1, "LIST");
+        shards.cores[1].handle(Input::Closed {
+            conn: ConnId(1),
+            reason: "Connection reset".into(),
+        });
+        shards.settle();
+        assert!(
+            shards.cores[1].state.pacing.is_empty(),
+            "nothing is paced to a connection that is gone"
+        );
+        shards.client(3, "carol", "");
+        shards.line(3, &format!("WHO {here}"));
+        let out = shards.drain(3);
+        assert_eq!(lines_with(&out, " 352 ").len(), 1, "{out:#?}");
+        assert_eq!(lines_with(&out, " 315 ").len(), 1, "{out:#?}");
+    }
+
+    /// Two JOINs to one channel on another shard, the first refused: the
+    /// channel is still in flight until the second is answered, so a NICK
+    /// sent between the two answers still reaches the owner that admits it.
+    #[test]
+    fn a_second_join_in_flight_to_one_channel_still_hears_member_updates() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(1, "bob", "");
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(1, &format!("MODE {there} +k sekrit"));
+        shards.client(2, "alice", "");
+        shards.drain(1);
+        shards.push_line(2, &format!("JOIN {there} wrong"));
+        shards.push_line(2, &format!("JOIN {there} sekrit"));
+        for super::Routed { to, input } in shards.cores[0].take_effects() {
+            shards.cores[to.0].handle(input);
+        }
+        let mut answers = shards.cores[1].take_effects().into_iter();
+        let refused = answers.next().expect("the first JOIN is answered");
+        assert!(
+            matches!(refused.input, Input::ChannelJoinResult { .. }),
+            "the refusal comes first: {:?}",
+            refused.input
+        );
+        shards.cores[refused.to.0].handle(refused.input);
+        // The refusal is in; the second JOIN is not answered yet.
+        shards.push_line(2, "NICK alicia");
+        for super::Routed { to, input } in answers {
+            shards.cores[to.0].handle(input);
+        }
+        shards.settle();
+        let out = shards.drain(1);
+        assert_eq!(
+            lines_with(&out, " NICK ")
+                .iter()
+                .filter(|l| l.ends_with("alicia"))
+                .count(),
+            1,
+            "bob hears the NICK: {out:#?}"
+        );
+        let key = shards.cores[1].state.chan_key(there);
+        let (_, _, identity, _) = shards.cores[1].state.channels[&key]
+            .member_profiles()
+            .find(|(conn, ..)| *conn == ConnId(2))
+            .expect("alicia is a member");
+        assert_eq!(identity.nick, "alicia", "the owner holds the new nick");
+    }
+
+    /// `JOIN #c wrong; JOIN #c right; JOIN 0`: the refused JOIN admitted
+    /// nothing, so it is the admitted one the `JOIN 0` parts — the user ends
+    /// in no channel, on two workers as on one.
+    #[test]
+    fn join_zero_parts_the_join_that_was_admitted_not_the_first_answered() {
+        for mut shards in [Shards::new(), Shards::on_one_worker()] {
+            let there = shards.owned[1];
+            shards.client(1, "bob", "");
+            shards.line(1, &format!("JOIN {there}"));
+            shards.line(1, &format!("MODE {there} +k sekrit"));
+            shards.client(2, "alice", "");
+            shards.drain(1);
+            shards.push_line(2, &format!("JOIN {there} wrong"));
+            shards.push_line(2, &format!("JOIN {there} sekrit"));
+            shards.push_line(2, "JOIN 0");
+            shards.settle();
+            let out = shards.drain(2);
+            let join_at = out
+                .iter()
+                .position(|l| l.contains(&format!(" JOIN {there}")));
+            let part_at = out
+                .iter()
+                .position(|l| l.contains(&format!(" PART {there}")));
+            assert!(
+                join_at.is_some() && join_at < part_at,
+                "the JOIN, then its PART: {out:#?}"
+            );
+            shards.drain(1);
+            shards.line(1, &format!("NAMES {there}"));
+            let names = shards.drain(1);
+            assert!(lines_with(&names, "alice").is_empty(), "{names:#?}");
+            let session = &shards.cores[shards.shard_of(2)].state.sessions[&ConnId(2)];
+            assert_eq!(session.joins_in_flight().count(), 0);
+        }
+    }
+
+    /// Batch references name the shard that opened them; everything else a
+    /// labeled response says must not depend on how many workers there are.
+    fn without_batch_references(out: Vec<String>) -> Vec<String> {
+        out.into_iter()
+            .map(|line| {
+                line.split(' ')
+                    .map(|word| match word.find("batch=") {
+                        Some(at) => format!("{}batch=*", &word[..at]),
+                        None if word.starts_with('+') || word.starts_with('-') => {
+                            if line.contains(" BATCH ") {
+                                word[..1].to_string()
+                            } else {
+                                word.to_string()
+                            }
+                        }
+                        None => word.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    /// What a labeled MODE, KICK or JOIN answers the operator who sent it —
+    /// including its own copy of what the channel is told — is the same on
+    /// one worker and on two, where the channel lives on another shard.
+    fn labeled_channel_changes(mut shards: Shards, there: &str, registered: &str) -> Vec<String> {
+        let folded = shards.cores[0]
+            .state
+            .chan_key(registered)
+            .as_str()
+            .to_string();
+        for core in &mut shards.cores {
+            core.preload_founders(vec![(folded.clone(), "nobody".into())]);
+            core.preload_mlock(vec![(folded.clone(), "+m".into())])
+                .expect("a valid mode lock");
+        }
+        shards.client(2, "alice", "batch labeled-response");
+        shards.client(1, "bob", "");
+        shards.client(3, "carol", "");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(3, &format!("JOIN {there}"));
+        shards.drain(2);
+        let mut answers = Vec::new();
+        for line in [
+            format!("@label=m1 MODE {there} +v bob"),
+            format!("@label=m2 MODE {there} +m-t"),
+            format!("@label=m3 MODE {there} +o nobody"),
+            format!("@label=k1 KICK {there} bob :out"),
+            format!("@label=k2 KICK {there} carol,nobody"),
+            format!("@label=j1 JOIN {registered}"),
+        ] {
+            shards.line(2, &line);
+            answers.extend(without_batch_references(shards.drain(2)));
+        }
+        answers
+    }
+
+    #[test]
+    fn labeled_mode_kick_and_join_answer_the_actor_alike_on_one_worker_and_two() {
+        // Both channels live on the shard alice's session does not.
+        let two = Shards::new();
+        let there = two.owned[1];
+        let registered = [
+            "#registered",
+            "#enrolled",
+            "#recorded",
+            "#listed",
+            "#signed",
+        ]
+        .into_iter()
+        .find(|name| two.cores[0].state.channel_owner(name).shard() == CoreShardId(1))
+        .expect("a channel owned by the second shard");
+        let one = labeled_channel_changes(Shards::on_one_worker(), there, registered);
+        let two = labeled_channel_changes(two, there, registered);
+        assert_eq!(one, two);
+        for label in ["m1", "m2", "k1"] {
+            let tagged = lines_with(&two, &format!("@label={label} "));
+            assert_eq!(tagged.len(), 1, "{label}: {two:#?}");
+            assert!(
+                tagged[0].contains(" MODE ") || tagged[0].contains(" KICK "),
+                "{label} is answered by the actor's own echo: {two:#?}"
+            );
+        }
+        assert!(lines_with(&two, " ACK").is_empty(), "{two:#?}");
+        let start = two
+            .iter()
+            .position(|l| l.contains("label=j1"))
+            .expect("the JOIN is answered");
+        let join_at = two[start..].iter().position(|l| l.contains(" JOIN #"));
+        let lock_at = two[start..]
+            .iter()
+            .position(|l| l.contains(":ChanServ MODE #"));
+        assert!(
+            join_at.is_some() && join_at < lock_at,
+            "the joiner hears its JOIN, then the lock it brought about: {two:#?}"
+        );
+    }
+
+    /// A labeled ChanServ VOICE of a channel on another shard answers with
+    /// the requester's own copy of the MODE inside its labeled response, as
+    /// on one worker.
+    #[test]
+    fn a_labeled_chanserv_voice_answers_alike_on_one_worker_and_two() {
+        let answer = |mut shards: Shards, there: &str| {
+            let folded = shards.cores[0].state.chan_key(there).as_str().to_string();
+            for core in &mut shards.cores {
+                core.preload_founders(vec![(folded.clone(), "alice".into())]);
+            }
+            shards.client(2, "alice", "batch labeled-response");
+            identify_on(&mut shards, 2, "alice");
+            shards.line(2, &format!("JOIN {there}"));
+            shards.drain(2);
+            shards.line(2, &format!("@label=v1 PRIVMSG ChanServ :VOICE {there}"));
+            without_batch_references(shards.drain(2))
+        };
+        let two = Shards::with_database();
+        let there = two.owned[1];
+        let one = answer(Shards::build(1, true), there);
+        let two = answer(two, there);
+        assert_eq!(one, two);
+        assert_eq!(lines_with(&two, "label=v1").len(), 1, "{two:#?}");
+        assert_eq!(
+            lines_with(&two, "@batch=* :irc.test MODE ").len(),
+            1,
+            "{two:#?}"
         );
     }
 

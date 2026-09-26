@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
 
@@ -1717,16 +1718,22 @@ pub(crate) struct Session {
     pub bot: bool,
     /// Joined channels.
     pub channels: HashSet<ChanKey>,
-    /// JOINs routed to a channel owned by another shard and not yet answered.
-    /// They count towards the per-session channel limit from the moment they
-    /// are sent: the limit is enforced here, before routing, and a pipelined
-    /// burst would otherwise be admitted without bound while its answers are
-    /// in flight. A channel this shard owns is joined in the same step and
-    /// never appears here.
-    pub pending_joins: HashSet<ChanKey>,
-    /// The subset of `pending_joins` a later `JOIN 0` must part once answered:
-    /// the JOIN reached its owner first, so it is honoured, then left.
-    pub part_on_join: HashSet<ChanKey>,
+    /// JOINs routed to a channel owned by another shard and not yet answered,
+    /// counted per channel: a client may send several to one channel before
+    /// the first is answered (a wrong key, then the right one), and the
+    /// channel is in flight until the last of them is. They count towards the
+    /// per-session channel limit from the moment they are sent: the limit is
+    /// enforced here, before routing, and a pipelined burst would otherwise
+    /// be admitted without bound while its answers are in flight. A channel
+    /// this shard owns is joined in the same step and never appears here.
+    /// Written only through [`Session::join_sent`] and
+    /// [`Session::join_answered`].
+    pending_joins: HashMap<ChanKey, NonZeroUsize>,
+    /// How many of a channel's `pending_joins` — the oldest, as the owner
+    /// answers in order — a later `JOIN 0` must part once answered: each
+    /// reached its owner first, so it is honoured, then left. Never more than
+    /// the channel's `pending_joins`.
+    part_on_join: HashMap<ChanKey, NonZeroUsize>,
     /// When this session's last KNOCK was delivered, on the monotonic clock: a
     /// user may knock once per `KNOCK_DELAY` (Solanum's `knock_delay`).
     pub last_knock: Option<e6irc_proto::time::MonoMillis>,
@@ -1734,6 +1741,12 @@ pub(crate) struct Session {
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
     pub multiline: Option<MultilineBatch>,
+    /// This connection's LIST still answering, gathering or sending. On the
+    /// session, so a LIST cannot be paced to a connection that is gone.
+    pub(crate) channel_list: Option<crate::core::list::ListProgress>,
+    /// This connection's WHO replies too long to queue at once, still going
+    /// out as its send queue drains. On the session for the same reason.
+    pub(crate) paced_who: Option<crate::core::paced::PacedReplies>,
     /// Labeled commands whose one response is being assembled from several
     /// channel owners' answers, by label.
     pub(crate) label_groups: HashMap<String, LabelGroup>,
@@ -2015,6 +2028,59 @@ impl Index<&ConnId> for SessionStore {
 }
 
 impl Session {
+    /// A JOIN to `key` was routed to the shard that owns it.
+    pub(crate) fn join_sent(&mut self, key: ChanKey) {
+        self.pending_joins
+            .entry(key)
+            .and_modify(|count| *count = count.checked_add(1).expect("JOINs in flight counted"))
+            .or_insert(NonZeroUsize::MIN);
+    }
+
+    /// Whether a JOIN to `key` is still waiting for its answer.
+    pub(crate) fn join_in_flight(&self, key: &ChanKey) -> bool {
+        self.pending_joins.contains_key(key)
+    }
+
+    /// The channels with a JOIN still waiting for its answer.
+    pub(crate) fn joins_in_flight(&self) -> impl Iterator<Item = &ChanKey> {
+        self.pending_joins.keys()
+    }
+
+    /// `JOIN 0`: every JOIN still in flight is parted once it is answered.
+    pub(crate) fn part_joins_in_flight(&mut self) {
+        self.part_on_join.clone_from(&self.pending_joins);
+    }
+
+    /// The oldest JOIN to `key` still in flight was answered — the owner
+    /// answers a session's JOINs to one channel in the order they were sent.
+    /// Whether a `JOIN 0` was sent after it, so what it admitted must be
+    /// parted.
+    pub(crate) fn join_answered(&mut self, key: &ChanKey) -> bool {
+        fn take_one(counts: &mut HashMap<ChanKey, NonZeroUsize>, key: &ChanKey) -> bool {
+            let Some(count) = counts.get_mut(key) else {
+                return false;
+            };
+            match NonZeroUsize::new(count.get() - 1) {
+                Some(left) => *count = left,
+                None => {
+                    counts.remove(key);
+                }
+            }
+            true
+        }
+        assert!(
+            take_one(&mut self.pending_joins, key),
+            "a JOIN was answered that this session never sent"
+        );
+        take_one(&mut self.part_on_join, key)
+    }
+
+    /// How many more bytes this connection's send queue takes before it is
+    /// half full: the most a paced reply may occupy.
+    pub(crate) fn paced_room(&self) -> usize {
+        self.output.paced_room()
+    }
+
     /// Whether registration has completed.
     pub fn is_registered(&self) -> bool {
         matches!(self.reg, Registration::Registered { .. })
@@ -2368,7 +2434,10 @@ pub struct ChannelJoinSuccess {
     pub(crate) secret: bool,
     pub(crate) members: Vec<(MemberModes, MemberIdentity)>,
     pub(crate) own_join: EventLine,
-    pub(crate) own_mode: Option<EventLine>,
+    /// The MODE lines the joining brought about, in order — the joiner's
+    /// automatic op or voice, a mode lock enforced on the channel it created
+    /// — which the broadcast left the joiner out of: they follow its JOIN.
+    pub(crate) own_modes: Vec<EventLine>,
 }
 
 #[derive(Debug, Clone)]
@@ -2951,6 +3020,9 @@ pub enum ChanServStatusResult {
         target: String,
         channel: String,
         change: StatusChange,
+        /// The requester's own copy of the MODE, when it is a member: the
+        /// broadcast left it out, as it is part of the command's response.
+        echo: Option<EventLine>,
     },
     /// The change could not be recorded in the audit trail, so it was not
     /// made.
@@ -3143,12 +3215,28 @@ impl ChannelKick {
 
 #[derive(Debug)]
 pub enum ChannelKickResult {
-    Kicked,
-    NoSuchChannel { target: String },
-    Hidden { target: String, proof: Hidden },
-    NotOnChannel { target: String },
-    NotOperator { target: String },
-    UserNotInChannel { victim: String, channel: String },
+    /// The kicker's own copy of the KICK, which the broadcast left out: it
+    /// is the command's response, emitted by the kicker's session.
+    Kicked {
+        echo: EventLine,
+    },
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+        proof: Hidden,
+    },
+    NotOnChannel {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    UserNotInChannel {
+        victim: String,
+        channel: String,
+    },
 }
 
 /// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
@@ -4270,12 +4358,12 @@ pub(crate) struct ServerState {
     pub pending_channel_controls: HashMap<u64, PendingChannelControl>,
     /// Monotonic request ID source for `pending_channel_controls`.
     pub channel_control_id: u64,
-    /// Each connection's LIST still answering, gathering or sending.
-    pub(crate) channel_lists: HashMap<ConnId, crate::core::list::ListProgress>,
     channel_list_id: u64,
-    /// Each connection's WHO replies too long to queue at once, still going
-    /// out as its send queue drains.
-    pub(crate) paced_replies: HashMap<ConnId, crate::core::paced::PacedReplies>,
+    /// The connections with a LIST or WHO reply being paced out: which
+    /// sessions the pacing turn visits. The paced output itself lives on the
+    /// session ([`Session::channel_list`], [`Session::paced_who`]), so it
+    /// cannot outlive the connection it answers.
+    pub(crate) pacing: HashSet<ConnId>,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -4567,16 +4655,20 @@ impl ServerState {
             .expect("channel LIST request identifiers exhausted");
         let session = SessionOwner::new(conn, self.shard);
         let request = ChannelListRequest::new(id, session, self.channel_actor(conn), filter);
-        let previous = self.channel_lists.insert(
-            conn,
-            crate::core::list::ListProgress::Gathering {
+        let remaining = self.channels.shard_count();
+        let session = self
+            .sessions
+            .output_mut(&conn)
+            .expect("a LIST is started by the session sending it");
+        let previous = session
+            .channel_list
+            .replace(crate::core::list::ListProgress::Gathering {
                 id,
                 label,
-                remaining: self.channels.shard_count(),
+                remaining,
                 rows: Vec::new(),
                 aborted: false,
-            },
-        );
+            });
         assert!(previous.is_none(), "a connection has one LIST in progress");
         request
     }
@@ -4606,21 +4698,18 @@ impl ServerState {
     ) -> Option<crate::core::list::GatheredList> {
         use crate::core::list::{GatheredList, ListProgress};
         let conn = result.session.conn();
+        // A closed connection's LIST went with its session.
+        let session = self.sessions.output_mut(&conn)?;
+        // Rows reach only a connection still gathering them: it has at most
+        // one LIST, which stops gathering once the last shard's rows are in.
         let Some(ListProgress::Gathering {
             id,
             remaining,
             rows,
             ..
-        }) = self.channel_lists.get_mut(&conn)
+        }) = session.channel_list.as_mut()
         else {
-            // Rows reach only a connection still gathering them: it has at
-            // most one LIST, which stops gathering once the last shard's rows
-            // are in. A closed connection's LIST is simply gone.
-            assert!(
-                !self.channel_lists.contains_key(&conn),
-                "LIST rows reached a connection that is not gathering them"
-            );
-            return None;
+            panic!("LIST rows reached a connection that is not gathering them");
         };
         assert_eq!(*id, result.id, "LIST rows reached another LIST");
         *remaining = remaining
@@ -4635,7 +4724,7 @@ impl ServerState {
             rows,
             aborted,
             ..
-        }) = self.channel_lists.remove(&conn)
+        }) = session.channel_list.take()
         else {
             unreachable!("the LIST was gathering a moment ago");
         };
@@ -4913,7 +5002,11 @@ impl ServerState {
         let mut by_shard: std::collections::BTreeMap<usize, Vec<ChannelOwner>> =
             std::collections::BTreeMap::new();
         let session = &self.sessions[&conn];
-        for key in session.channels.iter().chain(&session.pending_joins) {
+        // A channel rejoined while a member is in both: it is named once.
+        let in_flight = session
+            .joins_in_flight()
+            .filter(|key| !session.channels.contains(*key));
+        for key in session.channels.iter().chain(in_flight) {
             let owner = self.channels.owner(key);
             by_shard.entry(owner.shard().0).or_default().push(owner);
         }
@@ -5240,8 +5333,7 @@ impl ServerState {
             admin_connection_list_id: 0,
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
-            channel_lists: HashMap::new(),
-            paced_replies: HashMap::new(),
+            pacing: HashSet::new(),
             channel_list_id: 0,
         }
     }
@@ -6140,11 +6232,13 @@ impl ServerState {
                 wallops: false,
                 bot: false,
                 channels: HashSet::new(),
-                pending_joins: HashSet::new(),
-                part_on_join: HashSet::new(),
+                pending_joins: HashMap::new(),
+                part_on_join: HashMap::new(),
                 last_knock: None,
                 monitoring: HashMap::new(),
                 multiline: None,
+                channel_list: None,
+                paced_who: None,
                 label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
                 // Seed the flood bucket full, with its refill watermark at the
@@ -6601,12 +6695,13 @@ impl ServerState {
     }
 
     /// `:<server> NOTICE <target> :<text>`, from the server itself, without
-    /// sending it.
+    /// sending it; `text` is fitted to the line
+    /// ([`server_notice`](crate::core::handler::server_notice)).
     pub(crate) fn server_notice_line(&self, conn: ConnId, text: &str) -> String {
-        format!(
-            ":{} NOTICE {} :{text}",
-            self.config.server_name,
-            self.reply_target(conn)
+        crate::core::handler::server_notice(
+            &self.config.server_name,
+            &self.reply_target(conn),
+            text,
         )
     }
 
@@ -6620,12 +6715,48 @@ impl ServerState {
         self.emitting_deferred = previous;
     }
 
-    /// How many more lines `conn`'s send queue takes before it is half full,
-    /// the most a paced reply may occupy (`None` when the session is gone).
-    pub(crate) fn paced_room(&self, conn: ConnId) -> Option<usize> {
-        self.sessions
-            .get(&conn)
-            .map(|session| session.output.paced_room())
+    /// `conn`'s session's paced output of one kind, taken out by `take` to be
+    /// sent, with how many more bytes its send queue takes before it is half
+    /// full: the most a paced reply may occupy. `None` when there is none to
+    /// send — which is also what a closed connection has, its paced output
+    /// having gone with its session. What is left over goes back through
+    /// [`Self::resume_paced`].
+    pub(crate) fn take_paced<T>(
+        &mut self,
+        conn: ConnId,
+        take: impl FnOnce(&mut Session) -> Option<T>,
+    ) -> Option<(usize, T)> {
+        let session = self.sessions.output_mut(&conn)?;
+        let paced = take(session)?;
+        Some((session.paced_room(), paced))
+    }
+
+    /// Queue a WHO reply to be paced out to `conn`, behind any already
+    /// going. A closed connection's paced output went with its session
+    /// (`ServerState::close`); so does this.
+    pub(crate) fn queue_paced_who(&mut self, conn: ConnId, reply: crate::core::paced::PacedReply) {
+        let Some(session) = self.sessions.output_mut(&conn) else {
+            return;
+        };
+        session.paced_who.get_or_insert_default().push(reply);
+        self.pacing.insert(conn);
+    }
+
+    /// Put `conn`'s paced output back, to be paced on as its send queue
+    /// drains. A session that closed while it was out had its paced output
+    /// go with it (`ServerState::close`); so does this.
+    pub(crate) fn resume_paced<T>(
+        &mut self,
+        conn: ConnId,
+        field: impl FnOnce(&mut Session) -> &mut Option<T>,
+        paced: T,
+    ) {
+        let Some(session) = self.sessions.output_mut(&conn) else {
+            return;
+        };
+        let previous = field(session).replace(paced);
+        assert!(previous.is_none(), "paced output resumed over another");
+        self.pacing.insert(conn);
     }
 
     /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`.
@@ -6805,6 +6936,26 @@ impl ServerState {
         );
     }
 
+    /// Broadcast `line` to `key`'s members for a command `actor` sent,
+    /// leaving the actor out, and return the actor's copy when it is a
+    /// member. That copy is part of the command's response: the actor's
+    /// session emits it, inside the labeled response when the command was
+    /// labeled, exactly where one worker's capture puts it — whichever shard
+    /// owns the channel.
+    pub(crate) fn broadcast_channel_answering(
+        &mut self,
+        key: &ChanKey,
+        line: EventLine,
+        actor: ConnId,
+    ) -> Option<EventLine> {
+        let member = self
+            .channels
+            .get(key)
+            .is_some_and(|channel| channel.is_member(actor));
+        self.broadcast_channel(key, &line, Some(actor));
+        member.then_some(line)
+    }
+
     /// Serialize once per capability variant, deliver to each recipient.
     fn broadcast_recipients(
         &mut self,
@@ -6817,7 +6968,17 @@ impl ServerState {
             let bytes = rendered[line.variant(recipient.caps())]
                 .get_or_insert_with(|| line.render(recipient.caps()))
                 .clone();
-            if recipient.shard() != self.shard {
+            // The connection a capture collects a response for is sent its
+            // copy there, on whichever shard its session lives: a channel
+            // owner answering another shard's command captures the actor's
+            // copy of what the command broadcast, as one worker's dispatch
+            // capture does, so it goes out inside the command's response
+            // rather than after it.
+            let captured = self
+                .capture
+                .as_ref()
+                .is_some_and(|capture| capture.conn == recipient.conn());
+            if recipient.shard() != self.shard && !captured {
                 self.effects.push(CoreEffect::Delivery {
                     owner: recipient.owner,
                     line: bytes,
@@ -6920,8 +7081,8 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return;
         };
-        self.channel_lists.remove(&conn);
-        self.paced_replies.remove(&conn);
+        // Its paced LIST and WHO replies go with the session itself.
+        self.pacing.remove(&conn);
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the

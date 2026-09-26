@@ -144,17 +144,24 @@ test("the connection fields are required before anything is sent", () => {
   assert.throws(() => updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: " " }), NetworkRequestError);
 });
 
-test("auto-join accepts commas, spaces, or both, and drops the gaps", () => {
-  assert.deepEqual(autojoinList("#e6qu, #rust  #irc"), ["#e6qu", "#rust", "#irc"]);
+test("auto-join entries are separated by commas, and the gaps are dropped", () => {
+  assert.deepEqual(autojoinList("#e6qu, #rust,,  #irc ,"), ["#e6qu", "#rust", "#irc"]);
   assert.deepEqual(autojoinList(""), []);
+  assert.deepEqual(autojoinList(" , "), []);
   assert.deepEqual(autojoinList(undefined), []);
 });
 
-// A keyed channel is written as /join takes it: the key after the channel. A
-// word that is not a channel is the key of the channel before it.
+// A keyed channel is written as /join takes it: the key after the channel, in
+// the same entry. The server splits an entry at its first space, so the word
+// after the channel is the key whatever it begins with; a key such as `#pw`
+// used to be saved as a second channel to join.
 test("auto-join reads a key after its channel, and never repeats one in a refusal", () => {
-  assert.deepEqual(autojoinList("#staff hunter2, #rust #irc"), ["#staff hunter2", "#rust", "#irc"]);
-  for (const typed of ["hunter2 #staff", "#staff hunter2 again"]) {
+  assert.deepEqual(autojoinList("#staff hunter2, #rust, #irc"), ["#staff hunter2", "#rust", "#irc"]);
+  for (const key of ["#pw", "&pw", "+pw", "!pw"]) {
+    assert.deepEqual(autojoinList(`#staff ${key}, #rust`), [`#staff ${key}`, "#rust"], key);
+  }
+  // Three words cannot be one entry: refused, not guessed at.
+  for (const typed of ["hunter2 #staff", "#staff hunter2 again", "#staff #pw #rust"]) {
     assert.throws(
       () => autojoinList(typed),
       (error) => error instanceof NetworkRequestError && error.field === "autojoin"

@@ -30,12 +30,21 @@ pub(crate) use history::*;
 use message::*;
 pub(crate) use monitor::*;
 pub(crate) use oper::*;
-pub(crate) use query::pace_who_replies;
 use query::*;
 pub(crate) use read_marker::*;
 use registration::*;
 pub(crate) use sasl::*;
 use services::*;
+
+/// Send what every LIST and WHO reply being paced out on this shard has room
+/// for now. A connection whose paced output is not finished is put back in
+/// `pacing` as it is resumed.
+pub(crate) fn pace_replies(state: &mut ServerState) {
+    for conn in std::mem::take(&mut state.pacing) {
+        chanops::pace_channel_list(state, conn);
+        query::pace_who_replies_to(state, conn);
+    }
+}
 
 fn replace_registered_topic(
     state: &mut ServerState,
@@ -528,48 +537,46 @@ pub(crate) fn pack_trailing_list(items: &[String], head_len: usize) -> String {
     out
 }
 
-/// Clip a client-supplied token for echoing inside a reply. Numerics that
-/// attribute an error echo the offending token (an unknown command, a bad CAP
-/// subcommand, a rejected target list); the token's length is bounded only by
-/// the input frame, so echoing it whole can push the reply past the wire limit
-/// and the recipient's framing then discards the very line explaining the
-/// error. 64 bytes identifies anything; every reply shape stays well inside
-/// the limit with room for its other, server-bounded parameters.
+/// A client-supplied token echoed inside a reply, as the core's `&str`
+/// middles take it: the shared [`MiddleParam::echo`] rule (the bouncer's
+/// attach listener uses the same one), so an empty, `:`-leading or spaced
+/// token (`KICK #c :a b` makes the nick `a b`) is the `*` placeholder and the
+/// rest is clipped to [`MiddleParam::ECHO_MAX`] bytes.
+///
+/// [`MiddleParam::echo`]: e6irc_proto::message::MiddleParam::echo
+/// [`MiddleParam::ECHO_MAX`]: e6irc_proto::message::MiddleParam::ECHO_MAX
 pub(crate) fn clip_echo(token: &str) -> &str {
-    // A client token echoed back into a reply lands in a *middle* parameter
-    // position, so it must be able to stand as one: an empty token collapses
-    // into the field separator, a ':'-leading token opens the trailing early
-    // and swallows the rest of the line (the numeric-middle framing class —
-    // e.g. a fuzzer's `CAP :` echoed into ERR_INVALIDCAPCMD), and a token with
-    // a space splits into two parameters. A parsed parameter *can* hold a
-    // space: the last one may be in trailing form (`KICK #c :a b` makes the
-    // nick `a b`), so a space is refused like the other two, and each of them
-    // shows the conventional "*" placeholder. The rest is clipped to bound the
-    // echo. CR/LF/NUL never survive the parser.
-    if token.is_empty() || token.starts_with(':') || token.contains(' ') {
-        return "*";
-    }
-    e6irc_proto::message::truncate_on_char_boundary(token, 64)
+    e6irc_proto::message::MiddleParam::echo(token).as_str()
+}
+
+/// `:{server} NOTICE {target} :{text}`, with `text` fitted to the line. The
+/// one shape every server-sourced NOTICE takes, so none can carry an
+/// oper-typed mask or a client's host past the wire limit — where the
+/// recipient's framing discards it whole, and the debug wire check aborts the
+/// worker that built it.
+pub(crate) fn server_notice(server: &str, target: &str, text: &str) -> String {
+    fitted_line(format!(":{server} NOTICE {target} :"), text)
 }
 
 /// The shared `:{server} FAIL <command> <code> [context] :<detail>` wire
-/// shape. The CHATHISTORY and multiline failure paths differ in label
-/// handling and context clipping, not in the line itself.
-pub(super) fn fail_line(
+/// shape. Each context parameter is the client's own text echoed for
+/// attribution (an account name, a subcommand, a target), so it is rendered
+/// through [`clip_echo`] here, and the detail is fitted to the line: no caller
+/// can hand a raw token to a middle position or push the line past the limit.
+pub(crate) fn fail_line(
     server: &str,
     command: &str,
     code: &str,
     context: &[&str],
     detail: &str,
 ) -> String {
-    let mut line = format!(":{server} FAIL {command} {code}");
+    let mut head = format!(":{server} FAIL {command} {code}");
     for param in context {
-        line.push(' ');
-        line.push_str(param);
+        head.push(' ');
+        head.push_str(clip_echo(param));
     }
-    line.push_str(" :");
-    line.push_str(detail);
-    line
+    head.push_str(" :");
+    fitted_line(head, detail)
 }
 
 /// The standard-reply codes history surfaces (CHATHISTORY, MARKREAD) answer
@@ -604,9 +611,8 @@ impl HistoryFail {
         }
     }
 
-    /// `:{source} FAIL {command} {code} {context..} :{detail}`, each context
-    /// parameter (the client's own subcommand/target, echoed for attribution)
-    /// clipped so the line explaining an error is never discarded for length.
+    /// `:{source} FAIL {command} {code} {context..} :{detail}`, through
+    /// [`fail_line`], which clips each echoed context parameter.
     pub(crate) fn line(
         self,
         source: &str,
@@ -614,8 +620,7 @@ impl HistoryFail {
         context: &[&str],
         detail: &str,
     ) -> String {
-        let clipped: Vec<&str> = context.iter().map(|p| clip_echo(p)).collect();
-        fail_line(source, command, self.code(), &clipped, detail)
+        fail_line(source, command, self.code(), context, detail)
     }
 }
 

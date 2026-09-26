@@ -74,13 +74,14 @@ pub fn dispatch(app: &mut App, key: KeyEvent) -> KeyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::test_app;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
 
     fn app_with_two_buffers() -> App {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&e6irc_client::OwnedMessage::from(
             &e6irc_proto::message::Message::parse(":x!x@h PRIVMSG #b :hi").unwrap(),
         ));
@@ -124,7 +125,7 @@ mod tests {
 
     #[test]
     fn escape_clears_the_composer_and_only_quit_or_control_c_leaves() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         for c in "draft".chars() {
             dispatch(&mut app, key(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -140,7 +141,7 @@ mod tests {
         );
         assert!(app.should_quit);
 
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         for c in "/quit".chars() {
             dispatch(&mut app, key(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -152,7 +153,7 @@ mod tests {
 
     #[test]
     fn enter_offers_the_line_to_the_writer() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         for c in "hi".chars() {
             dispatch(&mut app, key(KeyCode::Char(c), KeyModifiers::NONE));
         }

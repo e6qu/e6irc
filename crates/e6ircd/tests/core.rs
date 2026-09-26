@@ -2834,6 +2834,26 @@ fn account_registration_persists_only_valid_normalized_contact_email() {
     );
 }
 
+/// The account a REGISTER names is echoed in its FAIL, and it is the client's
+/// own text: 480 bytes of it once built a 600-byte line, which the debug wire
+/// check turns into a panic of the worker every client shares. It is clipped
+/// like every other echo, and the line fits.
+#[test]
+fn register_fail_clips_the_echoed_account_name() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
+    s.drain(alice);
+    s.line(alice, &format!("REGISTER {} * hunter2", "a".repeat(480)));
+    let out = s.drain(alice);
+    let fail = out
+        .iter()
+        .find(|line| line.contains("FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK"))
+        .unwrap_or_else(|| panic!("no FAIL: {out:#?}"));
+    let echoed = fail.split(' ').nth(4).expect("the FAIL names the account");
+    assert_eq!(echoed, "a".repeat(64), "{fail}");
+    assert!(fail.len() <= 510, "{} bytes", fail.len());
+}
+
 #[test]
 fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
     let mut s = TestServer::new();
@@ -11920,6 +11940,46 @@ fn oper_kline_bans_disconnects_and_refuses() {
     );
 }
 
+/// A server-ban mask had no length bound, and every operator NOTICE was a
+/// `format!` of it: a 460-byte mask built a refusal or confirmation past the
+/// wire limit, which the debug wire check turns into a panic of the worker.
+/// The mask is bounded like a channel ban's, and every server NOTICE is fitted
+/// — SETHOST's refusal echoes a host of any length too.
+#[test]
+fn overlong_server_ban_masks_are_refused_within_the_line() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.db_requests();
+
+    for command in [
+        format!("KLINE *@{} :r", "a".repeat(460)),
+        format!("DLINE {}.* :r", "1".repeat(460)),
+        format!("XLINE {} :r", "b".repeat(460)),
+        format!("UNKLINE *@{}", "a".repeat(460)),
+        format!("SETHOST god {}", "h".repeat(460)),
+    ] {
+        s.line(op, &command);
+        let out = s.drain(op);
+        assert!(!out.is_empty(), "{command}: no answer");
+        for line in &out {
+            assert!(line.len() <= 510, "{command}: {} bytes", line.len());
+        }
+        assert!(
+            s.db_requests().is_empty(),
+            "{command}: an overlong mask reached storage"
+        );
+    }
+    s.line(op, &format!("KLINE *@{} :r", "a".repeat(460)));
+    let out = s.drain(op);
+    assert!(
+        out.iter()
+            .any(|line| line.contains("a mask is at most 100 bytes (BANMASKLEN)")),
+        "{out:#?}"
+    );
+}
+
 /// A server ban preserves the operator's original mask casing for STATS/the
 /// confirmation (a `MaskKey`, like the channel `+b` lists), while still removing
 /// case-insensitively — the display-fidelity the folded-`String` form lost.
@@ -13936,8 +13996,15 @@ fn malformed_client_tag_keys_are_not_relayed() {
         relayed.contains("+example.com/reply=abc"),
         "valid client tag dropped: {relayed}"
     );
+    // Judged on the tag section by key: the random msgid is hex, and a
+    // substring test for "bad" failed whenever the msgid happened to spell it.
+    let tags = relayed
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(tags, _)| tags)
+        .expect("the relayed line carries tags");
     assert!(
-        !relayed.contains("bad"),
+        !tags.split(';').any(|tag| tag.starts_with("+bad")),
         "malformed client tag key relayed: {relayed}"
     );
 }

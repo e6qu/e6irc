@@ -9,16 +9,25 @@
 //! across the sequences a normal client produces; a fuzzer's job is to find a
 //! sequence that does not.
 //!
-//! Any panic is the finding. There is no oracle beyond "the worker survives
-//! whatever a client sends", which is exactly the contract a server owes a
-//! hostile peer.
+//! Any panic is the finding — including the debug build's wire check, which
+//! aborts on any line the worker builds past the IRC wire limit. There is no
+//! oracle beyond "the worker survives whatever a client sends", which is
+//! exactly the contract a server owes a hostile peer.
+//!
+//! The first byte selects the configuration, so the account surface
+//! (REGISTER, SASL, services) is reached too: with `sasl_enabled` the worker
+//! queues database requests nothing answers, and a full queue is itself a path
+//! (every account command refuses loudly when it cannot enqueue).
 
 use e6irc_queue::{Config, Policy, queue};
 use e6ircd::core::{ConnId, ConnectionTransport, Core, CoreConfig, Input};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(text) = std::str::from_utf8(data) else {
+    let Some((&selector, rest)) = data.split_first() else {
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(rest) else {
         return;
     };
     let (db_tx, _db_rx) = queue(Config {
@@ -34,9 +43,9 @@ fuzz_target!(|data: &[u8]| {
             sendq_bytes: 512 * 512,
             motd: vec!["motd".into()],
             nicklen: 16,
-            // No database is reachable here, so leave the account-backed
-            // surface off; `db_rx` is never drained.
-            sasl_enabled: false,
+            // No database answers here (`db_rx` is never drained), which
+            // the account surface must survive like a stalled one.
+            sasl_enabled: selector & 1 != 0,
             opers: vec![("o".into(), "p".into())],
             max_hot_channels: 4,
             max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
@@ -45,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(1_000_000_000),
             command_flood: None,
             registration_burst: None,
-            registration_before_connect: false,
+            registration_before_connect: selector & 2 != 0,
             registration_require_email: false,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),

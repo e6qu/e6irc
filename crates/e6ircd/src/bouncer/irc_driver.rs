@@ -770,11 +770,12 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // network refused before any credential was sent, so a weaker one that is
     // used instead is never a silent choice.
     for note in conn.sasl_notes() {
-        ends.emit_line(format!(":*bnc* NOTICE * :upstream SASL: {note}"));
+        ends.emit_line(super::bnc_notice("*", &format!("upstream SASL: {note}")));
     }
     if let (Some(mechanism), Some((account, _))) = (conn.sasl_mechanism(), &config.sasl) {
-        ends.emit_line(format!(
-            ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"
+        ends.emit_line(super::bnc_notice(
+            "*",
+            &format!("upstream logged in as {account} with SASL {mechanism}"),
         ));
     }
     let mut echoes = UpstreamEchoes::default();
@@ -861,9 +862,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         let closed = super::LinkClosed::new(
                             message.params.last().map(String::as_str).unwrap_or("no reason given"),
                         );
-                        ends.emit_line(format!(
-                            ":*bnc* NOTICE * :upstream closed the link: {}",
-                            closed.diagnostic()
+                        ends.emit_line(super::bnc_notice(
+                            "*",
+                            &format!("upstream closed the link: {}", closed.diagnostic()),
                         ));
                         return super::SessionOutcome::ClosedByUpstream(closed);
                     }
@@ -876,11 +877,13 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         })
                         && shared.joined.forget(channel)
                     {
-                        ends.emit_line(format!(
-                            ":*bnc* NOTICE * :{} will not be rejoined after a reconnect: \
-                             the upstream refused to join it ({})",
-                            e6irc_proto::message::truncate_on_char_boundary(channel, 200),
-                            message.command
+                        ends.emit_line(super::bnc_notice(
+                            "*",
+                            &format!(
+                                "{channel} will not be rejoined after a reconnect: \
+                                 the upstream refused to join it ({})",
+                                message.command
+                            ),
                         ));
                     }
                     match router.classify(&message, raw, conn.names(), &identity.nick, std::time::Instant::now()) {
@@ -918,8 +921,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // loss visible to attached clients and the detached buffer.
                     // A syntactically valid local NOTICE is bounded independently
                     // of the rejected payload and cannot itself be discarded.
-                    ends.emit_line(format!(
-                        ":e6irc NOTICE * :upstream input rejected: {rejected}"
+                    ends.emit_line(super::bnc_notice(
+                        "*",
+                        &format!("upstream input rejected: {rejected}"),
                     ));
                 }
                 // Only a genuine EOF or a real I/O error ends the session.
@@ -1109,10 +1113,12 @@ fn outgoing(
                 {
                     ends.answer(
                         cmd.origin,
-                        format!(
-                            ":*bnc* NOTICE * :{}: no longer rejoined after a reconnect \
-                             (this session is not in it)",
-                            e6irc_proto::message::truncate_on_char_boundary(channel, 200)
+                        super::bnc_notice(
+                            "*",
+                            &format!(
+                                "{channel}: no longer rejoined after a reconnect \
+                                 (this session is not in it)"
+                            ),
                         ),
                     );
                 }

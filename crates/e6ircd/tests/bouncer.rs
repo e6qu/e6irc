@@ -322,6 +322,12 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
             .write_all(b":speaker!s@h PRIVMSG #bnc :caf\xe9\r\n")
             .await
             .unwrap();
+        // Two hundred high bytes fit the frame, but decode to six hundred
+        // bytes of U+FFFD: the relay fits the text rather than rejecting it.
+        let mut high = b":speaker!s@h PRIVMSG #bnc :latin1 ".to_vec();
+        high.extend(std::iter::repeat_n(0xE9, 200));
+        high.extend_from_slice(b"\r\n");
+        write.write_all(&high).await.unwrap();
         // This cannot be relayed inside the accepted server-frame bound, but
         // its loss must remain visible and must not consume the next event from
         // the same socket read.
@@ -360,9 +366,17 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 
     // Collect events until the post-bad-line message arrives; assert no
     // Disconnected (reconnect) happened in between.
+    let untagged = |line: &str| -> String {
+        match line.strip_prefix('@') {
+            Some(tagged) => tagged.split_once(' ').map_or("", |(_, body)| body),
+            None => line,
+        }
+        .to_string()
+    };
     let outcome = tokio::time::timeout(deadline::HANG, async {
         let mut saw_bad_line = false;
-        let mut saw_rejection = false;
+        let mut saw_high_bytes = false;
+        let mut rejections = 0;
         let mut disconnected_before_after = false;
         loop {
             match events.recv().await {
@@ -373,14 +387,30 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
                     saw_bad_line = true;
                 }
                 Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
+                    if l.contains("PRIVMSG #bnc :latin1 \u{FFFD}") =>
+                {
+                    let body = untagged(&l);
+                    assert!(
+                        body.len() <= e6irc_proto::message::MAX_LINE_LEN - 2,
+                        "the relayed high-byte line must fit: {} bytes",
+                        body.len()
+                    );
+                    saw_high_bytes = true;
+                }
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
                     if l.contains("upstream input rejected") =>
                 {
-                    saw_rejection = true;
+                    assert!(
+                        untagged(&l).starts_with(":*bnc* NOTICE * :"),
+                        "the bouncer's own notice speaks as *bnc*: {l}"
+                    );
+                    rejections += 1;
                 }
                 Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
                     if l.contains("after the bad line") =>
                 {
-                    return (saw_bad_line, saw_rejection, disconnected_before_after);
+                    assert!(saw_high_bytes, "the high-byte line must be relayed");
+                    return (saw_bad_line, rejections == 1, disconnected_before_after);
                 }
                 Ok(DriverEvent::Status {
                     status: DriverConnectionStatus::Reconnecting(_),

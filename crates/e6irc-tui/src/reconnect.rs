@@ -8,12 +8,19 @@
 //! something this module said to stop.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use e6irc_client::{RegistrationRefusal, RegistrationRejection, SaslRejection, SaslRejectionClass};
 
 /// Longest wait between attempts, however many have failed.
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
+
+/// How long a session must stay up for its end to start the backoff afresh:
+/// one liveness window, the time the client takes to tell a live server from
+/// a dead one. A server that welcomes the client and drops it at once is
+/// failing, however often registration succeeds, and must not be answered by
+/// a reconnect every `--reconnect-delay` forever.
+pub const STABLE_SESSION: Duration = e6irc_client::liveness::LIVENESS_WINDOW;
 
 /// The next step after a failed attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,29 +32,41 @@ pub enum AfterFailure {
     RetryAfter(Duration),
 }
 
-/// Capped exponential backoff from the user's `--reconnect-delay`, reset by a
-/// successful connection.
+/// Capped exponential backoff from the user's `--reconnect-delay`, reset only
+/// by a session that stayed up for [`STABLE_SESSION`].
 #[derive(Debug)]
 pub struct ReconnectPolicy {
     floor: Duration,
     consecutive_failures: u32,
+    /// When the live session began.
+    connected_at: Instant,
 }
 
 impl ReconnectPolicy {
-    pub fn new(floor: Duration) -> Self {
+    /// The policy for a session that registered at `connected_at`.
+    pub fn new(floor: Duration, connected_at: Instant) -> Self {
         Self {
             floor,
             consecutive_failures: 0,
+            connected_at,
         }
     }
 
-    pub fn connected(&mut self) {
-        self.consecutive_failures = 0;
+    /// A new session registered at `at`. It does not reset the backoff: only
+    /// staying up does.
+    pub fn connected(&mut self, at: Instant) {
+        self.connected_at = at;
     }
 
-    /// The wait before the first attempt after a live connection dropped.
-    pub fn first_delay(&self) -> Duration {
-        self.floor
+    /// The wait before the first attempt after the live session ended at
+    /// `at`. A session that stayed up for [`STABLE_SESSION`] starts the
+    /// backoff afresh from `--reconnect-delay`; one that ended sooner counts
+    /// as one more failure.
+    pub fn session_ended(&mut self, at: Instant) -> Duration {
+        if at.saturating_duration_since(self.connected_at) >= STABLE_SESSION {
+            self.consecutive_failures = 0;
+        }
+        self.backoff()
     }
 
     pub fn after(&mut self, error: &io::Error) -> AfterFailure {
@@ -56,13 +75,17 @@ impl ReconnectPolicy {
                 "{reason}; not reconnecting — restart with corrected settings"
             ));
         }
+        AfterFailure::RetryAfter(self.backoff())
+    }
+
+    /// The wait for one more failure, doubling with each since the backoff
+    /// last started afresh.
+    fn backoff(&mut self) -> Duration {
         let doublings = self.consecutive_failures.min(16);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        AfterFailure::RetryAfter(
-            self.floor
-                .saturating_mul(1 << doublings)
-                .min(MAX_RECONNECT_DELAY),
-        )
+        self.floor
+            .saturating_mul(1 << doublings)
+            .min(MAX_RECONNECT_DELAY)
     }
 }
 
@@ -162,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_credentials_and_bans_are_never_retried() {
-        let mut policy = ReconnectPolicy::new(Duration::from_secs(2));
+        let mut policy = ReconnectPolicy::new(Duration::from_secs(2), Instant::now());
         let rejected = registration_error(
             plain(),
             &[
@@ -194,7 +217,7 @@ mod tests {
     /// wants and was not given, or one it rejected — and says which.
     #[tokio::test]
     async fn a_missing_or_rejected_server_password_is_never_retried() {
-        let mut policy = ReconnectPolicy::new(Duration::from_secs(2));
+        let mut policy = ReconnectPolicy::new(Duration::from_secs(2), Instant::now());
         let script: &[(&str, &str)] = &[("CAP LS", ":srv 464 * :Password required")];
         let missing = registration_error(Authentication::None, script).await;
         let AfterFailure::Stop(status) = policy.after(&missing) else {
@@ -219,7 +242,7 @@ mod tests {
     /// a taken nickname frees up: both wait, neither hammers.
     #[tokio::test]
     async fn other_failures_back_off_exponentially_to_a_cap_and_reset_on_success() {
-        let mut policy = ReconnectPolicy::new(Duration::from_secs(2));
+        let mut policy = ReconnectPolicy::new(Duration::from_secs(2), Instant::now());
         let in_use = registration_error(
             Authentication::None,
             &[
@@ -247,10 +270,37 @@ mod tests {
             policy.after(&refused),
             AfterFailure::RetryAfter(MAX_RECONNECT_DELAY)
         );
-        policy.connected();
+        let connected = Instant::now();
+        policy.connected(connected);
+        assert_eq!(
+            policy.session_ended(connected + STABLE_SESSION),
+            Duration::from_secs(2),
+            "a session that stayed up starts the backoff afresh"
+        );
         assert_eq!(
             policy.after(&refused),
-            AfterFailure::RetryAfter(Duration::from_secs(2))
+            AfterFailure::RetryAfter(Duration::from_secs(4))
         );
+    }
+
+    /// A server that welcomes the client and drops it at once is failing:
+    /// each such session is one more failure, not a fresh start, so the
+    /// client does not reconnect every two seconds forever.
+    #[test]
+    fn sessions_that_end_before_they_are_stable_keep_backing_off() {
+        let start = Instant::now();
+        let mut policy = ReconnectPolicy::new(Duration::from_secs(2), start);
+        let mut now = start;
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            now += Duration::from_secs(1);
+            let wait = policy.session_ended(now);
+            waits.push(wait.as_secs());
+            now += wait;
+            policy.connected(now);
+        }
+        assert_eq!(waits, [2, 4, 8, 16, 32]);
+        now += STABLE_SESSION;
+        assert_eq!(policy.session_ended(now), Duration::from_secs(2));
     }
 }

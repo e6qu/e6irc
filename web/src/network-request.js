@@ -31,36 +31,38 @@ export class NetworkRequestError extends Error {
   }
 }
 
-// What begins a channel name (RFC 2811); a word that does not is a key.
+// What begins a channel name (RFC 2811).
 const CHANNEL_PREFIX = /^[#&+!]/;
 
 /**
- * Split an auto-join box into entries, on commas or whitespace: each channel,
- * and a keyed channel's key after it, as `/join #staff key` takes them. An
- * entry is `#channel` or `#channel key`, the form the API reads. A key is
- * never repeated in a refusal: it is a secret.
+ * Split an auto-join box into entries. Commas separate entries; within one,
+ * the channel comes first and a keyed channel's key after it, as `/join
+ * #staff key` takes them. That is the API's own entry, `#channel` or
+ * `#channel key`, which the server splits at its first space, so the word
+ * after a channel is its key whatever it begins with: `#staff #pw` is #staff
+ * with the key `#pw`. Separating entries by spaces as well used to read that
+ * as two channels and save the key as a channel to join. A key is never
+ * repeated in a refusal: it is a secret.
  */
 export function autojoinList(value) {
   const entries = [];
-  for (const word of String(value ?? "").split(/[\s,]+/).filter(Boolean)) {
-    if (CHANNEL_PREFIX.test(word)) {
-      entries.push(word);
-      continue;
-    }
-    const channel = entries.at(-1);
-    if (channel === undefined) {
+  for (const segment of String(value ?? "").split(",")) {
+    const words = segment.split(/\s+/).filter(Boolean);
+    if (words.length === 0) continue;
+    const [channel, key, ...extra] = words;
+    if (!CHANNEL_PREFIX.test(channel)) {
       throw new NetworkRequestError(
         "autojoin",
-        "Channels to join must start with a channel: a name begins with #, &, + or !, and a key goes after its channel (#staff key).",
+        "Each auto-join entry must start with a channel: a name begins with #, &, + or !, and a key goes after its channel (#staff key).",
       );
     }
-    if (channel.includes(" ")) {
+    if (extra.length > 0) {
       throw new NetworkRequestError(
         "autojoin",
-        `${channel.split(" ")[0]} is followed by two words that are not channels; a channel takes one key.`,
+        `${channel} is followed by more than one word; an entry is a channel and at most one key. Separate channels with commas (#staff key, #rust).`,
       );
     }
-    entries[entries.length - 1] = `${channel} ${word}`;
+    entries.push(key === undefined ? channel : `${channel} ${key}`);
   }
   return entries;
 }

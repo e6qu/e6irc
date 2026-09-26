@@ -947,6 +947,103 @@ this change fixes:
   documents), DESIGN §5's dependency policy, the default flood limits, the
   client's SASL mechanisms, and CI's PostgreSQL setup.
 
+A review of the web client and the console script found, and this change
+fixes, each with a test that failed before:
+
+- **The ban directory failed on "All kinds".** The filter form submits
+  `kind=`, and the console forwarded its page query verbatim, so the
+  contract's enum refused the read before it was sent; the accounts page sent
+  its invitation cursor and the reauthentication flag to an operation that
+  declares neither. Every directory's API query and pager link now come from
+  one allow-list helper, `directoryQuery`, and a test pins that the console
+  reads its page query nowhere else.
+- **STATUSMSG sigils were hard-coded `@+`.** The chat client now reads
+  `005 STATUSMSG` and takes off only advertised sigils, as the server's
+  `NetworkNames::conversation` does, with its test cases (`%#dev`, `&#dev`).
+- **A reconnect cleared "messages were not confirmed".** The socket's open
+  handler cleared the key that alert shared with "Not connected"; the two
+  have separate keys and only connection-down alerts clear on open.
+- **PART, KICK and QUIT reasons kept their colour codes.** One helper renders
+  every such reason.
+- **Channel and nick names were drawn with bidi controls** in the
+  conversation list, header, member list and alerts; they are stripped where
+  drawn and each name is a bidi isolate.
+- **An auto-join key beginning with `#`, `&`, `+` or `!` was saved as a
+  channel.** The settings box separates entries by commas, and the word after
+  a channel is its key, as the server's entry grammar reads it.
+
+A review of wire safety found, and this change fixes (DESIGN §7.1, limits and
+decoding):
+
+- **A channel message of high bytes was replaced by a rejection notice.** Two
+  hundred Latin-1 bytes fit the frame but decode to six hundred bytes of
+  U+FFFD, and the bouncer replaced the whole line with an `:e6irc` "upstream
+  input rejected" NOTICE. Decoding now fits the text again, so a line that fits
+  as bytes is always relayed, and the notice speaks as `*bnc*`; the
+  `bouncer_lines` fuzz target asserts it.
+- **Echoed client tokens could split a bouncer reply** (`NICK :a b` answered
+  `432 * a b :…`; `CAP :a b`, `JOIN :#a b` and `JOIN ::x` on a bridge alike).
+  The core's echo rule is now `MiddleParam` in `e6irc-proto`, the only type the
+  bouncer's attach numerics take.
+- **Over-long lines that aborted the debug worker**: a `FAIL REGISTER` echoing
+  a 480-byte account, and operator NOTICEs echoing an unbounded K/D/X-line mask
+  or SETHOST host. `fail_line` clips and fits, every server NOTICE goes through
+  one fitted `server_notice`, and server-ban masks are bounded. The bouncer's
+  own notices carrying upstream text (a closing reason, SASL notes, bridge
+  targets) go through a fitted `bnc_notice`, where a multi-byte reason used to
+  turn them into the rejection notice. `core_dispatch` now also fuzzes with
+  accounts enabled.
+
+A review of the client library, the TUI and the CLI found, and this change
+fixes, each with a test that failed before:
+
+- **A server could grow the connection's capability state without end.**
+  Every name in every `CAP ACK` was enabled, requested or not, each by a
+  linear scan: a peer streaming acknowledgements (an upstream network the
+  bouncer connects to included) cost unbounded memory and quadratic time. A
+  verdict now counts only for a name awaiting one, and the enabled set holds
+  the program's own names, so the server cannot add one.
+- **One Latin-1 line in the welcome burst failed the TUI's connect and
+  `e6irc history`**, and the TUI never saw the MOTD or the 005 read while its
+  capabilities were requested. That request now reads the burst as the
+  steady-state stream does and hands every line back; the TUI shows it and
+  takes the connection's naming rules (CASEMAPPING, CHANTYPES, STATUSMSG) on
+  every connect, and its second copy of the STATUSMSG sigils is gone.
+- **`--history-lines` above the server's limit broke every connect**, and a
+  server that cut pages to its own limit made the client mark unread lines
+  read everywhere. Pages fit the 005 `CHATHISTORY` limit, a refused history
+  request costs only that channel's history, and `history --count` is cut to
+  the limit with a warning.
+- **`--no-read-markers` still sent `MARKREAD`**: markers now follow whether
+  the connection has `draft/read-marker` enabled.
+- **A server that dropped the TUI right after welcoming it was reconnected to
+  every two seconds forever**: the backoff starts afresh only after a session
+  stays up for one liveness window.
+- **The SCRAM-to-PLAIN step after a refusal before any credential was said
+  only by the bouncer**; the TUI and the CLI now say it too.
+
+A review of the sharded core found, and this change fixes, each with
+a test that failed before:
+
+- **A remote WHO answered after its asker closed aborted the worker.** The
+  reply was queued to be paced to a connection that no longer existed, and the
+  pacer's "only an open connection is paced" expectation killed the daemon.
+  Paced LIST and WHO replies now live on the session itself, so none can be
+  queued for, or paced to, a closed connection (DESIGN §7.2).
+- **A second JOIN in flight to one channel lost member updates.** The session
+  kept the channels with a JOIN in flight as a set, so the first answer (a
+  refused key) ended the window of the JOIN behind it: a NICK sent between
+  them never reached the owner that then admitted the user, a `JOIN 0` sent
+  after both was spent on the refusal and left the user in the channel, and
+  the channel limit undercounted. Both are counted per channel now.
+- **A labeled MODE or KICK of a channel on another shard broke its labeled
+  response**: the actor's own echo came after an empty `ACK`, untagged, where
+  one worker sends it as the labeled answer. The owner now returns the actor's
+  copy in the result; a ChanServ OP/VOICE of a remote channel had the same
+  split, and a mode lock enforced by the JOIN that recreated its channel was
+  told before that JOIN on one worker and after its labeled response on two —
+  it now follows the JOIN inside it, alike on both.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

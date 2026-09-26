@@ -1,4 +1,4 @@
-CAP LS 302
+0CAP LS 302
 CAP REQ :batch labeled-response echo-message
 NICK a
 USER a 0 * :A
