@@ -194,13 +194,6 @@ pub(crate) enum ListProgress {
     },
 }
 
-impl ListProgress {
-    /// Whether the reply is open and rows remain to be paced out.
-    pub(crate) fn is_sending(&self) -> bool {
-        matches!(self, Self::Sending { .. })
-    }
-}
-
 /// A LIST whose rows are all in: what [`ListProgress::Gathering`] becomes.
 pub(crate) struct GatheredList {
     pub label: Option<String>,

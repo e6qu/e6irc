@@ -315,9 +315,15 @@ pub(super) fn deliver_who_reply(
     requester: WhoRequester,
     reply: crate::core::paced::WhoReply<bytes::Bytes>,
 ) {
+    // A channel owner's reply can arrive after the session it answers has
+    // closed. Its output, and the hold this reply was to release, went with
+    // the session (`ServerState::close`): nothing can be sent or paced to it.
+    let Some(session) = state.sessions.get(&conn) else {
+        return;
+    };
     let lines = reply.rows.len() + 1;
-    let queued = state.paced_replies.get(&conn);
-    let immediate = queued.is_none() && state.paced_room(conn).is_some_and(|room| lines <= room);
+    let queued = session.paced_who.as_ref();
+    let immediate = queued.is_none() && lines <= session.paced_room();
     let admitted = queued.is_none_or(|queued| queued.admits(lines, state.config.sendq));
     let send_now = |state: &mut ServerState, lines: Vec<bytes::Bytes>| match &requester {
         WhoRequester::Local => {
@@ -358,11 +364,7 @@ pub(super) fn deliver_who_reply(
     });
     let mut lines: std::collections::VecDeque<_> = reply.rows.into();
     lines.push_back(reply.end);
-    state
-        .paced_replies
-        .entry(conn)
-        .or_default()
-        .push(crate::core::paced::PacedReply { batch, lines });
+    state.queue_paced_who(conn, crate::core::paced::PacedReply { batch, lines });
     match requester {
         WhoRequester::Local => pace_who_replies_to(state, conn),
         // The connection's later output waited on this reply: it has
@@ -375,15 +377,11 @@ pub(super) fn deliver_who_reply(
 
 /// Send `conn`'s paced WHO replies while its send queue is under half full,
 /// each inside its labeled batch if it has one, dropping each once it ends.
-fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
-    // A closing connection's replies go with it (`ServerState::close`).
-    let mut room = state
-        .paced_room(conn)
-        .expect("a WHO is paced only to an open connection");
-    let mut paced = state
-        .paced_replies
-        .remove(&conn)
-        .expect("only a connection with paced WHO replies is paced");
+pub(super) fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
+    let Some((mut room, mut paced)) = state.take_paced(conn, |session| session.paced_who.take())
+    else {
+        return;
+    };
     while let Some(reply) = paced.replies.front_mut() {
         let batch = reply.batch.as_mut().map(|batch| {
             if !batch.opened {
@@ -415,15 +413,7 @@ fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
         state.send_unheld(conn, line);
     }
     if !paced.replies.is_empty() {
-        state.paced_replies.insert(conn, paced);
-    }
-}
-
-/// Send what every paced WHO reply on this shard has room for now.
-pub(crate) fn pace_who_replies(state: &mut ServerState) {
-    let paced: Vec<ConnId> = state.paced_replies.keys().copied().collect();
-    for conn in paced {
-        pace_who_replies_to(state, conn);
+        state.resume_paced(conn, |session| &mut session.paced_who, paced);
     }
 }
 

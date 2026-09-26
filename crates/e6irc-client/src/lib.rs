@@ -215,15 +215,22 @@ pub struct Connection {
     /// Capabilities to ask for during registration when the server offers
     /// them, each in a request of its own ([`Connection::request_when_offered`]).
     requested_when_offered: Vec<&'static str>,
-    /// Every capability the server has acknowledged and not since withdrawn
-    /// (`CAP DEL`) — what is enabled on this connection now.
-    enabled: Vec<String>,
+    /// Every capability this connection asked for that the server
+    /// acknowledged and has not since withdrawn (`CAP DEL`) — what is enabled
+    /// on this connection now. Its entries are this program's own names
+    /// (`&'static str`), so an `ACK` can only confirm a request, never add a
+    /// name the server chose: the set is bounded by what the program asks for,
+    /// however much a server sends.
+    enabled: std::collections::BTreeSet<&'static str>,
     /// Capabilities requested after registration whose verdict has not
     /// arrived, so a repeated `CAP NEW` does not ask twice.
     awaiting_verdict: Vec<&'static str>,
     /// The network's `CASEMAPPING` and `CHANTYPES`, from every 005 read on
     /// this connection (whichever read path read it).
     names: NetworkNames,
+    /// The most lines one `CHATHISTORY` request may ask for, from the 005
+    /// `CHATHISTORY=<max>` token; `None` when the server named no limit.
+    chathistory_limit: Option<usize>,
 }
 
 /// Whether what is written to a connection can be read on the path — decided
@@ -1062,9 +1069,10 @@ impl Connection {
         Self {
             transport,
             requested_when_offered: Vec::new(),
-            enabled: Vec::new(),
+            enabled: std::collections::BTreeSet::new(),
             awaiting_verdict: Vec::new(),
             names: NetworkNames::default(),
+            chathistory_limit: None,
             reader,
             writer,
             framing: LineBuffer::new(e6irc_proto::message::MAX_SERVER_FRAME_LEN),
@@ -1160,7 +1168,7 @@ impl Connection {
                             )
                         })?;
                         let msg = OwnedMessage::from(&msg);
-                        self.names.adopt_isupport(&msg);
+                        self.adopt_isupport(&msg);
                         return Ok(Some((msg, text.to_string())));
                     }
                     LineEvent::TooLong => {
@@ -1202,14 +1210,15 @@ impl Connection {
                             return Ok(Some(RelayEvent::Rejected(RejectedLine::TooLong)));
                         }
                         // Lossy: an invalid byte sequence becomes U+FFFD
-                        // instead of failing the whole read (mirrors the
-                        // in-process local driver).
-                        let text = String::from_utf8_lossy(&line).into_owned();
+                        // instead of failing the whole read, and a line that
+                        // fitted as bytes is fitted again as text, so decoding
+                        // can never make it one the relay must reject.
+                        let text = e6irc_proto::message::decode_server_line(&line).into_owned();
                         // Best-effort parse; `None` means "relay only, don't
                         // act on it".
                         let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
                         if let Some(message) = &parsed {
-                            self.names.adopt_isupport(message);
+                            self.adopt_isupport(message);
                             self.observe_capability_change(message);
                         }
                         return Ok(Some(RelayEvent::Line {
@@ -1370,7 +1379,7 @@ impl Connection {
     /// advertised. They are optional, so a refusal is consumed and
     /// registration continues without them.
     async fn request_metadata_capabilities(&mut self) -> io::Result<()> {
-        let wanted: Vec<&str> = METADATA_CAPABILITIES
+        let wanted: Vec<&'static str> = METADATA_CAPABILITIES
             .into_iter()
             .filter(|capability| self.advertised.offers(capability))
             .collect();
@@ -1425,17 +1434,24 @@ impl Connection {
             Some("DEL") => {
                 self.advertised.withdraw(list);
                 self.enabled
-                    .retain(|enabled| !list.split_whitespace().any(|name| name == enabled));
+                    .retain(|enabled| !list.split_whitespace().any(|name| name == *enabled));
             }
             Some(verdict @ ("ACK" | "NAK")) => {
-                for token in list.split_whitespace() {
-                    let (name, on) = match token.strip_prefix('-') {
-                        Some(name) => (name, false),
-                        None => (token, true),
+                // A verdict answers only a request still waiting for one. A
+                // name nobody asked for, or one already answered, is not this
+                // connection's to act on: acting on it would let the server
+                // grow the enabled set without end.
+                for name in list.split_whitespace() {
+                    let Some(position) = self
+                        .awaiting_verdict
+                        .iter()
+                        .position(|awaiting| *awaiting == name)
+                    else {
+                        continue;
                     };
-                    self.awaiting_verdict.retain(|awaiting| *awaiting != name);
+                    let capability = self.awaiting_verdict.swap_remove(position);
                     if verdict == "ACK" {
-                        self.set_enabled(name, on);
+                        self.enabled.insert(capability);
                     }
                 }
             }
@@ -1443,11 +1459,48 @@ impl Connection {
         }
     }
 
-    fn set_enabled(&mut self, capability: &str, on: bool) {
-        self.enabled.retain(|enabled| enabled != capability);
-        if on {
-            self.enabled.push(capability.to_owned());
+    /// Adopt what a 005 declares: the naming rules ([`NetworkNames`]) and the
+    /// `CHATHISTORY` page limit. Any other message changes nothing.
+    fn adopt_isupport(&mut self, message: &OwnedMessage) {
+        self.names.adopt_isupport(message);
+        if message.command != "005" {
+            return;
         }
+        let tokens = message
+            .params
+            .get(1..message.params.len().saturating_sub(1))
+            .unwrap_or_default();
+        for token in tokens
+            .iter()
+            .filter_map(|raw| e6irc_proto::isupport::IsupportToken::parse(raw).ok())
+            .filter(|token| token.name == "CHATHISTORY")
+        {
+            // `CHATHISTORY=0`, or no value, is a server without a limit. A
+            // value that is not a number names none either; a request the
+            // server then refuses is reported as the refusal it is.
+            self.chathistory_limit = if token.negated {
+                None
+            } else {
+                token
+                    .value
+                    .as_deref()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|limit| *limit > 0)
+            };
+        }
+    }
+
+    /// The most lines the server takes in one `CHATHISTORY` request, as its
+    /// 005 `CHATHISTORY` token declared; `None` when it declared no limit.
+    /// History requests made through this connection are never larger.
+    pub fn chathistory_limit(&self) -> Option<usize> {
+        self.chathistory_limit
+    }
+
+    /// `wanted` lines, clamped to what the server takes in one request.
+    fn history_request_size(&self, wanted: usize) -> usize {
+        self.chathistory_limit
+            .map_or(wanted, |limit| wanted.min(limit))
     }
 
     /// The capabilities this connection wants that the server now offers but
@@ -1480,13 +1533,29 @@ impl Connection {
     /// Whether `capability` is enabled on this connection now: acknowledged
     /// during registration or since, and not withdrawn by a `CAP DEL`.
     pub fn enabled(&self, capability: &str) -> bool {
-        self.enabled.iter().any(|enabled| enabled == capability)
+        self.enabled.contains(capability)
     }
 
-    /// Request `capabilities` atomically and consume exactly their verdict.
+    /// Read `message` as the verdict on the one outstanding `CAP REQ` for
+    /// `capabilities`, and enable them when it acknowledges them. `Ok(None)`:
+    /// not the verdict.
+    fn settle_capability_request(
+        &mut self,
+        message: &OwnedMessage,
+        capabilities: &[&'static str],
+    ) -> io::Result<Option<CapabilityVerdict>> {
+        let verdict = capability_verdict(message, capabilities)?;
+        if verdict == Some(CapabilityVerdict::Acknowledged) {
+            self.enabled.extend(capabilities.iter().copied());
+        }
+        Ok(verdict)
+    }
+
+    /// Request `capabilities` atomically during registration and consume
+    /// exactly their verdict.
     async fn request_capabilities(
         &mut self,
-        capabilities: &[&str],
+        capabilities: &[&'static str],
     ) -> io::Result<CapabilityVerdict> {
         self.send_line(&format!("CAP REQ :{}", capabilities.join(" ")))
             .await?;
@@ -1495,12 +1564,7 @@ impl Connection {
             if let Some(err) = self.registration_refused(&msg) {
                 return Err(err);
             }
-            if let Some(verdict) = capability_verdict(&msg, capabilities)? {
-                if verdict == CapabilityVerdict::Acknowledged {
-                    for capability in capabilities {
-                        self.set_enabled(capability, true);
-                    }
-                }
+            if let Some(verdict) = self.settle_capability_request(&msg, capabilities)? {
                 return Ok(verdict);
             }
             self.answer_ping(&msg).await?;
@@ -2106,14 +2170,60 @@ impl Connection {
     /// Require an atomic set of capabilities on an already registered
     /// connection. A server NAK is a visible feature error, never a silent
     /// downgrade.
-    pub async fn require_capabilities(&mut self, capabilities: &[&str]) -> io::Result<()> {
+    ///
+    /// The request is made while the welcome burst (MOTD, 005, a bouncer's
+    /// playback) is still arriving, so it is read as the steady-state stream
+    /// is: every line before the verdict is handed to `each`, a Latin-1 MOTD
+    /// line included, and a server `PING` is answered and not handed on.
+    /// Bounded by the response deadline.
+    pub async fn require_capabilities(
+        &mut self,
+        capabilities: &[&'static str],
+        mut each: impl FnMut(RelayEvent) -> io::Result<()>,
+    ) -> io::Result<()> {
         if capabilities.is_empty() {
             return Ok(());
         }
         let verdict = within(
             self.response_deadline,
             "answering a capability request",
-            self.request_capabilities(capabilities),
+            async {
+                self.send_line(&format!("CAP REQ :{}", capabilities.join(" ")))
+                    .await?;
+                loop {
+                    let event = self.next_line_relayable().await?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "the server closed the connection before answering a capability \
+                             request",
+                        )
+                    })?;
+                    if let RelayEvent::Line {
+                        message: Some(message),
+                        ..
+                    } = &event
+                    {
+                        if let Some(verdict) =
+                            self.settle_capability_request(message, capabilities)?
+                        {
+                            return Ok(verdict);
+                        }
+                        if message.command == "ERROR" {
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                format!(
+                                    "the server closed the link: {}",
+                                    registration_diagnostic(message)
+                                ),
+                            ));
+                        }
+                        if self.answer_ping(message).await? {
+                            continue;
+                        }
+                    }
+                    each(event)?;
+                }
+            },
         )
         .await?;
         match verdict {
@@ -2130,11 +2240,14 @@ impl Connection {
 
     /// Join one channel, wait for confirmation, and load what its user has not
     /// read: the history after the channel's shared read marker, paged forward
-    /// `page_lines` at a time until a page comes back short, for at most
+    /// `page_lines` at a time (never more than the server's 005 `CHATHISTORY`
+    /// limit) until a page comes back short, for at most
     /// [`MAX_HISTORY_PAGES`] pages and `max_lines` lines. Without a marker it
     /// is the latest `page_lines` lines. Messages observed during JOIN and
     /// playback are returned in wire order so a UI can build state before its
-    /// first draw, with whether unread lines remain beyond what was loaded.
+    /// first draw, with whether unread lines remain beyond what was loaded. A
+    /// history request the server refuses leaves the join standing and is
+    /// returned as [`JoinedHistory::refusal`].
     pub async fn join_with_history(
         &mut self,
         target: &str,
@@ -2152,7 +2265,9 @@ impl Connection {
     }
 
     /// Join one channel and load the latest bounded history window regardless
-    /// of its shared read marker. This is the scripting/history-inspection
+    /// of its shared read marker: `history_count` lines, or the server's 005
+    /// `CHATHISTORY` limit when that is smaller. A refused history request is
+    /// an error. This is the scripting/history-inspection
     /// shape; interactive clients normally want [`Connection::join_with_history`]
     /// so reconnect resumes where the user stopped reading.
     pub async fn join_with_latest_history(
@@ -2160,10 +2275,13 @@ impl Connection {
         target: &str,
         history_count: usize,
     ) -> io::Result<Vec<ClientEvent>> {
-        Ok(self
+        let joined = self
             .join_history(target, HistoryRequest::Latest(history_count))
-            .await?
-            .events)
+            .await?;
+        match joined.refusal {
+            None => Ok(joined.events),
+            Some(refusal) => Err(io::Error::other(refusal.to_string())),
+        }
     }
 
     async fn join_history(
@@ -2258,37 +2376,16 @@ impl Connection {
                 return Ok(JoinedHistory {
                     events,
                     coverage: HistoryCoverage::NoHistory,
+                    refusal: None,
                 });
             }
-            HistoryRequest::Latest(count) => {
-                self.history_page(
-                    &format!("CHATHISTORY LATEST {target} * {count}"),
-                    count,
-                    &mut events,
-                )
-                .await?;
-                return Ok(JoinedHistory {
-                    events,
-                    coverage: HistoryCoverage::Latest,
-                });
-            }
+            HistoryRequest::Latest(count) => return self.latest_page(target, count, events).await,
             HistoryRequest::Unread {
                 page_lines,
                 max_lines,
             } => match read_marker {
                 Some(marker) => (page_lines, max_lines, marker),
-                None => {
-                    self.history_page(
-                        &format!("CHATHISTORY LATEST {target} * {page_lines}"),
-                        page_lines,
-                        &mut events,
-                    )
-                    .await?;
-                    return Ok(JoinedHistory {
-                        events,
-                        coverage: HistoryCoverage::Latest,
-                    });
-                }
+                None => return self.latest_page(target, page_lines, events).await,
             },
         };
 
@@ -2299,27 +2396,45 @@ impl Connection {
         let mut loaded = 0usize;
         let mut pages = 0usize;
         loop {
-            let wanted = page_lines.min(max_lines.saturating_sub(loaded));
+            // Never more than the server takes in one request: a page it cut
+            // to its own limit would read as short, and a short page is taken
+            // to mean every unread line is loaded.
+            let wanted =
+                self.history_request_size(page_lines.min(max_lines.saturating_sub(loaded)));
             if wanted == 0 || pages == MAX_HISTORY_PAGES {
                 // The last page was full and no more may be loaded.
                 return Ok(JoinedHistory {
                     events,
                     coverage: HistoryCoverage::UnreadBeyondLoaded,
+                    refusal: None,
                 });
             }
-            let page = self
+            let page = match self
                 .history_page(
                     &format!("CHATHISTORY AFTER {target} {anchor} {wanted}"),
                     wanted,
                     &mut events,
                 )
-                .await?;
+                .await?
+            {
+                Ok(page) => page,
+                // Whatever was loaded stays; the rest of the unread lines were
+                // not, and the read marker must not pass over them.
+                Err(refusal) => {
+                    return Ok(JoinedHistory {
+                        events,
+                        coverage: HistoryCoverage::UnreadBeyondLoaded,
+                        refusal: Some(refusal),
+                    });
+                }
+            };
             pages += 1;
             loaded += page.lines;
             if page.lines < wanted {
                 return Ok(JoinedHistory {
                     events,
                     coverage: HistoryCoverage::AllUnread,
+                    refusal: None,
                 });
             }
             match page.last_anchor {
@@ -2330,20 +2445,50 @@ impl Connection {
                     return Ok(JoinedHistory {
                         events,
                         coverage: HistoryCoverage::UnreadBeyondLoaded,
+                        refusal: None,
                     });
                 }
             }
         }
     }
 
+    /// The latest `count` lines of `target` (at most what the server takes in
+    /// one request), after the join burst in `events`.
+    async fn latest_page(
+        &mut self,
+        target: &str,
+        count: usize,
+        mut events: Vec<ClientEvent>,
+    ) -> io::Result<JoinedHistory> {
+        let count = self.history_request_size(count);
+        let refusal = self
+            .history_page(
+                &format!("CHATHISTORY LATEST {target} * {count}"),
+                count,
+                &mut events,
+            )
+            .await?
+            .err();
+        Ok(JoinedHistory {
+            events,
+            coverage: match refusal {
+                Some(_) => HistoryCoverage::NoHistory,
+                None => HistoryCoverage::Latest,
+            },
+            refusal,
+        })
+    }
+
     /// Send one CHATHISTORY `request` for at most `count` lines and read its
-    /// batch into `events`.
+    /// batch into `events`. The inner `Err` is the server refusing the
+    /// request (`FAIL CHATHISTORY`), which costs that channel its history and
+    /// nothing else: the connection is as good as before.
     async fn history_page(
         &mut self,
         request: &str,
         count: usize,
         events: &mut Vec<ClientEvent>,
-    ) -> io::Result<HistoryPage> {
+    ) -> io::Result<Result<HistoryPage, HistoryRefusal>> {
         self.send_line(request).await?;
         let limit = events
             .len()
@@ -2367,10 +2512,9 @@ impl Connection {
                     .first()
                     .is_some_and(|command| command == "CHATHISTORY")
             {
-                return Err(io::Error::other(format!(
-                    "CHATHISTORY failed: {}",
-                    msg.params.join(" ")
-                )));
+                return Ok(Err(HistoryRefusal(bounded_diagnostic(
+                    &msg.params.get(1..).unwrap_or_default().join(" "),
+                ))));
             }
             if msg.command == "BATCH"
                 && let Some(reference) = msg.params.first()
@@ -2384,7 +2528,7 @@ impl Connection {
                 if let Some(closed) = reference.strip_prefix('-')
                     && history_batch.as_deref() == Some(closed)
                 {
-                    return Ok(page);
+                    return Ok(Ok(page));
                 }
             }
             if history_batch.is_some() && msg.tag("batch") == history_batch.as_deref() {
@@ -2427,12 +2571,27 @@ pub struct JoinedHistory {
     pub events: Vec<ClientEvent>,
     /// How much of the channel's history the events hold.
     pub coverage: HistoryCoverage,
+    /// The server refused a history request for the channel: the join
+    /// stands, and `coverage` says what did load.
+    pub refusal: Option<HistoryRefusal>,
+}
+
+/// A server's `FAIL CHATHISTORY` answer to a history request, as its code and
+/// reason (bounded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRefusal(String);
+
+impl std::fmt::Display for HistoryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the server refused its history: {}", self.0)
+    }
 }
 
 /// How much history a join loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryCoverage {
-    /// None was asked for.
+    /// None: none was asked for, or the server refused the request for the
+    /// latest lines ([`JoinedHistory::refusal`]).
     NoHistory,
     /// The latest lines, with no read marker to resume from (or none asked
     /// about): older unread lines may exist before them.
@@ -2440,7 +2599,8 @@ pub enum HistoryCoverage {
     /// Every line after the read marker: nothing unread is missing.
     AllUnread,
     /// Unread lines remain after the last one loaded: paging stopped at its
-    /// bound on a full page. A client must not advance the read marker past
+    /// bound on a full page, or the server refused a page
+    /// ([`JoinedHistory::refusal`]). A client must not advance the read marker past
     /// the last loaded line while this holds, or the unloaded lines would be
     /// marked read on every device.
     UnreadBeyondLoaded,
@@ -4574,6 +4734,34 @@ mod tests {
         ));
     }
 
+    /// Two hundred Latin-1 bytes fit the frame; lossily decoded they are six
+    /// hundred bytes of U+FFFD. The relay must hand on a line that still fits,
+    /// or the bouncer replaces the whole message with a rejection notice.
+    #[tokio::test]
+    async fn relay_fits_a_high_byte_line_that_fitted_as_bytes() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
+        let (_reader, mut writer) = tokio::io::split(server_io);
+        let mut line = b":alice!u@h PRIVMSG #c :".to_vec();
+        line.extend(std::iter::repeat_n(0xE9, 200));
+        line.extend_from_slice(b"\r\n");
+        writer.write_all(&line).await.unwrap();
+
+        let Some(RelayEvent::Line { raw, message }) = conn.next_line_relayable().await.unwrap()
+        else {
+            panic!("a line that fits as bytes was not relayed");
+        };
+        assert!(
+            e6irc_proto::message::server_frame_fits(raw.as_bytes()),
+            "decoded line is {} bytes",
+            raw.len()
+        );
+        let message = message.expect("the fitted line still parses");
+        assert_eq!(message.command, "PRIVMSG");
+        assert!(message.params[1].starts_with('\u{FFFD}'));
+    }
+
     #[tokio::test]
     async fn next_event_lossy_survives_non_utf8_line_and_surfaces_rejections() {
         use tokio::io::AsyncWriteExt;
@@ -4754,7 +4942,7 @@ mod tests {
             let error = if join {
                 must_give_up(connection.join_with_history("#room", 0, 0)).await
             } else {
-                must_give_up(connection.require_capabilities(&["batch"])).await
+                must_give_up(connection.require_capabilities(&["batch"], |_| Ok(()))).await
             };
             assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
             peer.abort();
@@ -4990,12 +5178,15 @@ mod tests {
             sw.write_all(b":srv BATCH -history\r\n").await.unwrap();
         });
 
-        conn.require_capabilities(&[
-            "batch",
-            "draft/chathistory",
-            "server-time",
-            "draft/read-marker",
-        ])
+        conn.require_capabilities(
+            &[
+                "batch",
+                "draft/chathistory",
+                "server-time",
+                "draft/read-marker",
+            ],
+            |_| Ok(()),
+        )
         .await
         .unwrap();
         let messages = if resume_after_marker {
@@ -5248,9 +5439,183 @@ mod tests {
             .await
             .unwrap();
         let error = conn
-            .require_capabilities(&["draft/read-marker"])
+            .require_capabilities(&["draft/read-marker"], |_| Ok(()))
             .await
             .expect_err("NAK must be visible");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// A verdict answers a request. A server that streams `CAP ACK` for names
+    /// nobody asked for — or repeats one already answered — cannot enable
+    /// anything, and cannot grow what the connection holds: every entry of
+    /// the enabled set is one of this program's own names.
+    #[tokio::test]
+    async fn unrequested_acknowledgements_enable_nothing_and_hold_nothing() {
+        let mut steps = after_discovery(":srv CAP * LS :server-time", vec![]);
+        steps.extend([
+            Expect("CAP REQ :server-time"),
+            Send(":srv CAP * ACK :server-time"),
+        ]);
+        steps.extend(IDENTITY_THEN_WELCOME);
+        steps.push(Send(":srv CAP nick NEW :message-tags"));
+        let mut flood = Vec::new();
+        for round in 0..50 {
+            flood.push(if round % 2 == 0 {
+                ":srv CAP nick ACK :c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 -server-time message-tags"
+            } else {
+                ":srv CAP nick NAK :server-time d0 d1 d2 d3"
+            });
+        }
+        steps.extend(flood.into_iter().map(Send));
+        steps.push(Send(":srv CAP nick ACK :message-tags"));
+        let (mut connection, server) = scripted(steps);
+        connection
+            .register(&TEST_IDENTITY)
+            .await
+            .expect("registered");
+        // CAP NEW: message-tags is now wanted and asked for.
+        connection.next_line_relayable().await.unwrap();
+        assert_eq!(connection.capabilities_to_request(), vec!["message-tags"]);
+        // The first flooded ACK answers the one outstanding request; every
+        // other name in every flooded line is nobody's.
+        for _ in 0..51 {
+            connection.next_line_relayable().await.unwrap();
+        }
+        assert!(connection.enabled("message-tags"), "the requested one");
+        assert!(
+            connection.enabled("server-time"),
+            "never asked to be disabled"
+        );
+        for unrequested in ["c0", "c9", "d0"] {
+            assert!(!connection.enabled(unrequested), "{unrequested}");
+        }
+        assert_eq!(connection.enabled.len(), 2, "{:?}", connection.enabled);
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
+    /// A capability request made after registration meets the rest of the
+    /// welcome burst: an MOTD in Latin-1, the 005 that says how the network
+    /// names things, a PING. None of it ends the connection or disappears:
+    /// the lines are handed back in order, the 005 is adopted, and the PING is
+    /// answered.
+    #[tokio::test]
+    async fn a_post_registration_capability_request_hands_back_the_burst_it_reads() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (mut connection, server_io) = duplex_connection(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_io);
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            writer
+                .write_all(
+                    b":srv 005 nick CASEMAPPING=ascii CHATHISTORY=100 STATUSMSG=@ \
+                      :are supported by this server\r\n\
+                      :srv 372 nick :- caf\xe9\r\nPING :alive\r\n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                lines.next_line().await.unwrap().as_deref(),
+                Some("CAP REQ :batch")
+            );
+            assert_eq!(
+                lines.next_line().await.unwrap().as_deref(),
+                Some("PONG :alive")
+            );
+            writer
+                .write_all(b":srv CAP nick ACK :batch\r\n")
+                .await
+                .unwrap();
+        });
+        let mut burst = Vec::new();
+        connection
+            .require_capabilities(&["batch"], |event| {
+                burst.push(ClientEvent::from(event));
+                Ok(())
+            })
+            .await
+            .expect("a Latin-1 MOTD line does not fail the request");
+        let burst = messages_of(&burst);
+        assert_eq!(
+            burst.iter().map(|m| m.command.as_str()).collect::<Vec<_>>(),
+            ["005", "372"]
+        );
+        assert_eq!(
+            burst[1].params.last().map(String::as_str),
+            Some("- caf\u{fffd}")
+        );
+        assert!(connection.enabled("batch"));
+        assert!(!connection.names().eq("#a[", "#a{"), "CASEMAPPING=ascii");
+        assert_eq!(connection.names().conversation("@#a"), "#a");
+        assert_eq!(connection.chathistory_limit(), Some(100));
+        server.await.unwrap();
+    }
+
+    /// A page is never larger than the server's advertised CHATHISTORY limit —
+    /// a page it cut short would read as the end of the unread lines — and a
+    /// history request the server refuses leaves the join standing, with the
+    /// unread lines beyond what loaded still unread.
+    #[tokio::test]
+    async fn history_pages_fit_the_servers_limit_and_a_refusal_keeps_the_join() {
+        let mut steps = vec![
+            Expect("JOIN #r"),
+            Send(":srv 005 me CHATHISTORY=2 :are supported by this server"),
+            Send(":me!u@h JOIN #r"),
+            Send(":srv MARKREAD #r timestamp=2026-07-30T12:00:00.000Z"),
+            Send(":srv 366 me #r :End of NAMES"),
+            Expect("CHATHISTORY AFTER #r timestamp=2026-07-30T12:00:00.000Z 2"),
+            Send(":srv BATCH +h chathistory #r"),
+            Send("@batch=h;msgid=a :x!u@h PRIVMSG #r :1"),
+            Send("@batch=h;msgid=b :x!u@h PRIVMSG #r :2"),
+            Send(":srv BATCH -h"),
+            Expect("CHATHISTORY AFTER #r msgid=b 2"),
+            Send(":srv FAIL CHATHISTORY MESSAGE_ERROR #r :history store unavailable"),
+        ];
+        let (mut connection, server) = scripted(std::mem::take(&mut steps));
+        let joined = connection
+            .join_with_history("#r", 50, 500)
+            .await
+            .expect("a refused history request does not fail the join");
+        assert_eq!(joined.coverage, HistoryCoverage::UnreadBeyondLoaded);
+        let refusal = joined.refusal.expect("the refusal is reported").to_string();
+        assert!(refusal.contains("history store unavailable"), "{refusal}");
+        let texts: Vec<&str> = messages_of(&joined.events)
+            .into_iter()
+            .filter(|message| message.command == "PRIVMSG")
+            .map(|message| message.params[1].as_str())
+            .collect();
+        assert_eq!(texts, ["1", "2"]);
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+
+        // Without a marker nothing unread is known; a refusal of the latest
+        // lines is a join without history. For a script it is an error.
+        for latest in [false, true] {
+            let steps = vec![
+                Expect("JOIN #r"),
+                Send(":me!u@h JOIN #r"),
+                Send(":srv 366 me #r :End of NAMES"),
+                Expect("CHATHISTORY LATEST #r * 1000"),
+                Send(":srv FAIL CHATHISTORY INVALID_PARAMS LATEST #r :limit too large"),
+            ];
+            let (mut connection, server) = scripted(steps);
+            if latest {
+                let error = connection
+                    .join_with_latest_history("#r", 1000)
+                    .await
+                    .expect_err("a script asked for history and got none");
+                assert!(error.to_string().contains("limit too large"), "{error}");
+            } else {
+                let joined = connection
+                    .join_with_history("#r", 1000, 5000)
+                    .await
+                    .expect("the join stands");
+                assert_eq!(joined.coverage, HistoryCoverage::NoHistory);
+                assert!(joined.refusal.is_some());
+            }
+            drop(connection);
+            assert_eq!(server.await.unwrap(), Vec::<String>::new());
+        }
     }
 }

@@ -1821,11 +1821,12 @@ pub(crate) fn chanserv_status_on_owner(
         state.service_prefix("ChanServ"),
         change.mode()
     ));
-    state.broadcast_channel(&key, &line, None);
+    let echo = state.broadcast_channel_answering(&key, line, actor.recipient.conn());
     ChanServStatusResult::Changed {
         target: target_nick,
         channel: display,
         change,
+        echo,
     }
 }
 
@@ -1859,7 +1860,11 @@ pub(crate) fn emit_chanserv_status_result(
             target,
             channel,
             change,
+            echo,
         } => {
+            if let Some(echo) = echo {
+                state.send_event(conn, &echo);
+            }
             let done = match change {
                 StatusChange::Op => "Opped",
                 StatusChange::Deop => "Deopped",

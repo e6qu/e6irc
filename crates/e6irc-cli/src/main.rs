@@ -197,6 +197,8 @@ enum Command {
     /// Print the most recent history of a channel via CHATHISTORY.
     History {
         target: String,
+        /// Lines to print: at most the server's CHATHISTORY limit, which a
+        /// larger count is cut to with a warning.
         #[arg(long, default_value_t = 20)]
         count: usize,
     },
@@ -382,6 +384,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     .await?;
     let own_nick = registered.nick;
     let mut conn = registered.connection;
+    // A mechanism the server refused before any credential, and the weaker
+    // one used instead, is never a silent choice.
+    for note in conn.sasl_notes() {
+        eprintln!("warning: SASL: {}", terminal_safe(note));
+    }
     let mut stdout = std::io::stdout().lock();
     match cli.command {
         Command::Send { target, message } => {
@@ -407,10 +414,19 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 .await
         }
         Command::History { target, count } => {
-            conn.require_capabilities(&["batch", "draft/chathistory", "server-time"])
-                .await?;
+            conn.require_capabilities(&["batch", "draft/chathistory", "server-time"], |event| {
+                reported(event.into());
+                Ok(())
+            })
+            .await?;
             for event in learn_network(&mut conn).await? {
                 reported(event.into());
+            }
+            if let Some(limit) = conn.chathistory_limit().filter(|limit| count > *limit) {
+                eprintln!(
+                    "warning: the server returns at most {limit} lines per history request; \
+                     printing the latest {limit}"
+                );
             }
             let names = conn.names().clone();
             for event in conn.join_with_latest_history(&target, count).await? {
@@ -490,7 +506,11 @@ async fn send(
              refusal could arrive after the connection closed; the message was not sent",
         ));
     }
-    conn.require_capabilities(&["echo-message"]).await?;
+    conn.require_capabilities(&["echo-message"], |event| {
+        reported(event.into());
+        Ok(())
+    })
+    .await?;
     // Channels are +n by default, so join before speaking and wait for the
     // join to be confirmed. A refused or unconfirmed join is an error here.
     let names = conn.names().clone();

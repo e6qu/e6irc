@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  ALERTS_RESOLVED_BY_CONNECTING,
   ApiError,
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -262,4 +264,28 @@ test("an error that already ends its sentence is not given a second full stop", 
   assert.equal(errorMessage("load Libera", new Error("The API path schema is invalid.")), "Could not load Libera. The API path schema is invalid.");
   assert.equal(errorMessage("load Libera", new Error("Database unavailable")), "Could not load Libera. Database unavailable.");
   assert.equal(errorMessage("load Libera", new Error("")), "Could not load Libera.");
+});
+
+// A reconnect used to clear the "send" key, which also carried "N message(s)
+// were not confirmed before the live connection closed": the one alert saying
+// messages were lost vanished the moment the connection came back.
+test("a reconnect resolves not-connected alerts but never a lost-message alert", async () => {
+  assert.ok(ALERTS_RESOLVED_BY_CONNECTING.includes("not-connected"));
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const body = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start !== -1, name);
+    return source.slice(start, source.indexOf("\n}\n", start));
+  };
+  const keyOf = (name) => body(name).match(/showAlert\(\s*"([a-z-]+)"/)[1];
+  for (const failure of ["rejectAllPendingSends", "rejectPendingSend", "restoreRejectedMessage"]) {
+    assert.ok(!ALERTS_RESOLVED_BY_CONNECTING.includes(keyOf(failure)), failure);
+  }
+  assert.equal(keyOf("showNotConnected"), "not-connected");
+  // The open handler clears the list and nothing else; "Not connected" is
+  // said only through its own key.
+  const open = source.slice(source.indexOf('liveSocket.addEventListener("open"'), source.indexOf('liveSocket.addEventListener("error"'));
+  assert.deepEqual([...open.matchAll(/clearAlert\([^)]*\)/g)].map(([call]) => call), ["clearAlert(key)"]);
+  assert.match(open, /for \(const key of ALERTS_RESOLVED_BY_CONNECTING\) clearAlert\(key\)/);
+  assert.equal([...source.matchAll(/Not connected/g)].length, [...body("showNotConnected").matchAll(/Not connected/g)].length);
 });

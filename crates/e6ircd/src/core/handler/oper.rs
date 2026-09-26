@@ -56,13 +56,11 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // recorded does not happen.
     let operator = crate::db::AuditPrincipal::operator(&state.casemap.casefold(name));
     if queue_audit(state, &operator, "OPER", &operator, &format!("nick {nick}")).is_err() {
-        let server = state.config.server_name.clone();
-        state.send(
+        send_server_notice(
+            state,
             conn,
-            &format!(
-                ":{server} NOTICE {nick} :Services are temporarily unavailable; OPER not granted \
-                 (the audit trail cannot record it)"
-            ),
+            "Services are temporarily unavailable; OPER not granted \
+             (the audit trail cannot record it)",
         );
         return;
     }
@@ -108,13 +106,12 @@ pub(super) fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
     false
 }
 
-fn server_and_registered_nick(state: &ServerState, conn: ConnId) -> (String, String) {
-    let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn]
+/// The nick of an operator `require_oper` admitted, who is registered.
+fn oper_nick(state: &ServerState, conn: ConnId) -> String {
+    state.sessions[&conn]
         .nick()
         .map(String::from)
-        .expect("registered");
-    (server, nick)
+        .expect("registered")
 }
 
 // ---- KILL ---------------------------------------------------------------
@@ -177,15 +174,23 @@ fn operator_name(state: &ServerState, conn: ConnId) -> String {
 /// Tell an operator their command did nothing because its audit row could not
 /// be queued.
 fn refuse_unaudited(state: &mut ServerState, conn: ConnId, command: &str) {
-    let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
-    state.send(
+    send_server_notice(
+        state,
         conn,
         &format!(
-            ":{server} NOTICE {nick} :Services are temporarily unavailable; {command} not \
-             performed (the audit trail cannot record it)"
+            "Services are temporarily unavailable; {command} not performed \
+             (the audit trail cannot record it)"
         ),
     );
+}
+
+/// Send `conn` a server NOTICE through the one fitted shape
+/// ([`ServerState::server_notice_line`]): every operator-facing notice here
+/// can carry an operator-typed mask, a stored ban reason or a host, none of
+/// which a `format!`ed line would keep inside the wire limit.
+fn send_server_notice(state: &mut ServerState, conn: ConnId, text: &str) {
+    let line = state.server_notice_line(conn, text);
+    state.send(conn, &line);
 }
 
 /// Carry out `action` on `conn`'s session: here if it lives on this shard,
@@ -381,12 +386,8 @@ pub(super) fn notify_opers(state: &mut ServerState, except: Option<ConnId>, text
         // ban reason), so fit it to the wire limit per recipient — the head's
         // length varies with the recipient's nick — or a maximal comment pushes
         // the line past 512 and the recipient's framing discards it whole.
-        let head = format!(":{server} NOTICE {} :*** Notice -- ", user.nick);
-        let fitted = fit_trailing(&head, text);
-        state.send_recipient_uncaptured(
-            user.recipient,
-            bytes::Bytes::from(format!("{head}{fitted}\r\n")),
-        );
+        let line = server_notice(&server, &user.nick, &format!("*** Notice -- {text}"));
+        state.send_recipient_uncaptured(user.recipient, bytes::Bytes::from(line + "\r\n"));
     }
 }
 
@@ -435,22 +436,23 @@ pub(super) enum BanReject {
     /// user connected from), or a CIDR host whose prefix is out of range.
     /// Carries the display mask and why.
     Invalid(String, &'static str),
-    /// The mask is longer than its kind allows (carried): not echoed, since a
-    /// mask that long would not fit the refusal either.
-    TooLong(usize),
 }
 
 impl BanReject {
     /// The refusal as the operator is told it, for a ban of kind `label`.
+    /// The mask is shown clipped to the longest a mask may be, so the reason
+    /// after it survives the notice's fit to the line.
     pub(super) fn describe(&self, label: &str) -> String {
+        let shown = |mask: &str| {
+            e6irc_proto::message::truncate_on_char_boundary(mask, super::channel::REALLEN)
+                .to_string()
+        };
         match self {
             Self::MatchesEveryone(mask) => format!(
-                "Refusing {label} for {mask}: it matches every user (use a more specific mask)"
+                "Refusing {label} for {}: it matches every user (use a more specific mask)",
+                shown(mask)
             ),
-            Self::Invalid(mask, why) => format!("Refusing {label} for {mask}: {why}"),
-            Self::TooLong(max) => {
-                format!("Refusing {label}: the mask is longer than {max} bytes")
-            }
+            Self::Invalid(mask, why) => format!("Refusing {label} for {}: {why}", shown(mask)),
         }
     }
 }
@@ -502,6 +504,22 @@ impl BanMask {
         // whole past 512 bytes. 300 chars is ample with room for the wrapping.
         let reason = e6irc_proto::message::truncate_on_char_boundary(&reason, 300).to_string();
         let display = ban_mask(kind, &raw_mask);
+        // Bound the mask like a channel ban's (BANMASKLEN): it rides the ban
+        // list, STATS and every operator's notice, and no subject it could
+        // match is longer — a `user@host` is far inside 100 bytes, a gecos
+        // inside REALLEN. Refused rather than cut: a clipped glob bans
+        // someone the operator did not name.
+        let bound = match kind {
+            BanKind::Xline => super::channel::REALLEN,
+            BanKind::Kline | BanKind::Dline => super::channel::BANMASKLEN,
+        };
+        if display.len() > bound {
+            let why = match kind {
+                BanKind::Xline => "a realname mask is at most 150 bytes (REALLEN)",
+                BanKind::Kline | BanKind::Dline => "a mask is at most 100 bytes (BANMASKLEN)",
+            };
+            return Err(BanReject::Invalid(display, why));
+        }
         // A mask that constrains nothing bans everyone. `user@host` is a netban
         // only when *both* sides are pure wildcard; a single-field DLINE/XLINE
         // glob is one when the whole field is.
@@ -514,17 +532,6 @@ impl BanMask {
         };
         if matches_everyone {
             return Err(BanReject::MatchesEveryone(display));
-        }
-        // Bounded like a channel list mask (BANMASKLEN): the mask rides every
-        // STATS row, listing and notice, which must fit one line. An X-line
-        // matches a realname, which is at most REALLEN, so its mask may be as
-        // long; a longer mask of either kind could match nothing it is for.
-        let max_len = match kind {
-            BanKind::Kline | BanKind::Dline => super::channel::BANMASKLEN,
-            BanKind::Xline => super::channel::REALLEN,
-        };
-        if display.len() > max_len {
-            return Err(BanReject::TooLong(max_len));
         }
         match kind {
             BanKind::Dline if !valid_dline(&display) => {
@@ -563,7 +570,7 @@ pub(super) fn cmd_add_ban(
         return;
     }
     let label = kind.label();
-    let (server, nick) = server_and_registered_nick(state, conn);
+    let nick = oper_nick(state, conn);
     if p.is_empty() {
         // List current bans of this kind.
         let now_secs = (state.config.clock)().as_secs();
@@ -574,23 +581,21 @@ pub(super) fn cmd_add_ban(
                 let temporary = b.minutes_left(now_secs).map_or(String::new(), |left| {
                     format!(" (temporary, {left} min. left)")
                 });
-                fitted_line(
-                    format!(
-                        ":{server} NOTICE {nick} :{label} {}{temporary} (by {}) :",
+                state.server_notice_line(
+                    conn,
+                    &format!(
+                        "{label} {}{temporary} (by {}) :{}",
                         b.mask.as_str(),
                         b.set_by,
+                        b.reason
                     ),
-                    &b.reason,
                 )
             })
             .collect();
         for line in lines {
             state.send(conn, &line);
         }
-        state.send(
-            conn,
-            &format!(":{server} NOTICE {nick} :End of {label} list."),
-        );
+        send_server_notice(state, conn, &format!("End of {label} list."));
         return;
     }
     // Enforcement folds mask and subject under the casemap (`mask::matches`), so
@@ -637,9 +642,7 @@ pub(super) fn cmd_add_ban(
     let (parsed_mask, reason) = match BanMask::parse(kind, &params, has_trailing) {
         Ok(parsed) => parsed,
         Err(reject) => {
-            let refusal = reject.describe(label);
-            let line = fitted_line(format!(":{server} NOTICE {nick} :"), &refusal);
-            state.send(conn, &line);
+            send_server_notice(state, conn, &reject.describe(label));
             return;
         }
     };
@@ -653,8 +656,7 @@ pub(super) fn cmd_add_ban(
     let mask = crate::core::state::MaskKey::new(parsed_mask.as_str(), casemap);
     let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick.clone(), expiry);
     if !state.config.sasl_enabled {
-        let text = ban_added_text(kind, mask.as_str(), expiry);
-        state.send(conn, &format!(":{server} NOTICE {nick} :{text}"));
+        send_server_notice(state, conn, &ban_added_text(kind, mask.as_str(), expiry));
         commit_server_ban(state, mutation);
         return;
     }
@@ -755,8 +757,6 @@ fn begin_oper_server_ban(
             state.defer_captured_reply(conn);
         }
         Err(error) => {
-            let server = state.config.server_name.clone();
-            let nick = state.sessions[&conn].nick().unwrap_or("*");
             let message = match error {
                 QueueServerBanError::AlreadyPending => format!(
                     "A {label} change for {} is already in progress",
@@ -766,7 +766,7 @@ fn begin_oper_server_ban(
                     "Services are temporarily unavailable; {label} not {unavailable_action}"
                 ),
             };
-            state.send(conn, &format!(":{server} NOTICE {nick} :{message}"));
+            send_server_notice(state, conn, &message);
         }
     }
 }
@@ -796,10 +796,11 @@ fn apply_server_ban_hot(state: &mut ServerState, ban: ServerBan) {
     // a `public|private` reason.
     let reason = crate::core::state::public_ban_reason(&ban.reason);
     for victim in victims {
-        state.send(
-            victim,
-            &format!("ERROR :Closing Link: ({label}d: {reason})"),
-        );
+        // A stored reason is bounded where a ban is set, but a row written by
+        // an older build or by hand is not: fit it like the KILL close.
+        let head = format!("ERROR :Closing Link: ({label}d: ");
+        let fitted = fit_trailing(&format!("{head})"), reason);
+        state.send(victim, &format!("{head}{fitted})"));
         state.close(victim, &format!("{label}d: {reason}"));
     }
 }
@@ -818,22 +819,20 @@ pub(crate) fn expire_server_bans(state: &mut ServerState) {
         .into_iter()
         .partition(|ban| !ban.in_force(now_secs));
     state.server_bans = kept;
-    let server = state.config.server_name.clone();
-    let operators: Vec<(ConnId, String)> = state
+    let operators: Vec<ConnId> = state
         .sessions
         .iter()
         .filter(|(_, session)| session.is_registered() && session.oper.is_some())
-        .filter_map(|(&conn, session)| Some((conn, session.nick()?.to_string())))
+        .map(|(&conn, _)| conn)
         .collect();
     for ban in lapsed {
         let text = format!(
-            "Temporary {} for {} expired",
+            "*** Notice -- Temporary {} for {} expired",
             ban.kind.label(),
             ban.mask.as_str()
         );
-        for (conn, nick) in &operators {
-            let line = fitted_line(format!(":{server} NOTICE {nick} :*** Notice -- "), &text);
-            state.send(*conn, &line);
+        for &conn in &operators {
+            send_server_notice(state, conn, &text);
         }
     }
 }
@@ -863,10 +862,8 @@ fn server_ban_oper_verdict(
     if !state.sessions.contains_key(&conn) {
         return;
     }
-    let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
     state.emit_deferred_labeled(conn, response_label, |state| {
-        state.send(conn, &format!(":{server} NOTICE {nick} :{text}"));
+        send_server_notice(state, conn, text);
     });
 }
 
@@ -1131,17 +1128,15 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         _ => p[0].to_string(),
     };
     let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
-    let (server, nick) = server_and_registered_nick(state, conn);
+    let nick = oper_nick(state, conn);
     let exists = state
         .server_bans_in_force()
         .any(|ban| ban.kind == kind && ban.mask == mask);
     if !exists {
-        state.send(
+        send_server_notice(
+            state,
             conn,
-            &format!(
-                ":{server} NOTICE {nick} :No {label} found for {}",
-                mask.as_str()
-            ),
+            &format!("No {label} found for {}", mask.as_str()),
         );
         return;
     }
@@ -1150,12 +1145,10 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
             state,
             crate::core::ServerBanMutation::remove(&mask, kind, nick.clone()),
         );
-        state.send(
+        send_server_notice(
+            state,
             conn,
-            &format!(
-                ":{server} NOTICE {nick} :Removed {label} for {}",
-                mask.as_str()
-            ),
+            &format!("Removed {label} for {}", mask.as_str()),
         );
         return;
     }
@@ -1174,16 +1167,9 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "SETHOST");
         return;
     };
-    let server = state.config.server_name.clone();
-    let oper_nick = state.sessions[&conn]
-        .nick()
-        .map(String::from)
-        .expect("registered");
+    let oper_nick = oper_nick(state, conn);
     if !valid_visible_host(newhost) {
-        state.send(
-            conn,
-            &format!(":{server} NOTICE {oper_nick} :Invalid host: {newhost}"),
-        );
+        send_server_notice(state, conn, &format!("Invalid host: {newhost}"));
         return;
     }
     let Some(target) = state.registered_user(&state.nick_key(nick)) else {
@@ -1284,11 +1270,14 @@ fn set_host(
         );
     }
     let server = state.config.server_name.clone();
+    let line = server_notice(
+        &server,
+        oper_nick,
+        &format!("Set host of {nick} to {newhost}"),
+    );
     state.send_recipient_uncaptured(
         crate::core::state::Recipient::new(oper, Default::default()),
-        bytes::Bytes::from(format!(
-            ":{server} NOTICE {oper_nick} :Set host of {nick} to {newhost}\r\n"
-        )),
+        bytes::Bytes::from(line + "\r\n"),
     );
 }
 
@@ -1317,5 +1306,33 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .collect();
     for recipient in recipients {
         state.send_event_recipient(recipient, &line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal names the bound it enforces, so the two cannot drift.
+    #[test]
+    fn a_ban_mask_refusal_names_the_bound_it_enforces() {
+        use super::super::channel::{BANMASKLEN, REALLEN};
+        for (kind, bound) in [
+            (BanKind::Kline, BANMASKLEN),
+            (BanKind::Dline, BANMASKLEN),
+            (BanKind::Xline, REALLEN),
+        ] {
+            let mask = "1".repeat(bound + 1);
+            match BanMask::parse(kind, &[mask.as_str()], false) {
+                Err(BanReject::Invalid(_, why)) => {
+                    assert!(why.contains(&format!("at most {bound} bytes")), "{why}");
+                }
+                _ => panic!(
+                    "{}: a {}-byte mask was not refused",
+                    kind.label(),
+                    mask.len()
+                ),
+            }
+        }
     }
 }

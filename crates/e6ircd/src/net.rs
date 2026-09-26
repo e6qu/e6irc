@@ -2769,9 +2769,20 @@ mod tests {
                         .unwrap();
                     heard_tx.send(Some("registered".into())).await.unwrap();
                 } else if line.starts_with("QUIT") {
+                    // As a server does: answer the goodbye and close. The
+                    // driver reads to that close (`say_goodbye`), so both are
+                    // heard before shutdown completes, whatever the platform's
+                    // scheduling; an upstream that never answers is bounded by
+                    // the goodbye deadline instead.
                     heard_tx.send(Some(line)).await.unwrap();
+                    writer
+                        .write_all(b"ERROR :Closing Link: bncbot (Quit)\r\n")
+                        .await
+                        .unwrap();
+                    writer.shutdown().await.unwrap();
                 }
             }
+            // End of stream: the driver closed its socket.
             heard_tx.send(None).await.unwrap();
         });
         let (core_tx, _core_rx) = queue::<Input>(e6irc_queue::Config {
@@ -2819,15 +2830,22 @@ mod tests {
         let mut handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
         handle.bnc_registry = Some(registry.clone());
         assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
-        // What the upstream had read by the time `run` returned.
+        // The goodbye was sent before `run` returned; the upstream may see
+        // the close a moment later on its own task, so wait for it (bounded).
+        // The test still holds the registry, so only the driver closing its
+        // socket can end the upstream's stream.
         let mut heard = Vec::new();
-        while let Ok(line) = heard_rx.try_recv() {
+        while heard.last() != Some(&None) {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+                .await
+                .expect("the driver closed its socket during shutdown")
+                .expect("the upstream reports what it read");
             heard.push(line);
         }
         assert_eq!(
             heard,
             vec![Some("QUIT :e6irc bouncer stopping".to_string()), None],
-            "the upstream reads the goodbye, then end of stream, before shutdown completes"
+            "the upstream reads the goodbye, then the driver's close"
         );
         drop(registry);
     }
