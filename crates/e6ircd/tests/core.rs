@@ -13825,8 +13825,15 @@ fn malformed_client_tag_keys_are_not_relayed() {
         relayed.contains("+example.com/reply=abc"),
         "valid client tag dropped: {relayed}"
     );
+    // Judged on the tag section by key: the random msgid is hex, and a
+    // substring test for "bad" failed whenever the msgid happened to spell it.
+    let tags = relayed
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(tags, _)| tags)
+        .expect("the relayed line carries tags");
     assert!(
-        !relayed.contains("bad"),
+        !tags.split(';').any(|tag| tag.starts_with("+bad")),
         "malformed client tag key relayed: {relayed}"
     );
 }
