@@ -53,8 +53,11 @@ fuzz_target!(|data: &[u8]| {
         "sanitize left an injectable byte: {sanitized:?}"
     );
     // A framed line never holds CR or LF (the framing split on them); within
-    // that domain, a line that fits as bytes is relayed as itself, with only
-    // its NULs neutralized.
+    // that domain, a line that fits as bytes still fits once decoded, and is
+    // relayed as itself with only its NULs neutralized -- unless neutralizing
+    // a NUL (to a space) moved where the line splits into tags and body, and
+    // the line so split no longer fits: then relaying it would put an
+    // over-budget line on the client's wire, and the loud rejection is right.
     let framed = !bytes.iter().any(|b| matches!(b, b'\r' | b'\n'));
     if framed && server_frame_fits(bytes) {
         assert!(
@@ -62,11 +65,13 @@ fuzz_target!(|data: &[u8]| {
             "decoding outgrew the budget the bytes fitted: {} bytes",
             raw.len()
         );
-        assert_eq!(
-            sanitized,
-            raw.replace('\0', " "),
-            "a line that fits as bytes was rejected as text"
-        );
+        let neutralized = raw.replace('\0', " ");
+        if server_frame_fits(neutralized.as_bytes()) {
+            assert_eq!(
+                sanitized, neutralized,
+                "a line that fits as bytes was rejected as text"
+            );
+        }
     }
 
     let delivered = filter_tags(&sanitized, caps);

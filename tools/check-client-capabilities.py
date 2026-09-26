@@ -42,7 +42,9 @@ def main() -> int:
 
     cli_caps = quoted_values(
         cli_source,
-        r"require_capabilities\(&\[(.*?)\]\)",
+        # The history request is the first; its list is followed by the
+        # callback that receives the lines read meanwhile.
+        r"require_capabilities\(\s*&\[(.*?)\]",
     )
     if "`history` requires `" + " ".join(cli_caps) + "`" not in document:
         return fail("CLI history requirement differs from the matrix")
