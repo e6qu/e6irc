@@ -50,7 +50,6 @@ fuzz_target!(|data: &[u8]| {
             max_hot_channels: 4,
             clock: || e6irc_proto::time::Millis::from_millis(1_000_000_000),
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(1_000_000_000),
-            command_flood: None,
             registration_burst: None,
             registration_before_connect: selector & 2 != 0,
             registration_require_email: false,

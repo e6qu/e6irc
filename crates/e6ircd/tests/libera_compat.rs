@@ -130,7 +130,6 @@ fn our_isupport() -> HashMap<String, String> {
             max_hot_channels: 8192,
             clock: || e6irc_proto::time::Millis::from_millis(0),
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),

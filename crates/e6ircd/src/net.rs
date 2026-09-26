@@ -749,7 +749,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         remaining_core_senders.push(sender);
         core_receivers.push(receiver);
     }
-    let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders);
+    // Every connection's lines are metered where they enter the core: an
+    // empty bucket stops its reader, not the connection (DESIGN §7.2).
+    let command_flood =
+        crate::core::CommandFlood::new(config.limits.command_burst, config.limits.command_rate)
+            .map_err(io::Error::other)?;
+    let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders)
+        .with_command_flood(command_flood);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,
@@ -1105,10 +1111,6 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .collect(),
         clock: wall_clock,
         mono_clock,
-        command_flood: Some(
-            crate::core::CommandFlood::new(config.limits.command_burst, config.limits.command_rate)
-                .map_err(io::Error::other)?,
-        ),
         registration_burst: config.limits.registration_burst,
         sasl_requirement: config.limits.sasl_requirement(),
         reserved_account_names: configured_administrators.clone(),
@@ -1989,12 +1991,15 @@ where
     let mut framing = LineBuffer::new(LINE_LIMIT);
     let mut buf = [0u8; READ_BUF];
     let mut events = Vec::new();
+    let mut meter = core_tx.line_meter(conn);
     let reason = loop {
         match read_half.read(&mut buf).await {
             Ok(0) => break "Connection closed".to_string(),
             Ok(n) => {
                 framing.feed(&buf[..n], &mut events);
-                if !crate::core::push_framed(core_tx, conn, &mut events).await {
+                // Nothing more is read until these lines are through the
+                // meter: a client past its allowance waits in its own socket.
+                if !crate::core::push_framed(core_tx, &mut meter, conn, &mut events).await {
                     return; // core gone
                 }
             }
@@ -2706,7 +2711,6 @@ mod tests {
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
@@ -2965,6 +2969,52 @@ mod tests {
         assert!(
             saw_error,
             "every client must be notified with an ERROR on shutdown"
+        );
+    }
+
+    /// A client streaming lines — PONGs, before it has even registered — gets
+    /// no more of them into the core's queue than its command allowance: past
+    /// its bucket its reader stops reading the socket until a token is back,
+    /// and the rest wait in the client's own socket buffers.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_streaming_pongs_gets_only_its_allowance_into_the_core_queue() {
+        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-core",
+            capacity: 65536,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::single(core_tx)
+            .with_command_flood(crate::core::CommandFlood::new(40, 20).expect("valid bucket"));
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        client
+            .write_all("PONG :x\r\n".repeat(5000).as_bytes())
+            .await
+            .expect("write");
+        let telemetry = Telemetry::new();
+        let reader = read_loop(server, ConnId(1), &ingress, &telemetry);
+        tokio::pin!(reader);
+        let queued = |rx: &mut Receiver<Input>| {
+            std::iter::from_fn(|| rx.try_pop())
+                .filter(|envelope| matches!(envelope.payload, Input::Line { .. }))
+                .count()
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut reader)
+                .await
+                .is_err(),
+            "the reader is still reading"
+        );
+        assert_eq!(queued(&mut core_rx), 40, "one burst at once");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut reader)
+                .await
+                .is_err(),
+            "the reader is still reading"
+        );
+        let second = queued(&mut core_rx);
+        assert!(
+            (19..=21).contains(&second),
+            "then twenty a second, not {second}"
         );
     }
 }

@@ -27,7 +27,7 @@ pub struct ConnId(pub u64);
 /// Casefolded channel-name key. Constructible only via
 /// [`ServerState::chan_key`], so a display-cased name can never index
 /// the channel table — that bug class is unrepresentable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChanKey(String);
 
 impl ChanKey {
@@ -1212,13 +1212,15 @@ pub(crate) struct CoreDirectories {
     pub(crate) topics: RetainedTopicDirectory,
     pub(crate) channel_options: ChannelOptionsDirectory,
     pub(crate) nick_registrations: NickRegistrationDirectory,
+    /// Which connections their readers let past the line meter.
+    pub(crate) flood_exemptions: crate::core::line_meter::FloodExemptions,
 }
 
 /// A validated command-flood bucket shape: `burst` tokens at most, refilling
 /// `rate` per second. Constructed only through [`CommandFlood::new`], so a
-/// bucket that never refills (`rate = 0`), that kills every command
+/// bucket that never refills (`rate = 0`), that never admits a line
 /// (`burst = 0`), or that cannot hold one second of its own rate
-/// (`burst < rate`) cannot reach the dispatcher.
+/// (`burst < rate`) cannot reach a connection's line meter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandFlood {
     burst: u32,
@@ -1246,7 +1248,7 @@ impl std::fmt::Display for CommandFloodError {
             }
             Self::BurstZero => write!(
                 f,
-                "limits.command_burst must be at least 1 (0 flood-kills every command)"
+                "limits.command_burst must be at least 1 (0 never admits a line)"
             ),
             Self::BurstBelowRate { burst, rate } => write!(
                 f,
@@ -1342,13 +1344,6 @@ pub struct CoreConfig {
     /// reaper). The wall clock stays the source only for real timestamps
     /// (`server-time`, msgids, signon).
     pub mono_clock: fn() -> e6irc_proto::time::MonoMillis,
-    /// Per-session command-flood bucket. Registered non-oper sessions spend
-    /// one token per command (PING/PONG exempt) and are closed with Excess
-    /// Flood when the bucket is empty. The server always sets it (see
-    /// `limits.command_burst`/`limits.command_rate`); `None` exists for the
-    /// in-process drivers of the test and fuzz harnesses, which pipeline
-    /// whole scripted sessions in one clock instant.
-    pub command_flood: Option<CommandFlood>,
     /// Per-client-IP account-creation bucket size; `None` disables the throttle.
     /// One token is spent per REGISTER/NickServ-REGISTER that reaches account
     /// creation; the bucket refills to full over an hour (account creation is
@@ -1736,9 +1731,10 @@ pub(crate) struct Session {
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
     pub multiline: Option<MultilineBatch>,
-    /// This connection's LIST still answering, gathering or sending. On the
-    /// session, so a LIST cannot be paced to a connection that is gone.
-    pub(crate) channel_list: Option<crate::core::list::ListProgress>,
+    /// This connection's LIST still answering: its place in each shard's
+    /// channels and the rows of the pages not yet sent. On the session, so a
+    /// LIST cannot be paced to a connection that is gone.
+    pub(crate) channel_list: Option<crate::core::list::ChannelListCursor>,
     /// This connection's WHO replies too long to queue at once, still going
     /// out as its send queue drains. On the session for the same reason.
     pub(crate) paced_who: Option<crate::core::paced::PacedReplies>,
@@ -1753,13 +1749,10 @@ pub(crate) struct Session {
     /// would write a persisted marker the client never asked to associate with the
     /// account (same reason the DM-history identity key is not back-filled).
     pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
-    /// Command-flood token bucket: tokens remaining, and the clock-millisecond
-    /// through which refill has already been credited (it advances by whole
-    /// tokens' worth only, so a sub-token remainder carries forward instead of
-    /// being discarded).
-    pub flood_tokens: u32,
-    /// Monotonic — the flood refill is a timer, not a timestamp.
-    pub flood_refilled_to_ms: e6irc_proto::time::MonoMillis,
+    /// Whether this connection's reader is told it is exempt from the line
+    /// meter ([`crate::core::line_meter`]): what `oper` was when it was last
+    /// published there.
+    flood_exempt: bool,
     /// Monotonic millisecond of the last non-keepalive command — the elapsed
     /// idle duration since it (WHOIS idle / WHOX `l`) and the reaper's idle-ping
     /// cadence both read it. (WHOIS *signon*, a real timestamp, is `signon`.)
@@ -2733,33 +2726,23 @@ pub struct ChannelHistoryRequest {
     pub(crate) parameters: Vec<String>,
 }
 
-/// One whole-network LIST request. Each channel shard answers once.
+/// A request for one page of a LIST: the rows of one channel shard's channels
+/// after `after`, in key order, that the LIST's conditions admit and its
+/// connection may see — at most `limit` of them.
 #[derive(Debug, Clone)]
 pub struct ChannelListRequest {
     id: ChannelListRequestId,
     session: SessionOwner,
-    actor: ChannelActor,
-    filter: crate::core::list::ListFilter,
+    shard: CoreShardId,
+    filter: Arc<crate::core::list::ListFilter>,
+    after: Option<ChanKey>,
+    limit: NonZeroUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelListRequestId(u64);
 
 impl ChannelListRequest {
-    fn new(
-        id: ChannelListRequestId,
-        session: SessionOwner,
-        actor: ChannelActor,
-        filter: crate::core::list::ListFilter,
-    ) -> Self {
-        Self {
-            id,
-            session,
-            actor,
-            filter,
-        }
-    }
-
     pub(crate) fn id(&self) -> ChannelListRequestId {
         self.id
     }
@@ -2768,29 +2751,42 @@ impl ChannelListRequest {
         self.session
     }
 
-    pub(crate) fn actor(&self) -> &ChannelActor {
-        &self.actor
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.shard
     }
 
     pub(crate) fn filter(&self) -> &crate::core::list::ListFilter {
         &self.filter
+    }
+
+    pub(crate) fn after(&self) -> Option<&ChanKey> {
+        self.after.as_ref()
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.get()
     }
 }
 
 /// One visible channel row returned by a channel shard.
 #[derive(Debug, Clone)]
 pub struct ChannelListRow {
+    pub(crate) key: ChanKey,
     pub(crate) name: String,
     pub(crate) members: usize,
     pub(crate) topic: String,
 }
 
-/// A channel shard's complete contribution to a whole-network LIST request.
+/// One page of a LIST, from the shard it was asked of.
 #[derive(Debug)]
 pub struct ChannelListResult {
     pub(crate) id: ChannelListRequestId,
     pub(crate) session: SessionOwner,
+    pub(crate) shard: CoreShardId,
     pub(crate) rows: Vec<ChannelListRow>,
+    /// The key the shard's next page starts after; `None` when it has no
+    /// channel past this page.
+    pub(crate) next: Option<ChanKey>,
 }
 
 /// A parsed channel MODE mutation, with its mode token separate from arguments.
@@ -4125,7 +4121,8 @@ impl ChannelOwner {
 
 pub(crate) struct ChannelDirectory {
     shards: CoreShardCount,
-    channels: HashMap<ChanKey, Channel>,
+    /// Ordered, so a LIST can keep its place in it as a key (§7.2).
+    channels: std::collections::BTreeMap<ChanKey, Channel>,
     /// Channels handed out mutably, or removed, since the last
     /// [`ChannelDirectory::take_touched`]: the only ones whose published
     /// description can have changed.
@@ -4141,7 +4138,7 @@ impl ChannelDirectory {
     pub(crate) fn new(shards: CoreShardCount) -> Self {
         Self {
             shards,
-            channels: HashMap::new(),
+            channels: std::collections::BTreeMap::new(),
             touched: Vec::new(),
             activity_touched: Vec::new(),
         }
@@ -4188,7 +4185,7 @@ impl ChannelDirectory {
     pub(crate) fn entry(
         &mut self,
         key: ChanKey,
-    ) -> std::collections::hash_map::Entry<'_, ChanKey, Channel> {
+    ) -> std::collections::btree_map::Entry<'_, ChanKey, Channel> {
         self.touched.push(key.clone());
         self.channels.entry(key)
     }
@@ -4202,8 +4199,14 @@ impl ChannelDirectory {
         self.channels.len()
     }
 
-    pub(crate) fn iter(&self) -> std::collections::hash_map::Iter<'_, ChanKey, Channel> {
-        self.channels.iter()
+    /// This shard's channels in key order, from the first after `after` (from
+    /// the very first when `None`).
+    pub(crate) fn after(
+        &self,
+        after: Option<&ChanKey>,
+    ) -> std::collections::btree_map::Range<'_, ChanKey, Channel> {
+        let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        self.channels.range((start, std::ops::Bound::Unbounded))
     }
 }
 
@@ -4235,6 +4238,9 @@ pub(crate) struct ServerState {
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
+    /// The line meter's exemptions, which this shard publishes for its own
+    /// sessions ([`Self::sync_flood_exemption`]).
+    flood_exemptions: crate::core::line_meter::FloodExemptions,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
@@ -4526,7 +4532,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelJoin {
+            .push(CoreEffect::input(crate::core::Input::ChannelJoin {
                 owner,
                 actor,
                 name,
@@ -4543,7 +4549,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelJoinResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelJoinResult {
                 session,
                 requested,
                 result,
@@ -4560,7 +4566,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelPart {
+            .push(CoreEffect::input(crate::core::Input::ChannelPart {
                 owner,
                 actor,
                 name,
@@ -4576,7 +4582,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelPartResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelPartResult {
                 session,
                 result,
                 label,
@@ -4585,12 +4591,12 @@ impl ServerState {
 
     pub fn route_quit(&mut self, quit: ChannelQuit) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelQuit { quit }));
+            .push(CoreEffect::input(crate::core::Input::ChannelQuit { quit }));
     }
 
     pub fn route_topic(&mut self, topic: ChannelTopic) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTopic {
+            .push(CoreEffect::input(crate::core::Input::ChannelTopic {
                 topic,
             }));
     }
@@ -4602,7 +4608,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTopicResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelTopicResult {
                 session,
                 result,
                 label,
@@ -4611,13 +4617,13 @@ impl ServerState {
 
     pub fn route_channel_command(&mut self, command: ChannelCommand) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelCommand {
+            .push(CoreEffect::input(crate::core::Input::ChannelCommand {
                 command,
             }));
     }
 
     pub(crate) fn route_input(&mut self, input: crate::core::Input) {
-        self.effects.push(CoreEffect::Input(input));
+        self.effects.push(CoreEffect::input(input));
     }
 
     pub fn route_channel_command_result(
@@ -4626,7 +4632,7 @@ impl ServerState {
         result: ChannelCommandResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::Input(
+        self.effects.push(CoreEffect::input(
             crate::core::Input::ChannelCommandResult {
                 session,
                 result,
@@ -4635,42 +4641,55 @@ impl ServerState {
         ));
     }
 
-    /// Ask every channel shard for `conn`'s LIST rows; the connection has no
-    /// LIST in progress.
+    /// Begin `conn`'s LIST, whose reply is already open (inside `batch` when
+    /// labeled): a cursor at the start of every channel shard. The connection
+    /// has no LIST in progress.
     pub fn start_channel_list(
         &mut self,
         conn: ConnId,
-        label: Option<String>,
+        batch: Option<String>,
         filter: crate::core::list::ListFilter,
-    ) -> ChannelListRequest {
+    ) {
         let id = ChannelListRequestId(self.channel_list_id);
         self.channel_list_id = self
             .channel_list_id
             .checked_add(1)
             .expect("channel LIST request identifiers exhausted");
-        let session = SessionOwner::new(conn, self.shard);
-        let request = ChannelListRequest::new(id, session, self.channel_actor(conn), filter);
-        let remaining = self.channels.shard_count();
+        let shards = self.channels.shard_count();
         let session = self
             .sessions
             .output_mut(&conn)
             .expect("a LIST is started by the session sending it");
         let previous = session
             .channel_list
-            .replace(crate::core::list::ListProgress::Gathering {
-                id,
-                label,
-                remaining,
-                rows: Vec::new(),
-                aborted: false,
-            });
+            .replace(crate::core::list::ChannelListCursor::new(
+                id, filter, batch, shards,
+            ));
         assert!(previous.is_none(), "a connection has one LIST in progress");
-        request
     }
 
-    pub fn route_channel_list(&mut self, request: ChannelListRequest) {
+    /// Ask channel shard `shard` for the next page of `conn`'s LIST: at most
+    /// `limit` rows after `after`.
+    pub(crate) fn route_channel_list_page(
+        &mut self,
+        conn: ConnId,
+        cursor: &crate::core::list::ChannelListCursor,
+        shard: usize,
+        after: Option<ChanKey>,
+        limit: NonZeroUsize,
+    ) {
+        let request = ChannelListRequest {
+            id: cursor.id,
+            session: SessionOwner::new(conn, self.shard),
+            shard: CoreShardId::new(shard),
+            filter: Arc::clone(&cursor.filter),
+            after,
+            limit,
+        };
         self.effects
-            .push(CoreEffect::BroadcastChannelList { request });
+            .push(CoreEffect::input(crate::core::Input::ChannelList {
+                request,
+            }));
     }
 
     pub(crate) fn has_single_core_shard(&self) -> bool {
@@ -4679,55 +4698,28 @@ impl ServerState {
 
     pub fn route_channel_list_result(&mut self, result: ChannelListResult) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelListResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelListResult {
                 result,
             }));
     }
 
-    /// Add one shard's rows to the LIST they answer: the whole LIST once the
-    /// last shard's are in. `None` while others are outstanding, or when the
-    /// connection closed in the meantime.
-    pub fn take_channel_list(
-        &mut self,
-        result: ChannelListResult,
-    ) -> Option<crate::core::list::GatheredList> {
-        use crate::core::list::{GatheredList, ListProgress};
-        let conn = result.session.conn();
-        // A closed connection's LIST went with its session.
-        let session = self.sessions.output_mut(&conn)?;
-        // Rows reach only a connection still gathering them: it has at most
-        // one LIST, which stops gathering once the last shard's rows are in.
-        let Some(ListProgress::Gathering {
-            id,
-            remaining,
-            rows,
-            ..
-        }) = session.channel_list.as_mut()
-        else {
-            panic!("LIST rows reached a connection that is not gathering them");
+    /// Hand one shard's page to the LIST that asked for it. `false` when there
+    /// is none to take it: the connection closed, or the LIST that asked was
+    /// aborted by another since — the page answers a question nobody is
+    /// asking any more, and goes with it.
+    pub fn accept_channel_list_page(&mut self, result: ChannelListResult) -> bool {
+        let Some(session) = self.sessions.output_mut(&result.session.conn()) else {
+            return false;
         };
-        assert_eq!(*id, result.id, "LIST rows reached another LIST");
-        *remaining = remaining
-            .checked_sub(1)
-            .expect("LIST received too many shard results");
-        rows.extend(result.rows);
-        if *remaining > 0 {
-            return None;
-        }
-        let Some(ListProgress::Gathering {
-            label,
-            rows,
-            aborted,
-            ..
-        }) = session.channel_list.take()
+        let Some(cursor) = session
+            .channel_list
+            .as_mut()
+            .filter(|cursor| cursor.id == result.id)
         else {
-            unreachable!("the LIST was gathering a moment ago");
+            return false;
         };
-        Some(GatheredList {
-            label,
-            rows,
-            aborted,
-        })
+        cursor.accept(result.shard.0, result.rows, result.next);
+        true
     }
 
     pub fn route_channel_session_event(
@@ -4736,20 +4728,20 @@ impl ServerState {
         event: ChannelSessionEvent,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelSessionEvent {
+            .push(CoreEffect::input(crate::core::Input::ChannelSessionEvent {
                 session,
                 event,
             }));
     }
 
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
-        self.effects.push(crate::core::CoreEffect::Input(
+        self.effects.push(crate::core::CoreEffect::input(
             crate::core::Input::SessionChannelRemoved { session, key },
         ));
     }
 
     pub fn route_kick(&mut self, kick: ChannelKick) {
-        self.effects.push(crate::core::CoreEffect::Input(
+        self.effects.push(crate::core::CoreEffect::input(
             crate::core::Input::ChannelKick { kick },
         ));
     }
@@ -4760,7 +4752,7 @@ impl ServerState {
         result: ChannelKickResult,
         label: Option<String>,
     ) {
-        self.effects.push(crate::core::CoreEffect::Input(
+        self.effects.push(crate::core::CoreEffect::input(
             crate::core::Input::ChannelKickResult {
                 session,
                 result,
@@ -4794,7 +4786,7 @@ impl ServerState {
 
     pub fn route_message(&mut self, message: ChannelMessage) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelMessage {
+            .push(CoreEffect::input(crate::core::Input::ChannelMessage {
                 message,
             }));
     }
@@ -4805,7 +4797,7 @@ impl ServerState {
         result: ChannelMessageResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::Input(
+        self.effects.push(CoreEffect::input(
             crate::core::Input::ChannelMessageResult {
                 session,
                 result,
@@ -4816,7 +4808,7 @@ impl ServerState {
 
     pub fn route_multiline(&mut self, message: ChannelMultiline) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelMultiline {
+            .push(CoreEffect::input(crate::core::Input::ChannelMultiline {
                 message,
             }));
     }
@@ -4826,14 +4818,14 @@ impl ServerState {
         session: SessionOwner,
         result: ChannelMultilineResult,
     ) {
-        self.effects.push(CoreEffect::Input(
+        self.effects.push(CoreEffect::input(
             crate::core::Input::ChannelMultilineResult { session, result },
         ));
     }
 
     pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsg {
+            .push(CoreEffect::input(crate::core::Input::ChannelTagmsg {
                 tagmsg,
             }));
     }
@@ -4845,7 +4837,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsgResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelTagmsgResult {
                 session,
                 result,
                 label,
@@ -4899,7 +4891,7 @@ impl ServerState {
                 self.apply_channel_member_update(update);
             } else {
                 self.effects
-                    .push(CoreEffect::Input(crate::core::Input::ChannelMemberUpdate {
+                    .push(CoreEffect::input(crate::core::Input::ChannelMemberUpdate {
                         update,
                     }));
             }
@@ -5315,6 +5307,7 @@ impl ServerState {
             pending_server_bans: HashSet::new(),
             whowas: directories.whowas,
             census: directories.census,
+            flood_exemptions: directories.flood_exemptions,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,
@@ -5370,7 +5363,7 @@ impl ServerState {
         }
         let entry = buckets.entry(key).or_insert((burst, now));
         // The refill watermark is monotonic; guard against a non-monotonic
-        // source as defense in depth (same as the command-flood bucket).
+        // source as defense in depth.
         if now < entry.1 {
             entry.1 = now;
         }
@@ -6231,16 +6224,7 @@ impl ServerState {
                 paced_who: None,
                 label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
-                // Seed the flood bucket full, with its refill watermark at the
-                // open time — NOT a zero `MonoMillis` sentinel. The monotonic
-                // clock's epoch is process start, so a zero watermark makes the
-                // first refill credit `now - 0 = uptime` seconds: within the
-                // first burst-many seconds of uptime the bucket would start
-                // at only `min(uptime, burst)` tokens and wrongly kill a client
-                // that pipelines a legitimate burst — worst exactly during a
-                // post-restart reconnect storm.
-                flood_tokens: self.config.command_flood.map_or(0, CommandFlood::burst),
-                flood_refilled_to_ms: opened_at,
+                flood_exempt: false,
                 // Every monotonic watermark is seeded from the open time, never a
                 // zero `MonoMillis` sentinel. A zero would be indistinguishable
                 // from a real early reading (the mono epoch IS process start), so
@@ -7065,6 +7049,19 @@ impl ServerState {
         true
     }
 
+    /// Tell `conn`'s reader whether its lines are metered: an IRC operator's
+    /// are not. Run after each of its lines, which are what change it.
+    pub(crate) fn sync_flood_exemption(&mut self, conn: ConnId) {
+        let Some(session) = self.sessions.get_mut(&conn) else {
+            return;
+        };
+        let exempt = session.oper.is_some();
+        if session.flood_exempt != exempt {
+            session.flood_exempt = exempt;
+            self.flood_exemptions.set(conn, exempt);
+        }
+    }
+
     // ---- teardown -------------------------------------------------------
 
     /// Remove a session: broadcast QUIT to channel peers, free the nick,
@@ -7075,6 +7072,9 @@ impl ServerState {
         };
         // Its paced LIST and WHO replies go with the session itself.
         self.pacing.remove(&conn);
+        if session.flood_exempt {
+            self.flood_exemptions.set(conn, false);
+        }
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the
@@ -7089,8 +7089,8 @@ impl ServerState {
                 self.send_bytes_uncaptured(conn, line);
             }
         }
-        // A teardown initiated from inside a labeled command (QUIT, flood
-        // kill, credential-budget close) has its terminal `ERROR` sitting in
+        // A teardown initiated from inside a labeled command (QUIT, a
+        // credential-budget close) has its terminal `ERROR` sitting in
         // the labeled-response capture buffer; the dispatch wrapper would only
         // try to deliver it after this session is gone and silently drop it.
         // Flush the capture now, while the connection can still receive the
@@ -7475,7 +7475,6 @@ mod session_store_tests {
                 opers: Vec::new(),
                 clock: wall_clock,
                 mono_clock,
-                command_flood: None,
                 registration_burst: None,
                 sasl_requirement: Default::default(),
                 reserved_account_names: crate::identity::ReservedAccountNames::default(),

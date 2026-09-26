@@ -751,65 +751,9 @@ fn batch_command_ref(line: &[u8], sign: char) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Spend one command-flood token. Returns `true` if the command may
-/// proceed, `false` if the bucket is empty (the caller closes the link).
-/// Always `true` for pre-registered and oper sessions, and for a harness
-/// core built without a bucket. Refills `rate` tokens per elapsed second up
-/// to `burst`; a fresh session is seeded full at `open()` (with its
-/// watermark at the open time), so it starts with the whole burst available.
-fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
-    let Some(flood) = state.config.command_flood else {
-        return true;
-    };
-    {
-        let s = &state.sessions[&conn];
-        if !s.is_registered() || s.oper.is_some() {
-            return true;
-        }
-    }
-    let now = (state.config.mono_clock)();
-    let s = state.sessions.get_mut(&conn).expect("session present");
-    // The refill watermark is monotonic, so it can never end up ahead of `now`
-    // (that was the wall-clock NTP-backstep hazard sweep 70 re-anchored around);
-    // the guard remains as defense in depth should the monotonic source ever
-    // report non-monotonically.
-    if now < s.flood_refilled_to_ms {
-        s.flood_refilled_to_ms = now;
-    }
-    // Credit whole tokens only (`rate` per 1000 ms) and advance the watermark
-    // by exactly the milliseconds those tokens cost — never to `now` — so a
-    // sub-token remainder carries forward instead of being discarded. Resetting
-    // the watermark on every command would let a steady sub-interval stream
-    // starve the bucket of refill forever.
-    let rate = u64::from(flood.rate());
-    let elapsed_ms = now.saturating_sub(s.flood_refilled_to_ms).as_millis();
-    let credited = elapsed_ms.saturating_mul(rate) / 1000;
-    // `credited * 1000 / rate <= elapsed_ms`, so the watermark never passes `now`.
-    let credited_ms = credited.saturating_mul(1000) / rate;
-    let tokens = (u64::from(s.flood_tokens) + credited).min(u64::from(flood.burst())) as u32;
-    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add_millis(credited_ms);
-    if tokens == 0 {
-        return false;
-    }
-    s.flood_tokens = tokens - 1;
-    true
-}
-
 fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
-    let server = state.config.server_name.clone();
     let command = msg.command.to_ascii_uppercase();
     let p = &msg.params;
-
-    // Command-flood throttle. Keepalive is exempt; a depleted bucket closes
-    // the link loudly (Excess Flood), never silently drops.
-    if command != "PING" && command != "PONG" && !flood_ok(state, conn) {
-        state.send(
-            conn,
-            &format!("ERROR :Closing Link: {server} (Excess Flood)"),
-        );
-        state.close(conn, "Excess Flood");
-        return;
-    }
 
     // Any inbound line — *including* a keepalive PING/PONG — proves the socket
     // is alive, so it answers an outstanding liveness PING: the reaper must not

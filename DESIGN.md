@@ -814,7 +814,24 @@ strip = "symbols"
   worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
   Other traffic keeps flowing beside the rows, and a labeled one stays one
   labeled batch across its turns. A second `LIST` aborts the first (`/LIST
-  aborted`), so a connection paces at most one. A `WHO` whose reply fits the
+  aborted`), so a connection paces at most one.
+- A `LIST` keeps a cursor, not a copy of the channel list (`core/list.rs`,
+  as Solanum's SAFELIST keeps its place in the channel hash). Its reply opens
+  at once; each channel shard is then asked, turn by turn, for the next page
+  of its channels after the last key it reported — no more rows than the room
+  the client's SendQ has, from at most 1024 channels examined — that the
+  `ELIST` conditions admit and the asker may see. The session holds its filter,
+  one resume key per shard and at most one unsent page per shard, so a `LIST`
+  of 100k channels costs a page of memory, not the whole list, and aborting it
+  drops the cursor at no cost (a page still on its way finds no `LIST` of its
+  id and is dropped). **Ordering:** rows come out in casemapped channel-name
+  order across the whole network: each shard's pages are in key order (its
+  channels live in an ordered map) and the asker's shard merges them, sending
+  a row only once every shard still reporting has a row queued to compare it
+  with. **Consistency:** a channel is listed if it exists and qualifies when
+  its shard's cursor reaches its name, with the member count and topic it has
+  then; one created behind the cursor or removed ahead of it is not listed, and
+  none is listed twice. A `WHO` whose reply fits the
   room left, with none paced ahead of it, goes out at once; otherwise it waits
   behind the connection's paced WHO replies and follows them whole, in order
   (`core/paced.rs`). What waits is bounded: once one is paced, more may queue
@@ -837,14 +854,29 @@ strip = "symbols"
   session and then EOF) still reads every reply to what it sent — its welcome,
   its `ERROR` — for up to 5 s after its EOF, before the connection is torn
   down.
-- RecvQ/flood control: a token bucket per connection, on by default with
+- RecvQ/flood control: every line a connection sends is metered where it
+  enters the core (`core/line_meter.rs`), by a token bucket per connection with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
-  20` per second; a registered non-oper session spends one per command, PING
-  and PONG exempt, and is closed with Excess Flood when the bucket is empty).
-  It used to be off by default with a fixed one-token-per-second refill, which
-  left every output-amplifying command class — repeated JOIN/NAMES targets,
-  repeated list modes — unbounded for anyone who never turned it on, and made
-  any burst that was turned on flood-kill an ordinary autojoin storm. Two
+  20` per second). Every line spends one — PING and PONG, and lines sent before
+  registration, included — whether it arrives over TCP, `/ws/irc`, or from the
+  bouncer's in-process session. An empty bucket closes nothing: the connection's
+  reader stops reading until a token is back, so a client sending too fast waits
+  in its own socket buffers, as Solanum parses a client's receive queue only as
+  fast as its allowance. One connection therefore occupies at most its bucket's
+  worth of the core's queue: a client streaming PONGs, or churning NICK before
+  it registers, can no longer monopolise its shard. A WebSocket or bouncer
+  session past its allowance keeps receiving what the core sends it; only its
+  input waits. IRC operators are exempt (Solanum's `no_oper_flood`): the shard
+  owning the session publishes its operator status after each of its lines,
+  and the reader consults it only when its bucket is empty. The allowance
+  covers a registration with capability negotiation and SASL, a full
+  `draft/multiline` batch (32 lines plus its `BATCH` pair) and a paste within
+  the burst without any pause; a longer paste or autojoin is paced at 20 lines
+  a second rather than, as before, closed with Excess Flood. The bucket used
+  to live in the core and apply only to registered sessions' non-keepalive
+  commands, after each line was already queued, so it bounded nothing a
+  connection could put in the queue ahead of it; before that it was off by
+  default with a fixed one-token-per-second refill. Two
   per-address bounds are off unless configured: `limits.max_connections_per_ip`
   caps simultaneous connections from one address (the excess is refused at
   accept), and `limits.registration_burst` throttles account creation
