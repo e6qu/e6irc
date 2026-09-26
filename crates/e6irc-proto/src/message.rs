@@ -95,6 +95,111 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..floor_char_boundary(s, max_bytes)]
 }
 
+/// Decode one CRLF-stripped server→client line for relay, never turning a
+/// line that fits the wire budgets *as bytes* into one that does not fit *as
+/// text*.
+///
+/// IRC bodies are arbitrary bytes, and a relay cannot know which legacy
+/// encoding a sender used (Latin-1, CP1252, Shift-JIS, KOI8-R are all routine),
+/// so every invalid byte becomes U+FFFD: guessing one code page would render
+/// the others as plausible-looking wrong text, where U+FFFD marks the loss
+/// honestly. U+FFFD is three bytes, so a line of high bytes can triple in
+/// size. Checking the budget on the bytes and then decoding used to hand
+/// downstream code a 600-byte text line from a 230-byte frame, which the
+/// bouncer then replaced whole with a rejection notice — a member of any
+/// channel could blank every line they sent that way. So when decoding
+/// overflows a budget the text is fitted here, on character boundaries:
+///
+/// - the tag section drops every tag that carries U+FFFD (the tags that grew;
+///   what remains is byte-for-byte a subset of what fitted, so it fits too),
+///   and is dropped whole if no tag is left;
+/// - the traditional part is cut to [`MAX_LINE_LEN`] − 2 bytes, like any
+///   over-long trailing.
+///
+/// A line whose *bytes* already exceed a budget is returned decoded but
+/// unfitted: that line is the caller's to reject, loudly, as too long.
+pub fn decode_server_line(line: &[u8]) -> Cow<'_, str> {
+    let text = String::from_utf8_lossy(line);
+    if !server_frame_fits(line) || server_frame_fits(text.as_bytes()) {
+        return text;
+    }
+    let body_budget = MAX_LINE_LEN - 2;
+    let Some(rest) = text.strip_prefix('@') else {
+        return Cow::Owned(truncate_on_char_boundary(&text, body_budget).to_owned());
+    };
+    let Some((tags, body)) = rest.split_once(' ') else {
+        // A tag-only (malformed) line: only the tag allowance bounds it.
+        return Cow::Owned(truncate_on_char_boundary(&text, MAX_SERVER_TAGS_LEN).to_owned());
+    };
+    let mut fitted = String::with_capacity(line.len());
+    let tags_len = tags.len() + 2; // the `@` and the separating space
+    if tags_len <= MAX_SERVER_TAGS_LEN {
+        fitted.push('@');
+        fitted.push_str(tags);
+        fitted.push(' ');
+    } else {
+        let kept: Vec<&str> = tags
+            .split(';')
+            .filter(|tag| !tag.contains(char::REPLACEMENT_CHARACTER))
+            .collect();
+        if !kept.is_empty() {
+            fitted.push('@');
+            fitted.push_str(&kept.join(";"));
+            fitted.push(' ');
+        }
+    }
+    fitted.push_str(truncate_on_char_boundary(body, body_budget));
+    Cow::Owned(fitted)
+}
+
+/// A parameter that can stand in a *middle* position of an outbound line:
+/// non-empty, not `:`-leading, and free of space, CR, LF and NUL.
+///
+/// Replies that attribute an error echo the offending client token (an
+/// unknown command, a bad CAP subcommand, a rejected channel) as a middle
+/// parameter. A parsed parameter can break every one of those rules — the last
+/// one may arrive in trailing form (`NICK :a b`, `JOIN ::x`) — and an echo that
+/// breaks one splits or shifts the reply's parameters (`432 * a b :…`), while
+/// one of unbounded length pushes the reply past the wire limit, where the
+/// recipient's framing discards the very line explaining the error. The only
+/// constructor, [`MiddleParam::echo`], renders an unframeable token as the
+/// conventional `*` placeholder and clips the rest to
+/// [`MiddleParam::ECHO_MAX`] bytes, so a line builder that takes a
+/// `MiddleParam` cannot be handed raw client text. The core and the bouncer's
+/// attach listener share it, so their echo rules cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MiddleParam<'a>(&'a str);
+
+impl<'a> MiddleParam<'a> {
+    /// The longest echo: identifies any token, and leaves every reply shape
+    /// room for its other, server-bounded parameters.
+    pub const ECHO_MAX: usize = 64;
+
+    /// `token`, or `*` when it cannot stand as a middle parameter, clipped to
+    /// [`Self::ECHO_MAX`] bytes on a character boundary.
+    pub fn echo(token: &'a str) -> Self {
+        let unframeable = token.is_empty()
+            || token.starts_with(':')
+            || token
+                .bytes()
+                .any(|byte| matches!(byte, b' ' | b'\r' | b'\n' | 0));
+        if unframeable {
+            return Self("*");
+        }
+        Self(truncate_on_char_boundary(token, Self::ECHO_MAX))
+    }
+
+    pub fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MiddleParam<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<'a> {
     pub tags: Vec<Tag<'a>>,
@@ -582,5 +687,50 @@ mod tests {
         for invalid in ["", ":trailing", "has space", "has\rreturn", "has\nline"] {
             assert!(!valid_message_id(invalid), "{invalid:?}");
         }
+    }
+
+    /// A line that fits as bytes still fits once its invalid bytes are
+    /// decoded: each one becomes three-byte U+FFFD, and the relay used to
+    /// reject the tripled line whole.
+    #[test]
+    fn decoding_never_turns_a_fitting_frame_into_an_overlong_line() {
+        let mut raw = b":alice!u@h PRIVMSG #c :".to_vec();
+        raw.extend(std::iter::repeat_n(0xE9, 200));
+        assert!(server_frame_fits(&raw));
+        let text = decode_server_line(&raw);
+        assert!(server_frame_fits(text.as_bytes()), "{} bytes", text.len());
+        assert!(text.starts_with(":alice!u@h PRIVMSG #c :\u{FFFD}"));
+        assert!(Message::parse(&text).is_ok());
+
+        // An over-grown tag section loses the tags that grew, keeps the rest.
+        let mut tagged = b"@time=2026-01-01T00:00:00.000Z;+x=".to_vec();
+        tagged.extend(std::iter::repeat_n(0xE9, 5000));
+        tagged.extend_from_slice(b" :a PRIVMSG #c :hi");
+        assert!(server_frame_fits(&tagged));
+        let text = decode_server_line(&tagged);
+        assert!(server_frame_fits(text.as_bytes()));
+        assert_eq!(text, "@time=2026-01-01T00:00:00.000Z :a PRIVMSG #c :hi");
+
+        // Valid text is untouched, and a frame already over budget is left
+        // for the caller to reject.
+        assert!(matches!(
+            decode_server_line(b":a PRIVMSG #c :hi"),
+            Cow::Borrowed(":a PRIVMSG #c :hi")
+        ));
+        let overlong = vec![b'x'; MAX_LINE_LEN];
+        assert_eq!(decode_server_line(&overlong).len(), MAX_LINE_LEN);
+    }
+
+    #[test]
+    fn a_middle_echo_is_always_one_bounded_parameter() {
+        for token in ["", ":x", "a b", ":", "a\rb", "a\nb", "a\0b"] {
+            assert_eq!(MiddleParam::echo(token).as_str(), "*", "{token:?}");
+        }
+        assert_eq!(MiddleParam::echo("nick").as_str(), "nick");
+        assert_eq!(
+            MiddleParam::echo(&"é".repeat(40)).as_str().len(),
+            MiddleParam::ECHO_MAX
+        );
+        assert_eq!(MiddleParam::echo(&"x".repeat(100)).to_string().len(), 64);
     }
 }

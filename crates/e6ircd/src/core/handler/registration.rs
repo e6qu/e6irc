@@ -209,7 +209,8 @@ pub(super) fn cap_target(state: &ServerState, conn: ConnId) -> String {
 }
 
 /// `FAIL REGISTER <code> <account> :<description>` — the spec's shape, with the
-/// account the client asked about so it can tell which attempt failed.
+/// account the client asked about so it can tell which attempt failed. The
+/// account is the client's own text, echoed through [`super::fail_line`].
 pub(super) fn register_fail(
     state: &mut ServerState,
     conn: ConnId,
@@ -217,11 +218,14 @@ pub(super) fn register_fail(
     account: &str,
     detail: &str,
 ) {
-    let server = state.config.server_name.clone();
-    state.send(
-        conn,
-        &format!(":{server} FAIL REGISTER {code} {account} :{detail}"),
+    let line = super::fail_line(
+        &state.config.server_name,
+        "REGISTER",
+        code,
+        &[account],
+        detail,
     );
+    state.send(conn, &line);
 }
 
 /// `REGISTER <account> <email> <password>` (draft/account-registration).

@@ -1202,9 +1202,10 @@ impl Connection {
                             return Ok(Some(RelayEvent::Rejected(RejectedLine::TooLong)));
                         }
                         // Lossy: an invalid byte sequence becomes U+FFFD
-                        // instead of failing the whole read (mirrors the
-                        // in-process local driver).
-                        let text = String::from_utf8_lossy(&line).into_owned();
+                        // instead of failing the whole read, and a line that
+                        // fitted as bytes is fitted again as text, so decoding
+                        // can never make it one the relay must reject.
+                        let text = e6irc_proto::message::decode_server_line(&line).into_owned();
                         // Best-effort parse; `None` means "relay only, don't
                         // act on it".
                         let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
@@ -4572,6 +4573,34 @@ mod tests {
             conn.next_line_relayable().await.unwrap(),
             Some(RelayEvent::Rejected(RejectedLine::TooLong))
         ));
+    }
+
+    /// Two hundred Latin-1 bytes fit the frame; lossily decoded they are six
+    /// hundred bytes of U+FFFD. The relay must hand on a line that still fits,
+    /// or the bouncer replaces the whole message with a rejection notice.
+    #[tokio::test]
+    async fn relay_fits_a_high_byte_line_that_fitted_as_bytes() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
+        let (_reader, mut writer) = tokio::io::split(server_io);
+        let mut line = b":alice!u@h PRIVMSG #c :".to_vec();
+        line.extend(std::iter::repeat_n(0xE9, 200));
+        line.extend_from_slice(b"\r\n");
+        writer.write_all(&line).await.unwrap();
+
+        let Some(RelayEvent::Line { raw, message }) = conn.next_line_relayable().await.unwrap()
+        else {
+            panic!("a line that fits as bytes was not relayed");
+        };
+        assert!(
+            e6irc_proto::message::server_frame_fits(raw.as_bytes()),
+            "decoded line is {} bytes",
+            raw.len()
+        );
+        let message = message.expect("the fitted line still parses");
+        assert_eq!(message.command, "PRIVMSG");
+        assert!(message.params[1].starts_with('\u{FFFD}'));
     }
 
     #[tokio::test]

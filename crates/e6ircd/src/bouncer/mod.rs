@@ -17,6 +17,8 @@ use std::collections::HashMap;
 #[cfg(any(feature = "discord", feature = "slack"))]
 use std::future::Future;
 
+use e6irc_proto::message::MiddleParam;
+
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -4153,14 +4155,15 @@ pub(super) fn carriable(
         return Some(cmd.line.clone());
     };
     if message.command.eq_ignore_ascii_case("TAGMSG") {
-        let target = message.params.first().map_or("*", |target| {
-            e6irc_proto::message::truncate_on_char_boundary(target, 200)
-        });
+        let target = message.params.first().copied().unwrap_or("*");
         ends.answer(
             cmd.origin,
-            format!(
-                ":*bnc* FAIL TAGMSG CLIENT_TAGS_UNSUPPORTED {target} :the network does not carry \
-                 message tags (CLIENTTAGDENY=*); nothing was sent"
+            crate::core::fail_line(
+                "*bnc*",
+                "TAGMSG",
+                "CLIENT_TAGS_UNSUPPORTED",
+                &[target],
+                "the network does not carry message tags (CLIENTTAGDENY=*); nothing was sent",
             ),
         );
         return None;
@@ -4178,9 +4181,15 @@ fn without_tags(line: &str) -> String {
     }
 }
 
-/// The widest nick a bouncer-made numeric names as its target, as
-/// `write_attach_numeric` bounds it.
-const NUMERIC_TARGET_BYTES: usize = 64;
+/// A `*bnc*` NOTICE to `target` (`*`, or a channel), its text fitted to the
+/// line. The bouncer's own notices carry upstream text — a closing reason, a
+/// SASL refusal, a channel name, a bridge's room id — bounded in characters,
+/// not in bytes, so a `format!`ed notice could outgrow the line and then be
+/// replaced whole by [`ingest`]'s rejection: the notice that exists to say
+/// what happened would say nothing. Every such notice is built here.
+pub(crate) fn bnc_notice(target: &str, text: &str) -> String {
+    crate::core::server_notice("*bnc*", MiddleParam::echo(target).as_str(), text)
+}
 
 /// Take one line into the bouncer: neutralized (see
 /// [`crate::sanitize::upstream_line`]) and stamped with the time it arrived
@@ -4294,8 +4303,11 @@ fn live_isupport(line: &str, client_tags: ClientTags) -> Option<Option<String>> 
 /// framing discards, and the silence came back. It is truncated to fit.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -> String {
-    let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
-    format!(":*bnc* NOTICE {shown} :not delivered: no bridged {platform} {kind} for {shown}")
+    let shown = MiddleParam::echo(target);
+    bnc_notice(
+        shown.as_str(),
+        &format!("not delivered: no bridged {platform} {kind} for {shown}"),
+    )
 }
 
 /// A `*bnc*` NOTICE telling the client its message reached a bridged target but
@@ -4307,7 +4319,10 @@ pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn undelivered_notice(platform: &str, kind: &str, target: &str) -> String {
     let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
-    format!(":*bnc* NOTICE * :not delivered: {platform} send to {kind} {shown} failed")
+    bnc_notice(
+        "*",
+        &format!("not delivered: {platform} send to {kind} {shown} failed"),
+    )
 }
 
 /// A `*bnc*` NOTICE telling the client its message was not delivered because
@@ -4321,10 +4336,12 @@ pub(crate) fn rate_limited_notice(
     retry_after: std::time::Duration,
 ) -> String {
     let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
-    format!(
-        ":*bnc* NOTICE * :not delivered: {platform} rate-limited sends to {kind} {shown} \
-         (it asked for {}s)",
-        retry_after.as_secs_f64().ceil()
+    bnc_notice(
+        "*",
+        &format!(
+            "not delivered: {platform} rate-limited sends to {kind} {shown} (it asked for {}s)",
+            retry_after.as_secs_f64().ceil()
+        ),
     )
 }
 
@@ -4439,7 +4456,10 @@ pub(crate) fn unrelayed_notice(
         || "an unknown sender".to_string(),
         crate::sanitize::nick_token,
     );
-    format!(":*bnc* NOTICE {channel} :{platform}: a {what} message from {sender} was not relayed")
+    bnc_notice(
+        channel,
+        &format!("{platform}: a {what} message from {sender} was not relayed"),
+    )
 }
 
 /// Outcome of a non-blocking send to a network's shared upstream command queue.
@@ -5056,7 +5076,7 @@ impl DriverEnds {
             .unwrap_or_else(|| "-CLIENTTAGDENY".to_string());
         let line = ingest(format!(
             ":*bnc* 005 {} {token} :are supported by this server",
-            e6irc_proto::message::truncate_on_char_boundary(&nick, NUMERIC_TARGET_BYTES)
+            MiddleParam::echo(&nick)
         ));
         let buffer = self.buffer.lock().expect("buffer poisoned");
         drop(self.events.send(DriverEvent::Notice(BufferedLine {
@@ -5225,8 +5245,9 @@ impl DriverEnds {
         // this session does not hold and will not restore. Say so to whoever is
         // attached; it is not conversation, so it stays out of the backlog.
         for name in &change.untracked {
-            let line = ingest(format!(
-                ":*bnc* NOTICE * :upstream confirmed a channel name e6irc cannot track: {name}"
+            let line = ingest(bnc_notice(
+                "*",
+                &format!("upstream confirmed a channel name e6irc cannot track: {name}"),
             ));
             // Not retained, so it reports the ring's position unchanged — read
             // and published under the ring's lock, in order with the lines
@@ -5562,10 +5583,13 @@ impl DriverEnds {
 
 fn lifecycle_notice(state: &str, failure: NetworkFailure, diagnostic: Option<&str>) -> String {
     let detail = diagnostic.map_or_else(String::new, |value| format!("; upstream: {value}"));
-    format!(
-        ":*bnc* NOTICE * :component {state}: {} ({}){detail}",
-        failure.summary(),
-        failure.code()
+    bnc_notice(
+        "*",
+        &format!(
+            "component {state}: {} ({}){detail}",
+            failure.summary(),
+            failure.code()
+        ),
     )
 }
 
@@ -6156,7 +6180,7 @@ where
                             write,
                             attachment.nick,
                             421,
-                            Some("MARKREAD"),
+                            Some(MiddleParam::echo("MARKREAD")),
                             "Unknown command",
                         )
                         .await?;
@@ -6264,7 +6288,14 @@ where
         return match command {
             "NICK" => write_attach_numeric(write, nick, 431, None, "No nickname given").await,
             _ => {
-                write_attach_numeric(write, nick, 461, Some(command), "Not enough parameters").await
+                write_attach_numeric(
+                    write,
+                    nick,
+                    461,
+                    Some(MiddleParam::echo(command)),
+                    "Not enough parameters",
+                )
+                .await
             }
         };
     };
@@ -6284,10 +6315,7 @@ where
     }
     let connected = attachment.handle.irc_session_snapshot().is_some();
     for channel in first.split(',').filter(|channel| !channel.is_empty()) {
-        let shown = e6irc_proto::message::truncate_on_char_boundary(
-            channel,
-            upstream_identity::ConfirmedChannel::MAX_BYTES,
-        );
+        let shown = MiddleParam::echo(channel);
         match downstream.channels.get(&downstream.names.fold(channel)) {
             Some(bridged) => {
                 let audience = JoinAudience {
@@ -6353,22 +6381,25 @@ fn attach_pong(token: &str) -> String {
     format!("{HEAD}{token}\r\n")
 }
 
+/// A `*bnc*` numeric to one attached client. The echoed token is a
+/// [`MiddleParam`], so raw client text (`JOIN :#a b`, `JOIN ::x`) cannot reach
+/// a middle position; the target nick, the upstream's to choose, is one too,
+/// and the trailing is fitted to the line.
 async fn write_attach_numeric<W>(
     write: &mut W,
     nick: &str,
     numeric: u16,
-    middle: Option<&str>,
+    middle: Option<MiddleParam<'_>>,
     trailing: &str,
 ) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
-    let nick = e6irc_proto::message::truncate_on_char_boundary(nick, 64);
+    let nick = MiddleParam::echo(nick);
     let middle = middle.map_or_else(String::new, |value| format!(" {value}"));
-    write
-        .write_all(format!(":*bnc* {numeric:03} {nick}{middle} :{trailing}\r\n").as_bytes())
-        .await?;
+    let line = crate::core::fitted_line(format!(":*bnc* {numeric:03} {nick}{middle} :"), trailing);
+    write.write_all(format!("{line}\r\n").as_bytes()).await?;
     write.flush().await
 }
 
@@ -6593,7 +6624,7 @@ where
         )
         .await?;
     }
-    let target = e6irc_proto::message::truncate_on_char_boundary(nick, NUMERIC_TARGET_BYTES);
+    let target = MiddleParam::echo(nick);
     write_synthesized(
         write,
         &[format!(":*bnc* 353 {target} = {channel} :{nick}")],
@@ -8854,6 +8885,54 @@ mod tests {
             ends.commands.try_recv().is_err(),
             "a session command was relayed to the bridge"
         );
+        drop(write);
+        drop(lines);
+        attach.await.expect("attach task").expect("attach result");
+    }
+
+    /// A bridge's own JOIN answer echoes each requested channel as one middle
+    /// parameter: `JOIN :#a b` used to answer `437 alice #a b :…` and
+    /// `JOIN ::x` `437 alice :x :…`, both of which shift the reply's
+    /// parameters. Each is the `*` placeholder.
+    #[tokio::test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    async fn a_bridge_join_echoes_an_unframeable_channel_as_a_placeholder() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (handle, _ends) = NetworkHandle::bridge_channels(4);
+        let attach = tokio::spawn(async move {
+            attach(
+                server,
+                ClientInput::default(),
+                &handle,
+                AttachCaps::default(),
+                "alice",
+                "alice",
+                ATTACH_LIVENESS_INTERVAL,
+            )
+            .await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        write
+            .write_all(b"JOIN :#a b\r\nJOIN ::x\r\n")
+            .await
+            .expect("send");
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        let mut replies = Vec::new();
+        while replies.len() < 2 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+                .await
+                .expect("attach went silent")
+                .expect("attach read")
+                .expect("attach closed");
+            if !line.starts_with(":*bnc* NOTICE") {
+                replies.push(line);
+            }
+        }
+        for reply in &replies {
+            assert!(reply.starts_with(":*bnc* 437 alice * :"), "{replies:?}");
+        }
         drop(write);
         drop(lines);
         attach.await.expect("attach task").expect("attach result");

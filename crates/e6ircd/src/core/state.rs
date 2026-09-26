@@ -6593,12 +6593,13 @@ impl ServerState {
     }
 
     /// `:<server> NOTICE <target> :<text>`, from the server itself, without
-    /// sending it.
+    /// sending it; `text` is fitted to the line
+    /// ([`server_notice`](crate::core::handler::server_notice)).
     pub(crate) fn server_notice_line(&self, conn: ConnId, text: &str) -> String {
-        format!(
-            ":{} NOTICE {} :{text}",
-            self.config.server_name,
-            self.reply_target(conn)
+        crate::core::handler::server_notice(
+            &self.config.server_name,
+            &self.reply_target(conn),
+            text,
         )
     }
 
