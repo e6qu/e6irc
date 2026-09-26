@@ -40,10 +40,14 @@
             <span id="account-name" aria-live="polite">signed in</span>
             <span id="account-role" class="user-role" aria-live="polite"></span>
           </a>
-          <!-- Signing out needs the session's CSRF token, which arrives with
-               /api/v1/me. Until then there is no link: one without the token
-               only lands on a CSRF refusal page. -->
-          <a id="logout-link" data-shauth-sign-out hidden>Sign out</a>
+          <!-- Signing out posts the session's CSRF token, which arrives with
+               /api/v1/me. Until then there is no control: one without the
+               token only lands on a CSRF refusal page. The token rides in the
+               form body, never in a URL. -->
+          <form id="logout-form" method="post" hidden>
+            <input id="logout-csrf" type="hidden" name="csrf" />
+            <button id="logout-link" type="submit" data-shauth-sign-out>Sign out</button>
+          </form>
         </nav>
       </header>
 
@@ -184,9 +188,18 @@
 
           <label class="field">
             <span>Channels to join <em>optional</em></span>
-            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" />
-            <small>Comma or space separated. Re-joined automatically after a reconnect.</small>
+            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" autocomplete="off" />
+            <small id="nf-autojoin-note">Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.</small>
           </label>
+
+          <fieldset id="nf-autojoin-keys" hidden>
+            <legend>Stored channel keys</legend>
+            <p class="field-note">
+              These channels keep their stored key. To replace one, write the new
+              key after the channel above.
+            </p>
+            <div id="nf-autojoin-keys-list"></div>
+          </fieldset>
 
           <details id="nf-advanced">
             <summary>Advanced</summary>

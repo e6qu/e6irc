@@ -36,6 +36,22 @@ pub(crate) fn username(raw: &str, max_len: usize) -> Option<String> {
     (valid && !kept.is_empty()).then(|| kept.to_string())
 }
 
+/// A host or ban mask spelled so it stands as one middle parameter, in
+/// Solanum's spellings: a leading `:` (an IPv6 address such as `::1`) gets a
+/// `0` in front — `0::1`, the same address — so it cannot open the trailing
+/// parameter early, and a space (an X-line mask may hold several) is written
+/// `\s`, which is how X-line masks spell a space anyway. The operator's
+/// listing (STATS K/D/X) and a session's shown host both go through it, so
+/// neither can be rendered as the numeric funnel's `*` placeholder or split
+/// into two parameters.
+pub(crate) fn mask_middle(mask: &str) -> std::borrow::Cow<'_, str> {
+    if !mask.starts_with(':') && !mask.contains(' ') {
+        return std::borrow::Cow::Borrowed(mask);
+    }
+    let zero = if mask.starts_with(':') { "0" } else { "" };
+    std::borrow::Cow::Owned(format!("{zero}{}", mask.replace(' ', "\\s")))
+}
+
 /// A provider-supplied name reduced to a nick-like account name: ASCII
 /// alphanumerics and the RFC1459 "special" nick characters survive, everything
 /// else (spaces, control, line/tag separators) is dropped and bounded to 32.
@@ -236,6 +252,37 @@ pub(crate) fn client_tag_string(msg: &e6irc_proto::message::Message<'_>) -> Stri
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+/// Client-only tags that describe a moment rather than a message — a typing
+/// indicator — and so never enter history: replayed, they would announce
+/// someone typing long after they stopped, and stored as TAGMSGs they would
+/// crowd real messages out of the bounded hot ring.
+const EPHEMERAL_CLIENT_TAGS: &[&str] = &["+typing", "+draft/typing"];
+
+/// The part of a relayed client tag string ([`client_tag_string`]) that
+/// history keeps with the message: every tag but the ephemeral ones. Empty when
+/// nothing is left, which for a TAGMSG means there is nothing to store.
+pub(crate) fn history_client_tags(relayed: &str) -> String {
+    relayed
+        .split(';')
+        .filter(|tag| {
+            let key = tag.split_once('=').map_or(*tag, |(key, _)| key);
+            !key.is_empty() && !EPHEMERAL_CLIENT_TAGS.contains(&key)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Whether `line` is a TAGMSG that history keeps nothing of (only ephemeral
+/// client-only tags, or none): it is told live and never enters a backlog or
+/// the stored history — the rule the core's history applies, applied to the
+/// bouncer's raw lines.
+pub(crate) fn is_ephemeral_tagmsg(line: &str) -> bool {
+    e6irc_proto::message::Message::parse(line).is_ok_and(|message| {
+        message.command.eq_ignore_ascii_case("TAGMSG")
+            && history_client_tags(&client_tag_string(&message)).is_empty()
+    })
 }
 
 /// Whether `nick` is a legal nickname: it starts with a letter or one of the

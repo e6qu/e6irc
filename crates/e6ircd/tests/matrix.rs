@@ -155,8 +155,14 @@ async fn matrix_bridge_relays_both_ways() {
     .await
     .expect("no Matrix message was ever bridged");
     assert!(line.contains(&format!("PRIVMSG #{room_local}")), "{line}");
+    // The bouncer stamps every line it takes in with its arrival `time`; the
+    // sender is the source after that tag section.
+    let untagged = line
+        .strip_prefix('@')
+        .and_then(|tagged| tagged.split_once(' '))
+        .map_or(line.as_str(), |(_, rest)| rest);
     assert!(
-        line.starts_with(&format!(":{alice}!")),
+        untagged.starts_with(&format!(":{alice}!")),
         "sender nick: {line}"
     );
 

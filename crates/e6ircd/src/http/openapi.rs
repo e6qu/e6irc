@@ -101,10 +101,107 @@ fn merge_path_parameter_responses(spec: &mut serde_json::Value) {
     });
 }
 
+/// What an operation whose handler requires a recent sign-in
+/// (`RecentlyAuthenticated`) adds to its `403`.
+const REAUTHENTICATION_RESPONSE: &str = "the session has not signed in within the last 10 minutes: problem type urn:e6irc:problem:reauthentication-required; re-authenticate (POST /api/v1/me/reauthenticate) and retry";
+
+/// Whether a documented operation's handler takes `extractor`, read from its
+/// signature ([`super::documented_route_arguments`]).
+fn operations_extracting<T: 'static>() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+    let extractor = std::any::TypeId::of::<T>();
+    super::documented_route_arguments()
+        .into_iter()
+        .filter(|(_, _, arguments)| arguments.contains(&extractor))
+        .map(|(path, method, _)| (path, method))
+        .collect()
+}
+
+/// What an operation whose handler spends the per-address authentication
+/// budget (`RateLimited`) answers when it is spent.
+const RATE_LIMITED_RESPONSE: &str =
+    "this address's authentication budget is spent; Retry-After gives the seconds to wait";
+
+/// The responses the service's own bounds produce, before any handler runs:
+/// the request deadline (`408`) and body limit (`413`) for every request, and
+/// the per-address in-flight bound (`429`) for every request the admission
+/// bounds see — all but the probes.
+fn service_wide_responses(admitted: bool) -> serde_json::Map<String, serde_json::Value> {
+    let mut responses = serde_json::Map::new();
+    responses.insert(
+        "408".into(),
+        serde_json::json!({ "description": "the request passed the 30-second deadline (a problem document)" }),
+    );
+    responses.insert(
+        "413".into(),
+        serde_json::json!({ "description": "the request body is larger than 1 MiB (a problem document)" }),
+    );
+    if admitted {
+        responses.insert(
+            "429".into(),
+            serde_json::json!({ "description": "this address has 32 requests in flight; Retry-After gives the seconds to wait" }),
+        );
+    }
+    responses
+}
+
+/// Whether a documented operation's handler takes `RateLimited`.
+fn rate_limited_operations() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+    operations_extracting::<RateLimited>()
+}
+
+/// The operation `method` on `path`, when the document has it.
+fn operation_mut<'a>(
+    spec: &'a mut serde_json::Value,
+    path: &str,
+    method: &str,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    spec["paths"]
+        .get_mut(path)?
+        .get_mut(method)?
+        .get_mut("responses")?
+        .as_object_mut()
+}
+
+/// Give every operation whose handler spends the authentication budget its
+/// `429`, and every operation the service's bounds apply to theirs, keeping
+/// any the operation already states. Derived from the handlers and the router,
+/// so a new rate-limited route cannot be served without saying it can refuse.
+fn merge_service_responses(spec: &mut serde_json::Value) {
+    for (path, method) in rate_limited_operations() {
+        if let Some(responses) = operation_mut(spec, path, method) {
+            responses
+                .entry("429")
+                .or_insert_with(|| serde_json::json!({ "description": RATE_LIMITED_RESPONSE }));
+        }
+    }
+    for (path, method) in operations_extracting::<RecentlyAuthenticated>() {
+        if let Some(responses) = operation_mut(spec, path, method) {
+            let forbidden = responses
+                .entry("403")
+                .or_insert_with(|| serde_json::json!({ "description": "" }));
+            let described = forbidden["description"].as_str().unwrap_or_default();
+            forbidden["description"] = serde_json::Value::String(if described.is_empty() {
+                REAUTHENTICATION_RESPONSE.to_string()
+            } else {
+                format!("{described}; or {REAUTHENTICATION_RESPONSE}")
+            });
+        }
+    }
+    for &(path, method) in super::DOCUMENTED_ROUTE_OPERATIONS {
+        let admitted = !super::PROBE_PATHS.contains(&path);
+        if let Some(responses) = operation_mut(spec, path, method) {
+            for (status, response) in service_wide_responses(admitted) {
+                responses.entry(status).or_insert(response);
+            }
+        }
+    }
+}
+
 fn document() -> serde_json::Value {
     let mut spec = operations();
     merge_standard_authenticated_responses(&mut spec);
     merge_path_parameter_responses(&mut spec);
+    merge_service_responses(&mut spec);
     spec
 }
 
@@ -172,6 +269,13 @@ fn operations() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["app_password", "label", "note"],
             "properties": { "app_password": { "type": "string", "minLength": 1 }, "label": { "type": "string" }, "note": { "type": "string" } }
+        }),
+    );
+    let authorization_url_response = json_response(
+        "the provider URL for the page to navigate to; the sealed flow cookie is set on this answer",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["authorization_url"],
+            "properties": { "authorization_url": { "type": "string", "format": "uri" } }
         }),
     );
     let token_created_response = json_response_status(
@@ -272,16 +376,21 @@ fn operations() -> serde_json::Value {
         "maxLength": e6irc_client::ServerPassword::MAX_LEN, "writeOnly": true,
         "description": "The network's connection password, sent as PASS before registration; only for a private server that requires one. Stored sealed; never returned."
     });
+    let irc_autojoin_schema = serde_json::json!({
+        "type": "array", "maxItems": 64, "items": { "type": "string" },
+        "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none."
+    });
     let network_response_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime"],
+        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "autojoin_keyed", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
             "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
             "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" },
             "username": { "type": ["string", "null"], "description": "IRC user name (ident); null for a bridge." },
             "realname": { "type": ["string", "null"] },
-            "autojoin": { "type": "array", "items": { "type": "string" } },
+            "autojoin": { "type": "array", "items": { "type": "string" }, "description": "The channels (or bridge rooms) joined, without their keys." },
+            "autojoin_keyed": { "type": "array", "items": { "type": "string" }, "description": "The channels among autojoin that have a key stored. The key is stored sealed and never returned." },
             "sasl_account": { "type": ["string", "null"] },
             "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" }, "has_server_password": { "type": "boolean" },
             "enabled": { "type": "boolean" }, "connected": { "type": ["boolean", "null"] },
@@ -558,8 +667,8 @@ fn operations() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["channels", "next_before_id"],
             "properties": { "channels": { "type": "array", "items": { "type": "object", "additionalProperties": false,
-                "required": ["id", "name", "founder", "created_at", "policy"],
-                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": "boolean", "description": "Whether a retained topic is stored; the topic text itself is not returned here." }, "mlock": { "type": "string" }, "access_entries": { "type": "integer", "minimum": 0 } } } }
+                "required": ["id", "name", "founder", "successor", "created_at", "policy"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "successor": { "type": ["string", "null"], "description": "The account the channel passes to if the founder's account is deleted (ChanServ SET SUCCESSOR)." }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": "boolean", "description": "Whether a retained topic is stored; the topic text itself is not returned here." }, "mlock": { "type": ["string", "null"] }, "access_entries": { "type": "integer", "minimum": 0 } } } }
             } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
         }),
     );
@@ -585,9 +694,9 @@ fn operations() -> serde_json::Value {
     );
     let owned_channel_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "founder", "keeptopic", "topic", "topic_setter", "topic_set_at", "mlock", "access"],
+        "required": ["name", "founder", "successor", "keeptopic", "topic", "topic_setter", "topic_set_at", "mlock", "access"],
         "properties": {
-            "name": { "type": "string" }, "founder": { "type": "string" }, "keeptopic": { "type": "boolean" },
+            "name": { "type": "string" }, "founder": { "type": "string" }, "successor": { "type": ["string", "null"], "description": "The account the channel passes to if the founder's account is deleted (ChanServ SET SUCCESSOR)." }, "keeptopic": { "type": "boolean" },
             "topic": { "type": ["string", "null"] }, "topic_setter": { "type": ["string", "null"] }, "topic_set_at": { "type": ["integer", "null"], "minimum": 0 }, "mlock": { "type": ["string", "null"] },
             "access": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["account", "flags"], "properties": { "account": { "type": "string" }, "flags": { "type": "string", "enum": ["o", "v", "ov", "vo"] } } } }
         }
@@ -730,7 +839,9 @@ fn operations() -> serde_json::Value {
             "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
             "api_rate_burst": { "type": "integer", "minimum": 1 },
             "administrator_api_rate_burst": { "type": "integer", "minimum": 1 },
-            "registration_burst": { "type": ["integer", "null"], "minimum": 1 }
+            "registration_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "require_sasl": { "type": "boolean" },
+            "require_sasl_from": { "type": "array", "items": { "type": "string" } }
         }
     });
     let observability_schema = serde_json::json!({
@@ -992,7 +1103,7 @@ fn operations() -> serde_json::Value {
                     "security": [{ "monitoringBearer": [] }],
                     "responses": {
                         "200": application_observation_response["200"],
-                        "401": { "description": "missing or invalid monitoring bearer token" }
+                        "401": { "description": "missing or invalid monitoring bearer token (a problem document; WWW-Authenticate names the Bearer realm)" }
                     }
                 }
             },
@@ -1039,6 +1150,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "201": { "description": "the app password (shown once)" },
                         "400": { "description": "invalid account, password, or label" },
                         "401": { "description": "bad credentials" },
+                        "409": { "description": "the account already holds the most app passwords allowed; revoke one first" },
                         "429": { "description": "the account name has spent its password attempts for the window, or this address its authentication budget; Retry-After says when to try again" },
                         "503": { "description": "no database configured" } }
                 }
@@ -1144,8 +1256,8 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/sessions/{id}": {
                 "delete": {
                     "summary": "Revoke one of your browser sessions",
-                    "description": "The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
-                    "security": authenticated,
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header: browser sessions are managed by browser sessions, one at a time or all but the current one alike, so a bearer cannot sign its owner out of every browser. The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
+                    "security": browser_session_only,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer", "format": "int64", "minimum": 1 } }],
                     "responses": {
@@ -1195,7 +1307,7 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/auth/oidc/{provider}/callback": {
                 "get": { "summary": "OIDC redirect-back: exchange the code and establish the session",
-                    "description": "Opens the sealed flow in the state cookie and requires its state to equal the returned one, for this provider, within ten minutes; exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie. Every response to a callback that proved the browser's flow clears the state cookie, so a flow is answered once; the authorization code itself is single-use at the provider. A first login provisions an account named exactly by the provider's configured claim; a name already in use or retired is refused with 409 (the server never picks a different name for a person). As RFC 6749 §4.1.2 requires, response parameters other than these (Google's `authuser`, `hd` and `prompt`, Keycloak's and Microsoft Entra's `session_state`, a granted `scope`) are ignored: what is trusted is the verified ID token.",
+                    "description": "Opens the sealed flow in the state cookie and requires its state to equal the returned one, for this provider, within ten minutes; exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie. Every response to a callback that proved the browser's flow clears the state cookie, so a flow is answered once; the authorization code itself is single-use at the provider. A first login provisions an account named exactly by the provider's configured claim; a name already in use or retired is refused with 409 (the server never picks a different name for a person). An email names an account only when it is verified and the provider has an allowed-domain policy (403 otherwise). A flow answered once is refused if its cookie is presented again (401). As RFC 6749 §4.1.2 requires, response parameters other than these (Google's `authuser`, `hd` and `prompt`, Keycloak's and Microsoft Entra's `session_state`, a granted `scope`) are ignored: what is trusted is the verified ID token.",
                     "parameters": [
                         { "name": "provider", "in": "path", "required": true, "schema": { "type": "string" } },
                         { "name": "code", "in": "query", "required": false, "schema": { "type": "string" } },
@@ -1207,7 +1319,7 @@ fn operations() -> serde_json::Value {
                         "307": { "description": "a silent probe answered consent_required: redirect into an ordinary authorization request" },
                         "400": { "description": "the query is malformed, or is missing code or state" },
                         "401": { "description": "the flow cookie is missing, expired, for another provider, or bound to a different state; code or token validation failed, the provider refused, or no usable account claim" },
-                        "403": { "description": "the identity is outside the provider's allowed email domains, or the account cannot start a session or gain an identity" },
+                        "403": { "description": "the identity is outside the provider's allowed email domains, or the account cannot start a session or gain an identity, or a first sign-in would name an account by an email the provider has not verified or with no allowed-domain policy configured" },
                         "404": { "description": "unknown provider" },
                         "409": { "description": "first login: the claim's account name is already taken or retired; or link: identity already linked to another account" },
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" },
@@ -1224,19 +1336,43 @@ fn operations() -> serde_json::Value {
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/logout": {
-                "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
-                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed. A request that carries a session cookie must also carry that session's CSRF value as the `csrf` query parameter.",
-                    "parameters": [{ "name": "csrf", "in": "query", "required": false,
+                "post": { "summary": "Sign out: end the e6irc session and, for a provider session, the provider's SSO session",
+                    "description": "Ends the browser session named by the session cookie, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) when an identity provider asserted the session, so the provider's SSO session is ended too; a local session goes to /auth/signed-out. Incomplete OIDC logout configuration fails closed and keeps the session. A request that carries a session cookie must prove its session's CSRF value, never in the URL: in the `csrf` form field, a sign-out form the browser follows as a navigation, which performs the coordinated logout above; or in the `X-E6IRC-CSRF` header, a script's call, which ends this application's session only and answers 204. A request with no session has nothing to end.",
+                    "requestBody": { "required": false, "content": {
+                        "application/x-www-form-urlencoded": { "schema": {
+                            "type": "object", "additionalProperties": false, "required": ["csrf"],
+                            "properties": { "csrf": { "type": "string" } }
+                        } }
+                    } },
+                    "responses": { "204": { "description": "a script's call (CSRF header): this application's session is ended; the provider's is untouched" },
+                        "303": { "description": "a sign-out form's navigation (or no session was presented): session cleared, redirect to the provider's end-session endpoint, or to /auth/signed-out" },
+                        "403": { "description": "session cookie presented without its CSRF value" },
+                        "503": { "description": "database unavailable, or the OIDC provider or public URL is not configured for coordinated logout" } } }
+            },
+            "/api/v1/me/reauthenticate": {
+                "post": { "summary": "Prove the browser session's person again with the primary password",
+                    "description": "Step-up re-authentication: operations that mint or redirect lasting access to the account (tokens, app passwords, device approval, identity linking, a first password, the recovery email, deleting the account) need a sign-in from the last 10 minutes and are otherwise refused 403 with problem type `urn:e6irc:problem:reauthentication-required`. This records one for the calling session. The password check is the login's (per-address budget, per-account attempt throttle). An account without a primary password uses `POST /api/v1/me/reauthenticate/oidc/{provider}`.",
+                    "security": browser_session_only,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "additionalProperties": false,
+                            "required": ["password"],
+                            "properties": { "password": { "type": "string", "minLength": 1, "maxLength": 512, "writeOnly": true } } }
+                    } } },
+                    "responses": { "204": { "description": "this session counts as recently authenticated for the next 10 minutes" },
+                        "400": { "description": "the password is empty or longer than 512 bytes (`field` names it)" },
+                        "401": { "description": "the password is incorrect (`field` names it), or not signed in" },
+                        "429": { "description": "the account has spent its password attempts for the window, or this address its authentication budget; Retry-After says when to try again" } } }
+            },
+            "/api/v1/me/reauthenticate/oidc/{provider}": {
+                "post": { "summary": "Prove the browser session's person again at an identity provider",
+                    "description": "Answers the provider URL to navigate to, and sets the sealed flow cookie. The provider is asked to authenticate afresh (`prompt=login`, `max_age=0`); its callback accepts only an identity linked to this account whose `auth_time` is within the last 10 minutes, marks this session recently authenticated, and returns to /console/account?reauthenticated=1.",
+                    "security": browser_session_only,
+                    "parameters": [{ "name": "provider", "in": "path", "required": true,
                         "schema": { "type": "string" } }],
-                    "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" },
-                        "400": { "description": "the query has an unknown parameter" },
-                        "403": { "description": "session cookie presented without its CSRF value" },
-                        "503": { "description": "database unavailable, or the OIDC provider or public URL is not configured for coordinated logout" } } },
-                "post": { "summary": "Local logout: clear the e6irc session only",
-                    "description": "Ends the browser session named by the session cookie. A request that carries a session cookie must also carry that session's `X-E6IRC-CSRF` value, as every cookie-authenticated unsafe method does; a request with no session has nothing to end and answers 204.",
-                    "responses": { "204": { "description": "session cleared, or no session was presented" },
-                        "403": { "description": "session cookie presented without its CSRF value" },
-                        "503": { "description": "database unavailable" } } }
+                    "responses": {
+                        "200": authorization_url_response["200"],
+                        "404": { "description": "unknown provider" },
+                        "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/oidc/backchannel-logout": {
                 "post": {
@@ -1274,20 +1410,16 @@ fn operations() -> serde_json::Value {
                 }
             },
             "/api/v1/auth/oidc/{provider}/link": {
-                "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
-                    "description": "Requires a cookie-authenticated browser session: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it. Because it is a top-level navigation it cannot carry the X-E6IRC-CSRF header, so the session's CSRF value is required as the `csrf` query parameter instead; without it any site could start a link in the owner's browser.",
+                "post": { "summary": "Link an OIDC identity to your account",
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it. Answers the provider URL for the page to navigate to and sets the sealed flow cookie, so the session's CSRF value never travels in a URL. The callback attaches the returned identity and redirects to /?linked=1.",
                     "security": browser_session_only,
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
-                        "schema": { "type": "string" } },
-                        { "name": "csrf", "in": "query", "required": true,
                         "schema": { "type": "string" } }],
-                    "responses": { "307": { "description": "redirect into the provider" },
-                        "400": { "description": "the query has an unknown parameter" },
+                    "responses": {
+                        "200": authorization_url_response["200"],
                         "401": { "description": "browser session required" },
-                        "403": { "description": "invalid or missing CSRF token" },
                         "404": { "description": "unknown provider" },
                         "409": { "description": "identity already linked to another account (on return)" },
-                        "429": { "description": "the client's authentication rate limit is spent; Retry-After gives the seconds until it holds a token again" },
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/me/identities": {
@@ -1324,6 +1456,7 @@ fn operations() -> serde_json::Value {
                         }
                     } } },
                     "responses": { "200": { "description": "access_token once approved" },
+                        "503": { "description": "no database configured, or the database is unavailable" },
                         "400": { "description": "RFC 8628 error: authorization_pending, expired_token, invalid_grant, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
             },
             "/api/v1/auth/device/approve": {
@@ -1418,6 +1551,7 @@ fn operations() -> serde_json::Value {
                         }))["200"],
                         "400": { "description": "password is empty or exceeds 512 bytes" },
                         "401": { "description": "current primary password is incorrect" },
+                        "403": { "description": "current_password omitted (a first password) and the session has not signed in within the last 10 minutes: problem type urn:e6irc:problem:reauthentication-required; re-authenticate and retry. Also a suspended account or a missing X-E6IRC-CSRF value" },
                         "409": { "description": "current_password omitted but a primary password already exists" },
                         "429": { "description": "the account has spent its password attempts for the window; Retry-After says when to try again" },
                         "503": { "description": "database unavailable" }
@@ -1602,13 +1736,13 @@ fn operations() -> serde_json::Value {
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
-                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin, with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
+                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin (each entry `#channel`, or `#channel key` for a keyed channel, whose key is stored sealed and never returned), with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "oneOf": [
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
-                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": server_password_schema.clone() } },
+                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": irc_autojoin_schema.clone(), "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": server_password_schema.clone() } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "autojoin", "sasl_password"],
                                 "properties": { "kind": { "const": "matrix" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
@@ -1628,7 +1762,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/network-preflight": {
                 "post": {
                     "summary": "Qualify an IRC upstream without saving it",
-                    "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, optional SASL registration, and configured channel-join path. The connection closes after the probe.",
+                    "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, and optional SASL registration path. The autojoin list (keys included) is validated as a save would validate it, but no channel is joined. The connection says QUIT after the probe.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
@@ -1639,7 +1773,7 @@ fn operations() -> serde_json::Value {
                                 "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
                                 "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER; never derived from the nick." },
                                 "realname": { "type": "string", "minLength": 1, "maxLength": 128 },
-                                "autojoin": { "type": "array", "items": { "type": "string" } },
+                                "autojoin": irc_autojoin_schema.clone(),
                                 "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
                                 "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true },
                                 "server_password": server_password_schema.clone()
@@ -1723,19 +1857,22 @@ fn operations() -> serde_json::Value {
                     "responses": { "200": network_response["200"],
                         "404": { "description": "no such network" } } },
                 "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
-                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise).",
+                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise). The channel keys are write-only as well: an autojoin entry `#channel key` sets that channel's key, a channel named in `autojoin_keys.keep` (and listed without a new key) keeps the key stored for it, and every other channel has none; keeping a key the channel does not have, for a channel not listed, or beside a new key is a 400 with field=autojoin. A stored secret never follows the network to a new destination: when the IRC host or port changes, TLS is turned off, or a bridge's API base or homeserver moves to another origin, a secret carried over unchanged (by `keep`, or by replacing only the other half of a pair) is a 409 naming `credentials`, `server_password`, or `autojoin` (a kept channel key); enter it again or remove it.",
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["addr", "tls", "nick", "autojoin", "credentials", "server_password"],
+                            "required": ["addr", "tls", "nick", "autojoin", "autojoin_keys", "credentials", "server_password"],
                             "properties": {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string" },
                                 "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required when the stored network is kind=irc (400 with field=username when absent or invalid); refused for a bridge." },
                                 "realname": { "type": "string", "description": "IRC real name sent in USER. Required when the stored network is kind=irc (400 with field=realname when absent); refused for a bridge." },
-                                "autojoin": { "type": "array", "items": { "type": "string" }, "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing." },
+                                "autojoin": { "type": "array", "maxItems": 64, "items": { "type": "string" }, "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing. An IRC entry `#channel key` sets that channel's key." },
+                                "autojoin_keys": { "type": "object", "additionalProperties": false, "required": ["keep"],
+                                    "description": "Which stored channel keys carry over. Required: a key is write-only, so an entry listed without one could otherwise mean either keep or remove it.",
+                                    "properties": { "keep": { "type": "array", "items": { "type": "string" }, "description": "Channels, listed in autojoin without a new key, that keep their stored key. Every other channel's stored key is removed." } } },
                                 "credentials": {
                                     "oneOf": [
                                         { "type": "object", "additionalProperties": false,
@@ -1773,7 +1910,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "204": { "description": "updated and live driver replaced" },
                         "400": { "description": "invalid kind-specific configuration or credential action" },
                         "404": { "description": "no such network" },
-                        "409": { "description": "cannot seal credentials or start replacement driver" } } },
+                        "409": { "description": "cannot seal credentials or start replacement driver, or a stored secret would be sent to a new destination (field names it)" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
                     "security": authenticated,
                     "parameters": network_name_parameter,
@@ -1806,6 +1943,26 @@ fn operations() -> serde_json::Value {
                         "400": { "description": "limit outside 1–1000, or `through` is not a cursor (`field` names it)" },
                         "404": { "description": "no such network" },
                         "409": { "description": "`through` names no position of the running network's buffer (another buffer lifetime), or the network is stopped and its lines are persisted history without positions; read without `through`" } } }
+            },
+            "/ws/ui": {
+                "get": { "summary": "The web client's live chat socket for one of your networks",
+                    "description": "A WebSocket upgrade (RFC 6455): send `Connection: Upgrade`, `Upgrade: websocket`, and the handshake headers. A browser's `Origin` must be this application's (the configured public URL, else the `Host` it addressed). The socket first sends the network's status, its session snapshot, the replayed lines (after `after`, when that cursor is still in the ring), and a snapshot boundary, then live events; every server frame is one JSON event. A client frame is a composer request `{\"id\", \"target\", \"message\"}` answered by a `sent` or `send-error` event; sending needs the `write` scope or a browser session. The socket closes with code 1008 and a reason when policy refuses it — the account already holds 32 live sockets, or the session or token that opened it was revoked or expired (the client should not retry by itself) — and with 1013 when that credential could not be re-checked (reconnecting authenticates again).",
+                    "security": authenticated,
+                    "parameters": [
+                        { "name": "network", "in": "query", "required": true,
+                            "description": "One of your networks, by name.",
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "after", "in": "query", "required": false,
+                            "description": "The replay cursor of the last line the client holds; replay continues after it, or says it cannot.",
+                            "schema": { "type": "string", "minLength": 1 } }
+                    ],
+                    "responses": {
+                        "101": { "description": "Switching Protocols: the live chat socket (see the description for its events and close codes)" },
+                        "400": { "description": "not a valid WebSocket upgrade, or an invalid query (a problem document)" },
+                        "403": { "description": "the Origin is not this application's, or the credential is refused as for any authenticated read" },
+                        "404": { "description": "no such network of yours, or the bouncer is not enabled" },
+                        "426": { "description": "the WebSocket version is not supported (a problem document)" }
+                    } }
             },
             "/api/v1/history": {
                 "get": { "summary": "Paged message history for the account", "security": authenticated,
@@ -2212,6 +2369,8 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
     // Every response-status omission is reported together: an author fixing
     // the contract should see the whole list, not one entry per attempt.
     let mut undocumented_statuses = Vec::new();
+    let rate_limited = rate_limited_operations();
+    let recently_authenticated = operations_extracting::<RecentlyAuthenticated>();
     let patterns = expected.iter().map(|(path, _)| *path).collect();
     if let Some((left, right)) = colliding_route_patterns(&patterns) {
         return Err(format!(
@@ -2331,6 +2490,41 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
                 .get("responses")
                 .and_then(serde_json::Value::as_object)
                 .ok_or_else(|| format!("OpenAPI {method} {path} has no responses"))?;
+            let admitted = !super::PROBE_PATHS.contains(&path.as_str());
+            for status in service_wide_responses(admitted).keys() {
+                if !responses.contains_key(status) {
+                    undocumented_statuses.push(format!(
+                        "{} {path} does not document the service-wide {status}",
+                        method.to_ascii_uppercase()
+                    ));
+                }
+            }
+            if recently_authenticated
+                .iter()
+                .any(|&(gated, verb)| gated == path && verb == method)
+                && !responses
+                    .get("403")
+                    .and_then(|response| response["description"].as_str())
+                    .is_some_and(|description| {
+                        description.contains(super::REAUTHENTICATION_REQUIRED)
+                    })
+            {
+                undocumented_statuses.push(format!(
+                    "{} {path} requires a recent sign-in but its 403 does not name {}",
+                    method.to_ascii_uppercase(),
+                    super::REAUTHENTICATION_REQUIRED
+                ));
+            }
+            if rate_limited
+                .iter()
+                .any(|&(limited, verb)| limited == path && verb == method)
+                && !responses.contains_key("429")
+            {
+                undocumented_statuses.push(format!(
+                    "{} {path} spends the authentication budget but does not document 429",
+                    method.to_ascii_uppercase()
+                ));
+            }
             if operation_authenticates_an_account(operation) {
                 for status in standard_authenticated_responses().keys() {
                     if !responses.contains_key(status) {
@@ -2491,6 +2685,69 @@ mod tests {
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
     }
 
+    /// Which operations spend the authentication budget is read from their
+    /// handlers' signatures, so the contract says so for each without anyone
+    /// listing them — and a document that drops one is refused.
+    #[test]
+    fn every_rate_limited_operation_documents_its_429() {
+        let limited = super::rate_limited_operations();
+        for operation in [
+            ("/api/v1/auth/oidc/{provider}/callback", "get"),
+            ("/api/v1/auth/oidc/frontchannel-logout", "get"),
+            ("/api/v1/auth/device/start", "post"),
+            ("/api/v1/auth/device/token", "post"),
+            ("/api/v1/auth/app-passwords", "post"),
+        ] {
+            assert!(limited.contains(&operation), "{operation:?} not detected");
+        }
+        assert!(!limited.contains(&("/api/v1/me", "get")));
+        let spec = super::document();
+        for (path, method) in &limited {
+            let responses = &spec["paths"][path][method]["responses"];
+            assert!(responses["429"].is_object(), "{method} {path}");
+            assert!(responses["408"].is_object() && responses["413"].is_object());
+        }
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/device/start"]["post"]["responses"]["429"]["description"],
+            super::RATE_LIMITED_RESPONSE
+        );
+        let mut dropped = spec.clone();
+        dropped["paths"]["/api/v1/auth/oidc/{provider}/callback"]["get"]["responses"]
+            .as_object_mut()
+            .expect("responses")
+            .remove("429");
+        let error = super::validate_documented_operations(&dropped).expect_err("dropped 429");
+        assert!(error.contains("callback"), "{error}");
+    }
+
+    /// The service's own bounds answer before any handler: every operation
+    /// can meet the deadline and the body limit, and every one the admission
+    /// bounds see can meet the per-address in-flight bound.
+    #[test]
+    fn every_operation_documents_the_service_wide_statuses() {
+        let spec = super::document();
+        for &(path, method) in super::super::DOCUMENTED_ROUTE_OPERATIONS {
+            let responses = &spec["paths"][path][method]["responses"];
+            for status in ["408", "413"] {
+                assert!(
+                    responses[status].is_object(),
+                    "{method} {path} lacks {status}"
+                );
+            }
+            assert_eq!(
+                responses["429"].is_object(),
+                !super::super::PROBE_PATHS.contains(&path),
+                "{method} {path}"
+            );
+        }
+        let mut dropped = spec.clone();
+        dropped["paths"]["/api/v1/server"]["get"]["responses"]
+            .as_object_mut()
+            .expect("responses")
+            .remove("413");
+        assert!(super::validate_documented_operations(&dropped).is_err());
+    }
+
     #[test]
     fn a_literal_segment_beside_a_parameter_is_a_route_collision() {
         let table = |paths: &[&'static str]| paths.iter().copied().collect();
@@ -2645,7 +2902,9 @@ mod tests {
     }
 
     /// `PUT` is a full replacement: the contract and the parser agree that the
-    /// autojoin list cannot be omitted, where omission once cleared it.
+    /// autojoin list cannot be omitted, where omission once cleared it, nor
+    /// the channel-key action, whose omission would have to mean keep or
+    /// remove a write-only key.
     #[test]
     fn network_replace_requires_the_autojoin_list() {
         let spec = super::document();
@@ -2658,6 +2917,7 @@ mod tests {
             .filter_map(serde_json::Value::as_str)
             .collect();
         assert!(required.contains(&"autojoin"), "{required:?}");
+        assert!(required.contains(&"autojoin_keys"), "{required:?}");
         assert!(
             replace["properties"]["realname"]["description"]
                 .as_str()
@@ -2675,6 +2935,11 @@ mod tests {
         assert!(refused.to_string().contains("autojoin"), "{refused}");
         let mut with = without;
         with["autojoin"] = serde_json::json!([]);
+        let refused = serde_json::from_value::<super::UpdateNetwork>(with.clone())
+            .err()
+            .expect("an omitted channel-key action is refused");
+        assert!(refused.to_string().contains("autojoin_keys"), "{refused}");
+        with["autojoin_keys"] = serde_json::json!({ "keep": [] });
         assert!(serde_json::from_value::<super::UpdateNetwork>(with).is_ok());
     }
 
@@ -2799,6 +3064,32 @@ mod tests {
             kinds
                 .as_array()
                 .is_some_and(|values| values.contains(&serde_json::json!("local")))
+        );
+    }
+
+    /// The browser suites (web/test/visual.spec.js) answer
+    /// `/api/v1/openapi.json` with this checked-in copy of the served
+    /// document, so a mock can no longer drift from the contract the server
+    /// actually serves. A stale copy fails here and is rewritten in place;
+    /// commit the rewritten file.
+    #[test]
+    fn browser_suite_contract_fixture_is_the_served_document() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/test/fixtures/openapi.json");
+        let served = super::document();
+        let checked_in = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if checked_in.as_ref() == Some(&served) {
+            return;
+        }
+        let mut rendered = serde_json::to_string_pretty(&served).expect("serialize the contract");
+        rendered.push('\n');
+        std::fs::write(&path, rendered)
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+        panic!(
+            "{} was not the served OpenAPI document; it has been regenerated, commit it",
+            path.display()
         );
     }
 }

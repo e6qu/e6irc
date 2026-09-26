@@ -118,6 +118,12 @@ history and bouncer playback are ordered.
 drain its SendQ past the configured cap is disconnected ("SendQ exceeded")
 so one slow client cannot stall the server.
 
+**ELIST / SAFELIST** — the `005` tokens describing `LIST`. `ELIST` (extended
+LIST) names the conditions it takes, one letter each: `C` creation time, `M`
+channel-name mask, `N` negated mask, `T` topic time, `U` user count.
+`SAFELIST` says the reply is paced to the client's SendQ, so listing every
+channel cannot get the client disconnected.
+
 ---
 
 ## Services (NickServ, ChanServ, oper)
@@ -329,10 +335,10 @@ fields, never a preset identifier.
 
 **Preflight** — the optional **Test connection** diagnostic
 (`POST /api/v1/me/network-preflight`, `preflight_irc`). It resolves, connects,
-and registers exactly as the always-on IRC driver would, joins the requested
-channels, reports each stage's timing, sends `QUIT`, and stores nothing: no
-network is created and no driver is started. Saving a network never depends
-on it.
+and registers exactly as the always-on IRC driver would, reports each stage's
+timing, sends `QUIT`, and stores nothing: it joins no channel (the requested
+ones are only validated), no network is created and no driver is started.
+Saving a network never depends on it.
 
 **Server password (PASS)** — a network's connection password: the argument of
 the `PASS` line a private IRC server requires before `CAP LS`, `NICK` and
@@ -344,6 +350,14 @@ sealed like the SASL password, reports only whether one is stored
 from a rejected one (`server_password_rejected`); both wait on the refusal
 schedule. IRC networks only; a bridge has no such line.
 
+**Channel key** — the key of a keyed (`+k`) IRC channel: the second `JOIN`
+parameter, without which the server answers `475`. An account network's
+autojoin entry may carry one after its channel (`#staff key`); e6irc stores it
+sealed like the SASL password, reports only which channels have one
+(`autojoin_keyed`), and changes it on a replace only as `autojoin_keys` says.
+Keys the driver learns at runtime (a client's `JOIN`, a `+k`) are kept in
+memory only. IRC networks only; a bridge's rooms have no key.
+
 **Refusal schedule** — the delays before a driver re-dials an upstream that
 refused its registration: 30 seconds, then 1, 2, and 4 minutes, long enough for
 a ghost of the driver's own session to time out upstream. An ordinary
@@ -351,9 +365,13 @@ connection loss uses the shorter reconnect backoff instead.
 
 **Parked** — a driver that has stopped re-dialing and stays stopped until its
 network is reconfigured. Rejected credentials park on the first rejection,
-because every further attempt counts against the account upstream; any other
-registration refusal parks on the fifth in a row, after the refusal schedule
-is exhausted. A parked network shows why and what repairs it.
+because every further attempt counts against the account upstream, and so does
+a welcome under another nickname. A refusal that may be a configuration fault
+(a held nickname, one the network will not take, a server password) parks on
+the fifth of its kind in a row, after the refusal schedule is exhausted. A
+capacity or policy answer (a throttle, a ban, "SASL access only") never parks:
+it is retried every four minutes for as long as it lasts. DESIGN §10.3 is the
+full statement. A parked network shows why and what repairs it.
 
 **Supersede** and **ensure-running** — the two ways the registry starts a
 driver for a network that may already have one (`bouncer/serve.rs`).

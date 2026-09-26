@@ -24,8 +24,10 @@ mod history;
 pub(crate) mod networks;
 mod observation;
 mod oidc;
+mod oidc_provider;
 mod openapi;
 mod preflight;
+mod revocation;
 mod sessions;
 mod ws;
 
@@ -37,9 +39,11 @@ use history::*;
 use networks::*;
 use observation::*;
 use oidc::*;
+pub(crate) use oidc_provider::SpentFlows;
 use openapi::*;
 pub(crate) use preflight::PreflightLimiter;
 use preflight::PreflightPermit;
+pub(crate) use revocation::CredentialWatch;
 use sessions::*;
 pub(crate) use ws::UiSocketLimiter;
 use ws::*;
@@ -107,6 +111,9 @@ pub struct AppState {
     /// only short-lived browser state and is not derived from the optional
     /// at-rest `secret_key`: a restart ends flows begun before it.
     pub oidc_flow_key: crate::secret::SecretKey,
+    /// Authorization flows whose callback has been answered, so a kept copy
+    /// of a flow cookie cannot be answered again.
+    pub(crate) spent_oidc_flows: SpentFlows,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: crate::core::CoreIngress,
     /// Shared connection-id allocator (with every other ingress transport).
@@ -134,7 +141,8 @@ pub struct AppState {
     /// grant made outside this process needs no restart; these are the grants
     /// only configuration knows about, kept apart so revoking a durable grant
     /// cannot revoke authority configuration still gives (or pretend it did).
-    pub configured_admin_accounts: std::collections::HashSet<String>,
+    /// The same set the core refuses as account names.
+    pub configured_admin_accounts: crate::identity::ReservedAccountNames,
     /// Per-startup key for deriving CSRF tokens for cookie-authenticated
     /// form posts from the server-rendered pages.
     pub csrf_key: [u8; 32],
@@ -156,6 +164,9 @@ pub struct AppState {
     pub(crate) preflight_limiter: Arc<PreflightLimiter>,
     /// Live chat sockets open per account.
     pub(crate) ui_sockets: Arc<UiSocketLimiter>,
+    /// The credential each live socket was opened with, so the socket ends
+    /// when the credential is revoked or expires.
+    pub(crate) credential_watch: Arc<CredentialWatch>,
     /// Account exports running at once.
     pub(crate) account_exports: AccountExportSlots,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
@@ -270,6 +281,15 @@ impl RequestObservation {
 }
 
 impl AppState {
+    /// Where this server's identity providers' calls may go, and over which
+    /// schemes: `https` only when its cookies are `Secure`.
+    pub(crate) fn provider_rules(&self) -> oidc_provider::ProviderRules {
+        oidc_provider::ProviderRules {
+            egress: self.internal_upstreams,
+            schemes: oidc_provider::EndpointSchemes::for_secure_cookies(self.secure_cookies),
+        }
+    }
+
     /// The bootstrap values a managed-settings revision is judged against.
     pub(crate) fn bootstrap_context(&self) -> crate::config::BootstrapContext {
         crate::config::BootstrapContext {
@@ -305,7 +325,6 @@ impl AppState {
 /// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
 pub(super) const MAX_LABEL_LEN: usize = 64;
 pub(super) const MAX_ACCOUNT_LEN: usize = crate::config::MAX_ACCOUNT_NAME_LEN;
-pub(super) const MAX_PASSWORD_LEN: usize = 512;
 
 /// A problem response carried through an internal fallible helper. Boxing the
 /// response keeps every `Result` small while preserving the exact status,
@@ -366,18 +385,15 @@ pub(super) fn credential_input_error(account: &str, password: &str) -> Option<&'
     if account.is_empty() || account.len() > MAX_ACCOUNT_LEN {
         return Some("Account names must contain 1–64 bytes.");
     }
-    if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
-        return Some("Passwords must contain 1–512 bytes.");
-    }
-    None
+    password_input_error(password)
 }
 
+/// The password rule IRC `REGISTER` and NickServ `REGISTER` apply too
+/// ([`crate::identity::NewPassword`]).
 pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
-    if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
-        Some("Passwords must contain 1–512 bytes.")
-    } else {
-        None
-    }
+    crate::identity::NewPassword::parse(password)
+        .err()
+        .map(crate::identity::PasswordRefusal::explanation)
 }
 
 /// Resolve a bounded integer query parameter without silently changing the
@@ -418,12 +434,7 @@ pub(super) fn parse_json<T>(
 ) -> ResponseResult<T> {
     match body {
         Ok(axum::Json(b)) => Ok(b),
-        Err(e) => Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid request body",
-            Some(&e.to_string()),
-        )
-        .into()),
+        Err(e) => Err(body_rejection(e.status(), "Invalid request body", &e.to_string()).into()),
     }
 }
 
@@ -438,7 +449,15 @@ struct ProblemResponse<'a> {
     /// sentence onto it.
     #[serde(skip_serializing_if = "Option::is_none")]
     field: Option<&'a str>,
+    /// The RFC 9457 problem type, for the one refusal a client must act on by
+    /// kind rather than show: [`REAUTHENTICATION_REQUIRED`].
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    problem_type: Option<&'a str>,
 }
+
+/// The problem type of a refusal that asks the browser session's person to
+/// prove themselves again (`POST /api/v1/me/reauthenticate`) and retry.
+pub(crate) const REAUTHENTICATION_REQUIRED: &str = "urn:e6irc:problem:reauthentication-required";
 
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
     problem_at_field(status, title, detail, None)
@@ -450,16 +469,40 @@ fn problem_at_field(
     detail: Option<&str>,
     field: Option<&str>,
 ) -> Response {
-    let mut response = (
+    problem_document(
         status,
-        axum::Json(ProblemResponse {
+        ProblemResponse {
             status: status.as_u16(),
             title,
             detail,
             field,
-        }),
+            problem_type: None,
+        },
     )
-        .into_response();
+}
+
+/// The refusal of an operation that mints or redirects lasting authority over
+/// the account when the browser session has not proved its person within
+/// [`crate::db::STEP_UP_WINDOW`].
+pub(super) fn reauthentication_required() -> Response {
+    problem_document(
+        StatusCode::FORBIDDEN,
+        ProblemResponse {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            title: "Re-authentication required",
+            detail: Some(
+                "This change creates or redirects lasting access to the account, so it needs a \
+                 sign-in from the last 10 minutes. Confirm your password or sign in with your \
+                 identity provider again (POST /api/v1/me/reauthenticate), then retry.",
+            ),
+            field: None,
+            problem_type: Some(REAUTHENTICATION_REQUIRED),
+        },
+    )
+}
+
+fn problem_document(status: StatusCode, body: ProblemResponse<'_>) -> Response {
+    let mut response = (status, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/problem+json"),
@@ -654,8 +697,7 @@ async fn account_suspension_in_lane(
         prepared
     };
 
-    let configured_administrators: Vec<String> =
-        state.configured_admin_accounts.iter().cloned().collect();
+    let configured_administrators: Vec<String> = state.configured_admin_accounts.folded_names();
     let change = crate::db::set_account_suspended(
         pool,
         account_id,
@@ -729,8 +771,7 @@ pub(super) async fn mutate_account_administrator(
     administrator: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let configured_administrators: Vec<String> =
-        state.configured_admin_accounts.iter().cloned().collect();
+    let configured_administrators: Vec<String> = state.configured_admin_accounts.folded_names();
     let change = crate::db::set_account_administrator(
         pool,
         account_id,
@@ -741,7 +782,7 @@ pub(super) async fn mutate_account_administrator(
     .await
     .map_err(|error| authority_error_status("account authority mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
-    let configured = state.configured_admin_accounts.contains(&change.folded);
+    let configured = state.configured_admin_accounts.reserves(&change.folded);
     Ok(if administrator {
         format!(
             "Granted durable administrator authority to {}.",
@@ -760,17 +801,31 @@ pub(super) async fn mutate_account_administrator(
     })
 }
 
-/// Why an account-creation surface refused a configured administrator's name.
-pub(super) const RESERVED_ACCOUNT_NAME_DETAIL: &str = "The name is a configured administrator account; only OIDC sign-in or the \
-     bootstrap/recovery flows can create it.";
-
 impl AppState {
-    /// Whether `account` is a configured administrator's name, which only OIDC
-    /// provisioning and the bootstrap/recovery flows may create (see
-    /// [`crate::identity::ReservedAccountNames`]).
-    pub(super) fn account_name_reserved(&self, account: &str) -> bool {
+    /// Why an ordinary account-creation surface (an administrator creating an
+    /// account, an invitation) may not give an account `account`'s name, if
+    /// it may not: the one rule every claim path shares (see
+    /// [`crate::identity::ReservedAccountNames::claimable`]).
+    pub(super) fn unclaimable_account_name(&self, account: &str) -> Option<&'static str> {
         self.configured_admin_accounts
-            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
+            .claimable(account)
+            .err()
+            .map(account_name_refusal_detail)
+    }
+}
+
+/// What an account-creation surface tells the requester about a refused name.
+pub(super) fn account_name_refusal_detail(
+    refusal: crate::identity::NameClaimRefusal,
+) -> &'static str {
+    match refusal {
+        crate::identity::NameClaimRefusal::ServiceNick => {
+            "The name belongs to a services pseudo-client (NickServ or ChanServ)."
+        }
+        crate::identity::NameClaimRefusal::ConfiguredAdministrator => {
+            "The name is a configured administrator account; only OIDC sign-in or the \
+             bootstrap/recovery flows can create it."
+        }
     }
 }
 
@@ -791,8 +846,8 @@ pub(super) async fn create_account_lifecycle(
     if let Some(detail) = password_input_error(password) {
         return Err((StatusCode::BAD_REQUEST, detail.into()));
     }
-    if state.account_name_reserved(account) {
-        return Err((StatusCode::CONFLICT, RESERVED_ACCOUNT_NAME_DETAIL.into()));
+    if let Some(detail) = state.unclaimable_account_name(account) {
+        return Err((StatusCode::CONFLICT, detail.into()));
     }
     let contact_email = contact_email
         .map(crate::identity::ContactEmail::parse)
@@ -863,7 +918,7 @@ impl AppState {
             registry,
             secret_key: self.secret_key.clone(),
             internal_upstreams: self.internal_upstreams,
-            configured_administrators: self.configured_admin_accounts.iter().cloned().collect(),
+            configured_administrators: self.configured_admin_accounts.clone(),
         })
     }
 }
@@ -928,11 +983,14 @@ mod problem_contract_tests {
     /// malformed form is answered with the same problem document. The OIDC
     /// back-channel logout endpoint answers its own refusal for every
     /// malformed request, a well-formed but invalid logout token included.
+    /// Sign-out reads its form only as one of two places the CSRF value may
+    /// be (a script sends the header and no body), and answers a request
+    /// that proves it in neither with the CSRF refusal.
     #[test]
     fn only_parse_form_unwraps_a_form() {
         assert_eq!(
             occurrences(concat!("Form", "(")),
-            vec![("mod.rs", 1), ("oidc.rs", 1)]
+            vec![("device.rs", 1), ("mod.rs", 1), ("oidc.rs", 1)]
         );
     }
 
@@ -966,6 +1024,7 @@ mod query_limit_tests {
             title: "Not Found",
             detail: None,
             field: None,
+            problem_type: None,
         })
         .expect("problem response");
         assert_eq!(bare, r#"{"status":404,"title":"Not Found"}"#);
@@ -975,6 +1034,7 @@ mod query_limit_tests {
             title: "Invalid IRC identity",
             detail: Some("nick must be one word"),
             field: Some("nick"),
+            problem_type: None,
         })
         .expect("problem response");
         assert_eq!(
@@ -1306,6 +1366,41 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
 // bounds (the service-wide concurrency permit, the per-address in-flight cap),
 // so an orchestrator's liveness and readiness checks are never queued behind —
 // or refused by — the work they exist to watch.
+/// The argument types of a handler function, for [`handler_argument_types`].
+pub(super) trait HandlerArguments<Arguments> {
+    fn argument_types() -> Vec<std::any::TypeId>;
+}
+
+macro_rules! handler_arguments {
+    ($($argument:ident),*) => {
+        impl<Handler, Output, $($argument: 'static,)*> HandlerArguments<($($argument,)*)> for Handler
+        where
+            Handler: FnOnce($($argument),*) -> Output,
+        {
+            fn argument_types() -> Vec<std::any::TypeId> {
+                vec![$(std::any::TypeId::of::<$argument>()),*]
+            }
+        }
+    };
+}
+
+handler_arguments!();
+handler_arguments!(A1);
+handler_arguments!(A1, A2);
+handler_arguments!(A1, A2, A3);
+handler_arguments!(A1, A2, A3, A4);
+handler_arguments!(A1, A2, A3, A4, A5);
+handler_arguments!(A1, A2, A3, A4, A5, A6);
+handler_arguments!(A1, A2, A3, A4, A5, A6, A7);
+handler_arguments!(A1, A2, A3, A4, A5, A6, A7, A8);
+
+/// The types a handler function takes, in order.
+pub(super) fn handler_argument_types<Arguments, Handler: HandlerArguments<Arguments>>(
+    _: &Handler,
+) -> Vec<std::any::TypeId> {
+    Handler::argument_types()
+}
+
 macro_rules! documented_routes {
     (
         probes: { $( $probe_path:literal => { $( $probe_method:ident : $probe_handler:expr ),+ $(,)? } ),+ $(,)? }
@@ -1315,6 +1410,21 @@ macro_rules! documented_routes {
             $( $(($probe_path, stringify!($probe_method))),+ ),+ ,
             $( $(($path, stringify!($method))),+ ),+
         ];
+
+        /// The probes, which bypass the admission bounds.
+        pub(super) const PROBE_PATHS: &[&str] = &[$($probe_path),+];
+
+        /// Every documented operation with the argument types of its handler,
+        /// read from the handler's signature: what a handler extracts (the
+        /// per-address authentication budget, say) is what it can answer, so
+        /// the contract derives those answers instead of repeating them.
+        pub(super) fn documented_route_arguments(
+        ) -> Vec<(&'static str, &'static str, Vec<std::any::TypeId>)> {
+            vec![
+                $( $(($probe_path, stringify!($probe_method), handler_argument_types(&$probe_handler))),+ ),+ ,
+                $( $(($path, stringify!($method), handler_argument_types(&$handler))),+ ),+
+            ]
+        }
 
         fn add_probe_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
             router$(
@@ -1349,17 +1459,19 @@ documented_routes! {
     "/api/v1/auth/app-passwords" => { post: create_app_password },
     "/api/v1/auth/oidc/{provider}/start" => { get: oidc_start },
     "/api/v1/auth/oidc/{provider}/sso" => { get: oidc_sso_start },
-    "/api/v1/auth/oidc/{provider}/link" => { get: oidc_link_start },
+    "/api/v1/auth/oidc/{provider}/link" => { post: oidc_link_start },
     "/api/v1/auth/oidc/{provider}/callback" => { get: oidc_callback },
     "/api/v1/auth/oidc/backchannel-logout" => { post: oidc_backchannel_logout },
     "/api/v1/auth/oidc/frontchannel-logout" => { get: oidc_frontchannel_logout },
-    "/api/v1/auth/logout" => { get: logout_sso, post: logout },
+    "/api/v1/auth/logout" => { post: logout },
     "/api/v1/auth/device/start" => { post: device_start },
     "/api/v1/auth/device/token" => { post: device_token },
     "/api/v1/auth/device/approve" => { post: device_approve },
     "/api/v1/me" => { get: me },
     "/api/v1/me/profile" => { get: me_profile, patch: update_me_profile },
     "/api/v1/me/account" => { delete: delete_own_account },
+    "/api/v1/me/reauthenticate" => { post: reauthenticate_with_password },
+    "/api/v1/me/reauthenticate/oidc/{provider}" => { post: oidc_reauthenticate_start },
     "/api/v1/me/export" => { get: export_me },
     "/api/v1/me/security-activity" => { get: me_security_activity },
     "/api/v1/me/identities" => { get: me_identities },
@@ -1399,6 +1511,7 @@ documented_routes! {
     "/api/v1/me/networks/{name}/account-registration" => { post: network_account_command },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
+    "/ws/ui" => { get: ws_ui },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },
     "/api/v1/admin/accounts/{id}" => {
         patch: admin_account_state,
@@ -1485,9 +1598,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         );
-    let router = add_documented_routes(router)
-        .route("/ws/irc", get(ws_irc))
-        .route("/ws/ui", get(ws_ui));
+    let router = add_documented_routes(router).route("/ws/irc", get(ws_irc));
     // With the `embed-web` feature the built web client (web/dist) is
     // baked into the binary and served at `/` and `/assets/*`; otherwise
     // the assets live on S3/CDN and only the API + WebSocket paths are
@@ -1511,11 +1622,117 @@ pub fn router(state: Arc<AppState>) -> Router {
     // The fallback applies only to routes registered before it is set, so the
     // probes added here are given it again.
     let router = add_probe_routes(router).method_not_allowed_fallback(method_not_allowed);
+    let form_targets = Arc::new(LogoutFormTargets::from_providers(&state.oidc_providers));
     observed(
-        bound_request(router, REQUEST_DEADLINE).layer(axum::middleware::from_fn(baseline_headers)),
+        bound_request(router, REQUEST_DEADLINE)
+            .layer(axum::middleware::from_fn(baseline_headers))
+            .layer(axum::middleware::from_fn_with_state(
+                form_targets,
+                admit_logout_form_targets,
+            )),
         state.observation.clone(),
     )
     .with_state(state)
+}
+
+/// The origins a sign-out form's submission may be redirected to: each
+/// configured provider's end-session endpoint. Signing out is a form `POST`
+/// answered with a `303` to that endpoint, and browsers hold every redirect of
+/// a form submission to the page's `form-action`, so `form-action 'self'`
+/// alone blocked coordinated logout outright.
+struct LogoutFormTargets(Option<String>);
+
+impl LogoutFormTargets {
+    fn from_providers(providers: &[OidcProviderConfig]) -> Self {
+        let mut origins: Vec<String> = providers
+            .iter()
+            .filter_map(|provider| provider.end_session_endpoint.as_deref())
+            .filter_map(|endpoint| url::Url::parse(endpoint).ok())
+            .map(|endpoint| endpoint.origin())
+            .filter(url::Origin::is_tuple)
+            .map(|origin| origin.ascii_serialization())
+            .collect();
+        origins.sort();
+        origins.dedup();
+        Self((!origins.is_empty()).then(|| origins.join(" ")))
+    }
+
+    /// `csp` with the targets added to its `form-action 'self'`.
+    fn admit(&self, csp: &str) -> Option<String> {
+        let targets = self.0.as_deref()?;
+        csp.contains("form-action 'self'").then(|| {
+            csp.replace(
+                "form-action 'self'",
+                &format!("form-action 'self' {targets}"),
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod logout_form_target_tests {
+    use super::*;
+
+    fn provider(name: &str, end_session: Option<&str>) -> OidcProviderConfig {
+        OidcProviderConfig {
+            name: name.into(),
+            issuer_url: "https://idp.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "secret".into(),
+            account_claim: crate::config::OidcAccountClaim::PreferredUsername,
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: end_session.map(str::to_owned),
+            token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
+        }
+    }
+
+    /// A sign-out form's `303` to a provider's end-session endpoint is a
+    /// redirect of a form submission, which browsers hold to `form-action`:
+    /// each provider's end-session origin is admitted there, once, and only
+    /// there.
+    #[test]
+    fn end_session_origins_join_form_action_and_nothing_else() {
+        let targets = LogoutFormTargets::from_providers(&[
+            provider(
+                "shauth",
+                Some("http://localhost:8080/oauth2/sessions/logout"),
+            ),
+            provider("again", Some("http://localhost:8080/other")),
+            provider("corp", Some("https://login.corp.example/logout?x=1")),
+            provider("dex", None),
+        ]);
+        let csp = "default-src 'none'; form-action 'self'; base-uri 'none'";
+        assert_eq!(
+            targets.admit(csp).as_deref(),
+            Some(
+                "default-src 'none'; form-action 'self' http://localhost:8080 \
+                 https://login.corp.example; base-uri 'none'"
+            )
+        );
+        assert_eq!(targets.admit("default-src 'none'"), None);
+        let none = LogoutFormTargets::from_providers(&[provider("dex", None)]);
+        assert_eq!(none.admit(csp), None);
+    }
+}
+
+async fn admit_logout_form_targets(
+    State(targets): State<Arc<LogoutFormTargets>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let widened = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|csp| targets.admit(csp));
+    if let Some(csp) = widened.and_then(|csp| header::HeaderValue::from_str(&csp).ok()) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
+    response
 }
 
 /// Browser features no e6irc page uses, denied to every document the server
@@ -1720,10 +1937,54 @@ where
     S: Clone + Send + Sync + 'static,
 {
     router
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            MAX_REQUEST_BODY_BYTES,
+        ))
+        .layer(axum::middleware::from_fn(body_limit_problem))
         .layer(axum::middleware::from_fn(move |request, next| {
             request_deadline(deadline, request, next)
         }))
+}
+
+/// The largest request body the service reads.
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// The body limit's refusal as the problem document every other refusal is.
+/// The limit layer answers a declared oversize length itself, in plain text,
+/// and an extractor that hits the limit mid-stream answers `413` in its own
+/// shape; this is the one place both become the same document.
+async fn body_limit_problem(request: Request<axum::body::Body>, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value == "application/problem+json")
+    {
+        return response;
+    }
+    payload_too_large()
+}
+
+/// The refusal of a request body over [`MAX_REQUEST_BODY_BYTES`], whichever
+/// layer or extractor noticed it.
+pub(super) fn payload_too_large() -> Response {
+    problem(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Request body too large",
+        Some(&format!(
+            "The server reads at most {MAX_REQUEST_BODY_BYTES} bytes of a request body."
+        )),
+    )
+}
+
+/// A body extractor's refusal: the body limit is its own answer (`413`),
+/// anything else about the body is the client's `400` under `title`.
+pub(super) fn body_rejection(status: StatusCode, title: &str, detail: &str) -> Response {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return payload_too_large();
+    }
+    problem(StatusCode::BAD_REQUEST, title, Some(detail))
 }
 
 /// Abandon a request at the deadline with the same problem document every
@@ -2013,7 +2274,8 @@ mod pages {
         email: String,
         role: String,
         release: String,
-        logout_url: String,
+        /// The session-bound value the sign-out form posts.
+        csrf: String,
     }
 
     fn login_response(
@@ -2233,6 +2495,21 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
+        if let Err(crate::identity::NameClaimRefusal::ServiceNick) =
+            state.configured_admin_accounts.claimable(&form.account)
+        {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some(
+                    super::account_name_refusal_detail(
+                        crate::identity::NameClaimRefusal::ServiceNick,
+                    )
+                    .into(),
+                ),
+                StatusCode::BAD_REQUEST,
+            );
+        }
         match crate::db::bootstrap_first_admin(pool, &form.account, &form.password).await {
             Ok(_account_id) => {}
             Err(crate::db::DbError::AlreadyInitialized) => {
@@ -2418,8 +2695,7 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        let configured_administrators: Vec<String> =
-            state.configured_admin_accounts.iter().cloned().collect();
+        let configured_administrators: Vec<String> = state.configured_admin_accounts.folded_names();
         let account = match crate::db::accept_account_invitation(
             pool,
             &token,
@@ -2456,10 +2732,8 @@ mod pages {
         };
         // The console overview is administrators' only; anyone else would land
         // on "Admin only" as the first page of their new account.
-        let administrator = preview.administrator
-            || state
-                .configured_admin_accounts
-                .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
+        let administrator =
+            preview.administrator || state.configured_admin_accounts.reserves(&account);
         authenticated_redirect(
             &session,
             if administrator {
@@ -2644,7 +2918,7 @@ mod pages {
             email,
             role,
             release,
-            logout_url: format!("/api/v1/auth/logout?csrf={}", state.csrf_token(&token)),
+            csrf: state.csrf_token(&token),
         })
     }
 
@@ -2736,9 +3010,11 @@ mod pages {
     /// console is the one place a read-scoped token of an administrator must
     /// never be able to reach. A visitor with no session, or a session that
     /// has ended, goes to `/login`; a suspended account and an unavailable
-    /// database are reported as the problem they are, and the same per-account
-    /// budget every JSON read spends is spent here. With `admin_only`, a
-    /// signed-in non-administrator gets 403.
+    /// database are reported as the problem they are, and the per-account
+    /// budget the matching JSON routes spend is spent here: an administrator
+    /// page spends the separate, smaller administrator budget, as
+    /// `/api/v1/admin/*` does, and any other page the ordinary one. With
+    /// `admin_only`, a signed-in non-administrator gets 403.
     async fn page_actor(
         state: &AppState,
         headers: &axum::http::HeaderMap,
@@ -2751,7 +3027,7 @@ mod pages {
         if admin_only && !admin {
             return Err(problem(StatusCode::FORBIDDEN, "Admin only", None).into());
         }
-        spend_api_budget(state, &principal.account, false)
+        spend_api_budget(state, &principal.account, admin_only)
             .map_err(|retry_after| ResponseRejection::from(rate_limit_response(retry_after)))?;
         Ok(PageActor {
             account: principal.account,
@@ -3407,12 +3683,7 @@ mod pages {
     ) -> ResponseResult<T> {
         match form {
             Ok(axum::Form(f)) => Ok(f),
-            Err(e) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid form",
-                Some(&e.to_string()),
-            )
-            .into()),
+            Err(e) => Err(body_rejection(e.status(), "Invalid form", &e.to_string()).into()),
         }
     }
 
@@ -3460,6 +3731,25 @@ mod pages {
         outcome: Option<String>,
         /// Styles the outcome as success vs failure.
         approved: bool,
+        /// The session has not proved its person within the step-up window,
+        /// so the form asks for the password with the code.
+        confirm: bool,
+    }
+
+    /// Whether the page's session needs to prove its person before it may
+    /// approve a device (the approval mints a token).
+    async fn device_needs_confirmation(state: &AppState, session: &str) -> ResponseResult<bool> {
+        crate::db::session_recently_authenticated(pool_of(state), session)
+            .await
+            .map(|recent| !recent)
+            .map_err(|e| {
+                eprintln!("http: session age lookup failed: {e}");
+                ResponseRejection::from(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ))
+            })
     }
 
     /// The RFC 8628 verification page `device_start` advertises as
@@ -3474,10 +3764,15 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
+        let confirm = match device_needs_confirmation(&state, &actor.session).await {
+            Ok(confirm) => confirm,
+            Err(response) => return response.into(),
+        };
         render_auth(Device {
             csrf: actor.csrf,
             outcome: None,
             approved: false,
+            confirm,
         })
     }
 
@@ -3487,6 +3782,10 @@ mod pages {
     pub struct DeviceFormFields {
         user_code: String,
         csrf: String,
+        /// The account's password, when the session must prove its person
+        /// before approving (the approval mints a token).
+        #[serde(default)]
+        password: Option<String>,
     }
 
     /// Approve a device code from the verification page's form; re-renders
@@ -3510,6 +3809,54 @@ mod pages {
         };
         if !state.csrf_valid(&session, &fields.csrf) {
             return problem(StatusCode::FORBIDDEN, "Bad CSRF token", None);
+        }
+        let refuse = |outcome: &str| {
+            render_auth(Device {
+                csrf: state.csrf_token(&session),
+                outcome: Some(outcome.to_string()),
+                approved: false,
+                confirm: true,
+            })
+        };
+        match device_needs_confirmation(&state, &session).await {
+            Ok(false) => {}
+            Err(response) => return response.into(),
+            Ok(true) => {
+                let Some(password) = fields.password.as_deref().filter(|p| !p.is_empty()) else {
+                    return refuse(
+                        "You signed in more than 10 minutes ago. Enter your password to approve \
+                         a device.",
+                    );
+                };
+                match crate::db::verify_local_password(pool_of(&state), &account, password).await {
+                    Ok(Some(_)) => {
+                        if let Err(e) = crate::db::mark_session_reauthenticated(
+                            pool_of(&state),
+                            &account,
+                            &session,
+                            crate::db::Reauthentication::Password,
+                        )
+                        .await
+                        {
+                            eprintln!("http: re-authentication failed: {e}");
+                            return refuse(
+                                "Approval storage is temporarily unavailable — try again.",
+                            );
+                        }
+                    }
+                    Ok(None) => return refuse("That password is not correct."),
+                    Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+                        return refuse(&format!(
+                            "Too many password attempts. Try again in {} seconds.",
+                            retry_after.seconds()
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("http: device re-authentication failed: {e}");
+                        return refuse("Approval storage is temporarily unavailable — try again.");
+                    }
+                }
+            }
         }
         let (outcome, approved) =
             match super::device::approve_user_code(&state, &account, &fields.user_code).await {
@@ -3535,6 +3882,7 @@ mod pages {
             csrf: state.csrf_token(&session),
             outcome: Some(outcome.to_string()),
             approved,
+            confirm: false,
         })
     }
 
@@ -4026,6 +4374,62 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
         logout_token_with_type(payload, Some("logout+jwt"))
     }
 
+    /// A provider rotates its signing key and at once sends a logout token
+    /// signed by the new one. The cached key set cannot verify it, and a `400`
+    /// is final to the provider, so the keys are fetched again — once per
+    /// interval, not once per token — and the token verified with them.
+    #[tokio::test]
+    async fn a_logout_token_signed_by_a_rotated_key_verifies_after_one_refresh() {
+        use super::oidc_provider::tests::{age_for_refresh, provider, provider_config};
+        let policy = super::oidc_provider::ProviderRules {
+            egress: crate::egress::InternalUpstreams::Refuse,
+            schemes: super::oidc_provider::EndpointSchemes::HttpOrHttps,
+        };
+        let key_set = |kid: &str, key: &openidconnect::core::CoreJsonWebKey| {
+            let mut key = serde_json::to_value(key).expect("key JSON");
+            key["kid"] = serde_json::Value::String(kid.into());
+            serde_json::json!({ "keys": [key] })
+        };
+        let keys = Arc::new(std::sync::Mutex::new(serde_json::json!({ "keys": [] })));
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let issuer = provider(keys.clone(), fetches.clone(), true).await;
+        let config = provider_config(&issuer);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        let (raw, key) = logout_token(serde_json::json!({
+            "iss": issuer,
+            "aud": "e6irc",
+            "sid": "session-1",
+            "iat": now,
+            "exp": now + 600,
+            "jti": "rotated-1",
+            "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
+        }));
+        *keys.lock().expect("keys") = key_set("previous-key", &key);
+
+        // Fetched just now: the refresh a failed signature forces is
+        // throttled, so the token is refused rather than fetching again.
+        assert!(matches!(
+            verify_logout_token(policy, &config, &raw, now).await,
+            Err(LogoutVerification::Rejected(
+                LogoutTokenRejection::Signature
+            ))
+        ));
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The provider now publishes the key it signed with, and the interval
+        // has passed: one refresh, and the token verifies.
+        *keys.lock().expect("keys") = key_set("logout-key", &key);
+        age_for_refresh(&issuer, policy);
+        let claims = verify_logout_token(policy, &config, &raw, now)
+            .await
+            .expect("verified after the refresh");
+        assert_eq!(claims.sid.as_deref(), Some("session-1"));
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     fn logout_test_provider() -> OidcProviderConfig {
         OidcProviderConfig {
             name: "shauth".into(),
@@ -4038,6 +4442,46 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             end_session_endpoint: None,
             token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }
+    }
+
+    /// An email names a new account only when the provider verified it and a
+    /// domain policy says whose addresses they are; otherwise the local part
+    /// of an address anyone could register would become — say — a configured
+    /// administrator's name.
+    #[test]
+    fn an_email_names_a_new_account_only_when_verified_under_a_domain_policy() {
+        let mut provider = logout_test_provider();
+        provider.account_claim = crate::config::OidcAccountClaim::Email;
+        assert_eq!(
+            provisioned_account_name(&provider, Some("alice"), Some("alice@corp.example"), true),
+            Err(ProvisioningRefusal::NoDomainPolicy),
+            "no fallback to preferred_username either"
+        );
+        provider.allowed_email_domains =
+            vec![crate::identity::EmailDomain::parse("corp.example").expect("domain")];
+        assert_eq!(
+            provisioned_account_name(&provider, None, Some("alice@corp.example"), false),
+            Err(ProvisioningRefusal::UnverifiedEmail)
+        );
+        assert_eq!(
+            provisioned_account_name(&provider, None, Some("alice@corp.example"), true),
+            Ok("alice".to_string())
+        );
+        assert!(matches!(
+            provisioned_account_name(&provider, Some("alice"), None, true),
+            Err(ProvisioningRefusal::UnusableClaim(_))
+        ));
+        assert_eq!(
+            ProvisioningRefusal::NoDomainPolicy.response().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut by_username = logout_test_provider();
+        by_username.account_claim = crate::config::OidcAccountClaim::PreferredUsername;
+        assert_eq!(
+            provisioned_account_name(&by_username, Some("bob"), None, false),
+            Ok("bob".to_string())
+        );
     }
 
     #[test]

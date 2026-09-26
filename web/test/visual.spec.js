@@ -6,112 +6,40 @@ const { expect, test } = playwrightTest;
 
 const identity = {
   account: "visual-test", email: "visual@example.test", role: "operator", csrf_token: "session-bound-token",
-  logout_url: "/api/v1/auth/logout?csrf=session-bound-token",
+  logout_url: "/api/v1/auth/logout",
 };
 const presets = [
   { id: "libera", label: "Libera Chat", name: "libera", addr: "irc.libera.chat:6697", tls: true },
   { id: "oftc", label: "OFTC", name: "oftc", addr: "irc.oftc.net:6697", tls: true },
 ];
-const response = (schema) => ({ content: { "application/json": { schema } } });
-const apiContract = {
-  paths: {
-    "/api/v1/me": {
-      get: { responses: { 200: response({
-        type: "object", additionalProperties: false, required: ["account"], properties: {
-          account: { type: "string", minLength: 1 }, email: { type: ["string", "null"] },
-          role: { type: ["string", "null"] }, logout_url: { type: "string" },
-          csrf_token: { type: "string" },
-        },
-      }) } },
-    },
-    "/api/v1/network-presets": {
-      get: { responses: { 200: response({
-        type: "object", additionalProperties: false, required: ["presets"], properties: {
-          presets: { type: "array", items: {
-            type: "object", additionalProperties: false, required: ["id", "label", "name", "addr", "tls"],
-            properties: {
-              id: { type: "string" }, label: { type: "string" }, name: { type: "string" },
-              addr: { type: "string" }, tls: { type: "boolean" },
-            },
-          } },
-        },
-      }) } },
-    },
-    "/api/v1/me/networks": {
-      get: { responses: { 200: response({
-        type: "object", additionalProperties: false, required: ["networks"], properties: {
-          networks: { type: "array", items: {
-            type: "object", additionalProperties: false,
-            required: ["name", "kind", "nick", "enabled", "connected", "runtime"],
-            properties: {
-              name: { type: "string", minLength: 1 }, kind: { type: "string" }, nick: { type: "string" },
-              enabled: { type: "boolean" }, connected: { type: ["boolean", "null"] }, runtime: { oneOf: [
-                { type: "null" },
-                { type: "object", additionalProperties: false, required: ["state"], properties: {
-                  state: { type: "string" },
-                  last_error: { oneOf: [
-                    { type: "null" },
-                    { type: "object", additionalProperties: false, required: ["code"], properties: {
-                      code: { type: "string" }, diagnostic: { type: "string" },
-                    } },
-                  ] },
-                } },
-              ] },
-            },
-          } },
-        },
-      }) } },
-      post: {
-        requestBody: { required: true, content: { "application/json": { schema: {
-          type: "object", additionalProperties: false,
-          required: ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
-          properties: {
-            kind: { const: "irc" }, name: { type: "string" }, addr: { type: "string" }, tls: { type: "boolean" },
-            nick: { type: "string" }, username: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$" },
-            realname: { type: "string" },
-            autojoin: { type: "array", items: { type: "string" } },
-            sasl_account: { type: "string" }, sasl_password: { type: "string" },
-            server_password: { type: ["string", "null"], minLength: 1, maxLength: 504, writeOnly: true },
-          },
-        } } } },
-        responses: { 201: response({
-          type: "object", additionalProperties: false, required: ["name", "attach"],
-          properties: { name: { type: "string" }, attach: { type: "string" } },
-        }) },
-      },
-    },
-    "/api/v1/me/network-preflight": {
-      post: {
-        requestBody: { required: true, content: { "application/json": { schema: {
-          type: "object", additionalProperties: false,
-          required: ["addr", "tls", "nick", "username", "realname"],
-          properties: {
-            addr: { type: "string" }, tls: { type: "boolean" }, nick: { type: "string" },
-            username: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$" },
-            realname: { type: "string" },
-            autojoin: { type: "array", items: { type: "string" } },
-            sasl_account: { type: "string" }, sasl_password: { type: "string" },
-            server_password: { type: "string" },
-          },
-        } } } },
-        // The same flat shape the served OpenAPI declares: a mock that invents
-        // a nesting the server does not send is a test that passes while the
-        // product is broken, which is exactly what happened here.
-        responses: { 200: response({
-          type: "object", additionalProperties: false,
-          required: ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick", "sasl_mechanism"],
-          properties: {
-            ok: { const: true },
-            resolved_addresses: { type: "integer" }, dns_ms: { type: "integer" },
-            connect_ms: { type: "integer" }, registration_ms: { type: "integer" },
-            confirmed_nick: { type: "string" },
-            sasl_mechanism: { enum: ["SCRAM-SHA-512", "SCRAM-SHA-256", "PLAIN", null] },
-          },
-        }) },
-      },
-    },
-  },
+
+// Stored networks exactly as GET /api/v1/me/networks answers them: the served
+// schema (fixtures/openapi.json) requires every field below, so a list entry
+// built any other way is refused by the client exactly as the server's would be.
+const failureSummaries = {
+  authentication_rejected: "The upstream rejected the configured credentials.",
+  registration_rejected: "The upstream rejected IRC registration; check the nickname and network policy.",
 };
+const networkFailure = (code, extra = {}) => ({ code, summary: failureSummaries[code], ...extra });
+const upstreamRuntime = (state, extra = {}) => ({
+  state, state_changed_at: "2026-01-01T00:00:00Z", next_retry_at: null, recent_failures: [],
+  connected_at: null, last_input_at: null, last_output_at: null, last_error_at: null, last_error: null,
+  connect_latency_ms: null, connection_attempts: 1, errors: 0, attached_clients: 0,
+  traffic: { lines_in: 0, bytes_in: 0, lines_out: 0, bytes_out: 0 }, buffer: { lines: 0, capacity: 1000 },
+  ...extra,
+});
+const ircNetwork = (name, extra = {}) => ({
+  name, kind: "irc", addr: `irc.${name.toLowerCase()}.example:6697`, tls: true, nick: "viewer",
+  username: "viewer", realname: "Viewer", autojoin: [], sasl_account: null, autojoin_keyed: [],
+  has_sasl_account: false, has_sasl_password: false, has_server_password: false,
+  enabled: true, connected: true, runtime: upstreamRuntime("connected"), ...extra,
+});
+// The served OpenAPI document, as crates/e6ircd/src/http/openapi.rs builds it
+// (its test `browser_suite_contract_fixture_is_the_served_document` fails, and
+// rewrites this file, whenever the two differ). Tests stub responses, never
+// the contract: a hand-written schema drifts and then passes while the product
+// is broken.
+const apiContract = await readFile(new URL("fixtures/openapi.json", import.meta.url), "utf8");
 
 async function expectAccessible(page) {
   const results = await new AxeBuilder({ page }).include("#app").analyze();
@@ -120,7 +48,7 @@ async function expectAccessible(page) {
 
 async function mockApiContract(page) {
   await page.route("/api/v1/openapi.json", (route) => route.fulfill({
-    contentType: "application/json", body: JSON.stringify(apiContract),
+    contentType: "application/json", body: apiContract,
   }));
 }
 
@@ -181,9 +109,20 @@ async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
     contentType: "text/javascript",
     body: runtime,
   }));
+  // The served /console-contract.js is web/src/api-contract.js itself. The
+  // double re-exports every binding of the real module and shadows only the two
+  // functions that reach the network, so an export the console starts to
+  // import (REAUTHENTICATION_REQUIRED was one) can never be missing here and
+  // fail the whole runtime at module link time.
+  const contractModule = await readFile(new URL("../src/api-contract.js", import.meta.url), "utf8");
+  await page.route("**/console-contract-real.js", (route) => route.fulfill({
+    contentType: "text/javascript",
+    body: contractModule,
+  }));
   await page.route("**/console-contract.js", (route) => route.fulfill({
     contentType: "text/javascript",
-    body: `const responses = ${JSON.stringify(apiResponses)};
+    body: `export * from "/console-contract-real.js";
+      const responses = ${JSON.stringify(apiResponses)};
       export const apiContractLoader = () => async () => ({});
       export const getOperationJson = async (_fetch, _contract, method, url, options) => {
         window.consoleApiRequests ??= [];
@@ -373,7 +312,7 @@ test("console bridge editor sends only the fields the contract declares for a br
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   const network = {
     kind: "slack", name: "team", addr: "https://slack.com/api", tls: true, nick: "", username: null, realname: null,
-    autojoin: ["C123"], sasl_account: null, has_sasl_account: true, has_sasl_password: true, has_server_password: false, enabled: true,
+    autojoin: ["C123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: true, has_sasl_password: true, has_server_password: false, enabled: true,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network });
   await expect(page.getByRole("button", { name: "Save bridge", exact: true })).toBeVisible();
@@ -382,7 +321,7 @@ test("console bridge editor sends only the fields the contract declares for a br
   // blank credentials mean keep -- nothing is null.
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
     method: "PUT", url: "/api/v1/me/networks/team", json: {
-      addr: "https://slack.com/api", tls: true, nick: "", autojoin: ["C123"], credentials: { action: "keep" },
+      addr: "https://slack.com/api", tls: true, nick: "", autojoin: ["C123"], autojoin_keys: { keep: [] }, credentials: { action: "keep" },
       server_password: { action: "keep" },
     },
   }]);
@@ -409,7 +348,7 @@ test("console network page points at the one settings editor and registers on re
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
-    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
   };
   const operations = { enabled: true, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
   await mountConsoleRuntime(page, `<main>${detail}</main>`, await consoleStyles(), {
@@ -492,7 +431,7 @@ test("the network page loads the whole stored log into the transcript it already
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "Alice",
-    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
   };
   const recent = Array.from({ length: 100 }, (_, index) => `recent ${index}`);
   const whole = Array.from({ length: 400 }, (_, index) => `line ${index}`);
@@ -540,7 +479,7 @@ test("a background refresh never pulls a page out from under a pending confirmat
     },
     "/api/v1/me/networks/libera": {
       name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice",
-      username: "alice", realname: "Alice", autojoin: [], sasl_account: null,
+      username: "alice", realname: "Alice", autojoin: [], sasl_account: null, autojoin_keyed: [],
       has_sasl_account: false, has_sasl_password: false, has_server_password: false,
       enabled: true, connected: true,
       runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
@@ -640,10 +579,7 @@ test("chat preferences are keyboard-dismissible and retain their trigger focus",
 
 test("the selected conversation exposes current navigation state", async ({ page }) => {
   // The console belongs to a network's connection, so one is open here.
-  await mockSession(page, [{
-    name: "Libera", kind: "irc", nick: "viewer", enabled: true, connected: true,
-    runtime: { state: "connected", last_error: null },
-  }]);
+  await mockSession(page, [ircNetwork("Libera")]);
   await page.goto("/?network=Libera");
 
   const server = page.getByRole("button", { name: "Open console" });
@@ -697,18 +633,13 @@ test("the one network list shows typed states and opens a runnable network by it
   await page.setViewportSize({ width: 768, height: 1024 });
   await mockLiveSocket(page);
   await mockSession(page, [
-    { name: "Archive", kind: "irc", nick: "viewer", enabled: false, connected: null, runtime: null },
-    {
-      name: "Libera",
-      kind: "irc",
-      nick: "viewer",
-      enabled: true,
+    ircNetwork("Archive", { enabled: false, connected: null, runtime: null }),
+    ircNetwork("Libera", {
       connected: false,
-      runtime: {
-        state: "reconnecting",
-        last_error: { code: "registration_rejected", diagnostic: "Closing Link: (SASL access only)" },
-      },
-    },
+      runtime: upstreamRuntime("reconnecting", {
+        last_error: networkFailure("registration_rejected", { diagnostic: "Closing Link: (SASL access only)" }),
+      }),
+    }),
   ]);
   await page.goto("/");
 
@@ -736,10 +667,8 @@ test("the one network list shows typed states and opens a runnable network by it
 test("with several runnable networks the person chooses; the client does not pick one", async ({ page }) => {
   let sockets = 0;
   await page.routeWebSocket(/\/ws\/ui/, () => { sockets += 1; });
-  const runnable = (name, connected) => ({
-    name, kind: "irc", nick: "viewer", enabled: true, connected,
-    runtime: { state: connected ? "connected" : "reconnecting", last_error: null },
-  });
+  const runnable = (name, connected) =>
+    ircNetwork(name, { connected, runtime: upstreamRuntime(connected ? "connected" : "reconnecting") });
   await mockSession(page, [runnable("Libera", false), runnable("OFTC", true)]);
   await page.goto("/");
 
@@ -754,11 +683,7 @@ test("with several runnable networks the person chooses; the client does not pic
 
 test("on a phone the choice says how to reach the list instead of opening it unasked", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  const runnable = (name) => ({
-    name, kind: "irc", nick: "viewer", enabled: true, connected: true,
-    runtime: { state: "connected", last_error: null },
-  });
-  await mockSession(page, [runnable("Libera"), runnable("OFTC")]);
+  await mockSession(page, [ircNetwork("Libera"), ircNetwork("OFTC")]);
   await page.goto("/");
 
   const networks = page.getByRole("list", { name: "Networks" });
@@ -775,16 +700,12 @@ test("the network list follows the server instead of the first answer it got", a
   await page.route(/\/api\/v1\/me\/networks$/, (route) => {
     reads += 1;
     const parked = reads > 1;
-    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ networks: [{
-      name: "Libera",
-      kind: "irc",
-      nick: "viewer",
-      enabled: true,
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ networks: [ircNetwork("Libera", {
       connected: !parked,
       runtime: parked
-        ? { state: "authentication_failed", last_error: { code: "authentication_rejected" } }
-        : { state: "connected", last_error: null },
-    }] }) });
+        ? upstreamRuntime("authentication_failed", { last_error: networkFailure("authentication_rejected") })
+        : upstreamRuntime("connected"),
+    })] }) });
   });
   await page.goto("/");
 
@@ -794,67 +715,11 @@ test("the network list follows the server instead of the first answer it got", a
   await expect(networks.getByText(/rejected the NickServ account or password/)).toBeVisible();
 });
 
-const ircNetwork = (name, extra = {}) => ({
-  name, kind: "irc", nick: "viewer", enabled: true, connected: true,
-  runtime: { state: "connected", last_error: null }, ...extra,
-});
-const networkDetail = (name, addr) => ({
-  name, kind: "irc", addr, tls: true, nick: `${name}-nick`, username: "viewer", realname: "Viewer", autojoin: ["#kept"],
-  sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
-});
-const detailContract = {
-  get: { responses: { 200: response({
-    type: "object", additionalProperties: false,
-    required: ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled"],
-    properties: {
-      name: { type: "string" }, kind: { type: "string" }, addr: { type: "string" }, tls: { type: "boolean" },
-      nick: { type: "string" }, username: { type: ["string", "null"] }, realname: { type: ["string", "null"] },
-      autojoin: { type: "array", items: { type: "string" } }, sasl_account: { type: ["string", "null"] },
-      has_sasl_account: { type: "boolean" }, has_sasl_password: { type: "boolean" },
-      has_server_password: { type: "boolean" }, enabled: { type: "boolean" },
-    },
-  }) } },
-};
-
-// The replace request as the server documents it: both write-only secrets are
-// changed only by an explicit action.
-const secretAction = (set) => ({ oneOf: [
-  { type: "object", additionalProperties: false, required: ["action"], properties: { action: { const: "keep" } } },
-  { type: "object", additionalProperties: false, required: ["action"], properties: { action: { const: "remove" } } },
-  { type: "object", additionalProperties: false, required: ["action", ...set.required], properties: { action: { const: "set" }, ...set.properties } },
-] });
-const replaceContract = {
-  requestBody: { required: true, content: { "application/json": { schema: {
-    type: "object", additionalProperties: false, required: ["addr", "tls", "nick", "credentials", "server_password"],
-    properties: {
-      addr: { type: "string" }, tls: { type: "boolean" }, nick: { type: "string" },
-      username: { type: "string" }, realname: { type: "string" }, autojoin: { type: "array", items: { type: "string" } },
-      credentials: secretAction({ required: [], properties: { account: { type: "string" }, password: { type: "string" } } }),
-      server_password: secretAction({ required: ["password"], properties: { password: { type: "string", minLength: 1, maxLength: 504 } } }),
-    },
-  } } } },
-  responses: { 204: { description: "updated" } },
-};
+// GET /api/v1/me/networks/{name} answers the same shape as a list entry.
+const networkDetail = (name, addr) => ircNetwork(name, { addr, nick: `${name}-nick`, autojoin: ["#kept"] });
 
 async function mockNetworkDetails(page, respond) {
-  await page.route("/api/v1/openapi.json", (route) => route.fulfill({
-    contentType: "application/json",
-    body: JSON.stringify({ paths: { ...apiContract.paths, "/api/v1/me/networks/{name}": {
-      get: {
-        ...detailContract.get,
-        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
-      },
-      put: {
-        ...replaceContract,
-        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
-      },
-      // As the served contract declares it: no body, 204 on success.
-      delete: {
-        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
-        responses: { 204: { description: "deleted" } },
-      },
-    } } }),
-  }));
+  await mockApiContract(page);
   await page.route(/\/api\/v1\/me\/networks\/[^/]+$/, respond);
 }
 
@@ -928,7 +793,7 @@ test("a revealed password is hidden again and gone when the dialog is reopened",
 
 test("a bridge network's settings open its own form, not the IRC dialog", async ({ page }) => {
   await mockLiveSocket(page);
-  await mockSession(page, [ircNetwork("Libera"), ircNetwork("Team", { kind: "slack", nick: "" })]);
+  await mockSession(page, [ircNetwork("Libera"), ircNetwork("Team", { kind: "slack", addr: "https://slack.com/api", nick: "", username: null, realname: null })]);
   await page.goto("/?network=Libera");
   await expect(page.getByRole("link", { name: "Settings for Team" })).toHaveAttribute("href", "/console/networks/Team");
   await expect(page.getByRole("button", { name: "Settings for Libera" })).toBeVisible();
@@ -1173,10 +1038,7 @@ test("adding a network asks only what a known network cannot supply, and carries
   await page.route(/\/api\/v1\/me\/networks$/, async (route) => {
     if (route.request().method() !== "POST") return route.fallback();
     created = { csrf: await route.request().headerValue("x-e6irc-csrf"), body: route.request().postDataJSON() };
-    stored.push({
-      name: "libera", kind: "irc", nick: "visual-test", enabled: true, connected: true,
-      runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
-    });
+    stored.push(ircNetwork("libera", { addr: "irc.libera.chat:6697", nick: "visual-test" }));
     return route.fulfill({
       status: 201,
       contentType: "application/json",
@@ -1246,16 +1108,7 @@ test("adding a network asks only what a known network cannot supply, and carries
 
 test("chat reflows at a 200 percent equivalent layout width", async ({ page }) => {
   await page.setViewportSize({ width: 640, height: 800 });
-  await mockSession(page, [
-    {
-      name: "Libera",
-      kind: "irc",
-      nick: "viewer",
-      enabled: true,
-      connected: false,
-      runtime: { state: "reconnecting" },
-    },
-  ]);
+  await mockSession(page, [ircNetwork("Libera", { connected: false, runtime: upstreamRuntime("reconnecting") })]);
   await mockLiveSocket(page);
   await page.goto("/");
 
@@ -1284,17 +1137,10 @@ test("network picker distinguishes an unavailable API on narrow dark screens", a
 
 test("parked Libera registration gives the recovery beside its settings control", async ({ page }) => {
   await mockLiveSocket(page);
-  await mockSession(page, [{
-    name: "Libera",
-    kind: "irc",
-    nick: "viewer",
-    enabled: true,
+  await mockSession(page, [ircNetwork("Libera", {
     connected: false,
-    runtime: {
-      state: "registration_failed",
-      last_error: { code: "registration_rejected" },
-    },
-  }]);
+    runtime: upstreamRuntime("registration_failed", { last_error: networkFailure("registration_rejected") }),
+  })]);
   await page.goto("/");
 
   const networks = page.getByRole("list", { name: "Networks" });
@@ -1345,10 +1191,7 @@ test("network picker keeps recovery controls usable in forced colors", async ({ 
 
 test("phone conversation rail returns focus after Escape", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await mockSession(page, [{
-    name: "Libera", kind: "irc", nick: "viewer", enabled: true, connected: true,
-    runtime: { state: "connected", last_error: null },
-  }]);
+  await mockSession(page, [ircNetwork("Libera")]);
   await page.goto("/?network=Libera");
 
   const conversations = page.getByRole("button", { name: "Conversations" });
@@ -1555,7 +1398,7 @@ test("an expired session stops the socket retry loop and offers sign-in once", a
   await expectAccessible(page);
 });
 
-test("the sign-out link exists only once its CSRF-bearing URL is known", async ({ page }) => {
+test("the sign-out control exists only once the session's CSRF value is known", async ({ page }) => {
   let release;
   const held = new Promise((resolve) => { release = resolve; });
   await mockSession(page, []);
@@ -1566,10 +1409,12 @@ test("the sign-out link exists only once its CSRF-bearing URL is known", async (
   await page.goto("/");
   const signOut = page.locator("#logout-link");
   await expect(signOut).toBeHidden();
-  await expect(signOut).not.toHaveAttribute("href");
   release();
   await expect(signOut).toBeVisible();
-  await expect(signOut).toHaveAttribute("href", "/api/v1/auth/logout?csrf=session-bound-token");
+  // A form post: the session's token rides in the body, never in a URL.
+  await expect(page.locator("#logout-form")).toHaveAttribute("action", "/api/v1/auth/logout");
+  await expect(page.locator("#logout-form")).toHaveAttribute("method", "post");
+  await expect(page.locator("#logout-csrf")).toHaveValue("session-bound-token");
 });
 
 test("the add-network dialog's catalog does not type over what was typed while it loaded", async ({ page }) => {
@@ -1806,25 +1651,7 @@ test("on a phone the member list opens from the buffer header", async ({ page })
 
 // The buffer read "Load earlier" makes, as the served contract declares it.
 async function mockBuffer(page, respond) {
-  await page.route("/api/v1/openapi.json", (route) => route.fulfill({
-    contentType: "application/json",
-    body: JSON.stringify({ paths: { ...apiContract.paths, "/api/v1/me/networks/{name}/buffer": {
-      get: {
-        parameters: [
-          { name: "name", in: "path", required: true, schema: { type: "string" } },
-          { name: "limit", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 1000 } },
-          { name: "through", in: "query", required: false, schema: { type: "string", minLength: 1 } },
-        ],
-        responses: {
-          200: response({
-            type: "object", additionalProperties: false, required: ["lines"],
-            properties: { lines: { type: "array", items: { type: "string" } } },
-          }),
-          409: { description: "cursor not honoured" },
-        },
-      },
-    } } }),
-  }));
+  await mockApiContract(page);
   await page.route(/\/api\/v1\/me\/networks\/[^/]+\/buffer/, respond);
 }
 
@@ -2136,21 +1963,6 @@ test("enabling the open network opens one live socket, not two", async ({ page }
   });
   const stored = [ircNetwork("Libera", { enabled: false, connected: null, runtime: null })];
   await mockSession(page, stored);
-  await page.route("/api/v1/openapi.json", (route) => route.fulfill({
-    contentType: "application/json",
-    body: JSON.stringify({ paths: { ...apiContract.paths, "/api/v1/me/networks/{name}": {
-      patch: {
-        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
-        requestBody: { required: true, content: { "application/json": { schema: {
-          type: "object", additionalProperties: false, required: ["enabled"], properties: { enabled: { type: "boolean" } },
-        } } } },
-        responses: { 200: response({
-          type: "object", additionalProperties: false, required: ["name", "enabled"],
-          properties: { name: { type: "string" }, enabled: { type: "boolean" } },
-        }) },
-      },
-    } } }),
-  }));
   await page.route(/\/api\/v1\/me\/networks\/Libera$/, (route) => {
     stored[0] = ircNetwork("Libera");
     return route.fulfill({ contentType: "application/json", body: JSON.stringify({ name: "Libera", enabled: true }) });

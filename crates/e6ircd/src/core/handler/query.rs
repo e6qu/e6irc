@@ -6,12 +6,12 @@ use super::*;
 
 /// A `WHO <mask> %fields[,token]` request (the WHOX extension as
 /// implemented by charybdis/Solanum and advertised by Libera).
-pub(super) struct WhoxRequest {
-    pub(super) fields: Vec<char>,
-    pub(super) token: Option<String>,
+struct WhoxRequest {
+    fields: Vec<char>,
+    token: Option<String>,
 }
 
-pub(super) fn parse_whox(arg: &str) -> Option<WhoxRequest> {
+fn parse_whox(arg: &str) -> Option<WhoxRequest> {
     let spec = arg.strip_prefix('%')?;
     let (fields_part, token) = match spec.split_once(',') {
         Some((f, t)) => (f, Some(t.to_string())),
@@ -37,29 +37,24 @@ pub(super) fn parse_whox(arg: &str) -> Option<WhoxRequest> {
     })
 }
 
-/// Emit one 354 row with fields in the fixed WHOX order:
+/// One 354 row with fields in the fixed WHOX order:
 /// t, c, u, i, h, s, n, f, d, l, a, o, r.
 /// The fields of one WHOX reply row. Bundled into a struct (rather than a
 /// row of same-typed `&str` parameters) so the fields cannot be transposed
 /// at a call site.
-pub(super) struct WhoxRow<'a> {
-    pub(super) channel: &'a str,
-    pub(super) user: &'a str,
-    pub(super) host: &'a str,
-    pub(super) server: &'a str,
-    pub(super) nick: &'a str,
-    pub(super) flags: &'a str,
-    pub(super) account: Option<&'a str>,
-    pub(super) realname: &'a str,
-    pub(super) idle_secs: u64,
+struct WhoxRow<'a> {
+    channel: &'a str,
+    user: &'a str,
+    host: &'a str,
+    server: &'a str,
+    nick: &'a str,
+    flags: &'a str,
+    account: Option<&'a str>,
+    realname: &'a str,
+    idle_secs: u64,
 }
 
-pub(super) fn send_whox_row(
-    state: &mut ServerState,
-    conn: ConnId,
-    req: &WhoxRequest,
-    row: &WhoxRow,
-) {
+fn whox_row_line(state: &ServerState, conn: ConnId, req: &WhoxRequest, row: &WhoxRow) -> String {
     let mut middle: Vec<String> = Vec::new();
     let mut trailing = None;
     for f in "tcuihsnfdlaor".chars() {
@@ -84,7 +79,7 @@ pub(super) fn send_whox_row(
         }
     }
     let refs: Vec<&str> = middle.iter().map(String::as_str).collect();
-    state.numeric(conn, RPL_WHOSPCRPL, &refs, trailing.as_deref());
+    state.numeric_line(conn, RPL_WHOSPCRPL, &refs, trailing.as_deref())
 }
 
 /// WHO status flags: H (here) or G (gone/away), `*` for opers, then the
@@ -133,10 +128,28 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             return;
         }
     }
+    let reply = who_reply(state, conn, mask, p.get(1).copied().unwrap_or(""));
+    let reply = crate::core::paced::WhoReply {
+        rows: reply.rows.iter().map(|row| wire_line(row)).collect(),
+        end: wire_line(&reply.end),
+    };
+    deliver_who_reply(state, conn, WhoRequester::Local, reply);
+}
+
+fn wire_line(line: &str) -> bytes::Bytes {
+    bytes::Bytes::from(format!("{line}\r\n"))
+}
+
+/// The WHO of `mask` (`arg` its flags and WHOX spec) as `conn` sees it.
+fn who_reply(
+    state: &ServerState,
+    conn: ConnId,
+    mask: &str,
+    arg: &str,
+) -> crate::core::paced::WhoReply<String> {
     // The RFC 2812 `o` flag restricts matches to operators; Solanum also
     // accepts it combined with a WHOX spec (`WHO * o%nf`). Anything else in
     // the flags position is ignored, as before.
-    let arg = p.get(1).copied().unwrap_or("");
     let (opers_only, whox_part) = match arg.strip_prefix('o') {
         Some(rest) if rest.is_empty() || rest.starts_with('%') => (true, rest),
         _ => (false, arg),
@@ -146,17 +159,41 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     // Monotonic: idle is elapsed time since `last_active` (also monotonic).
     let now = (state.config.mono_clock)();
+    let row_line = |channel: &str, row: WhoRowData| match &whox {
+        Some(req) => whox_row_line(
+            state,
+            conn,
+            req,
+            &WhoxRow {
+                channel,
+                user: &row.user,
+                host: &row.host,
+                server: &server,
+                nick: &row.nick,
+                flags: &row.flags,
+                account: row.account.as_deref(),
+                realname: &row.realname,
+                idle_secs: row.idle_secs,
+            },
+        ),
+        None => state.numeric_line(
+            conn,
+            RPL_WHOREPLY,
+            &[
+                channel, &row.user, &row.host, &server, &row.nick, &row.flags,
+            ],
+            Some(&format!("0 {}", row.realname)),
+        ),
+    };
+    let mut rows = Vec::new();
     if mask.starts_with('#') {
         let key = state.chan_key(mask);
         if let Some(chan) = state.channels.get(&key) {
-            let display = chan.name.clone();
             // A +s channel's membership is hidden from non-members: emit no
             // rows, letting the terminating RPL_ENDOFWHO stand alone.
-            let hidden = chan.hidden_from(conn).is_some();
-            let rows: Vec<WhoRowData> = if hidden {
-                Vec::new()
-            } else {
-                chan.member_profiles()
+            if chan.hidden_from(conn).is_none() {
+                let members = chan
+                    .member_profiles()
                     // An invisible member is hidden from a WHO by someone who
                     // shares no channel with them (and isn't them) — the same
                     // rule the wildcard/host branch below applies. A fellow
@@ -168,12 +205,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     })
                     .filter(|(_, _, _, profile)| !opers_only || profile.oper)
                     .map(|(_, modes, identity, profile)| {
-                        let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
-                            (true, true, true) => "@+",
-                            (true, _, _) => "@",
-                            (false, true, _) => "+",
-                            _ => "",
-                        };
+                        let sigil = modes.sigils(requester_multi_prefix);
                         WhoRowData {
                             user: profile.user.clone(),
                             host: profile.host.clone(),
@@ -183,36 +215,8 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             account: profile.account.clone(),
                             idle_secs: now.saturating_sub(profile.last_active.get()).as_secs(),
                         }
-                    })
-                    .collect()
-            };
-            for row in rows {
-                match &whox {
-                    Some(req) => send_whox_row(
-                        state,
-                        conn,
-                        req,
-                        &WhoxRow {
-                            channel: &display,
-                            user: &row.user,
-                            host: &row.host,
-                            server: &server,
-                            nick: &row.nick,
-                            flags: &row.flags,
-                            account: row.account.as_deref(),
-                            realname: &row.realname,
-                            idle_secs: row.idle_secs,
-                        },
-                    ),
-                    None => state.numeric(
-                        conn,
-                        RPL_WHOREPLY,
-                        &[
-                            &display, &row.user, &row.host, &server, &row.nick, &row.flags,
-                        ],
-                        Some(&format!("0 {}", row.realname)),
-                    ),
-                }
+                    });
+                rows.extend(members.map(|row| row_line(&chan.name, row)));
             }
         }
     } else {
@@ -228,7 +232,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         // and a nick wildcard like `bo*` must still hide them.
         let is_wildcard = match_all || mask.contains('*') || mask.contains('?');
         // Every registered user, on whichever shard: the published records.
-        let targets: Vec<_> = state
+        let users = state
             .registered_users()
             .into_iter()
             .filter(|user| !opers_only || user.oper)
@@ -245,9 +249,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     || state.share_channel(conn, user.conn())
                     || named_by_nick
             })
-            .collect();
-        for user in targets {
-            let row = WhoRowData {
+            .map(|user| WhoRowData {
                 user: user.user.clone(),
                 host: user.host.clone(),
                 nick: user.nick.clone(),
@@ -255,58 +257,174 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 account: user.account.clone(),
                 flags: who_flags(user.away.is_some(), user.oper, user.bot, ""),
                 idle_secs: now.saturating_sub(user.last_active.get()).as_secs(),
-            };
-            match &whox {
-                Some(req) => send_whox_row(
-                    state,
-                    conn,
-                    req,
-                    &WhoxRow {
-                        channel: "*",
-                        user: &row.user,
-                        host: &row.host,
-                        server: &server,
-                        nick: &row.nick,
-                        flags: &row.flags,
-                        account: row.account.as_deref(),
-                        realname: &row.realname,
-                        idle_secs: row.idle_secs,
-                    },
-                ),
-                None => state.numeric(
-                    conn,
-                    RPL_WHOREPLY,
-                    &["*", &row.user, &row.host, &server, &row.nick, &row.flags],
-                    Some(&format!("0 {}", row.realname)),
-                ),
-            }
-        }
+            });
+        rows.extend(users.map(|row| row_line("*", row)));
     }
     // The mask is raw client input (`WHO :` → empty, `WHO ::x` → ':'-leading);
     // clip_echo renders those as the safe "*" placeholder so the terminating
     // numeric's middle can't break the reply's framing.
-    state.numeric(
+    let end = state.numeric_line(
         conn,
         RPL_ENDOFWHO,
         &[clip_echo(mask)],
         Some("End of /WHO list"),
     );
+    crate::core::paced::WhoReply { rows, end }
 }
 
 pub(super) fn who_on_owner(
     state: &mut ServerState,
     command: crate::core::state::ChannelCommand,
-) -> crate::core::state::ChannelCommandReplies {
+) -> crate::core::paced::WhoReply<bytes::Bytes> {
     let (owner, actor, target, operation) = command.into_parts();
     let crate::core::state::ChannelCommandOperation::Who(query) = operation else {
         unreachable!("WHO requires its operation")
     };
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "WHO owner does not match target");
+    // The capture only formats the reply for its remote requester.
     let conn = super::begin_channel_capture(state, &actor, None);
-    cmd_who(state, conn, &[target.as_str(), query.argument.as_str()]);
-    let lines = state.capture.take().expect("WHO capture installed").lines;
-    crate::core::state::ChannelCommandReplies { lines }
+    let reply = who_reply(state, conn, &target, &query.argument);
+    let capture = state.capture.take().expect("WHO capture installed");
+    assert!(
+        capture.lines.is_empty(),
+        "WHO formats its reply, never sends it"
+    );
+    crate::core::paced::WhoReply {
+        rows: reply.rows.iter().map(|row| wire_line(row)).collect(),
+        end: wire_line(&reply.end),
+    }
+}
+
+/// Where a WHO reply is answered from.
+pub(super) enum WhoRequester {
+    /// Handling the command, under its labeled-response capture if it has one.
+    Local,
+    /// A channel owner's reply arriving from another shard: the connection's
+    /// later output is held behind it, and `label` is the command's.
+    Remote { label: Option<String> },
+}
+
+/// Send `conn` its WHO reply. One its send queue has room for, with no paced
+/// WHO ahead of it, goes out at once; a longer one is paced
+/// (`crate::core::paced`), and one that would queue more than a send queue
+/// behind paced replies still going out is refused with `RPL_TRYAGAIN`.
+pub(super) fn deliver_who_reply(
+    state: &mut ServerState,
+    conn: ConnId,
+    requester: WhoRequester,
+    reply: crate::core::paced::WhoReply<bytes::Bytes>,
+) {
+    let lines = reply.rows.len() + 1;
+    let queued = state.paced_replies.get(&conn);
+    let immediate = queued.is_none() && state.paced_room(conn).is_some_and(|room| lines <= room);
+    let admitted = queued.is_none_or(|queued| queued.admits(lines, state.config.sendq));
+    let send_now = |state: &mut ServerState, lines: Vec<bytes::Bytes>| match &requester {
+        WhoRequester::Local => {
+            for line in lines {
+                state.send_bytes(conn, line);
+            }
+        }
+        WhoRequester::Remote { label } => {
+            state.emit_deferred_labeled(conn, label.clone(), |state| {
+                for line in lines {
+                    state.send_bytes(conn, line);
+                }
+            });
+        }
+    };
+    if immediate {
+        let mut lines = reply.rows;
+        lines.push(reply.end);
+        return send_now(state, lines);
+    }
+    if !admitted {
+        let refusal = state.numeric_line(
+            conn,
+            RPL_TRYAGAIN,
+            &["WHO"],
+            Some("Please wait a while and try again."),
+        );
+        return send_now(state, vec![wire_line(&refusal), reply.end]);
+    }
+    let label = match &requester {
+        WhoRequester::Local => state.defer_captured_label(conn),
+        WhoRequester::Remote { label } => label.clone(),
+    };
+    let batch = label.map(|label| crate::core::paced::PacedBatch {
+        label,
+        reference: state.next_msgid(),
+        opened: false,
+    });
+    let mut lines: std::collections::VecDeque<_> = reply.rows.into();
+    lines.push_back(reply.end);
+    state
+        .paced_replies
+        .entry(conn)
+        .or_default()
+        .push(crate::core::paced::PacedReply { batch, lines });
+    match requester {
+        WhoRequester::Local => pace_who_replies_to(state, conn),
+        // The connection's later output waited on this reply: it has
+        // started, so that output may follow.
+        WhoRequester::Remote { .. } => {
+            state.emit_deferred(conn, |state| pace_who_replies_to(state, conn))
+        }
+    }
+}
+
+/// Send `conn`'s paced WHO replies while its send queue is under half full,
+/// each inside its labeled batch if it has one, dropping each once it ends.
+fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
+    // A closing connection's replies go with it (`ServerState::close`).
+    let mut room = state
+        .paced_room(conn)
+        .expect("a WHO is paced only to an open connection");
+    let mut paced = state
+        .paced_replies
+        .remove(&conn)
+        .expect("only a connection with paced WHO replies is paced");
+    while let Some(reply) = paced.replies.front_mut() {
+        let batch = reply.batch.as_mut().map(|batch| {
+            if !batch.opened {
+                batch.opened = true;
+                let open =
+                    labeled_batch_open(&state.config.server_name, &batch.label, &batch.reference);
+                state.send_unheld(conn, wire_line(&open));
+            }
+            batch.reference.clone()
+        });
+        if reply.lines.is_empty() {
+            if let Some(batch) = batch {
+                let close = format!(":{} BATCH -{batch}", state.config.server_name);
+                state.send_unheld(conn, wire_line(&close));
+            }
+            paced.replies.pop_front();
+            continue;
+        }
+        if room == 0 {
+            break;
+        }
+        let line = reply.lines.pop_front().expect("the reply has lines left");
+        paced.lines -= 1;
+        room -= 1;
+        let line = match &batch {
+            Some(batch) => inject_tag(&line, &format!("batch={batch}")),
+            None => line,
+        };
+        state.send_unheld(conn, line);
+    }
+    if !paced.replies.is_empty() {
+        state.paced_replies.insert(conn, paced);
+    }
+}
+
+/// Send what every paced WHO reply on this shard has room for now.
+pub(crate) fn pace_who_replies(state: &mut ServerState) {
+    let paced: Vec<ConnId> = state.paced_replies.keys().copied().collect();
+    for conn in paced {
+        pace_who_replies_to(state, conn);
+    }
 }
 
 pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -407,8 +525,24 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // setname has its own refusal for a realname the server will not take,
+    // and NAMELEN told the client the bound: a longer one is refused, never
+    // cut to something the client did not ask for.
+    if new_name.len() > REALLEN {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &super::fail_line(
+                &server,
+                "SETNAME",
+                "INVALID_REALNAME",
+                &[],
+                &format!("Realname is longer than {REALLEN} bytes (NAMELEN)"),
+            ),
+        );
+        return;
+    }
     let prefix = state.sessions[&conn].prefix();
-    let new_name = truncate_chars(new_name, REALLEN);
     state
         .sessions
         .get_mut(&conn)
@@ -544,6 +678,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             &format!("MONITOR={MONITOR_LIMIT}"),
             &format!("CHATHISTORY={CHATHISTORY_MAX}"),
             "MSGREFTYPES=msgid,timestamp",
+            &format!("NAMELEN={REALLEN}"),
             &format!("MAXLIST=bqeI:{MAXLIST}"),
             &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
             // Every command that bounds its target list, at the bound it keeps
@@ -569,6 +704,12 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
                 crate::core::banmask::EXTBAN_TYPES
             ),
             &format!("ACCOUNTEXTBAN={}", crate::core::banmask::ACCOUNT_EXTBAN),
+            // Enforced by the MODE parser (`channel_mode_by`).
+            &format!("MODES={MODES}"),
+            // LIST paces its reply to the client's send queue, and takes
+            // exactly the conditions its parser (`ListFilter::parse`) does.
+            "SAFELIST",
+            &format!("ELIST={}", crate::core::list::ELIST),
         ],
         Some("are supported by this server"),
     );

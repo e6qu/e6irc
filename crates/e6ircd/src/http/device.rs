@@ -188,6 +188,7 @@ struct RegisteredChannelResponse {
     id: i64,
     name: String,
     founder: String,
+    successor: Option<String>,
     created_at: String,
     policy: RegisteredChannelPolicyResponse,
 }
@@ -477,7 +478,7 @@ mod tests {
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 pub(super) async fn device_approve(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account, _): SessionMutation,
+    RecentlyAuthenticated(account, _): RecentlyAuthenticated,
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
     match approve_user_code(&state, &account, &req.user_code).await {
@@ -613,7 +614,7 @@ pub(super) async fn admin_accounts(
                 .into_iter()
                 .map(|entry| {
                     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
-                    let configured = state.configured_admin_accounts.contains(&folded);
+                    let configured = state.configured_admin_accounts.reserves(&folded);
                     AccountDirectoryResponseEntry {
                         id: entry.id,
                         name: entry.name,
@@ -822,11 +823,11 @@ pub(super) async fn admin_create_account_invitation(
             Some("The account must be a valid IRC nickname of at most 64 bytes."),
         );
     }
-    if state.account_name_reserved(&body.account) {
+    if let Some(detail) = state.unclaimable_account_name(&body.account) {
         return problem(
             StatusCode::CONFLICT,
             "Account name unavailable",
-            Some(super::RESERVED_ACCOUNT_NAME_DETAIL),
+            Some(detail),
         );
     }
     let contact_email = match super::parse_optional_contact_email(body.contact_email.as_deref()) {
@@ -1139,21 +1140,182 @@ impl ManagedNetworkOwner {
 /// One function, because the read serves it and the write compares against it
 /// -- a client may send back exactly what it was given, and it can only do
 /// that if both sides mean the same thing by "the current configuration".
-fn without_secrets(mut settings: crate::config::ManagedConfig) -> crate::config::ManagedConfig {
-    for provider in &mut settings.oidc_providers {
-        provider.client_secret.clear();
+///
+/// An allowlist, by construction: every field of every section is named here,
+/// either passed through as public or replaced as secret, with no `..`. A
+/// field added to the configuration later does not compile until it is
+/// classified, so a new credential cannot be served by default the way a
+/// list of fields to clear would have served it.
+fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::ManagedConfig {
+    use crate::config::{
+        LimitsConfig, ListenerConfig, ManagedConfig, NetworkEntry, ObservabilityConfig,
+        OidcProviderConfig, OperConfig, RegistrationConfig, StorageConfig, TlsConfig,
+    };
+    let ManagedConfig {
+        server_name,
+        network_name,
+        description,
+        motd,
+        nicklen,
+        sendq,
+        core_queue,
+        core_workers,
+        max_hot_channels,
+        listeners,
+        registration,
+        limits,
+        observability,
+        storage,
+        bnc_addr,
+        bnc_tls,
+        public_url,
+        secure_cookies,
+        admin_accounts,
+        oidc_providers,
+        opers,
+        networks,
+        credentials_from_bootstrap,
+    } = settings;
+    // Sections that hold no secret: each field named, so a secret added to
+    // one of them is a compile error here until it is cleared.
+    let public_tls = |tls: &TlsConfig| {
+        let TlsConfig {
+            cert_path: _,
+            key_path: _,
+        } = tls;
+    };
+    for ListenerConfig {
+        addr: _,
+        tls,
+        websocket: _,
+    } in &listeners
+    {
+        tls.iter().for_each(public_tls);
     }
-    for oper in &mut settings.opers {
-        oper.password.clear();
+    bnc_tls.iter().for_each(public_tls);
+    let RegistrationConfig {
+        before_connect: _,
+        require_email: _,
+    } = &registration;
+    let LimitsConfig {
+        max_connections_per_ip: _,
+        command_burst: _,
+        command_rate: _,
+        trusted_proxies: _,
+        auth_rate_burst: _,
+        api_rate_burst: _,
+        administrator_api_rate_burst: _,
+        registration_burst: _,
+        require_sasl: _,
+        require_sasl_from: _,
+    } = &limits;
+    let ObservabilityConfig {
+        enabled: _,
+        sample_interval_seconds: _,
+        retention_hours: _,
+    } = &observability;
+    let StorageConfig {
+        history_retention_days: _,
+        audit_retention_days: _,
+    } = &storage;
+    let oidc_providers = oidc_providers
+        .into_iter()
+        .map(|provider| {
+            let OidcProviderConfig {
+                name,
+                issuer_url,
+                client_id,
+                client_secret: _,
+                account_claim,
+                scopes,
+                allowed_email_domains,
+                end_session_endpoint,
+                token_endpoint_auth_method,
+            } = provider;
+            OidcProviderConfig {
+                name,
+                issuer_url,
+                client_id,
+                client_secret: String::new(),
+                account_claim,
+                scopes,
+                allowed_email_domains,
+                end_session_endpoint,
+                token_endpoint_auth_method,
+            }
+        })
+        .collect();
+    let opers = opers
+        .into_iter()
+        .map(|oper| {
+            let OperConfig { name, password: _ } = oper;
+            OperConfig {
+                name,
+                password: String::new(),
+            }
+        })
+        .collect();
+    let networks = networks
+        .into_iter()
+        .map(|network| {
+            let NetworkEntry {
+                name,
+                kind,
+                owner,
+                addr,
+                tls,
+                nick,
+                username,
+                realname,
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password: _,
+                server_password: _,
+            } = network;
+            NetworkEntry {
+                name,
+                kind,
+                owner,
+                addr,
+                tls,
+                nick,
+                username,
+                realname,
+                autojoin,
+                buffer_cap,
+                // A Slack bot token rides in the account field.
+                sasl_account: sasl_account.filter(|_| !kind.account_is_secret()),
+                sasl_password: None,
+                server_password: None,
+            }
+        })
+        .collect();
+    ManagedConfig {
+        server_name,
+        network_name,
+        description,
+        motd,
+        nicklen,
+        sendq,
+        core_queue,
+        core_workers,
+        max_hot_channels,
+        listeners,
+        registration,
+        limits,
+        observability,
+        storage,
+        bnc_addr,
+        bnc_tls,
+        public_url,
+        secure_cookies,
+        admin_accounts,
+        oidc_providers,
+        opers,
+        networks,
+        credentials_from_bootstrap,
     }
-    for network in &mut settings.networks {
-        network.sasl_password = None;
-        network.server_password = None;
-        if network.kind.account_is_secret() {
-            network.sasl_account = None;
-        }
-    }
-    settings
 }
 
 #[derive(serde::Deserialize)]
@@ -1362,7 +1524,7 @@ pub(super) async fn admin_patch_configuration(
         pool_of(&state),
         current.revision,
         &settings,
-        &actor,
+        &crate::db::AuditPrincipal::account(&actor),
         &detail,
     )
     .await
@@ -1439,6 +1601,67 @@ fn bnc_listener_rollback_failure(
             None => "stopped, which no saved revision records".to_string(),
         }
     )
+}
+
+#[cfg(test)]
+mod shown_configuration_tests {
+    use super::without_secrets;
+
+    #[test]
+    fn the_shown_configuration_carries_no_stored_secret() {
+        let mut settings =
+            crate::config::ManagedConfig::from_config(&crate::config::Config::default(), None)
+                .expect("managed");
+        settings.oidc_providers = vec![crate::config::OidcProviderConfig {
+            name: "corp".into(),
+            issuer_url: "https://idp.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "provider-secret".into(),
+            account_claim: crate::config::OidcAccountClaim::PreferredUsername,
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: None,
+            token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
+        }];
+        settings.opers = vec![crate::config::OperConfig {
+            name: "root".into(),
+            password: "oper-secret".into(),
+        }];
+        let network = |kind, name: &str| crate::config::NetworkEntry {
+            kind,
+            name: name.into(),
+            owner: None,
+            addr: String::new(),
+            tls: true,
+            nick: "alice".into(),
+            username: None,
+            realname: None,
+            autojoin: vec![],
+            buffer_cap: 100,
+            sasl_account: Some(format!("{name}-account-secret")),
+            sasl_password: Some("password-secret".into()),
+            server_password: Some("pass-secret".into()),
+        };
+        settings.networks = vec![
+            network(crate::config::NetworkKind::Irc, "irc"),
+            network(crate::config::NetworkKind::Slack, "slack"),
+        ];
+        let shown = serde_json::to_string(&without_secrets(settings)).expect("JSON");
+        for secret in [
+            "provider-secret",
+            "oper-secret",
+            "password-secret",
+            "pass-secret",
+            "slack-account-secret",
+        ] {
+            assert!(!shown.contains(secret), "{secret} was shown: {shown}");
+        }
+        // Public values pass through: the IRC SASL account name is a login,
+        // not a secret.
+        for public in ["irc-account-secret", "https://idp.example", "root", "corp"] {
+            assert!(shown.contains(public), "{public} was hidden: {shown}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1784,7 +2007,7 @@ async fn mutate_managed_configuration(
         pool_of(state),
         revision,
         &settings,
-        actor,
+        &crate::db::AuditPrincipal::account(actor),
         &format!("{detail}; restart required"),
     )
     .await
@@ -1888,6 +2111,7 @@ pub(super) async fn admin_channels(
                     id: entry.id,
                     name: entry.name,
                     founder: entry.founder,
+                    successor: entry.successor,
                     created_at: entry.created_at,
                     policy: RegisteredChannelPolicyResponse {
                         keeptopic: entry.keeptopic,
@@ -2473,7 +2697,7 @@ pub(super) async fn me(
                     role: identity.role,
                     provider: identity.provider,
                     release_revision: state.application_release_revision.clone(),
-                    logout_url: format!("/api/v1/auth/logout?csrf={csrf_token}"),
+                    logout_url: LOGOUT_PATH.to_string(),
                     csrf_token,
                 });
             }
@@ -2559,18 +2783,12 @@ mod token_request_tests {
         .unwrap();
         assert_eq!(token, r#"{"access_token":"secret","token_type":"bearer"}"#);
     }
-
-    #[test]
-    fn csrf_query_rejects_unknown_fields() {
-        let uri = "/?extra=1".parse().expect("query URI");
-        assert!(axum::extract::Query::<CsrfQuery>::try_from_uri(&uri).is_err());
-    }
 }
 
 /// Mint a PAT for the authenticated account (shown once).
 pub(super) async fn create_api_token(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account, _): SessionMutation,
+    RecentlyAuthenticated(account, _): RecentlyAuthenticated,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -2622,69 +2840,35 @@ pub(super) async fn create_api_token(
     }
 }
 
-/// End the browser session named by the cookie. This route authenticates
-/// nothing — a request without a session has nothing to end — so the CSRF rule
-/// every cookie-authenticated unsafe method gets from [`Authenticated`] is
-/// applied here by hand: without it any page could sign a visitor out with a
-/// cross-site form.
+/// Where a browser posts to sign out.
+pub(super) const LOGOUT_PATH: &str = "/api/v1/auth/logout";
+
+/// The sign-out form's body: the session-bound CSRF value, which a form
+/// cannot put in a header.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LogoutForm {
+    pub(super) csrf: String,
+}
+
+/// Sign the browser out: end the session named by the cookie and, for a
+/// session an identity provider asserted, navigate to the provider's
+/// end-session endpoint (RP-initiated logout) so its SSO session ends too;
+/// otherwise to `/auth/signed-out`. A provider session whose provider is not
+/// configured for coordinated logout fails loudly instead of leaving the
+/// upstream SSO session active.
+///
+/// A `POST`, answered `303`: the console's and the chat client's sign-out
+/// controls are forms, so the browser follows the answer as a top-level
+/// navigation (the provider requires one). The route authenticates nothing —
+/// a request without a session has nothing to end — so the CSRF rule is
+/// applied by hand, from the `X-E6IRC-CSRF` header a script sends or the
+/// `csrf` field a form posts; never from the URL, where the long-lived value
+/// would reach history and proxy logs.
 pub(super) async fn logout(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-) -> Response {
-    let pool = require_pool!(state);
-    if let Some(token) = session_token(&headers, state.secure_cookies) {
-        if !csrf_header_valid(&state, &token, &headers) {
-            return csrf_refusal();
-        }
-        if let Err(e) = crate::db::delete_web_session(pool, &token).await {
-            eprintln!("http: logout failed: {e}");
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            );
-        }
-    }
-    (
-        StatusCode::NO_CONTENT,
-        [(
-            header::SET_COOKIE,
-            clear_session_cookie(state.secure_cookies),
-        )],
-    )
-        .into_response()
-}
-
-/// RP-initiated (front-channel) logout: clear the local session, then
-/// navigate the browser to the identity provider's end-session endpoint so
-/// the provider's SSO session is ended too — not just the local one. This
-/// is a GET so the logout link is a top-level browser navigation (the
-/// provider requires that, not a cross-origin fetch). A local-account session
-/// returns directly to this application. An OIDC session whose provider is
-/// not configured for coordinated logout fails loudly instead of leaving the
-/// upstream SSO session active.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CsrfQuery {
-    #[serde(default)]
-    pub(super) csrf: Option<String>,
-}
-
-impl CsrfQuery {
-    /// Whether the query carries `session`'s CSRF value — the gate for a
-    /// cookie-authenticated GET that must be a top-level navigation (a
-    /// provider redirect) and therefore cannot carry the CSRF header.
-    pub(super) fn admits(&self, state: &AppState, session: &str) -> bool {
-        self.csrf
-            .as_deref()
-            .is_some_and(|csrf| state.csrf_valid(session, csrf))
-    }
-}
-
-pub(super) async fn logout_sso(
-    State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    QueryParams(query): QueryParams<CsrfQuery>,
+    form: Result<Form<LogoutForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
     let clear = clear_session_cookie(state.secure_cookies);
     let pool = require_pool!(state);
@@ -2698,9 +2882,26 @@ pub(super) async fn logout_sso(
         )
             .into_response();
     };
-    // Require CSRF for this destructive GET; OIDC logout uses query parameters.
-    if !query.admits(&state, &token) {
-        return csrf_refusal();
+    let form_csrf_valid = form
+        .ok()
+        .is_some_and(|Form(form)| state.csrf_valid(&token, &form.csrf));
+    if !form_csrf_valid {
+        if !csrf_header_valid(&state, &token, &headers) {
+            return csrf_refusal();
+        }
+        // A script's call (the header) ends this application's session and
+        // nothing else: it cannot be a navigation to the provider, so it has
+        // no provider session to end. Only a sign-out form — a navigation the
+        // browser follows — performs coordinated logout below.
+        if let Err(e) = crate::db::delete_web_session(pool, &token).await {
+            eprintln!("http: logout failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+        return (StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear)]).into_response();
     }
     let crate::db::SessionLogoutHint { id_token, provider } =
         match crate::db::session_logout_hint(pool, &token).await {

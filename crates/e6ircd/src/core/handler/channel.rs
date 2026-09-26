@@ -76,9 +76,11 @@ pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = crate::db::READ_MARKER_LI
 /// are reloaded into RAM at boot — and, unlike account REGISTER, it runs no
 /// argon2 so the per-connection credential budget never throttles it. Without a
 /// cap one authenticated account could register channels in a loop (JOIN → CS
-/// REGISTER → PART) and grow those maps without bound, forever. Enforced in the
-/// ChanServ REGISTER handler against the count the account already founds.
-pub(super) const MAX_CHANNELS_PER_ACCOUNT: usize = 200;
+/// REGISTER → PART) and grow those maps without bound, forever. Checked by
+/// ChanServ REGISTER and the owner console against the count this shard knows
+/// (founded plus its own in-flight registrations) as a fast path; the database
+/// holds the cap where every shard's registrations and founder transfers meet.
+pub(super) const MAX_CHANNELS_PER_ACCOUNT: usize = crate::db::CHANNEL_FOUNDER_LIMIT as usize;
 
 /// Cap on a session's pending-invite set, bounding INVITE-driven growth.
 pub(super) const INVITE_LIMIT: usize = 100;
@@ -93,10 +95,15 @@ pub(super) const AWAYLEN: usize = 390;
 /// the username rides in every relayed line's source prefix, so it must be
 /// bounded for any line to be fittable.
 pub(super) const USERLEN: usize = 10;
-/// Realname cap, applied at USER and SETNAME. Not an ISUPPORT token (none is
-/// standardized), but WHOIS 311 carries it as a trailing parameter, so an
-/// unbounded one overflows that reply.
+/// Realname cap in bytes, advertised as `NAMELEN`: USER cuts a longer one (as
+/// Modern IRC has it), SETNAME refuses one (`FAIL SETNAME INVALID_REALNAME`).
+/// WHOIS 311 carries it as a trailing parameter, so an unbounded one overflows
+/// that reply.
 pub(super) const REALLEN: usize = 150;
+/// Modes that take a parameter one MODE command may change, advertised as
+/// `MODES` (Libera's value). Past it the rest of the command is refused
+/// loudly rather than applied.
+pub(super) const MODES: usize = 4;
 /// List-mode (+b/+q/+e/+I) mask cap, applied at store time (Solanum's
 /// `clean_ban_mask` truncates to BANLEN the same way). The value matches the
 /// `NUMERIC_MIDDLE_MAX` clip in `numeric()`: a stored mask that fits it is
@@ -351,7 +358,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .expect("checked above")
                 .pending_joins
                 .insert(key);
-            let label = state.defer_channel_reply(conn);
+            let label = state.defer_captured_reply(conn);
             state.route_join(
                 owner,
                 actor.clone(),
@@ -671,13 +678,7 @@ fn send_join_names(state: &mut ServerState, conn: ConnId, join: ChannelJoinSucce
             } else {
                 identity.nick.clone()
             };
-            let sigil = match (modes.op, modes.voice, caps.multi_prefix) {
-                (true, true, true) => "@+",
-                (true, _, _) => "@",
-                (false, true, _) => "+",
-                _ => "",
-            };
-            format!("{sigil}{shown}")
+            format!("{}{shown}", modes.sigils(caps.multi_prefix))
         })
         .collect();
     names.sort();
@@ -704,7 +705,7 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     for (_, target) in capped_channel_targets(state, conn, targets, PART_TARGMAX) {
         let owner = state.channel_owner(&target);
         if !state.owns_channel(&owner) {
-            let label = state.defer_channel_reply(conn);
+            let label = state.defer_captured_reply(conn);
             state.route_part(owner, actor.clone(), target, reason.clone(), label);
             continue;
         }
@@ -845,13 +846,7 @@ fn send_names_with_caps(
             } else {
                 identity.nick.clone()
             };
-            let sigil = match (modes.op, modes.voice, requester_caps.multi_prefix) {
-                (true, true, true) => "@+",
-                (true, _, _) => "@",
-                (false, true, _) => "+",
-                _ => "",
-            };
-            format!("{sigil}{shown}")
+            format!("{}{shown}", modes.sigils(requester_caps.multi_prefix))
         })
         .collect();
     names.sort(); // deterministic order
@@ -913,19 +908,7 @@ pub(super) fn names_on_owner(
     ));
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "NAMES owner does not match target");
-    debug_assert!(
-        state.capture.is_none(),
-        "channel owner must not have a capture"
-    );
-    state.capture = Some(crate::core::state::Capture {
-        conn: actor.recipient.conn(),
-        lines: Vec::new(),
-        reply_target: Some(actor.identity.nick),
-        reply_caps: Some(actor.recipient.caps()),
-        label: None,
-        deferred: false,
-        deferrals: 0,
-    });
+    super::begin_channel_capture(state, &actor, None);
     send_names_with_caps(
         state,
         actor.recipient.conn(),
@@ -1672,19 +1655,7 @@ pub(super) fn mode_change_on_owner(
     };
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "MODE owner does not match target");
-    debug_assert!(
-        state.capture.is_none(),
-        "channel owner must not have a capture"
-    );
-    state.capture = Some(crate::core::state::Capture {
-        conn: actor.recipient.conn(),
-        lines: Vec::new(),
-        reply_target: Some(actor.identity.nick.clone()),
-        reply_caps: Some(actor.recipient.caps()),
-        label: None,
-        deferred: false,
-        deferrals: 0,
-    });
+    super::begin_channel_capture(state, &actor, None);
     let mut arguments = Vec::with_capacity(change.arguments.len() + 1);
     arguments.push(change.modes);
     arguments.extend(change.arguments);
@@ -2073,8 +2044,28 @@ fn channel_mode_by(
     // List modes already dumped by this command: a letter repeated without a
     // mask (`MODE #c b+b`) is one query, not one dump per repetition.
     let mut listed = String::new();
+    // Parameter-taking modes applied so far, against `MODES`; the ones past it
+    // are named back to the client, never quietly dropped.
+    let mut parameter_modes = 0;
+    let mut over_limit = String::new();
+    let mut over_limit_sign = ' ';
 
     for c in rest[0].chars() {
+        let takes_parameter = match c {
+            'k' | 'o' | 'v' => true,
+            'l' => adding,
+            // Without a mask a list mode is a query, which changes nothing.
+            'b' | 'q' | 'e' | 'I' => args.clone().next().is_some(),
+            _ => false,
+        };
+        if takes_parameter {
+            parameter_modes += 1;
+            if parameter_modes > MODES {
+                let _ = args.next();
+                push_mode(&mut over_limit, &mut over_limit_sign, adding, c);
+                continue;
+            }
+        }
         match c {
             '+' => adding = true,
             '-' => adding = false,
@@ -2337,6 +2328,19 @@ fn channel_mode_by(
         }
     }
 
+    if !over_limit.is_empty() {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &super::fail_line(
+                &server,
+                "MODE",
+                "TOO_MANY_MODES",
+                &[&display, &over_limit],
+                &format!("At most {MODES} modes with a parameter are changed per MODE (MODES)"),
+            ),
+        );
+    }
     if !changes.is_empty() {
         broadcast_mode_changes(state, &key, actor, &display, &changes);
     }

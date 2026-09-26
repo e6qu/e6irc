@@ -11,6 +11,8 @@
 mod banmask;
 mod handler;
 mod hot_history;
+mod list;
+mod paced;
 mod state;
 mod timer;
 
@@ -370,6 +372,9 @@ impl Input {
             Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
+            Input::PaceReplies => {
+                panic!("a worker paces its own LIST and WHO replies, through its own queue")
+            }
             Input::Tick { .. }
             | Input::Shutdown
             | Input::ReadMarkersExpired { .. }
@@ -787,6 +792,10 @@ pub enum Input {
     Tick {
         now: e6irc_proto::time::MonoMillis,
     },
+    /// A worker's own reminder, every [`PACE_INTERVAL`] while it has a LIST
+    /// or WHO reply being paced out and nothing else to do: the reply's
+    /// client may have read enough for more of its rows.
+    PaceReplies,
     /// Read markers storage maintenance deleted as past the history
     /// retention, broadcast to every shard so its mirror drops them too. The
     /// mirror counts toward the per-account marker cap: a marker the database
@@ -1073,12 +1082,19 @@ pub enum PersistedChannelMutation {
     Drop,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelControlResult {
-    Applied,
+    /// Stored. `account` is the account an access change or founder transfer
+    /// named, as storage resolved it (a grouped nick names its account).
+    Applied {
+        account: Option<String>,
+    },
     MissingOrNotOwner,
     AccountMissing,
     AccessLimitReached,
+    /// The transfer's receiving account already founds
+    /// [`crate::db::CHANNEL_FOUNDER_LIMIT`] channels.
+    FounderLimitReached,
     KeeptopicDisabled,
     Unavailable,
 }
@@ -1088,6 +1104,9 @@ pub enum ChannelRegistrationResult {
     Registered,
     Exists,
     AccountMissing,
+    /// The founder already founds [`crate::db::CHANNEL_FOUNDER_LIMIT`]
+    /// channels — counted where every shard's registrations meet.
+    LimitReached,
     Unavailable,
 }
 
@@ -1224,6 +1243,9 @@ pub enum ChannelDropRequester {
 pub enum ChannelDropResult {
     Dropped,
     Missing,
+    /// The ChanServ requester no longer founds the channel (a transfer
+    /// committed after the core's check).
+    NotFounder,
     Unavailable,
 }
 
@@ -1232,11 +1254,25 @@ pub enum ServerBanRequester {
     Oper {
         session: SessionOwner,
         label: Option<String>,
+        /// The configured operator name the session opered up as — who the
+        /// audit row records, whatever nick the session holds.
+        operator: String,
     },
     Admin {
         request_id: u64,
         actor: String,
     },
+}
+
+impl ServerBanRequester {
+    /// Who the audit trail records as having made the change: an operator
+    /// by its configured name, an administrator by account.
+    pub fn audit_actor(&self) -> crate::db::AuditPrincipal {
+        match self {
+            Self::Oper { operator, .. } => crate::db::AuditPrincipal::operator(operator),
+            Self::Admin { actor, .. } => crate::db::AuditPrincipal::account(actor),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1358,13 +1394,30 @@ pub enum ChannelServicePersistence {
         display: String,
         label: Option<String>,
     },
+    /// The named account already founds [`crate::db::CHANNEL_FOUNDER_LIMIT`]
+    /// channels; the channel was not transferred.
+    FounderLimitReached {
+        display: String,
+        label: Option<String>,
+    },
+    /// An access entry now holds `flags` (`None`: it is gone).
     AccessSet {
         channel: String,
         display: String,
+        /// The account the requested name resolved to (a grouped nick
+        /// resolves to its account), as its display name.
         account: String,
         flags: Option<String>,
-        applied: bool,
+        /// What the entry held before (`None`: there was no entry).
+        previous: Option<String>,
         /// Which command asked, so the verdict speaks its language.
+        frontend: AccessFrontend,
+        label: Option<String>,
+    },
+    /// No account has the name an access change named.
+    AccessAccountMissing {
+        display: String,
+        account: String,
         frontend: AccessFrontend,
         label: Option<String>,
     },
@@ -1387,7 +1440,6 @@ pub enum ChannelServicePersistence {
         display: String,
         keeptopic: bool,
         topic: Option<(String, String, u64)>,
-        applied: bool,
         label: Option<String>,
     },
     KeeptopicUnavailable {
@@ -1403,7 +1455,6 @@ pub enum ChannelServicePersistence {
         channel: String,
         display: String,
         mlock: Option<String>,
-        applied: bool,
         label: Option<String>,
     },
     MlockUnavailable {
@@ -1422,8 +1473,17 @@ pub enum ChannelServicePersistence {
     /// store failed.
     SuccessorSet {
         display: String,
+        /// The successor as requested (`None`: clear it).
         successor: Option<String>,
         outcome: Option<crate::db::SuccessorChange>,
+        label: Option<String>,
+    },
+    /// A founder-only change (SET FOUNDER, access, KEEPTOPIC, MLOCK) found,
+    /// with the channel row locked, that the channel is gone or its requester
+    /// no longer founds it.
+    Refused {
+        display: String,
+        refusal: crate::db::ChannelRefusal,
         label: Option<String>,
     },
 }
@@ -1457,7 +1517,7 @@ pub enum DbRequest {
         conn: ConnId,
         name: String,
         contact_email: Option<crate::identity::ContactEmail>,
-        password: String,
+        password: crate::identity::NewPassword,
         /// Which command asked, so the answer speaks that command's language.
         origin: AccountOrigin,
     },
@@ -1699,9 +1759,9 @@ pub enum DbRequest {
     },
     /// Record a privileged (oper) action in the audit log. Fire-and-forget.
     AuditLog {
-        actor: String,
+        actor: crate::db::AuditPrincipal,
         action: String,
-        target: String,
+        target: crate::db::AuditPrincipal,
         detail: String,
     },
     /// Append one chat message to history. Fire-and-forget: no reply.
@@ -1717,7 +1777,7 @@ pub enum DbRequest {
         dm_peers: Vec<String>,
         sender_prefix: String,
         sender_account: Option<String>,
-        kind: MessageKind,
+        kind: HistoryKind,
         body: String,
         /// The sender was a bot (+B) at send time (replayed as the `bot` tag).
         sender_is_bot: bool,
@@ -1725,6 +1785,9 @@ pub enum DbRequest {
         /// (see `HistoryEntry::multiline`). Persisted so replay reconstructs the
         /// multiline message under its one msgid.
         multiline: Option<String>,
+        /// The client-only tags the message was relayed with (see
+        /// `HistoryRow::client_tags`); empty for none.
+        client_tags: String,
         /// Unix milliseconds.
         ts: e6irc_proto::time::Millis,
     },
@@ -1915,15 +1978,14 @@ pub enum SelectorBound {
     Timestamp(e6irc_proto::time::Millis),
 }
 
-/// PRIVMSG or NOTICE — the only two message kinds that carry a body, are
-/// delivered to an audience, and enter history. A single type instead of a
-/// `&str` so the three forms of the name cannot drift: the uppercase wire verb
-/// ([`MessageKind::wire`]), the lowercase storage token ([`MessageKind::db`],
-/// the `messages.kind` column), and the "does it trigger automatic replies"
-/// rule ([`MessageKind::is_loud`] — NOTICE never does). Before this they were
-/// carried as a string that was uppercased in one place and lowercased in
-/// another, so the ring and the database stored different casings of the same
-/// message; now the casing exists only at the edges where it is asked for.
+/// PRIVMSG or NOTICE — the only two message kinds that carry a body. A single
+/// type instead of a `&str` so the forms of the name cannot drift: the
+/// uppercase wire verb ([`MessageKind::wire`]) and the "does it trigger
+/// automatic replies" rule ([`MessageKind::is_loud`] — NOTICE never does).
+/// Before this they were carried as a string that was uppercased in one place
+/// and lowercased in another, so the ring and the database stored different
+/// casings of the same message; now the casing exists only at the edges where
+/// it is asked for (the storage token is [`HistoryKind::db`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Privmsg,
@@ -1939,35 +2001,99 @@ impl MessageKind {
         }
     }
 
-    /// The lowercase token stored in the `messages.kind` column.
-    pub fn db(self) -> &'static str {
-        match self {
-            MessageKind::Privmsg => "privmsg",
-            MessageKind::Notice => "notice",
-        }
-    }
-
     /// PRIVMSG triggers automatic replies (error numerics, away auto-reply);
     /// NOTICE must never trigger any (Modern IRC), so it is silent.
     pub fn is_loud(self) -> bool {
         matches!(self, MessageKind::Privmsg)
     }
+}
 
-    /// Parse the stored [`MessageKind::db`] token; `None` for anything else,
+/// What a history entry is: a message with text, or a `TAGMSG` — nothing but
+/// its client-only tags (a reaction, say). Both are
+/// stored and replayed under the msgid they were delivered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryKind {
+    Privmsg,
+    Notice,
+    Tagmsg,
+}
+
+impl From<MessageKind> for HistoryKind {
+    fn from(kind: MessageKind) -> Self {
+        match kind {
+            MessageKind::Privmsg => HistoryKind::Privmsg,
+            MessageKind::Notice => HistoryKind::Notice,
+        }
+    }
+}
+
+impl HistoryKind {
+    /// The uppercase verb as it appears on the wire.
+    pub fn wire(self) -> &'static str {
+        match self {
+            HistoryKind::Privmsg => MessageKind::Privmsg.wire(),
+            HistoryKind::Notice => MessageKind::Notice.wire(),
+            HistoryKind::Tagmsg => "TAGMSG",
+        }
+    }
+
+    /// The lowercase token stored in the `messages.kind` column.
+    pub fn db(self) -> &'static str {
+        match self {
+            HistoryKind::Privmsg => "privmsg",
+            HistoryKind::Notice => "notice",
+            HistoryKind::Tagmsg => "tagmsg",
+        }
+    }
+
+    /// Parse the stored [`HistoryKind::db`] token; `None` for anything else,
     /// so a corrupt or unexpected `kind` column surfaces rather than defaulting.
     pub fn from_db(token: &str) -> Option<Self> {
         match token {
-            "privmsg" => Some(MessageKind::Privmsg),
-            "notice" => Some(MessageKind::Notice),
+            "privmsg" => Some(HistoryKind::Privmsg),
+            "notice" => Some(HistoryKind::Notice),
+            "tagmsg" => Some(HistoryKind::Tagmsg),
             _ => None,
         }
     }
 }
 
-/// One rendered history row, newest-last, as the DB returns it.
+/// Which stored history entries a reader can be sent. A stored `TAGMSG` is
+/// nothing but tags, so a reader without `message-tags` — and the REST API,
+/// which serves text — cannot receive one at all. A page is cut in the
+/// reader's scope, so its `LIMIT` counts only entries it can be sent: excluding
+/// them after the cut would return fewer than asked for, which reads as the
+/// end of the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// PRIVMSG and NOTICE only.
+    Text,
+    /// Everything, `TAGMSG` included.
+    TextAndTags,
+}
+
+impl HistoryScope {
+    pub fn admits(self, kind: HistoryKind) -> bool {
+        self == HistoryScope::TextAndTags || kind != HistoryKind::Tagmsg
+    }
+}
+
+impl From<HistoryResponseCaps> for HistoryScope {
+    fn from(caps: HistoryResponseCaps) -> Self {
+        if caps.message_tags {
+            HistoryScope::TextAndTags
+        } else {
+            HistoryScope::Text
+        }
+    }
+}
+
+/// One history entry, as the hot ring keeps it and the database returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRow {
     pub msgid: String,
+    /// Unix **milliseconds** (see `Config::clock`): CHATHISTORY pages by this,
+    /// so second granularity would make same-second messages unorderable.
     pub ts: e6irc_proto::time::Millis,
     pub sender_prefix: String,
     /// The sender's account at send time (`None` if unauthenticated). Used to
@@ -1976,14 +2102,24 @@ pub struct HistoryRow {
     /// renamed mid-conversation still sees their own lines addressed to the
     /// correspondent, not to themselves.
     pub sender_account: Option<String>,
-    pub kind: MessageKind,
+    pub kind: HistoryKind,
+    /// The text; empty for a `TAGMSG`.
     pub body: String,
     /// The sender was a bot (+B) at send time; replay re-emits the `bot` tag.
     pub sender_is_bot: bool,
-    /// Encoded `draft/multiline` lines (see `HistoryEntry::multiline`); `None`
-    /// for a single-line message. Reconstructed into a multiline batch (or
-    /// flattened) on replay, reusing this row's single msgid.
+    /// For a `draft/multiline` message: its lines encoded as one string
+    /// (`crate::core::handler::message::encode_multiline`), so the whole message
+    /// is one history entry with one msgid — not one row per line with fresh,
+    /// never-delivered msgids. `None` for an ordinary single-line message;
+    /// `body` then holds the text. On replay a `Some` reconstructs the multiline
+    /// batch (or flattens) reusing the single msgid, as live delivery did.
     pub multiline: Option<String>,
+    /// The client-only tags the message was relayed with, escaped and
+    /// `;`-joined as on the wire (empty for none), less the ephemeral ones
+    /// (`crate::sanitize::history_client_tags`). Replayed to a reader that
+    /// negotiated `message-tags`, as live delivery sent them, so a reply or a
+    /// reaction keeps what it refers to.
+    pub client_tags: String,
 }
 
 /// Capability state that determines the wire shape of a CHATHISTORY reply.
@@ -1998,6 +2134,25 @@ pub struct HistoryResponseCaps {
     pub server_time: bool,
     pub account_tag: bool,
     pub multiline: bool,
+}
+
+impl HistoryResponseCaps {
+    /// [`state::event_tags`] for a reader with these capabilities.
+    pub(crate) fn event_tags(
+        self,
+        ts: e6irc_proto::time::Millis,
+        msgid: Option<&str>,
+        account: Option<&str>,
+        bot: bool,
+    ) -> Vec<String> {
+        let caps = state::Caps {
+            message_tags: self.message_tags,
+            server_time: self.server_time,
+            account_tag: self.account_tag,
+            ..state::Caps::default()
+        };
+        state::event_tags(caps, ts, msgid, account, bot)
+    }
 }
 
 impl From<state::Caps> for HistoryResponseCaps {
@@ -2307,6 +2462,11 @@ pub(crate) enum CoreWorkerExit {
 /// it has stopped, and [`CoreWorkerExit::Backlogged`] says so loudly.
 pub(crate) const CROSS_SHARD_BACKLOG_LIMIT: usize = 65_536;
 
+/// How long a worker with a LIST or WHO reply being paced out waits, idle,
+/// before giving it another turn: at the default send queue, half of it — 512
+/// rows — per turn.
+pub(crate) const PACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// One core and the only queue allowed to drive its state transitions.
 pub(crate) struct CoreWorker {
     core: Core,
@@ -2353,15 +2513,36 @@ impl CoreWorker {
                     None => std::future::pending().await,
                 }
             };
+            // A LIST or WHO reply being paced out needs a turn once its
+            // client has read some of it, even if nothing else happens
+            // meanwhile.
+            let pacing = !self.core.state.paced_replies.is_empty()
+                || self
+                    .core
+                    .state
+                    .channel_lists
+                    .values()
+                    .any(list::ListProgress::is_sending);
+            let pace = tokio::time::sleep(PACE_INTERVAL);
+            let mut paced = false;
             let popped = tokio::select! {
                 envelope = self.receiver.pop() => Some(envelope),
                 () = room => None,
                 () = &mut changed, if self.stopping => None,
+                () = pace, if pacing => {
+                    paced = true;
+                    None
+                }
             };
             match popped {
                 Some(Some(envelope)) => self.accept(envelope),
                 Some(None) => return CoreWorkerExit::IngressClosed,
                 None => {}
+            }
+            if paced {
+                // Through the queue like any event; a full queue already
+                // holds events enough to pace on.
+                drop(shards[self.core.shard.0].try_push(Input::PaceReplies));
             }
         }
     }
@@ -2558,6 +2739,12 @@ impl Core {
     /// worker loop starts (see [`ServerState::preload_founders`]).
     pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
         self.state.preload_founders(rows);
+    }
+
+    /// Seed each registered channel's successor, after
+    /// [`Self::preload_founders`] (see [`ServerState::preload_successors`]).
+    pub fn preload_successors(&mut self, rows: Vec<(String, String)>) {
+        self.state.preload_successors(rows);
     }
 
     /// Seed the retained-topic map from persisted rows before the worker
@@ -2928,6 +3115,8 @@ impl Core {
                 handler::channel_tagmsg_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
+            // Its whole work is the pacing every event ends with, below.
+            Input::PaceReplies => {}
             Input::Tick { now } => {
                 handler::reap_idle(&mut self.state, now);
                 handler::services::enforce_nick_protection(&mut self.state, now);
@@ -3105,6 +3294,10 @@ impl Core {
                 );
             }
         }
+        // Any event is a chance for a paced LIST or WHO reply to use the room
+        // its client's send queue has made since.
+        handler::pace_channel_lists(&mut self.state);
+        handler::pace_who_replies(&mut self.state);
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
         // overflows someone else's queue — hence the loop). Dropping the
@@ -3187,6 +3380,17 @@ impl SessionOutput {
             // zombie.
             Err(PushError::Closed(_)) => Ok(Written::Queued),
         }
+    }
+
+    /// How many more lines the queue takes before it is half full: the most
+    /// a paced reply (a LIST, a long WHO) may occupy, leaving the other half
+    /// for whatever else the connection is sent meanwhile. Solanum's SAFELIST
+    /// bound.
+    pub(crate) fn paced_room(&self) -> usize {
+        self.tx
+            .capacity()
+            .div_ceil(2)
+            .saturating_sub(self.tx.depth())
     }
 
     /// Queue the connection's closing line; nothing is written after it.
@@ -3288,6 +3492,7 @@ mod ingress_tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }
@@ -3692,7 +3897,7 @@ mod ingress_tests {
                 display: channel.into(),
                 account: "alice".into(),
                 flags: Some("o".into()),
-                applied: true,
+                previous: None,
                 frontend: super::AccessFrontend::Flags,
                 label: None,
             },
@@ -3874,6 +4079,12 @@ mod ingress_tests {
     #[test]
     fn invitation_for_a_session_that_has_closed_is_dropped() {
         let mut core = single_core();
+        let (bob, mut bob_rx) = register_on_first(&mut core, "bob");
+        core.handle(Input::Closed {
+            conn: bob,
+            reason: "gone".into(),
+        });
+        while bob_rx.try_pop().is_some() {}
         // The invitee disconnected while the invitation crossed shards.
         core.handle(Input::ChannelSessionEvent {
             session: SessionOwner::new(ConnId(2), CoreShardId(0)),
@@ -3884,6 +4095,21 @@ mod ingress_tests {
                 channel: "#chat".into(),
             },
         });
+        assert!(
+            bob_rx.try_pop().is_none(),
+            "nothing is written for a closed session"
+        );
+        assert!(
+            core.state.sessions.get(&bob).is_none(),
+            "the invitation does not bring the session back"
+        );
+        assert!(
+            core.state
+                .channels
+                .get(&core.state.chan_key("#chat"))
+                .is_none(),
+            "nor does it create the channel or an invitation to it"
+        );
     }
 
     #[test]
@@ -4740,10 +4966,6 @@ mod ingress_tests {
         );
     }
 
-    /// alice, not logged in, confides in bob, then identifies to her account
-    /// and leaves. A stranger takes the nick `alice` and asks for the
-    /// conversation with bob. Returns what CHATHISTORY shows the stranger and
-    /// the ring conversations TARGETS hands the database on their behalf.
     /// Identify `conn` to `account` through NickServ, answering the verify.
     fn identify_on(shards: &mut Shards, conn: u64, account: &str) {
         shards.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
@@ -4828,6 +5050,10 @@ mod ingress_tests {
         );
     }
 
+    /// alice, not logged in, confides in bob, then identifies to her account
+    /// and leaves. A stranger takes the nick `alice` and asks for the
+    /// conversation with bob. Returns what CHATHISTORY shows the stranger and
+    /// the ring conversations TARGETS hands the database on their behalf.
     fn conversation_after_login_and_nick_reuse(
         mut shards: Shards,
     ) -> (Vec<String>, Vec<(String, e6irc_proto::time::Millis)>) {
@@ -5485,6 +5711,261 @@ mod ingress_tests {
                     ChannelCommandOperation::ChanServStatus { .. }
                 )
         ));
+    }
+
+    /// Read `rx` up to and including the line that ends with `end`.
+    async fn output_until(rx: &mut Receiver<super::Output>, end: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        loop {
+            let line =
+                String::from_utf8(next_output(rx).await.payload.0.to_vec()).expect("utf8 output");
+            let done = line.trim_end().ends_with(end);
+            lines.push(line.trim_end().to_string());
+            if done {
+                return lines;
+            }
+        }
+    }
+
+    /// LIST's conditions reach the channels of every shard, and a reply larger
+    /// than half the lister's send queue is paced out by the worker as the
+    /// client reads it rather than overflowing the queue.
+    #[tokio::test]
+    async fn list_conditions_and_pacing_span_the_shards() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
+        // Thirty-two lines: a LIST of more than fifteen rows needs several
+        // turns.
+        let output_config = Config {
+            name: "list-output",
+            capacity: 32,
+            policy: Policy::Fifo,
+        };
+        let (alice_tx, mut alice_rx) = queue(output_config);
+        let (bob_tx, mut bob_rx) = queue(output_config);
+        first.state.open(
+            ConnId(2),
+            alice_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        second.state.open(
+            ConnId(1),
+            bob_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        for (core, conn, nick, rx) in [
+            (&mut first, ConnId(2), "alice", &mut alice_rx),
+            (&mut second, ConnId(1), "bob", &mut bob_rx),
+        ] {
+            for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
+                core.handle(Input::Line {
+                    conn,
+                    line: line.into_bytes(),
+                });
+                while rx.try_pop().is_some() {}
+            }
+        }
+        // Twenty channels on each shard, more than the queue holds, and a
+        // secret one.
+        let on_shard = |shard: usize, count: usize| -> Vec<String> {
+            (0..)
+                .map(|index| format!("#room{index}"))
+                .filter(|name| first.state.channel_owner(name).shard() == CoreShardId(shard))
+                .take(count)
+                .collect()
+        };
+        let mut rooms = on_shard(0, 20);
+        rooms.extend(on_shard(1, 20));
+        rooms.sort();
+        let secret = (0..)
+            .map(|index| format!("#secret{index}"))
+            .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel on shard one");
+        let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
+        let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        let send = |tx: &Sender<Input>, conn: ConnId, line: &str| {
+            tx.try_push(Input::Line {
+                conn,
+                line: line.as_bytes().to_vec(),
+            })
+            .expect("line queued");
+        };
+        for room in rooms.iter().chain([&secret]) {
+            send(&second_tx, ConnId(1), &format!("JOIN {room}"));
+            output_until(&mut bob_rx, ":End of /NAMES list").await;
+        }
+        send(&second_tx, ConnId(1), &format!("MODE {secret} +s"));
+        output_until(&mut bob_rx, "+s").await;
+        // A second member for the first room.
+        send(&first_tx, ConnId(2), &format!("JOIN {}", rooms[0]));
+        output_until(&mut alice_rx, ":End of /NAMES list").await;
+
+        let listed = |lines: &[String]| -> Vec<String> {
+            assert!(lines[0].contains(" 321 alice "), "{lines:#?}");
+            lines
+                .iter()
+                .filter(|line| line.split(' ').nth(1) == Some("322"))
+                .map(|line| line.split(' ').nth(3).expect("channel").to_string())
+                .collect()
+        };
+        send(&first_tx, ConnId(2), "LIST");
+        let everything = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert_eq!(listed(&everything), rooms, "{everything:#?}");
+        send(&first_tx, ConnId(2), "LIST >1");
+        let crowded = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert_eq!(listed(&crowded), [rooms[0].clone()]);
+        let last = &rooms[39];
+        send(&first_tx, ConnId(2), &format!("LIST #room*,!{last},<2"));
+        let narrowed = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert_eq!(listed(&narrowed), rooms[1..39]);
+        send(&first_tx, ConnId(2), "LIST #secret*");
+        let hidden = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert!(listed(&hidden).is_empty(), "{hidden:#?}");
+        // Its member lists it from the other shard.
+        send(&second_tx, ConnId(1), "LIST #secret*");
+        let shown = output_until(&mut bob_rx, ":End of /LIST").await;
+        assert!(
+            shown
+                .iter()
+                .any(|line| line.contains(&format!(" 322 bob {secret} 1 ")))
+        );
+
+        first_tx.try_push(Input::Shutdown).expect("stop first");
+        second_tx.try_push(Input::Shutdown).expect("stop second");
+        first_worker.await.expect("first worker");
+        second_worker.await.expect("second worker");
+    }
+
+    /// A WHO of a channel another shard owns, larger than half the asker's
+    /// send queue, is paced out on the asker's shard as it reads — plain, and
+    /// labeled as one batch — rather than overflowing the queue.
+    #[tokio::test]
+    async fn a_remote_channel_who_is_paced_on_the_askers_shard() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
+        let crowd = (0..)
+            .map(|index| format!("#crowd{index}"))
+            .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel on shard one");
+        // Thirty-two lines: a WHO of forty members needs several turns.
+        let (alice_tx, mut alice_rx) = queue(Config {
+            name: "who-output",
+            capacity: 32,
+            policy: Policy::Fifo,
+        });
+        first.state.open(
+            ConnId(2),
+            alice_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        for line in [
+            "CAP LS 302",
+            "CAP REQ :batch labeled-response",
+            "NICK alice",
+            "USER alice 0 * :alice",
+            "CAP END",
+        ] {
+            first.handle(Input::Line {
+                conn: ConnId(2),
+                line: line.as_bytes().to_vec(),
+            });
+            while alice_rx.try_pop().is_some() {}
+        }
+        let mut members = Vec::new();
+        for index in 0..40 {
+            let conn = ConnId(10 + index);
+            let (tx, mut rx) = queue(Config {
+                name: "who-member-output",
+                capacity: 128,
+                policy: Policy::Fifo,
+            });
+            second
+                .state
+                .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+            for line in [
+                format!("NICK member{index}"),
+                format!("USER member{index} 0 * :member{index}"),
+            ] {
+                second.handle(Input::Line {
+                    conn,
+                    line: line.into_bytes(),
+                });
+                while rx.try_pop().is_some() {}
+            }
+            members.push((conn, rx));
+        }
+        let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
+        let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        let send = |tx: &Sender<Input>, conn: ConnId, line: &str| {
+            tx.try_push(Input::Line {
+                conn,
+                line: line.as_bytes().to_vec(),
+            })
+            .expect("line queued");
+        };
+        for (conn, rx) in &mut members {
+            send(&second_tx, *conn, &format!("JOIN {crowd}"));
+            output_until(rx, ":End of /NAMES list").await;
+        }
+        send(&first_tx, ConnId(2), &format!("JOIN {crowd}"));
+        output_until(&mut alice_rx, ":End of /NAMES list").await;
+
+        let rows = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| line.contains(&format!(" 352 alice {crowd} ")))
+                .count()
+        };
+        send(&first_tx, ConnId(2), &format!("WHO {crowd}"));
+        let plain = output_until(&mut alice_rx, ":End of /WHO list").await;
+        assert_eq!(rows(&plain), 41, "{plain:#?}");
+        assert_eq!(plain.len(), 42, "{plain:#?}");
+
+        send(&first_tx, ConnId(2), &format!("@label=crowd WHO {crowd}"));
+        let mut labeled = Vec::new();
+        while !labeled
+            .last()
+            .is_some_and(|line: &String| line.contains(" BATCH -"))
+        {
+            let line = String::from_utf8(next_output(&mut alice_rx).await.payload.0.to_vec())
+                .expect("utf8 output");
+            labeled.push(line.trim_end().to_string());
+        }
+        assert!(
+            labeled[0].starts_with("@label=crowd ") && labeled[0].contains(" BATCH +"),
+            "{labeled:#?}"
+        );
+        assert_eq!(rows(&labeled), 41, "{labeled:#?}");
+        assert!(
+            labeled[1..labeled.len() - 1]
+                .iter()
+                .all(|line| line.starts_with("@batch=")),
+            "{labeled:#?}"
+        );
+        send(&first_tx, ConnId(2), "PING after-who");
+        output_until(&mut alice_rx, "after-who").await;
+
+        first_tx.try_push(Input::Shutdown).expect("stop first");
+        second_tx.try_push(Input::Shutdown).expect("stop second");
+        first_worker.await.expect("first worker");
+        second_worker.await.expect("second worker");
     }
 
     #[tokio::test]

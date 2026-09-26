@@ -6,10 +6,15 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use e6irc_client::{Connection, RelayEvent};
+use std::collections::HashMap;
 
-use super::upstream_identity::{UpstreamChannel, UpstreamNick, UpstreamRealname, UpstreamUsername};
-use super::{ConnectionEvent, DriverEnds, NetworkHandle};
+use e6irc_client::{Connection, NetworkNames, OwnedMessage, RelayEvent};
+
+use super::replies::{Correlation, ReplyRouter, Upstream};
+use super::upstream_identity::{
+    AutojoinChannel, ChannelKey, ConfirmedChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
+};
+use super::{ClientTags, ConnectionEvent, DriverEnds, NetworkHandle};
 
 /// Static configuration for one upstream network.
 #[derive(Debug, Clone)]
@@ -22,8 +27,8 @@ pub struct NetworkConfig {
     /// The `USER` name (ident), exactly as sent. Never derived from the nick.
     pub username: UpstreamUsername,
     pub realname: UpstreamRealname,
-    /// Channels to auto-join after registering.
-    pub autojoin: Vec<UpstreamChannel>,
+    /// Channels to auto-join after registering, keyed ones with their keys.
+    pub autojoin: Vec<AutojoinChannel>,
     /// Detached buffer capacity.
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
@@ -84,37 +89,157 @@ impl Default for NetworkConfig {
 /// (its command sender) tells the driver task to stop.
 pub struct IrcNetwork;
 
-/// State that survives one driver's reconnects: the set of channels the
-/// upstream has confirmed us in, keyed by RFC1459-folded name with the
-/// server's canonical casing as the value. `connect_once` joins the
-/// configured autojoin plus everything here, so channels joined at runtime
-/// (not just the static config) are restored after a drop — the behaviour
-/// ZNC/soju users rely on. In-memory only: a process restart legitimately
-/// falls back to the configured autojoin, which is the operator-declared
-/// floor.
+/// State that survives one driver's reconnects: the channels the upstream has
+/// confirmed us in, each with the key it is joined with when it is keyed,
+/// keyed by the network's own fold of the name with the server's canonical
+/// casing kept. `connect_once` joins the configured autojoin plus everything
+/// here, so channels joined at runtime (not just the static config) are
+/// restored after a drop — the behaviour ZNC/soju users rely on. In-memory
+/// only, learned keys included: a process restart legitimately falls back to
+/// the configured autojoin, with its configured keys, which is the owner's
+/// declared floor.
 #[derive(Debug, Default)]
-pub struct JoinedChannels(
-    std::sync::Mutex<std::collections::HashMap<String, super::upstream_identity::ConfirmedChannel>>,
-);
+pub struct JoinedChannels(std::sync::Mutex<Intent>);
+
+#[derive(Debug, Default)]
+struct Intent {
+    channels: HashMap<String, Intended>,
+    /// The naming rules the keys above were folded under: the network's, as
+    /// last known.
+    names: NetworkNames,
+    /// Keys attached clients sent with a `JOIN` the upstream has not
+    /// confirmed yet, by folded channel name.
+    offered_keys: HashMap<String, ChannelKey>,
+}
+
+#[derive(Debug, Clone)]
+struct Intended {
+    channel: ConfirmedChannel,
+    key: Option<ChannelKey>,
+}
+
+/// Most keys held for joins not yet confirmed; a refused join's key is never
+/// claimed, so the set is emptied past this.
+const MAX_OFFERED_KEYS: usize = 64;
+
+impl Intent {
+    /// Adopt `names`, re-keying what was folded under the old ones.
+    fn adopt(&mut self, names: &NetworkNames) {
+        if self.names.casemapping() == names.casemapping() {
+            self.names = names.clone();
+            return;
+        }
+        self.names = names.clone();
+        let names = &self.names;
+        self.channels = std::mem::take(&mut self.channels)
+            .into_values()
+            .map(|intended| (names.fold(intended.channel.as_str()), intended))
+            .collect();
+        self.offered_keys.clear();
+    }
+}
 
 impl JoinedChannels {
     /// Fold one line's membership change into the reconnect intent. The intent
     /// outlives sessions, so it carries the tracker's bound itself: successive
-    /// sessions could otherwise each confirm a different full set.
-    fn apply(&self, change: super::SessionChange) -> Result<(), super::ChannelLimitExceeded> {
-        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
-        let mut desired = self.0.lock().expect("joined set poisoned");
+    /// sessions could otherwise each confirm a different full set. A channel
+    /// confirmed after a client offered a key for it keeps that key.
+    fn apply(
+        &self,
+        change: super::SessionChange,
+        names: &NetworkNames,
+    ) -> Result<(), super::ChannelLimitExceeded> {
+        let mut intent = self.0.lock().expect("joined set poisoned");
+        intent.adopt(names);
         for left in &change.left {
-            desired.remove(left);
+            let key = intent.names.fold(left);
+            intent.channels.remove(&key);
         }
         for channel in change.joined {
-            let key = casemap.casefold(channel.as_str());
-            if !desired.contains_key(&key) && desired.len() >= super::MAX_TRACKED_CHANNELS {
+            let folded = intent.names.fold(channel.as_str());
+            if !intent.channels.contains_key(&folded)
+                && intent.channels.len() >= super::MAX_TRACKED_CHANNELS
+            {
                 return Err(super::ChannelLimitExceeded);
             }
-            desired.insert(key, channel);
+            let key = intent.offered_keys.remove(&folded).or_else(|| {
+                intent
+                    .channels
+                    .get(&folded)
+                    .and_then(|intended| intended.key.clone())
+            });
+            intent.channels.insert(folded, Intended { channel, key });
         }
         Ok(())
+    }
+
+    /// Remember the keys an attached client's `JOIN` line offers, until the
+    /// upstream confirms (or never confirms) the channels they open.
+    fn offer_keys(&self, message: &e6irc_proto::message::Message<'_>) {
+        let [channels, keys, ..] = message.params.as_slice() else {
+            return;
+        };
+        let mut intent = self.0.lock().expect("joined set poisoned");
+        for (channel, key) in channels.split(',').zip(keys.split(',')) {
+            let Some(key) = ChannelKey::parse(key) else {
+                continue;
+            };
+            if intent.offered_keys.len() >= MAX_OFFERED_KEYS {
+                intent.offered_keys.clear();
+            }
+            let folded = intent.names.fold(channel);
+            intent.offered_keys.insert(folded, key);
+        }
+    }
+
+    /// Follow a `+k`/`-k` on a channel in the intent.
+    fn set_key(&self, channel: &str, key: Option<ChannelKey>) {
+        let mut intent = self.0.lock().expect("joined set poisoned");
+        let folded = intent.names.fold(channel);
+        if let Some(intended) = intent.channels.get_mut(&folded) {
+            intended.key = key;
+        }
+    }
+
+    /// Stop rejoining `channel`. `true` when it was in the intent.
+    fn forget(&self, channel: &str) -> bool {
+        let mut intent = self.0.lock().expect("joined set poisoned");
+        let folded = intent.names.fold(channel);
+        intent.channels.remove(&folded).is_some()
+    }
+
+    /// The configured autojoin plus every channel the upstream confirmed
+    /// before the drop, with the keys they were joined with. Autojoin wins on
+    /// a fold-collision: its casing is the owner's. A configured channel is
+    /// joined with the key it was last seen with (a `+k` since, or the key a
+    /// client joined it with), and otherwise with its configured key.
+    fn rejoin(&self, autojoin: &[AutojoinChannel]) -> Vec<(String, Option<ChannelKey>)> {
+        let intent = self.0.lock().expect("joined set poisoned");
+        let names = &intent.names;
+        let mut list: Vec<(String, Option<ChannelKey>)> = autojoin
+            .iter()
+            .map(|configured| {
+                let channel = configured.channel().as_str();
+                let key = intent
+                    .channels
+                    .get(&names.fold(channel))
+                    .and_then(|intended| intended.key.clone())
+                    .or_else(|| configured.key().cloned());
+                (channel.to_string(), key)
+            })
+            .collect();
+        let configured: std::collections::HashSet<String> = autojoin
+            .iter()
+            .map(|configured| names.fold(configured.channel().as_str()))
+            .collect();
+        list.extend(
+            intent
+                .channels
+                .iter()
+                .filter(|(folded, _)| !configured.contains(*folded))
+                .map(|(_, intended)| (intended.channel.as_str().to_string(), intended.key.clone())),
+        );
+        list
     }
 }
 
@@ -305,8 +430,10 @@ pub async fn preflight_irc(
     let registration_started = Instant::now();
     let registration = register(config, &mut connection);
     let outcome = match tokio::time::timeout_at(deadline, registration).await {
-        Ok(Ok(welcomed)) => configured_nick_was_granted(config.nick.as_str(), welcomed)
-            .map_err(|rejection| preflight_refusal(Some(rejection))),
+        Ok(Ok(welcomed)) => {
+            configured_nick_was_granted(connection.names(), config.nick.as_str(), welcomed)
+                .map_err(|rejection| preflight_refusal(Some(rejection)))
+        }
         Ok(Err(error)) => Err(match RegistrationError::classify(error) {
             RegistrationError::CredentialsRejected(rejection) => {
                 IrcPreflightFailure::AuthenticationRejected(Some(rejection))
@@ -354,17 +481,31 @@ const GOODBYE_DEADLINE: Duration = Duration::from_secs(2);
 /// schedule behind it — whatever starts from the same settings a moment later:
 /// the connection test's driver, or a reconfigured network's replacement. The
 /// exit is already decided, so a failed or slow goodbye is only logged.
+///
+/// After the `QUIT` the socket is read to its end (a server answers `QUIT`
+/// with `ERROR` and closes): dropping it with that answer unread makes the
+/// kernel send a reset instead of an orderly close, and a reset may discard
+/// the `QUIT` itself before the upstream has read it (macOS does).
 async fn say_goodbye(connection: &mut Connection, reason: &str, who: &str) {
-    match tokio::time::timeout(
-        GOODBYE_DEADLINE,
-        connection.send_line(&format!("QUIT :{reason}")),
-    )
-    .await
+    let deadline = tokio::time::Instant::now() + GOODBYE_DEADLINE;
+    match tokio::time::timeout_at(deadline, connection.send_line(&format!("QUIT :{reason}"))).await
     {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("{who}: quit failed: {error}"),
-        Err(_) => eprintln!("{who}: quit timed out"),
+        Ok(Err(error)) => {
+            eprintln!("{who}: quit failed: {error}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("{who}: quit timed out");
+            return;
+        }
     }
+    // A server that keeps the connection open past the deadline is simply
+    // left: the exit is decided, and what it sent has been read.
+    let _closed = tokio::time::timeout_at(deadline, async {
+        while let Ok(Some(_)) = connection.next_message().await {}
+    })
+    .await;
 }
 
 /// What a stopped driver says on its way out, whether the network was removed
@@ -434,6 +575,10 @@ async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::i
     // The upstream's own echo is the verdict on a message: it arrives only
     // for a line the upstream accepted. See `PendingEchoes`.
     connection.request_when_offered("echo-message");
+    // Labels tell each attached client's replies apart (see
+    // `super::replies`); a multi-line answer comes in a batch.
+    connection.request_when_offered("batch");
+    connection.request_when_offered("labeled-response");
     let identity = e6irc_client::Identity {
         nick: config.nick.as_str(),
         username: config.username.as_str(),
@@ -452,10 +597,11 @@ async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::i
 /// identity invented on their behalf, with whatever channel access and services
 /// relationship that name has. Case is the server's to normalise.
 pub(super) fn configured_nick_was_granted(
+    names: &NetworkNames,
     configured: &str,
     welcomed: String,
 ) -> Result<String, e6irc_client::RegistrationRejection> {
-    if e6irc_proto::casemap::CaseMapping::Rfc1459.eq(configured, &welcomed) {
+    if names.eq(configured, &welcomed) {
         Ok(welcomed)
     } else {
         Err(e6irc_client::RegistrationRejection::welcomed_as(
@@ -567,20 +713,21 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         Ok(welcomed) => welcomed,
         Err(outcome) => return outcome,
     };
-    let current_nick = match configured_nick_was_granted(config.nick.as_str(), welcomed) {
-        Ok(nick) => nick,
-        Err(rejection) => {
-            // Registered, under a name nobody chose: leave as a client would,
-            // or the upstream keeps that session until its ping timeout.
-            say_goodbye(
-                &mut conn,
-                "registered under an unconfigured nickname",
-                "irc driver",
-            )
-            .await;
-            return super::SessionOutcome::RegistrationRejected(rejection);
-        }
-    };
+    let current_nick =
+        match configured_nick_was_granted(conn.names(), config.nick.as_str(), welcomed) {
+            Ok(nick) => nick,
+            Err(rejection) => {
+                // Registered, under a name nobody chose: leave as a client would,
+                // or the upstream keeps that session until its ping timeout.
+                say_goodbye(
+                    &mut conn,
+                    "registered under an unconfigured nickname",
+                    "irc driver",
+                )
+                .await;
+                return super::SessionOutcome::RegistrationRejected(rejection);
+            }
+        };
     let mut identity = SelfIdentity {
         nick: current_nick,
         // `~` because no identd answered; replaced by whatever the upstream
@@ -591,28 +738,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             .to_string(),
     };
     // Join the configured autojoin plus every channel the upstream confirmed
-    // us in before the drop (runtime joins are tracked in `shared.joined`).
-    // Autojoin wins on a fold-collision: its casing is the operator's.
-    let rejoin: Vec<String> = {
-        let mut list: Vec<String> = config.autojoin.iter().map(ToString::to_string).collect();
-        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
-        let folded: std::collections::HashSet<String> = config
-            .autojoin
-            .iter()
-            .map(|c| casemap.casefold(c.as_str()))
-            .collect();
-        let extras: Vec<String> = shared
-            .joined
-            .0
-            .lock()
-            .expect("joined set poisoned")
-            .iter()
-            .filter(|(key, _)| !folded.contains(*key))
-            .map(|(_, display)| display.as_str().to_string())
-            .collect();
-        list.extend(extras);
-        list
-    };
+    // us in before the drop (runtime joins are tracked in `shared.joined`),
+    // keyed channels with their keys.
+    let rejoin = shared.joined.rejoin(&config.autojoin);
     // As few lines as the wire allows, each bounded; the whole burst is still
     // raced against the stop signal so a removal or replacement is not held
     // behind a slow upstream's worth of them.
@@ -633,6 +761,8 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         Some(Err(_)) => return dropped(super::NetworkFailure::AutojoinFailed),
         Some(Ok(())) => {}
     }
+    let mut upstream = UpstreamCapabilities::of(&conn);
+    ends.set_client_tags(upstream.client_tags());
     ends.begin_irc_session(identity.nick.clone());
     ends.emit(ConnectionEvent::Connected);
     // The mechanism is the client's choice among what the network offered, so
@@ -647,12 +777,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"
         ));
     }
-    // With `echo-message` the upstream echoes each message it accepts, and
-    // only those: its echo is relayed as the one echo of the line. Without it
-    // the driver synthesizes the echo when it writes the line.
-    let upstream_echoes = conn.enabled("echo-message");
-    let mut pending_echoes = PendingEchoes::default();
+    let mut echoes = UpstreamEchoes::default();
     let mut requested_nicks = RequestedNicks::default();
+    let mut router = ReplyRouter::default();
 
     // Keepalive: `connect_once` bounds connect + registration, but the
     // steady-state read below would otherwise block forever on a half-open
@@ -675,116 +802,113 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                 Some(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
                     awaiting_keepalive = false;
                     silence.restart();
-                    // Keepalive filtering applies only to lines we could parse;
-                    // a line that didn't parse (a non-UTF-8 body, say) is never
-                    // a PING and is simply relayed. A bad line must not drop the
-                    // link — it is delivered, not fatal.
-                    if let Some(m) = &parsed {
-                        // Answer PINGs transparently (keepalive is the
-                        // driver's job, not the attached client's).
-                        if m.command == "PING" {
-                            let token = m.params.first().cloned().unwrap_or_default();
-                            if write_bounded(&mut conn, &pong_line(&token), super::UPSTREAM_WRITE_DEADLINE)
+                    // A line that didn't parse (a non-UTF-8 body, say) is never
+                    // a PING, a reply or framing, and is simply relayed. A bad
+                    // line must not drop the link — it is delivered, not fatal.
+                    let Some(message) = parsed else {
+                        if track(ends, shared, &mut identity, &mut requested_nicks, ends.emit_session_line(raw)).is_err() {
+                            return dropped(super::NetworkFailure::ChannelLimitExceeded);
+                        }
+                        continue;
+                    };
+                    // Answer PINGs transparently (keepalive is the driver's
+                    // job, not the attached client's).
+                    if message.command == "PING" {
+                        let token = message.params.first().cloned().unwrap_or_default();
+                        if write_bounded(&mut conn, &pong_line(&token), super::UPSTREAM_WRITE_DEADLINE)
+                            .await
+                            .is_err()
+                        {
+                            return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                        }
+                        continue;
+                    }
+                    // The reply to our *own* keepalive PING is internal
+                    // bookkeeping, not conversation — drop it so it doesn't
+                    // fill the backlog (one junk line per idle interval,
+                    // evicting real messages) and reach attached clients.
+                    // Mirrors the local driver's keepalive discipline.
+                    if message.command == "PONG"
+                        && message.params.last().map(String::as_str) == Some("e6bnc-keepalive")
+                    {
+                        continue;
+                    }
+                    // Capabilities are negotiated hop by hop. `CAP NEW` and
+                    // `CAP DEL` describe this driver's negotiation with the
+                    // upstream, which the connection has already followed;
+                    // an attached client negotiated with the bouncer and would
+                    // act on them against the wrong hop. What changed changes
+                    // how the driver writes from here on.
+                    if message.command == "CAP" {
+                        for capability in conn.capabilities_to_request() {
+                            if write_bounded(&mut conn, &format!("CAP REQ :{capability}"), super::UPSTREAM_WRITE_DEADLINE)
                                 .await
                                 .is_err()
                             {
                                 return dropped(super::NetworkFailure::UpstreamWriteFailed);
                             }
-                            continue;
                         }
-                        // The reply to our *own* keepalive PING is internal
-                        // bookkeeping, not conversation — drop it so it doesn't
-                        // fill the backlog (one junk line per idle interval,
-                        // evicting real messages) and reach attached clients.
-                        // Mirrors the local driver's keepalive discipline.
-                        if m.command == "PONG"
-                            && m.params.last().map(String::as_str) == Some("e6bnc-keepalive")
-                        {
-                            continue;
-                        }
-                        // Capabilities are negotiated hop by hop. `CAP NEW` and
-                        // `CAP DEL` describe this driver's negotiation with the
-                        // upstream; an attached client negotiated with the
-                        // bouncer and would act on them against the wrong hop.
-                        // There is no separate server-log stream to keep them
-                        // in, so they end here.
-                        if m.command == "CAP" {
-                            continue;
-                        }
-                        // The upstream is closing the link and says why. To an
-                        // attached client `ERROR` means *its* connection is
-                        // over, and replayed from the backlog days later it
-                        // would mean it again; the reason is kept as this
-                        // drop's diagnostic and said as a notice instead.
-                        if m.command == "ERROR" {
-                            let closed = super::LinkClosed::new(
-                                m.params.last().map(String::as_str).unwrap_or("no reason given"),
-                            );
-                            ends.emit_line(format!(
-                                ":*bnc* NOTICE * :upstream closed the link: {}",
-                                closed.diagnostic()
-                            ));
-                            return super::SessionOutcome::ClosedByUpstream(closed);
-                        }
+                        upstream = UpstreamCapabilities::of(&conn);
+                        ends.set_client_tags(upstream.client_tags());
+                        continue;
                     }
-                    // The upstream's own line: attached clients and the detached
-                    // buffer get what the network sent, tags and all. `attach`
-                    // strips the tags a client did not negotiate.
-                    //
-                    // A send with zero subscribers is fine — the driver
-                    // is always-on regardless of attach.
-                    //
-                    // QUIT clears live membership for attached-client state, but
-                    // the reconnect intent survives a transport drop: only a
-                    // confirmed JOIN/PART/KICK changes it, so an unrelated
-                    // numeric cannot erase channels still awaiting confirmation
-                    // on this new session.
-                    // Our own message, echoed by the upstream: the echo of the
-                    // line an attachment sent, routed to it.
-                    let echo = parsed
-                        .as_ref()
-                        .filter(|_| upstream_echoes)
-                        .and_then(|message| EchoKey::of_upstream_echo(message, &identity.nick))
-                        .map(|key| (key, parsed.as_ref()));
-                    let (raw, origin) = match echo {
-                        Some((key, Some(message))) => (
-                            redact_sensitive_echo(raw, message),
-                            pending_echoes.take(&key),
-                        ),
-                        _ => (raw, None),
-                    };
-                    let emitted = match origin {
-                        Some(origin) => ends.emit_session_echo(raw, origin),
-                        None => ends.emit_session_line(raw),
-                    };
-                    let tracked = emitted.and_then(|mut change| {
-                        if let Some(shown) = change.shown_identity.take() {
-                            if let Some(user) = shown.user {
-                                identity.user = user;
+                    // The upstream is closing the link and says why. To an
+                    // attached client `ERROR` means *its* connection is
+                    // over, and replayed from the backlog days later it
+                    // would mean it again; the reason is kept as this
+                    // drop's diagnostic and said as a notice instead.
+                    if message.command == "ERROR" {
+                        let closed = super::LinkClosed::new(
+                            message.params.last().map(String::as_str).unwrap_or("no reason given"),
+                        );
+                        ends.emit_line(format!(
+                            ":*bnc* NOTICE * :upstream closed the link: {}",
+                            closed.diagnostic()
+                        ));
+                        return super::SessionOutcome::ClosedByUpstream(closed);
+                    }
+                    // A refused join of a channel the driver meant to be in: the
+                    // channel cannot be joined as it is, so it is not rejoined
+                    // again and again after every reconnect (soju does the same).
+                    if let Some(channel) = refused_join(&message)
+                        && ends.irc_session_snapshot().is_some_and(|session| {
+                            !session.channels.iter().any(|joined| conn.names().eq(joined, channel))
+                        })
+                        && shared.joined.forget(channel)
+                    {
+                        ends.emit_line(format!(
+                            ":*bnc* NOTICE * :{} will not be rejoined after a reconnect: \
+                             the upstream refused to join it ({})",
+                            e6irc_proto::message::truncate_on_char_boundary(channel, 200),
+                            message.command
+                        ));
+                    }
+                    match router.classify(&message, raw, conn.names(), &identity.nick, std::time::Instant::now()) {
+                        // A correlation PING's answer closes what came before
+                        // it; the commands forwarded since want one of their own.
+                        Upstream::Consumed => {
+                            if let Some(barrier) = router.barrier_due()
+                                && write_bounded(&mut conn, &barrier, super::UPSTREAM_WRITE_DEADLINE)
+                                    .await
+                                    .is_err()
+                            {
+                                return dropped(super::NetworkFailure::UpstreamWriteFailed);
                             }
-                            identity.host = shown.host;
                         }
-                        if let Some(nick) = change.nick.take() {
-                            // Tracked, so the session goes on under it. A name
-                            // an attached client asked for is the owner's own
-                            // choice, confirmed; any other is announced, because
-                            // the owner did not choose it (a services enforcer,
-                            // typically).
-                            if !requested_nicks.confirms(&nick) {
-                                ends.record_error_with_upstream_detail(
-                                    super::NetworkFailure::RenamedByUpstream,
-                                    &format!(
-                                        "upstream renamed this session from {} to {nick}",
-                                        identity.nick
-                                    ),
-                                );
+                        Upstream::Reply { line, origin } => ends.emit_reply(origin, line),
+                        Upstream::Session { line, origin } => {
+                            if let Some((channel, key)) = key_change(&message, ends) {
+                                shared.joined.set_key(&channel, key);
                             }
-                            identity.nick = nick;
+                            let emitted = if upstream.echoes {
+                                echoes.publish(ends, &message, line, origin, &identity.nick, conn.names())
+                            } else {
+                                ends.emit_session_line(line)
+                            };
+                            if track(ends, shared, &mut identity, &mut requested_nicks, emitted).is_err() {
+                                return dropped(super::NetworkFailure::ChannelLimitExceeded);
+                            }
                         }
-                        shared.joined.apply(change)
-                    });
-                    if tracked.is_err() {
-                        return dropped(super::NetworkFailure::ChannelLimitExceeded);
                     }
                 }
                 Some(Ok(Some(RelayEvent::Rejected(rejected)))) => {
@@ -820,9 +944,26 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             // Downstream command -> upstream.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
-                    if write_bounded(&mut conn, &cmd.line, super::UPSTREAM_WRITE_DEADLINE)
+                    let Some(line) = outgoing(&cmd, &upstream, ends, shared) else {
+                        continue;
+                    };
+                    let written = router.forward(
+                        cmd.origin,
+                        &line,
+                        upstream.correlation,
+                        conn.names(),
+                        std::time::Instant::now(),
+                    );
+                    if write_bounded(&mut conn, &written, super::UPSTREAM_WRITE_DEADLINE)
                         .await
                         .is_err()
+                    {
+                        return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                    }
+                    if let Some(barrier) = router.barrier_due()
+                        && write_bounded(&mut conn, &barrier, super::UPSTREAM_WRITE_DEADLINE)
+                            .await
+                            .is_err()
                     {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
@@ -832,15 +973,19 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // echo-message on attach. An upstream that echoes is
                     // waited for — a refused line then has no echo, and the
                     // refusal is the verdict; one that does not echo gets
-                    // the echo manufactured here.
-                    requested_nicks.observe(&cmd.line);
-                    if upstream_echoes {
-                        if let Some(key) = EchoKey::of_client_line(&cmd.line) {
-                            pending_echoes.push(key, cmd.origin);
+                    // the echo manufactured here, one per target, from the
+                    // line as the upstream was sent it.
+                    requested_nicks.observe(&line);
+                    if upstream.echoes {
+                        if upstream.correlation == Correlation::Order {
+                            echoes.sent(&line, cmd.origin, conn.names());
                         }
-                    } else if let Some(echo) = self_echo(&cmd.line, &identity) {
-                        ends.emit_echo(echo, cmd.origin);
+                    } else {
+                        for echo in self_echoes(&line, &identity) {
+                            ends.emit_echo(echo, cmd.origin);
+                        }
                     }
+                    // A barrier's answer may already be due; the loop reads it.
                 }
                 // Stopped by the registry, or every handle dropped: the
                 // successor (if any) must not meet this session's ghost.
@@ -851,6 +996,203 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             },
         }
     }
+}
+
+/// What the upstream has enabled that decides how the driver writes: whether
+/// it echoes, whether it carries client-only tags, and how its replies are
+/// told apart. Re-read whenever a `CAP` line changes what is enabled.
+struct UpstreamCapabilities {
+    /// With `echo-message` the upstream echoes each message it accepts, and
+    /// only those: its echo is relayed as the one echo of the line. Without it
+    /// the driver synthesizes the echo when it writes the line.
+    echoes: bool,
+    message_tags: bool,
+    correlation: Correlation,
+}
+
+impl UpstreamCapabilities {
+    fn of(conn: &Connection) -> Self {
+        let message_tags = conn.enabled("message-tags");
+        let labels = message_tags && conn.enabled("batch") && conn.enabled("labeled-response");
+        Self {
+            echoes: conn.enabled("echo-message"),
+            message_tags,
+            correlation: if labels {
+                Correlation::Labels
+            } else {
+                Correlation::Order
+            },
+        }
+    }
+
+    fn client_tags(&self) -> ClientTags {
+        if self.message_tags {
+            ClientTags::Relayed
+        } else {
+            ClientTags::Denied
+        }
+    }
+}
+
+/// Fold what one published session line changed into the driver's own state:
+/// the identity the upstream shows, a rename (announced when nobody asked for
+/// it), and the reconnect intent.
+fn track(
+    ends: &DriverEnds,
+    shared: &SharedDriver,
+    identity: &mut SelfIdentity,
+    requested_nicks: &mut RequestedNicks,
+    emitted: Result<super::SessionChange, super::ChannelLimitExceeded>,
+) -> Result<(), super::ChannelLimitExceeded> {
+    let mut change = emitted?;
+    if let Some(shown) = change.shown_identity.take() {
+        if let Some(user) = shown.user {
+            identity.user = user;
+        }
+        identity.host = shown.host;
+    }
+    if let Some(nick) = change.nick.take() {
+        // Tracked, so the session goes on under it. A name an attached client
+        // asked for is the owner's own choice, confirmed; any other is
+        // announced, because the owner did not choose it (a services
+        // enforcer, typically).
+        let names = ends.names();
+        if !requested_nicks.confirms(&nick, &names) {
+            ends.record_error_with_upstream_detail(
+                super::NetworkFailure::RenamedByUpstream,
+                &format!(
+                    "upstream renamed this session from {} to {nick}",
+                    identity.nick
+                ),
+            );
+        }
+        identity.nick = nick;
+    }
+    // QUIT clears live membership for attached-client state, but the reconnect
+    // intent survives a transport drop: only a confirmed JOIN/PART/KICK changes
+    // it, so an unrelated numeric cannot erase channels still awaiting
+    // confirmation on this new session.
+    shared.joined.apply(change, &ends.names())
+}
+
+/// A client's line as the upstream is to be sent it (see
+/// [`super::carriable`]), or `None` when the bouncer answered it instead. A
+/// `PART` of a channel the reconnect intent holds but this session is not in
+/// (its rejoin failed) removes it from the intent — the one way a client can
+/// — and says so, before the upstream's own answer.
+fn outgoing(
+    cmd: &super::ClientCommand,
+    upstream: &UpstreamCapabilities,
+    ends: &DriverEnds,
+    shared: &SharedDriver,
+) -> Option<String> {
+    let line = super::carriable(cmd, upstream.client_tags(), ends)?;
+    let Ok(message) = e6irc_proto::message::Message::parse(&line) else {
+        return Some(line);
+    };
+    match message.command.to_ascii_uppercase().as_str() {
+        "JOIN" => shared.joined.offer_keys(&message),
+        "PART" => {
+            let live = ends
+                .irc_session_snapshot()
+                .map(|session| session.channels)
+                .unwrap_or_default();
+            let names = ends.names();
+            for channel in message
+                .params
+                .first()
+                .map(|channels| channels.split(',').collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                if !live.iter().any(|joined| names.eq(joined, channel))
+                    && shared.joined.forget(channel)
+                {
+                    ends.answer(
+                        cmd.origin,
+                        format!(
+                            ":*bnc* NOTICE * :{}: no longer rejoined after a reconnect \
+                             (this session is not in it)",
+                            e6irc_proto::message::truncate_on_char_boundary(channel, 200)
+                        ),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(line)
+}
+
+/// The channel an upstream refused to let us join, when `message` is such a
+/// refusal: it does not exist (403), or is full, invite-only, banned or keyed
+/// (471, 473, 474, 475).
+fn refused_join(message: &OwnedMessage) -> Option<&str> {
+    matches!(
+        message.command.as_str(),
+        "403" | "471" | "473" | "474" | "475"
+    )
+    .then(|| e6irc_client::numeric_subject(message))
+    .flatten()
+}
+
+/// The key change a channel `MODE` line makes: `+k <key>` sets it, `-k`
+/// clears it. Which modes take a parameter is the network's to say
+/// (`CHANMODES`, `PREFIX`), so the key's position is read with them.
+fn key_change(message: &OwnedMessage, ends: &DriverEnds) -> Option<(String, Option<ChannelKey>)> {
+    if !message.command.eq_ignore_ascii_case("MODE") {
+        return None;
+    }
+    let [channel, modes, arguments @ ..] = message.params.as_slice() else {
+        return None;
+    };
+    if !modes.contains('k') {
+        return None;
+    }
+    let features = ends.upstream_features();
+    let token = |name: &str| {
+        features.isupport.iter().find_map(|token| {
+            token
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+                .map(str::to_string)
+        })
+    };
+    let chanmodes = token("CHANMODES").unwrap_or_else(|| "beI,k,l,imnpst".to_string());
+    let prefix = token("PREFIX").unwrap_or_else(|| "(ov)@+".to_string());
+    let membership = prefix
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+        .map_or("", |(modes, _)| modes);
+    let mut kinds = chanmodes.split(',');
+    let (always, parameter, when_set) = (
+        kinds.next().unwrap_or(""),
+        kinds.next().unwrap_or(""),
+        kinds.next().unwrap_or(""),
+    );
+    let mut arguments = arguments.iter();
+    let mut adding = true;
+    let mut change = None;
+    for mode in modes.chars() {
+        match mode {
+            '+' => adding = true,
+            '-' => adding = false,
+            mode => {
+                let takes = always.contains(mode)
+                    || parameter.contains(mode)
+                    || membership.contains(mode)
+                    || (adding && when_set.contains(mode));
+                let argument = if takes { arguments.next() } else { None };
+                if mode == 'k' {
+                    change = Some(if adding {
+                        argument.and_then(|key| ChannelKey::parse(key))
+                    } else {
+                        None
+                    });
+                }
+            }
+        }
+    }
+    Some((channel.clone(), change?))
 }
 
 fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
@@ -883,32 +1225,71 @@ fn pong_line(token: &str) -> String {
 const JOIN_LINE_BUDGET: usize = 510;
 
 /// `channels` as the fewest `JOIN` lines that fit the wire, names comma-joined
-/// in order. One line per channel exceeded Solanum's flood allowance on a
-/// reconnect with many channels, which it answers by closing the link ("Excess
-/// Flood"); a comma list is one command to the flood counter.
-pub(super) fn join_lines(channels: &[String]) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for channel in channels {
-        match lines.last_mut() {
-            Some(line) if line.len() + 1 + channel.len() <= JOIN_LINE_BUDGET => {
-                line.push(',');
-                line.push_str(channel);
-            }
-            _ => lines.push(format!("JOIN {channel}")),
+/// in order and keyed channels first, their keys in a second comma list: a
+/// key is matched to its channel by position, so no unkeyed channel may come
+/// before a keyed one on a line. One line per channel exceeded Solanum's flood
+/// allowance on a reconnect with many channels, which it answers by closing
+/// the link ("Excess Flood"); a comma list is one command to the flood
+/// counter.
+pub(super) fn join_lines(channels: &[(String, Option<ChannelKey>)]) -> Vec<String> {
+    let render = |names: &[&str], keys: &[&str]| {
+        if keys.is_empty() {
+            format!("JOIN {}", names.join(","))
+        } else {
+            format!("JOIN {} {}", names.join(","), keys.join(","))
         }
+    };
+    let ordered = channels
+        .iter()
+        .filter(|(_, key)| key.is_some())
+        .chain(channels.iter().filter(|(_, key)| key.is_none()));
+    let mut lines = Vec::new();
+    let (mut names, mut keys): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for (channel, key) in ordered {
+        let mut with_names = names.clone();
+        with_names.push(channel);
+        let mut with_keys = keys.clone();
+        if let Some(key) = key {
+            with_keys.push(key.as_str());
+        }
+        if !names.is_empty() && render(&with_names, &with_keys).len() > JOIN_LINE_BUDGET {
+            lines.push(render(&names, &keys));
+            names.clear();
+            keys.clear();
+            names.push(channel);
+            keys.extend(key.as_ref().map(ChannelKey::as_str));
+        } else {
+            names = with_names;
+            keys = with_keys;
+        }
+    }
+    if !names.is_empty() {
+        lines.push(render(&names, &keys));
     }
     lines
 }
 
-/// Build the self-echo line for a client command, or `None` when the command
-/// is not a message an upstream would echo. The prefix is our current
-/// upstream identity (`nick!user@host` as the upstream shows it, see
-/// [`SelfIdentity`]), valid client-only tags ride along exactly as a real
-/// echo-message would return them, and a fresh authoritative `time=` tag stamps
-/// when the bouncer accepted the line so backlog playback orders it against
-/// upstream traffic.
-pub(super) fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
-    echo_of(line, None, identity)
+/// Build the self-echoes of a client command: one per target it names, as an
+/// upstream echoes (and delivers) a message to each target separately — or
+/// none when the command is not a message an upstream would echo. The prefix
+/// is our current upstream identity (`nick!user@host` as the upstream shows
+/// it, see [`SelfIdentity`]), valid client-only tags ride along exactly as a
+/// real echo-message would return them, and a fresh authoritative `time=` tag
+/// stamps when the bouncer accepted the line so backlog playback orders it
+/// against upstream traffic. A target list is never one conversation: `#a,#b`
+/// filed as a channel of that name would be in neither channel's history.
+pub(super) fn self_echoes(line: &str, identity: &SelfIdentity) -> Vec<String> {
+    let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
+        return Vec::new();
+    };
+    let Some(targets) = parsed.params.first() else {
+        return Vec::new();
+    };
+    targets
+        .split(',')
+        .filter(|target| !target.is_empty())
+        .filter_map(|target| echo_of(line, Some(target), identity))
+        .collect()
 }
 
 /// [`self_echo`] of a message as delivered to one `target` of its list: a
@@ -968,8 +1349,10 @@ fn echo_of(line: &str, to: Option<&str>, identity: &SelfIdentity) -> Option<Stri
     e6irc_proto::message::server_frame_fits(echo.as_bytes()).then_some(echo)
 }
 
-/// What identifies a message's echo: its command, its target (casefolded) and
-/// its text. The upstream's echo of a line carries the same three.
+/// What identifies a message's echo: its command, its one target (folded as
+/// the network folds names) and its text. The upstream echoes a message to
+/// several targets once per target, so a client's line has one key per
+/// target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EchoKey {
     command: String,
@@ -978,36 +1361,67 @@ struct EchoKey {
 }
 
 impl EchoKey {
-    fn new(command: &str, params: &[String]) -> Option<Self> {
-        let command = command.to_ascii_uppercase();
-        let (target, text) = match (command.as_str(), params) {
-            ("PRIVMSG" | "NOTICE", [target, text]) if !text.is_empty() => (target, text.as_str()),
-            ("TAGMSG", [target]) => (target, ""),
-            _ => return None,
-        };
+    fn new(command: &str, target: &str, text: &str, names: &NetworkNames) -> Option<Self> {
         (!target.is_empty()).then(|| Self {
-            command,
-            target: e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(target),
+            command: command.to_string(),
+            target: names.fold(target),
             text: text.to_string(),
         })
     }
 
-    /// The key of a message an attached client sent, when the upstream will
-    /// echo it.
-    fn of_client_line(line: &str) -> Option<Self> {
-        let parsed = e6irc_proto::message::Message::parse(line).ok()?;
-        let params: Vec<String> = parsed.params.iter().map(ToString::to_string).collect();
-        Self::new(parsed.command, &params)
+    /// The keys of a message an attached client sent, one per target, when
+    /// the upstream will echo it.
+    fn of_client_line(line: &str, names: &NetworkNames) -> Vec<Self> {
+        let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
+            return Vec::new();
+        };
+        let command = parsed.command.to_ascii_uppercase();
+        let (targets, text) = match (command.as_str(), parsed.params.as_slice()) {
+            ("PRIVMSG" | "NOTICE", [targets, text]) if !text.is_empty() => (*targets, *text),
+            ("TAGMSG", [targets]) => (*targets, ""),
+            _ => return Vec::new(),
+        };
+        targets
+            .split(',')
+            .filter_map(|target| Self::new(&command, target, text, names))
+            .collect()
     }
 
-    /// The key of an upstream line when it is the echo of our own message.
-    fn of_upstream_echo(message: &e6irc_client::OwnedMessage, own_nick: &str) -> Option<Self> {
+    /// The key of an upstream line when it is the echo of our own message,
+    /// with the length of what precedes its text on the wire — which decides
+    /// how much of a long text the upstream could echo.
+    fn of_upstream_echo(
+        message: &OwnedMessage,
+        own_nick: &str,
+        names: &NetworkNames,
+    ) -> Option<(Self, usize)> {
         let source = message.source.as_deref()?;
         let nick = source.split_once('!').map_or(source, |(nick, _)| nick);
-        if !e6irc_proto::casemap::CaseMapping::Rfc1459.eq(nick, own_nick) {
+        if !names.eq(nick, own_nick) {
             return None;
         }
-        Self::new(&message.command, &message.params)
+        let command = message.command.to_ascii_uppercase();
+        let (target, text) = match (command.as_str(), message.params.as_slice()) {
+            ("PRIVMSG" | "NOTICE", [target, text]) if !text.is_empty() => (target, text.as_str()),
+            ("TAGMSG", [target]) => (target, ""),
+            _ => return None,
+        };
+        // `:<source> <COMMAND> <target> :`
+        let head = 1 + source.len() + 1 + command.len() + 1 + target.len() + 2;
+        Some((Self::new(&command, target, text, names)?, head))
+    }
+
+    /// Whether this echo, `head` bytes before its text, is `sent` as the
+    /// upstream cut it to fit one line: a server truncates a text that would
+    /// not fit its line with our prefix, and echoes (and delivers) what is
+    /// left.
+    fn is_truncation_of(&self, sent: &Self, head: usize) -> bool {
+        self.command == sent.command
+            && self.target == sent.target
+            && !self.text.is_empty()
+            && self.text.len() < sent.text.len()
+            && sent.text.starts_with(&self.text)
+            && head + sent.text.len() + 2 > e6irc_proto::message::MAX_LINE_LEN
     }
 }
 
@@ -1031,10 +1445,60 @@ impl PendingEchoes {
         self.0.push_back((key, origin));
     }
 
-    /// The attachment that sent the line `key` echoes, when one is waiting.
-    fn take(&mut self, key: &EchoKey) -> Option<u64> {
-        let position = self.0.iter().position(|(pending, _)| pending == key)?;
+    /// The attachment that sent the line `echo` echoes, when one is waiting:
+    /// the same text, or failing that the text the upstream had to cut.
+    fn take(&mut self, echo: &EchoKey, head: usize) -> Option<u64> {
+        let position = self
+            .0
+            .iter()
+            .position(|(pending, _)| pending == echo)
+            .or_else(|| {
+                self.0
+                    .iter()
+                    .position(|(pending, _)| echo.is_truncation_of(pending, head))
+            })?;
         self.0.remove(position).map(|(_, origin)| origin)
+    }
+}
+
+/// The echoes of an upstream with `echo-message`: its echo of our own message
+/// is relayed as the one echo of the line, routed to the attachment that sent
+/// it — by its label, or, when replies are told apart by order, by matching it
+/// against the lines awaiting one. The `irc` and `local` drivers route them
+/// here alike.
+#[derive(Default)]
+pub(super) struct UpstreamEchoes(PendingEchoes);
+
+impl UpstreamEchoes {
+    /// Await the echo of `line`, which attachment `origin` sent, once per
+    /// target it names.
+    pub(super) fn sent(&mut self, line: &str, origin: u64, names: &NetworkNames) {
+        for key in EchoKey::of_client_line(line, names) {
+            self.0.push(key, origin);
+        }
+    }
+
+    /// Publish a session line of the upstream, as the echo of an attachment's
+    /// line when it is one (`origin` is its label's attachment, when it had
+    /// one), with a services command that can carry a secret redacted.
+    pub(super) fn publish(
+        &mut self,
+        ends: &DriverEnds,
+        message: &OwnedMessage,
+        line: String,
+        origin: Option<u64>,
+        own_nick: &str,
+        names: &NetworkNames,
+    ) -> Result<super::SessionChange, super::ChannelLimitExceeded> {
+        let Some((key, head)) = EchoKey::of_upstream_echo(message, own_nick, names) else {
+            return ends.emit_session_line(line);
+        };
+        let origin = origin.or_else(|| self.0.take(&key, head));
+        let line = redact_sensitive_echo(line, message);
+        match origin {
+            Some(origin) => ends.emit_session_echo(line, origin),
+            None => ends.emit_session_line(line),
+        }
     }
 }
 
@@ -1069,12 +1533,11 @@ impl RequestedNicks {
 
     /// Whether the upstream renaming this session to `nick` confirms a
     /// request. The request is consumed, with every older one it supersedes.
-    fn confirms(&mut self, nick: &str) -> bool {
-        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    fn confirms(&mut self, nick: &str, names: &NetworkNames) -> bool {
         match self
             .0
             .iter()
-            .position(|requested| casemap.eq(requested, nick))
+            .position(|requested| names.eq(requested, nick))
         {
             Some(position) => {
                 self.0.drain(..=position);
@@ -1088,7 +1551,7 @@ impl RequestedNicks {
 /// The upstream's echo of our own message, with a services command that can
 /// carry a secret replaced by the same redaction the synthesized echo uses:
 /// the backlog must never hold the password the upstream reflected back.
-fn redact_sensitive_echo(raw: String, message: &e6irc_client::OwnedMessage) -> String {
+fn redact_sensitive_echo(raw: String, message: &OwnedMessage) -> String {
     let [target, text] = message.params.as_slice() else {
         return raw;
     };
@@ -1356,12 +1819,204 @@ pub(super) mod tests {
             joined: names
                 .iter()
                 .map(|name| {
-                    super::super::upstream_identity::ConfirmedChannel::parse(name)
-                        .expect("test channel")
+                    super::super::upstream_identity::ConfirmedChannel::parse(
+                        name,
+                        &NetworkNames::default(),
+                    )
+                    .expect("test channel")
                 })
                 .collect(),
             ..Default::default()
         }
+    }
+
+    fn owned(line: &str) -> OwnedMessage {
+        OwnedMessage::from(&e6irc_proto::message::Message::parse(line).expect("test line"))
+    }
+
+    /// A message to several targets is echoed by the upstream once per
+    /// target, so it waits for one echo per target, and a bouncer-made echo
+    /// is one per target too: never one line to a conversation named `#a,#b`.
+    #[test]
+    fn a_message_to_several_targets_is_echoed_per_target() {
+        let names = NetworkNames::default();
+        let mut pending = PendingEchoes::default();
+        for key in EchoKey::of_client_line("PRIVMSG #a,#B :hi", &names) {
+            pending.push(key, 7);
+        }
+        for echo in [":alice!u@h PRIVMSG #a :hi", ":alice!u@h PRIVMSG #b :hi"] {
+            let (key, head) =
+                EchoKey::of_upstream_echo(&owned(echo), "alice", &names).expect("our echo");
+            assert_eq!(pending.take(&key, head), Some(7), "{echo}");
+        }
+        let echoes = self_echoes("PRIVMSG #a,#b :hi", &alice());
+        assert_eq!(echoes.len(), 2, "{echoes:?}");
+        assert!(echoes[0].ends_with(" PRIVMSG #a :hi"), "{echoes:?}");
+        assert!(echoes[1].ends_with(" PRIVMSG #b :hi"), "{echoes:?}");
+    }
+
+    /// An upstream cuts a text that does not fit its line with our prefix,
+    /// and echoes what is left: that echo is still the echo of the line sent.
+    /// A shorter text that is not a cut is not mistaken for one.
+    #[test]
+    fn an_echo_the_upstream_truncated_is_still_the_lines_echo() {
+        let names = NetworkNames::default();
+        let text = "x".repeat(480);
+        let mut pending = PendingEchoes::default();
+        for key in EchoKey::of_client_line(&format!("PRIVMSG #room :{text}"), &names) {
+            pending.push(key, 7);
+        }
+        for key in EchoKey::of_client_line("PRIVMSG #room :hello world", &names) {
+            pending.push(key, 8);
+        }
+        let short = ":alice!~alice@host.example PRIVMSG #room :hello";
+        let (key, head) =
+            EchoKey::of_upstream_echo(&owned(short), "alice", &names).expect("our echo");
+        assert_eq!(
+            pending.take(&key, head),
+            None,
+            "hello is not a cut of hello world"
+        );
+        let prefix = ":alice!~alice@host.example PRIVMSG #room :";
+        let cut = format!("{prefix}{}", &text[..510 - prefix.len()]);
+        let (key, head) =
+            EchoKey::of_upstream_echo(&owned(&cut), "alice", &names).expect("our echo");
+        assert_eq!(pending.take(&key, head), Some(7));
+    }
+
+    /// A keyed channel is rejoined with its key, from the client's JOIN and
+    /// from a later `+k`; a `-k` forgets it; keyed channels lead each JOIN
+    /// line so every key lands on its channel.
+    #[test]
+    fn a_keyed_channel_is_rejoined_with_its_key() {
+        let names = NetworkNames::default();
+        let joined = JoinedChannels::default();
+        let join = e6irc_proto::message::Message::parse("JOIN #priv,#open,#other hunter2")
+            .expect("a JOIN");
+        joined.offer_keys(&join);
+        joined
+            .apply(
+                confirmed(&["#open".into(), "#Priv".into(), "#other".into()]),
+                &names,
+            )
+            .expect("fits");
+        let rejoin = joined.rejoin(&[]);
+        let keyed: Vec<(&str, Option<&str>)> = rejoin
+            .iter()
+            .map(|(channel, key)| (channel.as_str(), key.as_ref().map(ChannelKey::as_str)))
+            .collect();
+        assert!(keyed.contains(&("#Priv", Some("hunter2"))), "{keyed:?}");
+        assert!(keyed.contains(&("#open", None)), "{keyed:?}");
+        let lines = join_lines(&rejoin);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("JOIN #Priv,"), "{lines:?}");
+        assert!(lines[0].ends_with(" hunter2"), "{lines:?}");
+
+        joined.set_key("#open", ChannelKey::parse("newkey"));
+        joined.set_key("#priv", None);
+        let rejoin = joined.rejoin(&[]);
+        let line = &join_lines(&rejoin)[0];
+        assert!(
+            line.starts_with("JOIN #open,") && line.ends_with(" newkey"),
+            "{line}"
+        );
+        assert!(!line.contains("hunter2"), "{line}");
+        assert!(
+            !format!("{rejoin:?}").contains("newkey"),
+            "keys are never shown"
+        );
+
+        assert!(joined.forget("#PRIV"));
+        assert!(!joined.forget("#priv"), "gone");
+        assert!(
+            joined
+                .rejoin(&[])
+                .iter()
+                .all(|(channel, _)| channel != "#Priv")
+        );
+    }
+
+    /// A configured key joins its channel after every connect, including the
+    /// first one after a restart, when nothing was learned yet; a key seen
+    /// since (a `+k`) is the one the channel is rejoined with.
+    #[test]
+    fn a_configured_key_joins_its_channel_until_another_is_seen() {
+        let configured: Vec<AutojoinChannel> = ["#staff hunter2", "#open"]
+            .iter()
+            .map(|entry| entry.parse().expect("an autojoin entry"))
+            .collect();
+        let joined = JoinedChannels::default();
+        let rejoin = joined.rejoin(&configured);
+        assert_eq!(join_lines(&rejoin), ["JOIN #staff,#open hunter2"]);
+        joined
+            .apply(
+                confirmed(&["#staff".into(), "#open".into()]),
+                &NetworkNames::default(),
+            )
+            .expect("fits");
+        joined.set_key("#STAFF", ChannelKey::parse("rotated"));
+        assert_eq!(
+            join_lines(&joined.rejoin(&configured)),
+            ["JOIN #staff,#open rotated"]
+        );
+        assert!(!format!("{configured:?}").contains("hunter2"));
+    }
+
+    /// A key's place among a MODE line's parameters is decided by which modes
+    /// take one, as the network's CHANMODES and PREFIX say.
+    #[test]
+    fn a_key_is_read_from_a_mode_line_with_the_networks_chanmodes() {
+        let (_handle, ends) = NetworkHandle::channels(4);
+        ends.begin_irc_session("me".into());
+        ends.emit_session_line(
+            ":s 005 me CHANMODES=beIq,k,fl,imnst PREFIX=(ov)@+ :are supported by this server"
+                .into(),
+        )
+        .expect("tracked");
+        let mode = |line: &str| {
+            key_change(&owned(line), &ends)
+                .map(|(channel, key)| (channel, key.map(|key| key.as_str().to_string())))
+        };
+        assert_eq!(
+            mode(":op!u@h MODE #c +bfok ban!*@* 5 nick secret"),
+            Some(("#c".to_string(), Some("secret".to_string())))
+        );
+        assert_eq!(
+            mode(":op!u@h MODE #c -lk *"),
+            Some(("#c".to_string(), None))
+        );
+        assert_eq!(mode(":op!u@h MODE #c +o nick"), None);
+    }
+
+    #[test]
+    fn many_keyed_channels_take_several_lines_each_within_the_limit() {
+        let key = ChannelKey::parse(&"k".repeat(40)).expect("a key");
+        let channels: Vec<(String, Option<ChannelKey>)> = (0..20)
+            .map(|index| (format!("#keyed-channel-{index:02}"), Some(key.clone())))
+            .chain((0..20).map(|index| (format!("#open-{index:02}"), None)))
+            .collect();
+        let lines = join_lines(&channels);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.len() <= JOIN_LINE_BUDGET, "{line}");
+            let mut parts = line.split(' ');
+            assert_eq!(parts.next(), Some("JOIN"));
+            let names: Vec<&str> = parts.next().expect("channels").split(',').collect();
+            let keys: Vec<&str> = parts
+                .next()
+                .map_or_else(Vec::new, |keys| keys.split(',').collect());
+            assert!(
+                names[..keys.len()]
+                    .iter()
+                    .all(|name| name.starts_with("#keyed")),
+                "a key would land on an unkeyed channel: {line}"
+            );
+        }
+        let joined: usize = lines
+            .iter()
+            .map(|line| line.split(' ').nth(1).expect("channels").split(',').count())
+            .sum();
+        assert_eq!(joined, 40);
     }
 
     /// The intent is kept across sessions, so a hostile upstream confirming a
@@ -1372,28 +2027,42 @@ pub(super) mod tests {
         let first: Vec<String> = (0..super::super::MAX_TRACKED_CHANNELS)
             .map(|index| format!("#session-one-{index}"))
             .collect();
-        joined.apply(confirmed(&first)).expect("a full set fits");
+        joined
+            .apply(confirmed(&first), &NetworkNames::default())
+            .expect("a full set fits");
         // Re-confirming a rejoined channel on the next session is not growth.
         joined
-            .apply(confirmed(&["#SESSION-ONE-0".to_string()]))
+            .apply(
+                confirmed(&["#SESSION-ONE-0".to_string()]),
+                &NetworkNames::default(),
+            )
             .expect("already intended");
         assert_eq!(
-            joined.apply(confirmed(&["#session-two-0".to_string()])),
+            joined.apply(
+                confirmed(&["#session-two-0".to_string()]),
+                &NetworkNames::default()
+            ),
             Err(super::super::ChannelLimitExceeded)
         );
         assert_eq!(
-            joined.0.lock().expect("joined set").len(),
+            joined.0.lock().expect("joined set").channels.len(),
             super::super::MAX_TRACKED_CHANNELS
         );
 
         joined
-            .apply(super::super::SessionChange {
-                left: vec!["#session-one-1".to_string()],
-                ..Default::default()
-            })
+            .apply(
+                super::super::SessionChange {
+                    left: vec!["#session-one-1".to_string()],
+                    ..Default::default()
+                },
+                &NetworkNames::default(),
+            )
             .expect("a departure cannot exceed the limit");
         joined
-            .apply(confirmed(&["#session-two-0".to_string()]))
+            .apply(
+                confirmed(&["#session-two-0".to_string()]),
+                &NetworkNames::default(),
+            )
             .expect("the departure made room");
     }
 
@@ -1516,6 +2185,13 @@ pub(super) mod tests {
         ));
     }
 
+    /// The one echo of a single-target line.
+    fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
+        let mut echoes = self_echoes(line, identity);
+        assert!(echoes.len() <= 1, "one target, one echo: {echoes:?}");
+        echoes.pop()
+    }
+
     /// The identity every echo test speaks as, before any echo revealed more.
     fn alice() -> SelfIdentity {
         SelfIdentity {
@@ -1610,20 +2286,35 @@ pub(super) mod tests {
     fn only_a_requested_nick_is_a_confirmation() {
         let mut requested = RequestedNicks::default();
         requested.observe("PRIVMSG #room :NICK chosen");
-        assert!(!requested.confirms("chosen"), "not a NICK command");
+        assert!(
+            !requested.confirms("chosen", &NetworkNames::default()),
+            "not a NICK command"
+        );
         requested.observe("nick First");
         requested.observe("NICK :second");
-        assert!(requested.confirms("SECOND"), "casefolded, either form");
         assert!(
-            !requested.confirms("first"),
+            requested.confirms("SECOND", &NetworkNames::default()),
+            "casefolded, either form"
+        );
+        assert!(
+            !requested.confirms("first", &NetworkNames::default()),
             "an older request is superseded by the one confirmed after it"
         );
-        assert!(!requested.confirms("enforced"), "never asked for");
+        assert!(
+            !requested.confirms("enforced", &NetworkNames::default()),
+            "never asked for"
+        );
         for n in 0..=MAX_REQUESTED_NICKS {
             requested.observe(&format!("NICK refused{n}"));
         }
-        assert!(!requested.confirms("refused0"), "the oldest is dropped");
-        assert!(requested.confirms(&format!("refused{MAX_REQUESTED_NICKS}")));
+        assert!(
+            !requested.confirms("refused0", &NetworkNames::default()),
+            "the oldest is dropped"
+        );
+        assert!(requested.confirms(
+            &format!("refused{MAX_REQUESTED_NICKS}"),
+            &NetworkNames::default()
+        ));
     }
 
     async fn assert_live_driver(network: &str, addr: &str, autojoin: &[&str]) {

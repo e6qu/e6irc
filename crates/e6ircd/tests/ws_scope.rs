@@ -393,3 +393,360 @@ async fn ui_socket_refuses_a_browser_origin_it_cannot_verify() {
         101
     );
 }
+
+/// Read until the server closes the socket, and return the close frame.
+async fn closed_with(socket: &mut UiSocket, case: &str) -> (u16, String) {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Tung::Close(Some(frame)))) => {
+                    return (u16::from(frame.code), frame.reason.to_string());
+                }
+                Some(Ok(Tung::Close(None))) => panic!("{case}: closed without a code"),
+                Some(Ok(_)) => {}
+                other => panic!("{case}: socket ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{case}: the socket outlived its revoked credential"))
+}
+
+/// Attach with `credential`, revoke it through `revoke`, and require the
+/// socket to close as a policy refusal — while `bystander`, opened with a
+/// credential the revocation leaves alone, stays open.
+async fn assert_revocation_closes(
+    http: std::net::SocketAddr,
+    case: &str,
+    credential: (&'static str, String),
+    bystander: Option<&mut UiSocket>,
+    revoke: impl std::future::Future<Output = ()>,
+) {
+    let mut socket = attach(http, &[credential]).await;
+    revoke.await;
+    let (code, reason) = closed_with(&mut socket, case).await;
+    assert_eq!(code, 1008, "{case}: {reason}");
+    assert!(reason.contains("Sign in again"), "{case}: {reason}");
+    if let Some(bystander) = bystander {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                loop {
+                    match bystander.next().await {
+                        Some(Ok(Tung::Close(_))) | None | Some(Err(_)) => return,
+                        Some(Ok(_)) => {}
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "{case}: a socket on a credential the revocation left alone was closed"
+        );
+    }
+}
+
+fn cookie(session: &str) -> (&'static str, String) {
+    ("cookie", format!("e6irc_session={session}"))
+}
+
+fn bearer(token: &str) -> (&'static str, String) {
+    ("authorization", format!("Bearer {token}"))
+}
+
+/// Every path that ends a browser session or a personal access token ends
+/// the live chat sockets it opened. The store announces the revocation
+/// itself, so each path below — and any path added later — is covered by
+/// the same mechanism rather than by each remembering to notify.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn every_revocation_path_closes_the_sockets_its_credential_opened() {
+    use e6ircd::db::{self, OidcSessionIdentity};
+    let url = support::test_db("every_revocation_path_closes_the_sockets").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "alice", "s3cr3t-original", None)
+        .await
+        .expect("account");
+    db::create_account_with_contact(&pool, "root", "s3cr3t-root", None)
+        .await
+        .expect("administrator");
+    // Another administrator, so suspending and deleting alice after she is
+    // made one by recovery leaves the server administered.
+    db::recover_administrator(&pool, "root")
+        .await
+        .expect("root administers");
+    let up = upstream().await;
+    let http = bouncer(url, up, None).await;
+    let session = || async {
+        db::create_web_session(&pool, "alice", None)
+            .await
+            .expect("session")
+    };
+    let token = |label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            db::issue_scoped_api_token(
+                &pool,
+                "alice",
+                label,
+                ApiTokenScopes::new([ApiTokenScope::Read, ApiTokenScope::Write]).expect("scopes"),
+                ApiTokenLifetimeDays::new(7).expect("lifetime"),
+            )
+            .await
+            .expect("token")
+        }
+    };
+    let token_id = |label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            db::list_api_tokens(&pool, "alice")
+                .await
+                .expect("tokens")
+                .into_iter()
+                .find(|token| token.label == label)
+                .expect("issued token")
+                .id
+        }
+    };
+    let kept = session().await;
+    let mut bystander = attach(http, &[cookie(&kept)]).await;
+
+    let signed_out = session().await;
+    assert_revocation_closes(
+        http,
+        "logout",
+        cookie(&signed_out),
+        Some(&mut bystander),
+        async {
+            db::delete_web_session(&pool, &signed_out)
+                .await
+                .expect("logout");
+        },
+    )
+    .await;
+
+    let revoked = session().await;
+    assert_revocation_closes(
+        http,
+        "single session revocation",
+        cookie(&revoked),
+        Some(&mut bystander),
+        async {
+            let id = db::list_web_sessions(&pool, "alice", Some(&revoked))
+                .await
+                .expect("sessions")
+                .into_iter()
+                .find(|row| row.current)
+                .expect("the revoked session")
+                .id;
+            db::delete_web_session_by_id(&pool, "alice", id, Some(&kept))
+                .await
+                .expect("revoke");
+        },
+    )
+    .await;
+
+    let other = session().await;
+    assert_revocation_closes(
+        http,
+        "bulk session revocation",
+        cookie(&other),
+        Some(&mut bystander),
+        async {
+            db::delete_other_web_sessions(&pool, "alice", &kept)
+                .await
+                .expect("bulk revoke");
+        },
+    )
+    .await;
+
+    let other = session().await;
+    assert_revocation_closes(
+        http,
+        "password change",
+        cookie(&other),
+        Some(&mut bystander),
+        async {
+            db::change_local_password(&pool, "alice", "s3cr3t-original", "s3cr3t-rotated", &kept)
+                .await
+                .expect("password change");
+        },
+    )
+    .await;
+
+    let issuer = "https://idp.example";
+    db::link_oidc_identity(&pool, "alice", issuer, "subject-1")
+        .await
+        .expect("link");
+    let asserted = db::create_web_session_with_identity(
+        &pool,
+        "alice",
+        OidcSessionIdentity {
+            provider: Some("corp"),
+            issuer: Some(issuer),
+            subject: Some("subject-1"),
+            sid: Some("sid-unlink"),
+            ..OidcSessionIdentity::default()
+        },
+        None,
+    )
+    .await
+    .expect("identity session");
+    assert_revocation_closes(
+        http,
+        "identity unlink",
+        cookie(&asserted),
+        Some(&mut bystander),
+        async {
+            let id = db::list_oidc_identities(&pool, "alice")
+                .await
+                .expect("identities")
+                .into_iter()
+                .next()
+                .expect("the linked identity")
+                .id;
+            db::unlink_oidc_identity(&pool, "alice", id)
+                .await
+                .expect("unlink");
+        },
+    )
+    .await;
+
+    for (case, sid) in [
+        ("front-channel logout", "sid-front"),
+        ("back-channel logout", "sid-back"),
+    ] {
+        let provider_session = db::create_web_session_with_identity(
+            &pool,
+            "alice",
+            OidcSessionIdentity {
+                provider: Some("corp"),
+                issuer: Some(issuer),
+                subject: Some("subject-2"),
+                sid: Some(sid),
+                ..OidcSessionIdentity::default()
+            },
+            None,
+        )
+        .await
+        .expect("provider session");
+        assert_revocation_closes(
+            http,
+            case,
+            cookie(&provider_session),
+            Some(&mut bystander),
+            async {
+                if case == "front-channel logout" {
+                    db::revoke_oidc_frontchannel_sessions(&pool, issuer, sid, None)
+                        .await
+                        .expect("front-channel");
+                } else {
+                    let expires = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64
+                        + 300;
+                    db::consume_oidc_backchannel_logout(
+                        &pool,
+                        issuer,
+                        None,
+                        Some(sid),
+                        "jti-1",
+                        expires,
+                    )
+                    .await
+                    .expect("back-channel");
+                }
+            },
+        )
+        .await;
+    }
+
+    // The oldest of 33 logins is evicted by the per-account cap. Only it and
+    // the newer kept session exist first, so the eviction takes exactly it.
+    let oldest = session().await;
+    db::delete_other_web_sessions(&pool, "alice", &oldest)
+        .await
+        .expect("start from one session");
+    let kept = session().await;
+    let mut bystander = attach(http, &[cookie(&kept)]).await;
+    assert_revocation_closes(
+        http,
+        "session-cap eviction",
+        cookie(&oldest),
+        Some(&mut bystander),
+        async {
+            for _ in 0..db::MAX_BROWSER_SESSIONS_PER_ACCOUNT - 1 {
+                session().await;
+            }
+        },
+    )
+    .await;
+
+    let revoked_token = token("revoked").await;
+    assert_revocation_closes(
+        http,
+        "token revocation",
+        bearer(&revoked_token),
+        Some(&mut bystander),
+        async {
+            let id = token_id("revoked").await;
+            db::delete_api_token(&pool, "alice", id)
+                .await
+                .expect("revoke token");
+        },
+    )
+    .await;
+
+    let expiring = token("expiring").await;
+    assert_revocation_closes(
+        http,
+        "token expiry",
+        bearer(&expiring),
+        Some(&mut bystander),
+        async {
+            sqlx::query("UPDATE api_tokens SET expires_at = now() WHERE label = 'expiring'")
+                .execute(&pool)
+                .await
+                .expect("expire token");
+        },
+    )
+    .await;
+
+    let alice = db::account_id_by_name(&pool, "alice")
+        .await
+        .expect("lookup")
+        .expect("alice");
+    let recovered = session().await;
+    assert_revocation_closes(
+        http,
+        "administrator recovery",
+        cookie(&recovered),
+        None,
+        async {
+            db::recover_administrator(&pool, "alice")
+                .await
+                .expect("recover");
+        },
+    )
+    .await;
+
+    let suspended = session().await;
+    assert_revocation_closes(http, "suspension", cookie(&suspended), None, async {
+        db::set_account_suspended(&pool, alice, true, "root", &[])
+            .await
+            .expect("suspend")
+            .expect("alice");
+    })
+    .await;
+    db::set_account_suspended(&pool, alice, false, "root", &[])
+        .await
+        .expect("reactivate");
+
+    let deleted = token("deleted").await;
+    assert_revocation_closes(http, "account deletion", bearer(&deleted), None, async {
+        db::delete_account_permanently(&pool, alice, "root", &[])
+            .await
+            .expect("delete")
+            .expect("alice");
+    })
+    .await;
+}

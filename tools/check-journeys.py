@@ -53,29 +53,41 @@ def fail(errors: list[str], message: str) -> None:
     errors.append(message)
 
 
-def defined_test_names() -> set[str]:
-    """Every name an Evidence block may cite as a test.
+# A Rust test: a function whose attributes include `#[test]` or an async
+# runtime's `#[tokio::test(..)]`.
+RUST_TEST = re.compile(
+    r"((?:#\[[^\]]*\]\s*)+)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-z_][a-z0-9_]*)"
+)
+RUST_TEST_ATTRIBUTE = re.compile(r"#\[\s*(?:tokio::)?test\b")
+# A scripted test: a `test("title", ..)` / `it("title", ..)` case (node:test,
+# Playwright, or the tool suites' own `test` helper), or a Python `test_` case.
+SCRIPTED_TEST = re.compile(
+    r"\b(?:test|it)(?:\.\w+)?\(\s*[\"'`]([a-z][a-z0-9_]*)[\"'`]|\bdef\s+(test_[a-z0-9_]*)"
+)
 
-    Rust tests are functions. The browser and tool suites name a case either as
-    a function or as a quoted title, so both spellings count there.
+
+def defined_test_names() -> set[str]:
+    """Every name an Evidence block may cite as a test: a Rust test function,
+    or a scripted suite's test case. A production function of the same shape
+    is not evidence of anything, so it is not a test name.
     """
 
     names: set[str] = set()
-    rust_function = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)")
-    scripted = re.compile(
-        r"\b(?:def|function)\s+([a-z_][a-z0-9_]*)|[\"'`]([a-z][a-z0-9_]*)[\"'`]"
-    )
     for root in RUST_TEST_ROOTS:
         for path in (ROOT / root).rglob("*.rs"):
             if "target" in path.relative_to(ROOT).parts:
                 continue
-            names.update(rust_function.findall(path.read_text(encoding="utf-8")))
+            for attributes, name in RUST_TEST.findall(path.read_text(encoding="utf-8")):
+                if RUST_TEST_ATTRIBUTE.search(attributes):
+                    names.add(name)
     for root in SCRIPTED_TEST_ROOTS:
         for path in (ROOT / root).rglob("*"):
             if path.suffix not in {".js", ".mjs", ".py", ".sh"} or not path.is_file():
                 continue
-            for function, title in scripted.findall(path.read_text(encoding="utf-8")):
-                names.add(function or title)
+            if "node_modules" in path.relative_to(ROOT).parts:
+                continue
+            for title, function in SCRIPTED_TEST.findall(path.read_text(encoding="utf-8")):
+                names.add(title or function)
     return names
 
 

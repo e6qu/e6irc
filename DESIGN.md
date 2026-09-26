@@ -227,6 +227,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     The IRC driver also derives reconnect-intent deltas from this one tracker;
     attach state and the next rejoin set cannot parse the same upstream line
     with two subtly different membership rules.
+  - `ReplyRouter` — every upstream line a driver reads passes one classifier
+    that decides whether it is the session's (retained, broadcast, stored) or
+    the answer to one attachment's command (delivered to that attachment's own
+    bounded route, live only). A `/LIST` of a large network used to be
+    broadcast to every attached client, overrun their shared 1,024-event
+    channel and detach them, and fill the ring and the stored history; a
+    reply now has no way into the broadcast or the ring.
   - `subscribe_with_replay_snapshot` — buffered emitters retain the IRC-session
     and buffer locks through broadcast publication, while each raw/browser
     attach subscribes and snapshots both under those same locks. The
@@ -239,10 +246,32 @@ These are project-wide rules, enforced in review and (where possible) CI:
     and `CAP LIST` derive from one closed set. An attach cannot use SASL without
     negotiating it, and a new capability cannot be accepted but omitted from
     discovery or state reporting.
-  - `MessageKind` (PRIVMSG/NOTICE) — one type with `wire()`, `db()` and
-    `is_loud()`, so the uppercase verb, the lowercase storage token, and the
-    "does it auto-reply" rule cannot drift; before, the ring and the database
-    stored different casings of the same message.
+  - `MessageKind` (PRIVMSG/NOTICE) — one type with `wire()` and `is_loud()`,
+    and `HistoryKind` (PRIVMSG/NOTICE/TAGMSG) with `wire()` and `db()`, so the
+    uppercase verb, the lowercase storage token, and the "does it auto-reply"
+    rule cannot drift; before, the ring and the database stored different
+    casings of the same message. The ring's `HistoryEntry` *is* the database's
+    `HistoryRow`, so the two cannot keep different facts about a message, and a
+    history read is cut in the reader's `HistoryScope` (§11.3).
+  - `Capture` — a labeled command's capture counts the answers it left to
+    asynchronous paths in one private field, raised only by `defer`; "deferred"
+    is that count being non-zero. A NickServ IDENTIFY once marked its capture
+    deferred through a separate flag without counting, so the echo captured
+    before the verdict was dropped when the verdict framed itself. Every
+    asynchronous answer — held (`emit_deferred_labeled`) or not
+    (`emit_labeled_unheld`) — is gathered with what the command answered on the
+    spot into the one labeled response.
+  - `NewPassword` — a password an account may be given (1–512 bytes) is parsed
+    once; account creation takes only this type, and the REST/web validators
+    call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
+    cannot store a password another surface refuses to verify (an empty one
+    was storable through `REGISTER` and could then never be logged in to).
+  - `MemberModes::sigils` — the one renderer of a member's rank sigils,
+    honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
+    copy that ignored the capability.
+  - `render_multiline` — one renderer for a multiline message's delivered
+    forms, used by local delivery, the channel owner and CHATHISTORY replay,
+    so the three cannot frame, tag or fit it differently.
   - `StatusSigil` — the STATUSMSG `@`/`+` target sigil is `Option<enum>`, so
     "does this enter history / narrow the audience" is `is_none()` and a
     method, not a byte compared against `0`.
@@ -532,8 +561,8 @@ e6irc/
 │   │                         #   communication primitive (§7.3); loom-verified,
 │   │                         #   step-schedulable for deterministic tests
 │   ├── e6ircd/               # the monolithic server binary
-│   ├── e6irc-client/         # client library: connection, TLS, SASL (PLAIN +
-│   │                         #   OAUTHBEARER), chathistory helpers
+│   ├── e6irc-client/         # client library: connection, TLS, SASL (SCRAM-
+│   │                         #   SHA-512/256, PLAIN, OAUTHBEARER), chathistory helpers
 │   ├── e6irc-cli/            # scripting-oriented CLI client binary
 │   ├── e6irc-tui/            # ratatui TUI client binary
 │   ├── e6irc-load/           # load generator binary: many concurrent clients,
@@ -573,7 +602,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | Queues | **custom `e6irc-queue`** | The core↔DB and per-connection SendQ primitive; built in-repo so it can be step-scheduled, traced, and loom-verified (§7.3). The always-on driver/attach layer (§10) additionally uses tokio `broadcast`/`mpsc` for event fan-out and command delivery. |
 | TLS | **rustls** (default `aws-lc-rs` provider) | No OpenSSL anywhere in the tree (enforced by `cargo-deny`); one TLS stack for listeners, upstream BNC connections, Postgres, and HTTP clients. |
 | HTTP | **axum** + tower | Thin over hyper, tower middleware for auth/rate limits; no needless layers. |
-| Database | **sqlx** (postgres + rustls features only) | Async, compile-time-checked queries, embedded migrations. |
+| Database | **sqlx** (`runtime-tokio`, `postgres`, `tls-rustls-aws-lc-rs`, `migrate`, `macros`; no default features) | Async; queries are runtime-checked (`sqlx::query`/`query_as` with bound parameters, no `query!` macros — the `macros` feature is there for `migrate!`), and migrations are embedded. |
 | Templates | **askama** | Compile-time templates → fast, no runtime template engine in the binary. |
 | Web client | **askama + standard forms** for server-rendered management; a small first-party runtime for confirmation/copy/refresh; vanilla-JS live chat bundled by **Vite** | No SPA framework or production package dependency; server-rendered where state is the server's, client-parsed where it is the client's (chat buffers/nick lists). |
 | TUI | **ratatui** + crossterm | Standard, portable. |
@@ -590,15 +619,26 @@ both native clients — one parser to fuzz, one behavior everywhere.
   tokio / an already-present dependency cannot, and why hand-rolling it
   in-repo is worse. Small utilities (a left-pad, a tiny format helper, a
   simple backoff) are written in-repo, never imported.
-- `default-features = false` on every dependency; features are enabled
-  individually and each enabled feature must be used.
+- `default-features = false` wherever a dependency's defaults bring more than
+  is used; features are then enabled individually and each enabled feature
+  must be used. Kept on their defaults, because the default set is what is
+  used: `url`, `socket2`, `http-body`, `ipnet` (plus `serde`) and `argon2`
+  (plus `std`) in e6ircd, and `unicode-width` in e6irc-tui. The test and
+  tooling binaries, e6irc-load and e6irc-qualification, take their
+  dependencies' defaults (serde, serde_json, sha2, url, futures-util, and
+  e6irc-qualification's tokio and axum); they never ship.
 - Every dependency must build and pass tests on the full target matrix
   (Linux, macOS, Windows × amd64, arm64); arch- or OS-specific code paths
   (SIMD, intrinsics, platform APIs) need an equivalent path on the other
   targets — no x86-only or Unix-only crates without a gated alternative.
-- The transitive tree is part of the review surface: CI posts a
-  `cargo tree` diff on PRs that change `Cargo.lock`, and `cargo-deny` gates
-  licenses (AGPL-compat), duplicate major versions, and known advisories.
+- The transitive tree is part of the review surface: a change to
+  `Cargo.lock` is reviewed in its diff, and `cargo-deny` gates licenses
+  (AGPL-compat), banned crates (OpenSSL and native-tls: rustls is the one
+  TLS stack), and known advisories (`deny.toml`). Duplicate versions of a
+  crate are a warning in general — sqlx, openidconnect and argon2 pull
+  differing versions of shared low-level crates — and a failure for the
+  network stack that must exist once: tokio, hyper, axum, rustls,
+  tokio-rustls, tungstenite, tokio-tungstenite, reqwest and sqlx.
 - Periodic pruning: a dependency whose justification no longer holds is
   removed, not kept out of inertia.
 - **Up-to-date, with a 24-hour cooldown**: dependencies are kept current,
@@ -609,9 +649,13 @@ both native clients — one parser to fuzz, one behavior everywhere.
   the same rule.
 - **GitHub Actions follow the same rule**: the latest release of each
   action is looked up via the GitHub API (never guessed), adopted only
-  if published ≥ 24 hours ago, and pinned to the exact release tag —
-  except where an action's documented interface is a rolling tag (e.g.
-  `dtolnay/rust-toolchain@stable`).
+  if published ≥ 24 hours ago, and pinned to the full commit SHA that
+  release tag names, with the tag in a trailing comment: a tag can be moved
+  to other code, a commit cannot. One version per action across ci.yml,
+  release.yml and qualification.yml. `dtolnay/rust-toolchain` has no
+  releases and picks the toolchain from the ref it is called by, so it is
+  pinned to a commit of its `master` branch and always given the toolchain
+  as its `toolchain` input. The header of ci.yml has the refresh recipe.
 
 ---
 
@@ -726,6 +770,21 @@ strip = "symbols"
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
   No unbounded buffering, no silent drops.
+- The replies a client cannot bound — `LIST` of every channel, and a `WHO *`
+  or a `WHO` of a large channel — are paced instead (`SAFELIST`): their rows
+  go out only while the client's SendQ is under half full, and the rest follow
+  as the client reads — on the next event its shard handles, or on the
+  worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
+  Other traffic keeps flowing beside the rows, and a labeled one stays one
+  labeled batch across its turns. A second `LIST` aborts the first (`/LIST
+  aborted`), so a connection paces at most one. A `WHO` whose reply fits the
+  room left, with none paced ahead of it, goes out at once; otherwise it waits
+  behind the connection's paced WHO replies and follows them whole, in order
+  (`core/paced.rs`). What waits is bounded: once one is paced, more may queue
+  behind it only while everything waiting fits one SendQ, and a `WHO` past
+  that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
+  channel's `WHO` is paced on the asker's shard, from the rows its owner sent
+  back.
 - Every write to a peer is bounded (`peer_write`): a write, flush or shutdown
   that makes no progress for 30 s fails, so a client with a shut receive
   window is closed ("Write timeout") instead of parking its writer forever —
@@ -740,12 +799,15 @@ strip = "symbols"
 - RecvQ/flood control: a token bucket per connection, on by default with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
   20` per second; a registered non-oper session spends one per command, PING
-  and PONG exempt, and is closed with Excess Flood when the bucket is empty),
-  plus per-IP connection throttle and registration throttle. It used to be off
-  by default with a fixed one-token-per-second refill, which left every
-  output-amplifying command class — repeated JOIN/NAMES targets, repeated list
-  modes — unbounded for anyone who never turned it on, and made any burst that
-  was turned on flood-kill an ordinary autojoin storm.
+  and PONG exempt, and is closed with Excess Flood when the bucket is empty).
+  It used to be off by default with a fixed one-token-per-second refill, which
+  left every output-amplifying command class — repeated JOIN/NAMES targets,
+  repeated list modes — unbounded for anyone who never turned it on, and made
+  any burst that was turned on flood-kill an ordinary autojoin storm. Two
+  per-address bounds are off unless configured: `limits.max_connections_per_ip`
+  caps simultaneous connections from one address (the excess is refused at
+  accept), and `limits.registration_burst` throttles account creation
+  (REGISTER and NickServ REGISTER) per address.
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with
@@ -756,8 +818,26 @@ strip = "symbols"
   however it is framed (`TOPIC :#c` used to clear the topic). Every echo of
   client text, PONG included, is fitted to the 512-byte wire limit.
 - Registration pipeline: `CAP LS 302` → (SASL) → NICK/USER → welcome burst
-  (001–005 with ISUPPORT, LUSERS, MOTD). SASL-required mode configurable
-  globally and per-IP-range.
+  (001–005 with ISUPPORT, LUSERS, MOTD).
+- SASL-required mode, globally (`limits.require_sasl = true`) or for clients
+  connecting from listed address ranges (`limits.require_sasl_from`, CIDRs; an
+  IPv4-mapped IPv6 peer is matched as IPv4). A client it covers that has not
+  logged in to an account when registration would complete — after NICK, USER
+  and CAP END, and after any SASL verdict in flight — is refused as Libera and
+  Solanum refuse a SASL-only range: `465 :You need to identify via SASL to use
+  this server`, then `ERROR :Closing Link: <host> (SASL access only)`, and the
+  connection closes (a server ban is checked, and reported, first). Logged in
+  means SASL, or a `draft/account-registration` REGISTER before connect, which
+  logs the new account in and which `registration.before_connect` enables
+  separately (bounded by `limits.registration_burst`). The bouncer's in-process
+  `local` sessions (§10.2) are exempt: their owner authenticated to the
+  bouncer. There is no WebIRC gateway to exempt: `/ws/irc` clients are judged
+  by the address `limits.trusted_proxies` resolves for them. Both settings are
+  console-owned limits (§18), and configuration validation — `check-config`,
+  start, and a console save — refuses a range that is not a CIDR, either
+  setting without `[database]` (no client could log in), and ranges listed
+  while `require_sasl` already covers everyone. The refusal is 465, which
+  e6irc-client reads as a policy refusal that never parks (§10.3).
 
 ### 7.3 Queue-based core: state model at 100k+ connections
 
@@ -942,7 +1022,13 @@ its labeled batch.
 
 Recipients that negotiated the capability receive the batch as sent, blank lines
 and `draft/multiline-concat` tags intact, because those are what the sender
-wrote. Everyone else receives one message per non-blank line: a PRIVMSG has no
+wrote. The capability does not relax the per-line limit: every line in the
+batch is an ordinary IRC line within 512 bytes, so a line the relay's source
+prefix pushes past it is split on a character boundary into lines whose
+continuations carry `draft/multiline-concat` (for a recipient without
+`message-tags`, which cannot be told a line continues, it is trimmed as the
+flattened form is). A batch closed with no lines at all is refused with
+`FAIL BATCH MULTILINE_INVALID`, like any other malformed batch. Everyone else receives one message per non-blank line: a PRIVMSG has no
 way to carry a line break, and a blank line would be an empty message. A batch
 whose lines are *all* blank therefore has no text in it, and is refused with
 `ERR_NOTEXTTOSEND` exactly as an empty PRIVMSG is -- delivered, it would reach
@@ -1003,6 +1089,29 @@ with 906 and the client registered without an account. A line that is not
 UTF-8 (`UTF8ONLY`) is refused with `FAIL <command> INVALID_UTF8`, naming the
 command read from a lossy decoding of the line (`*` when none is readable), on
 the core and the attach listener alike.
+
+The account a session is logged in to changes in exactly two places,
+`ServerState::set_account` and `clear_account`, and they send RPL_LOGGEDIN (900)
+and RPL_LOGGEDOUT (901) to the session — the SASL spec's "whether by SASL or
+otherwise" — so SASL, NickServ IDENTIFY, NickServ REGISTER, `REGISTER` and
+LOGOUT all tell the client its own state the same way (account-notify tells
+only its peers). A labeled `AUTHENTICATE` that completes the payload is answered
+by the verdict (900/903 or 904) as its labeled response, not with an early
+`ACK`; an attempt aborted meanwhile answers that label with `ACK` when its stale
+verdict lands. A line sent while the credentials are being verified abandons
+the attempt: its 904 is the attempt's only verdict and the verdict still in
+flight is dropped. The attach listener answers `AUTHENTICATE *` with 906
+whether or not an exchange is open, as the core does.
+
+A line refused before it could be parsed whole — not UTF-8, over the length
+limits, malformed after its tags — is still answered under the `label` its tag
+section carries, when that section can be read. SETNAME refuses a realname
+longer than `NAMELEN` (advertised; 150 bytes, the bound USER applies by cutting)
+with `FAIL SETNAME INVALID_REALNAME` rather than cutting it. `MODES=4` is
+advertised and enforced: a MODE changes at most four parameter-taking modes, and
+names the rest back in `FAIL MODE TOO_MANY_MODES <channel> <modes>`.
+invite-notify reaches the members who could have sent the invitation — channel
+operators, or every member of a `+g` channel — as Solanum sends it.
 
 This is a **superset of Libera's advertised set** (Libera does not offer
 chathistory/multiline); the Libera-compat contract (§7.7) governs the shared
@@ -1073,7 +1182,13 @@ subset's exact behavior.
   `STATS d` and `STATS x` (either case) are that operator listing in Solanum's
   numerics — `216 K <host> * <user>`, `225 D <address>`, `247 X 0 <mask>`,
   each with the whole reason, then 219; a non-operator gets 481 and the 219
-  terminator, as Solanum's stats access table answers.
+  terminator, as Solanum's stats access table answers. A mask part is spelled
+  as Solanum spells it so it stays one middle parameter
+  (`sanitize::mask_middle`): a space (X-line masks hold them) as `\s`, and a
+  leading `:` (an IPv6 address such as `::1`) with a `0` in front. A session's
+  shown host goes through the same spelling when it connects (`0::1`), and
+  `SETHOST` refuses a host starting with `:`, so WHO, WHOIS, CHGHOST and 396
+  always carry the host itself.
 - **Integrated services** (no separate Atheme process): `NickServ` and
   `ChanServ` pseudo-clients whose command surfaces
   (`REGISTER`, `IDENTIFY`, `GHOST`, `ACCESS`/`FLAGS`, `OP`, topic retention,
@@ -1097,24 +1212,66 @@ subset's exact behavior.
     warned with Atheme's notices, and renamed to `Guest` plus a number after 30
     seconds (on the first reaper tick at or past the deadline) unless they
     identify to that account or leave the nick first; identifying to another
-    account does not count. `NICKLEN` is at least 10, so a Guest nick always
+    account does not count. The clock does not restart (maintainer decision):
+    a session keeps the earliest deadline each protected nick it held got — at
+    most eight, past which a new nick's clock starts at the earliest kept — so
+    leaving and coming back finds the same deadline, and a session coming back,
+    unidentified, after its deadline passed is renamed at once, on the `NICK`.
+    Identifying to the protecting account settles that nick's clock. `NICKLEN` is at least 10, so a Guest nick always
     fits. `DROP <account> <password>` answers with a confirmation key and
     deletes the account when repeated with it, after verifying the primary
     password, through the same deletion procedure as the console (§9.1) — so
     the account's sessions, the dropping one included, are disconnected by
-    its live gate. Deliberate differences from Atheme (maintainer decisions):
-    only a protected nick's user is warned, since the core mirrors grouped
-    and protected nicks, not every account name; `GHOST`/`REGAIN` take no
-    password argument (identify first); `SET` takes only `ENFORCE`, since
-    passwords and contacts are changed in the web console; and a successor is set with `SET SUCCESSOR`, not `FLAGS +S`.
+    its live gate. `GHOST`, `REGAIN`, the enforcement rename and ChanServ
+    `OP`/`DEOP`/`VOICE`/`DEVOICE` act on another user's session, so each writes
+    an audit row before it is done — `NICK_GHOST`, `NICK_REGAIN`,
+    `NICK_GUEST_RENAME` (the protecting account as actor) with the folded nick
+    as target, `CHANNEL_OP`/`_DEOP`/`_VOICE`/`_DEVOICE` with the channel as
+    target and `nick=` detail — and one the audit trail cannot take is not
+    done (the enforcement rename retries on the next tick). A user whose
+    `IDENTIFY` or SASL verification is still
+    running at the deadline keeps the nick until the verdict: the rename is
+    rechecked on the next tick. `GROUP` claims a nick for an account as
+    `REGISTER` does, so both refuse what any account claim refuses — a
+    services nick or a configured administrator's name (one predicate,
+    `ReservedAccountNames::claimable`, §9.1). The mirror takes storage's
+    idempotent answers too ("already yours" groups, "not yours" ungroups), and
+    a verdict that arrives after its account was deleted adds nothing back.
+    Deliberate differences from Atheme (maintainer decisions): only a
+    protected nick's user is warned, since the core mirrors grouped and
+    protected nicks, not every account name; `GHOST`/`REGAIN` take no password
+    argument (identify first); `SET` takes only `ENFORCE`, since passwords and
+    contacts are changed in the web console; a successor is set with
+    `SET SUCCESSOR`, not `FLAGS +S`; `DROP` hands out its confirmation key
+    before checking the password (the password is checked once, when the key
+    comes back) and the key is random per session rather than derived from the
+    account; and a `VOP` may `VOICE`/`DEVOICE` (Atheme's `VOP` template, `+AV`,
+    grants auto-voice only).
   - ChanServ: `REGISTER`, `DROP`, `FLAGS`; `ACCESS <#channel> LIST|ADD|DEL` is
     the role front end over the same access entries (`AOP` = `+o`, `VOP` = `+v`,
     `VOP` by default); anyone on the list may `LIST` it, only the founder
-    changes it. `OP`/`DEOP` need op access and `VOICE`/`DEVOICE` voice or op
-    access (the founder has both). `SET` takes `FOUNDER`, `SUCCESSOR`,
-    `KEEPTOPIC` and `MLOCK`; the successor is the account the channel passes to
-    when the founder's account is deleted (§9.1), is never the founder, and is
-    cleared when it becomes founder or its own account is deleted.
+    changes it, and an `ADD` for an account that already has an entry says it
+    changed (or already had) the role rather than that it added one. Wherever
+    ChanServ — or the owner console's access and transfer controls — takes an
+    account, any of the account's nicks names it (Atheme resolves a grouped
+    nick to its account; one storage lookup, `resolve_account`, serves both
+    surfaces and login), and the reply names the account.
+    `OP`/`DEOP` need op access and `VOICE`/`DEVOICE` voice or op access (the
+    founder has both); the `MODE` line names the member by the nick the
+    channel knows. `SET` takes `FOUNDER`, `SUCCESSOR`, `KEEPTOPIC` and `MLOCK`;
+    the successor is the account the channel passes to when the founder's
+    account is deleted (§9.1), is never the founder, and is cleared when it
+    becomes founder, its own account is deleted, or the channel is transferred
+    to anyone (maintainer decision: the new founder names their own heir; one
+    transfer statement serves ChanServ and the owner console, and the core's
+    mirror follows the same rule). The successor
+    is shown wherever a channel's holders are: `FLAGS` and `ACCESS LIST`, the
+    owner console, and the administrators' channel directory. Every
+    founder-only change — ChanServ's `FLAGS`/`ACCESS`, `SET`, `DROP`, and the
+    owner console's — locks the channel row and re-checks, in the same
+    transaction, that its requester still founds the channel, so a request the
+    core queued before a transfer committed is refused rather than applied by a
+    former founder.
 
 ### 7.7 Libera.Chat compatibility contract
 
@@ -1131,6 +1288,23 @@ Concretely:
   parse them (WHOIS replies, ban list replies, `RPL_ISUPPORT`, error
   numerics).
 - **WHOX** (`WHO #chan %tnfhuar`) — heavily used by clients/bots on Libera.
+- **`LIST` conditions and `SAFELIST`**, as Solanum's `m_list` implements
+  them (`ELIST=CMNTU`): `<n` / `>n` members, `C<n` / `C>n` created and
+  `T<n` / `T>n` topic set less / more than `n` minutes ago (a channel with no
+  topic meets no `T` condition), a `#`/`*`/`?`-led glob of the casemapped name,
+  and `!glob` to exclude — up to seven, comma-separated, all of which must
+  hold; anything else is refused whole with Solanum's `Invalid parameters for
+  /LIST` notice. One parser (`ListFilter::parse`) and one matcher
+  (`ListFilter::admits`), applied by each shard to the channels it owns, so a
+  whole-network `LIST` carries the same conditions to every shard and only
+  matching rows cross back. Deliberate differences from Solanum: several
+  masks list what *any* of them matches (Solanum keeps the last), so
+  `LIST #a,#b` lists both; a `LIST` naming no existing channel ends with
+  `RPL_LISTEND` and no `ERR_NOSUCHNICK` (irctest's `testListNonexistent`,
+  which Solanum is marked to fail, and no existence oracle for a secret
+  channel); an eighth condition refuses the `LIST` rather than being ignored;
+  no `displayed_usercount` floor hides small channels from a bare `LIST`, and
+  no global `pace_wait` answers a busy moment with `RPL_LOAD2HI`.
 - NickServ/ChanServ surface per §7.6.
 - **Compatibility verification** — complementary checks, none of them a
   build dependency (e6irc is an independent implementation; a reference
@@ -1200,16 +1374,27 @@ Principal tables (columns abridged):
   delete, while a storage trigger makes a future unwrapped account insert reject
   a retired name independently of application routing.
 - `account_invitations` (opaque token digest, proposed account/contact/
-  authority, issuer, creation/expiry, consumption/accepted-account metadata).
+  authority, issuer, creation/expiry, consumption time).
   A partial unique index admits at most one live invitation per folded name;
-  bearer plaintext is returned once and never stored.
+  bearer plaintext is returned once and never stored. A consumed invitation is
+  deleted by the next storage-maintenance cycle; the audit log's
+  `ACCOUNT_INVITATION_ACCEPT` event is the durable record of the acceptance
+  (migration 0080 dropped the never-read `accepted_account_id`).
+- `login_attempts` (folded name, attempt count, window start) — the
+  per-account-name password throttle (migration 0074): every password check
+  reserves an attempt here first, keyed by the name whether or not an account
+  holds it; a verified password deletes the row. It is pruned by the next
+  reservation (rows whose window has passed), not by storage maintenance, so it
+  holds at most the names tried within one window.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
   revocable, shown once at creation
 - `oidc_identities` (issuer, subject) → account_id, UNIQUE(issuer, subject)
 - `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
   creation/expiry, bounded user agent, optional OIDC identity/session metadata)
-- `api_tokens` (hashed PATs, scopes, expiry)
+- `api_tokens` (hashed PATs, scopes, expiry) — at most 32 unexpired tokens per
+  account, counted under the account-row lock; an expired token holds no slot
+  while it waits for storage maintenance to delete it.
 - `channels` (registered channels: founder, successor, flags, topic
   retention, mlock). The founder reference is `ON DELETE RESTRICT` (migration
   0071): a channel is never account-owned data, so no account deletion can
@@ -1217,14 +1402,20 @@ Principal tables (columns abridged):
   counted. The successor reference (migration 0075) sets NULL when the
   successor's account is deleted, a check keeps it off the founder, and a
   trigger clears it when a founder change promotes it. Every other
-  reference to `accounts` cascades (or, for an accepted invitation, sets NULL):
-  each is data about the account itself.
+  reference to `accounts` cascades: each is data about the account itself.
+  An account founds at most 200 channels (`CHANNEL_FOUNDER_LIMIT`). Each core
+  shard checks that against what it knows as a fast path, but a shard sees only
+  its own in-flight registrations and no shard sees a transfer's receiving
+  side, so PostgreSQL holds the cap: registration and every founder change —
+  ChanServ `SET FOUNDER`, the owner console's transfer, and a deletion's
+  succession — lock the receiving account's row and count its channels in the
+  same transaction, and a refusal is a typed verdict each surface reports.
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS;
   `account_id` has its own index (migration 0073) for the deletion cascade and
   per-account lookups, since the primary key leads with `channel_id`.
 - `messages` — append-only history log; columns (id, msgid, target,
-  sender_prefix, sender_account, kind, body, ts), indexed `(target, ts)`
-  and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
+  sender_prefix, sender_account, kind, body, ts, dm_peers), indexed
+  `(target, ts, id)` (migration 0027) and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
   the direct-message peers index makes the account-message predicate (account
   deletion and export) a BitmapOr of two index scans. Migration 0064 dropped the
   unused BRIN on `ts`. The live storage policy retains 1–3650 days
@@ -1236,10 +1427,29 @@ Principal tables (columns abridged):
   trigger (migration 0072) refuses any row naming — as sender or direct-message
   peer — an account that is retired or being deleted, so an asynchronously
   written message can never outlive account deletion's purge (§9.1).
+- `dm_conversations` (account, peer, latest_ts, latest_text_ts) — one row per
+  participant of each stored direct-message conversation (folded identities; a
+  conversation with oneself is `(me, me)`), holding its newest entry time of
+  any kind and its newest PRIVMSG/NOTICE time (NULL while it holds only
+  `TAGMSG`s; migration 0085), each indexed `(account, <time>)`. CHATHISTORY
+  TARGETS reads its conversation half here, from the column of the reader's
+  `HistoryScope`, at most the request's limit of rows (§11.1.1, §11.3). It is a
+  function of `messages` kept by that table's statement triggers (migrations
+  0080, 0085): an insert advances each time it is newer than, and a delete that
+  removed a conversation's newest entry in either scope recomputes both from
+  what remains or forgets the conversation. Every writer — the history flush,
+  retention, account deletion's purge — therefore keeps it exact without
+  knowing it exists.
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
   server master key (§15), `server_password_sealed` (IRC only, a table CHECK;
-  sealed like the SASL password), enabled)
+  sealed like the SASL password), enabled). A CHECK (migration 0080) holds
+  `name` to `sanitize::valid_network_name`'s token language
+  (`[A-Za-z0-9._-]{1,64}`, not `.`/`..`), on which PostgreSQL's `lower()` and
+  the RFC 1459 fold agree — the equivalence the case-insensitive name index and
+  every folded buffer key rely on. The unique `(account_id, lower(name))` index
+  also serves every per-account read and the cascade; 0080 dropped the
+  redundant `(account_id)` index.
 - `bnc_buffer` (id, owner, network, network_id, line, created_at, target,
   msgid, sent_at) — persisted
   detached-buffer lines replayed on attach after a restart; `owner` is `*`
@@ -1250,9 +1460,15 @@ Principal tables (columns abridged):
   other IRC identifier and a case-mismatched attach cannot fall through to an
   operator's shared network of the same name (§2); display casing is preserved.
   `target` is the conversation the line belongs to, `msgid` the upstream
-  `msgid=` tag when present, and `sent_at` the effective ISO-8601 instant
-  (the `time=` tag verbatim, else bouncer arrival time) — the three columns
-  the attach listener's CHATHISTORY paging and TARGETS scan over.
+  `msgid=` tag when present, and `sent_at` the effective instant — the
+  `time=` tag when it parses, else bouncer arrival time — always written in the
+  one canonical `YYYY-MM-DDTHH:MM:SS.mmmZ` form (`server_time`; migration 0054
+  rebased older rows onto it). These are the three columns the attach
+  listener's CHATHISTORY paging and TARGETS scan over, and the paging, the
+  MARKREAD `GREATEST` over `bnc_read_markers.timestamp`, and the retention
+  comparison order that text lexically, which is correct only because it is
+  canonical rather than verbatim; a CHECK on both columns (migration 0080)
+  makes the form a fact of the schema.
   Both ways into a network's buffer — a live line
   from a driver and restored backlog from this table — remove CR/LF/NUL and
   cap one entry to the IRC wire limit. A replay cannot inject a second line or
@@ -1367,6 +1583,16 @@ index makes a second primary password unrepresentable in storage. The web
 "user section" manages all of them. NickServ `REGISTER` creates the same kind
 of account the OIDC first-login path creates.
 
+Which names an account may take is answered once. The configured
+administrators are computed once at startup (`ReservedAccountNames`) and shared
+by the core, the HTTP state and the deletion procedure; its `claimable` is the
+one predicate every ordinary claim asks — NickServ `REGISTER` and `GROUP`, the
+IRCv3 `REGISTER` command, an administrator-created account and an invitation —
+and it refuses a services nick and a configured administrator's name. Storage
+refuses a services nick to every creation path (`account_name_is_unavailable`,
+and the bootstrap), OpenID Connect provisioning included, which alone with the
+bootstrap/recovery flows may create an administrator's name.
+
 An empty database can expose a one-time browser bootstrap only when
 `[bootstrap].token`, PostgreSQL, and HTTP are all configured. `GET /bootstrap`
 binds the form to an expiring `HttpOnly; SameSite=Strict` browser state cookie;
@@ -1431,9 +1657,12 @@ unavailable response.
 Permanent deletion is a succession operation rather than a cascading accident.
 Every registered channel the target founds passes to its successor (ChanServ
 `SET SUCCESSOR`) in the deletion's transaction, audited as
-`CHANNEL_SUCCESSION`; the target must found no registered channel without one
-and cannot be the last active effective administrator, including authority
-supplied by deployment configuration. The console's two deletion controls and
+`CHANNEL_SUCCESSION`; the target must found no registered channel without one,
+no successor may be taken past the 200-channel founder cap (§8; a succession
+is a founder transfer, so the refusal names the channels whose successor would
+exceed it, and the founder names another successor or transfers them first),
+and the target cannot be the last active effective administrator, including
+authority supplied by deployment configuration. The console's two deletion controls and
 NickServ `DROP` run this one procedure (`account_deletion`). The shared account/network mutation lane first installs a
 folded authentication deny key in the ordered core, then stops the account's
 drivers, so no persistence task can write backlog behind the deletion (they
@@ -1462,7 +1691,11 @@ channel that passed to its successor. No shipped creation path—or
 the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
-so the two entry points cannot diverge; the capability's advertised value states
+so the two entry points cannot diverge — including the password rule
+(`NewPassword`, 1–512 bytes, which the web and REST API apply too): `REGISTER`
+refuses an empty password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
+one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
+account after with `NEED_NICK`; the capability's advertised value states
 the policy (`before-connect`, `email-required`) so a client knows the rules
 before it tries. `custom-account-name` is deliberately **not** advertised: an
 account always takes the registering nick's name, which keeps "the account you
@@ -1484,10 +1717,46 @@ provider-verified email claim.
   option). A non-empty domain policy admits only a syntactically valid,
   provider-verified email whose canonical domain exactly matches an entry;
   parent/subdomain relationships never become implicit wildcards. Discovery +
-  JWKS cached with proper refresh. First login
-  auto-provisions an account (nick derived from `preferred_username`,
-  conflict → user picks). Subsequent logins match on (issuer, subject),
-  never on email.
+  JWKS cached with proper refresh: a document is served from the cache for 15
+  minutes and a failed discovery for 30 seconds (an unreachable provider is not
+  dialled again by every unauthenticated start, callback, or back-channel
+  POST); an ID token or logout token that no cached key verifies fetches the
+  keys again — one fetch at a time, at most once per 30 seconds per provider —
+  and is verified once more, so a provider that rotates its signing key is
+  followed at once and a logout signed with the new key still ends the
+  session (a provider treats the `400` it would otherwise get as final). Every
+  provider call — discovery, keys, token exchange — goes through the egress
+  rule (§10.3): addresses that are never a network are refused always, and
+  the configured issuer's own position decides the rest. An administrator
+  may run the provider inside the server's network (a self-hosted provider
+  usually is), and then its endpoints may be inside too; a provider outside
+  may only advertise endpoints outside, so neither the provider nor whoever
+  controls its discovery document can aim this server's token and key
+  requests at internal infrastructure. A literal address is judged before each
+  request and every resolved address at connect time. When the server's
+  cookies are `Secure` (`secure_cookies`, which also requires an `https`
+  public URL) every provider endpoint is HTTPS: configuration validation
+  refuses an `http` `issuer_url` or `end_session_endpoint`, a discovery
+  document that advertises a plaintext `authorization_endpoint`,
+  `token_endpoint`, `jwks_uri` or `userinfo_endpoint` is refused as a whole
+  (the login answers `502`, and the refusal is cached like any failed
+  discovery), and each provider call judges its URL's scheme again before it
+  is sent. Plaintext there would let an on-path attacker supply signing keys
+  and forge ID tokens, or read authorization codes and the client secret. A
+  development server (`secure_cookies = false`) may talk to a local provider
+  over `http`. First login
+  auto-provisions an account named exactly by the provider's configured
+  claim (`preferred_username`, or an email's local part); a name already in
+  use or retired is a `409` (§12) — the server never picks or invents a name,
+  and the person is not asked to pick one either. An email names an account
+  only when the provider marked it verified *and* the provider has an
+  allowed-domain policy that admits it: without a policy, `alice@anywhere`
+  would become `alice` for whoever registered that mailbox at a provider that
+  lets people register — a configured administrator's name among them. Such a
+  first sign-in is refused with a `403` saying what the administrator must
+  configure; there is no fallback to another claim the administrator did not
+  choose. Subsequent logins match on (issuer, subject), never on email, and
+  are not re-judged by these rules.
 - An in-flight OIDC authorization is held by the browser, not the server:
   `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
   verifier, nonce, ten-minute expiry, link target, and silent flag into the
@@ -1499,14 +1768,29 @@ provider-verified email claim.
   provider, before its expiry. An anonymous flood of starts therefore holds no
   server capacity a real login needs — the earlier bounded in-memory table
   refused every login with a 503 once 4096 anonymous starts filled it.
-  Replay is bounded without server state: the authorization code is
-  single-use at the provider and bound to the flow's PKCE verifier, every
-  callback that proves the binding clears the cookie, and a restart ends
-  every flow. A refused callback leaves the cookie alone, so an attacker who
-  learns a victim's `state` cannot burn the victim's login.
-- Linking an identity is a cookie-authenticated top-level GET (a provider
-  redirect cannot carry the CSRF header), so it requires the session-bound
-  CSRF value as its `csrf` query parameter, as RP-initiated logout does.
+  Replay is bounded twice: the authorization code is single-use at the
+  provider and bound to the flow's PKCE verifier, and every callback that
+  proves the binding clears the cookie *and* records the flow's `state` as
+  spent until the flow would have expired, so a kept copy of the cookie is
+  refused rather than making this server call the token endpoint with its
+  client secret again. The record is bounded (65,536 flows; past that, the one
+  closest to its own expiry is forgotten first), so no volume of logins can
+  fill it or refuse a real one, and a restart ends every flow. The callback
+  spends the per-address authentication budget like the start. A refused
+  callback leaves the cookie alone, so an attacker who learns a victim's
+  `state` cannot burn the victim's login.
+- The session-bound CSRF value never travels in a URL, where it would reach
+  browser history and proxy access logs for the session's lifetime. Linking an
+  identity is a `POST` carrying the `X-E6IRC-CSRF` header like every other
+  unsafe API method; it answers the provider URL, and the page navigates
+  there. Signing out is a form `POST` (the value in its body) that the browser
+  follows as a navigation to the provider's end-session endpoint. A script's
+  call carries the header instead and ends this application's session only
+  (`204`): it is not a navigation, so it cannot end the provider's. Browsers hold every redirect of a form submission to
+  the page's `form-action`, so each configured provider's end-session origin
+  is added to `form-action 'self'` on every page (one layer over the router);
+  `'self'` alone blocked coordinated logout. The `GET` forms of both, which took the value as a
+  `csrf` query parameter, are gone.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
   per-IP authentication rate limit and the per-account attempt limit (§15),
@@ -1514,9 +1798,12 @@ provider-verified email claim.
   short-lived `HttpOnly; SameSite=Strict` browser cookie to prevent login
   CSRF/session planting.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
-  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
-  server-rendered forms carry a per-session HMAC token in the request body and
-  reject a missing or invalid token before mutation. Each login records a
+  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: every unsafe
+  cookie-authenticated request proves a per-session HMAC value before
+  mutation — REST methods (and the console's scripts) in the `X-E6IRC-CSRF`
+  header at the shared authentication boundary (§9.4), and the few
+  server-rendered form posts that cannot set a header (`/device`, sign-out)
+  in their body. Each login records a
   bounded, display-safe user agent and a separate stable resource id; neither
   the opaque token nor its hash is exposed by session inventory.
 - Local and OpenID Connect login cannot issue a session for a suspended
@@ -1531,7 +1818,7 @@ provider-verified email claim.
   a local login page. The application shell exposed the authenticated account
   and a top-level logout navigation.
 - Coordinated logout: the session retained its OIDC issuer, subject, session
-  ID, provider, and ID token. `GET /api/v1/auth/logout` performed
+  ID, provider, and ID token. `POST /api/v1/auth/logout` performed
   RP-initiated logout through the provider `end_session_endpoint` with the ID
   token, client ID, and registered post-logout URI. The provider called
   `POST /api/v1/auth/oidc/backchannel-logout` with a signed logout token, or
@@ -1577,10 +1864,43 @@ mint a broader replacement. Every unsafe cookie-authenticated REST method
 requires that same header at the shared authentication boundary. The web
 session cookie remains the browser credential, with the CSRF rules above.
 
+Step-up: the self-service operations that mint or redirect lasting authority
+over the account — minting a personal access token or an app password,
+approving a device (which mints a token), linking a login identity, setting a
+first primary password, changing the recovery email, and deleting the account
+— need a session whose person proved themselves within the last ten minutes
+(`STEP_UP_WINDOW`). Otherwise a cookie stolen from a browser, whose CSRF value
+`GET /api/v1/me` hands to whoever holds it, would become an app password that
+survives a password change and "sign out everywhere". A session records when
+its person last proved themselves (`web_sessions.authenticated_at`, migration
+0079): at sign-in, and at each re-authentication — `POST
+/api/v1/me/reauthenticate` with the primary password (the login's own
+throttles), or `POST /api/v1/me/reauthenticate/oidc/{provider}`, a fresh
+provider sign-in (`prompt=login`, `max_age=0`) whose identity must be linked to
+the account and whose `auth_time` must be recent. Handlers ask for the
+`RecentlyAuthenticated` extractor, and the contract derives the refusal it can
+answer from the handler signature, like `RateLimited`'s `429`. A refused
+request is a `403` problem document of type
+`urn:e6irc:problem:reauthentication-required`; the console answers it by asking
+the person to confirm (their password, or a provider sign-in, which returns to
+the account page) and retries a password-confirmed change once. A password
+rotation proves the person by the current password it verifies, so only a
+first password needs the recent sign-in; `/device`, a server-rendered page,
+asks for the password with the code. Every re-authentication is audited
+(`ACCOUNT_REAUTHENTICATE`). Administrator actions on other accounts are not
+under this rule.
+
+Browser sessions are managed by browser sessions: revoking one
+(`DELETE /api/v1/me/sessions/{id}`) refuses a bearer exactly as revoking all
+but the current one does, so a token cannot sign its owner out of every
+browser one session at a time where the bulk operation would refuse it.
+Listing them stays readable by a `read` token.
+
 Authenticated API requests share a per-account token bucket across browser
 sessions and personal access tokens (240 requests per minute by default).
-Administrator operations use a separate, smaller per-account bucket (60 per
-minute by default). Both are UI-managed, bounded in memory, and fail closed
+Administrator operations — `/api/v1/admin/*` and the administrator console
+pages alike — use a separate, smaller per-account bucket (60 per minute by
+default); the pages used to spend the ordinary one. Both are UI-managed, bounded in memory, and fail closed
 when the bucket registry cannot admit another active account. The HTTP service
 also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
 limit, and 30-second request deadline before work can consume unbounded
@@ -1659,6 +1979,24 @@ browser can read a close frame but not a refused upgrade — which the chat
 client shows once and does not retry by itself. A silent peer is sent a
 WebSocket Ping after `ATTACH_LIVENESS_INTERVAL` (120 s) and detached after a
 second silent interval, the same rule as an attached IRC client (§10.1).
+A chat socket also ends with the credential that opened it. The browser
+session or personal access token is authorized once, at the upgrade, but the
+socket lives for hours, so it holds a lease on that credential and is closed
+with code 1008 ("Your sign-in ended…"; the client does not retry) when the
+credential is revoked or reaches its expiry. Revocation has many paths —
+logout, single and bulk session revocation, a password change, identity
+unlink, provider front- and back-channel logout, the 32-session cap, token
+revocation, suspension, host recovery, account deletion by cascade — and some
+run in another process, so no path announces it: `web_sessions` and
+`api_tokens` do (migration 0077), with a trigger that notifies
+`e6irc_credential_changed` on every committed delete or update. One listener
+per process, on its own connection, re-reads each announced credential that a
+socket holds; after its connection is lost it re-reads every held credential,
+because what was announced in between was not heard. A credential that cannot
+be re-read (the database is unavailable) closes its sockets with 1013 instead,
+which the client retries, authenticating again. `/ws/irc` is not such a
+socket: it carries no HTTP credential, and its SASL login is an IRC session's,
+with the same lifetime as one on a TCP listener.
 The account directory also projects effective administrator authority, its
 durable/configuration sources, and suspension posture.
 `PATCH /api/v1/admin/accounts/{id}` and matching CSRF-protected console forms
@@ -1706,6 +2044,19 @@ digests, plaintext bearer values, provider identity tokens/session IDs, device
 codes, and sealed upstream credentials are absent. Credential, token, identity,
 browser-session, login/logout, provider-logout, invitation, account-state, and
 deletion transitions emit redacted account-visible audit events.
+An audit row records which namespace its actor and its target belong to
+(`actor_kind`/`target_kind`, migration 0078: account, operator, nick, channel,
+network, mask, server, provider, host, invitation), because the same spelling
+can be an account, a configured operator block, a nick anyone may hold, or a
+name an invitation reserves. The account's activity and export select only
+rows naming it *as an account*; registering `root` shows nothing the operator
+`root` did, and a KILL or SETHOST of the nick `eve` is not the account `eve`'s.
+Every writer states the kind through a typed `AuditPrincipal`, whose account
+constructor folds the name. Rows written before 0078 were classified where the
+writing code proves the kind; a name it cannot prove — the actor of an older
+KILL or K/D/X-line (IRC wrote the operator's name or nick, HTTP the
+administrator's account, under one action) or a `CONFIG` by `bootstrap` — is
+`legacy`, shown to administrators as before and never to an account.
 
 `/console/accounts` additionally owns immediate local account creation,
 single-use invitation issuance/revocation, and permanent deletion with exact
@@ -1730,7 +2081,11 @@ server-level networks, and the BNC attach address. The rule for a console-owned
 setting the bootstrap configuration also states is stated once, in §18
 ("Operational configuration").
 Credential-bearing values are sealed before entering PostgreSQL and are never
-rendered back. Existing
+rendered back: `GET /api/v1/admin/configuration` serves a projection that
+names every field of every section — passing each public one through and
+clearing each secret — with no catch-all, so a field added to the
+configuration later does not compile until it is classified, and a new
+credential cannot be served by default. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
 supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.
@@ -1759,8 +2114,12 @@ network's settings have exactly **one** editor, the chat client's dialog
 identity fields (addr, tls, nick, username, realname, autojoin) and write-only
 SASL and server credentials — keep the encrypted password while changing its
 account, replace it, or remove both halves, with typed values under a ticked
-Remove refused rather than silently dropped. The password is never rendered
-back to the browser. The console carried a second editor and a third
+Remove refused rather than silently dropped — and write-only channel keys: a
+key is written after its channel (`#staff key`, as `/join` takes it), a stored
+one is shown only as a per-channel Remove box, and a channel listed without a
+key keeps its stored one unless that box is ticked (a key typed under a ticked
+box is refused). The password and the keys are never rendered back to the
+browser. The console carried a second editor and a third
 credential form whose rules disagreed with it (one trimmed the password, one
 made "keep the stored one" impossible, one discarded what was typed); they are
 gone, and with them the `/console/networks/{name}/edit` and
@@ -1794,13 +2153,27 @@ input, including the resolved preset values. IRC addresses must be a syntactic
 REST, and console creation share that invariant so an invalid endpoint cannot
 be persisted into an endless reconnect loop. The identity a driver puts on the
 wire is parsed, not checked: `UpstreamNick`, `UpstreamRealname`, and
-`UpstreamChannel` are built only by `FromStr` at the one driver factory, so the
+`AutojoinChannel` (an `UpstreamChannel` and, for a keyed channel, its
+`ChannelKey`) are built only by `FromStr` at the one driver factory, so the
 configuration file, a stored row, and the API admit exactly the same values and
 a driver cannot be handed an unchecked one. The grammar is structural — what no
-server could read as one nickname or one channel (`al ice` is a two-parameter
-`NICK`; an autojoin entry of `0` means "leave every channel"; `#a key` supplies
-a key nobody configured) — not a network's nickname policy, which still comes
-back as a loud 432. A refusal names the request field it belongs to in the
+server could read as one nickname, one channel, or one key (`al ice` is a
+two-parameter `NICK`; an autojoin entry of `0` means "leave every channel";
+`#a,#b` is two channels; a key with a space, a comma, or a leading `:` is not
+one `JOIN` parameter) — not a network's nickname policy, which still comes
+back as a loud 432. An account network's autojoin entry is `#channel` or
+`#channel key`; the key is a secret of the channel's members, stored sealed
+under the owner's context in `bnc_networks.autojoin_keys_sealed` (migration
+0087: one entry per `autojoin` channel, NULL for none, held to one length and
+to IRC networks by table constraints), re-sealed by key rotation, opened only
+to build the driver, reported only as `autojoin_keyed` (the channels that have
+one), redacted in every `Debug`, and named in the audit trail as
+`autojoin_keys`. The driver joins a configured channel with the key it last
+saw for it (a `+k` since, or the key a client joined with) and otherwise with
+its configured key, so a keyed channel is rejoined after a restart. A
+server-level network's autojoin is public configuration — the administrator
+API returns it — so it names channels only, and an entry with a key in it is
+refused. A refusal names the request field it belongs to in the
 problem body (`field`), and both network forms mark, reveal, and focus that
 input. A blank real name means the nickname, on edit exactly as on create,
 because the form says so and an IRC network always has one. If no master key is configured,
@@ -1866,7 +2239,8 @@ via the console or REST, persisted, and started by the one feature-gated
 `bouncer::build_driver` factory that every construction site (config-network
 startup, DB-network boot, runtime create, re-enable) shares. Per-kind secrecy:
 the password is always sealed; a kind whose *account* field is a secret (Slack's
-bot token) seals that too, while an IRC `sasl_account` login name stays plaintext.
+bot token) seals that too, while an IRC `sasl_account` login name stays plaintext;
+an IRC channel's key is sealed, and a bridge's rooms and channel ids take none.
 Create, edit, and enable construct the prospective driver before mutating
 PostgreSQL, so a missing key or factory rejection cannot leave durable state
 claiming a driver configuration that never entered the live registry.
@@ -1916,15 +2290,42 @@ above the trait, provides for every network kind:
 - **Always-on presence**: driver stays up while zero clients are attached.
 - **Multi-client attach/detach**: any number of the user's IRC connections
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
-  are mirrored to all attached clients. A sender's own messages reach the
+  are mirrored to all attached clients. What answers one client's command is
+  that client's alone (`bouncer/replies.rs`): the replies to its `WHO`,
+  `WHOIS`, `LIST`, `NAMES`, `MODE` and `TOPIC` queries, its `INVITE` and
+  `AWAY` confirmations, and the error numerics and `FAIL`/`WARN`/`NOTE`
+  standard replies to anything it sent reach that attachment only, live, and
+  never enter the ring, the stored backlog or CHATHISTORY. With
+  `labeled-response` (plus `batch` and `message-tags`) enabled upstream, every
+  forwarded line carries a `label` and the upstream's labelled answer names its
+  attachment; the labelled batch is unwrapped. Otherwise the upstream answers
+  in order, so each forwarded command waits in a queue: a query's reply
+  numerics go to the oldest query that expects them (the one about the reply's
+  subject, when one is — a remote `WHOIS nick nick` answers after later
+  commands) until its end-of-reply numeric, an error goes to the oldest
+  command it names (by command, for 421/461/263, or by target), a command that
+  can end with no reply is closed by the answer to a correlation `PING`
+  written after it (one in flight, so a paste costs two), and anything still
+  waiting after 60 s is forgotten. What answers no pending command is the
+  session's, as before: conversation, membership, a numeric the upstream sent
+  unasked, and the topic and member list after our own `JOIN`, which are the
+  channel's state for every client. Each attachment's route holds 1,024
+  lines; a reply read more slowly than the network sends it loses the rest,
+  for that client alone, and it is told how many. The `/ws/ui` socket has a
+  route like a raw attach. A sender's own messages reach the
   stream exactly once. When the upstream offers `echo-message`, the driver
   requests it and relays the upstream's echo, which arrives only for a line the
   upstream accepted — a refused line (404, 486) is answered by the refusal
   alone, so a client that waits for its echo (as `e6irc send` does) learns the
-  truth; the echo is routed to the attachment that sent the line by matching
-  command, target and text against the lines awaiting one (at most 256; a
-  refused line's entry ages out). An upstream without `echo-message` gets the
-  echo synthesized when the line is written. Either way the originator
+  truth; the echo is routed to the attachment that sent the line by its label,
+  or by matching command, one target and text against the lines awaiting one
+  (at most 256; a refused line's entry ages out). A message to several targets
+  waits for, and is echoed as, one line per target — it is never filed as a
+  conversation named `#a,#b` — and an echo whose text the upstream cut to fit
+  its line with our prefix still matches the line it came from. An upstream
+  without `echo-message` gets the echo synthesized, per target, when the line
+  is written; the driver follows the upstream's `CAP DEL echo-message` (and
+  asks for what a `CAP NEW` offers) mid-session. Either way the originator
   receives its echo only when it negotiated `echo-message` on attach, the same
   contract a real server has, and a NickServ command that can carry a secret
   is redacted in the upstream's echo exactly as in a synthesized one. A bridge
@@ -1932,11 +2333,23 @@ above the trait, provides for every network kind:
   dropped, and each target the provider accepted is echoed once instead —
   under the bridge account's IRC identity, the prefix that copy would have
   carried — while a refused one is answered by its undelivered notice alone.
-  The `local` driver's synthesized echo shows the session as the core does,
-  the `USER` name verbatim.
+  The `local` driver negotiates `echo-message` with the core (§10.2), so its
+  echo is the core's, routed the same way.
   Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
+  Attached clients are always offered `message-tags` (the bouncer's own
+  CHATHISTORY, read markers and batches ride tags), but a network that cannot
+  carry client-only tags — an IRC upstream without `message-tags` — is described
+  to them with `CLIENTTAGDENY=*` (IRCv3 message-tags; in the welcome, and as a
+  live 005 when it changes): the tags are stripped before the line is
+  written, since a server that does not parse tags would read the tag section
+  as the command, and a `TAGMSG` is answered by the bouncer to its sender alone
+  with `FAIL TAGMSG CLIENT_TAGS_UNSUPPORTED` rather than refused with a 421 in
+  front of every client. The echo is made from the stripped line, so it never
+  shows a tag the network did not carry. soju strips the same way; offering
+  `message-tags` only when the upstream has it would take the bouncer's own
+  tag-borne features away from every client of such a network.
   What belongs to the attachment itself never reaches the upstream: a client's
   `PING` is answered locally (so lag checks work while the upstream is
   reconnecting or parked, and its `PONG`s do not fill the backlog), a `PONG` is
@@ -1961,7 +2374,21 @@ above the trait, provides for every network kind:
   attachment ends as too slow, where a parked write used to hide the network's
   removal and the client's silence from the relay for good.
 - **Detached buffering**: events accumulate in a per-network ring persisted
-  to PostgreSQL. A lifecycle notice is buffered and persisted once per
+  to PostgreSQL. Every line is stamped at ingest with the time it arrived when
+  it carries no valid `time` of its own — the upstream's lines on a network
+  without `server-time` (EFnet, IRCnet, QuakeNet), and the bouncer's own
+  notices — so the ring's replay, the stored `sent_at` and CHATHISTORY read one
+  time for it; a line restored from storage is stamped with its stored time.
+  The upstream's registration burst after `001` (002–005, the LUSERS numerics,
+  the MOTD, up to its end) is read — its 004/005 become the network's features
+  — and neither relayed nor retained, and a burst an older build stored is not
+  restored; a 005 later in the session is told to attached clients live, less
+  the tokens the bouncer answers for itself (§10.4). Where a new upstream
+  session begins the ring holds a session boundary with the session's state as
+  it began, and a raw attach replaying past it reconciles its client to it
+  exactly as a client attached then was (the old session's channels parted,
+  then the new session's JOINs), so a replay never shows a second JOIN without
+  the PART between. A lifecycle notice is buffered and persisted once per
   *transition* (lifecycle plus failure code); repeats are delivered live only.
   An upstream that is down all weekend would otherwise fill the ring, and then
   the stored backlog, with identical "reconnecting" lines and evict the very
@@ -1969,8 +2396,19 @@ above the trait, provides for every network kind:
   read markers (`bnc_read_markers`, served over `MARKREAD`); they are
   separate from the ircd core's per-account markers (§11) because a BNC
   target lives on an external network the core knows nothing about.
-- **Playback**: attaching clients receive the full detached ring,
-  tag-filtered by their negotiated caps. Subscription plus buffer snapshot is
+- **Playback**: attaching clients receive the detached ring,
+  tag-filtered by their negotiated caps. A raw IRC client presents no cursor,
+  so its account's read markers (`bnc_read_markers`, the `draft/read-marker`
+  positions it set with `MARKREAD`) are its position, conversation by
+  conversation: a message of a conversation the account has a marker for is
+  replayed only when it is newer than the marker (its `time`, which every
+  retained line carries), a conversation without one is replayed whole, and
+  lines that belong to no conversation — membership, nick changes, notices —
+  are always replayed, so the client's view of its session is complete. The
+  client is told how many messages it had already read were left to
+  CHATHISTORY, and told when the markers could not be read (the whole ring is
+  then replayed). The `/ws/ui` browser resumes from its own ring cursor
+  instead. Subscription plus buffer snapshot is
   one mutex-ordered boundary with publication, so a line is replayed or live,
   never both. A retained-event overrun is visible and terminal; reconnecting
   establishes a new authoritative boundary instead of continuing with possibly
@@ -2002,8 +2440,19 @@ above the trait, provides for every network kind:
 - **Authoritative attach state**: replay is followed by an
   `IrcSessionSnapshot` containing the current upstream nick and confirmed
   memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
-  reach it. A synthesized JOIN includes a minimal NAMES reply, with the
-  account's MARKREAD position before end-of-NAMES when negotiated. `/ws/ui`
+  reach it. A synthesized JOIN (the real one aged out of the ring) is followed,
+  on an IRC network, by the channel's real topic and member list: the bouncer
+  sends `TOPIC` and `NAMES` for the channel on the attaching client's behalf,
+  and the answers reach that client alone (§10.1's reply routing), as a
+  server's own answer to a JOIN would; the account's MARKREAD position follows
+  the JOIN, before the end of that list, when negotiated. A bridge, whose
+  provider has no member list to ask, and an upstream that cannot be asked
+  right now (its queue full, or parked — said in a notice) get a minimal
+  NAMES reply naming the session alone. Every line
+  the bouncer makes from the upstream's names fits one IRC line: a prefix
+  drops its user and host, or a PART its reason, when the names need the room,
+  and a line no shortening fits is replaced by a bounded notice saying what
+  could not be shown, never sent past the limit for the client to discard. `/ws/ui`
   sends the typed snapshot before its replay boundary; the browser separates
   current membership from transcript retention, so reconnect reconciliation
   marks a past channel instead of erasing its visible messages.
@@ -2025,14 +2474,36 @@ mean "assumed": the driver waits for the core's 001 (bounded by a 30 s
 `WELCOME_DEADLINE`, so a wedged core is a reported failure rather than a silent
 wait) and treats a refusal — the nickname is held by another session, or the
 welcome names a different one — exactly as the `irc` driver treats an
-upstream's.
+upstream's. Before registering it asks the core, in one all-or-nothing
+`CAP REQ`, for what makes the local network carry what any upstream offering
+them does: `message-tags` (an attached client's client-only tags — typing,
+reactions, replies — and its `TAGMSG` reach the core, and each message comes
+back with the `msgid` a reaction names), `server-time` (the backlog files and
+replays a line at the core's time), `echo-message` (our own message returns with
+the core's `msgid` and time, and only when the core accepted it — a synthesized
+echo had neither, so a reaction to one's own message named a message the
+backlog did not hold) and `account-tag` (offered to attached clients, as the
+`irc` driver asks every upstream for). Replies are told apart by order, which
+the core answers in, so `batch` and `labeled-response` are not asked for. The
+core is this binary: a refusal, or a welcome without the answer, is an
+`upstream_protocol_failed` drop, never a session that silently lacks them.
 
 ### 10.3 `irc` driver — external networks (ZNC/soju-style)
 
 - Full IRCv3 *client* implementation reusing `e6irc-proto` + the same SASL
   machinery; requests `server-time`, `message-tags`, and `account-tag`
-  from upstream when available (Libera: yes), and `echo-message`, in a
-  capability request of its own, when the upstream offers it (§10.1). An
+  from upstream when available (Libera: yes), and `echo-message`, `batch` and
+  `labeled-response` (the last only once `batch` is enabled), each in a
+  capability request of its own, when the upstream offers them (§10.1). What
+  is enabled follows the upstream's `CAP NEW` and `CAP DEL` for the whole
+  session: the connection tracks it, and the driver asks for a wanted
+  capability a `CAP NEW` offers and re-reads how it writes (echoes,
+  client-only tags, reply correlation) after every change. Names are compared
+  and classified the network's way everywhere — its 005 `CASEMAPPING`,
+  `CHANTYPES` and `STATUSMSG`, read through the client crate's
+  `NetworkNames` — in the session tracker, the rejoin set, echo matching,
+  requested-nick confirmation and history filing; only the welcome, which
+  arrives before any 005, is compared under RFC 1459. An
   upstream's SASL password or server password crosses only TLS, or a plaintext
   connection to a loopback address *literal* under
   `internal_upstreams = "allow"` (the test harness): every ingress refuses
@@ -2149,7 +2620,19 @@ upstream's.
   before the drop — comma-joined within the 510-byte line, so a heavy user's
   hundred channels are a handful of lines rather than a burst Solanum's flood
   limit answers with "Excess Flood" (runtime JOIN/PART/KICK are tracked as they
-  are acknowledged upstream). Tracked membership is bounded at 512 channels, per session and in
+  are acknowledged upstream). A keyed channel is rejoined with its key, keyed
+  channels first on each line so every key lands on its channel: the key a
+  client's `JOIN` offered once the upstream confirms that channel, then any
+  `+k`/`-k` the channel sees (read with the network's `CHANMODES` and
+  `PREFIX`), and failing both the key the owner configured for an autojoin
+  channel. A key is a secret of the channel's members: a learned one is held
+  in memory beside the reconnect intent only, a configured one is stored
+  sealed (§10, the network manager), and its `Debug` is redacted. A channel
+  whose rejoin the upstream refuses (403, 471, 473, 474, 475) is dropped from
+  the intent, with a `*bnc*` notice, rather than retried and refused after
+  every reconnect; and a client's `PART` of a channel the intent holds but the
+  session is not in drops it too, answered by a `*bnc*` notice before the
+  upstream's own 442. Tracked membership is bounded at 512 channels, per session and in
   the reconnect intent: the names come from the upstream, which a tenant may
   point at a server of their own, so an unbounded set was a memory and
   reconnect-flood lever on the shared daemon. Past the bound the session ends
@@ -2289,7 +2772,12 @@ are the core's, read the same way; bounded in number and length, `-TOKEN`
 honoured), or a bridge's fixed set when the network has reported none. The
 bouncer adds only what it serves itself — `CHATHISTORY` and `MSGREFTYPES`, and
 only when the network has a history store — replacing the network's own, whose
-limits say nothing about paging the bouncer's store.
+limits say nothing about paging the bouncer's store; and `CLIENTTAGDENY`, which
+is `*` while the network cannot carry client-only tags (§10.1) and the
+network's own value otherwise. Because the network's registration burst is
+never relayed or replayed (§10.1), no later line can put the network's own
+values of these back; a 005 the network sends later in the session reaches
+attached clients live with them removed.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 
@@ -2533,6 +3021,18 @@ Design constraints recorded now:
   could repeat would silently lose history; naming the shard and the boot makes
   a repeat impossible by construction. Every reader — CHATHISTORY pivots, the
   bouncer, clients — treats the id as opaque.
+  A message keeps the client-only tags it was relayed with (`+draft/reply`,
+  `+draft/react`, …: whatever the relay policy passes — the core relays every
+  valid `+` tag, and bounds them with the client's 4094-byte tag section), in
+  the ring and in `messages.client_tags` (migration 0081), and a `TAGMSG` is
+  history too — a reaction is part of the conversation — stored as a row of
+  kind `tagmsg` with no text. Replay gives a `message-tags` reader both exactly
+  as they were delivered, so a threaded reply keeps its parent and a reaction
+  what it reacts to. A typing indicator (`+typing`, `+draft/typing`) describes
+  a moment, not a message: it is never stored, a TAGMSG carrying nothing else
+  does not enter history, and the bouncer tells such a TAGMSG live without
+  retaining it in its ring or `bnc_buffer` (whose raw lines otherwise keep every
+  tag, so its CHATHISTORY replays the same client-only tags).
 - **11.1.1 Conversations**: a direct message is stored **once**, under a key
   built from both participants' *identities* sorted and joined by `!`. Sorting
   makes the key symmetric, so both sides read the same thread from the single
@@ -2558,17 +3058,40 @@ Design constraints recorded now:
   session gains an account — the field is write-private — and it performs the
   release. An authenticated participant keeps such a conversation for
   exactly as long as the other party holds the nick; CHATHISTORY TARGETS finds
-  each channel's newest message with one backward index probe (LATERAL
-  `max(ts)`), and lists
+  each channel's newest entry in the reader's scope (§11.3) with one backward
+  index scan (LATERAL `max(ts)`, stepping over the `TAGMSG`s a text-scope reader
+  cannot be sent) and each stored conversation's from `dm_conversations` (§8), reading
+  at most the request's limit of summary rows rather than every stored direct
+  message of the requester, and lists
   it from the ring alongside what the database returns. Only a conversation
   between two accounts is stored, and a stored conversation is always addressed
   by one exact key. Migration 0058 deleted the `~` conversations stored before
   this rule.
   The BNC persistence path applies the same symmetry to raw external-network
   lines: an inbound direct message is keyed by its source and a synthesized
-  outbound echo by its recipient, both RFC1459-folded. TARGETS and paging
-  therefore expose one peer buffer containing both directions, including after
-  restart or a nick change between emission and persistence.
+  outbound echo by its recipient. What is a channel, which STATUSMSG sigils
+  file a message under its channel, and when two names are the same are the
+  network's own (`CHANTYPES`, `STATUSMSG`, `CASEMAPPING`): a conversation's key
+  is its name folded the network's way (`target`, with the mapping in
+  `target_casemapping`), and the name as the network spelled it is kept
+  beside it (`target_display`, migration 0076). Rows keyed under another
+  mapping — stored before the network said, or before it changed — are
+  re-keyed from their spelling by the persistence task before it writes, and
+  a restarted network compares names under the mapping its newest rows were
+  keyed with until the network says again. The account's read markers on the
+  network (`bnc_read_markers`) are keyed the same way and keep the same two
+  facts beside the key (the name as MARKREAD spelled it and the mapping it was
+  folded under, migration 0086); every marker read or write names the
+  network's current mapping and first re-keys, under the account's row lock,
+  what was folded under another — two names the new mapping makes one merge at
+  the later position — so an `ascii` network's `#a[` keeps its marker across a
+  mapping change. TARGETS names each conversation as
+  spelled, never by its key, which on another mapping can name someone else;
+  CHATHISTORY accepts any target structurally (one parameter of at most 200
+  bytes), since nick grammar, channel types and lengths are the network's.
+  TARGETS and paging therefore expose one peer buffer containing both
+  directions, including after restart or a nick change between emission and
+  persistence.
 - **11.2 Query surface**: IRCv3 `CHATHISTORY` (BEFORE/AFTER/AROUND/BETWEEN/
   LATEST/TARGETS) for IRC clients; `GET /api/v1/history/...` for the web
   client and API consumers — both hit the same query layer, including direct
@@ -2617,10 +3140,20 @@ Design constraints recorded now:
   stored `TAGMSG` is nothing but tags, so a client that did not negotiate
   `message-tags` cannot receive one at all, and excluding those rows after the
   `LIMIT` returned fewer lines than asked for — indistinguishable from the end
-  of the buffer. `BncHistoryScope` is built from that one capability and rides
-  into the query, so the `LIMIT` counts only deliverable lines, and TARGETS
-  answers in the same scope rather than naming a conversation whose page comes
-  back empty. What decides it is `bnc_buffer.command`, a column generated from
+  of the buffer. The core cuts its pages the same way: a `HistoryScope` built
+  from the reader's `message-tags` excludes stored TAGMSG rows in the ring
+  filter and in the SQL before the `LIMIT` (the REST API, which serves text,
+  reads in the text scope). TARGETS answers in the reader's scope too: a
+  buffer is dated by its newest entry the reader can be sent, and one whose
+  only activity in the window is `TAGMSG`s is not listed for a reader without
+  `message-tags` — naming it would promise a page that comes back empty. The
+  ring keeps its newest time per scope, the channel query cuts by kind, and a
+  conversation's summary keeps both times (§8, migration 0085); one
+  `by_history_scope!` in `db.rs` spells what a scope means in SQL for pages,
+  windows and TARGETS alike. The bouncer does the same:
+  `BncHistoryScope` is built from that one capability
+  and rides into the query, so the `LIMIT` counts only deliverable lines, and TARGETS
+  answers in the same scope. What decides it is `bnc_buffer.command`, a column generated from
   the line (migration 0069) rather than written beside it: it cannot disagree
   with the line it describes, it covers rows stored before it existed, and it
   reads the frame — a message whose *body* mentions `TAGMSG` still arrives. A session may have at most 8 history requests waiting on the
@@ -2653,9 +3186,10 @@ Design constraints recorded now:
   O(targets)); an identity → conversations index answers "free this `~nick`'s
   conversations" on every unauthenticated disconnect or nick change, and
   CHATHISTORY TARGETS' conversation list, without visiting any other ring; and
-  each ring keeps its newest timestamp as a sliding-window maximum (entries
-  arrive in wall-clock order from several clocks, so the back entry is not
-  necessarily the newest). A permanently deleted account's hot copy follows
+  each ring keeps its newest timestamp in each `HistoryScope` as a
+  sliding-window maximum over the entries that scope admits (entries arrive in
+  wall-clock order from several clocks, so the back entry is not necessarily
+  the newest), which a channel's owner publishes for TARGETS on every shard. A permanently deleted account's hot copy follows
   the database purge: its lines and its conversations leave the rings, and
   its entries leave every channel's access list, on every shard.
 
@@ -2703,9 +3237,22 @@ Surface (initial):
   `password`, or `remove`; only an IRC network accepts `set` or `remove`);
   create and the connection test take an optional `server_password`, a value
   that cannot travel in one `PASS` line is a 400 naming `server_password`, and
-  responses report `has_server_password`, never the value. The tagged actions
-  refuse stray fields, so a password typed beside `keep` is refused rather than
-  silently dropped. Both browser clients omit a blank credential field rather
+  responses report `has_server_password`, never the value. Channel keys have a
+  required action too: an autojoin entry `#channel key` sets that channel's
+  key, the channels named in `autojoin_keys.keep` (listed without a new key)
+  keep theirs, and every other channel has none; a keep for a channel that is
+  not listed, has no stored key, or is given a new key beside it is a 400
+  naming `autojoin`, and responses report `autojoin_keyed`, never a key. The
+  tagged actions refuse stray fields, so a password typed beside `keep` is
+  refused rather than silently dropped. A stored secret never follows the
+  network somewhere else: when the destination changes — the IRC host or port,
+  TLS turned off, a bridge's API base or homeserver moved to another origin — a
+  secret carried over unchanged (by `keep`, or by replacing only the other half
+  of a pair) is a `409` naming `credentials`, `server_password`, or `autojoin`,
+  so whoever may edit a network cannot point it at their own listener and have
+  the server send them a password or key the API never reveals. The rule lives
+  in the one function that applies every credential action, comparing the
+  stored row with the edited one. Both browser clients omit a blank credential field rather
   than sending null; an
   account box emptied against a stored account, or a value typed under a
   ticked Remove, is refused at the box rather than resolved one way or the
@@ -2720,7 +3267,12 @@ Surface (initial):
   value.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
-  canonical MLOCK, access flags, founder transfer, unregister)
+  canonical MLOCK, access flags, founder transfer, unregister). A topic is
+  stored whole or refused: TOPICLEN bounds it, and so does the TOPIC line that
+  carries it, whose head (the server's and the channel's names) can leave
+  less room than TOPICLEN; a topic that does not fit is a `400` naming how
+  much fits, never a shortened topic answered as success. (IRC `TOPIC` keeps
+  IRC's own rule, truncation, because an IRC client expects it.)
 - `history`: paged queries per §11.2
 - `admin`: bounded, exact-filtered/stable-cursor account posture, registered
   channel policy, global K/D/X-line policy, and audit log; server stats;
@@ -2740,7 +3292,24 @@ The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
 dependency). Its method/path inventory and path/query parameter declarations
 are checked against the Axum API router; a mismatch is a unit-test failure and
-the endpoint refuses to serve a plausible but incomplete contract.
+the endpoint refuses to serve a plausible but incomplete contract. The
+statuses a request can meet before its handler runs are derived, not listed:
+the route table records each handler's argument types, so every operation
+whose handler takes `RateLimited` documents its `429`, every account-
+authenticated one the admission statuses, and every operation the service's
+own bounds (`408` deadline, `413` body limit, and — except the probes — the
+per-address in-flight `429`); the validator refuses a document that drops
+one. The body limit's refusal is a problem document like every other: the
+limit layer's plain-text answer to a declared oversize length and an
+extractor's to a streamed one pass through one `payload_too_large`. That
+refusal is answered before the client has finished sending, so an HTTP
+connection closes lingering (`lingering_close`): it shuts its write half,
+then reads and discards what the client still sends, for at most 2 s or
+8 MiB, before dropping the socket. Closing on unread input sends a reset,
+and a reset lets the client's stack discard the answer it had not read yet
+(macOS and Windows do), so the client saw a reset instead of the `413`. The live
+chat socket `/ws/ui` is in the contract too, as the `GET` it is (an upgrade
+answered `101`), with its query, its refusals, and its close codes.
 
 ---
 
@@ -2857,7 +3426,8 @@ membership sigils and which modes take a parameter from the network's own
 the ring; RFC-style defaults until the network sends them), and the
 client offers a join-channel input and click-to-query on nicks. On phone widths
 the member list is a header-toggled panel mirroring the conversation rail. The
-sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
+sign-out control, a form POST carrying the session's CSRF value in its body,
+exists only once `/me` has supplied that value and the sign-out URL.
 
 ### 13.2 Live chat over WebSocket
 
@@ -3247,7 +3817,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   each channel succession) and server bans; an upstream account command is recorded before it is sent,
   and a 503 answers when it cannot be. OPER, KILL and SETHOST are recorded under
   the operator name and refused with a NOTICE when the audit row cannot be
-  queued; an HTTP disconnect whose audit cannot be written is a 503. A
+  queued; an IRC-issued K/D/X-line's row is recorded under the operator name
+  too (the `set_by` STATS shows stays the nick); an HTTP disconnect whose audit
+  cannot be written is a 503. A
   suspension's disconnect is not refusable, because `ACCOUNT_SUSPEND` has
   already committed.
 - Administrator authority is read from the account row on every request
@@ -3524,8 +4096,8 @@ Layers, bottom to top:
    direct real-server integration tests. The matrix identifies partial
    journeys where adjacent layers are proven separately.
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
-   running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
-   over real sockets, including TLS.
+   running `e6ircd` + Postgres (in CI, a GitHub Actions `postgres` service
+   container); IRC flows exercised over real sockets, including TLS.
 8. **Released settings rows**: `tests/fixtures/server_settings/` holds the
    managed configuration each release stored, captured by that release's own
    code and named `<its last migration>-<release>.json`; a PostgreSQL test
@@ -3538,7 +4110,13 @@ Layers, bottom to top:
    off: pages send `Cross-Origin-Opener-Policy: same-origin`, and the context
    swap it causes makes Playwright's Firefox driver lose a page's events
    (microsoft/playwright#42731), so a reload hung about one run in five. Focused replay/race/membership cases use
-   browser-side network/history/WebSocket doubles. A separate full-stack case
+   browser-side network/history/WebSocket doubles. Those doubles stub
+   responses, never the contract: `web/test/visual.spec.js` answers
+   `/api/v1/openapi.json` with `web/test/fixtures/openapi.json`, a checked-in
+   copy of the served document that a unit test in `http/openapi.rs` keeps
+   equal to it (a stale copy fails the test and is rewritten in place), and the
+   console runtime's `/console-contract.js` double re-exports the real module,
+   replacing only its two network functions. A separate full-stack case
    edits every managed-configuration subsection and credential collection,
    proves persisted themes and the desktop-notification boundary, creates a
    network through the console, crosses real PostgreSQL, registry, IRC-driver,

@@ -63,19 +63,17 @@ pub(super) async fn list_browser_sessions(
 /// Revoke one browser session owned by the caller. Revoking the request's
 /// current cookie also clears that cookie, so the browser cannot retain a
 /// visibly logged-in but invalid credential.
+///
+/// Browser sessions are managed by browser sessions, one at a time or all but
+/// the current one alike: a bearer is refused by both, so a token cannot sign
+/// its owner out of every browser by revoking them one by one where the bulk
+/// operation would refuse it.
 pub(super) async fn revoke_browser_session(
     State(state): State<Arc<AppState>>,
-    Authenticated(account, credential): Authenticated,
+    BrowserSession(account, session): BrowserSession,
     PathParams(id): PathParams<i64>,
 ) -> Response {
-    match crate::db::delete_web_session_by_id(
-        pool_of(&state),
-        &account,
-        id,
-        credential.browser_session(),
-    )
-    .await
-    {
+    match crate::db::delete_web_session_by_id(pool_of(&state), &account, id, Some(&session)).await {
         Ok(Some(was_current)) => {
             let mut response = StatusCode::NO_CONTENT.into_response();
             if was_current {
@@ -92,6 +90,82 @@ pub(super) async fn revoke_browser_session(
         Ok(None) => problem(StatusCode::NOT_FOUND, "No such browser session", None),
         Err(error) => {
             eprintln!("http: browser session revoke failed: {error}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
+/// A step-up re-authentication by the account's primary password.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReauthenticateRequest {
+    password: String,
+}
+
+/// Prove the browser session's person again with the account's primary
+/// password, so the operations that mint or redirect lasting authority are
+/// admitted for the next [`crate::db::STEP_UP_WINDOW`]. The check is the
+/// login's: per-address budget, per-account attempt throttle, one Argon2
+/// verification. An account without a primary password re-authenticates
+/// through its identity provider instead
+/// (`POST /api/v1/me/reauthenticate/oidc/{provider}`).
+pub(super) async fn reauthenticate_with_password(
+    State(state): State<Arc<AppState>>,
+    _rl: RateLimited,
+    SessionMutation(account, session): SessionMutation,
+    JsonBody(request): JsonBody<ReauthenticateRequest>,
+) -> Response {
+    if let Some(detail) = password_input_error(&request.password) {
+        return problem_at_field(
+            StatusCode::BAD_REQUEST,
+            "Invalid password",
+            Some(detail),
+            Some("password"),
+        );
+    }
+    let pool = pool_of(&state);
+    match crate::db::verify_local_password(pool, &account, &request.password).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return problem_at_field(
+                StatusCode::UNAUTHORIZED,
+                "Password is incorrect",
+                None,
+                Some("password"),
+            );
+        }
+        Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+            return login_throttled(retry_after);
+        }
+        Err(error) => {
+            eprintln!("http: re-authentication failed: {error}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    }
+    match crate::db::mark_session_reauthenticated(
+        pool,
+        &account,
+        &session,
+        crate::db::Reauthentication::Password,
+    )
+    .await
+    {
+        Ok(true) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Ok(false) => problem(StatusCode::UNAUTHORIZED, "Not logged in", None),
+        Err(error) => {
+            eprintln!("http: re-authentication failed: {error}");
             problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",

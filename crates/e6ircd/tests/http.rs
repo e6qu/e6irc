@@ -50,6 +50,7 @@ async fn add_server_ban(
             set_by: set_by.into(),
             kind: kind.into(),
         },
+        &e6ircd::db::AuditPrincipal::account(set_by),
     )
     .await
     .map(|_| ())
@@ -176,6 +177,21 @@ fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
         let (header, value) = line.split_once(':')?;
         header.eq_ignore_ascii_case(name).then_some(value.trim())
     })
+}
+
+/// A sign-out form post: the session cookie, and the CSRF value in the form
+/// body when one is given — never in the URL.
+fn logout_form(cookie: Option<&str>, csrf: Option<&str>) -> String {
+    let cookie_header = cookie
+        .map(|value| format!("Cookie: e6irc_session={value}\r\n"))
+        .unwrap_or_default();
+    let body = csrf.map(|csrf| format!("csrf={csrf}")).unwrap_or_default();
+    format!(
+        "POST /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\n{cookie_header}\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn csrf_from_html(html: &str) -> &str {
@@ -1003,6 +1019,61 @@ async fn the_per_address_authentication_budget_says_when_to_retry() {
     assert!((1..=60).contains(&wait), "{head}");
 }
 
+/// The body limit answers before any handler, in the same shape as every
+/// other refusal (DESIGN §12: problem documents, all of them).
+#[tokio::test]
+async fn a_body_over_the_limit_is_a_problem_json_413() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    let declared = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{{}}",
+        2 * 1024 * 1024
+    );
+    let (status, head, body) = request(http, &declared).await;
+    assert_problem(status, &head, &body, 413);
+    let chunk = "x".repeat(64 * 1024);
+    // A body that declares no length is refused once it passes the limit.
+    let mut streamed = String::from(
+        "POST /api/v1/auth/device/token HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    for _ in 0..20 {
+        streamed.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    streamed.push_str("0\r\n\r\n");
+    let (status, head, body) = request(http, &streamed).await;
+    assert_problem(status, &head, &body, 413);
+}
+
+/// A callback can make the server call the provider's token endpoint, so it
+/// spends the same per-address budget as the flow's start.
+#[tokio::test]
+async fn the_oidc_callback_spends_the_authentication_budget() {
+    let mut config = test_config();
+    config.limits.auth_rate_burst = Some(1);
+    config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
+        name: "corp".into(),
+        issuer_url: "https://idp.invalid".into(),
+        client_id: "e6irc".into(),
+        client_secret: "secret".into(),
+        account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+        scopes: vec![],
+        allowed_email_domains: vec![],
+        end_session_endpoint: None,
+        token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+    }];
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let callback = get("/api/v1/auth/oidc/corp/callback?code=stolen&state=kept");
+    // The one token is spent on a refusal for want of a flow cookie.
+    let (status, _, _) = request(http, &callback).await;
+    assert_eq!(status, 401);
+    let (status, head, body) = request(http, &callback).await;
+    assert_problem(status, &head, &body, 429);
+}
+
 /// Send a WebSocket upgrade for `/ws/irc` and read only the response head, so
 /// an accepted connection stays open and keeps its per-address slot.
 async fn open_irc_websocket(addr: std::net::SocketAddr) -> (TcpStream, u16, String, String) {
@@ -1523,7 +1594,7 @@ async fn bnc_network_management_lifecycle() {
     // Full configuration replacement is available through REST as well. The
     // credential action is mandatory even when there is no secret to change.
     let update = format!(
-        r##"{{"addr":"{up}","tls":false,"nick":"alice_updated","username":"alice_upda","realname":"Alice","autojoin":["#other"],"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"##
+        r##"{{"addr":"{up}","tls":false,"nick":"alice_updated","username":"alice_upda","realname":"Alice","autojoin":["#other"],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"##
     );
     let update_req = format!(
         "PUT /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
@@ -1834,7 +1905,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         "must refuse to store a server password unsealed"
     );
 
-    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":[],"credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
+    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":[],"autojoin_keys":{"keep":[]},"credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
     let remove_req = format!(
         "PUT /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remove}",
@@ -2064,7 +2135,7 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
     // byte, set reseals, remove clears.
     let put = |server_password: &str| {
         let body = format!(
-            r#"{{{identity},"autojoin":[],"credentials":{{"action":"keep"}}{server_password}}}"#
+            r#"{{{identity},"autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}}{server_password}}}"#
         );
         format!(
             "PUT /api/v1/me/networks/private HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
@@ -2096,6 +2167,34 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
         secret_key.open(&resealed, &context).unwrap(),
         "rotated-9c1e"
     );
+    // A stored secret never follows the network to a new destination: moving
+    // it while keeping the password is refused at the field, and nothing is
+    // changed; entering the password again moves it.
+    let moved = format!(
+        r#""addr":"127.0.0.1:{}","tls":false,"nick":"alice_","username":"alice_","realname":"Alice""#,
+        up.port() + 1
+    );
+    let put_moved = |server_password: &str| {
+        let body = format!(
+            r#"{{{moved},"autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}}{server_password}}}"#
+        );
+        format!(
+            "PUT /api/v1/me/networks/private HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (status, _, body) =
+        request(http, &put_moved(r#","server_password":{"action":"keep"}"#)).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(problem_field(&body), "server_password", "{body}");
+    assert_eq!(stored().await.as_deref(), Some(resealed.as_str()));
+    let (status, _, body) = request(
+        http,
+        &put_moved(r#","server_password":{"action":"set","password":"rotated-9c1e"}"#),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
     let (status, _, body) = request(http, &put(r#","server_password":{"action":"remove"}"#)).await;
     assert_eq!(status, 204, "{body}");
     assert_eq!(stored().await, None);
@@ -2114,9 +2213,9 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
     assert!(
         details
             .iter()
-            .filter(|detail| detail.contains("changed: server_password"))
+            .filter(|detail| detail.contains("server_password") && detail.contains("changed: "))
             .count()
-            >= 2,
+            >= 3,
         "{details:?}"
     );
     assert!(
@@ -2124,6 +2223,287 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
             .iter()
             .all(|detail| !detail.contains("letmein") && !detail.contains("rotated")),
         "{details:?}"
+    );
+}
+
+/// An upstream that welcomes every registration and reports each `JOIN` line
+/// it is sent, for the channel-key test to read.
+async fn joining_upstream() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (joins_tx, joins_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let joins = joins_tx.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = tokio::io::BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let reply = if line == "CAP LS 302" {
+                        ":up CAP * LS :".to_owned()
+                    } else if let Some(nick) = line.strip_prefix("NICK ") {
+                        format!(":up 001 {nick} :welcome")
+                    } else if let Some(token) = line.strip_prefix("PING ") {
+                        format!(":up PONG up {token}")
+                    } else {
+                        if line.starts_with("JOIN ") && joins.send(line).is_err() {
+                            return;
+                        }
+                        continue;
+                    };
+                    if writer
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, joins_rx)
+}
+
+/// An autojoin channel's key over the API: written after its channel on
+/// create, stored sealed under the owner's context, joined with, never
+/// returned (only which channels have one), kept, replaced, or removed on a
+/// replace only as the request says, never carried to a new destination, and
+/// joined with again by the driver a restart builds from the stored row.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_autojoin_key_is_sealed_write_only_and_joined_across_a_restart() {
+    let url = support::test_db("autojoin_key_is_sealed_write_only").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("autojoin-key-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("token");
+    let (up, mut joins) = joining_upstream().await;
+    let config = || Config {
+        server_name: "irc.keys.example".into(),
+        network_name: "KeyNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path.clone(),
+            previous_key_files: Vec::new(),
+        }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    };
+    let running = net::start(config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    let identity = format!(
+        r#""addr":"{up}","tls":false,"nick":"alice_","username":"alice_","realname":"Alice""#
+    );
+    let problem_field = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).expect("problem JSON")["field"].clone()
+    };
+    let mut next_join = async || {
+        tokio::time::timeout(deadline::HANG, joins.recv())
+            .await
+            .expect("the driver joins")
+            .expect("the upstream is listening")
+    };
+
+    // A key that cannot be one JOIN parameter is refused at its field.
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(r##"{{"kind":"irc","name":"bad",{identity},"autojoin":["#staff two words"]}}"##),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(problem_field(&body), "autojoin", "{body}");
+    assert!(!body.contains("two words"), "{body}");
+
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(
+            r##"{{"kind":"irc","name":"keyed",{identity},"autojoin":["#staff hunter2-4b1d","#open"]}}"##
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(next_join().await, "JOIN #staff,#open hunter2-4b1d");
+    let context = e6ircd::bouncer::bnc_secret_context("alice");
+    let stored = async || {
+        e6ircd::db::get_bnc_network(&pool, "alice", "keyed")
+            .await
+            .expect("get")
+            .expect("network")
+            .autojoin
+    };
+    let autojoin = stored().await;
+    assert_eq!(autojoin[0].channel, "#staff");
+    let sealed = autojoin[0].key_sealed.clone().expect("a stored key");
+    assert!(e6ircd::secret::is_sealed(&sealed), "stored in the clear");
+    assert_eq!(secret_key.open(&sealed, &context).unwrap(), "hunter2-4b1d");
+    assert_eq!(autojoin[1], e6ircd::db::BncAutojoin::from("#open"));
+    assert!(!format!("{autojoin:?}").contains(&sealed));
+    let detail_req = format!(
+        "GET /api/v1/me/networks/keyed HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).expect("detail");
+    assert_eq!(detail["autojoin"], serde_json::json!(["#staff", "#open"]));
+    assert_eq!(detail["autojoin_keyed"], serde_json::json!(["#staff"]));
+    assert!(
+        !body.contains("hunter2") && !body.contains(&sealed),
+        "{body}"
+    );
+
+    let put_to = |addr: &str, autojoin: &str, keep: &str| {
+        let body = format!(
+            r#"{{"addr":"{addr}","tls":false,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":{autojoin},"autojoin_keys":{{"keep":{keep}}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"#
+        );
+        format!(
+            "PUT /api/v1/me/networks/keyed HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let here = up.to_string();
+    let put = |autojoin: &str, keep: &str| put_to(&here, autojoin, keep);
+
+    // Kept: the ciphertext byte for byte, and the restarted driver joins with it.
+    let (status, _, body) = request(http, &put(r##"["#STAFF","#open"]"##, r##"["#staff"]"##)).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        stored().await[0].key_sealed.as_deref(),
+        Some(sealed.as_str())
+    );
+    assert_eq!(next_join().await, "JOIN #STAFF,#open hunter2-4b1d");
+
+    // A keep that would do nothing, or that contradicts a new key, is refused
+    // and changes nothing.
+    for (autojoin, keep) in [
+        (r##"["#staff","#open"]"##, r##"["#gone"]"##),
+        (r##"["#staff","#open"]"##, r##"["#open"]"##),
+        (r##"["#staff new","#open"]"##, r##"["#staff"]"##),
+        (r##"["#open"]"##, r##"["#staff"]"##),
+    ] {
+        let (status, _, body) = request(http, &put(autojoin, keep)).await;
+        assert_eq!(status, 400, "{autojoin} {keep}: {body}");
+        assert_eq!(problem_field(&body), "autojoin", "{body}");
+    }
+    assert_eq!(
+        stored().await[0].key_sealed.as_deref(),
+        Some(sealed.as_str())
+    );
+
+    // A kept key never follows the network to a new destination.
+    let elsewhere = format!("127.0.0.1:{}", up.port() + 1);
+    let (status, _, body) = request(
+        http,
+        &put_to(&elsewhere, r##"["#staff","#open"]"##, r##"["#staff"]"##),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(problem_field(&body), "autojoin", "{body}");
+    assert_eq!(
+        stored().await[0].key_sealed.as_deref(),
+        Some(sealed.as_str())
+    );
+
+    // Replaced: resealed, and joined with.
+    let (status, _, body) = request(http, &put(r##"["#staff rotated-77a0","#open"]"##, "[]")).await;
+    assert_eq!(status, 204, "{body}");
+    let resealed = stored().await[0].key_sealed.clone().expect("a stored key");
+    assert_ne!(resealed, sealed);
+    assert_eq!(
+        secret_key.open(&resealed, &context).unwrap(),
+        "rotated-77a0"
+    );
+    assert_eq!(next_join().await, "JOIN #staff,#open rotated-77a0");
+
+    // A restart builds the driver from the stored row, key included.
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
+    let running = net::start(config()).await.expect("restart");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    assert_eq!(next_join().await, "JOIN #staff,#open rotated-77a0");
+
+    // Removed: listed without a key and not kept.
+    let (status, _, body) = request(http, &put(r##"["#staff","#open"]"##, "[]")).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(
+        stored()
+            .await
+            .iter()
+            .all(|entry| entry.key_sealed.is_none())
+    );
+    assert_eq!(next_join().await, "JOIN #staff,#open");
+    let (_, _, body) = request(http, &detail_req).await;
+    let detail: serde_json::Value = serde_json::from_str(&body).expect("detail");
+    assert_eq!(detail["autojoin_keyed"], serde_json::json!([]));
+
+    // The audit trail names the field, never the value.
+    let details: Vec<String> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action IN ('NETWORK_CREATE', 'NETWORK_UPDATE') ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert!(details[0].contains("autojoin_keys"), "{details:?}");
+    assert!(
+        details
+            .iter()
+            .filter(|detail| detail.contains("autojoin_keys"))
+            .count()
+            >= 3,
+        "{details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .all(|detail| !detail.contains("hunter2") && !detail.contains("rotated")),
+        "{details:?}"
+    );
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
     );
 }
 
@@ -2258,6 +2638,7 @@ async fn openapi_spec_is_served() {
             "username",
             "realname",
             "autojoin",
+            "autojoin_keyed",
             "sasl_account",
             "has_sasl_account",
             "has_sasl_password",
@@ -2620,7 +3001,10 @@ async fn openapi_spec_is_served() {
         ("/api/v1/me/password", "put"),
         ("/api/v1/me/credentials", "post"),
         ("/api/v1/me/identities/{id}", "delete"),
-        ("/api/v1/auth/oidc/{provider}/link", "get"),
+        ("/api/v1/me/sessions/{id}", "delete"),
+        ("/api/v1/auth/oidc/{provider}/link", "post"),
+        ("/api/v1/me/reauthenticate", "post"),
+        ("/api/v1/me/reauthenticate/oidc/{provider}", "post"),
         ("/api/v1/me/tokens", "post"),
         ("/api/v1/auth/device/approve", "post"),
     ] {
@@ -2665,12 +3049,12 @@ async fn openapi_spec_is_served() {
             "OIDC callback lacks {status}"
         );
     }
-    for path in [
-        "/api/v1/auth/oidc/{provider}/start",
-        "/api/v1/auth/oidc/{provider}/sso",
-        "/api/v1/auth/oidc/{provider}/link",
+    for (path, method) in [
+        ("/api/v1/auth/oidc/{provider}/start", "get"),
+        ("/api/v1/auth/oidc/{provider}/sso", "get"),
+        ("/api/v1/auth/oidc/{provider}/link", "post"),
     ] {
-        let responses = &v["paths"][path]["get"]["responses"];
+        let responses = &v["paths"][path][method]["responses"];
         assert!(responses["502"].is_object(), "{path} lacks 502");
         assert!(responses["429"].is_object(), "{path} lacks 429");
     }
@@ -2683,14 +3067,38 @@ async fn openapi_spec_is_served() {
             "{path}: no server-held login capacity exists to run out of"
         );
     }
-    assert!(
-        v["paths"]["/api/v1/auth/oidc/{provider}/link"]["get"]["parameters"]
-            .as_array()
-            .expect("link parameters")
-            .iter()
-            .any(|parameter| parameter["name"] == "csrf" && parameter["required"] == true),
-        "linking documents its required CSRF query value"
-    );
+    // No operation takes the session's CSRF value in its URL.
+    for (path, item) in v["paths"].as_object().expect("paths") {
+        for (method, operation) in item.as_object().expect("path item") {
+            assert!(
+                !operation["parameters"]
+                    .as_array()
+                    .is_some_and(|parameters| parameters
+                        .iter()
+                        .any(|parameter| parameter["name"] == "csrf")),
+                "{method} {path} takes the CSRF value in its URL"
+            );
+        }
+    }
+    // Every operation that mints or redirects lasting authority says it can
+    // ask for a recent sign-in, by the problem type the console acts on.
+    for (path, method) in [
+        ("/api/v1/me/tokens", "post"),
+        ("/api/v1/me/credentials", "post"),
+        ("/api/v1/auth/oidc/{provider}/link", "post"),
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/account", "delete"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/auth/device/approve", "post"),
+    ] {
+        assert!(
+            v["paths"][path][method]["responses"]["403"]["description"]
+                .as_str()
+                .is_some_and(|description| description
+                    .contains("urn:e6irc:problem:reauthentication-required")),
+            "{method} {path}"
+        );
+    }
     assert_eq!(
         v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["parameters"][1]["schema"]["default"],
         200
@@ -3027,6 +3435,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         .expect("open buffer"),
         Some("alice"),
         ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>",
+        &e6irc_client::NetworkNames::default(),
     )
     .await
     .expect("seed hostile backlog line");
@@ -4533,9 +4942,15 @@ async fn admin_accounts_endpoint_is_gated() {
     add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
-    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
-        .await
-        .expect("audit");
+    e6ircd::db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("alice"),
+        "KLINE",
+        &e6ircd::db::AuditPrincipal::mask("spammer@*"),
+        "spam",
+    )
+    .await
+    .expect("audit");
     sqlx::query(
         "INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
@@ -4720,9 +5135,15 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
     add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
-    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
-        .await
-        .expect("audit");
+    e6ircd::db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("alice"),
+        "KLINE",
+        &e6ircd::db::AuditPrincipal::mask("spammer@*"),
+        "spam",
+    )
+    .await
+    .expect("audit");
     sqlx::query(
         "INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
@@ -5474,11 +5895,12 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         body.contains("with no successor; transfer them, name a successor, or unregister"),
         "{body}"
     );
-    assert!(
-        e6ircd::db::set_channel_founder(&pool, "#bob", "alice", "founder")
+    assert!(matches!(
+        e6ircd::db::set_channel_founder(&pool, "#bob", "alice", "Bob")
             .await
-            .expect("transfer")
-    );
+            .expect("transfer"),
+        e6ircd::db::FounderTransfer::Transferred { .. }
+    ));
     let (status, headers, body) = request(http, &delete_bob(&bob_csrf)).await;
     assert_eq!(status, 204, "{body}");
     assert!(headers.contains("Max-Age=0"), "{headers}");
@@ -5787,9 +6209,15 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
         ("alice", "CONFIG", "server", "revision 2"),
         ("bob", "KLINE", "third@host", "spam"),
     ] {
-        e6ircd::db::insert_audit_log(&pool, actor, action, target, detail)
-            .await
-            .expect("seed audit entry");
+        e6ircd::db::insert_audit_log(
+            &pool,
+            &e6ircd::db::AuditPrincipal::account(actor),
+            action,
+            &seeded_target(action, target),
+            detail,
+        )
+        .await
+        .expect("seed audit entry");
     }
 
     let config = Config {
@@ -5842,9 +6270,15 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     assert!(first["audit"][0]["id"].as_i64().is_some(), "{body}");
     let cursor = first["next_before_id"].as_i64().expect("next page cursor");
 
-    e6ircd::db::insert_audit_log(&pool, "alice", "OPER", "alice", "concurrent")
-        .await
-        .expect("concurrent audit append");
+    e6ircd::db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::operator("alice"),
+        "OPER",
+        &e6ircd::db::AuditPrincipal::operator("alice"),
+        "concurrent",
+    )
+    .await
+    .expect("concurrent audit append");
     let older_path = format!("/api/v1/admin/audit?limit=2&before_id={cursor}");
     let (status, _, older_body) = request(http, &cookie_get(&older_path, &alice_session)).await;
     assert_eq!(status, 200, "{older_body}");
@@ -7143,6 +7577,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "@alice:new.example",
         "autojoin": ["!one:new.example", "!two:new.example"],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "matrix-new-password" },
         "server_password": { "action": "keep" }
     })
@@ -7160,6 +7595,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "",
         "autojoin": ["200", "201"],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "discord-new-token" },
         "server_password": { "action": "keep" }
     })
@@ -7179,6 +7615,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "",
         "autojoin": ["C200", "C201"],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "slack-new-app" },
         "server_password": { "action": "keep" }
     })
@@ -7200,7 +7637,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         .expect("matrix row");
     assert_eq!(matrix.addr, "https://matrix.new.example");
     assert_eq!(matrix.nick, "@alice:new.example");
-    assert_eq!(matrix.autojoin, ["!one:new.example", "!two:new.example"]);
+    assert_eq!(
+        matrix.autojoin,
+        [
+            e6ircd::db::BncAutojoin::from("!one:new.example"),
+            e6ircd::db::BncAutojoin::from("!two:new.example")
+        ]
+    );
     assert_eq!(
         secret_key
             .open(
@@ -7218,7 +7661,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         .expect("discord read")
         .expect("discord row");
     assert_eq!(discord.addr, "https://discord-api.example/v10/");
-    assert_eq!(discord.autojoin, ["200", "201"]);
+    assert_eq!(
+        discord.autojoin,
+        [
+            e6ircd::db::BncAutojoin::from("200"),
+            e6ircd::db::BncAutojoin::from("201")
+        ]
+    );
     assert_eq!(
         secret_key
             .open(
@@ -7239,7 +7688,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         slack.sasl_account.as_deref(),
         Some(slack_bot_token.as_str())
     );
-    assert_eq!(slack.autojoin, ["C200", "C201"]);
+    assert_eq!(
+        slack.autojoin,
+        [
+            e6ircd::db::BncAutojoin::from("C200"),
+            e6ircd::db::BncAutojoin::from("C201")
+        ]
+    );
     assert_eq!(
         secret_key
             .open(
@@ -7260,6 +7715,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "@alice:new.example",
         "autojoin": [],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "do-not-echo" },
         "server_password": { "action": "keep" }
     })
@@ -8331,6 +8787,7 @@ async fn network_buffer_read() {
             .expect("open buffer"),
             Some("alice"),
             line,
+            &e6irc_client::NetworkNames::default(),
         )
         .await
         .expect("seed");
@@ -8630,8 +9087,8 @@ async fn rp_initiated_logout_redirects_to_provider() {
         );
     }
 
-    // The logout GET now requires the session's CSRF token (anti-forced-logout);
-    // fetch it from the account page the way a browser would.
+    // Signing out requires the session's CSRF token (anti-forced-logout), in
+    // the form body; fetch it from the account page the way a browser would.
     let (_, _, page) = request(
         http,
         &format!(
@@ -8640,21 +9097,22 @@ async fn rp_initiated_logout_redirects_to_provider() {
     )
     .await;
     let csrf = csrf_from_html(&page).to_string();
-    // Without the token, the destructive logout GET is refused (a cross-site
-    // navigation can't forge it): anti-forced-logout CSRF.
-    let (no_csrf, _, _) = request(
+    // Without the token, the destructive sign-out is refused (a cross-site
+    // form can't forge it): anti-forced-logout CSRF. The old GET that took the
+    // token in its URL is gone.
+    let (no_csrf, _, _) = request(http, &logout_form(Some(&session), None)).await;
+    assert_eq!(no_csrf, 403, "logout without CSRF token must be refused");
+    let (get_status, _, _) = request(
         http,
         &format!(
-            "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
-    assert_eq!(no_csrf, 403, "logout without CSRF token must be refused");
-    // A GET logout on an OIDC session redirects to the provider's end-session
+    assert_eq!(get_status, 405, "the CSRF value never travels in a URL");
+    // Signing out of an OIDC session redirects to the provider's end-session
     // endpoint with an id_token_hint and post_logout_redirect_uri.
-    let req = format!(
-        "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
+    let req = logout_form(Some(&session), Some(&csrf));
     let (status, headers, _) = request(http, &req).await;
     assert_eq!(status, 303, "{headers}");
     let location = headers
@@ -8749,12 +9207,9 @@ async fn rp_initiated_logout_redirects_to_provider() {
     // Local-account and already-signed-out browser navigations use the same
     // app-local landing, and stale cookies are expired idempotently.
     for cookie in [Some(local_session.as_str()), None] {
-        let cookie_header = cookie
-            .map(|value| format!("Cookie: e6irc_session={value}\r\n"))
-            .unwrap_or_default();
         // A session-bearing logout carries its CSRF token; a cookieless
-        // navigation has no session to protect and needs none.
-        let csrf_q = match cookie {
+        // request has no session to protect and needs none.
+        let csrf = match cookie {
             Some(value) => {
                 let (_, _, page) = request(
                     http,
@@ -8763,14 +9218,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
                     ),
                 )
                 .await;
-                let token = csrf_from_html(&page);
-                format!("?csrf={token}")
+                Some(csrf_from_html(&page).to_string())
             }
-            None => String::new(),
+            None => None,
         };
-        let logout = format!(
-            "GET /api/v1/auth/logout{csrf_q} HTTP/1.1\r\nHost: t\r\n{cookie_header}Connection: close\r\n\r\n"
-        );
+        let logout = logout_form(cookie, csrf.as_deref());
         let (status, headers, _) = request(http, &logout).await;
         assert_eq!(status, 303, "{headers}");
         assert!(
@@ -8948,9 +9400,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
     )
     .await;
     let csrf = csrf_from_html(&page).to_string();
-    let logout = format!(
-        "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
+    let logout = logout_form(Some(&session), Some(&csrf));
     let (status, _, body) = request(http, &logout).await;
     assert_eq!(status, 503, "{body}");
 
@@ -9125,6 +9575,57 @@ async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running
     net::start(config).await.expect("start")
 }
 
+/// Administrator console pages spend the separate administrator budget that
+/// `/api/v1/admin/*` spends (DESIGN §9.4), not the ordinary one: with a budget
+/// of one, the second administrator page is refused while an ordinary page
+/// still answers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn administrator_pages_spend_the_administrator_budget() {
+    let url = support::test_db("administrator_pages_spend_the_administrator_budget").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(&pool, "root", None)
+        .await
+        .expect("session");
+    let mut config = test_config();
+    config.limits.administrator_api_rate_burst = 1;
+    let http = net::start(Config {
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["root".into()],
+            hsts_include_subdomains: false,
+        }),
+        ..config
+    })
+    .await
+    .expect("start")
+    .http_addr
+    .expect("http");
+    let page = |path: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    let (status, _, _) = request(http, &page("/console/audit")).await;
+    assert_eq!(status, 200);
+    let (status, head, body) = request(http, &page("/console/accounts")).await;
+    assert_problem(status, &head, &body, 429);
+    let (status, _, _) = request(http, &page("/console/account")).await;
+    assert_eq!(status, 200, "the ordinary budget is separate");
+}
+
 /// One request line plus the credential headers a caller chose, with an
 /// optional JSON body.
 fn api_request(method: &str, path: &str, credential_headers: &str, body: Option<&str>) -> String {
@@ -9226,7 +9727,7 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
     let (status, _, body) = request(
         http,
         &api_request(
-            "GET",
+            "POST",
             "/api/v1/auth/oidc/any/link",
             &bearer_headers(&token),
             None,
@@ -9251,30 +9752,20 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
 
     // The owner's browser session keeps every one of those abilities.
     let owner = session_headers(http, &session).await;
-    // Linking is a top-level navigation and cannot carry the CSRF header, so
-    // the session's value rides the query. The owner's cookie alone — all a
-    // cross-site link sends — is refused before any flow begins.
+    // Linking is a POST carrying the session's CSRF header like every other
+    // unsafe method (the answer names where to navigate). The owner's cookie
+    // alone — all a cross-site form sends — is refused before any flow begins.
     let cookie_only = format!("Cookie: e6irc_session={session}\r\n");
     let (status, _, body) = request(
         http,
-        &api_request("GET", "/api/v1/auth/oidc/any/link", &cookie_only, None),
+        &api_request("POST", "/api/v1/auth/oidc/any/link", &cookie_only, None),
     )
     .await;
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("Invalid or missing CSRF token"), "{body}");
-    let csrf = owner
-        .split("X-E6IRC-CSRF: ")
-        .nth(1)
-        .expect("CSRF header")
-        .trim_end();
     let (status, _, body) = request(
         http,
-        &api_request(
-            "GET",
-            &format!("/api/v1/auth/oidc/any/link?csrf={csrf}"),
-            &cookie_only,
-            None,
-        ),
+        &api_request("POST", "/api/v1/auth/oidc/any/link", &owner, None),
     )
     .await;
     assert_eq!(status, 404, "the checked link reaches the provider: {body}");
@@ -9866,6 +10357,7 @@ async fn logout_post_requires_the_session_csrf_value() {
         "a request without the CSRF value logged the owner out"
     );
 
+    // A script's call (the header) ends this application's session only.
     let owner = session_headers(http, &session).await;
     let (status, headers, body) = request(
         http,
@@ -9881,11 +10373,192 @@ async fn logout_post_requires_the_session_csrf_value() {
         None
     );
 
+    // A sign-out form (the value in its body) is a navigation: it ends the
+    // session and sends the browser on — here, a local session, to the
+    // signed-out page.
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("second session");
+    let owner = session_headers(http, &session).await;
+    let csrf = owner
+        .split("X-E6IRC-CSRF: ")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .expect("CSRF value");
+    let body = format!("csrf={csrf}");
+    let (status, headers, _) = request(
+        http,
+        &format!(
+            "POST /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(headers.contains("e6irc_session=;"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("location: /auth/signed-out"),
+        "{headers}"
+    );
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &session)
+            .await
+            .expect("session lookup"),
+        None
+    );
+
     // With no session there is nothing to forge: clearing the cookie is all
     // that is left to do.
     let (status, _, body) =
         request(http, &api_request("POST", "/api/v1/auth/logout", "", None)).await;
+    assert_eq!(status, 303, "{body}");
+}
+
+/// Minting or redirecting lasting access to an account needs a sign-in from
+/// the last ten minutes. A session cookie stolen an hour after its sign-in
+/// cannot mint a token, an app password, or a device approval, set a first
+/// password, move the recovery email, link an identity, or delete the account
+/// until its holder proves the password again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn changes_that_mint_lasting_access_need_a_recent_sign_in() {
+    let url = support::test_db("changes_that_mint_lasting_access_need_a_recent_sign_in").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "correct-horse", None)
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .expect("an hour-old sign-in");
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+    let owner = session_headers(http, &session).await;
+
+    for (method, path, body) in [
+        ("POST", "/api/v1/me/tokens", Some(r#"{"label":"stolen"}"#)),
+        (
+            "POST",
+            "/api/v1/me/credentials",
+            Some(r#"{"label":"stolen"}"#),
+        ),
+        (
+            "PATCH",
+            "/api/v1/me/profile",
+            Some(r#"{"contact_email":"attacker@example.test"}"#),
+        ),
+        (
+            "DELETE",
+            "/api/v1/me/account",
+            Some(r#"{"confirmation":"alice"}"#),
+        ),
+        (
+            "POST",
+            "/api/v1/auth/device/approve",
+            Some(r#"{"user_code":"ABCD-EFGH"}"#),
+        ),
+        ("POST", "/api/v1/auth/oidc/any/link", None),
+    ] {
+        let (status, _, response) = request(http, &api_request(method, path, &owner, body)).await;
+        assert_eq!(status, 403, "{method} {path}: {response}");
+        let problem: serde_json::Value = serde_json::from_str(&response).expect("problem");
+        assert_eq!(
+            problem["type"], "urn:e6irc:problem:reauthentication-required",
+            "{method} {path}"
+        );
+    }
+    assert!(
+        e6ircd::db::list_api_tokens(&pool, "alice")
+            .await
+            .expect("tokens")
+            .is_empty()
+    );
+
+    // A wrong password proves nothing; the right one admits the change.
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/reauthenticate",
+            &owner,
+            Some(r#"{"password":"wrong"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/reauthenticate",
+            &owner,
+            Some(r#"{"password":"correct-horse"}"#),
+        ),
+    )
+    .await;
     assert_eq!(status, 204, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/tokens",
+            &owner,
+            Some(r#"{"label":"mine"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'ACCOUNT_REAUTHENTICATE'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1);
+
+    // The device page asks for the password with the code, and approves only
+    // once it is right.
+    sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .expect("an hour-old sign-in again");
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "GET /device HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(page.contains(r#"name="password""#), "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+    let device_form = |password: &str| {
+        let body = format!("user_code=ABCD-EFGH&csrf={csrf}&password={password}");
+        format!(
+            "POST /device HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (_, _, page) = request(http, &device_form("wrong")).await;
+    assert!(page.contains("That password is not correct."), "{page}");
+    let (_, _, page) = request(http, &device_form("correct-horse")).await;
+    assert!(
+        page.contains("No pending device with that code"),
+        "the confirmed request reached the approval: {page}"
+    );
 }
 
 /// An identity provider that serves only its discovery document (and an empty
@@ -10595,4 +11268,15 @@ async fn frontchannel_logout_clears_only_a_revoked_sessions_cookie() {
     let (status, headers, _) = request(http, &logout("bob-sid", &sessions[1])).await;
     assert_eq!(status, 200, "{headers}");
     assert!(headers.contains("e6irc_session=;"), "{headers}");
+}
+
+/// The target principal a seeded audit row names, by the kind its action
+/// records: a ban's mask, the server's configuration, or an account.
+fn seeded_target(action: &str, target: &str) -> e6ircd::db::AuditPrincipal {
+    match action {
+        "KLINE" => e6ircd::db::AuditPrincipal::mask(target),
+        "CONFIG" => e6ircd::db::AuditPrincipal::server(),
+        "OPER" => e6ircd::db::AuditPrincipal::operator(target),
+        _ => e6ircd::db::AuditPrincipal::account(target),
+    }
 }

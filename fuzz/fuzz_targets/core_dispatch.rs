@@ -45,6 +45,7 @@ fuzz_target!(|data: &[u8]| {
             registration_burst: None,
             registration_before_connect: false,
             registration_require_email: false,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,

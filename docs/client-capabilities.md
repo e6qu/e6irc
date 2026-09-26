@@ -19,11 +19,36 @@ The BNC requires a negotiated `sasl` capability before it accepts
 `AUTHENTICATE`. A capability request is atomic. `CAP LIST` reports enabled
 capabilities, not the offered list.
 
+CHATHISTORY replays a message with the client-only tags it was delivered with
+(`+draft/reply`, `+draft/react`, …) and replays reactions and other `TAGMSG`s,
+to a client that negotiated `message-tags` — on the server and, from the raw
+lines it stores, on the bouncer. A client without `message-tags` receives
+neither, and its pages count only the lines it can receive; `CHATHISTORY
+TARGETS` dates each buffer for it by the newest line it can receive, and leaves
+out a buffer whose only activity in the window is `TAGMSG`s. Typing indicators
+(`+typing`, `+draft/typing`) are live only: they are never replayed. REST
+history serves text messages only.
+
 The CLI, the TUI and the web chat read which targets are channels and which
 names are the same from the network's `005`: `CHANTYPES` (default `#&`) and
 `CASEMAPPING` (default `rfc1459`). `rfc1459`, `rfc1459-strict` (or
 `strict-rfc1459`) and `ascii` are known; any other mapping (`rfc7613`, …) is
 compared as `ascii` — the letters every mapping folds — and the client says so.
+
+`LIST` takes Libera's conditions (`ELIST=CMNTU`): `>n` / `<n` members,
+`C<n` / `C>n` and `T<n` / `T>n` for a channel created, or its topic set, less
+or more than `n` minutes ago, a channel-name glob such as `#rust*` or `*bot*`,
+and `!glob` to leave names out — comma-separated, up to seven, all of which
+must hold (`LIST #rust*,>10,!*-offtopic`). A secret channel is listed only to
+its members. The reply is paced to the client's send queue (`SAFELIST`), so a
+client that lists every channel is never disconnected for it; a second `LIST`
+while one is still arriving aborts the first with a `/LIST aborted` notice.
+
+`WHO *` and a `WHO` of a large channel are paced the same way. A `WHO` sent
+while an earlier one is still arriving is answered after it; one that would
+leave more waiting than the send queue holds is answered `263 WHO :Please wait
+a while and try again.` and its `315`, and can be sent again once the first
+has arrived.
 
 ## Qualification boundary
 

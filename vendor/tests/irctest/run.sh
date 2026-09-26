@@ -69,13 +69,23 @@ GREEN_TESTS=(
     irctest/server_tests/websocket.py
     irctest/server_tests/regressions.py
 )
+# The green list's skips are held to expected-skips.txt: irctest skips what a
+# server does not advertise, so a lost capability would otherwise stay green.
+green=false
 if (( $# == 0 )); then
     set -- "${GREEN_TESTS[@]}"
+    green=true
 fi
+report=$(mktemp)
+trap 'rm -f "$report"' EXIT
 (
     cd -- "$IRCTEST_DIR"
     PATH="$REPO_ROOT/target/debug:$PATH" \
     PYTHONPATH="$REPO_ROOT/vendor/tests/irctest" \
     "$PYTHON" -m pytest --controller=e6ircd_controller --timeout=15 \
-        -m "$MARKERS" "$@"
+        -rs --junitxml="$report" -m "$MARKERS" "$@"
 )
+if [[ $green == true ]]; then
+    "$PYTHON" "$REPO_ROOT/vendor/tests/irctest/check_skips.py" "$report" \
+        "$REPO_ROOT/vendor/tests/irctest/expected-skips.txt"
+fi

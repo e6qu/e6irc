@@ -1359,7 +1359,7 @@ mod tests {
                     if let Ok(DriverEvent::Line(line)) = events.recv().await
                         && line.line.contains(needle)
                     {
-                        return line.line;
+                        return crate::bouncer::without_tag(&line.line, "time");
                     }
                 }
             })

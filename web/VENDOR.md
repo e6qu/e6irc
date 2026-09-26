@@ -15,6 +15,13 @@ Build:
 cd web && pnpm install --frozen-lockfile && pnpm build   # -> web/dist (content-hashed)
 ```
 
+The visual-regression baselines under `test/__snapshots__/` are macOS renders,
+as CI's `visual-regression` job (macos-15) makes them. Fonts rasterize
+differently elsewhere, so on any other platform `pnpm test:visual` keeps its
+screenshots in a platform directory (`…/linux/`, ignored by git): a local run
+compares against local renders, and `--update-snapshots` there never
+overwrites the committed baselines. Only a macOS run changes those.
+
 The production bundle has no runtime package dependencies; the chat client is
 implemented with browser DOM and WebSocket APIs.
 

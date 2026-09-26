@@ -1,0 +1,28 @@
+# Every test the persistence-backed irctest job (ci.yml, irctest-services)
+# skips, as the JUnit report names it, under the reason it skips.
+# check_skips.py fails the job on a skip missing here and on an entry here
+# that no longer skips. A new entry needs its reason.
+
+# e6ircd does not offer draft/event-playback: CHATHISTORY replays messages,
+# not JOIN/PART/TAGMSG events.
+irctest.server_tests.chathistory.ChathistoryTestCase::testChathistoryEventPlayback[AFTER]
+irctest.server_tests.chathistory.ChathistoryTestCase::testChathistoryEventPlayback[AROUND]
+irctest.server_tests.chathistory.ChathistoryTestCase::testChathistoryEventPlayback[BEFORE]
+irctest.server_tests.chathistory.ChathistoryTestCase::testChathistoryEventPlayback[BETWEEN]
+irctest.server_tests.chathistory.ChathistoryTestCase::testChathistoryEventPlayback[LATEST]
+irctest.server_tests.chathistory.ChathistoryTestCase::testChathistoryTagmsg
+
+# An authenticated session cannot replace its identity with a second SASL
+# exchange (907 ERR_SASLALREADY).
+irctest.server_tests.sasl.SaslTestCase::testPlainPostRegistrationAndReAuthenticate
+irctest.server_tests.sasl.SaslTestCase::testPlainReAuthenticate
+
+# The server offers PLAIN and OAUTHBEARER; SCRAM is on the client side only.
+irctest.server_tests.sasl.SaslTestCase::testScramSha256Failure
+irctest.server_tests.sasl.SaslTestCase::testScramSha256Success
+
+# irctest itself marks these skipped ("Not consistently implemented").
+irctest.server_tests.who.WhoTestCase::testWhoRealNameSpaces
+irctest.server_tests.who.WhoTestCase::testWhoUsernameRealName[hostname]
+irctest.server_tests.who.WhoTestCase::testWhoUsernameRealName[realname-mask]
+irctest.server_tests.who.WhoTestCase::testWhoUsernameRealName[username]

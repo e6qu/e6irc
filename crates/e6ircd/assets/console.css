@@ -37,6 +37,12 @@ header .brand { border-left: 0.45rem solid var(--route); padding-left: 0.55rem; 
 header .who { color: var(--chrome-muted); }
 header a { color: var(--chrome-fg); text-decoration-color: var(--chrome-border); text-underline-offset: 0.2em; }
 header a:hover { text-decoration-color: var(--route); }
+/* Signing out is a form post (the session's CSRF value rides in its body, never
+   a URL), shown as the header link it replaced. */
+header .sign-out { display: inline; margin: 0; }
+header .sign-out button { padding: 0; border: 0; background: none; color: var(--chrome-fg); font: inherit;
+  text-decoration: underline; text-decoration-color: var(--chrome-border); text-underline-offset: 0.2em; cursor: pointer; }
+header .sign-out button:hover { text-decoration-color: var(--route); }
 .theme-picker { display: inline-flex; align-items: center; gap: 0.35rem; color: var(--chrome-muted); font: 0.72rem/1 var(--font-mono); text-transform: uppercase; }
 .theme-picker select { border: 1px solid var(--chrome-border); border-radius: 0.25rem; background: var(--chrome-raised); color: var(--chrome-fg); font: inherit; padding: 0.3rem 0.4rem; }
 .layout { display: flex; align-items: flex-start; gap: 0; }

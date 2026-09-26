@@ -4,6 +4,8 @@
 
 #[path = "support/deadline.rs"]
 mod deadline;
+#[path = "support/membership.rs"]
+mod membership;
 
 use e6ircd::bouncer::{IrcNetwork, NetworkConfig, NetworkHandle, attach};
 use e6ircd::config::{Config, ListenerConfig};
@@ -64,6 +66,9 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
         ..NetworkConfig::default()
     });
     wait_connected(&handle).await;
+    // Connected is the welcome; the autojoin follows it. A message sent to
+    // the channel before the driver is in it never reaches the driver.
+    membership::wait_joined(addr, "bnc", "#room").await;
 
     // a peer posts a message BEFORE the client attaches -> goes to buffer
     let mut peer = e6irc_client::Connection::connect(&addr.to_string())
@@ -192,6 +197,7 @@ async fn two_clients_attach_to_one_always_on_network() {
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
+    membership::wait_joined(addr, "shared", "#multi").await;
 
     // two clients attach
     let (c1, s1) = tokio::io::duplex(64 * 1024);

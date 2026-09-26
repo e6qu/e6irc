@@ -1,4 +1,4 @@
-import { apiContractLoader, getOperationJson } from "/console-contract.js";
+import { REAUTHENTICATION_REQUIRED, apiContractLoader, getOperationJson } from "/console-contract.js";
 import { loadSettings, saveSetting } from "/console-settings.js";
 
 (() => {
@@ -207,15 +207,91 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   };
 
+  // Step-up re-authentication. A change that mints or redirects lasting
+  // access to the account (a token, an app password, a linked identity, a
+  // first password, the recovery email, deleting the account) is refused with
+  // REAUTHENTICATION_REQUIRED when the session last signed in more than ten
+  // minutes ago. The person confirms here -- their password, or a fresh sign-in
+  // at a provider (which leaves the page and returns to the account page) --
+  // and a confirmed password retries the change once.
+  const reauthenticateDialog = document.querySelector("[data-console-reauthenticate]");
+  const reauthenticateForm = document.querySelector("[data-console-reauthenticate-form]");
+  const reauthenticateResult = document.querySelector("[data-console-reauthenticate-result]");
+  const reauthenticateProviders = document.querySelector("[data-console-reauthenticate-providers]");
+  const reauthenticate = () => new Promise((resolve) => {
+    if (!(reauthenticateDialog instanceof HTMLDialogElement) || !(reauthenticateForm instanceof HTMLFormElement)) {
+      resolve(false);
+      return;
+    }
+    const passwordField = reauthenticateForm.elements.namedItem("password");
+    if (passwordField instanceof HTMLInputElement) passwordField.value = "";
+    if (reauthenticateResult) reauthenticateResult.textContent = "";
+    let confirmed = false;
+    const onSubmit = (event) => {
+      if (!(event.submitter instanceof HTMLButtonElement) || event.submitter.value !== "password") return;
+      event.preventDefault();
+      const password = passwordField instanceof HTMLInputElement ? passwordField.value : "";
+      if (!password) {
+        if (reauthenticateResult) reauthenticateResult.textContent = "Enter your password.";
+        return;
+      }
+      void apiRequest(reauthenticateForm, apiMutation("POST", "/api/v1/me/reauthenticate"), { password })
+        .then(() => {
+          confirmed = true;
+          reauthenticateDialog.close("confirmed");
+        })
+        .catch((error) => {
+          if (reauthenticateResult) reauthenticateResult.textContent = error instanceof Error ? error.message : "Confirmation failed.";
+        });
+    };
+    reauthenticateForm.addEventListener("submit", onSubmit);
+    reauthenticateDialog.addEventListener("close", () => {
+      reauthenticateForm.removeEventListener("submit", onSubmit);
+      if (passwordField instanceof HTMLInputElement) passwordField.value = "";
+      resolve(confirmed);
+    }, { once: true });
+    if (reauthenticateProviders instanceof HTMLElement) {
+      reauthenticateProviders.replaceChildren();
+      void apiRead("/api/v1/me/identities").then((result) => {
+        for (const provider of apiCollection(result, "link_providers")) {
+          const button = element("button", "", `Sign in again with ${provider}`);
+          button.type = "button";
+          button.addEventListener("click", () => {
+            void apiRequest(reauthenticateForm, apiMutation("POST", `/api/v1/me/reauthenticate/oidc/${encodeURIComponent(provider)}`))
+              .then((flow) => window.location.assign(flow.authorization_url))
+              .catch((error) => {
+                if (reauthenticateResult) reauthenticateResult.textContent = error instanceof Error ? error.message : "Sign-in failed.";
+              });
+          });
+          reauthenticateProviders.append(button);
+        }
+      }).catch((error) => {
+        if (reauthenticateResult) reauthenticateResult.textContent = `Identity providers could not be listed: ${error instanceof Error ? error.message : "unknown error"}`;
+      });
+    }
+    reauthenticateDialog.showModal();
+  });
+  const needsReauthentication = (error) => error instanceof Error && error.type === REAUTHENTICATION_REQUIRED;
+
   // A form's API mutation. It resolves to `{ value }` on success -- `value` is
   // undefined for a 204, which is success too -- and to null when the request
   // failed (reported through `report`) or the form was already submitting. A
   // helper that returned the body made "no content" read as "failed", and a
-  // revoked invitation was reported as nothing at all.
+  // revoked invitation was reported as nothing at all. A refusal that asks for
+  // a recent sign-in is answered by confirming it and retrying once.
   const submitMutation = (form, method, url, body, report, trigger) => runFormSubmission(form, async () => {
+    const attempt = () => apiRequest(form, apiMutation(method, url), body);
     try {
-      return { value: await apiRequest(form, apiMutation(method, url), body) };
+      return { value: await attempt() };
     } catch (error) {
+      if (needsReauthentication(error) && await reauthenticate()) {
+        try {
+          return { value: await attempt() };
+        } catch (retried) {
+          report(retried);
+          return null;
+        }
+      }
       report(error);
       return null;
     }
@@ -1083,10 +1159,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
           command_burst: positiveInteger(fields, "command_burst", "Command burst"),
           command_rate: positiveInteger(fields, "command_rate", "Command rate"),
-          trusted_proxies: String(fields.get("trusted_proxies") || "")
-            .split("\n")
-            .map((entry) => entry.trim())
-            .filter(Boolean),
+          trusted_proxies: splitValues(String(fields.get("trusted_proxies") || ""), "\n"),
+          require_sasl: fields.has("require_sasl"),
+          require_sasl_from: splitValues(String(fields.get("require_sasl_from") || ""), "\n"),
           auth_rate_burst: optionalPositiveInteger(fields, "auth_rate_burst", "Authentication burst"),
           api_rate_burst: positiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
           administrator_api_rate_burst: positiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
@@ -1449,6 +1524,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     for (const name of ["nicklen", "sendq", "core_queue", "core_workers", "max_hot_channels"]) configurationValue(form, name, settings[name]);
     for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
+    configurationChecked(form, "require_sasl", settings.limits.require_sasl);
+    configurationValue(form, "require_sasl_from", apiCollection(settings.limits, "require_sasl_from", "configuration").join("\n"));
     configurationChecked(form, "observability_enabled", settings.observability.enabled);
     configurationValue(form, "observability_sample_interval_seconds", settings.observability.sample_interval_seconds);
     configurationValue(form, "observability_retention_hours", settings.observability.retention_hours);
@@ -1928,9 +2005,16 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (providers.length) {
         const actions = element("div", "provider-actions");
         for (const provider of providers) {
-          const link = element("a", "button-link secondary-link", `Link ${provider}`);
-          link.href = `/api/v1/auth/oidc/${encodeURIComponent(provider)}/link?csrf=${encodeURIComponent(csrf)}`;
-          actions.append(link);
+          // A POST with the session's CSRF header, answered with the provider
+          // URL to navigate to: the token never travels in a URL.
+          const form = element("form", "cell-form");
+          form.method = "post";
+          form.action = `/api/v1/auth/oidc/${encodeURIComponent(provider)}/link`;
+          form.dataset.apiAccountIdentityLink = "";
+          const button = element("button", "secondary", `Link ${provider}`);
+          button.type = "submit";
+          form.append(hiddenInput("csrf", csrf), button);
+          actions.append(form);
         }
         linkProviders.append(actions);
       } else linkProviders.append(element("p", "section-note", "No login providers are currently configured."));
@@ -2131,6 +2215,19 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
       });
   });
+
+  // Linking starts a provider flow: the answer names where to go.
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-account-identity-link]")) return;
+    event.preventDefault();
+    void mutateAccount(form, "POST", undefined, "Identity linking failed.")
+      .then((result) => { if (result) window.location.assign(result.value.authorization_url); });
+  });
+
+  if (new URLSearchParams(window.location.search).get("reauthenticated") === "1") {
+    setAccountResult("Confirmed. Repeat the change you were making; it is allowed for the next 10 minutes.", true);
+  }
 
   for (const form of document.querySelectorAll("[data-api-account-delete-self]")) {
     form.addEventListener("submit", (event) => {
@@ -2576,6 +2673,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       tls: true,
       nick: fieldValue(fields, "nick"),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
+      // A bridge's rooms and channel ids have no keys to keep.
+      autojoin_keys: { keep: [] },
       credentials: account || password
         ? { action: "set", ...(account ? { account } : {}), ...(password ? { password } : {}) }
         : { action: "keep" },
@@ -2703,7 +2802,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
-      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("server-password", network.kind !== "irc" ? "Not used" : network.has_server_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.map((channel) => (network.autojoin_keyed ?? []).includes(channel) ? `${channel} (key stored encrypted)` : channel).join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("server-password", network.kind !== "irc" ? "Not used" : network.has_server_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
       // A bridge stores provider tokens and room identifiers in the same fields.
       const bridgeLabels = { nick: "Identity", autojoin: "Rooms / channel IDs", "account-credential": "Account credential", "secret-credential": "Secret credential" };
       if (network.kind !== "irc") for (const [field, label] of Object.entries(bridgeLabels)) { const node = ownerNetworkDetail.querySelector(`[data-network-label="${field}"]`); if (node) node.textContent = label; }
@@ -2785,7 +2884,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
-        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = hiddenInput("csrf", adminChannelRows.dataset.csrf || ""); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
+        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.successor ? `${channel.founder} (successor ${channel.successor})` : channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = hiddenInput("csrf", adminChannelRows.dataset.csrf || ""); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
       } catch (error) {
         tableLoadFailure(adminChannelRows, 7, error, () => void refreshAdminChannelDirectory());
         return false;
@@ -2896,7 +2995,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const url = `/api/v1/me/channels/${encodeURIComponent(channel.name)}`;
         const card = element("article", "panel channel-control");
         const access = apiCollection(channel, "access", "channel access");
-        card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
+        card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${channel.successor ? `Successor ${channel.successor}` : "No successor"} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
         const topic = form(url, (node) => { const { label, control: area } = labelledControl("textarea", "topic", "Retained topic"); area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; node.append(label); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
         const lock = form(url, (node) => { const { label, control } = labelledControl("input", "mlock", "Mode lock"); control.value = channel.mlock || ""; node.append(label); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
         const keep = form(url, (node) => { const select = namedControl("select", "enabled", `Topic retention for ${channel.name}`); for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));

@@ -338,6 +338,20 @@ const CLOSE_POLICY_VIOLATION: u16 = 1008;
 /// reason verbatim; a close reason is at most 123 bytes.
 const UI_SOCKET_LIMIT_REASON: &str = "This account has 32 live chat connections open, the most allowed. Close another tab and retry.";
 
+/// What a socket whose credential ended says: it was signed out, revoked, or
+/// expired, and reconnecting with it would be refused, so the close is a
+/// policy refusal the client does not retry by itself.
+const UI_SOCKET_CREDENTIAL_ENDED_REASON: &str =
+    "Your sign-in ended (signed out, revoked, or expired). Sign in again to reconnect.";
+
+/// WebSocket close code 1013, "try again later" (RFC 6455 §7.4.1 registry).
+const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// What a socket whose credential could not be re-checked says. Reconnecting
+/// authenticates again, so the client's ordinary reconnect is the right answer.
+const UI_SOCKET_CREDENTIAL_UNVERIFIABLE_REASON: &str =
+    "Could not confirm your sign-in is still valid; reconnecting will check again.";
+
 /// Live chat sockets open per folded account.
 pub(crate) struct UiSocketLimiter {
     open: Mutex<HashMap<String, usize>>,
@@ -417,6 +431,12 @@ pub(super) async fn ws_ui(
     };
     // Counted before the upgrade, so sockets still in their handshake count.
     let slot = state.ui_sockets.admit(&account);
+    // Watched from before the upgrade, so a revocation committed while the
+    // handshake is in flight still ends the socket.
+    let credential = state
+        .credential_watch
+        .lease(pool_of(&state), credential.revocable())
+        .await;
     let resume = params.after.as_deref().map(ReplayRequest::from_cursor);
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
@@ -424,7 +444,10 @@ pub(super) async fn ws_ui(
             ws_ui_conn(
                 handle,
                 socket,
-                composer,
+                UiSocketAuthority {
+                    composer,
+                    credential,
+                },
                 slot,
                 resume,
                 crate::bouncer::ATTACH_LIVENESS_INTERVAL,
@@ -448,7 +471,15 @@ impl ReplayRequest {
     }
 }
 
-/// Serve one live chat socket until either side ends it.
+/// What a live chat socket was authorized with: whether its composer may
+/// send, and the credential whose end is the socket's end.
+pub(super) struct UiSocketAuthority {
+    pub(super) composer: ComposerAuthority,
+    pub(super) credential: super::revocation::CredentialLease,
+}
+
+/// Serve one live chat socket until either side ends it, or the credential
+/// that opened it stops authorizing it.
 ///
 /// `slot` is the account's admission; without one the socket is closed at once
 /// with a policy-violation code and a reason — after the upgrade, because a
@@ -464,7 +495,7 @@ impl ReplayRequest {
 pub(super) async fn ws_ui_conn(
     handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
     mut socket: WebSocket,
-    composer: ComposerAuthority,
+    authority: UiSocketAuthority,
     slot: Option<UiSocketSlot>,
     resume: Option<ReplayRequest>,
     liveness: std::time::Duration,
@@ -472,12 +503,12 @@ pub(super) async fn ws_ui_conn(
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
 
+    let UiSocketAuthority {
+        composer,
+        credential: mut lease,
+    } = authority;
     let Some(_slot) = slot else {
-        let close = axum::extract::ws::CloseFrame {
-            code: CLOSE_POLICY_VIOLATION,
-            reason: UI_SOCKET_LIMIT_REASON.into(),
-        };
-        drop(send_frame(&mut socket, WsMessage::Close(Some(close))).await);
+        send_close(&mut socket, CLOSE_POLICY_VIOLATION, UI_SOCKET_LIMIT_REASON).await;
         return;
     };
 
@@ -504,7 +535,7 @@ pub(super) async fn ws_ui_conn(
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
-    let authority = handle.session_authority();
+    let session_authority = handle.session_authority();
     let after = match resume {
         Some(ReplayRequest::After(cursor)) => Some(cursor),
         Some(ReplayRequest::Unknown) | None => None,
@@ -514,7 +545,11 @@ pub(super) async fn ws_ui_conn(
         replay,
         session: session_snapshot,
         features,
+        ..
     } = handle.subscribe_with_replay_snapshot(after);
+    // The answers to this socket's own commands (the NAMES it asks for after
+    // the boundary, a WHOIS) reach it here, and only here.
+    let mut replies = handle.route_replies(attach_id);
     // Every line event names the ring position after it, so a client that
     // loses this socket can hand back exactly where it stopped. A live event
     // that entered no ring keeps the position where it was.
@@ -593,12 +628,32 @@ pub(super) async fn ws_ui_conn(
     let mut awaiting_pong = false;
     loop {
         tokio::select! {
+            // The credential that opened the socket was revoked or expired:
+            // nothing the socket carries is authorized any more.
+            ended = lease.ended() => {
+                let (code, reason) = match ended {
+                    super::revocation::CredentialStanding::Unverifiable => {
+                        (CLOSE_TRY_AGAIN_LATER, UI_SOCKET_CREDENTIAL_UNVERIFIABLE_REASON)
+                    }
+                    _ => (CLOSE_POLICY_VIOLATION, UI_SOCKET_CREDENTIAL_ENDED_REASON),
+                };
+                send_close(&mut socket, code, reason).await;
+                break;
+            }
             // Network removed/replaced/disabled: send a typed terminal status
             // and detach. The browser uses it to stop its ordinary reconnect
             // loop instead of retrying a network that cannot accept a socket.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
                     send_unavailable(&mut socket).await;
+                    break;
+                }
+            }
+            // A reply takes no ring position, so the cursor stays where it is.
+            line = replies.recv() => {
+                if send_frame(&mut socket, WsMessage::text(line_event(&line, cursor))).await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -690,7 +745,7 @@ pub(super) async fn ws_ui_conn(
                 peer_silence.restart();
                 match frame {
                 Some(Ok(WsMessage::Text(t))) => {
-                    let request = match composer_request(&t, authority) {
+                    let request = match composer_request(&t, session_authority) {
                         Ok(request) => request,
                         Err(error) => {
                             let event = composer_result_event(cursor, ComposerResult::Rejected {
@@ -781,6 +836,15 @@ pub(super) async fn ws_ui_conn(
             },
         }
     }
+}
+
+/// Close the socket with `code` and a reason the client can show.
+async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    let close = axum::extract::ws::CloseFrame {
+        code,
+        reason: reason.into(),
+    };
+    drop(send_frame(socket, WsMessage::Close(Some(close))).await);
 }
 
 async fn send_unavailable(socket: &mut WebSocket) {
@@ -1282,6 +1346,7 @@ mod tests {
                             "PREFIX=(ov)@+".to_string(),
                             "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz".to_string(),
                         ],
+                        client_tags: crate::bouncer::ClientTags::Relayed,
                     },
                 ),
                 serde_json::json!({
@@ -1533,21 +1598,46 @@ mod ui_socket_bound_tests {
         handle: Arc<crate::bouncer::NetworkHandle>,
         limiter: Arc<UiSocketLimiter>,
     ) -> std::net::SocketAddr {
+        serve_with_credential(handle, limiter, std::time::Duration::from_secs(3600))
+            .await
+            .0
+    }
+
+    /// Like [`serve`], with every socket opened by one session that expires
+    /// after `lifetime`, and the watch that can revoke it.
+    async fn serve_with_credential(
+        handle: Arc<crate::bouncer::NetworkHandle>,
+        limiter: Arc<UiSocketLimiter>,
+        lifetime: std::time::Duration,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<Arc<super::super::revocation::CredentialWatch>>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("address");
+        let watches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opened = watches.clone();
         let app = Router::new().route(
             "/ws",
             get(move |ws: WebSocketUpgrade| {
-                let (handle, limiter) = (handle.clone(), limiter.clone());
+                let (handle, limiter, opened) = (handle.clone(), limiter.clone(), opened.clone());
                 async move {
                     let slot = limiter.admit("Alice");
+                    let (watch, credential) = super::super::revocation::tests::lease_for_test(
+                        crate::db::RevocableCredential::browser_session("session"),
+                        lifetime,
+                    );
+                    opened.lock().expect("watches").push(watch);
                     ws.on_upgrade(move |socket| {
                         ws_ui_conn(
                             handle,
                             socket,
-                            ComposerAuthority::MaySend,
+                            UiSocketAuthority {
+                                composer: ComposerAuthority::MaySend,
+                                credential,
+                            },
                             slot,
                             None,
                             LIVENESS,
@@ -1557,7 +1647,68 @@ mod ui_socket_bound_tests {
             }),
         );
         tokio::spawn(async move { axum::serve(listener, app).await });
-        addr
+        (addr, watches)
+    }
+
+    /// Read frames until the server closes the socket, answering nothing but
+    /// letting the client library answer pings.
+    async fn close_frame(
+        peer: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match peer.next().await {
+                    Some(Ok(Peer::Close(frame))) => return frame.expect("close frame"),
+                    Some(Ok(_)) => {}
+                    other => panic!("no close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("close")
+    }
+
+    #[tokio::test]
+    async fn a_revoked_credential_closes_its_socket_as_a_policy_refusal() {
+        let (handle, _ends) = attachable_network();
+        let (addr, watches) = serve_with_credential(
+            handle.clone(),
+            UiSocketLimiter::new(),
+            std::time::Duration::from_secs(3600),
+        )
+        .await;
+        let (mut peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        attached_clients_become(&handle, 1).await;
+        let watch = watches.lock().expect("watches")[0].clone();
+        super::super::revocation::tests::revoke_for_test(
+            &watch,
+            &crate::db::RevocableCredential::browser_session("session"),
+        );
+        let close = close_frame(&mut peer).await;
+        assert_eq!(u16::from(close.code), 1008);
+        assert!(close.reason.contains("Sign in again"), "{}", close.reason);
+        attached_clients_become(&handle, 0).await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_credential_closes_its_socket() {
+        let (handle, _ends) = attachable_network();
+        let (addr, _watches) = serve_with_credential(
+            handle.clone(),
+            UiSocketLimiter::new(),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let (mut peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        let close = close_frame(&mut peer).await;
+        assert_eq!(u16::from(close.code), 1008);
+        attached_clients_become(&handle, 0).await;
     }
 
     fn attachable_network() -> (

@@ -367,7 +367,11 @@ residential address reached Libera without SASL. Evidence from one egress
 qualifies only that egress.
 
 When a network refuses registration, the driver retries on its refusal schedule
-(30 seconds, then 1, 2, and 4 minutes) and then parks. The network's row in the
+(30 seconds, then 1, 2, and 4 minutes). A refusal that is the network's policy
+— Libera's "SASL access only", a throttle, a ban — is then retried every 4
+minutes for as long as it lasts and never parks; one that may be a
+configuration fault, such as a nickname the network will not take, parks on the
+fifth in a row (DESIGN §10.3 has the three policies). The network's row in the
 chat client says so and quotes the network's own words ("The network said: …"),
 and the repair is in that network's settings: enter the NickServ account and
 password there, and the driver reconnects with SASL. A host without IPv6 egress
@@ -379,7 +383,7 @@ routable IPv6 where the host offers it.
 - `GET /api/v1/auth/oidc/shauth/start` — interactive login
 - `GET /api/v1/auth/oidc/shauth/sso` — silent `prompt=none` session probe
 - `GET /api/v1/auth/oidc/shauth/callback` — registered authorization callback
-- `GET /api/v1/auth/logout` — RP-initiated logout (ends the Shauth session too)
+- `POST /api/v1/auth/logout` — RP-initiated logout (ends the Shauth session too); the sign-out control is a form post carrying the session's CSRF value in its body
 - `GET /healthz` — liveness: process up and every core shard fresh (Shauth catalog health URL)
 
 The Shauth client registered `E6IRC_PUBLIC_URL` as its post-logout return and

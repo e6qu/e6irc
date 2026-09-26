@@ -62,6 +62,7 @@ async function endApplicationSession(request) {
   assert.equal(identity.status(), 200, await identity.text());
   const logout = await request.post(`${applicationOrigin}/api/v1/auth/logout`, {
     headers: { "X-E6IRC-CSRF": (await identity.json()).csrf_token },
+    maxRedirects: 0,
   });
   assert.equal(logout.status(), 204, await logout.text());
 }
@@ -134,6 +135,9 @@ issuer_url = ${JSON.stringify(issuerURL)}
 client_id = "e6irc-test"
 client_secret = "e6irc-test-secret"
 account_claim = "email"
+# An email names a new account only under a domain policy (and when the
+# provider verified it): dex's mock user is kilgore@kilgore.trout.
+allowed_email_domains = ["kilgore.trout"]
 token_endpoint_auth_method = "client_secret_basic"
 `;
 await writeFile(
@@ -241,7 +245,7 @@ try {
     // "… due to access control checks." rejection in addition to the response
     // diagnostic; the response handler above already records the real status,
     // so this engine artifact is noise, not a page error.
-    if (error.message.includes("due to access control checks")) return;
+    if (browserName === "webkit" && error.message.includes("due to access control checks")) return;
     if (isApplicationURL(page.url())) applicationErrors.push(error.message);
   });
   page.on("requestfailed", (request) => {
@@ -1615,6 +1619,7 @@ try {
             username: "webident",
             realname: null,
             autojoin: [],
+            autojoin_keyed: [],
             sasl_account: null,
             has_sasl_account: false,
             has_sasl_password: false,

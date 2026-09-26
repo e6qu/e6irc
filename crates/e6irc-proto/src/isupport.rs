@@ -54,37 +54,11 @@ impl<'a> IsupportToken<'a> {
             value,
         })
     }
-
-    /// Wire form of this token (value re-escaped as needed).
-    pub fn serialize(&self) -> String {
-        // `parse` validates the name, but the fields are public, so a
-        // hand-constructed token could carry a space or `=` in `name` and
-        // serialize to a split/merged, invalid 005 token. The daemon only ever
-        // *parses* tokens (it builds ISUPPORT as raw strings), so this is
-        // untriggerable in production — but assert it in debug/test/fuzz, where
-        // the construct→serialize path is exercised, matching the wire-length
-        // invariant's debug-assertion approach.
-        debug_assert!(
-            valid_name(self.name),
-            "IsupportToken serialized with an invalid name: {:?}",
-            self.name
-        );
-        let mut out = String::new();
-        if self.negated {
-            out.push('-');
-        }
-        out.push_str(self.name);
-        if let Some(value) = &self.value {
-            out.push('=');
-            out.push_str(&escape_value(value));
-        }
-        out
-    }
 }
 
 /// Decode `\xHH` escapes for ASCII octets. Invalid or truncated escapes,
 /// and escapes of non-ASCII octets, are literal text; multi-byte UTF-8
-/// stays as-is (it needs no escaping — see [`escape_value`]).
+/// stays as-is: a server has no reason to escape it.
 pub fn unescape_value(raw: &str) -> Cow<'_, str> {
     if !raw.contains('\\') {
         return Cow::Borrowed(raw);
@@ -117,27 +91,6 @@ pub fn unescape_value(raw: &str) -> Cow<'_, str> {
                 out.push(c);
                 i += c.len_utf8();
             }
-        }
-    }
-    Cow::Owned(out)
-}
-
-/// Encode a value: ASCII outside the printable non-space range, plus `\`
-/// and `=`, becomes `\xHH`; non-ASCII UTF-8 passes through unescaped so
-/// escape/unescape stay exact inverses.
-pub fn escape_value(value: &str) -> Cow<'_, str> {
-    fn needs_escape(b: u8) -> bool {
-        b <= 0x20 || b == 0x7F || b == b'\\' || b == b'='
-    }
-    if !value.bytes().any(needs_escape) {
-        return Cow::Borrowed(value);
-    }
-    let mut out = String::with_capacity(value.len() + 6);
-    for c in value.chars() {
-        if c.is_ascii() && needs_escape(c as u8) {
-            out.push_str(&format!("\\x{:02X}", c as u8));
-        } else {
-            out.push(c);
         }
     }
     Cow::Owned(out)
@@ -202,19 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn value_escaping_roundtrip() {
+    fn value_unescaping() {
         assert_eq!(unescape_value(r"a\x20b"), "a b");
         assert_eq!(unescape_value(r"\x5Cx"), r"\x");
+        assert_eq!(unescape_value(r"a\x3Db\x5Cc"), r"a=b\c");
         // invalid/truncated escapes stay literal
         assert_eq!(unescape_value(r"a\xZZb"), r"a\xZZb");
         assert_eq!(unescape_value(r"tail\x2"), r"tail\x2");
         assert!(matches!(unescape_value("plain"), Cow::Borrowed("plain")));
-
-        assert_eq!(escape_value("a b=c\\d"), r"a\x20b\x3Dc\x5Cd");
-        assert!(matches!(escape_value("plain"), Cow::Borrowed("plain")));
-        for value in ["a b=c\\d", "Ünïcode Nét", "mix é = \\ x"] {
-            assert_eq!(unescape_value(&escape_value(value)), value, "{value:?}");
-        }
         // escapes of non-ASCII octets stay literal (UTF-8 is never escaped)
         assert_eq!(unescape_value(r"\xC3\xA9"), r"\xC3\xA9");
         // `\x` followed by multi-byte UTF-8 must not slice mid-char (a
@@ -228,27 +176,5 @@ mod tests {
     fn parse_unescapes_values() {
         let t = IsupportToken::parse(r"NETWORK=Some\x20Net").unwrap();
         assert_eq!(t.value.as_deref(), Some("Some Net"));
-    }
-
-    #[test]
-    fn serialize_forms() {
-        let flag = IsupportToken {
-            negated: false,
-            name: "EXCEPTS",
-            value: None,
-        };
-        assert_eq!(flag.serialize(), "EXCEPTS");
-        let neg = IsupportToken {
-            negated: true,
-            name: "MONITOR",
-            value: None,
-        };
-        assert_eq!(neg.serialize(), "-MONITOR");
-        let valued = IsupportToken {
-            negated: false,
-            name: "NETWORK",
-            value: Some("Some Net".into()),
-        };
-        assert_eq!(valued.serialize(), r"NETWORK=Some\x20Net");
     }
 }

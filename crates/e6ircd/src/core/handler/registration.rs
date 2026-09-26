@@ -58,6 +58,11 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     if !state.claim_nick(key.clone(), conn) {
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .note_nick_in_use(nick);
         state.numeric(
             conn,
             ERR_NICKNAMEINUSE,
@@ -260,17 +265,28 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    // `*` means "my current nick". Without a nick there is nothing to name the
-    // account after — which is the case when the nick the client wanted was
-    // already taken, so it is reported as the name being unavailable.
+    // `*` means "my current nick". Without one there is nothing to name the
+    // account after (NEED_NICK) — unless the nick the client asked for was
+    // refused because another session holds it: that name is not available as
+    // an account either, which is what the client needs to hear (Ergo and
+    // irctest's RegisterNoLandGrabs answer ACCOUNT_EXISTS).
     let Some(nick) = nick else {
-        register_fail(
-            state,
-            conn,
-            "ACCOUNT_EXISTS",
-            "*",
-            "That nickname is already in use, so it cannot be registered",
-        );
+        match state.sessions[&conn].refused_nick().map(String::from) {
+            Some(taken) => register_fail(
+                state,
+                conn,
+                "ACCOUNT_EXISTS",
+                &taken,
+                "That name is held by another user",
+            ),
+            None => register_fail(
+                state,
+                conn,
+                "NEED_NICK",
+                "*",
+                "You must hold a nickname before registering an account",
+            ),
+        }
         return;
     };
     if *account != "*" && !state.casemap.eq(account, &nick) {
@@ -283,14 +299,16 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    if state.config.reserved_account_names.reserves(&nick) {
-        register_fail(
-            state,
-            conn,
-            "BAD_ACCOUNT_NAME",
-            &nick,
-            "That account name is reserved for a server administrator and cannot be registered",
-        );
+    if let Err(refusal) = state.config.reserved_account_names.claimable(&nick) {
+        let description = match refusal {
+            crate::identity::NameClaimRefusal::ServiceNick => {
+                "That account name is a services nick and cannot be registered"
+            }
+            crate::identity::NameClaimRefusal::ConfiguredAdministrator => {
+                "That account name is reserved for a server administrator and cannot be registered"
+            }
+        };
+        register_fail(state, conn, "BAD_ACCOUNT_NAME", &nick, description);
         return;
     }
     if state.config.registration_require_email && *email == "*" {
@@ -318,6 +336,17 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 );
                 return;
             }
+        }
+    };
+    let password = match crate::identity::NewPassword::parse(password) {
+        Ok(password) => password,
+        Err(refusal) => {
+            let code = match refusal {
+                crate::identity::PasswordRefusal::Empty => "WEAK_PASSWORD",
+                crate::identity::PasswordRefusal::TooLong => "UNACCEPTABLE_PASSWORD",
+            };
+            register_fail(state, conn, code, &nick, refusal.explanation());
+            return;
         }
     };
     if state.sessions[&conn].account().is_some() {
@@ -367,7 +396,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         conn,
         name: nick.clone(),
         contact_email,
-        password: password.to_string(),
+        password,
         origin: crate::core::AccountOrigin::RegisterCommand,
     };
     if state.db_tx.try_push(request).is_err() {
@@ -380,12 +409,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
     } else {
         // Hold later output until the database replies.
-        state.defer_reply(conn);
-        let label = state.capture.as_mut().and_then(|cap| {
-            cap.label.clone().inspect(|_| {
-                cap.deferred = true;
-            })
-        });
+        let label = state.defer_captured_reply(conn);
         state
             .sessions
             .get_mut(&conn)

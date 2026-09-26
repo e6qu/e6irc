@@ -133,39 +133,34 @@ pub(super) fn record_history(
     dm_peers: Vec<String>,
     entry: crate::core::state::HistoryEntry,
 ) {
-    let (msgid, ts) = (entry.msgid.clone(), entry.ts);
-    let (prefix, body, kind) = (entry.sender_prefix.clone(), entry.body.clone(), entry.kind);
-    let sender_account = entry.sender_account.clone();
-    let sender_is_bot = entry.sender_is_bot;
-    let multiline = entry.multiline.clone();
-    state.push_history(key, entry);
     // A conversation with an unauthenticated party is never persisted. `~nick`
     // is not a person, it is whoever holds the nick right now: stored under it,
     // the conversation — and the list of who they talked to — would be handed
     // to the next stranger who takes the nick. It lives only in the ring, which
     // is purged when that party disconnects (`ServerState::close`); the other
     // party, authenticated or not, keeps it for exactly that long.
-    if dm_peers.iter().any(|peer| peer.starts_with('~')) {
-        return;
-    }
+    //
     // Persist only when a database is configured (the same db-present proxy the
     // other DB writes use). Without one the hot ring is the entire record, so
     // there is nothing to enqueue — and enqueuing anyway would fail on every
     // message, flooding stderr and starving the core worker under load.
-    if !state.config.sasl_enabled {
-        return;
+    if dm_peers.iter().any(|peer| peer.starts_with('~')) || !state.config.sasl_enabled {
+        return state.push_history(key, entry);
     }
+    let stored = entry.clone();
+    state.push_history(key, entry);
     let log = crate::core::DbRequest::LogMessage {
-        msgid,
+        msgid: stored.msgid,
         target: key.as_str().to_string(),
         dm_peers,
-        sender_prefix: prefix,
-        sender_account,
-        kind,
-        body,
-        sender_is_bot,
-        multiline,
-        ts,
+        sender_prefix: stored.sender_prefix,
+        sender_account: stored.sender_account,
+        kind: stored.kind,
+        body: stored.body,
+        sender_is_bot: stored.sender_is_bot,
+        multiline: stored.multiline,
+        client_tags: stored.client_tags,
+        ts: stored.ts,
     };
     if state.db_tx.try_push(log).is_err() {
         eprintln!("history: log queue full or closed; message not persisted");
@@ -405,7 +400,7 @@ pub(super) fn deliver_one_message(
     if channel_target.starts_with('#') {
         let owner = state.channel_owner(channel_target);
         if !state.owns_channel(&owner) {
-            let label = state.defer_channel_reply(conn);
+            let label = state.defer_captured_reply(conn);
             state.route_message(crate::core::state::ChannelMessage::new(
                 owner,
                 state.channel_actor(conn),
@@ -444,10 +439,11 @@ pub(super) fn deliver_one_message(
         ts,
         sender_prefix: prefix.clone(),
         sender_account: state.sessions[&conn].account().map(str::to_owned),
-        kind,
+        kind: kind.into(),
         body: text.to_string(),
         sender_is_bot: state.sessions[&conn].bot,
         multiline: None,
+        client_tags: crate::sanitize::history_client_tags(client_tags),
     };
     let delivery = Delivery {
         sender_account: entry.sender_account.as_deref(),
@@ -522,10 +518,11 @@ pub(super) fn message_on_owner(
         ts,
         sender_prefix: prefix.clone(),
         sender_account: actor.account.clone(),
-        kind,
+        kind: kind.into(),
         body: text.to_string(),
         sender_is_bot: actor.bot,
         multiline: None,
+        client_tags: crate::sanitize::history_client_tags(&client_tags),
     };
     let delivery = Delivery {
         sender_account: entry.sender_account.as_deref(),
@@ -639,7 +636,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     if channel_target.starts_with('#') {
         let owner = state.channel_owner(channel_target);
         if !state.owns_channel(&owner) {
-            let label = state.defer_channel_reply(conn);
+            let label = state.defer_captured_reply(conn);
             state.route_tagmsg(crate::core::state::ChannelTagmsg::new(
                 owner,
                 state.channel_actor(conn),
@@ -650,74 +647,92 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
             return;
         }
     }
-    let prefix = state.sessions[&conn].prefix();
-    let (now, msgid) = state.stamp();
-    // The sender's account/bot state. TAGMSG carries `account` (for account-tag
-    // recipients) and `bot` (for a bot sender) exactly like PRIVMSG/NOTICE — the
-    // IRCv3 account-tag and bot-mode specs list TAGMSG among the messages that
-    // bear them, and identity/anti-spam tooling keying on these tags would
-    // otherwise silently lose typing/reaction attribution.
-    let sender_account = state.sessions[&conn].account().map(str::to_owned);
-    let sender_is_bot = state.sessions[&conn].bot;
-    // TAGMSG only reaches message-tags clients, so `msgid` is always present.
-    let make_line = |caps: crate::core::state::Caps| {
-        let mut tags = crate::core::state::event_tags(
-            caps,
-            now,
-            Some(&msgid),
-            sender_account.as_deref(),
-            sender_is_bot,
-        );
-        if !client_tags.is_empty() {
-            tags.push(client_tags.to_string());
-        }
-        format!("@{} :{prefix} TAGMSG {target}", tags.join(";"))
-    };
-
     // A STATUSMSG (`@#chan`/`+#chan`) is valid for TAGMSG too (message-tags
-    // spec): route typing/reaction tags to the same op/voice subset PRIVMSG
-    // would, rather than falling through to the nick branch and answering
-    // ERR_NOSUCHNICK. The echoed `target` keeps the sigil, like PRIVMSG.
-    let (status_prefix, chan_target) = StatusSigil::split(target);
-    let recipients: Vec<Recipient> = if chan_target.starts_with('#') {
-        let key = state.chan_key(chan_target);
-        let Some(chan) = state.channels.get(&key) else {
-            state.err_nosuchchannel(conn, target);
-            return;
-        };
-        // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't
-        // relay TAGMSG (typing/reaction tags) it couldn't relay as text.
-        let subject = state.sessions[&conn].mask_subject(&prefix);
-        if let Some(why) = speak_refusal(chan, conn, state.casemap, &subject, status_prefix, false)
-        {
-            emit_speak_refusal(state, conn, target, why);
-            return;
-        }
-        chan.recipients_where(|member, modes| {
-            member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
-        })
-    } else {
-        let key = state.nick_key(target);
-        let Some(peer) = state.registered_user(&key) else {
-            state.err_nosuchnick(conn, target);
-            return;
-        };
-        vec![peer.recipient]
+    // spec): the same gate and op/voice subset PRIVMSG uses, so a banned or
+    // quieted member can't relay TAGMSG (typing/reaction tags) it couldn't
+    // relay as text. The echoed `target` keeps the sigil, like PRIVMSG.
+    let Some(resolved) = resolve_message_target(state, conn, target, false, true) else {
+        return;
     };
-
-    for recipient in recipients {
-        let caps = recipient.caps();
-        if !caps.message_tags {
-            continue; // spec: TAGMSG must not reach cap-less clients
+    let prefix = state.sessions[&conn].prefix();
+    let line = format!(":{prefix} TAGMSG {target}");
+    let (ts, msgid) = state.stamp();
+    let entry = tagmsg_history_entry(
+        msgid,
+        ts,
+        prefix,
+        state.sessions[&conn].account().map(str::to_owned),
+        state.sessions[&conn].bot,
+        client_tags,
+    );
+    // TAGMSG carries `account` (for account-tag recipients) and `bot` (for a
+    // bot sender) exactly like PRIVMSG/NOTICE — the IRCv3 account-tag and
+    // bot-mode specs list TAGMSG among the messages that bear them.
+    let delivery = Delivery {
+        sender_account: entry.sender_account.as_deref(),
+        sender_is_bot: entry.sender_is_bot,
+        msgid: &entry.msgid,
+        client_tags,
+        body: &line,
+        ts: entry.ts,
+        bypass_capture: true,
+    };
+    deliver_and_echo(
+        state,
+        conn,
+        &tagmsg_audience(&resolved.recipients),
+        &delivery,
+    );
+    match resolved.kind {
+        ResolvedKind::Channel {
+            status_prefix: Some(_),
+            ..
+        } => {} // STATUSMSG never enters history (see the PRIVMSG path)
+        ResolvedKind::Channel { key, .. } => {
+            if !entry.client_tags.is_empty() {
+                record_history(state, &(&key).into(), Vec::new(), entry);
+            }
         }
-        let line = make_line(caps);
-        // A delivery, not a response: bypass labeled-response capture.
-        let bytes = bytes::Bytes::from(format!("{line}\r\n"));
-        state.send_recipient_uncaptured(recipient, bytes);
+        ResolvedKind::User { peer } => {
+            if !entry.client_tags.is_empty() {
+                record_conversation(state, conn, &peer, entry);
+            }
+        }
     }
-    if state.sessions[&conn].caps.echo_message {
-        let line = make_line(state.sessions[&conn].caps);
-        state.send(conn, &line); // echo is the labeled response
+}
+
+/// The recipients a TAGMSG reaches: those that negotiated `message-tags`. For
+/// everyone else it must not exist at all.
+fn tagmsg_audience(recipients: &[Recipient]) -> Vec<Recipient> {
+    recipients
+        .iter()
+        .copied()
+        .filter(|recipient| recipient.caps().message_tags)
+        .collect()
+}
+
+/// The history entry of a TAGMSG: no text, the client-only tags history keeps
+/// ([`crate::sanitize::history_client_tags`]). Empty tags mean there is nothing
+/// to replay — a typing indicator, or a TAGMSG with no client tags — and the
+/// caller records nothing.
+fn tagmsg_history_entry(
+    msgid: String,
+    ts: e6irc_proto::time::Millis,
+    sender_prefix: String,
+    sender_account: Option<String>,
+    sender_is_bot: bool,
+    client_tags: &str,
+) -> crate::core::state::HistoryEntry {
+    crate::core::state::HistoryEntry {
+        msgid,
+        ts,
+        sender_prefix,
+        sender_account,
+        kind: crate::core::HistoryKind::Tagmsg,
+        body: String::new(),
+        sender_is_bot,
+        multiline: None,
+        client_tags: crate::sanitize::history_client_tags(client_tags),
     }
 }
 
@@ -747,50 +762,38 @@ pub(super) fn tagmsg_on_owner(
     ) {
         return crate::core::state::ChannelTagmsgResult::CannotSend { target, why };
     }
-    let recipients = channel.recipients_where(|member, modes| {
+    let recipients = tagmsg_audience(&channel.recipients_where(|member, modes| {
         member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
-    });
+    }));
+    let line = format!(":{} TAGMSG {target}", actor.identity.prefix);
     let (ts, msgid) = state.stamp();
-    for recipient in recipients {
-        let caps = recipient.caps();
-        if caps.message_tags {
-            state.send_recipient_uncaptured(
-                recipient,
-                render_tagmsg(&actor, &target, &client_tags, &msgid, ts, caps),
-            );
-        }
+    let entry = tagmsg_history_entry(
+        msgid,
+        ts,
+        actor.identity.prefix.clone(),
+        actor.account.clone(),
+        actor.bot,
+        &client_tags,
+    );
+    let delivery = Delivery {
+        sender_account: entry.sender_account.as_deref(),
+        sender_is_bot: entry.sender_is_bot,
+        msgid: &entry.msgid,
+        client_tags: &client_tags,
+        body: &line,
+        ts: entry.ts,
+        bypass_capture: true,
+    };
+    deliver_message(state, &recipients, &delivery);
+    let echo = actor
+        .recipient
+        .caps()
+        .echo_message
+        .then(|| render_delivery(actor.recipient.caps(), &delivery));
+    if status_prefix.is_none() && !entry.client_tags.is_empty() {
+        record_history(state, &(&key).into(), Vec::new(), entry);
     }
-    let echo = actor.recipient.caps().echo_message.then(|| {
-        render_tagmsg(
-            &actor,
-            &target,
-            &client_tags,
-            &msgid,
-            ts,
-            actor.recipient.caps(),
-        )
-    });
     crate::core::state::ChannelTagmsgResult::Delivered { echo }
-}
-
-fn render_tagmsg(
-    actor: &crate::core::state::ChannelActor,
-    target: &str,
-    client_tags: &str,
-    msgid: &str,
-    ts: e6irc_proto::time::Millis,
-    caps: crate::core::state::Caps,
-) -> bytes::Bytes {
-    let mut tags =
-        crate::core::state::event_tags(caps, ts, Some(msgid), actor.account.as_deref(), actor.bot);
-    if !client_tags.is_empty() {
-        tags.push(client_tags.to_string());
-    }
-    bytes::Bytes::from(format!(
-        "@{} :{} TAGMSG {target}\r\n",
-        tags.join(";"),
-        actor.identity.prefix
-    ))
 }
 
 pub(super) fn emit_tagmsg_result(
@@ -818,7 +821,7 @@ pub(super) fn emit_tagmsg_result(
 /// A client must be able to see them before it starts a batch it cannot finish.
 pub(super) const MULTILINE_CAP: &str = "draft/multiline";
 /// Total bytes of message text one multiline message may carry.
-pub(crate) const MULTILINE_MAX_BYTES: usize = 4096;
+pub(super) const MULTILINE_MAX_BYTES: usize = 4096;
 /// Lines one multiline message may carry.
 pub(super) const MULTILINE_MAX_LINES: usize = 32;
 /// Tag marking a line as continuing the previous one without a break.
@@ -843,6 +846,19 @@ pub(super) fn multiline_fail(
         .get_mut(&conn)
         .and_then(|session| session.multiline.take())
         .and_then(|batch| batch.label);
+    multiline_batch_fail(state, conn, label, code, context, detail);
+}
+
+/// `FAIL BATCH <code> [context] :<description>` for a batch already taken from
+/// the session, under the label of the BATCH that opened it.
+fn multiline_batch_fail(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<String>,
+    code: &str,
+    context: &[&str],
+    detail: &str,
+) {
     let server = state.config.server_name.clone();
     let mut line = String::new();
     if let Some(label) = &label {
@@ -935,11 +951,14 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             let client_tags = crate::sanitize::client_tag_string(msg);
             // The response to this command is the batch itself, emitted when
             // the client closes it — so the label travels with the batch and
-            // the framer must not ACK this as an empty response.
-            let label = state.capture.as_ref().and_then(|c| c.label.clone());
-            if let Some(cap) = state.capture.as_mut() {
-                cap.deferred = true;
-            }
+            // the framer must not ACK this as an empty response. Opening the
+            // batch answers nothing on the spot, so every close-time outcome
+            // answers the label on its own (see `ack_multiline_label`).
+            debug_assert!(
+                state.capture.as_ref().is_none_or(|c| c.lines.is_empty()),
+                "a multiline batch open answered on the spot"
+            );
+            let label = state.defer_captured_label(conn);
             let session = state.sessions.get_mut(&conn).expect("checked");
             session.multiline = Some(crate::core::state::MultilineBatch {
                 reference: reference.to_string(),
@@ -1018,15 +1037,26 @@ pub(super) fn deliver_multiline(
     conn: ConnId,
     batch: crate::core::state::MultilineBatch,
 ) {
-    // Nothing to send: either no lines at all, or only blank ones. A blank
-    // line is a line break, not text, so a message made only of them has no
-    // text in it -- exactly what ERR_NOTEXTTOSEND refuses for a PRIVMSG, and
-    // what recipients without `draft/multiline` would be sent: nothing. Stored
-    // instead, it became a history row that replays as no line at all, so a
-    // page of N rows reached such a client as fewer than N messages and read
-    // as the end of the buffer.
+    // A batch closed with no lines in it is no message at all: refused like
+    // any other malformed batch, never answered with silence.
+    if batch.lines.is_empty() {
+        return multiline_batch_fail(
+            state,
+            conn,
+            batch.label,
+            "MULTILINE_INVALID",
+            &[],
+            "Empty batch",
+        );
+    }
+    // Only blank lines: a blank line is a line break, not text, so a message
+    // made only of them has no text in it -- exactly what ERR_NOTEXTTOSEND
+    // refuses for a PRIVMSG, and what recipients without `draft/multiline`
+    // would be sent: nothing. Stored instead, it became a history row that
+    // replays as no line at all, so a page of N rows reached such a client as
+    // fewer than N messages and read as the end of the buffer.
     if batch.lines.iter().all(|(text, _)| text.is_empty()) {
-        if !batch.lines.is_empty() && batch.kind.is_some_and(crate::core::MessageKind::is_loud) {
+        if batch.kind.is_some_and(crate::core::MessageKind::is_loud) {
             state.numeric(conn, ERR_NOTEXTTOSEND, &[], Some("No text to send"));
         }
         // The opening BATCH was labeled, so that command still owes a response
@@ -1059,12 +1089,22 @@ pub(super) fn deliver_multiline(
         ack_multiline_label(state, conn, batch.label.as_deref());
         return;
     };
-    let target = batch.target.as_str();
     let prefix = state.sessions[&conn].prefix();
     let sender_account = state.sessions[&conn].account().map(str::to_owned);
-    let sender_is_bot = state.sessions[&conn].bot;
     let (ts, msgid) = state.stamp();
     let batch_ref = state.next_msgid();
+    let server = state.config.server_name.clone();
+    let message = MultilineMessage {
+        prefix: &prefix,
+        kind,
+        target: &batch.target,
+        lines: &batch.lines,
+        client_tags: &batch.client_tags,
+        msgid: &msgid,
+        ts,
+        account: sender_account.as_deref(),
+        bot: state.sessions[&conn].bot,
+    };
 
     let echo_message = state.sessions[&conn].caps.echo_message;
     let mut audience: Vec<(Recipient, bool)> = resolved
@@ -1078,85 +1118,16 @@ pub(super) fn deliver_multiline(
         audience.push((state.local_recipient(conn), false));
     }
     for (recipient, bypass) in audience {
-        let caps = recipient.caps();
-        // Tags every form carries, in the order the other delivery path uses.
-        let common = crate::core::state::event_tags(
-            caps,
-            ts,
-            None,
-            sender_account.as_deref(),
-            sender_is_bot,
-        );
-        if caps.multiline && caps.batch {
-            let mut open: Vec<String> = Vec::new();
+        let framing = MultilineFraming {
+            caps: recipient.caps().into(),
+            batch_ref: &batch_ref,
+            outer_batch: None,
             // Only the sender's own copy is the labeled response to its command.
-            if !bypass && let Some(label) = &batch.label {
-                open.push(format!("label={label}"));
-            }
-            if caps.message_tags {
-                open.push(format!("msgid={msgid}"));
-                if !batch.client_tags.is_empty() {
-                    open.push(batch.client_tags.clone());
-                }
-            }
-            open.extend(common.iter().cloned());
-            let tags = tag_prefix(&open);
-            send_multiline_line(
-                state,
-                recipient,
-                bypass,
-                &format!("{tags}:{prefix} BATCH +{batch_ref} {MULTILINE_CAP} {target}"),
-            );
-            for (text, concat) in &batch.lines {
-                let mut line_tags = vec![format!("batch={batch_ref}")];
-                if *concat && caps.message_tags {
-                    line_tags.push(MULTILINE_CONCAT_TAG.to_string());
-                }
-                line_tags.extend(common.iter().cloned());
-                let tags = tag_prefix(&line_tags);
-                send_multiline_line(
-                    state,
-                    recipient,
-                    bypass,
-                    &format!("{tags}:{prefix} {} {target} :{text}", kind.wire()),
-                );
-            }
-            send_multiline_line(
-                state,
-                recipient,
-                bypass,
-                &format!(":{} BATCH -{batch_ref}", state.config.server_name.clone()),
-            );
-        } else {
-            // Flattened: the msgid identifies the message, so it rides the
-            // first line only — the rest are the same message continuing.
-            let mut first = true;
-            for (text, _) in batch.lines.iter().filter(|(t, _)| !t.is_empty()) {
-                let mut line_tags: Vec<String> = Vec::new();
-                if first && caps.message_tags {
-                    line_tags.push(format!("msgid={msgid}"));
-                    if !batch.client_tags.is_empty() {
-                        line_tags.push(batch.client_tags.clone());
-                    }
-                } else if caps.message_tags && !batch.client_tags.is_empty() {
-                    line_tags.push(batch.client_tags.clone());
-                }
-                line_tags.extend(common.iter().cloned());
-                let tags = tag_prefix(&line_tags);
-                // Flattened lines go to a client without draft/multiline, which
-                // gets one PRIVMSG per line and holds each to the 512-byte limit
-                // — so each is trimmed to fit, exactly as a single message is.
-                // The batch form above is left full: its recipient negotiated
-                // the capability and the larger frame that comes with it.
-                let text = fit_relayed_text(&prefix, kind.wire(), target, text);
-                send_multiline_line(
-                    state,
-                    recipient,
-                    bypass,
-                    &format!("{tags}:{prefix} {} {target} :{text}", kind.wire()),
-                );
-                first = false;
-            }
+            label: batch.label.as_deref().filter(|_| !bypass),
+            server: &server,
+        };
+        for line in render_multiline(&message, &framing) {
+            send_multiline_line(state, recipient, bypass, &line);
         }
     }
 
@@ -1177,41 +1148,13 @@ pub(super) fn deliver_multiline(
         away_reply(state, conn, peer, loud);
     }
 
-    // History records what a client without the capability would have seen:
-    // one entry per non-blank line, the first carrying the message's msgid.
-    if let ResolvedKind::Channel {
-        status_prefix: Some(_),
-        ..
-    } = &resolved.kind
-    {
-        return; // STATUSMSG never enters history (see the other path)
-    }
-    // A multiline message is ONE history entry carrying its single (live)
-    // msgid and its lines encoded together, so CHATHISTORY reconstructs the
-    // whole message under the id it was delivered with (per the CHATHISTORY
-    // spec: "msgid MUST be the msgid as originally sent") — rather than one row
-    // per line with fresh, never-delivered ids that a msgid-deduplicating client
-    // would replay as brand-new messages. `body` holds a plain-line fallback (a
-    // reader without the multiline field); `multiline` is authoritative on
-    // replay. All lines are kept, blanks included, so the reconstructed batch
-    // matches the live one; the flattened replay drops blanks as live does.
-    let fallback = batch
-        .lines
-        .iter()
-        .map(|(t, _)| t.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let entry = crate::core::state::HistoryEntry {
-        msgid,
-        ts,
-        sender_prefix: prefix.clone(),
-        sender_account: sender_account.clone(),
-        kind,
-        body: fallback,
-        sender_is_bot,
-        multiline: Some(encode_multiline(&batch.lines)),
-    };
+    let entry = multiline_history_entry(&message);
     match &resolved.kind {
+        // STATUSMSG never enters history (see the other path).
+        ResolvedKind::Channel {
+            status_prefix: Some(_),
+            ..
+        } => {}
         ResolvedKind::Channel { key, .. } => record_history(state, &key.into(), Vec::new(), entry),
         ResolvedKind::User { peer } => record_conversation(state, conn, peer, entry),
     }
@@ -1296,58 +1239,46 @@ pub(super) fn multiline_on_owner(
     });
     let (ts, msgid) = state.stamp();
     let batch_ref = state.next_msgid();
+    let server = state.config.server_name.clone();
+    let message = MultilineMessage {
+        prefix: &actor.identity.prefix,
+        kind,
+        target: &batch.target,
+        lines: &batch.lines,
+        client_tags: &batch.client_tags,
+        msgid: &msgid,
+        ts,
+        account: actor.account.as_deref(),
+        bot: actor.bot,
+    };
+    let render = |caps: crate::core::state::Caps, label: Option<&str>| {
+        render_multiline(
+            &message,
+            &MultilineFraming {
+                caps: caps.into(),
+                batch_ref: &batch_ref,
+                outer_batch: None,
+                label,
+                server: &server,
+            },
+        )
+        .iter()
+        .map(|line| render_multiline_line(line))
+        .collect::<Vec<_>>()
+    };
     for recipient in recipients {
-        for line in render_multiline_lines(
-            state,
-            recipient.caps(),
-            &actor,
-            &batch,
-            kind,
-            ts,
-            &msgid,
-            &batch_ref,
-            None,
-        ) {
+        for line in render(recipient.caps(), None) {
             state.send_recipient_uncaptured(recipient, line);
         }
     }
     let echo = if actor.recipient.caps().echo_message {
-        render_multiline_lines(
-            state,
-            actor.recipient.caps(),
-            &actor,
-            &batch,
-            kind,
-            ts,
-            &msgid,
-            &batch_ref,
-            batch.label.as_deref(),
-        )
+        render(actor.recipient.caps(), batch.label.as_deref())
     } else {
         Vec::new()
     };
     if status.is_none() {
-        let fallback = batch
-            .lines
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        record_history(
-            state,
-            &(&key).into(),
-            Vec::new(),
-            crate::core::state::HistoryEntry {
-                msgid,
-                ts,
-                sender_prefix: actor.identity.prefix.clone(),
-                sender_account: actor.account.clone(),
-                kind,
-                body: fallback,
-                sender_is_bot: actor.bot,
-                multiline: Some(encode_multiline(&batch.lines)),
-            },
-        );
+        let entry = multiline_history_entry(&message);
+        record_history(state, &(&key).into(), Vec::new(), entry);
     }
     crate::core::state::ChannelMultilineResult::Delivered {
         echo,
@@ -1378,78 +1309,162 @@ fn multiline_carries_blocked_ctcp(lines: &[(String, bool)]) -> bool {
         || lines.iter().any(|(raw, _)| is_blocked_ctcp(raw))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_multiline_lines(
-    state: &ServerState,
-    caps: crate::core::state::Caps,
-    actor: &crate::core::state::ChannelActor,
-    batch: &crate::core::state::MultilineBatch,
-    kind: crate::core::MessageKind,
-    ts: e6irc_proto::time::Millis,
-    msgid: &str,
-    batch_ref: &str,
-    label: Option<&str>,
-) -> Vec<bytes::Bytes> {
-    let target = &batch.target;
-    let prefix = &actor.identity.prefix;
-    let common =
-        crate::core::state::event_tags(caps, ts, None, actor.account.as_deref(), actor.bot);
+/// The one history entry a multiline message is kept as: its single (live)
+/// msgid and its lines encoded together, so CHATHISTORY reconstructs the whole
+/// message under the id it was delivered with (per the CHATHISTORY spec: "msgid
+/// MUST be the msgid as originally sent") — rather than one row per line with
+/// fresh, never-delivered ids that a msgid-deduplicating client would replay as
+/// brand-new messages. `body` holds a plain-line fallback (a reader without the
+/// multiline field); `multiline` is authoritative on replay. All lines are
+/// kept, blanks included, so the reconstructed batch matches the live one; the
+/// flattened replay drops blanks as live does.
+fn multiline_history_entry(message: &MultilineMessage) -> crate::core::state::HistoryEntry {
+    crate::core::state::HistoryEntry {
+        msgid: message.msgid.to_string(),
+        ts: message.ts,
+        sender_prefix: message.prefix.to_string(),
+        sender_account: message.account.map(str::to_owned),
+        kind: message.kind.into(),
+        body: message
+            .lines
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        sender_is_bot: message.bot,
+        multiline: Some(encode_multiline(message.lines)),
+        client_tags: crate::sanitize::history_client_tags(message.client_tags),
+    }
+}
+
+/// One multiline message — as delivered live, and as history rebuilds it.
+pub(super) struct MultilineMessage<'a> {
+    pub(super) prefix: &'a str,
+    pub(super) kind: crate::core::MessageKind,
+    pub(super) target: &'a str,
+    pub(super) lines: &'a [(String, bool)],
+    /// The client-only tags the batch was opened with, as relayed.
+    pub(super) client_tags: &'a str,
+    pub(super) msgid: &'a str,
+    pub(super) ts: e6irc_proto::time::Millis,
+    pub(super) account: Option<&'a str>,
+    pub(super) bot: bool,
+}
+
+/// How one recipient's copy of a [`MultilineMessage`] is framed.
+pub(super) struct MultilineFraming<'a> {
+    pub(super) caps: crate::core::HistoryResponseCaps,
+    /// Reference of the `draft/multiline` batch: fresh for each rendering.
+    pub(super) batch_ref: &'a str,
+    /// The batch the message sits in — the CHATHISTORY batch on replay.
+    pub(super) outer_batch: Option<&'a str>,
+    /// The sender's own copy answers the label of the BATCH that opened it.
+    pub(super) label: Option<&'a str>,
+    pub(super) server: &'a str,
+}
+
+/// Render a multiline message for one recipient, lines without CRLF. The one
+/// renderer live delivery (local and channel-owner) and CHATHISTORY replay
+/// share, so a replayed message is the one delivered.
+///
+/// A recipient that negotiated `draft/multiline` and `batch` gets the batch as
+/// sent — blank lines and `draft/multiline-concat` tags intact. Every line in
+/// it is still an ordinary IRC line held to the 512-byte limit: a line the
+/// relay's source prefix would push past it is split on a character boundary,
+/// its continuations marked `draft/multiline-concat` (the capability's way of
+/// carrying one logical line in several), or trimmed for a recipient without
+/// `message-tags`, which cannot be told a line continues. Anyone else gets one
+/// message per non-blank line, each trimmed to fit, the msgid on the first.
+pub(super) fn render_multiline(
+    message: &MultilineMessage,
+    framing: &MultilineFraming,
+) -> Vec<String> {
+    let caps = framing.caps;
+    let verb = message.kind.wire();
+    let target = message.target;
+    let prefix = message.prefix;
+    let head = format!(":{prefix} {verb} {target} :");
+    let outer: Vec<String> = framing
+        .outer_batch
+        .map(|outer| format!("batch={outer}"))
+        .into_iter()
+        .collect();
+    let client_tags = (caps.message_tags && !message.client_tags.is_empty())
+        .then(|| message.client_tags.to_string());
     let mut lines = Vec::new();
     if caps.multiline && caps.batch {
-        let mut open = Vec::new();
-        if let Some(label) = label {
-            open.push(format!("label={label}"));
-        }
-        if caps.message_tags {
-            open.push(format!("msgid={msgid}"));
-            if !batch.client_tags.is_empty() {
-                open.push(batch.client_tags.clone());
-            }
-        }
-        open.extend(common.iter().cloned());
-        lines.push(render_multiline_line(&format!(
+        let batch_ref = framing.batch_ref;
+        let mut open = outer.clone();
+        open.extend(framing.label.map(|label| format!("label={label}")));
+        open.extend(caps.event_tags(
+            message.ts,
+            Some(message.msgid),
+            message.account,
+            message.bot,
+        ));
+        open.extend(client_tags);
+        lines.push(format!(
             "{}:{prefix} BATCH +{batch_ref} {MULTILINE_CAP} {target}",
             tag_prefix(&open)
-        )));
-        for (text, concat) in &batch.lines {
-            let mut tags = vec![format!("batch={batch_ref}")];
-            if *concat && caps.message_tags {
-                tags.push(MULTILINE_CONCAT_TAG.into());
+        ));
+        let common = caps.event_tags(message.ts, None, message.account, message.bot);
+        for (text, concat) in message.lines {
+            for (index, piece) in split_to_fit(&head, text, caps.message_tags)
+                .into_iter()
+                .enumerate()
+            {
+                let mut tags = vec![format!("batch={batch_ref}")];
+                tags.extend(common.iter().cloned());
+                if caps.message_tags && (*concat || index > 0) {
+                    tags.push(MULTILINE_CONCAT_TAG.to_string());
+                }
+                lines.push(format!("{}{head}{piece}", tag_prefix(&tags)));
             }
-            tags.extend(common.iter().cloned());
-            lines.push(render_multiline_line(&format!(
-                "{}:{prefix} {} {target} :{text}",
-                tag_prefix(&tags),
-                kind.wire()
-            )));
         }
-        lines.push(render_multiline_line(&format!(
-            ":{} BATCH -{batch_ref}",
-            state.config.server_name
-        )));
+        lines.push(format!(
+            "{}:{} BATCH -{batch_ref}",
+            tag_prefix(&outer),
+            framing.server
+        ));
     } else {
+        let outer: Vec<String> = if caps.batch { outer } else { Vec::new() };
         let mut first = true;
-        for (text, _) in batch.lines.iter().filter(|(text, _)| !text.is_empty()) {
-            let mut tags = Vec::new();
-            if caps.message_tags {
-                if first {
-                    tags.push(format!("msgid={msgid}"));
-                }
-                if !batch.client_tags.is_empty() {
-                    tags.push(batch.client_tags.clone());
-                }
-            }
-            tags.extend(common.iter().cloned());
-            let text = fit_relayed_text(prefix, kind.wire(), target, text);
-            lines.push(render_multiline_line(&format!(
-                "{}:{prefix} {} {target} :{text}",
-                tag_prefix(&tags),
-                kind.wire()
-            )));
+        for (text, _) in message.lines.iter().filter(|(text, _)| !text.is_empty()) {
+            let mut tags = outer.clone();
+            tags.extend(caps.event_tags(
+                message.ts,
+                first.then_some(message.msgid),
+                message.account,
+                message.bot,
+            ));
+            tags.extend(client_tags.clone());
+            let text = super::fit_trailing(&head, text);
+            lines.push(format!("{}{head}{text}", tag_prefix(&tags)));
             first = false;
         }
     }
     lines
+}
+
+/// `text` as the trailing of lines starting `head`, each within the wire
+/// limit: in pieces cut on character boundaries when `continuable` (the pieces
+/// after the first continue the line), or trimmed to the first piece when not.
+fn split_to_fit<'a>(head: &str, text: &'a str, continuable: bool) -> Vec<&'a str> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    loop {
+        let mut piece = super::fit_trailing(head, rest);
+        if piece.is_empty() && !rest.is_empty() {
+            // A budget narrower than one character still moves forward.
+            let width = rest.chars().next().map_or(0, char::len_utf8);
+            piece = &rest[..width];
+        }
+        pieces.push(piece);
+        rest = &rest[piece.len()..];
+        if rest.is_empty() || !continuable {
+            return pieces;
+        }
+    }
 }
 
 pub(super) fn emit_multiline_result(

@@ -179,7 +179,7 @@ fn begin_owned_channel_registration(
     if state.channels_founded_by(&actor) >= super::channel::MAX_CHANNELS_PER_ACCOUNT {
         let _ = reply.send(channel_error(
             crate::core::ChannelControlError::Conflict,
-            "too many registered channels; unregister one before adding another",
+            TOO_MANY_REGISTERED_CHANNELS,
         ));
         return;
     }
@@ -302,6 +302,11 @@ fn queue_channel_control(
     true
 }
 
+/// The refusal of a registration past the founder cap, from the core's fast
+/// path and from storage's authoritative count alike.
+const TOO_MANY_REGISTERED_CHANNELS: &str =
+    "too many registered channels; unregister one before adding another";
+
 fn channel_error(kind: crate::core::ChannelControlError, message: impl Into<String>) -> AdminReply {
     AdminReply::ChannelErr {
         kind,
@@ -334,17 +339,22 @@ fn normalize_channel_mutation(
                         .channels
                         .get(key)
                         .map_or(key.as_str(), |channel| channel.name.as_str());
-                    let fitted = super::fit_trailing(
-                        &format!(":{} TOPIC {display} :", state.config.server_name),
-                        &raw,
-                    );
-                    (!fitted.is_empty()).then(|| {
-                        (
-                            fitted.to_string(),
-                            actor.to_string(),
-                            (state.config.clock)().as_secs(),
-                        )
-                    })
+                    // The topic travels in a TOPIC line whose head (this
+                    // server's and the channel's names) takes part of the wire
+                    // budget. A topic that does not fit whole is refused: the
+                    // request asked for this text, and storing less of it
+                    // while answering success would be a silent change.
+                    let head = format!(":{} TOPIC {display} :", state.config.server_name);
+                    let fitted = super::fit_trailing(&head, &raw);
+                    if fitted.len() != raw.len() {
+                        let room = super::fit_trailing(&head, &"x".repeat(raw.len())).len();
+                        return Err(format!(
+                            "topic is {} bytes; on this channel a topic holds at most {room}",
+                            raw.len()
+                        ));
+                    }
+                    (!raw.is_empty())
+                        .then(|| (raw, actor.to_string(), (state.config.clock)().as_secs()))
                 }
             };
             Ok(PersistedChannelMutation::SetTopic { topic })
@@ -894,7 +904,7 @@ pub(crate) fn channel_control_result(
     };
     let reply = pending.reply;
     let response = match result {
-        ChannelControlResult::Applied => {
+        ChannelControlResult::Applied { account: resolved } => {
             let summary = match mutation {
                 PersistedChannelMutation::SetTopic { topic } => {
                     let live_topic = topic.map(|(text, set_by, set_at_secs)| Topic {
@@ -977,6 +987,7 @@ pub(crate) fn channel_control_result(
                     format!("Updated the mode lock for {}", key.as_str())
                 }
                 PersistedChannelMutation::SetAccess { account, flags } => {
+                    let account = resolved.unwrap_or(account);
                     let account_key = state.account_key(&account);
                     match flags {
                         Some(flags) => {
@@ -993,9 +1004,8 @@ pub(crate) fn channel_control_result(
                     format!("Updated {account}'s access on {}", key.as_str())
                 }
                 PersistedChannelMutation::TransferFounder { account } => {
-                    state
-                        .registered_founders
-                        .set(key.clone(), state.account_key(&account));
+                    let account = resolved.unwrap_or(account);
+                    state.transfer_founder(key.as_str(), &account);
                     format!("Transferred {} to {account}", key.as_str())
                 }
                 PersistedChannelMutation::Drop => {
@@ -1019,6 +1029,13 @@ pub(crate) fn channel_control_result(
         ChannelControlResult::AccessLimitReached => channel_error(
             ChannelControlError::Conflict,
             "the channel access list is full; remove an entry before adding another",
+        ),
+        ChannelControlResult::FounderLimitReached => channel_error(
+            ChannelControlError::Conflict,
+            format!(
+                "the target account already founds the maximum of {} channels",
+                crate::db::CHANNEL_FOUNDER_LIMIT
+            ),
         ),
         ChannelControlResult::KeeptopicDisabled => channel_error(
             ChannelControlError::Conflict,
@@ -1060,7 +1077,7 @@ pub(crate) fn owned_channel_registration_result(
     state.pending_channel_registrations.remove(&key);
     let response = match result {
         ChannelRegistrationResult::Registered => {
-            state.set_founder(&channel, &founder_account);
+            state.register_founder(&channel, &founder_account);
             replace_registered_topic(state, &key, topic);
             AdminReply::Ok(format!("Registered {channel} to {founder_account}"))
         }
@@ -1072,6 +1089,9 @@ pub(crate) fn owned_channel_registration_result(
             ChannelControlError::NotFound,
             "the founder account is no longer registered",
         ),
+        ChannelRegistrationResult::LimitReached => {
+            channel_error(ChannelControlError::Conflict, TOO_MANY_REGISTERED_CHANNELS)
+        }
         ChannelRegistrationResult::Unavailable => channel_error(
             ChannelControlError::Unavailable,
             "persistence unavailable; channel was not registered",

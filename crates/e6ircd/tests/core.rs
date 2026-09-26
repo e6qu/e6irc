@@ -104,6 +104,7 @@ impl TestServer {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         };
         adjust(&mut config);
@@ -386,7 +387,30 @@ fn reject_read_marker(s: &mut TestServer) -> PendingReadMarker {
 }
 
 fn has_numeric(lines: &[String], code: &str) -> bool {
-    lines.iter().any(|l| l.split(' ').nth(1) == Some(code))
+    lines
+        .iter()
+        .any(|l| traditional_part(l).split(' ').nth(1) == Some(code))
+}
+
+/// The one response `out` carries for `label`: the single labeled line, or the
+/// lines inside its `labeled-response` batch. Fails unless the label answers
+/// exactly once.
+fn labeled_response(out: &[String], label: &str) -> Vec<String> {
+    let opener = format!("@label={label} ");
+    let labeled: Vec<&String> = out.iter().filter(|l| l.starts_with(&opener)).collect();
+    assert_eq!(labeled.len(), 1, "one response for {label}: {out:#?}");
+    let first = labeled[0];
+    let Some(reference) = first
+        .split_once(" BATCH +")
+        .and_then(|(_, rest)| rest.strip_suffix(" labeled-response"))
+    else {
+        return vec![first.clone()];
+    };
+    let inside = format!("@batch={reference}");
+    out.iter()
+        .filter(|l| l.starts_with(&format!("{inside} ")) || l.starts_with(&format!("{inside};")))
+        .cloned()
+        .collect()
 }
 
 #[test]
@@ -1899,6 +1923,143 @@ fn sasl_plain_success_flow() {
     assert!(has_numeric(&s.drain(c), "001"));
 }
 
+/// A server whose `[limits]` require SASL as `limits` says.
+fn sasl_required_server(limits: e6ircd::config::LimitsConfig) -> TestServer {
+    TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.sasl_requirement = limits.sasl_requirement();
+        },
+    )
+}
+
+/// Log `conn` in to `account` with SASL PLAIN, before registration.
+fn sasl_login(s: &mut TestServer, conn: ConnId, account: &str) {
+    s.line(conn, "CAP LS 302");
+    s.line(conn, "CAP REQ :sasl");
+    s.line(conn, "AUTHENTICATE PLAIN");
+    s.line(
+        conn,
+        &format!("AUTHENTICATE {}", b64(&format!("\0{account}\0pw"))),
+    );
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: account.into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert!(has_numeric(&s.drain(conn), "903"), "{account} logged in");
+}
+
+/// NICK and USER (and CAP END, harmless without negotiation) for `conn`.
+fn finish_registration(s: &mut TestServer, conn: ConnId, nick: &str) -> Vec<String> {
+    s.line(conn, &format!("NICK {nick}"));
+    s.line(conn, &format!("USER {nick} 0 * :{nick}"));
+    s.line(conn, "CAP END");
+    s.drain(conn)
+}
+
+/// The refusal Libera gives a client of a SASL-only range: 465 naming why,
+/// then the `SASL access only` closing link — and no welcome.
+fn assert_refused_for_sasl(out: &[String], host: &str) {
+    assert!(
+        out.iter().any(|l| l.split(' ').nth(1) == Some("465")
+            && l.ends_with(":You need to identify via SASL to use this server")),
+        "{out:#?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l == &format!("ERROR :Closing Link: {host} (SASL access only)")),
+        "{out:#?}"
+    );
+    assert!(!has_numeric(out, "001"), "{out:#?}");
+}
+
+#[test]
+fn sasl_required_of_everyone_refuses_an_anonymous_client_and_admits_a_logged_in_one() {
+    let mut s = sasl_required_server(e6ircd::config::LimitsConfig {
+        require_sasl: true,
+        ..Default::default()
+    });
+    let anonymous = s.connect(1);
+    assert_refused_for_sasl(
+        &finish_registration(&mut s, anonymous, "joe"),
+        "host1.example",
+    );
+    // Closed, not parked: the nick it asked for is free.
+    let alice = s.connect(2);
+    sasl_login(&mut s, alice, "alice");
+    assert!(has_numeric(
+        &finish_registration(&mut s, alice, "joe"),
+        "001"
+    ));
+
+    // A SASL attempt that fails does not count as logging in.
+    let failed = s.connect(3);
+    s.line(failed, "CAP LS 302");
+    s.line(failed, "CAP REQ :sasl");
+    s.line(failed, "AUTHENTICATE PLAIN");
+    s.line(failed, &format!("AUTHENTICATE {}", b64("\0bob\0wrong")));
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: failed,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert_refused_for_sasl(&finish_registration(&mut s, failed, "bob"), "host3.example");
+
+    // The bouncer's in-process sessions are exempt: their owner logged in to
+    // the bouncer.
+    let local = s.connect_with_transport(4, e6ircd::core::ConnectionTransport::Local);
+    assert!(has_numeric(
+        &finish_registration(&mut s, local, "carol"),
+        "001"
+    ));
+}
+
+#[test]
+fn sasl_required_from_ranges_refuses_only_clients_inside_them() {
+    let mut s = sasl_required_server(e6ircd::config::LimitsConfig {
+        require_sasl_from: vec![
+            "192.0.2.0/24".parse().expect("CIDR"),
+            "2001:db8::/32".parse().expect("CIDR"),
+        ],
+        ..Default::default()
+    });
+    for (id, address, refused) in [
+        (1, "192.0.2.7", true),
+        // An IPv4 client reaching a dual-stack socket is matched as IPv4.
+        (2, "::ffff:192.0.2.8", true),
+        (3, "2001:db8::9", true),
+        (4, "198.51.100.1", false),
+        (5, "2001:db9::1", false),
+        // A session opened under a name has no address a range can match.
+        (6, "host6.example", false),
+    ] {
+        let conn = s.connect_from(id, address, e6ircd::core::ConnectionTransport::Tcp);
+        let out = finish_registration(&mut s, conn, &format!("user{id}"));
+        if refused {
+            assert!(has_numeric(&out, "465"), "{address}: {out:#?}");
+            assert!(
+                out.iter().any(|l| l.ends_with("(SASL access only)")),
+                "{address}: {out:#?}"
+            );
+        } else {
+            assert!(has_numeric(&out, "001"), "{address}: {out:#?}");
+        }
+    }
+    let logged_in = s.connect_from(7, "192.0.2.10", e6ircd::core::ConnectionTransport::Tcp);
+    sasl_login(&mut s, logged_in, "dave");
+    assert!(has_numeric(
+        &finish_registration(&mut s, logged_in, "dave"),
+        "001"
+    ));
+}
+
 #[test]
 fn sasl_rejected_password_is_904() {
     let mut s = TestServer::new();
@@ -2325,6 +2486,62 @@ fn stats_lists_server_bans_to_operators_only() {
     }
 }
 
+/// A ban mask that cannot stand as a middle parameter as stored — an X-line
+/// mask with spaces, an IPv6 address starting with `:` — is listed in
+/// Solanum's spellings (`\s`, a leading `0`), not split into two parameters or
+/// flattened into the funnel's `*` placeholder.
+#[test]
+fn stats_lists_spaced_and_ipv6_masks_as_one_readable_parameter() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "KLINE *@::1 :v6 spam");
+    commit_server_ban(&mut s);
+    s.line(op, "DLINE :::2");
+    commit_server_ban(&mut s);
+    s.line(op, "XLINE *Evil Corp* :spam");
+    commit_server_ban(&mut s);
+    s.drain(op);
+
+    s.line(op, "STATS k");
+    assert_eq!(
+        s.drain(op)[0],
+        ":irc.test.example 216 god K 0::1 * * :v6 spam"
+    );
+    s.line(op, "STATS d");
+    let out = s.drain(op);
+    assert!(
+        out[0].starts_with(":irc.test.example 225 god D 0::2 :"),
+        "{out:#?}"
+    );
+    s.line(op, "STATS x");
+    assert_eq!(
+        s.drain(op)[0],
+        ":irc.test.example 247 god X 0 *Evil\\sCorp* :spam"
+    );
+}
+
+/// A session from an IPv6 address that starts with `:` shows its host with a
+/// leading `0`, as Solanum does, so WHO and WHOIS carry the address rather
+/// than the funnel's `*`.
+#[test]
+fn an_ipv6_host_starting_with_a_colon_is_shown_with_a_leading_zero() {
+    let mut s = TestServer::new();
+    let local = s.connect_from(1, "::1", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(local, "NICK local");
+    s.line(local, "USER local 0 * :Local");
+    s.drain(local);
+    let asker = s.register(2, "asker");
+    s.line(asker, "WHOIS local");
+    let out = s.drain(asker);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 311 asker local local 0::1 * :Local")),
+        "{out:#?}"
+    );
+}
+
 #[test]
 fn nick_to_exact_same_nick_is_a_silent_noop() {
     let mut s = TestServer::new();
@@ -2523,7 +2740,7 @@ fn nickserv_register_creates_account() {
             conn: alice,
             name: "alice".into(),
             contact_email: None,
-            password: "hunter2".into(),
+            password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -2564,7 +2781,8 @@ fn account_registration_persists_only_valid_normalized_contact_email() {
                 e6ircd::identity::ContactEmail::parse("Alice+IRC@example.com")
                     .expect("valid contact email")
             ),
-            password: "correct-horse-battery".into(),
+            password: e6ircd::identity::NewPassword::parse("correct-horse-battery")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::RegisterCommand,
         }]
     );
@@ -2606,7 +2824,7 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
                 e6ircd::identity::ContactEmail::parse("Alice@example.com")
                     .expect("valid contact email")
             ),
-            password: "hunter2".into(),
+            password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -2806,7 +3024,9 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
             .any(|l| l.contains("authentication is already in progress")),
         "the IDENTIFY must be told an authentication is in progress"
     );
-    // The SASL result still resolves normally.
+    // The overlapping AUTHENTICATE abandoned the attempt (its 904 was the
+    // verdict), so the verify still in flight is dropped when it lands — and
+    // only then may an IDENTIFY start a verify of its own.
     s.core.handle(Input::DbReply {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
@@ -2814,9 +3034,16 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
+    let stale = s.drain(alice);
     assert!(
-        s.drain(alice).iter().any(|l| l.contains(" 903 ")),
-        "the original SASL authentication still succeeds"
+        !has_numeric(&stale, "903") && !has_numeric(&stale, "900"),
+        "an abandoned attempt's verdict is not delivered: {stale:?}"
+    );
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY pw");
+    assert_eq!(
+        s.db_requests().len(),
+        1,
+        "the drained SASL verify frees IDENTIFY"
     );
 }
 
@@ -3005,10 +3232,14 @@ fn labeled_register_reply_carries_the_label() {
             origin: e6ircd::core::AccountOrigin::RegisterCommand,
         },
     });
+    // The login's RPL_LOGGEDIN and the SUCCESS are one labeled response.
     let out = s.drain(alice);
+    let response = labeled_response(&out, "reg1");
     assert!(
-        out.iter()
-            .any(|l| l.starts_with("@label=reg1 ") && l.contains("REGISTER SUCCESS alice")),
+        has_numeric(&response, "900")
+            && response
+                .iter()
+                .any(|l| l.contains("REGISTER SUCCESS alice")),
         "labeled REGISTER SUCCESS carries the label: {out:#?}"
     );
 
@@ -3068,9 +3299,9 @@ fn labeled_identify_verdict_carries_the_label() {
         },
     });
     let out = s.drain(alice);
+    let response = labeled_response(&out, "id7");
     assert!(
-        out.iter()
-            .any(|l| l.starts_with("@label=id7 ") && l.contains("identified")),
+        has_numeric(&response, "900") && response.iter().any(|l| l.contains("identified")),
         "the labeled IDENTIFY verdict carries the label: {out:#?}"
     );
 }
@@ -3194,7 +3425,7 @@ fn channel_access_reply_for_unregistered_channel_is_not_phantom_inserted() {
             display: "#ghost".into(),
             account: "bob".into(),
             flags: Some("o".into()),
-            applied: true,
+            previous: None,
             frontend: e6ircd::core::AccessFrontend::Flags,
             label: None,
         },
@@ -3255,6 +3486,74 @@ fn chanserv_register_flow() {
         out.iter()
             .any(|l| l.starts_with(":ChanServ!") && l.contains("registered")),
         "{out:#?}"
+    );
+}
+
+/// The founder cap is held in storage, where every shard's registrations meet;
+/// its refusal reaches ChanServ as the cap's own answer and registers nothing.
+#[test]
+fn chanserv_register_reports_the_storage_founder_cap() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #mine");
+    s.drain(alice);
+    s.db_requests();
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
+    let req = s.db_requests();
+    s.channel_registration_persisted(req, e6ircd::core::ChannelRegistrationResult::LimitReached);
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with(":ChanServ!") && l.contains("too many channels")),
+        "{out:#?}"
+    );
+    // The refusal released the in-flight reservation: a retry is queued again.
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
+    assert!(
+        matches!(
+            s.db_requests().as_slice(),
+            [e6ircd::core::DbRequest::RegisterChannel { .. }]
+        ),
+        "a refused registration still holds its reservation"
+    );
+}
+
+/// A transfer storage refused because the receiving account is at the founder
+/// cap is reported as that, and ownership stays where it was.
+#[test]
+fn chanserv_set_founder_reports_the_storage_founder_cap() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER alice");
+    s.db_requests();
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::FounderLimitReached {
+            display: "#room".to_string(),
+            label: None,
+        },
+    );
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|l| l.contains("Could not transfer")
+            && l.contains(&format!(
+                "maximum of {} channels",
+                e6ircd::db::CHANNEL_FOUNDER_LIMIT
+            ))),
+        "{out:#?}"
+    );
+    // boss still founds #room: another transfer is queued, not refused.
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER carol");
+    assert!(
+        s.db_requests().iter().any(|r| matches!(
+            r,
+            e6ircd::core::DbRequest::SetChannelFounder { new_founder, .. } if new_founder == "carol"
+        )),
+        "the refused transfer moved ownership"
     );
 }
 
@@ -4105,6 +4404,469 @@ fn list_hides_secret_channels() {
     s.line(alice, "LIST");
     let out = s.drain(alice);
     assert!(out.iter().any(|l| l.contains("#sec")));
+}
+
+/// The channel names `out`'s RPL_LIST rows name, in order, after checking the
+/// reply is whole: one RPL_LISTSTART, then the rows, then RPL_LISTEND.
+fn list_reply(out: &[String]) -> Vec<String> {
+    let lines: Vec<&str> = out
+        .iter()
+        .map(|line| traditional_part(line))
+        .filter(|line| [Some("321"), Some("322"), Some("323")].contains(&line.split(' ').nth(1)))
+        .collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|l| l.split(' ').nth(1) == Some("321"))
+            && lines
+                .last()
+                .is_some_and(|l| l.split(' ').nth(1) == Some("323")),
+        "a whole LIST reply: {out:#?}"
+    );
+    lines[1..lines.len() - 1]
+        .iter()
+        .map(|line| {
+            assert_eq!(line.split(' ').nth(1), Some("322"), "{out:#?}");
+            line.split(' ')
+                .nth(3)
+                .expect("RPL_LIST channel")
+                .to_string()
+        })
+        .collect()
+}
+
+fn list(s: &mut TestServer, conn: ConnId, command: &str) -> Vec<String> {
+    s.line(conn, command);
+    list_reply(&s.drain(conn))
+}
+
+/// `#chan1` (alice) and `#chan2` (alice and bob), as irctest's LIST cases
+/// build them, plus carol who is in neither.
+fn two_listed_channels(s: &mut TestServer) -> (ConnId, ConnId, ConnId) {
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let carol = s.register(3, "carol");
+    s.line(alice, "JOIN #chan1");
+    s.line(alice, "JOIN #chan2");
+    s.line(bob, "JOIN #chan2");
+    s.drain(alice);
+    s.drain(bob);
+    (alice, bob, carol)
+}
+
+#[test]
+fn isupport_advertises_safelist_and_the_elist_conditions() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Real");
+    let out = s.drain(c);
+    let tokens: Vec<&str> = out
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some("005"))
+        .flat_map(|l| l.split(" :").next().expect("head").split(' ').skip(3))
+        .collect();
+    assert!(tokens.contains(&"SAFELIST"), "{out:#?}");
+    assert!(tokens.contains(&"ELIST=CMNTU"), "{out:#?}");
+}
+
+#[test]
+fn list_masks_select_channels_by_casemapped_glob() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    assert_eq!(list(&mut s, carol, "LIST *an1"), ["#chan1"]);
+    assert_eq!(list(&mut s, carol, "LIST *an2"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST #c*n2"), ["#chan2"]);
+    assert!(list(&mut s, carol, "LIST *an3").is_empty());
+    assert_eq!(list(&mut s, carol, "LIST #ch*"), ["#chan1", "#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST #CH?N1"), ["#chan1"]);
+    // A plain name is the exact channel, and several masks list what any
+    // of them matches.
+    assert_eq!(list(&mut s, carol, "LIST #CHAN2"), ["#chan2"]);
+    assert_eq!(
+        list(&mut s, carol, "LIST #chan1,#chan2"),
+        ["#chan1", "#chan2"]
+    );
+    assert!(list(&mut s, carol, "LIST #nonexistent").is_empty());
+}
+
+#[test]
+fn list_negated_masks_exclude_what_they_match() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    assert_eq!(list(&mut s, carol, "LIST !*an1"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST !#c*n2"), ["#chan1"]);
+    assert_eq!(list(&mut s, carol, "LIST !*an3"), ["#chan1", "#chan2"]);
+    assert!(list(&mut s, carol, "LIST !#ch*").is_empty());
+}
+
+#[test]
+fn list_user_counts_are_strict_bounds() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    assert_eq!(list(&mut s, carol, "LIST >0"), ["#chan1", "#chan2"]);
+    assert!(list(&mut s, carol, "LIST <1").is_empty());
+    assert_eq!(list(&mut s, carol, "LIST <100"), ["#chan1", "#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST >1"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST <2"), ["#chan1"]);
+    assert_eq!(list(&mut s, carol, "LIST <0"), ["#chan1", "#chan2"]);
+}
+
+static LIST_CLOCK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1_000_000_000);
+
+fn list_clock() -> Millis {
+    Millis::from_millis(LIST_CLOCK_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn list_clock_advance_minutes(minutes: u64) {
+    LIST_CLOCK_MS.fetch_add(minutes * 60_000, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// irctest's FaketimeListTestCase, with the server's clock moved by hand:
+/// `C<n` is "created less than n minutes ago", `C>n` "more than", and the
+/// same for `T` and the time the topic was set. One test, since the clock
+/// is shared.
+#[test]
+fn list_creation_and_topic_times_are_minutes_ago() {
+    let mut s = TestServer::configured(false, list_clock, |_| {});
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #chan1");
+    s.line(alice, "TOPIC #chan1 :First channel");
+    s.line(alice, "JOIN #quiet");
+    s.drain(alice);
+    list_clock_advance_minutes(2);
+    s.line(alice, "JOIN #chan2");
+    s.line(alice, "TOPIC #chan2 :Second channel");
+    s.drain(alice);
+    list_clock_advance_minutes(1);
+
+    assert_eq!(list(&mut s, bob, "LIST C>2"), ["#chan1", "#quiet"]);
+    assert_eq!(list(&mut s, bob, "LIST C<2"), ["#chan2"]);
+    assert!(list(&mut s, bob, "LIST C<0").is_empty());
+    assert_eq!(
+        list(&mut s, bob, "LIST C>0"),
+        ["#chan1", "#chan2", "#quiet"]
+    );
+    assert_eq!(
+        list(&mut s, bob, "LIST C<10"),
+        ["#chan1", "#chan2", "#quiet"]
+    );
+    // A channel with no topic meets no topic-time condition.
+    assert_eq!(list(&mut s, bob, "LIST T>2"), ["#chan1"]);
+    assert_eq!(list(&mut s, bob, "LIST T<2"), ["#chan2"]);
+    assert!(list(&mut s, bob, "LIST T<0").is_empty());
+    assert_eq!(list(&mut s, bob, "LIST T>0"), ["#chan1", "#chan2"]);
+    assert_eq!(list(&mut s, bob, "LIST t<10"), ["#chan1", "#chan2"]);
+}
+
+#[test]
+fn list_conditions_combine_and_all_must_hold() {
+    let mut s = TestServer::new();
+    let (alice, _, carol) = two_listed_channels(&mut s);
+    s.line(alice, "JOIN #other");
+    s.line(carol, "JOIN #other");
+    s.drain(alice);
+    s.drain(carol);
+    assert_eq!(list(&mut s, carol, "LIST >1"), ["#chan2", "#other"]);
+    assert_eq!(list(&mut s, carol, "LIST >1,#ch*"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST #ch*,!*2"), ["#chan1"]);
+    assert!(list(&mut s, carol, "LIST >1,<2").is_empty());
+    assert_eq!(list(&mut s, carol, "LIST >1,!#chan2,"), ["#other"]);
+}
+
+#[test]
+fn a_malformed_list_parameter_is_refused_whole() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    for parameter in [
+        "LIST foo",
+        "LIST >1,bar",
+        "LIST <x",
+        "LIST C5",
+        "LIST >1,,<5",
+    ] {
+        s.line(carol, parameter);
+        let out = s.drain(carol);
+        assert_eq!(
+            out,
+            [
+                ":irc.test.example 321 carol Channel :Users  Name",
+                ":irc.test.example NOTICE carol :Invalid parameters for /LIST",
+                ":irc.test.example 323 carol :End of /LIST",
+            ],
+            "{parameter}"
+        );
+    }
+}
+
+#[test]
+fn list_conditions_never_reveal_a_secret_channel() {
+    let mut s = TestServer::new();
+    let (alice, bob, carol) = two_listed_channels(&mut s);
+    s.line(alice, "JOIN #hidden");
+    s.line(alice, "MODE #hidden +s");
+    s.drain(alice);
+    for command in [
+        "LIST",
+        "LIST #hidden",
+        "LIST #h*",
+        "LIST !#chan*",
+        "LIST >0,<5",
+    ] {
+        let listed = list(&mut s, carol, command);
+        assert!(
+            !listed.contains(&"#hidden".to_string()),
+            "{command}: {listed:?}"
+        );
+    }
+    // Its member sees it, under the same conditions as any channel.
+    assert_eq!(list(&mut s, alice, "LIST #h*"), ["#hidden"]);
+    assert_eq!(list(&mut s, alice, "LIST <2"), ["#chan1", "#hidden"]);
+    assert!(list(&mut s, alice, "LIST >1,#h*").is_empty());
+    assert_eq!(list(&mut s, bob, "LIST !#chan*"), Vec::<String>::new());
+}
+
+/// Channels enough that one LIST fills more than half of a test connection's
+/// 256-line send queue: `count` of them, `#room000` on, across three members.
+fn many_channels(s: &mut TestServer, count: usize) -> ConnId {
+    let members: Vec<ConnId> = (0..3)
+        .map(|index| s.register(10 + index, &format!("member{index}")))
+        .collect();
+    for room in 0..count {
+        let member = members[room % members.len()];
+        s.line(member, &format!("JOIN #room{room:03}"));
+        s.drain(member);
+    }
+    s.register(20, "lister")
+}
+
+#[test]
+fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
+    let mut s = TestServer::new();
+    let lister = many_channels(&mut s, 300);
+    s.line(lister, "LIST");
+    let mut out = s.drain(lister);
+    // Half of the 256-line queue: the RPL_LISTSTART and 127 rows.
+    assert_eq!(out.len(), 128, "{out:#?}");
+    assert!(!has_numeric(&out, "323"), "{out:#?}");
+    // Each turn sends what the client's queue has room for now: the drained
+    // queue takes another half.
+    s.core.handle(Input::PaceReplies);
+    // Other traffic keeps flowing meanwhile, beside the rows.
+    s.line(lister, "PING mid-list");
+    let next = s.drain(lister);
+    assert!(
+        next.iter()
+            .any(|l| l.contains("PONG") && l.contains("mid-list")),
+        "{next:#?}"
+    );
+    assert!(next.len() <= 129, "{next:#?}");
+    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    while !has_numeric(&out, "323") {
+        s.core.handle(Input::PaceReplies);
+        let more = s.drain(lister);
+        assert!(!more.is_empty() && more.len() <= 129, "{more:#?}");
+        out.extend(more);
+    }
+    let listed = list_reply(&out);
+    let expected: Vec<String> = (0..300).map(|room| format!("#room{room:03}")).collect();
+    assert_eq!(listed, expected);
+    assert_answers_ping(&mut s, lister, "after a paced LIST");
+}
+
+#[test]
+fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
+    let mut s = TestServer::new_no_persistence();
+    let lister = register_with_caps(&mut s, 20, "lister", "batch labeled-response");
+    let members: Vec<ConnId> = (0..3)
+        .map(|index| s.register(10 + index, &format!("member{index}")))
+        .collect();
+    for room in 0..200 {
+        let member = members[room % members.len()];
+        s.line(member, &format!("JOIN #room{room:03}"));
+        s.drain(member);
+    }
+    s.line(lister, "@label=big LIST");
+    let mut out = s.drain(lister);
+    while !out.last().is_some_and(|l| l.contains(" BATCH -")) {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(lister));
+    }
+    let inside = labeled_response(&out, "big");
+    assert_eq!(inside.len(), 202, "LISTSTART, 200 rows, LISTEND: {out:#?}");
+    assert_eq!(list_reply(&inside).len(), 200);
+    assert_eq!(out.len(), 204, "the batch and nothing else: {out:#?}");
+}
+
+#[test]
+fn a_list_sent_during_a_paced_list_aborts_it() {
+    let mut s = TestServer::new();
+    let lister = many_channels(&mut s, 300);
+    s.line(lister, "LIST");
+    assert_eq!(s.drain(lister).len(), 128);
+    s.line(lister, "LIST");
+    let out = s.drain(lister);
+    assert_eq!(
+        out,
+        [
+            ":irc.test.example NOTICE lister :/LIST aborted",
+            ":irc.test.example 323 lister :End of /LIST",
+        ]
+    );
+    // Aborted means gone: nothing more of it is paced out, and the next LIST
+    // is a new one.
+    s.core.handle(Input::PaceReplies);
+    assert!(s.drain(lister).is_empty());
+    assert_eq!(list(&mut s, lister, "LIST #room001"), ["#room001"]);
+}
+
+/// Users enough that a `WHO *` fills more than half of a test connection's
+/// 256-line send queue: `count` of them, `user000` on, and the one asking.
+fn many_users(s: &mut TestServer, count: u64) -> ConnId {
+    for index in 0..count {
+        s.register(100 + index, &format!("user{index:03}"));
+    }
+    s.register(20, "watcher")
+}
+
+/// The nicks of `out`'s WHO rows, in order.
+fn who_nicks(out: &[String]) -> Vec<String> {
+    out.iter()
+        .filter(|line| has_numeric(std::slice::from_ref(*line), "352"))
+        .map(|line| {
+            traditional_part(line)
+                .split(' ')
+                .nth(7)
+                .expect("a WHO row's nick")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
+    let mut s = TestServer::new();
+    let watcher = many_users(&mut s, 300);
+    s.line(watcher, "WHO *");
+    let mut out = s.drain(watcher);
+    // Half of the 256-line queue, all rows.
+    assert_eq!(out.len(), 128, "{out:#?}");
+    assert!(!has_numeric(&out, "315"), "{out:#?}");
+    s.core.handle(Input::PaceReplies);
+    // Other traffic keeps flowing meanwhile, beside the rows.
+    s.line(watcher, "PING mid-who");
+    let next = s.drain(watcher);
+    assert!(
+        next.iter()
+            .any(|l| l.contains("PONG") && l.contains("mid-who")),
+        "{next:#?}"
+    );
+    assert!(next.len() <= 129, "{next:#?}");
+    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    while !has_numeric(&out, "315") {
+        s.core.handle(Input::PaceReplies);
+        let more = s.drain(watcher);
+        assert!(!more.is_empty() && more.len() <= 128, "{more:#?}");
+        out.extend(more);
+    }
+    let mut expected: Vec<String> = (0..300).map(|index| format!("user{index:03}")).collect();
+    expected.push("watcher".into());
+    let mut nicks = who_nicks(&out);
+    nicks.sort();
+    expected.sort();
+    assert_eq!(nicks, expected);
+    assert_eq!(
+        out.last().map(String::as_str),
+        Some(":irc.test.example 315 watcher * :End of /WHO list")
+    );
+    assert_answers_ping(&mut s, watcher, "after a paced WHO");
+}
+
+#[test]
+fn a_paced_labeled_who_stays_one_batch_across_its_turns() {
+    let mut s = TestServer::new();
+    for index in 0..200 {
+        s.register(100 + index, &format!("user{index:03}"));
+    }
+    let watcher = register_with_caps(&mut s, 20, "watcher", "batch labeled-response");
+    s.line(watcher, "@label=big WHO *");
+    let mut out = s.drain(watcher);
+    while !out.last().is_some_and(|l| l.contains(" BATCH -")) {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(watcher));
+    }
+    let inside = labeled_response(&out, "big");
+    assert_eq!(inside.len(), 202, "201 rows and RPL_ENDOFWHO: {out:#?}");
+    assert_eq!(who_nicks(&inside).len(), 201);
+    assert_eq!(out.len(), 204, "the batch and nothing else: {out:#?}");
+}
+
+#[test]
+fn whos_asked_during_a_paced_who_answer_after_it_within_a_send_queue() {
+    let mut s = TestServer::new();
+    let watcher = many_users(&mut s, 300);
+    s.line(watcher, "WHO *");
+    assert_eq!(s.drain(watcher).len(), 128);
+    // Lines of it are still to go: a two-line reply waits behind them...
+    s.line(watcher, "WHO user007");
+    // ...but another 302 would hold more than a send queue, so it is refused,
+    // at once and closed, while the first is still going out.
+    s.line(watcher, "WHO *");
+    let mut out = s.drain(watcher);
+    assert_eq!(
+        out[out.len() - 2..],
+        [
+            ":irc.test.example 263 watcher WHO :Please wait a while and try again.",
+            ":irc.test.example 315 watcher * :End of /WHO list",
+        ]
+    );
+    assert_eq!(
+        out.iter().filter(|l| l.contains(" 315 ")).count(),
+        1,
+        "{out:#?}"
+    );
+    out.truncate(out.len() - 2);
+    while !out
+        .iter()
+        .any(|l: &String| l.contains(" 315 watcher user007 "))
+    {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(watcher));
+    }
+    let ends: Vec<&String> = out.iter().filter(|l| l.contains(" 315 ")).collect();
+    assert_eq!(ends.len(), 2, "{out:#?}");
+    assert!(ends[0].contains(" 315 watcher * "), "{out:#?}");
+    let tail = &out[out.len() - 2..];
+    assert!(tail[0].contains(" 352 watcher * user007 "), "{out:#?}");
+    // Nothing is left paced for the connection.
+    s.core.handle(Input::PaceReplies);
+    assert!(s.drain(watcher).is_empty());
+}
+
+#[test]
+fn a_large_channel_who_is_paced_too() {
+    let mut s = TestServer::new();
+    let members: Vec<ConnId> = (0..150)
+        .map(|index| s.register(100 + index, &format!("user{index:03}")))
+        .collect();
+    for member in &members {
+        s.line(*member, "JOIN #crowd");
+        for other in &members {
+            s.drain(*other);
+        }
+    }
+    let watcher = s.register(20, "watcher");
+    s.line(watcher, "WHO #crowd");
+    let mut out = s.drain(watcher);
+    assert_eq!(out.len(), 128, "{out:#?}");
+    while !has_numeric(&out, "315") {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(watcher));
+    }
+    assert_eq!(who_nicks(&out).len(), 150);
+    assert_answers_ping(&mut s, watcher, "after a paced channel WHO");
 }
 
 #[test]
@@ -6141,6 +6903,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             mono_clock: early_mono,
             command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
@@ -6228,6 +6991,7 @@ fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive
                 mono_clock: ticking_mono,
                 command_flood: Some(flood),
                 registration_burst: None,
+                sasl_requirement: Default::default(),
                 reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
             },
             db_tx,
@@ -6358,6 +7122,7 @@ fn account_creation_is_rate_limited_per_ip() {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: Some(1),
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
@@ -6433,6 +7198,7 @@ fn hot_history_ring_is_lru_evicted() {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
@@ -6860,10 +7626,11 @@ fn chathistory_deferred_reply_uses_request_time_capabilities() {
             ts: Millis::from_millis(1_000),
             sender_prefix: "bob!u@h".into(),
             sender_account: None,
-            kind: e6ircd::core::MessageKind::Privmsg,
+            kind: e6ircd::core::HistoryKind::Privmsg,
             body: "before cap change".into(),
             sender_is_bot: false,
             multiline: None,
+            client_tags: String::new(),
         }]),
         label: None,
     });
@@ -7195,6 +7962,94 @@ fn chathistory_targets_lists_conversations_and_orders_oldest_first() {
         !out.iter().any(|l| l.contains("CHATHISTORY TARGETS ")),
         "no buffer's latest message is in that window: {out:#?}"
     );
+}
+
+thread_local! {
+    /// The wall-clock time [`set_wall`] reads, per test thread.
+    static WALL_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(1_000_000_000) };
+}
+
+/// A wall clock a test moves with [`advance_wall`].
+fn set_wall() -> Millis {
+    Millis::from_millis(WALL_NOW.with(std::cell::Cell::get))
+}
+
+fn advance_wall(to: u64) {
+    WALL_NOW.with(|now| now.set(to));
+}
+
+/// The `(target, time)` pairs of a TARGETS reply.
+fn listed_targets(out: &[String]) -> Vec<(String, String)> {
+    out.iter()
+        .filter(|l| l.contains("CHATHISTORY TARGETS "))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace().skip(4);
+            Some((words.next()?.to_string(), words.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// TARGETS dates a buffer by its newest entry the requester can be sent, from
+/// the rings (no database): a reader without `message-tags` has TAGMSGs
+/// ignored — a buffer is dated by its newest text, and one holding only
+/// TAGMSGs is not listed — while a reader with it is dated by the TAGMSG.
+#[test]
+fn chathistory_targets_dates_buffers_in_the_readers_scope() {
+    const TEXT_AT: &str = "1970-01-12T13:46:40.000Z";
+    const REACTION_AT: &str = "1970-01-12T13:46:45.000Z";
+    advance_wall(1_000_000_000);
+    let mut s = TestServer::configured(false, set_wall, |_| {});
+    let tags = "batch draft/chathistory message-tags server-time";
+    let alice = register_with_caps(&mut s, 1, "alice", tags);
+    let bob = register_with_caps(&mut s, 2, "bob", tags);
+    let carol = register_with_caps(&mut s, 3, "carol", "batch draft/chathistory server-time");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #text");
+        s.line(c, "JOIN #tags");
+    }
+    s.line(alice, "PRIVMSG #text :hello");
+    s.line(alice, "PRIVMSG carol :hello");
+    advance_wall(1_000_005_000);
+    s.line(alice, "@+draft/react=x TAGMSG #text");
+    s.line(alice, "@+draft/react=x TAGMSG #tags");
+    s.line(alice, "@+draft/react=x TAGMSG carol");
+    s.line(bob, "@+draft/react=x TAGMSG carol");
+    for c in [alice, bob, carol] {
+        s.drain(c);
+    }
+    let targets = "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z \
+                   timestamp=2262-01-01T00:00:00.000Z 10";
+    let pair = |name: &str, at: &str| (name.to_string(), at.to_string());
+
+    s.line(carol, targets);
+    let out = s.drain(carol);
+    assert_eq!(
+        listed_targets(&out),
+        [pair("#text", TEXT_AT), pair("alice", TEXT_AT)],
+        "{out:#?}"
+    );
+
+    s.line(bob, targets);
+    let mut listed = listed_targets(&s.drain(bob));
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            pair("#tags", REACTION_AT),
+            pair("#text", REACTION_AT),
+            pair("carol", REACTION_AT)
+        ]
+    );
+
+    // The window bounds the reader's own time: carol's buffers were last
+    // active, for her, before it.
+    s.line(
+        carol,
+        "CHATHISTORY TARGETS timestamp=1970-01-12T13:46:41.000Z \
+         timestamp=2262-01-01T00:00:00.000Z 10",
+    );
+    let out = s.drain(carol);
+    assert!(listed_targets(&out).is_empty(), "{out:#?}");
 }
 
 #[test]
@@ -7592,7 +8447,6 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
         display: "#reg".into(),
         keeptopic: false,
         topic: None,
-        applied: true,
         label: None,
     });
     let out = s.drain(boss);
@@ -7650,7 +8504,6 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
         display: "#reg".into(),
         keeptopic: true,
         topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
-        applied: true,
         label: None,
     });
     s.drain(boss);
@@ -7684,7 +8537,6 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
         display: "#reg".into(),
         keeptopic: false,
         topic: None,
-        applied: true,
         label: None,
     });
     s.drain(boss);
@@ -7765,7 +8617,6 @@ fn chanserv_set_mlock_enforces_modes() {
         channel: "#reg".into(),
         display: "#reg".into(),
         mlock: Some("+m-t".into()),
-        applied: true,
         label: None,
     });
     let out = s.drain(boss);
@@ -8356,7 +9207,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
                 conn: alice,
                 name: "alice".into(),
                 contact_email: None,
-                password: "hunter2".into(),
+                password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
                 origin: e6ircd::core::AccountOrigin::RegisterCommand,
             }],
             "REGISTER {arg} must register the caller's own nick"
@@ -8504,6 +9355,7 @@ fn history_logmessage_gated_on_database() {
                 mono_clock: test_mono,
                 command_flood: None,
                 registration_burst: None,
+                sasl_requirement: Default::default(),
                 reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
             },
             db_tx,
@@ -8654,21 +9506,286 @@ fn identifying_within_the_delay_cancels_the_rename() {
         "an identified owner was renamed: {out:#?}"
     );
 
-    // Identifying to some other account does not count.
-    let third = s.register(3, "third");
-    identify(&mut s, third, "mallory");
-    s.line(third, "PRIVMSG NickServ :GHOST alice");
-    s.drain(third);
+    // Identifying to some other account while the clock runs does not count.
     s.line(second, "NICK other");
     s.drain(second);
+    let third = s.register(3, "third");
     s.line(third, "NICK alice");
     assert_eq!(notices(&s.drain(third)).len(), 2, "no warning");
+    identify(&mut s, third, "mallory");
     tick_after(&mut s, 30_000);
     assert!(
         s.drain(third)
             .iter()
             .any(|line| line.contains(" NICK Guest3")),
         "identified to another account, yet kept the protected nick"
+    );
+}
+
+thread_local! {
+    /// Milliseconds past `test_mono()` that [`set_mono`] reads, per test thread.
+    static MONO_AHEAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A monotonic clock a test moves with [`advance_mono`].
+fn set_mono() -> MonoMillis {
+    MonoMillis::from_millis(test_mono().as_millis() + MONO_AHEAD.with(std::cell::Cell::get))
+}
+
+fn advance_mono(to: u64) {
+    MONO_AHEAD.with(|ahead| ahead.set(to));
+}
+
+/// A server whose monotonic clock the test moves, for nick protection.
+fn server_with_moving_clock() -> TestServer {
+    advance_mono(0);
+    TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| config.mono_clock = set_mono,
+    )
+}
+
+/// A session's clock for a protected nick never restarts: leaving the nick
+/// and coming back finds the deadline it had, and the rename follows it.
+#[test]
+fn leaving_and_returning_to_a_protected_nick_keeps_its_deadline() {
+    let mut s = server_with_moving_clock();
+    let _owner = protected_alice(&mut s);
+    let intruder = s.register(2, "intruder");
+    s.line(intruder, "NICK alice");
+    assert_eq!(notices(&s.drain(intruder)).len(), 2);
+    advance_mono(25_000);
+    s.line(intruder, "NICK alice_");
+    s.drain(intruder);
+    advance_mono(26_000);
+    s.line(intruder, "NICK alice");
+    assert_eq!(
+        notices(&s.drain(intruder))[1],
+        "You have 4 seconds to identify to your nickname before it is changed.",
+        "the clock restarted"
+    );
+    tick_after(&mut s, 30_000);
+    assert!(
+        s.drain(intruder)
+            .iter()
+            .any(|line| line.contains(" NICK Guest")),
+        "not renamed at the original deadline"
+    );
+}
+
+/// A session returning, unidentified, to a nick whose deadline passed while it
+/// was away is renamed on the spot, not at the next tick.
+#[test]
+fn returning_to_a_protected_nick_after_its_deadline_renames_at_once() {
+    let mut s = server_with_moving_clock();
+    let _owner = protected_alice(&mut s);
+    let intruder = s.register(2, "intruder");
+    s.line(intruder, "NICK alice");
+    s.drain(intruder);
+    s.line(intruder, "NICK elsewhere");
+    s.drain(intruder);
+    advance_mono(40_000);
+    s.db_requests();
+    s.line(intruder, "NICK alice");
+    let out = s.drain(intruder);
+    assert_eq!(
+        notices(&out),
+        ["You failed to identify in time for the nickname alice"],
+        "{out:#?}"
+    );
+    assert!(
+        out.iter().any(|line| line.contains(" NICK Guest")),
+        "{out:#?}"
+    );
+    // The rename acted on the session for the protecting account: audited.
+    assert!(s.db_requests().iter().any(|request| matches!(
+        request,
+        e6ircd::core::DbRequest::AuditLog { actor, action, target, .. }
+            if *actor == e6ircd::db::AuditPrincipal::account("alice")
+                && action == "NICK_GUEST_RENAME"
+                && *target == e6ircd::db::AuditPrincipal::nick("alice")
+    )));
+}
+
+/// Identifying to the protecting account settles the nick's clock: coming
+/// back later, still identified, draws nothing.
+#[test]
+fn identifying_settles_the_clock_for_good() {
+    let mut s = server_with_moving_clock();
+    let _owner = protected_alice(&mut s);
+    let second = s.register(2, "second");
+    s.line(second, "NICK alice");
+    s.drain(second);
+    identify(&mut s, second, "alice");
+    s.line(second, "NICK other");
+    advance_mono(60_000);
+    s.line(second, "NICK alice");
+    let out = s.drain(second);
+    assert!(notices(&out).is_empty(), "{out:#?}");
+    tick_after(&mut s, 90_000);
+    assert!(!s.drain(second).iter().any(|line| line.contains(" NICK ")));
+}
+
+/// GHOST, REGAIN and ChanServ OP/DEOP/VOICE/DEVOICE act on other users'
+/// sessions, so each is audited with the acting account and its target — and
+/// not done when the audit trail cannot take the row.
+#[test]
+fn services_actions_on_other_sessions_are_audited() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    use e6ircd::db::AuditPrincipal;
+    let audits = |s: &mut TestServer| -> Vec<(AuditPrincipal, String, AuditPrincipal, String)> {
+        s.db_requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                e6ircd::core::DbRequest::AuditLog {
+                    actor,
+                    action,
+                    target,
+                    detail,
+                } => Some((actor, action, target, detail)),
+                _ => None,
+            })
+            .collect()
+    };
+    let row = |actor: &str, action: &str, target: AuditPrincipal, detail: &str| {
+        (
+            AuditPrincipal::account(actor),
+            action.to_string(),
+            target,
+            detail.to_string(),
+        )
+    };
+    let stale = s.register(1, "Boss");
+    let boss = s.register(2, "boss_");
+    identify(&mut s, boss, "BOSS");
+    s.line(boss, "PRIVMSG NickServ :GHOST Boss");
+    assert_eq!(
+        audits(&mut s),
+        [row("boss", "NICK_GHOST", AuditPrincipal::nick("boss"), "")]
+    );
+    s.drain(stale);
+    let holder = s.register(3, "boss");
+    s.line(boss, "PRIVMSG NickServ :REGAIN boss");
+    assert_eq!(
+        audits(&mut s),
+        [row("boss", "NICK_REGAIN", AuditPrincipal::nick("boss"), "")]
+    );
+    s.drain(holder);
+
+    let carol = s.register(4, "carol");
+    s.line(carol, "JOIN #chan");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.drain(carol);
+    for (command, action) in [
+        ("VOICE", "CHANNEL_VOICE"),
+        ("DEVOICE", "CHANNEL_DEVOICE"),
+        ("OP", "CHANNEL_OP"),
+        ("DEOP", "CHANNEL_DEOP"),
+    ] {
+        s.line(boss, &format!("PRIVMSG ChanServ :{command} #chan CAROL"));
+        assert_eq!(
+            audits(&mut s),
+            [row(
+                "boss",
+                action,
+                AuditPrincipal::channel("#chan"),
+                "nick=carol"
+            )],
+            "{command}"
+        );
+    }
+    // An unchanged status changes nothing, and records nothing.
+    s.line(boss, "PRIVMSG ChanServ :DEOP #chan carol");
+    assert!(audits(&mut s).is_empty());
+}
+
+/// When the audit trail cannot take the row, the action is not taken.
+#[test]
+fn a_services_action_the_audit_trail_cannot_record_is_refused() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    let carol = s.register(2, "carol");
+    s.line(carol, "JOIN #chan");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.drain(carol);
+    // Fill the database queue (capacity 64) so the audit row cannot be queued.
+    for _ in 0..64 {
+        s.line(carol, "PRIVMSG #chan :filling the database queue");
+    }
+    s.drain(boss);
+    s.drain(carol);
+    s.line(boss, "PRIVMSG ChanServ :VOICE #chan carol");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["Services are temporarily unavailable. Try again later."]
+    );
+    assert!(
+        !s.drain(carol).iter().any(|line| line.contains(" MODE ")),
+        "voiced without an audit row"
+    );
+}
+
+/// The rename waits for an IDENTIFY that is still being verified at the
+/// deadline: the verdict decides, not when the tick happens to fall.
+#[test]
+fn an_identify_in_flight_at_the_deadline_defers_the_rename() {
+    let mut s = TestServer::new();
+    let _owner = protected_alice(&mut s);
+    let late = s.register(2, "late");
+    s.line(late, "NICK alice");
+    s.drain(late);
+    s.line(late, "PRIVMSG NickServ :IDENTIFY alice pw");
+    s.db_requests();
+    tick_after(&mut s, 30_000);
+    assert!(
+        !s.drain(late).iter().any(|line| line.contains(" NICK ")),
+        "renamed while its IDENTIFY was being verified"
+    );
+    s.core.handle(Input::DbReply {
+        conn: late,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    s.drain(late);
+    tick_after(&mut s, 45_000);
+    assert!(
+        !s.drain(late).iter().any(|line| line.contains(" NICK ")),
+        "renamed after identifying in time"
+    );
+
+    // A verification that fails leaves the rename to the next tick.
+    let wrong = s.register(3, "wrong");
+    s.line(late, "NICK elsewhere");
+    s.drain(late);
+    s.line(wrong, "NICK alice");
+    s.drain(wrong);
+    s.line(wrong, "PRIVMSG NickServ :IDENTIFY alice guess");
+    s.db_requests();
+    tick_after(&mut s, 30_000);
+    assert!(!s.drain(wrong).iter().any(|line| line.contains(" NICK ")));
+    s.core.handle(Input::DbReply {
+        conn: wrong,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    s.drain(wrong);
+    tick_after(&mut s, 45_000);
+    assert!(
+        s.drain(wrong)
+            .iter()
+            .any(|line| line.contains(" NICK Guest")),
+        "a failed IDENTIFY kept the protected nick"
     );
 }
 
@@ -8809,6 +9926,95 @@ fn a_grouped_nick_is_mirrored_from_the_boot_load() {
             .any(|line| line.contains(" NICK Guest")),
         "not renamed"
     );
+}
+
+/// Storage's idempotent answers repair the mirror: GROUP's "already yours"
+/// records the grouping, UNGROUP's "not yours" drops a stale one. A verdict
+/// that arrives after its account was deleted adds nothing back.
+#[test]
+fn nickserv_verdicts_repair_the_mirror_and_cannot_resurrect_a_deleted_account() {
+    let mut s = TestServer::new();
+    let owner = s.register(1, "owner");
+    identify(&mut s, owner, "alice");
+    s.line(owner, "NICK alice_away");
+    s.drain(owner);
+    s.line(owner, "PRIVMSG NickServ :GROUP");
+    nickserv_verdict(
+        &mut s,
+        owner,
+        e6ircd::core::DbReply::NickGroup {
+            account: "alice".into(),
+            nick: "alice_away".into(),
+            outcome: Some(e6ircd::db::NickGroupOutcome::AlreadyYours),
+            label: None,
+        },
+    );
+    s.drain(owner);
+    // The mirror now knows the nick is alice's: GHOST reaches it.
+    s.line(owner, "NICK owner");
+    s.drain(owner);
+    let holder = s.register(2, "alice_away");
+    s.line(owner, "PRIVMSG NickServ :GHOST alice_away");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["\x02alice_away\x02 has been ghosted."]
+    );
+    s.drain(holder);
+
+    // Storage says it is not alice's after all: the mirror follows.
+    s.line(owner, "PRIVMSG NickServ :UNGROUP alice_away");
+    nickserv_verdict(
+        &mut s,
+        owner,
+        e6ircd::core::DbReply::NickUngroup {
+            account: "alice".into(),
+            nick: "alice_away".into(),
+            removed: Some(false),
+            label: None,
+        },
+    );
+    s.drain(owner);
+    s.line(owner, "PRIVMSG NickServ :GHOST alice_away");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["You do not own \x02alice_away\x02."]
+    );
+
+    // Late verdicts for an account deleted in the meantime.
+    s.line(owner, "PRIVMSG NickServ :SET ENFORCE ON");
+    s.db_requests();
+    s.line(owner, "NICK alice_back");
+    s.line(owner, "PRIVMSG NickServ :GROUP");
+    s.db_requests();
+    s.core.handle(Input::AccountDeleted {
+        account: "alice".into(),
+        successions: Vec::new(),
+    });
+    for reply in [
+        e6ircd::core::DbReply::NickEnforce {
+            account: "alice".into(),
+            enforce: true,
+            outcome: Some(e6ircd::db::NickEnforceChange::Changed),
+            label: None,
+        },
+        e6ircd::core::DbReply::NickGroup {
+            account: "alice".into(),
+            nick: "alice_back".into(),
+            outcome: Some(e6ircd::db::NickGroupOutcome::Grouped),
+            label: None,
+        },
+    ] {
+        s.core.handle(Input::DbReply { conn: owner, reply });
+    }
+    let taker = s.register(3, "taker");
+    for nick in ["alice", "alice_back"] {
+        s.line(taker, &format!("NICK {nick}"));
+        let out = s.drain(taker);
+        assert!(
+            notices(&out).is_empty(),
+            "a deleted account's nick {nick} is protected: {out:#?}"
+        );
+    }
 }
 
 #[test]
@@ -9089,7 +10295,7 @@ fn chanserv_access_lists_roles_and_edits_the_flags_store() {
         display: "#chan".into(),
         account: "dave".into(),
         flags: Some("o".into()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "AOP" },
         label: None,
     });
@@ -9107,15 +10313,14 @@ fn chanserv_access_lists_roles_and_edits_the_flags_store() {
         s.db_requests().as_slice(),
         [e6ircd::core::DbRequest::SetChannelAccess { flags: Some(flags), .. }] if flags == "v"
     ));
-    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
-        channel: "#chan".into(),
-        display: "#chan".into(),
-        account: "erin".into(),
-        flags: Some("v".into()),
-        applied: false,
-        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
-        label: None,
-    });
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::AccessAccountMissing {
+            display: "#chan".into(),
+            account: "erin".into(),
+            frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+            label: None,
+        },
+    );
     assert_eq!(notices(&s.drain(boss)), ["\x02erin\x02 is not registered."]);
 
     s.line(boss, "PRIVMSG ChanServ :ACCESS #chan DEL nobody");
@@ -9230,15 +10435,17 @@ fn chanserv_set_successor_is_persisted_and_answered_by_its_verdict() {
         matches!(
             queued.as_slice(),
             [e6ircd::core::DbRequest::SetChannelSuccessor { successor: Some(successor), actor, .. }]
-                if successor == "carol" && actor == "boss"
+                if successor == "Carol" && actor == "boss"
         ),
         "{queued:?}"
     );
     assert!(s.drain(boss).is_empty(), "answered before PostgreSQL");
     s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
         display: "#room".into(),
-        successor: Some("carol".into()),
-        outcome: Some(e6ircd::db::SuccessorChange::Applied),
+        successor: Some("Carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied {
+            successor: Some("carol".into()),
+        }),
         label: None,
     });
     assert_eq!(
@@ -9273,6 +10480,8 @@ fn a_deleted_founders_channel_follows_its_successor_in_the_mirror() {
     let mut s = TestServer::new();
     s.core
         .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    s.core
+        .preload_successors(vec![("#room".to_string(), "carol".to_string())]);
     s.core.handle(Input::AccountDeleted {
         account: "boss".into(),
         successions: vec![e6ircd::db::ChannelSuccession {
@@ -9280,19 +10489,326 @@ fn a_deleted_founders_channel_follows_its_successor_in_the_mirror() {
             founder: "carol".into(),
         }],
     });
+    // A registered channel opens no ops by arrival: the former founder's
+    // join is not opped, the successor's is.
+    let boss = s.register(2, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #room");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.ends_with(" 353 boss = #room :boss")),
+        "the former founder was opped on join: {out:#?}"
+    );
     let carol = s.register(1, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "JOIN #room");
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| line.ends_with("MODE #room +o carol")),
+        "the successor was not opped on join: {out:#?}"
+    );
+    s.drain(carol);
+    // The successor became founder, so the channel has no successor now.
+    s.line(carol, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["You are not the founder of \x02#room\x02."]
+    );
+}
+
+/// The successor is part of who holds a channel, so the founder sees it in
+/// FLAGS and ACCESS listings; it goes when its own account is deleted, and a
+/// founder transfer clears it.
+#[test]
+fn the_successor_is_listed_and_followed_through_transfers_and_deletion() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR carol");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied {
+            successor: Some("carol".into()),
+        }),
+        label: None,
+    });
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        [
+            "Access list for \x02#room\x02:",
+            "carol (successor)",
+            "End of access list."
+        ]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #room LIST");
+    assert_eq!(
+        notices(&s.drain(boss))[2..4],
+        [
+            "1     boss                   Founder",
+            "2     carol                  Successor"
+        ]
+    );
+
+    // Deleting the successor's account clears it.
+    s.core.handle(Input::AccountDeleted {
+        account: "carol".into(),
+        successions: Vec::new(),
+    });
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
+
+    // A transfer to anyone clears the successor: the new founder names their
+    // own.
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR erin");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("erin".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied {
+            successor: Some("erin".into()),
+        }),
+        label: None,
+    });
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER dave");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderChanged {
+        channel: "#room".into(),
+        account: "dave".into(),
+        display: "#room".into(),
+        label: None,
+    });
+    s.drain(boss);
+    let dave = s.register(2, "dave");
+    identify(&mut s, dave, "dave");
+    s.line(dave, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(dave)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
+}
+
+/// A transfer to the successor itself always leaves the channel without one.
+#[test]
+fn a_transfer_to_the_successor_clears_it() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    s.core
+        .preload_successors(vec![("#room".to_string(), "carol".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER carol");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderChanged {
+        channel: "#room".into(),
+        account: "carol".into(),
+        display: "#room".into(),
+        label: None,
+    });
+    let carol = s.register(2, "carol");
     identify(&mut s, carol, "carol");
     s.line(carol, "PRIVMSG ChanServ :FLAGS #room");
     assert_eq!(
         notices(&s.drain(carol)),
         ["Access list for \x02#room\x02:", "End of access list."]
     );
-    let boss = s.register(2, "boss");
+}
+
+/// A founder-only change that storage refused because its requester stopped
+/// founding the channel (a transfer committed first) says so.
+#[test]
+fn a_change_refused_in_storage_for_a_former_founder_says_so() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
     identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR carol");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Refused(
+            e6ircd::db::ChannelRefusal::NotFounder,
+        )),
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["You are no longer the founder of \x02#room\x02."]
+    );
     s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
     assert_eq!(
         notices(&s.drain(boss)),
-        ["You are not the founder of \x02#room\x02."]
+        ["Access list for \x02#room\x02:", "End of access list."],
+        "a refused successor entered the mirror"
+    );
+}
+
+/// ACCESS ADD on an account that already has an entry changes it, and says
+/// so, rather than claiming it was added.
+#[test]
+fn chanserv_access_add_on_an_existing_entry_reports_the_change() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core
+        .preload_access(vec![("#chan".into(), "bob".into(), "o".into())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD bob");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "bob".into(),
+        flags: Some("v".into()),
+        previous: Some("o".into()),
+        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02bob\x02's role in \x02#chan\x02 was changed from \x02AOP\x02 to \x02VOP\x02."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD bob VOP");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "bob".into(),
+        flags: Some("v".into()),
+        previous: Some("v".into()),
+        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02bob\x02 already has the \x02VOP\x02 role in \x02#chan\x02."]
+    );
+}
+
+/// ChanServ takes any of an account's nicks where it expects an account, as
+/// Atheme does: the core's own checks resolve a grouped nick through the
+/// mirror (storage resolves it again when it applies the change).
+#[test]
+fn chanserv_resolves_a_grouped_nick_to_its_account() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core
+        .preload_access(vec![("#chan".into(), "alice".into(), "o".into())]);
+    s.core
+        .preload_nick_registrations(e6ircd::db::NickRegistrations {
+            grouped: vec![
+                ("alice_away".into(), "alice".into()),
+                ("boss_alt".into(), "boss".into()),
+            ],
+            enforced: Vec::new(),
+        });
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    // FLAGS edits alice's entry, not an empty one for the nick.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice_away +v");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { flags: Some(flags), .. }]
+                if flags == "ov"
+        ),
+        "{queued:?}"
+    );
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessUnavailable {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        label: None,
+    });
+    s.drain(boss);
+    // ACCESS DEL finds alice's entry by her grouped nick.
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan DEL alice_away");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { flags: None, frontend, .. }]
+                if *frontend == e6ircd::core::AccessFrontend::AccessDel { role: "AOP" }
+        ),
+        "{queued:?}"
+    );
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "alice".into(),
+        flags: None,
+        previous: Some("o".into()),
+        frontend: e6ircd::core::AccessFrontend::AccessDel { role: "AOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02alice\x02 was removed from the \x02AOP\x02 role in \x02#chan\x02."]
+    );
+    // The founder's own grouped nick is the founder.
+    s.line(boss, "PRIVMSG ChanServ :SET #chan SUCCESSOR boss_alt");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02boss_alt\x02 is the founder of \x02#chan\x02 and cannot also be its successor."]
+    );
+    assert!(s.db_requests().is_empty());
+}
+
+/// An AOP who is not the founder may DEOP, and the MODE line names the
+/// member by the nick the channel knows, however the command spelled it.
+#[test]
+fn an_aop_may_deop_and_the_mode_line_names_the_member_as_they_are() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core.preload_access(vec![
+        ("#chan".into(), "dave".into(), "o".into()),
+        ("#chan".into(), "carol".into(), "o".into()),
+    ]);
+    let dave = s.register(1, "dave");
+    identify(&mut s, dave, "dave");
+    s.line(dave, "JOIN #chan");
+    let carol = s.register(2, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "JOIN #chan");
+    s.drain(dave);
+    s.drain(carol);
+    s.line(dave, "PRIVMSG ChanServ :DEOP #chan CAROL");
+    let seen = s.drain(carol);
+    assert!(
+        seen.iter()
+            .any(|line| line.ends_with("MODE #chan -o carol")),
+        "{seen:#?}"
+    );
+    assert_eq!(
+        notices(&s.drain(dave)),
+        ["Deopped \x02carol\x02 on \x02#chan\x02."]
+    );
+    s.line(dave, "PRIVMSG ChanServ :OP #chan Carol");
+    assert!(
+        s.drain(carol)
+            .iter()
+            .any(|line| line.ends_with("MODE #chan +o carol"))
     );
 }
 
@@ -9541,6 +11057,63 @@ fn admin_channel_drop_waits_for_the_database_verdict() {
     );
 }
 
+/// A topic set over the API is stored whole or refused. With a long server
+/// name and channel name the TOPIC line's head leaves less than TOPICLEN for
+/// the text; the core used to store the part that fitted and answer success.
+#[test]
+fn an_api_topic_that_does_not_fit_its_line_is_refused_not_shortened() {
+    let server = format!("irc.{}.example", "s".repeat(52));
+    let channel = format!("#{}", "c".repeat(49));
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.server_name = server.clone();
+        },
+    );
+    s.core
+        .preload_founders(vec![(channel.clone(), "boss".to_string())]);
+    let submit = |s: &mut TestServer, topic: String| {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        s.core.handle(Input::Admin {
+            req: e6ircd::core::AdminRequest::MutateOwnedChannel {
+                channel: channel.clone(),
+                actor: "boss".into(),
+                mutation: e6ircd::core::ChannelMutation::SetTopic { topic: Some(topic) },
+            },
+            reply: reply_tx,
+        });
+        reply_rx
+    };
+    let mut refused = submit(&mut s, "t".repeat(390));
+    match refused.try_recv() {
+        Ok(e6ircd::core::AdminReply::ChannelErr {
+            kind: e6ircd::core::ChannelControlError::Invalid,
+            message,
+        }) => assert!(message.contains("390 bytes"), "{message}"),
+        other => panic!("an over-long topic was not refused: {other:?}"),
+    }
+    assert!(
+        s.db_requests().is_empty(),
+        "nothing is stored for a refusal"
+    );
+
+    let fitting = "t".repeat(300);
+    let _pending = submit(&mut s, fitting.clone());
+    match s.db_requests().as_slice() {
+        [
+            e6ircd::core::DbRequest::MutateOwnedChannel {
+                mutation:
+                    e6ircd::core::PersistedChannelMutation::SetTopic {
+                        topic: Some((text, _, _)),
+                    },
+                ..
+            },
+        ] => assert_eq!(text, &fitting, "a topic that fits is stored whole"),
+        other => panic!("the fitting topic was not queued: {other:#?}"),
+    }
+}
+
 #[test]
 fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
     let mut s = TestServer::new();
@@ -9591,7 +11164,7 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
     s.core.handle(Input::ChannelControlResult {
         owner,
         request_id,
-        result: e6ircd::core::ChannelControlResult::Applied,
+        result: e6ircd::core::ChannelControlResult::Applied { account: None },
     });
     assert!(matches!(
         reply_rx.try_recv(),
@@ -9665,7 +11238,7 @@ fn owner_channel_control_verdicts_are_request_bound_and_consumed_once() {
     s.core.handle(Input::ChannelControlResult {
         owner: owner.clone(),
         request_id,
-        result: e6ircd::core::ChannelControlResult::Applied,
+        result: e6ircd::core::ChannelControlResult::Applied { account: None },
     });
     assert!(matches!(
         reply_rx.try_recv(),
@@ -9677,7 +11250,7 @@ fn owner_channel_control_verdicts_are_request_bound_and_consumed_once() {
     s.core.handle(Input::ChannelControlResult {
         owner,
         request_id,
-        result: e6ircd::core::ChannelControlResult::Applied,
+        result: e6ircd::core::ChannelControlResult::Applied { account: None },
     });
     let (next_tx, mut next_rx) = tokio::sync::oneshot::channel();
     s.core.handle(Input::Admin {
@@ -9816,7 +11389,7 @@ fn chanserv_flags_auto_ops_on_join() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -9875,15 +11448,14 @@ fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
     assert!(persisted, "SetChannelAccess not queued");
 
     // The DB reports the write did not apply (no such account).
-    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
-        channel: "#chan".to_string(),
-        display: "#chan".to_string(),
-        account: "ghost".to_string(),
-        flags: Some("o".to_string()),
-        applied: false,
-        frontend: e6ircd::core::AccessFrontend::Flags,
-        label: None,
-    });
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::AccessAccountMissing {
+            display: "#chan".to_string(),
+            account: "ghost".to_string(),
+            frontend: e6ircd::core::AccessFrontend::Flags,
+            label: None,
+        },
+    );
     assert!(
         s.drain(boss)
             .iter()
@@ -9946,7 +11518,7 @@ fn account_deletion_drops_its_hot_history_and_channel_access() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -10033,7 +11605,7 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -10053,7 +11625,7 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: None,
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -10566,6 +12138,7 @@ fn server_ban_store_failure_is_loud_labeled_and_non_mutating() {
                     requester @ e6ircd::core::ServerBanRequester::Oper {
                         session,
                         label: Some(label),
+                        ..
                     },
             },
         ] if session.connection_id() == op && label == "ban7" => {
@@ -10642,7 +12215,9 @@ fn oper_actions_are_audited() {
         s.db_requests()
             .into_iter()
             .filter_map(|r| match r {
-                e6ircd::core::DbRequest::AuditLog { action, target, .. } => Some((action, target)),
+                e6ircd::core::DbRequest::AuditLog { action, target, .. } => {
+                    Some((action, target.name().to_string()))
+                }
                 _ => None,
             })
             .collect()
@@ -10708,7 +12283,11 @@ fn self_kill_audit_row_names_the_actor() {
             _ => None,
         })
         .expect("KILL not audited");
-    assert_eq!(actor, "god", "self-KILL audit row lost its actor");
+    assert_eq!(
+        actor,
+        e6ircd::db::AuditPrincipal::operator("god"),
+        "self-KILL audit row lost its actor"
+    );
 }
 
 fn audit_rows(s: &mut TestServer) -> Vec<(String, String, String)> {
@@ -10720,7 +12299,7 @@ fn audit_rows(s: &mut TestServer) -> Vec<(String, String, String)> {
                 action,
                 target,
                 ..
-            } => Some((actor, action, target)),
+            } => Some((actor.name().to_string(), action, target.name().to_string())),
             _ => None,
         })
         .collect()
@@ -11802,21 +13381,29 @@ fn mode_broadcast_splits_to_fit_the_wire_limit() {
     // never see the bans that are now in force. State and what members observe
     // diverge silently.
     let mut s = TestServer::new();
-    let alice = s.register(1, "alice");
+    // A 63-byte host and a 50-byte channel name: the broadcast carries both.
+    let host = format!("{}.example", "h".repeat(55));
+    let alice = s.connect_from(1, &host, e6ircd::core::ConnectionTransport::Tcp);
+    s.line(alice, "NICK alice");
+    s.line(alice, "USER alice 0 * :Real alice");
     let bob = s.register(2, "bob");
-    s.line(alice, "JOIN #c");
+    let channel = format!("#{}", "c".repeat(49));
+    s.line(alice, &format!("JOIN {channel}"));
     s.drain(alice);
-    s.line(bob, "JOIN #c");
+    s.line(bob, &format!("JOIN {channel}"));
     s.drain(alice);
     s.drain(bob);
 
-    // Six distinct ~80-byte masks: the input fits 510, the echoed broadcast
-    // (with the +bbbbbb prefix and the op's own hostmask) does not.
-    let masks: Vec<String> = (0..6).map(|i| format!("{}{i}", "b".repeat(78))).collect();
-    s.line(alice, &format!("MODE #c +bbbbbb {}", masks.join(" ")));
+    // MODES distinct 96-byte masks (100 once canonicalized): the input fits
+    // 510, the echoed broadcast (with the op's own hostmask) does not.
+    let masks: Vec<String> = (0..4).map(|i| format!("{}{i}", "b".repeat(95))).collect();
+    s.line(alice, &format!("MODE {channel} +bbbb {}", masks.join(" ")));
     let out = s.drain(bob);
 
-    let mode_lines: Vec<&String> = out.iter().filter(|l| l.contains(" MODE #c ")).collect();
+    let mode_lines: Vec<&String> = out
+        .iter()
+        .filter(|l| l.contains(&format!(" MODE {channel} ")))
+        .collect();
     assert!(
         !mode_lines.is_empty(),
         "bob must see the MODE change: {out:#?}"
@@ -11912,21 +13499,31 @@ fn relay_trim_lands_on_a_character_boundary() {
     assert!(!sent_body.is_empty());
 }
 
+/// The traditional (non-tag) part of a line, which the 512-byte limit governs.
+fn traditional_part(line: &str) -> &str {
+    line.strip_prefix('@').map_or(line, |r| {
+        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(line)
+    })
+}
+
 #[test]
-fn multiline_flattened_line_fits_but_batch_form_stays_full() {
-    // A multiline line near the input limit relays fine inside the batch to a
-    // capable client (which negotiated the larger frame), but a client without
-    // draft/multiline gets it flattened to a standalone PRIVMSG that must hold
-    // the 512-byte wire limit — so the flattened copy is trimmed while the
-    // batch copy is left full.
+fn multiline_lines_hold_the_wire_limit_in_every_form() {
+    // draft/multiline does not relax the per-line limit: every line inside the
+    // batch is an ordinary IRC line. A line near the input limit grows past 512
+    // once the relay adds the sender's source prefix, so inside the batch it is
+    // split, its continuation marked draft/multiline-concat (one logical line
+    // in several); a batch recipient without message-tags cannot be told a
+    // line continues, so it is trimmed; a client without draft/multiline gets
+    // it flattened to a standalone PRIVMSG, trimmed.
     let mut s = TestServer::new_no_persistence();
     let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
     let bob = register_with_caps(&mut s, 2, "bob", "batch draft/multiline message-tags");
     let carol = register_with_caps(&mut s, 3, "carol", "message-tags");
-    for c in [alice, bob, carol] {
+    let dave = register_with_caps(&mut s, 4, "dave", "batch draft/multiline");
+    for c in [alice, bob, carol, dave] {
         s.line(c, "JOIN #m");
     }
-    for c in [alice, bob, carol] {
+    for c in [alice, bob, carol, dave] {
         s.drain(c);
     }
 
@@ -11936,25 +13533,36 @@ fn multiline_flattened_line_fits_but_batch_form_stays_full() {
     s.line(alice, &format!("@batch=7 PRIVMSG #m :{text}"));
     s.line(alice, "BATCH -7");
 
-    // Capable recipient: the inner PRIVMSG keeps the full body (its non-tag part
-    // legitimately exceeds 512 — that is what multiline is for).
     let capable = s.drain(bob);
-    let inner = capable
+    let inner: Vec<&String> = capable
         .iter()
-        .find(|l| l.contains("PRIVMSG #m"))
-        .expect("bob's inner line");
-    let non_tag = inner.strip_prefix('@').map_or(inner.as_str(), |r| {
-        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(inner)
-    });
-    assert!(
-        non_tag.contains(&text),
-        "the batch form must keep the full body"
+        .filter(|l| l.contains("PRIVMSG #m"))
+        .collect();
+    assert_eq!(
+        inner.len(),
+        2,
+        "the long line is split in two: {capable:#?}"
     );
+    for line in &inner {
+        assert!(traditional_part(line).len() + 2 <= 512, "{line}");
+    }
     assert!(
-        non_tag.len() > 512,
-        "the batch form is left full (non-tag {} bytes)",
-        non_tag.len()
+        !inner[0].contains("draft/multiline-concat") && inner[1].contains("draft/multiline-concat"),
+        "the continuation, and only it, is marked: {inner:#?}"
     );
+    let rejoined: String = inner
+        .iter()
+        .map(|l| l.rsplit_once(" :").expect("trailing").1)
+        .collect();
+    assert_eq!(rejoined, text, "no byte of the line is lost");
+
+    let untagged = s.drain(dave);
+    let inner: Vec<&String> = untagged
+        .iter()
+        .filter(|l| l.contains("PRIVMSG #m"))
+        .collect();
+    assert_eq!(inner.len(), 1, "{untagged:#?}");
+    assert!(traditional_part(inner[0]).len() + 2 <= 512, "{}", inner[0]);
 
     // Non-capable recipient: flattened to a PRIVMSG whose traditional part (the
     // non-tag portion, which the 512 limit governs) fits the wire limit.
@@ -11963,9 +13571,7 @@ fn multiline_flattened_line_fits_but_batch_form_stays_full() {
         .iter()
         .find(|l| l.contains("PRIVMSG #m"))
         .expect("carol's flattened line");
-    let non_tag = line.strip_prefix('@').map_or(line.as_str(), |r| {
-        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(line)
-    });
+    let non_tag = traditional_part(line);
     assert!(
         non_tag.len() + 2 <= 512,
         "flattened line's traditional part is {} bytes, over the wire limit: {line}",
@@ -12228,10 +13834,10 @@ fn malformed_client_tag_keys_are_not_relayed() {
 #[test]
 fn empty_labeled_multiline_batch_still_answers_the_label() {
     // A labeled `BATCH +` opened and then closed with no content delivers
-    // nothing — but the labeled command still owes a response. The framer was
-    // told not to ACK the opening BATCH (the batch is its deferred response),
-    // so the close must resolve the label with an ACK or a label-tracking
-    // client waits forever.
+    // nothing — but the labeled command still owes a response, and a batch
+    // with no message in it is a malformed batch: it is refused with the code
+    // every other malformed batch gets, under the opening BATCH's label (the
+    // framer was told not to ACK it — the batch is its deferred response).
     let mut s = TestServer::new_no_persistence();
     let alice = register_with_caps(
         &mut s,
@@ -12245,10 +13851,10 @@ fn empty_labeled_multiline_batch_still_answers_the_label() {
     assert!(s.drain(alice).is_empty());
     s.line(alice, "BATCH -9");
     let out = s.drain(alice);
-    assert!(
-        out.iter()
-            .any(|l| l.starts_with("@label=abc ") && l.contains("ACK")),
-        "an empty labeled batch must still answer the label: {out:#?}"
+    assert_eq!(
+        labeled_response(&out, "abc"),
+        ["@label=abc :irc.test.example FAIL BATCH MULTILINE_INVALID :Empty batch"],
+        "an empty batch is refused, never silence, under the label: {out:#?}"
     );
 }
 
@@ -12672,7 +14278,7 @@ fn labeled_chanserv_flags_is_one_labeled_response_that_orders_later_output() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: Some("f1".to_string()),
     });
@@ -14065,6 +15671,45 @@ fn configured_administrator_names_cannot_be_registered_over_irc() {
     assert_eq!(created_accounts(&mut s), ["alice"]);
 }
 
+/// GROUP claims a nick for an account just as REGISTER does, so it refuses a
+/// configured administrator's name the same way: grouping it would block the
+/// administrator's own account from ever being created, and let the grouper
+/// protect the name against them.
+#[test]
+fn a_configured_administrator_name_cannot_be_grouped() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.reserved_account_names = e6ircd::identity::ReservedAccountNames::new(["Root"]);
+        },
+    );
+    let mallory = s.register(1, "mallory");
+    identify(&mut s, mallory, "mallory");
+    s.line(mallory, "NICK rOOt");
+    s.drain(mallory);
+    s.line(mallory, "PRIVMSG NickServ :GROUP");
+    assert_eq!(
+        notices(&s.drain(mallory)),
+        ["\x02rOOt\x02 is reserved for a server administrator and cannot be registered."]
+    );
+    let queued = s.db_requests();
+    assert!(
+        !queued
+            .iter()
+            .any(|request| matches!(request, e6ircd::core::DbRequest::GroupNick { .. })),
+        "a reserved name reached storage: {queued:?}"
+    );
+    // Any other nick groups as before.
+    s.line(mallory, "NICK mallory_");
+    s.drain(mallory);
+    s.line(mallory, "PRIVMSG NickServ :GROUP");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::GroupNick { nick, .. }] if nick == "mallory_"
+    ));
+}
+
 /// An account name that has spent its password attempts is refused over SASL
 /// with the protocol's 904 and over NickServ with a notice, both saying how
 /// long to wait.
@@ -14772,4 +16417,484 @@ fn quit_reason_follows_solanum() {
         s.line(who, quit);
         assert_eq!(s.drain(op), [seen], "{quit}");
     }
+}
+
+// ---- IRCv3 conformance sweep ---------------------------------------------
+
+/// A labeled NickServ IDENTIFY with echo-message: the echo is captured before
+/// the verdict is left to the database, and the verdict must be gathered with
+/// it into the one labeled response — not replace it.
+#[test]
+fn labeled_identify_with_echo_keeps_the_echo_in_its_response() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch labeled-response echo-message");
+    s.db_requests();
+    s.line(alice, "@label=L1 PRIVMSG NickServ :IDENTIFY hunter2");
+    assert!(s.drain(alice).is_empty(), "held for the verdict");
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    let out = s.drain(alice);
+    let response = labeled_response(&out, "L1");
+    assert_eq!(response.len(), 3, "{out:#?}");
+    assert!(
+        response[0].contains("PRIVMSG NickServ :[sensitive"),
+        "the redacted echo leads the response: {out:#?}"
+    );
+    assert!(has_numeric(&response[1..2], "900"), "{out:#?}");
+    assert!(response[2].contains("identified for"), "{out:#?}");
+}
+
+/// RPL_LOGGEDIN is sent "whether by SASL or otherwise", RPL_LOGGEDOUT when the
+/// account is unset: NickServ IDENTIFY and REGISTER log in, LOGOUT logs out.
+#[test]
+fn every_login_path_sends_900_and_logout_sends_901() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY pw");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l
+            == ":irc.test.example 900 alice alice!alice@host1.example alice :You are now logged in as alice"),
+        "IDENTIFY announces the login: {out:#?}"
+    );
+    s.line(alice, "PRIVMSG NickServ :LOGOUT");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l
+            == ":irc.test.example 901 alice alice!alice@host1.example :You are now logged out"),
+        "LOGOUT announces the logout: {out:#?}"
+    );
+
+    let bob = s.register(2, "bob");
+    s.line(bob, "PRIVMSG NickServ :REGISTER hunter2");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: bob,
+        reply: e6ircd::core::DbReply::AccountCreated {
+            account: "bob".into(),
+            origin: e6ircd::core::AccountOrigin::NickServ,
+        },
+    });
+    assert!(
+        has_numeric(&s.drain(bob), "900"),
+        "NickServ REGISTER logs in"
+    );
+}
+
+/// SASL sends 900 once: from the one login path, not also from SASL itself.
+#[test]
+fn sasl_success_sends_900_exactly_once() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    s.db_requests();
+    s.drain(c);
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    let out = s.drain(c);
+    let codes: Vec<&str> = out.iter().filter_map(|l| l.split(' ').nth(1)).collect();
+    assert_eq!(codes, ["900", "903"], "{out:#?}");
+}
+
+/// A labeled AUTHENTICATE that completes the payload is answered by its
+/// verdict, not by an empty ACK before the verdict exists.
+#[test]
+fn labeled_authenticate_is_answered_by_its_verdict() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP REQ :sasl batch labeled-response");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, &format!("@label=s1 AUTHENTICATE {}", b64("\0alice\0pw")));
+    s.db_requests();
+    assert!(s.drain(c).is_empty(), "no ACK while the verdict is pending");
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    let out = s.drain(c);
+    let response = labeled_response(&out, "s1");
+    assert!(
+        has_numeric(&response, "900") && has_numeric(&response, "903"),
+        "{out:#?}"
+    );
+
+    // A denial is labeled the same way, and an aborted attempt's label is
+    // still answered when its stale verdict lands.
+    let d = s.connect(2);
+    s.line(d, "CAP REQ :sasl batch labeled-response");
+    s.line(d, "AUTHENTICATE PLAIN");
+    s.line(d, &format!("@label=s2 AUTHENTICATE {}", b64("\0bob\0pw")));
+    s.db_requests();
+    s.line(d, "AUTHENTICATE *");
+    s.drain(d);
+    s.core.handle(Input::DbReply {
+        conn: d,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    let out = s.drain(d);
+    assert_eq!(
+        labeled_response(&out, "s2"),
+        ["@label=s2 :irc.test.example ACK"],
+        "{out:#?}"
+    );
+}
+
+/// A line sent while the credentials are being verified abandons the attempt:
+/// its 904 is the attempt's only verdict, and the verify's verdict, landing
+/// later, is not delivered on top of it.
+#[test]
+fn authenticate_during_verification_ends_the_attempt_once() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    s.db_requests();
+    s.drain(c);
+    s.line(c, "AUTHENTICATE x");
+    assert!(has_numeric(&s.drain(c), "904"));
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    let out = s.drain(c);
+    assert!(
+        !has_numeric(&out, "900") && !has_numeric(&out, "903"),
+        "no second, contradictory verdict: {out:#?}"
+    );
+}
+
+/// `REGISTER` refuses a password no login surface would accept, with the
+/// spec's code, and enqueues nothing.
+#[test]
+fn register_refuses_an_empty_password() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
+    s.db_requests();
+    s.line(alice, "REGISTER * * :");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example FAIL REGISTER WEAK_PASSWORD alice :Passwords must contain 1–512 bytes."
+        ]
+    );
+    assert!(s.db_requests().is_empty(), "no account is created");
+}
+
+/// With no nick to name the account after, REGISTER answers the spec's
+/// NEED_NICK rather than claiming the account exists.
+#[test]
+fn register_without_a_nick_needs_one() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.registration_before_connect = true;
+        },
+    );
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :draft/account-registration");
+    s.drain(c);
+    s.line(c, "REGISTER * * hunter2");
+    let out = s.drain(c);
+    assert_eq!(
+        out,
+        [
+            ":irc.test.example FAIL REGISTER NEED_NICK * :You must hold a nickname before registering an account"
+        ]
+    );
+}
+
+/// A client whose NICK was refused because another session holds it asks to
+/// register "my nick": that name is not available as an account, and it is
+/// told so (ACCOUNT_EXISTS, as Ergo and irctest's RegisterNoLandGrabs expect),
+/// not that it never chose one.
+#[test]
+fn register_after_a_refused_nick_says_the_name_is_taken() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.registration_before_connect = true;
+        },
+    );
+    s.register(1, "root");
+    let c = s.connect(2);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :draft/account-registration");
+    s.line(c, "NICK root");
+    s.drain(c);
+    s.line(c, "REGISTER * * hunter2");
+    let out = s.drain(c);
+    assert_eq!(
+        out,
+        [":irc.test.example FAIL REGISTER ACCOUNT_EXISTS root :That name is held by another user"]
+    );
+    // Taking a nick settles it: the refusal no longer names the old one.
+    s.line(c, "NICK other");
+    s.drain(c);
+    s.line(c, "REGISTER * * hunter2");
+    assert!(
+        !s.drain(c)
+            .iter()
+            .any(|line| line.contains("ACCOUNT_EXISTS root")),
+    );
+}
+
+/// invite-notify reaches the members who could have invited: operators, or
+/// everyone on a `+g` channel — never a plain member of a `-g` channel.
+#[test]
+fn invite_notify_reaches_only_members_who_may_invite() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "invite-notify");
+    let bob = register_with_caps(&mut s, 2, "bob", "invite-notify");
+    let carol = s.register(3, "carol");
+    s.register(4, "dave");
+    s.line(alice, "JOIN #c");
+    s.line(alice, "MODE #c +i");
+    s.line(alice, "INVITE bob #c");
+    s.line(bob, "JOIN #c");
+    for c in [alice, bob, carol] {
+        s.drain(c);
+    }
+    s.line(alice, "INVITE carol #c");
+    assert!(
+        !s.drain(bob).iter().any(|l| l.contains("INVITE carol")),
+        "a plain member of a -g channel is not told"
+    );
+    s.line(alice, "MODE #c +g");
+    s.drain(bob);
+    s.line(alice, "INVITE dave #c");
+    assert!(
+        s.drain(bob).iter().any(|l| l.contains("INVITE dave :#c")),
+        "on a +g channel every member may invite, so every member is told"
+    );
+}
+
+/// multi-prefix covers WHOIS: a member holding op and voice is shown with both.
+#[test]
+fn whois_channels_honour_multi_prefix() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "multi-prefix");
+    let carol = s.register(3, "carol");
+    s.line(alice, "JOIN #c");
+    s.line(alice, "MODE #c +v alice");
+    s.line(bob, "WHOIS alice");
+    assert!(
+        s.drain(bob)
+            .iter()
+            .any(|l| l == ":irc.test.example 319 bob alice :@+#c"),
+        "all ranks for a multi-prefix requester"
+    );
+    s.line(carol, "WHOIS alice");
+    assert!(
+        s.drain(carol)
+            .iter()
+            .any(|l| l == ":irc.test.example 319 carol alice :@#c"),
+        "the highest rank otherwise"
+    );
+}
+
+/// SETNAME refuses a realname over NAMELEN with setname's own FAIL instead of
+/// cutting it; NAMELEN is advertised.
+#[test]
+fn setname_refuses_an_over_long_realname() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "setname");
+    s.line(alice, "VERSION");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" NAMELEN=150 ")),
+        "NAMELEN is advertised"
+    );
+    s.line(alice, &format!("SETNAME :{}", "r".repeat(151)));
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example FAIL SETNAME INVALID_REALNAME :Realname is longer than 150 bytes (NAMELEN)"
+        ]
+    );
+    s.line(alice, &format!("SETNAME :{}", "r".repeat(150)));
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.ends_with(&format!("SETNAME :{}", "r".repeat(150)))),
+        "a realname at the limit is taken as sent"
+    );
+}
+
+/// A line refused before it could be parsed is still answered under the label
+/// its tag section carries.
+#[test]
+fn preparse_refusals_carry_the_label() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch labeled-response");
+    s.line(alice, &format!("@label=z PRIVMSG #c :{}", "x".repeat(600)));
+    assert_eq!(
+        s.drain(alice),
+        ["@label=z :irc.test.example 417 alice :Input line was too long"]
+    );
+    s.line(alice, "@label=y :");
+    assert_eq!(
+        s.drain(alice),
+        ["@label=y :irc.test.example FAIL * INVALID_MESSAGE :Malformed line"]
+    );
+    s.core.handle(Input::Line {
+        conn: alice,
+        line: b"@label=w PRIVMSG #c :\xff".to_vec(),
+    });
+    assert_eq!(
+        s.drain(alice),
+        ["@label=w :irc.test.example FAIL PRIVMSG INVALID_UTF8 :Message rejected, not valid UTF-8"]
+    );
+}
+
+/// An unknown MONITOR subcommand is refused with 421's shape: the command as
+/// its one parameter.
+#[test]
+fn unknown_monitor_subcommand_keeps_421s_shape() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "MONITOR x");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 421 alice MONITOR :Unknown MONITOR subcommand x"]
+    );
+}
+
+/// MODES is advertised and enforced: past it, the rest of a MODE's
+/// parameter-taking changes are named back to the client, not applied.
+#[test]
+fn modes_is_advertised_and_enforced() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "VERSION");
+    assert!(s.drain(alice).iter().any(|l| l.contains(" MODES=4 ")));
+    s.line(alice, "JOIN #c");
+    let nicks = ["b", "c", "d", "e", "f"];
+    for (id, nick) in (2..).zip(nicks) {
+        let conn = s.register(id, nick);
+        s.line(conn, "JOIN #c");
+    }
+    s.drain(alice);
+    s.line(alice, "MODE #c +vvvvv b c d e f");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.ends_with(" MODE #c +vvvv b c d e")),
+        "the first four apply: {out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l
+            == ":irc.test.example FAIL MODE TOO_MANY_MODES #c +v :At most 4 modes with a parameter are changed per MODE (MODES)"),
+        "the fifth is named, not dropped: {out:#?}"
+    );
+}
+
+/// Client-only tags ride history: a reply marker is replayed on the PRIVMSG it
+/// was sent with, a reaction TAGMSG is replayed at all — to a reader that
+/// negotiated message-tags — and a typing indicator never enters history.
+#[test]
+fn chathistory_replays_client_only_tags_and_reactions() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags echo-message");
+    let bob = register_with_caps(
+        &mut s,
+        2,
+        "bob",
+        "batch draft/chathistory message-tags server-time",
+    );
+    let carol = register_with_caps(&mut s, 3, "carol", "batch draft/chathistory");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #h");
+    }
+    s.line(alice, "PRIVMSG #h :parent");
+    s.line(alice, "@+draft/reply=m1;+typing=done PRIVMSG #h :child");
+    s.line(alice, "@+draft/react=👍;+draft/reply=m1 TAGMSG #h");
+    s.line(alice, "@+typing=active TAGMSG #h");
+    let live: Vec<String> = s
+        .drain(bob)
+        .into_iter()
+        .filter(|l| l.contains("PRIVMSG #h") || l.contains("TAGMSG #h"))
+        .collect();
+    assert_eq!(live.len(), 4, "{live:#?}");
+    for c in [alice, carol] {
+        s.drain(c);
+    }
+
+    s.line(bob, "CHATHISTORY LATEST #h * 10");
+    let replay: Vec<String> = s
+        .drain(bob)
+        .into_iter()
+        .filter(|l| l.contains("PRIVMSG #h") || l.contains("TAGMSG #h"))
+        .collect();
+    assert_eq!(
+        replay.len(),
+        3,
+        "the typing indicator is not history: {replay:#?}"
+    );
+    // Replayed as delivered, less the batch reference and the ephemeral tag.
+    let unbatched = |line: &str| {
+        line.split_once(';')
+            .map(|(_, rest)| format!("@{rest}"))
+            .expect("tagged")
+    };
+    assert_eq!(unbatched(&replay[1]), live[1].replace(";+typing=done", ""));
+    assert!(replay[1].contains("+draft/reply=m1"), "{replay:#?}");
+    assert_eq!(unbatched(&replay[2]), live[2]);
+    assert!(replay[2].contains("+draft/react=👍"), "{replay:#?}");
+
+    // A reader without message-tags can be sent neither the tags nor the
+    // TAGMSG, and its page is cut before the limit: two lines, both text.
+    s.line(carol, "CHATHISTORY LATEST #h * 2");
+    let replay: Vec<String> = s
+        .drain(carol)
+        .into_iter()
+        .filter(|l| l.contains(" #h"))
+        .filter(|l| !l.contains("BATCH"))
+        .collect();
+    assert_eq!(
+        replay,
+        [
+            "@batch=1000000000-0-X :alice!alice@host1.example PRIVMSG #h :parent",
+            "@batch=1000000000-0-X :alice!alice@host1.example PRIVMSG #h :child"
+        ]
+        .map(|expected| {
+            let reference = replay[0]
+                .strip_prefix("@batch=")
+                .and_then(|r| r.split_once(' '))
+                .map(|(r, _)| r)
+                .expect("batched");
+            expected.replace("1000000000-0-X", reference)
+        }),
+    );
 }

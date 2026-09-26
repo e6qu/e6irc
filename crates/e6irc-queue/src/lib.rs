@@ -286,6 +286,11 @@ impl<T> Sender<T> {
         self.shared.lock().buf.len()
     }
 
+    /// The most events the queue buffers ([`Config::capacity`]).
+    pub fn capacity(&self) -> usize {
+        self.shared.config.capacity
+    }
+
     pub fn monitor(&self) -> QueueMonitor {
         let state = self.shared.lock();
         self.shared.publish_unconditionally(&state);
@@ -1014,13 +1019,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "capacity must be > 0")]
     fn zero_capacity_is_a_loud_construction_error() {
         let _ = fifo(0);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "watermarks must satisfy low < high <= capacity")]
     fn inverted_watermarks_are_a_loud_construction_error() {
         let _ = queue::<u32>(Config {
             name: "bad",

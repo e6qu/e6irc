@@ -17,7 +17,11 @@ use crate::core::{DbReply, DbRequest, Input};
 use crate::observability::Telemetry;
 use e6irc_queue::Receiver;
 
+mod credential_change;
 mod secret_rotation;
+pub use credential_change::{
+    CredentialChange, CredentialChangeListener, RevocableCredential, credential_remaining,
+};
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
 
 /// Migrations are compiled into the binary; startup refuses to run on
@@ -51,6 +55,8 @@ pub enum DbError {
     DuplicateNetwork(String),
     /// A persisted BNC network kind is outside the closed driver-kind set.
     InvalidNetworkKind(String),
+    /// A persisted BNC network's autojoin channels and keys do not pair up.
+    InvalidNetworkAutojoin(String),
     /// Persisted server settings do not decode into the closed typed schema.
     InvalidServerSettings(String),
     /// A database-wide secret re-seal could not prove every value readable.
@@ -76,8 +82,6 @@ pub enum DbError {
     TooManyCredentials,
     /// The account already holds the maximum number of BNC networks.
     TooManyNetworks,
-    /// The channel already holds the maximum number of access entries.
-    TooManyAccessEntries,
     /// Browser bootstrap is permanently closed once any account exists.
     AlreadyInitialized,
     /// An administrator attempted to suspend the account authenticating the
@@ -93,6 +97,9 @@ pub enum DbError {
     /// An account must transfer every founded channel that has no successor
     /// before deletion.
     AccountOwnsChannels(usize),
+    /// Passing these channels (folded names) to their successors would take a
+    /// successor past [`CHANNEL_FOUNDER_LIMIT`]; nothing was deleted.
+    SuccessorChannelLimit(Vec<String>),
     /// An administrator already holds the maximum number of live invitations.
     TooManyInvitations,
     /// A bearer invitation is unknown, expired, revoked, or already consumed —
@@ -131,6 +138,10 @@ impl std::fmt::Display for DbError {
             Self::InvalidNetworkKind(kind) => {
                 write!(f, "invalid persisted BNC network kind: {kind}")
             }
+            Self::InvalidNetworkAutojoin(network) => write!(
+                f,
+                "persisted BNC network {network} has autojoin keys that do not pair with its channels"
+            ),
             Self::InvalidServerSettings(error) => {
                 write!(f, "invalid persisted server settings: {error}")
             }
@@ -153,7 +164,6 @@ impl std::fmt::Display for DbError {
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
             Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
             Self::TooManyNetworks => write!(f, "account holds too many networks"),
-            Self::TooManyAccessEntries => write!(f, "channel holds too many access entries"),
             Self::AlreadyInitialized => write!(f, "server account bootstrap is already complete"),
             Self::CannotSuspendSelf => write!(f, "an administrator cannot suspend itself"),
             Self::RecoveryOfSuspendedAccount(n) => write!(
@@ -173,6 +183,13 @@ impl std::fmt::Display for DbError {
                      name a successor, or unregister them first"
                 )
             }
+            Self::SuccessorChannelLimit(channels) => write!(
+                f,
+                "the successor of {} already founds the maximum of {CHANNEL_FOUNDER_LIMIT} \
+                 channels; name another successor, transfer, or unregister {} first",
+                channels.join(", "),
+                if channels.len() == 1 { "it" } else { "them" }
+            ),
             Self::TooManyInvitations => {
                 write!(
                     f,
@@ -1149,7 +1166,7 @@ pub async fn save_managed_config(
     pool: &PgPool,
     expected_revision: i64,
     settings: &crate::config::ManagedConfig,
-    actor: &str,
+    actor: &AuditPrincipal,
     audit_detail: &str,
 ) -> Result<ManagedConfigSnapshot, DbError> {
     let value = serde_json::to_value(settings)
@@ -1165,19 +1182,26 @@ pub async fn save_managed_config(
     )
     .bind(expected_revision)
     .bind(value)
-    .bind(actor)
+    .bind(actor.name())
     .fetch_optional(&mut *tx)
     .await
     .map_err(query_error)?;
     let Some((revision, updated_at)) = next else {
         return Err(DbError::StaleServerSettings);
     };
-    insert_audit_log_with(&mut *tx, actor, "CONFIG", "server", audit_detail).await?;
+    insert_audit_log_with(
+        &mut *tx,
+        actor,
+        "CONFIG",
+        &AuditPrincipal::server(),
+        audit_detail,
+    )
+    .await?;
     tx.commit().await.map_err(query_error)?;
     Ok(ManagedConfigSnapshot {
         revision,
         settings: settings.clone(),
-        updated_by: actor.to_string(),
+        updated_by: actor.name().to_string(),
         updated_at,
     })
 }
@@ -1241,14 +1265,19 @@ async fn lock_account_name(
         .map_err(query_error)
 }
 
-/// Whether a new account may not take `folded`: the name is retired, or it is
+/// Whether a new account may not take `folded`: the name is retired, it is
 /// a nick grouped to another account (migration 0075's storage triggers refuse
-/// both; this answers first, so the refusal is a duplicate, not a fault).
+/// both; this answers first, so the refusal is a duplicate, not a fault), or
+/// it is a services pseudo-client's nick, which no session could ever use.
+/// Every creation path — OpenID Connect provisioning included — asks this.
 /// The caller holds the name's lock.
 async fn account_name_is_unavailable(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     folded: &str,
 ) -> Result<bool, DbError> {
+    if crate::identity::SERVICE_NICKS.contains(&folded) {
+        return Ok(true);
+    }
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM retired_account_names WHERE name_folded = $1)
              OR EXISTS (SELECT 1 FROM account_nicks WHERE nick_folded = $1)",
@@ -1313,9 +1342,9 @@ pub async fn create_account_with_contact(
     // to exist (administrator, invitation, bootstrap); the actor is the account.
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "self-registered over IRC",
     )
     .await?;
@@ -1355,9 +1384,9 @@ pub async fn create_account_by_administrator(
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if administrator {
             "local account created with durable administrator authority"
         } else {
@@ -1491,9 +1520,9 @@ pub async fn issue_account_invitation(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_INVITATION_CREATE",
-        &folded,
+        &AuditPrincipal::invitation(&folded),
         if administrator {
             "single-use local account invitation issued with durable administrator authority"
         } else {
@@ -1561,9 +1590,9 @@ pub async fn revoke_account_invitation(
     };
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_INVITATION_REVOKE",
-        &target,
+        &AuditPrincipal::invitation(&target),
         "",
     )
     .await?;
@@ -1676,21 +1705,16 @@ pub async fn accept_account_invitation(
     .await?
     .ok_or(DbError::InvitationUnavailable)?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
-    sqlx::query(
-        "UPDATE account_invitations
-         SET consumed_at = now(), accepted_account_id = $2
-         WHERE id = $1",
-    )
-    .bind(invitation_id)
-    .bind(account_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(query_error)?;
+    sqlx::query("UPDATE account_invitations SET consumed_at = now() WHERE id = $1")
+        .bind(invitation_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_INVITATION_ACCEPT",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if administrator {
             "local account created from invitation with durable administrator authority"
         } else {
@@ -1741,9 +1765,9 @@ pub async fn set_account_contact_email(
     }
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_CONTACT_UPDATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if contact_email.is_some() {
             "contact email replaced"
         } else {
@@ -1775,6 +1799,9 @@ pub async fn bootstrap_first_admin(
     password: &str,
 ) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(name);
+    if crate::identity::SERVICE_NICKS.contains(&folded.as_str()) {
+        return Err(DbError::DuplicateAccount(name.to_string()));
+    }
     let hash = hash_password(password.to_string()).await?;
     let mut transaction = pool.begin().await.map_err(query_error)?;
     sqlx::query("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE")
@@ -1805,9 +1832,9 @@ pub async fn bootstrap_first_admin(
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_BOOTSTRAP",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "first administrator created through one-time browser bootstrap",
     )
     .await?;
@@ -1884,7 +1911,7 @@ pub async fn recover_administrator(
     revoke_issued_invitations(
         &mut transaction,
         &folded,
-        ADMINISTRATOR_RECOVERY_ACTOR,
+        &AuditPrincipal::host(ADMINISTRATOR_RECOVERY_ACTOR),
         "issuer's credentials were recovered from the host",
     )
     .await?;
@@ -1897,9 +1924,9 @@ pub async fn recover_administrator(
         .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        ADMINISTRATOR_RECOVERY_ACTOR,
+        &AuditPrincipal::host(ADMINISTRATOR_RECOVERY_ACTOR),
         "ADMINISTRATOR_RECOVERY",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "every credential revoked (local and app passwords, personal access tokens, device grants, browser sessions) with every invitation the account issued, local password replaced, and administrator authority granted from the host",
     )
     .await?;
@@ -1941,7 +1968,6 @@ pub struct ChannelSuccession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedAccount {
     pub name: String,
-    pub folded: String,
     pub successions: Vec<ChannelSuccession>,
 }
 
@@ -1975,6 +2001,26 @@ pub async fn account_deletion_target(
         return Err(DbError::AccountOwnsChannels(
             usize::try_from(founded_channels).unwrap_or(usize::MAX),
         ));
+    }
+    // What the deletion's succession would give each successor, so a refusal
+    // the transaction would reach anyway is answered before the account is
+    // gated and its networks stopped. The transaction re-checks under locks.
+    let over_limit: Vec<String> = sqlx::query_scalar(
+        "SELECT c.name_folded FROM channels c
+         WHERE c.founder_account_id = $1 AND c.successor_account_id IS NOT NULL
+           AND (SELECT count(*) FROM channels founded
+                WHERE founded.founder_account_id = c.successor_account_id
+                   OR (founded.founder_account_id = $1
+                       AND founded.successor_account_id = c.successor_account_id)) > $2
+         ORDER BY c.name_folded",
+    )
+    .bind(account_id)
+    .bind(CHANNEL_FOUNDER_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    if !over_limit.is_empty() {
+        return Err(DbError::SuccessorChannelLimit(over_limit));
     }
     if flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded) {
         require_other_active_administrator(pool, account_id, configured_administrators).await?;
@@ -2049,6 +2095,43 @@ pub async fn delete_account_permanently(
     .fetch_all(&mut *transaction)
     .await
     .map_err(query_error)?;
+    // A succession is a founder transfer, so it is held to the same cap under
+    // the same lock: each successor's row is locked (in id order, after the
+    // channel rows, the order a transfer takes them in) and its founded
+    // channels — the ones it just received included — counted. A successor
+    // the deletion would take past the cap refuses the deletion, naming the
+    // channels, as an unsuccessored channel does.
+    let passed: Vec<&str> = successions
+        .iter()
+        .map(|(channel, _)| channel.as_str())
+        .collect();
+    // Locked by its own statement: the count must be read by a later one,
+    // whose snapshot includes whatever committed while this one waited.
+    sqlx::query(
+        "SELECT a.id FROM accounts a
+         WHERE a.id IN (SELECT founder_account_id FROM channels WHERE name_folded = ANY($1))
+         ORDER BY a.id
+         FOR NO KEY UPDATE",
+    )
+    .bind(&passed)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    let over_limit: Vec<String> = sqlx::query_scalar(
+        "SELECT c.name_folded FROM channels c
+         WHERE c.name_folded = ANY($1)
+           AND (SELECT count(*) FROM channels founded
+                WHERE founded.founder_account_id = c.founder_account_id) > $2
+         ORDER BY c.name_folded",
+    )
+    .bind(&passed)
+    .bind(CHANNEL_FOUNDER_LIMIT)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    if !over_limit.is_empty() {
+        return Err(DbError::SuccessorChannelLimit(over_limit));
+    }
     let founded_channels: i64 =
         sqlx::query_scalar("SELECT count(*) FROM channels WHERE founder_account_id = $1")
             .bind(account_id)
@@ -2118,18 +2201,18 @@ pub async fn delete_account_permanently(
     for (channel, successor) in &successions {
         insert_audit_log_with(
             &mut *transaction,
-            &actor_folded,
+            &AuditPrincipal::account(&actor_folded),
             "CHANNEL_SUCCESSION",
-            channel,
+            &AuditPrincipal::channel(channel),
             &format!("founder={folded} successor={successor}"),
         )
         .await?;
     }
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_DELETE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "account and account-owned data permanently removed; name retired",
     )
     .await?;
@@ -2141,7 +2224,6 @@ pub async fn delete_account_permanently(
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(DeletedAccount {
         name,
-        folded,
         successions: successions
             .into_iter()
             .map(|(channel, founder)| ChannelSuccession { channel, founder })
@@ -2387,7 +2469,7 @@ pub async fn set_account_administrator(
         revoke_issued_invitations(
             &mut transaction,
             &folded,
-            &actor_folded,
+            &AuditPrincipal::account(&actor_folded),
             "issuer's administrator authority was revoked",
         )
         .await?;
@@ -2397,7 +2479,14 @@ pub async fn set_account_administrator(
     } else {
         "ACCOUNT_ADMIN_REVOKE"
     };
-    insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&actor_folded),
+        action,
+        &AuditPrincipal::account(&folded),
+        "",
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountAuthorityChange {
         name,
@@ -2449,7 +2538,7 @@ pub async fn set_account_suspended(
         revoke_issued_invitations(
             &mut transaction,
             &folded,
-            &actor_folded,
+            &AuditPrincipal::account(&actor_folded),
             "issuer was suspended",
         )
         .await?;
@@ -2459,7 +2548,14 @@ pub async fn set_account_suspended(
     } else {
         "ACCOUNT_REACTIVATE"
     };
-    insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&actor_folded),
+        action,
+        &AuditPrincipal::account(&folded),
+        "",
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountStateChange {
         name,
@@ -2504,7 +2600,7 @@ async fn revoke_account_bearers(
 async fn revoke_issued_invitations(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     issuer: &str,
-    actor: &str,
+    actor: &AuditPrincipal,
     reason: &str,
 ) -> Result<(), DbError> {
     let revoked: Vec<String> = sqlx::query_scalar(
@@ -2522,7 +2618,7 @@ async fn revoke_issued_invitations(
             &mut **transaction,
             actor,
             "ACCOUNT_INVITATION_REVOKE",
-            &invited,
+            &AuditPrincipal::invitation(&invited),
             reason,
         )
         .await?;
@@ -2786,9 +2882,9 @@ pub async fn issue_app_password_for_account(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_APP_PASSWORD_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "app password created",
     )
     .await?;
@@ -3043,7 +3139,8 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         Vec::with_capacity(n),
     );
     // A channel message stores NULL here; a direct message stores its
-    // casefolded participants, which is what CHATHISTORY TARGETS searches.
+    // casefolded participants, from which the `dm_conversations` triggers keep
+    // the summary CHATHISTORY TARGETS reads.
     // Bound as the joined form and split back into an array in SQL: a
     // conversation has one or two participants, and Postgres arrays passed
     // through UNNEST must be rectangular, which a ragged nesting is not.
@@ -3052,6 +3149,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
     // NULL for an ordinary message; the encoded lines for a draft/multiline one
     // (see `core::handler::message::encode_multiline`), authoritative on replay.
     let mut multilines: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut client_tags_column: Vec<String> = Vec::with_capacity(n);
     for request in batch {
         let DbRequest::LogMessage {
             msgid,
@@ -3063,6 +3161,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
             body,
             sender_is_bot,
             multiline,
+            client_tags,
             ts,
         } = request
         else {
@@ -3077,6 +3176,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         bodies.push(body);
         bots.push(sender_is_bot);
         multilines.push(multiline);
+        client_tags_column.push(client_tags);
         let Ok(ts) = millis_for_database(ts, "messages.ts") else {
             eprintln!("db: message logging skipped: timestamp exceeds exact database range");
             return false;
@@ -3084,13 +3184,14 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         tss.push(ts);
     }
     let result = sqlx::query(
-        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot, multiline)
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot, multiline, client_tags)
          SELECT m, t, p, a, k, b, at,
                 CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END,
-                bot, ml
+                bot, ml, ct
          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                      ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x),
-                     $8::text[], $9::bool[], $10::text[]) AS u(m, t, p, a, k, b, at, d, bot, ml)
+                     $8::text[], $9::bool[], $10::text[], $11::text[])
+              AS u(m, t, p, a, k, b, at, d, bot, ml, ct)
          ON CONFLICT (msgid) DO NOTHING",
     )
     .bind(&msgids)
@@ -3103,6 +3204,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
     .bind(&peers)
     .bind(&bots)
     .bind(&multilines)
+    .bind(&client_tags_column)
     .execute(pool)
     .await;
     if let Err(e) = result {
@@ -3259,8 +3361,9 @@ async fn handle_request(
                 }
             };
             let result = match dropped {
-                Ok(true) => crate::core::ChannelDropResult::Dropped,
-                Ok(false) => crate::core::ChannelDropResult::Missing,
+                Ok(Ok(())) => crate::core::ChannelDropResult::Dropped,
+                Ok(Err(ChannelRefusal::ChannelMissing)) => crate::core::ChannelDropResult::Missing,
+                Ok(Err(ChannelRefusal::NotFounder)) => crate::core::ChannelDropResult::NotFounder,
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: channel drop failed: {e}");
@@ -3287,17 +3390,31 @@ async fn handle_request(
         } => {
             let display = channel.clone();
             let result = match set_channel_founder(pool, &channel, &new_founder, &actor).await {
-                Ok(true) => crate::core::ChannelServicePersistence::FounderChanged {
-                    channel,
-                    account: new_founder,
-                    display,
-                    label,
-                },
-                Ok(false) => crate::core::ChannelServicePersistence::FounderMissing {
-                    channel,
-                    display,
-                    label,
-                },
+                Ok(FounderTransfer::Transferred { founder }) => {
+                    crate::core::ChannelServicePersistence::FounderChanged {
+                        channel,
+                        account: founder,
+                        display,
+                        label,
+                    }
+                }
+                Ok(FounderTransfer::AccountMissing) => {
+                    crate::core::ChannelServicePersistence::FounderMissing {
+                        channel,
+                        display,
+                        label,
+                    }
+                }
+                Ok(FounderTransfer::LimitReached) => {
+                    crate::core::ChannelServicePersistence::FounderLimitReached { display, label }
+                }
+                Ok(FounderTransfer::Refused(refusal)) => {
+                    crate::core::ChannelServicePersistence::Refused {
+                        display,
+                        refusal,
+                        label,
+                    }
+                }
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: founder transfer failed: {e}");
@@ -3321,7 +3438,9 @@ async fn handle_request(
             label,
         } => {
             let rows = async {
-                let rows = query_history(pool, &target, floor, query.clone()).await?;
+                let scope = crate::core::HistoryScope::from(caps);
+                let rows =
+                    query_history_in_scope(pool, &target, floor, query.clone(), scope).await?;
                 if rows.is_empty()
                     && positioned_by_unknown_msgid(pool, &target, floor, &query).await?
                 {
@@ -3366,19 +3485,21 @@ async fn handle_request(
             caps,
             label,
         } => {
-            let targets = query_targets(pool, &channels, me.as_deref(), min_ts, max_ts, limit)
-                .await
-                .map(|mut targets| {
-                    // Same order and bound as the query: oldest activity first.
-                    targets.extend(session_only);
-                    targets.sort_by_key(|(_, latest)| *latest);
-                    targets.truncate(limit);
-                    targets
-                })
-                .map_err(|e| {
-                    record_database_error(telemetry);
-                    eprintln!("db: targets query failed: {e}");
-                });
+            let scope = crate::core::HistoryScope::from(caps);
+            let targets =
+                query_targets(pool, &channels, me.as_deref(), scope, min_ts, max_ts, limit)
+                    .await
+                    .map(|mut targets| {
+                        // Same order and bound as the query: oldest activity first.
+                        targets.extend(session_only);
+                        targets.sort_by_key(|(_, latest)| *latest);
+                        targets.truncate(limit);
+                        targets
+                    })
+                    .map_err(|e| {
+                        record_database_error(telemetry);
+                        eprintln!("db: targets query failed: {e}");
+                    });
             core_tx
                 .push(Input::TargetsPage {
                     conn,
@@ -3489,12 +3610,16 @@ async fn handle_request(
             let result =
                 match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone(), &actor).await
                 {
-                    Ok(applied) => crate::core::ChannelServicePersistence::KeeptopicSet {
+                    Ok(Ok(())) => crate::core::ChannelServicePersistence::KeeptopicSet {
                         channel,
                         display,
                         keeptopic,
                         topic,
-                        applied,
+                        label,
+                    },
+                    Ok(Err(refusal)) => crate::core::ChannelServicePersistence::Refused {
+                        display,
+                        refusal,
                         label,
                     },
                     Err(e) => {
@@ -3519,11 +3644,15 @@ async fn handle_request(
             actor,
         } => {
             let result = match set_channel_mlock(pool, &channel, mlock.clone(), &actor).await {
-                Ok(applied) => crate::core::ChannelServicePersistence::MlockSet {
+                Ok(Ok(())) => crate::core::ChannelServicePersistence::MlockSet {
                     channel,
                     display,
                     mlock,
-                    applied,
+                    label,
+                },
+                Ok(Err(refusal)) => crate::core::ChannelServicePersistence::Refused {
+                    display,
+                    refusal,
                     label,
                 },
                 Err(e) => {
@@ -3554,19 +3683,36 @@ async fn handle_request(
             // negative that was really a transient DB failure.
             let result =
                 match set_channel_access(pool, &channel, &account, flags.clone(), &actor).await {
-                    Ok(applied) => crate::core::ChannelServicePersistence::AccessSet {
-                        channel,
-                        display,
-                        account,
-                        flags,
-                        applied,
-                        frontend,
-                        label,
-                    },
-                    Err(DbError::TooManyAccessEntries) => {
+                    Ok(AccessChange::Applied { account, previous }) => {
+                        crate::core::ChannelServicePersistence::AccessSet {
+                            channel,
+                            display,
+                            account,
+                            flags,
+                            previous,
+                            frontend,
+                            label,
+                        }
+                    }
+                    Ok(AccessChange::AccountMissing) => {
+                        crate::core::ChannelServicePersistence::AccessAccountMissing {
+                            display,
+                            account,
+                            frontend,
+                            label,
+                        }
+                    }
+                    Ok(AccessChange::LimitReached) => {
                         crate::core::ChannelServicePersistence::AccessLimitReached {
                             channel,
                             display,
+                            label,
+                        }
+                    }
+                    Ok(AccessChange::Refused(refusal)) => {
+                        crate::core::ChannelServicePersistence::Refused {
+                            display,
+                            refusal,
                             label,
                         }
                     }
@@ -3714,15 +3860,16 @@ async fn handle_request(
             mutation,
             requester,
         } => {
-            let result = match mutate_server_ban_audited(pool, &mutation).await {
-                Ok(true) => crate::core::ServerBanResult::Stored,
-                Ok(false) => crate::core::ServerBanResult::Missing,
-                Err(e) => {
-                    record_database_error(telemetry);
-                    eprintln!("db: audited server-ban mutation failed: {e}");
-                    crate::core::ServerBanResult::Unavailable
-                }
-            };
+            let result =
+                match mutate_server_ban_audited(pool, &mutation, &requester.audit_actor()).await {
+                    Ok(true) => crate::core::ServerBanResult::Stored,
+                    Ok(false) => crate::core::ServerBanResult::Missing,
+                    Err(e) => {
+                        record_database_error(telemetry);
+                        eprintln!("db: audited server-ban mutation failed: {e}");
+                        crate::core::ServerBanResult::Unavailable
+                    }
+                };
             core_tx
                 .push(Input::ServerBanResult {
                     mutation,
@@ -3975,9 +4122,9 @@ pub async fn unlink_oidc_identity(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_IDENTITY_UNLINK",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "OpenID Connect identity unlinked and correlated sessions revoked",
     )
     .await?;
@@ -4012,9 +4159,9 @@ pub async fn link_oidc_identity(
     if inserted.is_some() {
         insert_audit_log_with(
             &mut *transaction,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_IDENTITY_LINK",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "OpenID Connect identity linked",
         )
         .await?;
@@ -4093,6 +4240,27 @@ struct HistoryDbRow {
     sender_is_bot: bool,
     /// Encoded draft/multiline lines, or NULL for an ordinary message.
     multiline: Option<String>,
+    client_tags: String,
+}
+
+/// Expand `$build!(@ <kind predicate>, <dm_conversations column>; ...)` once
+/// per [`crate::core::HistoryScope`] and pick the statement for `$scope`.
+///
+/// What a scope means in SQL is written here and nowhere else: a reader that
+/// cannot receive a TAGMSG has `messages` rows of that kind cut (before any
+/// `LIMIT`, so it counts only rows the reader is sent), and reads the
+/// `dm_conversations` time that ignores them (migration 0085). Every
+/// scope-dependent statement is built through this, so a page, a window and
+/// TARGETS cannot disagree about what a scope admits.
+macro_rules! by_history_scope {
+    ($scope:expr, $build:ident ! ( $($args:tt)* )) => {
+        match $scope {
+            crate::core::HistoryScope::TextAndTags => $build!(@ "", "latest_ts"; $($args)*),
+            crate::core::HistoryScope::Text => {
+                $build!(@ "AND kind <> 'tagmsg' ", "latest_text_ts"; $($args)*)
+            }
+        }
+    };
 }
 
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
@@ -4107,11 +4275,26 @@ struct HistoryDbRow {
 /// no temporary to outlive the query. The SQL also stays greppable, which an
 /// interpolated string would not.
 macro_rules! history_select {
-    ($rest:literal) => {
+    ($scope:expr, $rest:literal) => {
+        by_history_scope!($scope, history_select!($rest))
+    };
+    (@ $kind:literal, $dm_latest:literal; $rest:literal) => {
         concat!(
             "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-             sender_account, kind, body, sender_is_bot, multiline FROM messages ",
+             sender_account, kind, body, sender_is_bot, multiline, client_tags FROM messages ",
+            history_where!($kind),
             $rest
+        )
+    };
+}
+
+/// The predicate every history statement starts with: the target (`$1`), the
+/// reader's floor (`$2`), and the scope's kind predicate.
+macro_rules! history_where {
+    ($kind:literal) => {
+        concat!(
+            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ",
+            $kind
         )
     };
 }
@@ -4120,14 +4303,21 @@ macro_rules! history_select {
 /// inner select aliases the timestamp so the outer query can order by it, and
 /// carries `ts`/`id` for that ordering.
 macro_rules! history_window {
-    ($older:literal, $newer:literal) => {
+    ($scope:expr, $older:literal, $newer:literal) => {
+        by_history_scope!($scope, history_window!($older, $newer))
+    };
+    (@ $kind:literal, $dm_latest:literal; $older:literal, $newer:literal) => {
         concat!(
-            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline FROM ( (SELECT msgid, \
+            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
+             client_tags FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
-             body, sender_is_bot, multiline, ts, id FROM messages ",
+             body, sender_is_bot, multiline, client_tags, ts, id FROM messages ",
+            history_where!($kind),
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
-             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, ts, id FROM messages ",
+             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts, id \
+             FROM messages ",
+            history_where!($kind),
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
         )
@@ -4178,11 +4368,24 @@ pub(crate) async fn positioned_by_unknown_msgid(
     Ok(false)
 }
 
+/// A page of `target`'s text messages — what the REST API serves, which has no
+/// way to present a TAGMSG.
 pub async fn query_history(
     pool: &PgPool,
     target: &str,
     floor: crate::core::HistoryFloor,
     query: crate::core::HistoryQuery,
+) -> Result<Vec<crate::core::HistoryRow>, DbError> {
+    query_history_in_scope(pool, target, floor, query, crate::core::HistoryScope::Text).await
+}
+
+/// A page of `target`'s history cut in the reader's `scope`.
+pub(crate) async fn query_history_in_scope(
+    pool: &PgPool,
+    target: &str,
+    floor: crate::core::HistoryFloor,
+    query: crate::core::HistoryQuery,
+    scope: crate::core::HistoryScope,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::HistoryQuery;
     // Every statement below binds the target as `$1` and the floor as `$2`,
@@ -4198,7 +4401,7 @@ pub async fn query_history(
         limit,
     } = query
     {
-        return query_between_selectors(pool, target, floor, &first, &second, limit).await;
+        return query_between_selectors(pool, target, floor, &first, &second, limit, scope).await;
     }
     // LATEST/BEFORE (and its msgid pivot) select newest-first and get reversed
     // below; the rest are already oldest-first. Computed before the match
@@ -4226,16 +4429,15 @@ pub async fn query_history(
         Option<usize>,
     ) = match query {
         HistoryQuery::Latest { limit } => (
-            history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
-            ),
+            history_select!(scope, "ORDER BY ts DESC, id DESC LIMIT $3"),
             None,
             limit,
             None,
         ),
         HistoryQuery::Before { before_ts, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 before_ts,
@@ -4249,7 +4451,8 @@ pub async fn query_history(
         // the most recent ones rather than the oldest.
         HistoryQuery::LatestAfter { after_ts, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4260,7 +4463,8 @@ pub async fn query_history(
         ),
         HistoryQuery::LatestAfterMsgid { msgid, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4268,7 +4472,8 @@ pub async fn query_history(
         ),
         HistoryQuery::After { after_ts, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
+                scope,
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4280,8 +4485,9 @@ pub async fn query_history(
         // Half older than the point, half at/after it, then oldest-first.
         HistoryQuery::Around { around_ts, limit } => (
             history_window!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
+                scope,
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
+                "AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
             ),
             Some(Position::Millis(millis_for_database(
                 around_ts,
@@ -4305,7 +4511,8 @@ pub async fn query_history(
         // which is what the caller asked about.
         HistoryQuery::BeforeMsgid { msgid, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4313,7 +4520,8 @@ pub async fn query_history(
         ),
         HistoryQuery::AfterMsgid { msgid, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
+                scope,
+                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4321,8 +4529,9 @@ pub async fn query_history(
         ),
         HistoryQuery::AroundMsgid { msgid, limit } => (
             history_window!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
+                scope,
+                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
+                "AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
             ),
             Some(Position::Msgid(msgid)),
             limit / 2,
@@ -4358,11 +4567,12 @@ fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbE
         ts: millis_from_database(row.ts_millis, "messages.ts")?,
         sender_prefix: row.sender_prefix,
         sender_account: row.sender_account,
-        kind: crate::core::MessageKind::from_db(&row.kind)
+        kind: crate::core::HistoryKind::from_db(&row.kind)
             .expect("messages.kind is constrained to known message kinds"),
         body: row.body,
         sender_is_bot: row.sender_is_bot,
         multiline: row.multiline,
+        client_tags: row.client_tags,
     })
 }
 
@@ -4379,6 +4589,7 @@ async fn query_between_selectors(
     first: &crate::core::SelectorBound,
     second: &crate::core::SelectorBound,
     limit: usize,
+    scope: crate::core::HistoryScope,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::SelectorBound;
     struct HistoryMarker {
@@ -4462,14 +4673,16 @@ async fn query_between_selectors(
     );
     let sql = if newest_first {
         history_select!(
-            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) \
+            scope,
+            "\
              AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
              AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
              ORDER BY ts DESC, id DESC LIMIT $7"
         )
     } else {
         history_select!(
-            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) \
+            scope,
+            "\
              AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
              AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
              ORDER BY ts ASC, id ASC LIMIT $7"
@@ -4498,11 +4711,68 @@ struct HistoryTargetRow {
     latest: i64,
 }
 
-/// Return visible targets with latest activity in the requested window.
+/// The CHATHISTORY TARGETS statement, in a scope's fragments.
+///
+/// A channel's newest entry in scope is one backward scan of
+/// `messages_target_ts_id_idx` per requested channel (a LATERAL `max(ts)`
+/// becomes `Index Scan Backward ... Limit 1`, stepping over the TAGMSG rows a
+/// text-scope reader cannot be sent); grouping
+/// `WHERE target = ANY(..)` instead read every row of every joined channel to
+/// find each maximum. A direct-message conversation's newest entry in each
+/// scope is kept in `dm_conversations` by triggers on `messages` (migrations
+/// 0080 and 0085), so that half reads at most `limit` rows of the index on
+/// the scope's column.
+macro_rules! targets_select {
+    ($scope:expr) => {
+        by_history_scope!($scope, targets_select!())
+    };
+    (@ $kind:literal, $dm_latest:literal;) => {
+        concat!(
+            "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
+                 SELECT requested.name, newest.latest
+                 FROM unnest($1::text[], $6::bigint[]) AS requested(name, floor)
+                 CROSS JOIN LATERAL (
+                     SELECT max(ts) AS latest FROM messages
+                     WHERE target = requested.name
+                       AND ts >= to_timestamp(requested.floor::double precision / 1000) ",
+            $kind,
+            ") newest
+                 WHERE newest.latest IS NOT NULL
+                 UNION ALL
+                 (SELECT peer AS name, ",
+            $dm_latest,
+            " AS latest
+                  FROM dm_conversations
+                  WHERE account = $5
+                    AND ",
+            $dm_latest,
+            " > to_timestamp($2::double precision / 1000)
+                    AND ",
+            $dm_latest,
+            " < to_timestamp($3::double precision / 1000)
+                  ORDER BY ",
+            $dm_latest,
+            " ASC
+                  LIMIT $4)
+             ) buffers
+             GROUP BY name
+             HAVING MAX(latest) > to_timestamp($2::double precision / 1000)
+                AND MAX(latest) < to_timestamp($3::double precision / 1000)
+             ORDER BY latest ASC
+             LIMIT $4"
+        )
+    };
+}
+
+/// Return visible targets whose latest activity in the reader's `scope` falls
+/// in the requested window, dated by that activity: a buffer whose only
+/// activity is entries the reader cannot be sent (TAGMSGs, for a reader
+/// without `message-tags`) is not its buffer.
 pub async fn query_targets(
     pool: &PgPool,
     channels: &[(String, crate::core::HistoryFloor)],
     me: Option<&str>,
+    scope: crate::core::HistoryScope,
     min_ts: e6irc_proto::time::Millis,
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
@@ -4518,46 +4788,15 @@ pub async fn query_targets(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .unzip();
-    let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(
-        // A channel's newest message is one backward probe of
-        // `messages_target_ts_id_idx` per requested channel (a LATERAL
-        // `max(ts)` becomes `Index Only Scan Backward ... Limit 1`); grouping
-        // `WHERE target = ANY(..)` instead read every row of every joined
-        // channel to find each maximum.
-        "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
-             SELECT requested.name, newest.latest
-             FROM unnest($1::text[], $6::bigint[]) AS requested(name, floor)
-             CROSS JOIN LATERAL (
-                 SELECT max(ts) AS latest FROM messages
-                 WHERE target = requested.name
-                   AND ts >= to_timestamp(requested.floor::double precision / 1000)
-             ) newest
-             WHERE newest.latest IS NOT NULL
-             UNION ALL
-             SELECT COALESCE(
-                        (SELECT p FROM UNNEST(dm_peers) p WHERE p <> $5 LIMIT 1),
-                        $5
-                    ) AS name,
-                    MAX(ts) AS latest
-             FROM messages
-             WHERE dm_peers @> ARRAY[$5::text]
-               AND NOT EXISTS (SELECT 1 FROM UNNEST(dm_peers) p WHERE left(p, 1) = '~')
-             GROUP BY name
-         ) buffers
-         GROUP BY name
-         HAVING MAX(latest) > to_timestamp($2::double precision / 1000)
-            AND MAX(latest) < to_timestamp($3::double precision / 1000)
-         ORDER BY latest ASC
-         LIMIT $4",
-    )
-    .bind(names)
-    .bind(min_ts as f64)
-    .bind(max_ts as f64)
-    .bind(limit as i64)
-    .bind(me)
-    .bind(floors)
-    .fetch_all(pool)
-    .await;
+    let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(targets_select!(scope))
+        .bind(names)
+        .bind(min_ts as f64)
+        .bind(max_ts as f64)
+        .bind(limit as i64)
+        .bind(me)
+        .bind(floors)
+        .fetch_all(pool)
+        .await;
     rows.map_err(query_error)?
         .into_iter()
         .map(|row| {
@@ -4573,109 +4812,204 @@ pub async fn query_targets(
 /// the persisted `channel_access` rows and the in-core map they preload into.
 const MAX_ACCESS_ENTRIES_PER_CHANNEL: i64 = 256;
 
-/// Upsert (`flags = Some`) or remove (`flags = None`) one channel-access entry.
-/// Returns whether the change was *applied to a real account*: the grant INSERT
-/// affects no rows when no `accounts` row matches (the account isn't
-/// registered), so the caller can refuse to record a phantom grant in its hot
-/// map. A removal is always considered applied — dropping a (possibly stale)
-/// entry is idempotent cleanup.
-///
-/// An applied change is audited (`CHANNEL_ACCESS`, as the owner console
-/// records it) in its own transaction, with the founder `actor`.
+/// Why a founder-only ChanServ change to a registered channel did not apply,
+/// found with the channel row locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelRefusal {
+    /// The channel is not registered.
+    ChannelMissing,
+    /// The actor no longer founds the channel: a transfer committed between
+    /// the core's founder check and this write (a pipelined `SET FOUNDER`).
+    NotFounder,
+}
+
+/// Lock the registered channel `channel_folded` (`FOR NO KEY UPDATE`, which
+/// a concurrent founder transfer also takes) and check, inside the caller's
+/// transaction, that `actor` still founds it. Every founder-only mutation —
+/// ChanServ's and the owner console's — starts here, so none can be applied by
+/// someone the core still believed was founder when it queued the request.
+async fn lock_channel_as_founder(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel_folded: &str,
+    actor: &str,
+) -> Result<Result<ChannelMutationOwnerRow, ChannelRefusal>, DbError> {
+    let row: Option<ChannelMutationOwnerRow> = sqlx::query_as(
+        "SELECT c.id AS channel_id, c.founder_account_id AS founder_id,
+                a.name_folded AS founder, c.keeptopic
+         FROM channels c JOIN accounts a ON a.id = c.founder_account_id
+         WHERE c.name_folded = $1
+         FOR NO KEY UPDATE OF c",
+    )
+    .bind(channel_folded)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    let Some(row) = row else {
+        return Ok(Err(ChannelRefusal::ChannelMissing));
+    };
+    if row.founder != CaseMapping::Rfc1459.casefold(actor) {
+        return Ok(Err(ChannelRefusal::NotFounder));
+    }
+    Ok(Ok(row))
+}
+
+/// An account a name resolves to.
+#[derive(sqlx::FromRow)]
+struct ResolvedAccount {
+    id: i64,
+    /// Display name.
+    name: String,
+    name_folded: String,
+}
+
+/// The account `name` names: the account of that name, or the account a nick
+/// of that name is grouped to (NickServ GROUP; Atheme resolves any of an
+/// account's nicks to it). The one resolution login, NickServ INFO and every
+/// ChanServ account argument share.
+async fn resolve_account<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    name: &str,
+) -> Result<Option<ResolvedAccount>, DbError> {
+    sqlx::query_as(
+        "SELECT a.id, a.name, a.name_folded
+         FROM accounts a
+         WHERE a.name_folded = $1
+            OR a.id = (SELECT account_id FROM account_nicks WHERE nick_folded = $1)",
+    )
+    .bind(CaseMapping::Rfc1459.casefold(name))
+    .fetch_optional(executor)
+    .await
+    .map_err(query_error)
+}
+
+/// What writing one channel access entry did.
+enum AccessEntryWrite {
+    /// The entry holds the flags asked for; `previous` is what it held before
+    /// (`None`: it is new).
+    Written { previous: Option<String> },
+    /// A new entry would exceed [`MAX_ACCESS_ENTRIES_PER_CHANNEL`].
+    LimitReached,
+}
+
+/// Upsert `account_id`'s access entry on the locked channel `channel_id`.
+/// Only a *new* entry counts against the cap; re-flagging an existing one is
+/// always allowed. The caller holds the channel row lock, so two grants
+/// cannot both slip past the cap.
+async fn write_access_entry(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel_id: i64,
+    account_id: i64,
+    flags: &str,
+) -> Result<AccessEntryWrite, DbError> {
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT flags FROM channel_access WHERE channel_id = $1 AND account_id = $2",
+    )
+    .bind(channel_id)
+    .bind(account_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    if previous.is_none() {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM channel_access WHERE channel_id = $1")
+                .bind(channel_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(query_error)?;
+        if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
+            return Ok(AccessEntryWrite::LimitReached);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO channel_access (channel_id, account_id, flags)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
+    )
+    .bind(channel_id)
+    .bind(account_id)
+    .bind(flags)
+    .execute(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    Ok(AccessEntryWrite::Written { previous })
+}
+
+/// What a ChanServ access change (FLAGS, ACCESS ADD/DEL) did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessChange {
+    /// The entry now holds the flags asked for (`None`: it is gone).
+    Applied {
+        /// The account the name resolved to, as its display name.
+        account: String,
+        /// The flags the entry held before (`None`: there was no entry).
+        previous: Option<String>,
+    },
+    /// No account has that name or nick.
+    AccountMissing,
+    /// A new entry would exceed the per-channel cap.
+    LimitReached,
+    Refused(ChannelRefusal),
+}
+
+/// Set (`flags = Some`) or remove (`flags = None`) the access entry of the
+/// account `account` names (its name, or a nick grouped to it) on a registered
+/// channel `actor` founds — checked with the channel row locked. A change is
+/// audited (`CHANNEL_ACCESS`, as the owner console records it) in the same
+/// transaction.
 pub async fn set_channel_access(
     pool: &PgPool,
     channel: &str,
     account: &str,
     flags: Option<String>,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<AccessChange, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
-    let account_folded = CaseMapping::Rfc1459.casefold(account);
-    let detail = format!(
-        "account={account_folded} flags={}",
-        flags.as_deref().unwrap_or("-")
-    );
-    match flags {
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let channel = match lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(AccessChange::Refused(refusal)),
+    };
+    let Some(target) = resolve_account(&mut *transaction, account).await? else {
+        return Ok(AccessChange::AccountMissing);
+    };
+    let previous = match flags.as_deref() {
         Some(flags) => {
-            // Cap the access list per channel, like every sibling grant collection
-            // (app passwords, PATs, BNC networks): count + insert in one
-            // transaction with the channel row locked FOR NO KEY UPDATE, so two founders
-            // granting concurrently can't both slip past the cap. Without it the
-            // map — and its persisted rows, re-loaded into RAM on every boot by
-            // `preload_access` — grow without bound. Only a *new* (channel,
-            // account) pair counts against the cap; re-flagging an existing entry
-            // is always allowed (it replaces, it doesn't grow).
-            let mut tx = pool.begin().await.map_err(query_error)?;
-            let ids: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT c.id, a.id FROM channels c, accounts a
-                 WHERE c.name_folded = $1 AND a.name_folded = $2
-                 FOR NO KEY UPDATE OF c",
-            )
-            .bind(&channel_folded)
-            .bind(&account_folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            // No match → the account isn't registered (or the channel is gone);
-            // nothing granted, same as before.
-            let Some((channel_id, account_id)) = ids else {
-                return Ok(false);
-            };
-            let already: Option<i64> = sqlx::query_scalar(
-                "SELECT account_id FROM channel_access WHERE channel_id = $1 AND account_id = $2",
-            )
-            .bind(channel_id)
-            .bind(account_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            if already.is_none() {
-                let count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM channel_access WHERE channel_id = $1")
-                        .bind(channel_id)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(query_error)?;
-                if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
-                    return Err(DbError::TooManyAccessEntries);
-                }
+            match write_access_entry(&mut transaction, channel.channel_id, target.id, flags).await?
+            {
+                AccessEntryWrite::Written { previous } => previous,
+                AccessEntryWrite::LimitReached => return Ok(AccessChange::LimitReached),
             }
-            sqlx::query(
-                "INSERT INTO channel_access (channel_id, account_id, flags)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
-            )
-            .bind(channel_id)
-            .bind(account_id)
-            .bind(flags)
-            .execute(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            audit_channel_service(&mut tx, actor, "CHANNEL_ACCESS", &channel_folded, &detail)
-                .await?;
-            tx.commit().await.map_err(query_error)?;
-            Ok(true)
         }
-        None => {
-            let mut tx = pool.begin().await.map_err(query_error)?;
-            let removed = sqlx::query(
-                "DELETE FROM channel_access ca USING channels c, accounts a
-                 WHERE ca.channel_id = c.id AND ca.account_id = a.id
-                   AND c.name_folded = $1 AND a.name_folded = $2",
-            )
-            .bind(&channel_folded)
-            .bind(&account_folded)
-            .execute(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            if removed.rows_affected() > 0 {
-                audit_channel_service(&mut tx, actor, "CHANNEL_ACCESS", &channel_folded, &detail)
-                    .await?;
-            }
-            tx.commit().await.map_err(query_error)?;
-            Ok(true)
-        }
+        None => sqlx::query_scalar(
+            "DELETE FROM channel_access WHERE channel_id = $1 AND account_id = $2
+             RETURNING flags",
+        )
+        .bind(channel.channel_id)
+        .bind(target.id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(query_error)?,
+    };
+    if previous != flags {
+        let detail = format!(
+            "account={} flags={}",
+            target.name_folded,
+            flags.as_deref().unwrap_or("-")
+        );
+        audit_channel_service(
+            &mut transaction,
+            actor,
+            "CHANNEL_ACCESS",
+            &channel_folded,
+            &detail,
+        )
+        .await?;
     }
+    transaction.commit().await.map_err(query_error)?;
+    Ok(AccessChange::Applied {
+        account: target.name,
+        previous,
+    })
 }
 
 /// Record one change of a registered channel inside its transaction — target
@@ -4690,17 +5024,21 @@ async fn audit_channel_service(
 ) -> Result<(), DbError> {
     insert_audit_log_with(
         &mut **transaction,
-        &CaseMapping::Rfc1459.casefold(actor),
+        &AuditPrincipal::account(&CaseMapping::Rfc1459.casefold(actor)),
         action,
-        channel_folded,
+        &AuditPrincipal::channel(channel_folded),
         detail,
     )
     .await
 }
 
+/// A registered channel row locked for a founder-only change (see
+/// [`lock_channel_as_founder`]).
 #[derive(sqlx::FromRow)]
 struct ChannelMutationOwnerRow {
     channel_id: i64,
+    founder_id: i64,
+    /// The founder's folded account name.
     founder: String,
     keeptopic: bool,
 }
@@ -4717,27 +5055,12 @@ pub async fn persist_owned_channel_mutation(
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let row: Option<ChannelMutationOwnerRow> = sqlx::query_as(
-        "SELECT c.id AS channel_id, a.name_folded AS founder, c.keeptopic
-         FROM channels c JOIN accounts a ON a.id = c.founder_account_id
-         WHERE c.name_folded = $1
-         FOR NO KEY UPDATE OF c",
-    )
-    .bind(&channel_folded)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(query_error)?;
-    let Some(ChannelMutationOwnerRow {
-        channel_id,
-        founder,
-        keeptopic,
-    }) = row
-    else {
+    let Ok(owner) = lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? else {
         return Ok(ChannelControlResult::MissingOrNotOwner);
     };
-    if founder != actor_folded {
-        return Ok(ChannelControlResult::MissingOrNotOwner);
-    }
+    let (channel_id, keeptopic) = (owner.channel_id, owner.keeptopic);
+    // The account an access change or transfer named, as resolved.
+    let mut resolved = None;
 
     let (action, detail) = match mutation {
         PersistedChannelMutation::SetTopic { topic } => {
@@ -4820,87 +5143,44 @@ pub async fn persist_owned_channel_mutation(
             )
         }
         PersistedChannelMutation::SetAccess { account, flags } => {
-            let account_folded = CaseMapping::Rfc1459.casefold(account);
-            if let Some(flags) = flags {
-                let account_id: Option<i64> =
-                    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-                        .bind(&account_folded)
-                        .fetch_optional(&mut *transaction)
-                        .await
-                        .map_err(query_error)?;
-                let Some(account_id) = account_id else {
-                    return Ok(ChannelControlResult::AccountMissing);
-                };
-                let already: Option<i64> = sqlx::query_scalar(
-                    "SELECT account_id FROM channel_access
-                     WHERE channel_id = $1 AND account_id = $2",
-                )
-                .bind(channel_id)
-                .bind(account_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-                if already.is_none() {
-                    let count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM channel_access WHERE channel_id = $1",
-                    )
-                    .bind(channel_id)
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(query_error)?;
-                    if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
-                        return Ok(ChannelControlResult::AccessLimitReached);
-                    }
-                }
-                sqlx::query(
-                    "INSERT INTO channel_access (channel_id, account_id, flags)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (channel_id, account_id)
-                     DO UPDATE SET flags = EXCLUDED.flags",
-                )
-                .bind(channel_id)
-                .bind(account_id)
-                .bind(flags)
-                .execute(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-            } else {
-                sqlx::query(
-                    "DELETE FROM channel_access ca USING accounts a
-                     WHERE ca.channel_id = $1 AND ca.account_id = a.id
-                       AND a.name_folded = $2",
-                )
-                .bind(channel_id)
-                .bind(&account_folded)
-                .execute(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-            }
-            (
-                "CHANNEL_ACCESS",
-                format!(
-                    "account={account_folded} flags={}",
-                    flags.as_deref().unwrap_or("-")
-                ),
-            )
-        }
-        PersistedChannelMutation::TransferFounder { account } => {
-            let account_id: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-                    .bind(account)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(query_error)?;
-            let Some(account_id) = account_id else {
+            let Some(target) = resolve_account(&mut *transaction, account).await? else {
                 return Ok(ChannelControlResult::AccountMissing);
             };
-            sqlx::query("UPDATE channels SET founder_account_id = $2 WHERE id = $1")
-                .bind(channel_id)
-                .bind(account_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-            ("CHANNEL_FOUNDER", account.clone())
+            if let Some(flags) = flags {
+                if let AccessEntryWrite::LimitReached =
+                    write_access_entry(&mut transaction, channel_id, target.id, flags).await?
+                {
+                    return Ok(ChannelControlResult::AccessLimitReached);
+                }
+            } else {
+                sqlx::query("DELETE FROM channel_access WHERE channel_id = $1 AND account_id = $2")
+                    .bind(channel_id)
+                    .bind(target.id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(query_error)?;
+            }
+            let detail = format!(
+                "account={} flags={}",
+                target.name_folded,
+                flags.as_deref().unwrap_or("-")
+            );
+            resolved = Some(target.name);
+            ("CHANNEL_ACCESS", detail)
+        }
+        PersistedChannelMutation::TransferFounder { account } => {
+            let Some(founder) = resolve_account(&mut *transaction, account).await? else {
+                return Ok(ChannelControlResult::AccountMissing);
+            };
+            match transfer_channel_founder(&mut transaction, &owner, founder.id).await? {
+                FounderWrite::Transferred => {}
+                FounderWrite::AccountMissing => return Ok(ChannelControlResult::AccountMissing),
+                FounderWrite::LimitReached => {
+                    return Ok(ChannelControlResult::FounderLimitReached);
+                }
+            }
+            resolved = Some(founder.name);
+            ("CHANNEL_FOUNDER", founder.name_folded)
         }
         PersistedChannelMutation::Drop => {
             sqlx::query("DELETE FROM channels WHERE id = $1")
@@ -4913,14 +5193,14 @@ pub async fn persist_owned_channel_mutation(
     };
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         action,
-        &channel_folded,
+        &AuditPrincipal::channel(&channel_folded),
         &detail,
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(ChannelControlResult::Applied)
+    Ok(ChannelControlResult::Applied { account: resolved })
 }
 
 /// Whether `account` holds a registered relationship with `channel` — its
@@ -4963,102 +5243,155 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
     .map_err(query_error)
 }
 
-/// Transfer a channel's founder to `new_founder_folded`. Returns whether
-/// a row was updated (false = no such channel or account).
-/// Transfer a channel's founder. `Ok(true)` = a row was updated, `Ok(false)` =
-/// no such channel/account (a definitive negative), `Err` = the store failed.
-/// The caller must keep these distinct: reporting a DB fault as "no such
-/// account" would tell the founder a lie they might act on.
-/// A transfer is audited (`CHANNEL_FOUNDER`) in its own transaction, with the
-/// outgoing founder `actor`.
+/// What a founder transfer on a locked channel did.
+enum FounderWrite {
+    Transferred,
+    /// The receiving account was deleted after its name was resolved.
+    AccountMissing,
+    /// The receiving account already founds [`CHANNEL_FOUNDER_LIMIT`] channels.
+    LimitReached,
+}
+
+/// Make `founder_id` the founder of the locked channel `channel`: the one
+/// founder transfer both ChanServ and the owner console run. The receiving
+/// account's row is locked and its founded channels counted first, as a
+/// registration does, so no transfer can take an account past
+/// [`CHANNEL_FOUNDER_LIMIT`]. A transfer clears the successor — the outgoing
+/// founder picked the heir, and the new founder names their own (maintainer
+/// decision; succession by account deletion clears it too, through migration
+/// 0075's trigger). A transfer to the founder the channel already has changes
+/// nothing.
+async fn transfer_channel_founder(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel: &ChannelMutationOwnerRow,
+    founder_id: i64,
+) -> Result<FounderWrite, DbError> {
+    if channel.founder_id == founder_id {
+        return Ok(FounderWrite::Transferred);
+    }
+    let locked: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(founder_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(query_error)?;
+    if locked.is_none() {
+        return Ok(FounderWrite::AccountMissing);
+    }
+    if let FounderCapacity::LimitReached = founder_capacity(transaction, founder_id).await? {
+        return Ok(FounderWrite::LimitReached);
+    }
+    sqlx::query(
+        "UPDATE channels SET founder_account_id = $2, successor_account_id = NULL WHERE id = $1",
+    )
+    .bind(channel.channel_id)
+    .bind(founder_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    Ok(FounderWrite::Transferred)
+}
+
+/// What ChanServ `SET FOUNDER` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FounderTransfer {
+    /// The channel now belongs to `founder` (the account's display name).
+    Transferred {
+        founder: String,
+    },
+    /// No account has that name or nick.
+    AccountMissing,
+    /// That account already founds [`CHANNEL_FOUNDER_LIMIT`] channels.
+    LimitReached,
+    Refused(ChannelRefusal),
+}
+
+/// Transfer a channel `actor` founds — checked with its row locked — to the
+/// account `new_founder` names (its name, or a nick grouped to it). Audited
+/// (`CHANNEL_FOUNDER`) in the same transaction, with the outgoing founder
+/// `actor`. A store failure is an `Err`, never "no such account": that would
+/// tell the founder a lie they might act on.
 pub async fn set_channel_founder(
     pool: &PgPool,
     channel: &str,
-    new_founder_folded: &str,
+    new_founder: &str,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<FounderTransfer, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let res = sqlx::query(
-        "UPDATE channels SET founder_account_id = a.id
-         FROM accounts a
-         WHERE channels.name_folded = $1 AND a.name_folded = $2",
-    )
-    .bind(&channel_folded)
-    .bind(new_founder_folded)
-    .execute(&mut *transaction)
-    .await
-    .map_err(query_error)?;
-    if res.rows_affected() == 0 {
-        return Ok(false);
+    let channel = match lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(FounderTransfer::Refused(refusal)),
+    };
+    let Some(founder) = resolve_account(&mut *transaction, new_founder).await? else {
+        return Ok(FounderTransfer::AccountMissing);
+    };
+    match transfer_channel_founder(&mut transaction, &channel, founder.id).await? {
+        FounderWrite::Transferred => {}
+        FounderWrite::AccountMissing => return Ok(FounderTransfer::AccountMissing),
+        FounderWrite::LimitReached => return Ok(FounderTransfer::LimitReached),
     }
     audit_channel_service(
         &mut transaction,
         actor,
         "CHANNEL_FOUNDER",
         &channel_folded,
-        new_founder_folded,
+        &founder.name_folded,
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(true)
+    Ok(FounderTransfer::Transferred {
+        founder: founder.name,
+    })
 }
 
 /// What naming a channel's successor did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuccessorChange {
-    /// The successor was set (or cleared) as asked.
-    Applied,
-    /// The channel is not registered.
-    ChannelMissing,
-    /// No account has the successor's name.
+    /// The successor was set as asked: the account's display name, or `None`
+    /// once cleared.
+    Applied {
+        successor: Option<String>,
+    },
+    /// No account has the successor's name or nick.
     AccountMissing,
     /// The named account founds the channel; a founder cannot also succeed it.
     IsFounder,
+    Refused(ChannelRefusal),
 }
 
-/// Name `successor_folded` as the account a registered channel passes to when
-/// its founder's account is deleted (ChanServ SET SUCCESSOR), or clear it with
-/// `None`. Audited (`CHANNEL_SUCCESSOR`) with the founder `actor` in the same
-/// transaction. The channel row is locked first, so a concurrent founder
-/// transfer is either seen or waits.
+/// Name the account `successor` names (its name, or a nick grouped to it) as
+/// the one a registered channel passes to when its founder's account is
+/// deleted (ChanServ SET SUCCESSOR), or clear it with `None`. The channel row
+/// is locked and `actor` checked to still found it first, so a founder
+/// transfer committed after the core's check refuses this rather than let a
+/// former founder pick the heir. Audited (`CHANNEL_SUCCESSOR`) with `actor` in
+/// the same transaction.
 pub async fn set_channel_successor(
     pool: &PgPool,
     channel: &str,
-    successor_folded: Option<&str>,
+    successor: Option<&str>,
     actor: &str,
 ) -> Result<SuccessorChange, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let channel_row: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT id, founder_account_id FROM channels WHERE name_folded = $1 FOR NO KEY UPDATE",
-    )
-    .bind(&channel_folded)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(query_error)?;
-    let Some((channel_id, founder_id)) = channel_row else {
-        return Ok(SuccessorChange::ChannelMissing);
+    let channel = match lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(SuccessorChange::Refused(refusal)),
     };
-    let successor_id = match successor_folded {
-        Some(successor) => {
-            let id: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-                    .bind(successor)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(query_error)?;
-            match id {
-                None => return Ok(SuccessorChange::AccountMissing),
-                Some(id) if id == founder_id => return Ok(SuccessorChange::IsFounder),
-                Some(id) => Some(id),
+    let successor = match successor {
+        Some(successor) => match resolve_account(&mut *transaction, successor).await? {
+            None => return Ok(SuccessorChange::AccountMissing),
+            Some(account) if account.id == channel.founder_id => {
+                return Ok(SuccessorChange::IsFounder);
             }
-        }
+            Some(account) => Some(account),
+        },
         None => None,
     };
     sqlx::query("UPDATE channels SET successor_account_id = $2 WHERE id = $1")
-        .bind(channel_id)
-        .bind(successor_id)
+        .bind(channel.channel_id)
+        .bind(successor.as_ref().map(|account| account.id))
         .execute(&mut *transaction)
         .await
         .map_err(query_error)?;
@@ -5067,11 +5400,27 @@ pub async fn set_channel_successor(
         actor,
         "CHANNEL_SUCCESSOR",
         &channel_folded,
-        successor_folded.unwrap_or("-"),
+        successor
+            .as_ref()
+            .map_or("-", |account| account.name_folded.as_str()),
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(SuccessorChange::Applied)
+    Ok(SuccessorChange::Applied {
+        successor: successor.map(|account| account.name),
+    })
+}
+
+/// Every registered channel's successor, as `(channel name_folded, successor
+/// name_folded)` — boot-loaded into the founder mirror.
+pub async fn list_channel_successors(pool: &PgPool) -> Result<Vec<(String, String)>, DbError> {
+    sqlx::query_as(
+        "SELECT c.name_folded, a.name_folded
+         FROM channels c JOIN accounts a ON a.id = c.successor_account_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)
 }
 
 /// Most nicks one account may hold, its own name included (Atheme's
@@ -5153,9 +5502,9 @@ pub async fn group_nick(
         .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         "NICK_GROUP",
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         &nick_folded,
     )
     .await?;
@@ -5183,9 +5532,9 @@ pub async fn ungroup_nick(pool: &PgPool, account: &str, nick: &str) -> Result<bo
     if removed {
         insert_audit_log_with(
             &mut *transaction,
-            &account_folded,
+            &AuditPrincipal::account(&account_folded),
             "NICK_UNGROUP",
-            &account_folded,
+            &AuditPrincipal::account(&account_folded),
             &nick_folded,
         )
         .await?;
@@ -5232,9 +5581,9 @@ pub async fn set_nick_enforce(
         .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         "NICK_ENFORCE",
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         if enforce { "on" } else { "off" },
     )
     .await?;
@@ -5331,9 +5680,10 @@ pub async fn nickserv_account_info(
 pub async fn mutate_server_ban_audited(
     pool: &PgPool,
     mutation: &crate::core::ServerBanMutation,
+    actor: &AuditPrincipal,
 ) -> Result<bool, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let (actor, action, target, detail) = match mutation {
+    let (action, target, detail) = match mutation {
         crate::core::ServerBanMutation::Add {
             mask,
             mask_display,
@@ -5358,7 +5708,6 @@ pub async fn mutate_server_ban_audited(
             .await
             .map_err(query_error)?;
             (
-                set_by.as_str(),
                 kind.to_ascii_uppercase(),
                 mask_display.as_str(),
                 reason.as_str(),
@@ -5369,7 +5718,7 @@ pub async fn mutate_server_ban_audited(
             mask,
             mask_display,
             kind,
-            actor,
+            ..
         } => {
             let mut delete =
                 sqlx::QueryBuilder::<sqlx::Postgres>::new("DELETE FROM server_bans WHERE mask = ");
@@ -5387,42 +5736,166 @@ pub async fn mutate_server_ban_audited(
                 return Ok(false);
             }
             (
-                actor.as_str(),
                 format!("UN{}", kind.to_ascii_uppercase()),
                 mask_display.as_str(),
                 "",
             )
         }
     };
-    insert_audit_log_with(&mut *transaction, actor, &action, target, detail).await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        actor,
+        &action,
+        &AuditPrincipal::mask(target),
+        detail,
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }
 
+/// What kind of name an audit row's actor or target is. Account names,
+/// operator names, nicknames, channels, and masks are different namespaces
+/// that can hold the same spelling — an operator block named `root` beside an
+/// account named `root`, a nick `eve` beside the account `eve` — so a row
+/// records which one it means, and an account's own view selects only rows
+/// that name it *as an account*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditPrincipalKind {
+    /// A folded account name.
+    Account,
+    /// A configured IRC operator name (the `OPER` block), not an account.
+    Operator,
+    /// An IRC nickname, which any connection may hold.
+    Nick,
+    Channel,
+    /// An account's network, as `owner/network`.
+    Network,
+    /// A server-ban mask.
+    Mask,
+    /// The server itself (its configuration and keys).
+    Server,
+    /// An identity provider, as `oidc:<issuer>`.
+    Provider,
+    /// A command run on the host (`host:recover-administrator`, the secret
+    /// rotation, the bootstrap import), which no account performed.
+    Host,
+    /// A name reserved by an invitation, which no account holds yet.
+    Invitation,
+}
+
+impl AuditPrincipalKind {
+    /// The stored spelling, constrained by migration 0078.
+    const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Operator => "operator",
+            Self::Nick => "nick",
+            Self::Channel => "channel",
+            Self::Network => "network",
+            Self::Mask => "mask",
+            Self::Server => "server",
+            Self::Provider => "provider",
+            Self::Host => "host",
+            Self::Invitation => "invitation",
+        }
+    }
+}
+
+/// An audit row's actor or target: a name and the namespace it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditPrincipal {
+    kind: AuditPrincipalKind,
+    name: String,
+}
+
+impl AuditPrincipal {
+    fn new(kind: AuditPrincipalKind, name: &str) -> Self {
+        Self {
+            kind,
+            name: name.to_owned(),
+        }
+    }
+
+    /// An account, by its folded name — the account namespace's key, so an
+    /// account's own view matches it whatever spelling the caller held.
+    pub fn account(name: &str) -> Self {
+        Self::new(
+            AuditPrincipalKind::Account,
+            &CaseMapping::Rfc1459.casefold(name),
+        )
+    }
+
+    pub fn operator(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Operator, name)
+    }
+
+    pub fn nick(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Nick, name)
+    }
+
+    pub fn channel(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Channel, name)
+    }
+
+    pub fn network(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Network, name)
+    }
+
+    pub fn mask(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Mask, name)
+    }
+
+    pub fn server() -> Self {
+        Self::new(AuditPrincipalKind::Server, "server")
+    }
+
+    pub fn provider(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Provider, name)
+    }
+
+    pub fn host(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Host, name)
+    }
+
+    pub fn invitation(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Invitation, name)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 async fn insert_audit_log_with<'executor>(
     executor: impl sqlx::Executor<'executor, Database = sqlx::Postgres>,
-    actor: &str,
+    actor: &AuditPrincipal,
     action: &str,
-    target: &str,
+    target: &AuditPrincipal,
     detail: &str,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO audit_log (actor, action, target, detail) VALUES ($1, $2, $3, $4)")
-        .bind(actor)
-        .bind(action)
-        .bind(target)
-        .bind(detail)
-        .execute(executor)
-        .await
-        .map_err(query_error)?;
+    sqlx::query(
+        "INSERT INTO audit_log (actor, actor_kind, action, target, target_kind, detail)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&actor.name)
+    .bind(actor.kind.as_db_str())
+    .bind(action)
+    .bind(&target.name)
+    .bind(target.kind.as_db_str())
+    .bind(detail)
+    .execute(executor)
+    .await
+    .map_err(query_error)?;
     Ok(())
 }
 
 /// Record one privileged action in the audit trail.
 pub async fn insert_audit_log(
     pool: &PgPool,
-    actor: &str,
+    actor: &AuditPrincipal,
     action: &str,
-    target: &str,
+    target: &AuditPrincipal,
     detail: &str,
 ) -> Result<(), DbError> {
     insert_audit_log_with(pool, actor, action, target, detail).await
@@ -5536,10 +6009,23 @@ pub async fn query_audit_log(
     })
 }
 
-/// Query the security-relevant activity visible to one account. Actor matches
-/// include the account's own mutations; target matches include administrator
-/// actions taken against it. Exact RFC1459 folding prevents one account from
-/// observing a similarly named account's events.
+/// The SQL condition selecting the audit rows (alias `log`) an account sees as
+/// its own activity, the account's folded name being the SQL expression
+/// `name`: the rows naming it *as an account*, as actor (its own mutations) or
+/// target (administrator actions taken against it). An operator, nick, or
+/// reserved name spelled like the account is another principal, and its rows
+/// are not the account's. The account's view and its export share this one
+/// predicate so they cannot select different rows.
+fn account_audit_predicate(log: &str, name: &str) -> String {
+    format!(
+        "(({log}.actor_kind = 'account' AND {log}.actor = {name}) \
+         OR ({log}.target_kind = 'account' AND {log}.target = {name}))"
+    )
+}
+
+/// Query the security-relevant activity visible to one account
+/// ([`account_audit_predicate`]). Exact RFC1459 folding prevents one account
+/// from observing a similarly named account's events.
 pub async fn query_account_security_activity(
     pool: &PgPool,
     account: &str,
@@ -5548,20 +6034,18 @@ pub async fn query_account_security_activity(
 ) -> Result<AuditLogPage, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let fetch_limit = page_size.value() + 1;
-    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT id, actor, action, target, detail,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("WITH me AS (SELECT ");
+    query.push_bind(&folded).push(
+        "::text AS name)
+         SELECT log.id, log.actor, log.action, log.target, log.detail,
+                to_char(log.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
                     AS created_at
-         FROM audit_log
-         WHERE (actor = ",
+         FROM audit_log log, me
+         WHERE ",
     );
-    query
-        .push_bind(&folded)
-        .push(" OR target = ")
-        .push_bind(&folded)
-        .push(")");
+    query.push(account_audit_predicate("log", "me.name"));
     if let Some(before_id) = before_id {
-        query.push(" AND id < ").push_bind(before_id);
+        query.push(" AND log.id < ").push_bind(before_id);
     }
     query
         .push(" ORDER BY id DESC LIMIT ")
@@ -5622,7 +6106,9 @@ pub async fn begin_account_export(
         .execute(&mut *transaction)
         .await
         .map_err(query_error)?;
-    let head: Option<(String, String)> = sqlx::query_as(
+    // Every interpolated piece is built from constants of this module.
+    let account_activity = account_audit_predicate("log", "a.name_folded");
+    let head: Option<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         r#"
         WITH owner AS (
             SELECT id, name, name_folded, contact_email, flags, created_at
@@ -5694,6 +6180,12 @@ pub async fn begin_account_export(
                     'username', n.username,
                     'realname', n.realname,
                     'autojoin', n.autojoin,
+                    'autojoin_keyed', COALESCE((
+                        SELECT jsonb_agg(entry.channel ORDER BY entry.position)
+                        FROM unnest(n.autojoin, n.autojoin_keys_sealed)
+                             WITH ORDINALITY AS entry(channel, key_sealed, position)
+                        WHERE entry.key_sealed IS NOT NULL
+                    ), '[]'::jsonb),
                     'sasl_account', n.sasl_account,
                     'has_sasl_password', n.sasl_password_sealed IS NOT NULL,
                     'has_server_password', n.server_password_sealed IS NOT NULL,
@@ -5753,12 +6245,12 @@ pub async fn begin_account_export(
                         'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                 ) ORDER BY log.id)
                 FROM audit_log log
-                WHERE log.actor = a.name_folded OR log.target = a.name_folded
+                WHERE {account_activity}
             ), '[]'::jsonb)
         )::text
         FROM owner a
         "#,
-    )
+    )))
     .bind(&folded)
     .fetch_optional(&mut *transaction)
     .await
@@ -5781,7 +6273,8 @@ pub async fn begin_account_export(
              'timestamp', to_char(m.ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
              'direct_message_peers', m.dm_peers,
              'sender_is_bot', m.sender_is_bot,
-             'multiline', m.multiline
+             'multiline', m.multiline,
+             'client_tags', m.client_tags
          )::text
          FROM messages m WHERE {predicate} ORDER BY m.id"
     )))
@@ -5901,30 +6394,46 @@ pub enum ChannelDropper<'a> {
 }
 
 /// Unregister a channel by its casefolded name, audited in the same
-/// transaction with the dropping account as the actor. Returns whether a row
-/// was removed (nothing is recorded when none was).
+/// transaction with the dropping account as the actor. A founder's drop is
+/// refused unless the founder still founds the channel, checked with its row
+/// locked; nothing is recorded when nothing was removed.
 pub async fn drop_channel(
     pool: &PgPool,
     channel_folded: &str,
     dropper: ChannelDropper<'_>,
-) -> Result<bool, DbError> {
-    let (actor, action) = match dropper {
-        ChannelDropper::Founder(actor) => (actor, "CHANNEL_DROP"),
-        ChannelDropper::Administrator(actor) => (actor, "DROPCHAN"),
-    };
+) -> Result<Result<(), ChannelRefusal>, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let dropped = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
-        .bind(channel_folded)
-        .execute(&mut *transaction)
-        .await
-        .map_err(query_error)?
-        .rows_affected()
-        == 1;
-    if dropped {
-        audit_channel_service(&mut transaction, actor, action, channel_folded, "").await?;
+    let (actor, action, dropped) = match dropper {
+        ChannelDropper::Founder(actor) => {
+            let channel =
+                match lock_channel_as_founder(&mut transaction, channel_folded, actor).await? {
+                    Ok(channel) => channel,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+            let dropped = sqlx::query("DELETE FROM channels WHERE id = $1")
+                .bind(channel.channel_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(query_error)?
+                .rows_affected();
+            (actor, "CHANNEL_DROP", dropped)
+        }
+        ChannelDropper::Administrator(actor) => {
+            let dropped = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
+                .bind(channel_folded)
+                .execute(&mut *transaction)
+                .await
+                .map_err(query_error)?
+                .rows_affected();
+            (actor, "DROPCHAN", dropped)
+        }
+    };
+    if dropped != 1 {
+        return Ok(Err(ChannelRefusal::ChannelMissing));
     }
+    audit_channel_service(&mut transaction, actor, action, channel_folded, "").await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(dropped)
+    Ok(Ok(()))
 }
 
 /// Insert one registered channel with its initial retained topic and audit
@@ -5949,53 +6458,83 @@ pub async fn persist_channel_registration(
         None => (None, None, None),
     };
     let mut transaction = pool.begin().await.map_err(query_error)?;
+    let Some(founder_id) = lock_account_id(&mut transaction, &founder_folded).await? else {
+        return Ok(ChannelRegistrationResult::AccountMissing);
+    };
+    if let FounderCapacity::LimitReached = founder_capacity(&mut transaction, founder_id).await? {
+        return Ok(ChannelRegistrationResult::LimitReached);
+    }
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO channels (
              name, name_folded, founder_account_id,
              topic, topic_setter, topic_set_at
          )
-         SELECT $1, $2, a.id, $4, $5,
-                CASE WHEN $6::double precision IS NULL
-                     THEN NULL
-                     ELSE to_timestamp($6::double precision)
-                END
-         FROM accounts a WHERE a.name_folded = $3
+         VALUES ($1, $2, $3, $4, $5,
+                 CASE WHEN $6::double precision IS NULL
+                      THEN NULL
+                      ELSE to_timestamp($6::double precision)
+                 END)
          ON CONFLICT (name_folded) DO NOTHING RETURNING id",
     )
     .bind(channel)
     .bind(&chan_folded)
-    .bind(&founder_folded)
+    .bind(founder_id)
     .bind(topic_text)
     .bind(topic_setter)
     .bind(topic_set_at)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(query_error)?;
-    let result = if inserted.is_some() {
-        insert_audit_log_with(
-            &mut *transaction,
-            &founder_folded,
-            "CHANNEL_REGISTER",
-            &chan_folded,
-            "",
-        )
-        .await?;
-        ChannelRegistrationResult::Registered
-    } else {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM channels WHERE name_folded = $1)")
-                .bind(&chan_folded)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-        if exists {
-            ChannelRegistrationResult::Exists
-        } else {
-            ChannelRegistrationResult::AccountMissing
-        }
-    };
+    if inserted.is_none() {
+        return Ok(ChannelRegistrationResult::Exists);
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&founder_folded),
+        "CHANNEL_REGISTER",
+        &AuditPrincipal::channel(&chan_folded),
+        "",
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(result)
+    Ok(ChannelRegistrationResult::Registered)
+}
+
+/// Most registered channels one account may found. A registered channel is a
+/// permanent `registered_founders` (and possibly `registered_topics`) entry
+/// every core shard reloads at boot, and registering one runs no Argon2, so
+/// without a cap one account could grow those maps without bound. Each core
+/// shard checks it as a fast path, but a shard sees only its own in-flight
+/// registrations and no shard sees a founder transfer's receiving side: the
+/// database, where every registration and transfer lands, holds the cap, under
+/// the receiving account's row lock.
+pub const CHANNEL_FOUNDER_LIMIT: i64 = 200;
+
+/// Whether the account whose row the caller has locked (`FOR NO KEY UPDATE`)
+/// may found one more channel.
+enum FounderCapacity {
+    Available,
+    LimitReached,
+}
+
+/// Count the channels `account_id` founds. The caller holds that account's row
+/// lock, which every registration and founder transfer to the account also
+/// takes first, so two of them cannot both pass a count of one below the cap.
+async fn founder_capacity(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<FounderCapacity, DbError> {
+    let founded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM channels WHERE founder_account_id = $1")
+            .bind(account_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(query_error)?;
+    Ok(if founded >= CHANNEL_FOUNDER_LIMIT {
+        FounderCapacity::LimitReached
+    } else {
+        FounderCapacity::Available
+    })
 }
 
 /// The three outcomes of a credential check, before an origin is attached.
@@ -6235,9 +6774,9 @@ pub async fn poll_device_grant(
             Err(refusal @ (DbError::TooManyCredentials | DbError::BadCredentials)) => {
                 insert_audit_log_with(
                     &mut *tx,
-                    &folded,
+                    &AuditPrincipal::account(&folded),
                     "ACCOUNT_DEVICE_TOKEN_DENIED",
-                    &folded,
+                    &AuditPrincipal::account(&folded),
                     match refusal {
                         DbError::TooManyCredentials => {
                             "approved device grant denied: personal access token limit reached"
@@ -6253,9 +6792,9 @@ pub async fn poll_device_grant(
         };
         insert_audit_log_with(
             &mut *tx,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_DEVICE_TOKEN_CREATE",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "personal access token created from an approved device grant",
         )
         .await?;
@@ -6352,7 +6891,7 @@ pub async fn query_account_directory(
                  WHERE c.account_id = a.id AND c.kind = 'app_password') AS app_passwords,
                 (SELECT count(*) FROM api_tokens t
                  WHERE t.account_id = a.id
-                   AND (t.expires_at IS NULL OR t.expires_at > now())) AS api_tokens,
+                   AND t.expires_at > now()) AS api_tokens,
                 (SELECT count(*) FROM oidc_identities i
                  WHERE i.account_id = a.id) AS oidc_identities,
                 (SELECT count(*) FROM web_sessions s
@@ -6390,6 +6929,8 @@ pub struct RegisteredChannelDirectoryRow {
     pub id: i64,
     pub name: String,
     pub founder: String,
+    /// The account the channel passes to if the founder's is deleted.
+    pub successor: Option<String>,
     pub created_at: String,
     pub keeptopic: bool,
     pub topic_retained: bool,
@@ -6426,7 +6967,7 @@ pub async fn query_registered_channel_directory(
     let page_size = filter.page_size.value();
     let fetch_limit = page_size + 1;
     let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT c.id, c.name, a.name AS founder,
+        "SELECT c.id, c.name, a.name AS founder, successor.name AS successor,
                 to_char(c.created_at AT TIME ZONE 'UTC',
                         'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
                 c.keeptopic, c.topic IS NOT NULL AS topic_retained, c.mlock,
@@ -6434,6 +6975,7 @@ pub async fn query_registered_channel_directory(
                  WHERE ca.channel_id = c.id) AS access_entries
          FROM channels c
          JOIN accounts a ON a.id = c.founder_account_id
+         LEFT JOIN accounts successor ON successor.id = c.successor_account_id
          WHERE TRUE",
     );
     if let Some(before_id) = filter.before_id {
@@ -6732,17 +7274,22 @@ async fn verify_any_credential(
     let (Some(display_name), Some(id)) = (display_name, matched_id) else {
         return Ok(None);
     };
-    // Record the use so the credential list can show it. Best-effort: a
-    // failure here must not fail an otherwise-successful authentication, so it
-    // is logged, not propagated.
-    if let Err(e) = sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
-        .bind(id)
+    record_credential_use(pool, id).await?;
+    Ok(Some(display_name))
+}
+
+/// Record that credential `credential_id` just verified, for the credential
+/// list's "last used". Both password checks end here. A failure is the
+/// verification's failure: the database that could not record the use is the
+/// one the login is about to depend on, and a success reported past a failed
+/// write is the "log and continue" DESIGN §2 rules out.
+async fn record_credential_use(pool: &PgPool, credential_id: i64) -> Result<(), DbError> {
+    sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
+        .bind(credential_id)
         .execute(pool)
         .await
-    {
-        eprintln!("db: failed to record credential use: {e}");
-    }
-    Ok(Some(display_name))
+        .map(|_| ())
+        .map_err(query_error)
 }
 
 /// Verify only an account's primary password.
@@ -6797,11 +7344,7 @@ async fn verify_primary_password(
     )
     .await?;
     if matched.is_some() {
-        sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
-            .bind(credential_id)
-            .execute(pool)
-            .await
-            .map_err(query_error)?;
+        record_credential_use(pool, credential_id).await?;
         Ok(Some(display_name))
     } else {
         Ok(None)
@@ -6928,9 +7471,9 @@ pub async fn change_local_password(
     delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_PASSWORD_CHANGE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "primary password changed; other browser sessions ended",
     )
     .await?;
@@ -6976,9 +7519,9 @@ pub async fn set_local_password(
     delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_PASSWORD_ADD",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "primary password added; other browser sessions ended",
     )
     .await?;
@@ -6988,9 +7531,48 @@ pub async fn set_local_password(
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------
 
-/// A stored per-account BNC network. `sasl_password_sealed` and
-/// `server_password_sealed` are sealed blobs (or `None`); the caller opens
-/// them with the master key before starting the driver.
+/// One stored autojoin entry: a channel (or a bridge's room or channel id) and,
+/// for an IRC channel, its key sealed like every stored upstream secret. The
+/// key is write-only: its `Debug` says only whether one is stored.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BncAutojoin {
+    pub channel: String,
+    pub key_sealed: Option<String>,
+}
+
+impl From<&str> for BncAutojoin {
+    /// A channel joined without a key.
+    fn from(channel: &str) -> Self {
+        Self {
+            channel: channel.to_string(),
+            key_sealed: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for BncAutojoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BncAutojoin")
+            .field("channel", &self.channel)
+            .field("key_sealed", &self.key_sealed.as_ref().map(|_| "<sealed>"))
+            .finish()
+    }
+}
+
+/// Split autojoin entries into the two parallel columns they are stored in
+/// (`autojoin`, `autojoin_keys_sealed`), whose lengths a table CHECK holds
+/// equal.
+fn autojoin_columns(autojoin: &[BncAutojoin]) -> (Vec<String>, Vec<Option<String>>) {
+    autojoin
+        .iter()
+        .map(|entry| (entry.channel.clone(), entry.key_sealed.clone()))
+        .unzip()
+}
+
+/// A stored per-account BNC network. `sasl_password_sealed`,
+/// `server_password_sealed` and each autojoin key are sealed blobs (or
+/// `None`); the caller opens them with the master key before starting the
+/// driver.
 #[derive(Debug, Clone)]
 pub struct BncNetworkRow {
     /// Which driver backs this network (`irc` for a plain upstream, or a
@@ -7003,7 +7585,7 @@ pub struct BncNetworkRow {
     /// The IRC `USER` name. Present exactly for `kind = irc` (a table CHECK).
     pub username: Option<String>,
     pub realname: Option<String>,
-    pub autojoin: Vec<String>,
+    pub autojoin: Vec<BncAutojoin>,
     pub sasl_account: Option<String>,
     pub sasl_password_sealed: Option<String>,
     /// The sealed IRC server password (`PASS`). Only `kind = irc` carries one
@@ -7024,6 +7606,19 @@ fn stored_network_kind(kind: &str) -> Result<crate::config::NetworkKind, DbError
 fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
     use sqlx::Row;
     let kind = row.get::<String, _>("kind");
+    let channels: Vec<String> = row.get("autojoin");
+    let keys: Vec<Option<String>> = row.get("autojoin_keys_sealed");
+    if channels.len() != keys.len() {
+        return Err(DbError::InvalidNetworkAutojoin(row.get("name")));
+    }
+    let autojoin = channels
+        .into_iter()
+        .zip(keys)
+        .map(|(channel, key_sealed)| BncAutojoin {
+            channel,
+            key_sealed,
+        })
+        .collect();
     Ok(BncNetworkRow {
         kind: stored_network_kind(&kind)?,
         name: row.get("name"),
@@ -7033,7 +7628,7 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
         username: row.get("username"),
         realname: row.get("realname"),
         enabled: row.get("enabled"),
-        autojoin: row.get("autojoin"),
+        autojoin,
         sasl_account: row.get("sasl_account"),
         sasl_password_sealed: row.get("sasl_password_sealed"),
         server_password_sealed: row.get("server_password_sealed"),
@@ -7046,7 +7641,8 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
 macro_rules! bnc_network_columns {
     () => {
         "n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin, \
-         n.sasl_account, n.sasl_password_sealed, n.server_password_sealed, n.enabled, n.kind"
+         n.autojoin_keys_sealed, n.sasl_account, n.sasl_password_sealed, \
+         n.server_password_sealed, n.enabled, n.kind"
     };
 }
 
@@ -7072,9 +7668,9 @@ async fn audit_network_mutation(
 ) -> Result<(), DbError> {
     insert_audit_log_with(
         &mut **transaction,
-        &CaseMapping::Rfc1459.casefold(audit.actor),
+        &AuditPrincipal::account(&CaseMapping::Rfc1459.casefold(audit.actor)),
         action,
-        &format!("{owner_folded}/{network}"),
+        &AuditPrincipal::network(&format!("{owner_folded}/{network}")),
         audit.detail,
     )
     .await
@@ -7111,12 +7707,13 @@ pub async fn create_bnc_network(
     if count >= MAX_BNC_NETWORKS_PER_ACCOUNT {
         return Err(DbError::TooManyNetworks);
     }
+    let (autojoin, autojoin_keys) = autojoin_columns(&net.autojoin);
     let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
             sasl_account, sasl_password_sealed, kind, enabled, username,
-            server_password_sealed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            server_password_sealed, autojoin_keys_sealed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          ON CONFLICT (account_id, lower(name)) DO NOTHING
          RETURNING id",
     )
@@ -7126,13 +7723,14 @@ pub async fn create_bnc_network(
     .bind(net.tls)
     .bind(&net.nick)
     .bind(&net.realname)
-    .bind(&net.autojoin)
+    .bind(&autojoin)
     .bind(&net.sasl_account)
     .bind(&net.sasl_password_sealed)
     .bind(net.kind.as_db_str())
     .bind(net.enabled)
     .bind(&net.username)
     .bind(&net.server_password_sealed)
+    .bind(&autojoin_keys)
     .fetch_optional(&mut *tx)
     .await
     .map_err(query_error)?
@@ -7263,12 +7861,13 @@ pub async fn update_bnc_network(
     audit: NetworkAudit<'_>,
 ) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let (autojoin, autojoin_keys) = autojoin_columns(&network.autojoin);
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let stored: Option<String> = sqlx::query_scalar(
         "UPDATE bnc_networks n
          SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7,
              sasl_account = $8, sasl_password_sealed = $9, username = $10,
-             server_password_sealed = $11
+             server_password_sealed = $11, autojoin_keys_sealed = $12
          FROM accounts a
          WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)
          RETURNING n.name",
@@ -7279,11 +7878,12 @@ pub async fn update_bnc_network(
     .bind(network.tls)
     .bind(&network.nick)
     .bind(&network.realname)
-    .bind(&network.autojoin)
+    .bind(&autojoin)
     .bind(&network.sasl_account)
     .bind(&network.sasl_password_sealed)
     .bind(&network.username)
     .bind(&network.server_password_sealed)
+    .bind(&autojoin_keys)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(query_error)?;
@@ -7342,6 +7942,8 @@ pub struct ChannelAccessEntry {
 pub struct OwnedChannel {
     pub name: String,
     pub founder: String,
+    /// The account the channel passes to if the founder's is deleted.
+    pub successor: Option<String>,
     pub keeptopic: bool,
     pub topic: Option<String>,
     pub topic_setter: Option<String>,
@@ -7354,6 +7956,7 @@ pub struct OwnedChannel {
 struct OwnedChannelRow {
     name: String,
     founder: String,
+    successor: Option<String>,
     keeptopic: bool,
     topic: Option<String>,
     topic_setter: Option<String>,
@@ -7375,6 +7978,7 @@ pub async fn list_owned_channels(
     let rows: Vec<OwnedChannelRow> = sqlx::query_as(
         "SELECT c.name,
                 founder.name AS founder,
+                successor.name AS successor,
                 c.keeptopic,
                 c.topic,
                 c.topic_setter,
@@ -7385,6 +7989,7 @@ pub async fn list_owned_channels(
                 ca.flags AS access_flags
          FROM channels c
          JOIN accounts founder ON founder.id = c.founder_account_id
+         LEFT JOIN accounts successor ON successor.id = c.successor_account_id
          LEFT JOIN channel_access ca ON ca.channel_id = c.id
          LEFT JOIN accounts access_account ON access_account.id = ca.account_id
          WHERE founder.name_folded = $1
@@ -7404,6 +8009,7 @@ pub async fn list_owned_channels(
             channels.push(OwnedChannel {
                 name: row.name.clone(),
                 founder: row.founder,
+                successor: row.successor,
                 keeptopic: row.keeptopic,
                 topic: row.topic,
                 topic_setter: row.topic_setter,
@@ -7460,7 +8066,8 @@ pub async fn list_channel_topics(
         .collect()
 }
 
-/// Persist a registered channel's KEEPTOPIC option on its `channels` row.
+/// Persist the KEEPTOPIC option of a registered channel `actor` founds —
+/// checked with its row locked — on its `channels` row.
 ///
 /// An applied change is audited (`CHANNEL_KEEPTOPIC`) in the same transaction
 /// with the founder `actor`.
@@ -7470,7 +8077,7 @@ pub async fn set_channel_keeptopic(
     keeptopic: bool,
     topic: Option<(String, String, u64)>,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<Result<(), ChannelRefusal>, DbError> {
     let (text, setter, set_at) = match topic {
         Some((text, setter, set_at)) if keeptopic => (
             Some(text),
@@ -7480,7 +8087,11 @@ pub async fn set_channel_keeptopic(
         _ => (None, None, None),
     };
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let applied = sqlx::query(
+    let channel = match lock_channel_as_founder(&mut transaction, channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    sqlx::query(
         "UPDATE channels
          SET keeptopic = $2,
              topic = $3,
@@ -7490,30 +8101,26 @@ pub async fn set_channel_keeptopic(
                  THEN NULL
                  ELSE to_timestamp($5::double precision)
              END
-         WHERE name_folded = $1",
+         WHERE id = $1",
     )
-    .bind(channel_folded)
+    .bind(channel.channel_id)
     .bind(keeptopic)
     .bind(text)
     .bind(setter)
     .bind(set_at)
     .execute(&mut *transaction)
     .await
-    .map_err(query_error)?
-    .rows_affected()
-        == 1;
-    if applied {
-        audit_channel_service(
-            &mut transaction,
-            actor,
-            "CHANNEL_KEEPTOPIC",
-            channel_folded,
-            if keeptopic { "on" } else { "off" },
-        )
-        .await?;
-    }
+    .map_err(query_error)?;
+    audit_channel_service(
+        &mut transaction,
+        actor,
+        "CHANNEL_KEEPTOPIC",
+        channel_folded,
+        if keeptopic { "on" } else { "off" },
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(applied)
+    Ok(Ok(()))
 }
 
 /// The folded names of registered channels whose KEEPTOPIC is OFF — the
@@ -7525,36 +8132,36 @@ pub async fn list_keeptopic_off(pool: &PgPool) -> Result<Vec<String>, DbError> {
         .map_err(query_error)
 }
 
-/// Persist a registered channel's mode lock on its `channels` row (`None`
-/// clears it), audited (`CHANNEL_MLOCK`) in the same transaction with the
-/// founder `actor`.
+/// Persist the mode lock of a registered channel `actor` founds — checked
+/// with its row locked — on its `channels` row (`None` clears it), audited
+/// (`CHANNEL_MLOCK`) in the same transaction with the founder `actor`.
 pub async fn set_channel_mlock(
     pool: &PgPool,
     channel_folded: &str,
     mlock: Option<String>,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<Result<(), ChannelRefusal>, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let applied = sqlx::query("UPDATE channels SET mlock = $2 WHERE name_folded = $1")
-        .bind(channel_folded)
+    let channel = match lock_channel_as_founder(&mut transaction, channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    sqlx::query("UPDATE channels SET mlock = $2 WHERE id = $1")
+        .bind(channel.channel_id)
         .bind(&mlock)
         .execute(&mut *transaction)
         .await
-        .map_err(query_error)?
-        .rows_affected()
-        == 1;
-    if applied {
-        audit_channel_service(
-            &mut transaction,
-            actor,
-            "CHANNEL_MLOCK",
-            channel_folded,
-            mlock.as_deref().unwrap_or("cleared"),
-        )
-        .await?;
-    }
+        .map_err(query_error)?;
+    audit_channel_service(
+        &mut transaction,
+        actor,
+        "CHANNEL_MLOCK",
+        channel_folded,
+        mlock.as_deref().unwrap_or("cleared"),
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(applied)
+    Ok(Ok(()))
 }
 
 /// Registered channels with a mode lock, as `(name_folded, spec)` —
@@ -7710,20 +8317,24 @@ pub async fn open_bnc_buffer(
 }
 
 /// Append one upstream line to a network's persisted buffer, extracting the
-/// conversation target for CHATHISTORY queries.
+/// conversation target for CHATHISTORY queries: classified and keyed by the
+/// network's own naming rules (`names`), with its name kept as the network
+/// spelled it.
 pub async fn persist_bnc_line(
     pool: &PgPool,
     buffer: &BncBuffer,
     own_nick: Option<&str>,
     line: &str,
+    names: &e6irc_client::NetworkNames,
 ) -> Result<(), DbError> {
-    let target =
-        bnc_line_target(line, own_nick).map(|target| CaseMapping::Rfc1459.casefold(&target));
+    let display = bnc_line_target(line, own_nick, names);
+    let target = display.as_deref().map(|display| names.fold(display));
     let msgid = bnc_line_msgid(line);
     let sent_at = bnc_line_sent_at(line);
     sqlx::query(
-        "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at,
+                                 target_display, target_casemapping)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&buffer.key.owner)
     .bind(&buffer.key.network)
@@ -7732,27 +8343,100 @@ pub async fn persist_bnc_line(
     .bind(target)
     .bind(msgid)
     .bind(sent_at)
+    .bind(display)
+    .bind(names.casemapping().isupport_token())
     .execute(pool)
     .await
     .map_err(query_error)?;
     Ok(())
 }
 
-/// The conversation target of a stored raw IRC line, for CHATHISTORY paging:
-/// the channel or nick a PRIVMSG/NOTICE/TAGMSG was addressed to. Non-message
-/// lines (JOIN, NICK, numerics) return `None` so they are excluded from
-/// target-filtered history without an extra predicate.
-fn bnc_line_target(line: &str, own_nick: Option<&str>) -> Option<String> {
+/// `casemapping`'s fold as the two arguments of a SQL `translate()`: every
+/// byte the mapping lowers, and what to. The one rendering of a mapping in
+/// SQL, so stored lines and read markers are re-keyed by the same fold.
+fn fold_translation(casemapping: CaseMapping) -> (String, String) {
+    (0u8..128)
+        .filter(|byte| casemapping.lower(*byte) != *byte)
+        .map(|byte| (char::from(byte), char::from(casemapping.lower(byte))))
+        .unzip()
+}
+
+/// Re-key every stored conversation of one buffer that was folded under
+/// another case mapping than `casemapping` — rows stored before the network
+/// said how it compares names, or before it changed — from the name as the
+/// network spelled it, so what was stored is found under the keys the network
+/// now uses. Returns how many rows were re-keyed.
+pub async fn rekey_bnc_targets(
+    pool: &PgPool,
+    buffer: &BncBuffer,
+    casemapping: CaseMapping,
+) -> Result<u64, DbError> {
+    let (upper, lower) = fold_translation(casemapping);
+    sqlx::query(
+        "UPDATE bnc_buffer
+         SET target = translate(target_display, $3, $4), target_casemapping = $5
+         WHERE owner = $1 AND network = $2
+           AND target_display IS NOT NULL AND target_casemapping <> $5",
+    )
+    .bind(&buffer.key.owner)
+    .bind(&buffer.key.network)
+    .bind(upper)
+    .bind(lower)
+    .bind(casemapping.isupport_token())
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(query_error)
+}
+
+/// The case mapping the newest stored conversation of `(owner, network)` was
+/// keyed under: what the network last said, remembered across a restart
+/// until it says it again.
+pub async fn bnc_buffer_casemapping(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+) -> Result<Option<CaseMapping>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT target_casemapping FROM bnc_buffer
+         WHERE id = (SELECT max(id) FROM bnc_buffer
+                     WHERE owner = $1 AND network = $2 AND target IS NOT NULL)",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(stored.as_deref().and_then(CaseMapping::from_isupport_token))
+}
+
+/// The conversation a stored raw IRC line belongs to, for CHATHISTORY paging,
+/// as the network spelled it: the channel a PRIVMSG/NOTICE/TAGMSG was
+/// addressed to (a STATUSMSG's channel), or for a direct message the other
+/// party — so both directions share one conversation. What is a channel, a
+/// STATUSMSG and the same nick is the network's to say (`names`). A line
+/// addressed to several targets at once is no one conversation, and
+/// non-message lines (JOIN, NICK, numerics) have none: `None` keeps them out
+/// of target-filtered history without an extra predicate.
+pub(crate) fn bnc_line_target(
+    line: &str,
+    own_nick: Option<&str>,
+    names: &e6irc_client::NetworkNames,
+) -> Option<String> {
     let msg = e6irc_proto::message::Message::parse(line).ok()?;
     match msg.command.to_ascii_uppercase().as_str() {
         "PRIVMSG" | "NOTICE" | "TAGMSG" => {
-            let addressed = crate::bouncer::conversation_target(msg.params.first()?);
-            if addressed.starts_with(['#', '&']) {
+            let addressed = names.conversation(msg.params.first()?);
+            if addressed.is_empty() || addressed.contains(',') {
+                return None;
+            }
+            if names.is_channel(addressed) {
                 return Some(addressed.to_string());
             }
             let source = msg.source.as_ref()?;
             let own_nick = own_nick?;
-            if CaseMapping::Rfc1459.eq(source.name, own_nick) {
+            if names.eq(source.name, own_nick) {
                 Some(addressed.to_string())
             } else if source.user.is_some() || source.host.is_some() {
                 Some(source.name.to_string())
@@ -7855,13 +8539,33 @@ pub async fn recent_bnc_lines(
     network: &str,
     limit: i64,
 ) -> Result<Vec<String>, DbError> {
+    Ok(recent_bnc_backlog(pool, owner, network, limit)
+        .await?
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect())
+}
+
+/// [`recent_bnc_lines`], each with the time it was stored under (its `time`
+/// tag, or its arrival), for a ring restored from storage.
+pub async fn recent_bnc_backlog(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>, DbError> {
     let key = BncBufferKey::new(owner, network);
     // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
     // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
     // backward and filters out every other buffer's newer lines, so a quiet
-    // buffer's replay cost grew with everyone else's traffic.
-    sqlx::query_scalar(
-        "SELECT line FROM bnc_buffer
+    // buffer's replay cost grew with everyone else's traffic. A row from
+    // before `sent_at` existed has its arrival.
+    sqlx::query_as(
+        "SELECT line,
+                coalesce(sent_at,
+                         to_char(created_at AT TIME ZONE 'UTC',
+                                 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))
+         FROM bnc_buffer
          WHERE id = ANY(ARRAY(
              SELECT id FROM bnc_buffer
              WHERE owner = $1 AND network = $2
@@ -8027,6 +8731,7 @@ pub async fn bnc_history_window(
     owner: &str,
     network: &str,
     target: &str,
+    casemapping: CaseMapping,
     paging: BncHistoryPaging,
     scope: BncHistoryScope,
     first: &BncHistorySelector,
@@ -8034,7 +8739,7 @@ pub async fn bnc_history_window(
     limit: i64,
 ) -> Result<Result<Vec<BncHistoryLine>, UnknownBncMsgid>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    let target = CaseMapping::Rfc1459.casefold(target);
+    let target = casemapping.casefold(target);
     // Where a selector sits: `after` bounds the lines strictly after it,
     // `before` the lines strictly before it. A message id names one row; a
     // timestamp sorts before (`before`) or after (`after`) every row carrying
@@ -8171,9 +8876,11 @@ pub async fn bnc_history_window(
 }
 
 /// The distinct conversation targets that still have backlog for one network,
-/// oldest-active first, with each target's newest `sent_at` (CHATHISTORY
-/// TARGETS; the timestamp lets a client resume each target from its end).
-/// Both bounds are exclusive, matching draft/chathistory's BETWEEN semantics.
+/// oldest-active first, each named as the network last spelled it, with its
+/// newest `sent_at` (CHATHISTORY TARGETS; the timestamp lets a client resume
+/// each target from its end). The name is never the folded key: on another
+/// network's case mapping that key can be a different conversation. Both
+/// bounds are exclusive, matching draft/chathistory's BETWEEN semantics.
 pub async fn bnc_history_targets(
     pool: &PgPool,
     owner: &str,
@@ -8190,7 +8897,8 @@ pub async fn bnc_history_targets(
     // scope varies the text and sqlx accepts only literal SQL otherwise --
     // the varying part is a constant of this module, never input.
     let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT target, max(sent_at) FROM bnc_buffer WHERE owner = ",
+        "SELECT (array_agg(coalesce(target_display, target) ORDER BY id DESC))[1], max(sent_at)
+         FROM bnc_buffer WHERE owner = ",
     );
     query
         .push_bind(&key.owner)
@@ -8212,28 +8920,134 @@ pub async fn bnc_history_targets(
 }
 
 // ---- BNC read markers -----------------------------------------------------
+//
+// A marker is keyed like the backlog it marks: its conversation folded the
+// network's way, with the name as spelled (`target_display`) and the mapping
+// the key was folded under (`target_casemapping`) beside it. Every access
+// names the network's current mapping and first re-keys what was folded under
+// another, so no read can miss a marker because the network changed how it
+// compares names.
+
+/// Lock `account`'s row for a read-marker operation and bring its markers on
+/// `network` (folded) under `casemapping`. Every marker operation starts here:
+/// the lock orders the re-key against concurrent writers and the per-account
+/// cap, and a caller cannot reach a marker still keyed the old way. `None`
+/// when the account does not exist.
+async fn lock_bnc_read_markers(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account: &str,
+    network: &str,
+    casemapping: CaseMapping,
+) -> Result<Option<i64>, DbError> {
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
+            .bind(CaseMapping::Rfc1459.casefold(account))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(query_error)?;
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    let mapping = casemapping.isupport_token();
+    let moved: Vec<(String, String)> = sqlx::query_as(
+        "DELETE FROM bnc_read_markers
+         WHERE account_id = $1 AND network = $2 AND target_casemapping <> $3
+         RETURNING target_display, timestamp",
+    )
+    .bind(account_id)
+    .bind(network)
+    .bind(mapping)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(query_error)?;
+    if moved.is_empty() {
+        return Ok(Some(account_id));
+    }
+    // Two names one mapping told apart may be one name under the next
+    // (`#a[` and `#a{` under RFC 1459): they become one marker, at the later
+    // of their positions, as they are one conversation now.
+    let (displays, stamps): (Vec<String>, Vec<String>) = moved.into_iter().unzip();
+    let (upper, lower) = fold_translation(casemapping);
+    sqlx::query(
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
+         SELECT $1, $2, translate(display, $4, $5), max(stamp), min(display), $3
+         FROM unnest($6::text[], $7::text[]) AS moved(display, stamp)
+         GROUP BY translate(display, $4, $5)
+         ON CONFLICT (account_id, network, target)
+         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp)",
+    )
+    .bind(account_id)
+    .bind(network)
+    .bind(mapping)
+    .bind(upper)
+    .bind(lower)
+    .bind(&displays)
+    .bind(&stamps)
+    .execute(&mut **tx)
+    .await
+    .map_err(query_error)?;
+    Ok(Some(account_id))
+}
 
 /// Get one per-network, per-target read marker, or `None` if unset.
+///
+/// `target` is folded under the network's `casemapping`, as its backlog is.
 pub async fn get_bnc_read_marker(
     pool: &PgPool,
     account: &str,
     network: &str,
     target: &str,
+    casemapping: CaseMapping,
 ) -> Result<Option<String>, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
-    let target_folded = CaseMapping::Rfc1459.casefold(target);
-    sqlx::query_scalar(
+    let mut tx = pool.begin().await.map_err(query_error)?;
+    let Some(account_id) =
+        lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    else {
+        return Ok(None);
+    };
+    let stored = sqlx::query_scalar(
         "SELECT timestamp FROM bnc_read_markers
-         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
-           AND network = $2 AND target = $3",
+         WHERE account_id = $1 AND network = $2 AND target = $3",
     )
-    .bind(&folded)
+    .bind(account_id)
     .bind(&net_folded)
-    .bind(&target_folded)
-    .fetch_optional(pool)
+    .bind(casemapping.casefold(target))
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
+    Ok(stored)
+}
+
+/// Every read marker `account` keeps on `network`, as (target folded under
+/// `casemapping`, timestamp): where an attaching client's replay of each
+/// conversation starts.
+pub async fn bnc_read_markers(
+    pool: &PgPool,
+    account: &str,
+    network: &str,
+    casemapping: CaseMapping,
+) -> Result<Vec<(String, String)>, DbError> {
+    let net_folded = CaseMapping::Rfc1459.casefold(network);
+    let mut tx = pool.begin().await.map_err(query_error)?;
+    let Some(account_id) =
+        lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let markers = sqlx::query_as(
+        "SELECT target, timestamp FROM bnc_read_markers
+         WHERE account_id = $1 AND network = $2",
+    )
+    .bind(account_id)
+    .bind(&net_folded)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
+    Ok(markers)
 }
 
 /// Set (upsert) one per-network, per-target read marker.
@@ -8252,26 +9066,20 @@ pub async fn set_bnc_read_marker(
     account: &str,
     network: &str,
     target: &str,
+    casemapping: CaseMapping,
     timestamp: &str,
 ) -> Result<BncReadMarkerWrite, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
-    let target_folded = CaseMapping::Rfc1459.casefold(target);
+    let target_folded = casemapping.casefold(target);
     let mut tx = pool.begin().await.map_err(query_error)?;
-    // Lock the durable account row while checking and consuming marker
-    // capacity. This both serializes concurrent writers for the same account
-    // and keeps the identifier at its schema-native BIGINT width.
-    let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
-            .bind(&folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
-    let Some(account_id) = account_id else {
+    // The account row lock taken here serializes concurrent writers for the
+    // same account, so two attaches cannot both see 255 rows and commit the
+    // 256th/257th.
+    let Some(account_id) =
+        lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };
-    // Without the account row lock above, two attaches can both see 255 rows
-    // and commit the 256th/257th concurrently.
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM bnc_read_markers
@@ -8296,16 +9104,20 @@ pub async fn set_bnc_read_marker(
         }
     }
     let stored: String = sqlx::query_scalar(
-        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (account_id, network, target)
-         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp)
+         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp),
+                       target_display = EXCLUDED.target_display
          RETURNING timestamp",
     )
     .bind(account_id)
     .bind(&net_folded)
     .bind(&target_folded)
     .bind(timestamp)
+    .bind(target)
+    .bind(casemapping.isupport_token())
     .fetch_one(&mut *tx)
     .await
     .map_err(query_error)?;
@@ -8350,6 +9162,25 @@ pub async fn bnc_buffer_summary(
 
 // ---- web auth (OIDC identities + sessions) ------------------------------
 
+/// The account an OpenID Connect identity is linked to, if any.
+pub async fn oidc_linked_account(
+    pool: &PgPool,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<String>, DbError> {
+    sqlx::query_scalar(OIDC_LINKED_ACCOUNT)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .map_err(query_error)
+}
+
+/// The account (`name`) linked to the identity (`$1` issuer, `$2` subject).
+const OIDC_LINKED_ACCOUNT: &str = "SELECT a.name FROM accounts a
+     JOIN oidc_identities o ON o.account_id = a.id
+     WHERE o.issuer = $1 AND o.subject = $2";
+
 /// Find the account linked to (issuer, subject), or provision one named
 /// exactly `account_name`, the name the provider's configured claim carries.
 /// A name that is already an account's or retired is refused with
@@ -8361,16 +9192,8 @@ pub async fn find_or_create_oidc_account(
     subject: &str,
     account_name: &str,
 ) -> Result<String, DbError> {
-    const LINKED_ACCOUNT: &str = "SELECT a.name FROM accounts a
-         JOIN oidc_identities o ON o.account_id = a.id
-         WHERE o.issuer = $1 AND o.subject = $2";
-    let existing: Option<String> = sqlx::query_scalar(LINKED_ACCOUNT)
-        .bind(issuer)
-        .bind(subject)
-        .fetch_optional(pool)
-        .await
-        .map_err(query_error)?;
-    if let Some(name) = existing {
+    const LINKED_ACCOUNT: &str = OIDC_LINKED_ACCOUNT;
+    if let Some(name) = oidc_linked_account(pool, issuer, subject).await? {
         return Ok(name);
     }
 
@@ -8431,9 +9254,9 @@ pub async fn find_or_create_oidc_account(
     }
     insert_audit_log_with(
         &mut *tx,
-        &format!("oidc:{issuer}"),
+        &AuditPrincipal::provider(&format!("oidc:{issuer}")),
         "ACCOUNT_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "provisioned from OpenID Connect",
     )
     .await?;
@@ -8593,9 +9416,9 @@ pub async fn create_web_session_with_identity(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_LOGIN",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if provider.is_some() {
             "browser session created through OpenID Connect"
         } else {
@@ -8706,9 +9529,9 @@ pub async fn consume_oidc_backchannel_logout(
     for account in affected_accounts {
         insert_audit_log_with(
             &mut *tx,
-            &account,
+            &AuditPrincipal::account(&account),
             "ACCOUNT_OIDC_LOGOUT",
-            &account,
+            &AuditPrincipal::account(&account),
             "browser sessions revoked by OpenID Connect back-channel logout",
         )
         .await?;
@@ -8759,9 +9582,9 @@ pub async fn revoke_oidc_frontchannel_sessions(
     for account in affected_accounts {
         insert_audit_log_with(
             &mut *transaction,
-            &account,
+            &AuditPrincipal::account(&account),
             "ACCOUNT_OIDC_LOGOUT",
-            &account,
+            &AuditPrincipal::account(&account),
             "browser sessions revoked by OpenID Connect front-channel logout",
         )
         .await?;
@@ -8805,6 +9628,79 @@ pub async fn session_account(pool: &PgPool, token: &str) -> Result<Option<String
         .map_err(query_error)
 }
 
+/// How recently a browser session's person must have proved themselves
+/// (signed in, or re-authenticated) for an operation that mints or redirects
+/// lasting authority over the account (DESIGN §9.4).
+pub const STEP_UP_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Whether the browser session `token` proved its person within
+/// [`STEP_UP_WINDOW`].
+pub async fn session_recently_authenticated(pool: &PgPool, token: &str) -> Result<bool, DbError> {
+    sqlx::query_scalar(
+        "SELECT authenticated_at > now() - make_interval(secs => $2)
+         FROM web_sessions WHERE token_hash = $1 AND expires_at > now()",
+    )
+    .bind(token_hash(token))
+    .bind(STEP_UP_WINDOW.as_secs_f64())
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)
+    .map(|recent| recent.unwrap_or(false))
+}
+
+/// How a browser session's person proved themselves again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reauthentication {
+    /// The account's primary password.
+    Password,
+    /// A fresh sign-in at a linked identity provider.
+    IdentityProvider,
+}
+
+/// Record that the person behind `account`'s browser session `token` has just
+/// proved themselves ([`Reauthentication`]), with an audit row. `false` when
+/// the session is not `account`'s (or has ended).
+pub async fn mark_session_reauthenticated(
+    pool: &PgPool,
+    account: &str,
+    token: &str,
+    how: Reauthentication,
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let updated = sqlx::query(
+        "UPDATE web_sessions s SET authenticated_at = now()
+         FROM accounts a
+         WHERE s.token_hash = $1 AND s.expires_at > now()
+           AND a.id = s.account_id AND a.name_folded = $2",
+    )
+    .bind(token_hash(token))
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    if updated.rows_affected() == 0 {
+        return Ok(false);
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&folded),
+        "ACCOUNT_REAUTHENTICATE",
+        &AuditPrincipal::account(&folded),
+        match how {
+            Reauthentication::Password => {
+                "browser session re-authenticated with the primary password"
+            }
+            Reauthentication::IdentityProvider => {
+                "browser session re-authenticated through OpenID Connect"
+            }
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
+}
+
 /// Delete a session (logout). Deleting an unknown token is not an
 /// error: logout must be idempotent.
 pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbError> {
@@ -8826,9 +9722,9 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
     if let Some(owner) = owner {
         insert_audit_log_with(
             &mut *transaction,
-            &owner,
+            &AuditPrincipal::account(&owner),
             "ACCOUNT_LOGOUT",
-            &owner,
+            &AuditPrincipal::account(&owner),
             "browser session ended",
         )
         .await?;
@@ -8909,9 +9805,9 @@ pub async fn delete_web_session_by_id(
         let folded = CaseMapping::Rfc1459.casefold(account);
         insert_audit_log_with(
             &mut *transaction,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_SESSION_REVOKE",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "browser session revoked",
         )
         .await?;
@@ -8953,9 +9849,9 @@ pub async fn delete_other_web_sessions(
     if deleted != 0 {
         insert_audit_log_with(
             &mut *transaction,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_SESSIONS_REVOKE",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "other browser sessions revoked",
         )
         .await?;
@@ -8984,9 +9880,9 @@ pub async fn issue_scoped_api_token(
     let token = mint_api_token_under_cap(&mut tx, account, label, scopes, lifetime).await?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_TOKEN_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "personal access token created",
     )
     .await?;
@@ -8994,17 +9890,22 @@ pub async fn issue_scoped_api_token(
     Ok(token)
 }
 
-/// How many personal access tokens `account_id` holds. Meaningful as a cap
-/// check only while the caller's transaction holds the account row's lock.
+/// How many unexpired personal access tokens `account_id` holds. Meaningful as
+/// a cap check only while the caller's transaction holds the account row's
+/// lock. An expired token authenticates nothing and the account directory does
+/// not count it, so it does not hold a slot while it waits for maintenance to
+/// delete it.
 async fn api_token_count(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
 ) -> Result<i64, DbError> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(query_error)
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_tokens WHERE account_id = $1 AND expires_at > now()",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(query_error)
 }
 
 /// The one way a personal access token comes to exist: mint it for `account`
@@ -9051,7 +9952,7 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
         "SELECT a.name FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
-           AND (t.expires_at IS NULL OR t.expires_at > now())
+           AND t.expires_at > now()
            AND 'irc' = ANY(t.scopes)
            AND (a.flags & $2) = 0",
     )
@@ -9168,7 +10069,14 @@ async fn commit_credential_revocation(
     if result.rows_affected() == 0 {
         return Ok(false);
     }
-    insert_audit_log_with(&mut *transaction, folded, action, folded, detail).await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(folded),
+        action,
+        &AuditPrincipal::account(folded),
+        detail,
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }
@@ -9412,56 +10320,92 @@ mod history_sql_tests {
         }
     }
 
+    /// The naming rules of a network that says `tokens`.
+    fn network(tokens: &[&str]) -> e6irc_client::NetworkNames {
+        let mut names = e6irc_client::NetworkNames::default();
+        names.adopt_tokens(tokens.iter().copied());
+        names
+    }
+
     #[test]
     fn bnc_direct_messages_share_the_peer_target_in_both_directions() {
+        let names = network(&[]);
         assert_eq!(
-            bnc_line_target(":alice!u@h PRIVMSG Bob :outbound", Some("ALICE"),),
+            bnc_line_target(":alice!u@h PRIVMSG Bob :outbound", Some("ALICE"), &names),
             Some("Bob".to_string())
         );
         assert_eq!(
-            bnc_line_target(":Bob!u@h PRIVMSG alice :inbound", Some("Alice")),
+            bnc_line_target(":Bob!u@h PRIVMSG alice :inbound", Some("Alice"), &names),
             Some("Bob".to_string())
         );
         assert_eq!(
-            bnc_line_target(":server.example NOTICE alice :maintenance", Some("alice")),
+            bnc_line_target(
+                ":server.example NOTICE alice :maintenance",
+                Some("alice"),
+                &names
+            ),
             None,
             "server notices are not direct-message conversations"
         );
         assert_eq!(
-            bnc_line_target(":Bob!u@h PRIVMSG #Room :channel", Some("alice")),
+            bnc_line_target(":Bob!u@h PRIVMSG #Room :channel", Some("alice"), &names),
             Some("#Room".to_string())
         );
     }
 
     /// A STATUSMSG is channel conversation with a narrower audience. Filed
     /// under its sender it became a direct message from someone who never sent
-    /// one, and vanished from the channel history it belongs to.
+    /// one, and vanished from the channel history it belongs to. Which sigils
+    /// and channel types exist is the network's to say: Ergo's halfops get a
+    /// `%#dev`, IRCnet has `!` channels.
     #[test]
     fn bnc_statusmsg_lines_belong_to_their_channel() {
+        let names = network(&["STATUSMSG=~&@%+", "CHANTYPES=#&!"]);
         for (addressed, channel) in [
             ("@#Room", "#Room"),
             ("+#Room", "#Room"),
             ("@&local", "&local"),
+            ("%#dev", "#dev"),
+            ("&#dev", "#dev"),
+            ("!ABCDEchan", "!ABCDEchan"),
         ] {
             assert_eq!(
                 bnc_line_target(
                     &format!(":Bob!u@h PRIVMSG {addressed} :ops only"),
-                    Some("alice")
+                    Some("alice"),
+                    &names
                 ),
                 Some(channel.to_string()),
                 "{addressed}"
             );
         }
         assert_eq!(
-            bnc_line_target(":alice!u@h NOTICE @#Room :from us", Some("alice")),
+            bnc_line_target(":alice!u@h NOTICE @#Room :from us", Some("alice"), &names),
             Some("#Room".to_string())
         );
         assert_eq!(
             bnc_line_target(
                 ":Bob!u@h PRIVMSG +alice :a nick, not a STATUSMSG",
-                Some("+alice")
+                Some("+alice"),
+                &names
             ),
             Some("Bob".to_string())
+        );
+        assert_eq!(
+            bnc_line_target(":alice!u@h PRIVMSG #a,#b :to both", Some("alice"), &names),
+            None,
+            "a target list is no one conversation"
+        );
+    }
+
+    /// On an `ascii` network `dev[m]` is not `dev{m}`: a message from one is
+    /// not ours when we are the other.
+    #[test]
+    fn bnc_own_nick_is_compared_the_networks_way() {
+        let names = network(&["CASEMAPPING=ascii"]);
+        assert_eq!(
+            bnc_line_target(":dev{m}!u@h PRIVMSG dev[m] :hi", Some("dev[m]"), &names),
+            Some("dev{m}".to_string())
         );
     }
 
@@ -9507,29 +10451,49 @@ mod history_sql_tests {
     /// history read, so it is pinned rather than trusted.
     #[test]
     fn history_select_expands_to_the_expected_statement() {
+        let prefix = "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
+                      sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
+                      client_tags FROM messages WHERE target = $1 AND ts >= \
+                      to_timestamp($2::double precision / 1000) ";
         assert_eq!(
-            history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-             sender_account, kind, body, sender_is_bot, multiline FROM messages WHERE target = $1 ORDER BY ts \
-             DESC, id DESC LIMIT $2"
+            history_select!(
+                crate::core::HistoryScope::TextAndTags,
+                "ORDER BY ts DESC, id DESC LIMIT $3"
+            ),
+            format!("{prefix}ORDER BY ts DESC, id DESC LIMIT $3")
+        );
+        // A reader that cannot receive a TAGMSG has them cut before the LIMIT.
+        assert_eq!(
+            history_select!(
+                crate::core::HistoryScope::Text,
+                "ORDER BY ts DESC, id DESC LIMIT $3"
+            ),
+            format!("{prefix}AND kind <> 'tagmsg' ORDER BY ts DESC, id DESC LIMIT $3")
         );
     }
 
     /// The windowed form keeps the alias and the ordering columns the outer
-    /// query depends on.
+    /// query depends on, and cuts both halves in the reader's scope.
     #[test]
     fn history_window_keeps_alias_and_ordering_columns() {
-        let sql = history_window!("WHERE a", "WHERE b");
-        assert!(
-            sql.contains("AS ts_millis"),
-            "the millis column is aliased so FromRow can bind it by name: {sql}"
-        );
-        assert_eq!(
-            sql.matches("ts, id").count(),
-            2,
-            "both halves carry ordering columns"
-        );
-        assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
-        assert!(sql.contains("UNION ALL"));
+        for (scope, cuts) in [
+            (crate::core::HistoryScope::TextAndTags, 0),
+            (crate::core::HistoryScope::Text, 2),
+        ] {
+            let sql = history_window!(scope, "AND a", "AND b");
+            assert!(
+                sql.contains("AS ts_millis"),
+                "the millis column is aliased so FromRow can bind it by name: {sql}"
+            );
+            assert_eq!(
+                sql.matches("ts, id").count(),
+                2,
+                "both halves carry ordering columns"
+            );
+            assert_eq!(sql.matches("kind <> 'tagmsg'").count(), cuts, "{sql}");
+            assert_eq!(sql.matches("client_tags").count(), 3, "{sql}");
+            assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
+            assert!(sql.contains("UNION ALL"));
+        }
     }
 }

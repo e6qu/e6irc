@@ -635,7 +635,11 @@ A sweep of the bouncer found, and this change fixes:
   confirmation of a client's own `NICK` counted as `renamed_by_upstream`.
 - **The local driver.** A stop during registration left the half-registered
   core session to the reaper, and its synthesized echo showed `~nick` where
-  the core shows the `USER` name.
+  the core shows the `USER` name. It also negotiated no capabilities with the
+  core, so the local network stripped client-only tags (`CLIENTTAGDENY=*`):
+  no typing indicators, no reactions, and an echo without the core's `msgid`.
+  It now asks the core for `message-tags`, `server-time`, `echo-message` and
+  `account-tag`, and relays the core's own echo.
 - **Lines sent with `CAP END` were refused.** The attach handshake answered
   lines arriving in the same read as `CAP END` with 421, and dropped the half
   of a line it had framed; both now reach the attached session.
@@ -725,6 +729,206 @@ now shared); ChanServ ACCESS, DEOP/VOICE/DEVOICE and SET SUCCESSOR, with
 account deletion passing founded channels to their successors in storage and
 in every shard's mirror. Operators read the server bans, private reasons
 included, with STATS k/d/x.
+
+A review of that surface fixed, each with a test that failed before:
+
+- **GROUP claimed names REGISTER refuses.** Any identified user could group a
+  configured administrator's name and so block that administrator's account
+  from ever being created. Every claim path now asks one predicate
+  (`ReservedAccountNames::claimable`), and storage refuses a services nick to
+  every creation path, OpenID Connect included; the administrator set is
+  computed once and shared.
+- **Founder-only ChanServ changes trusted the core's founder check.** A
+  pipelined `SET FOUNDER` let the former founder still name the successor,
+  change access, set KEEPTOPIC/MLOCK or `DROP` the channel. Storage now
+  re-checks the founder with the row locked for all of them.
+- **The successor was invisible.** FLAGS, ACCESS LIST and both consoles show
+  it; the core mirrors it, and a transfer clears it.
+- **STATS k/d/x split an X-line mask with spaces and blanked an IPv6 mask**
+  to `*`; masks, and a session's host, are spelled as Solanum spells them.
+- **The nick mirror could drift and a late verdict revived a deleted
+  account's nicks**; storage's idempotent answers now repair it and a deleted
+  account gains nothing back.
+- **Nick protection renamed a session whose IDENTIFY was still being
+  verified**; it waits for the verdict.
+- **ChanServ refused grouped nicks where it takes an account**, ACCESS ADD on
+  an existing entry claimed it was added, and the OP/DEOP/VOICE/DEVOICE MODE
+  line echoed the nick as typed. The owner console resolves grouped nicks the
+  same way.
+
+Maintainer decisions implemented on top: a founder transfer always clears the
+successor; the nick-protection clock never restarts (leaving and returning
+keeps the deadline, and a return after it renames at once); and GHOST, REGAIN,
+the enforcement rename and ChanServ OP/DEOP/VOICE/DEVOICE are audited.
+
+A review of the bouncer as a client of its upstream and a server to its
+attached clients found, and this change fixes:
+
+- **One client's replies went to every client and into the history.** A
+  `/LIST` reached every attached client, overran their shared broadcast and
+  detached them, and evicted the stored conversation; a `WHO` on join filled
+  the backlog. Replies are routed to the attachment whose command they answer —
+  by `labeled-response` when the upstream has it, by reply order otherwise —
+  live, on a bounded route of its own, and never retained or stored.
+- **Client-only tags and `TAGMSG` reached upstreams that cannot carry them**,
+  answered by a 421 in front of every client (or, on a server that does not
+  parse tags, losing the message behind a fake echo). They are stripped, with
+  `CLIENTTAGDENY=*` advertised, and a `TAGMSG` is answered to its sender alone.
+- **Names were compared under RFC 1459 whatever the network said.** Another
+  user's `NICK` or `JOIN` could be taken for ours on an `ascii` network, and
+  two channels shared one history. The session, rejoin set, echo matching and
+  history filing read the network's `CASEMAPPING`, `CHANTYPES` and
+  `STATUSMSG`; stored conversations keep their spelling and are keyed and
+  re-keyed under the network's mapping (migration 0076), and TARGETS names them
+  as spelled. Read markers keep their spelling and mapping too and are re-keyed
+  the same way (migration 0086).
+- **A keyed channel could not be autojoined.** Only a key a client joined with
+  or a `+k` the driver saw was remembered, in memory, so a restart lost it and
+  the channel was answered with 475. An account network's autojoin entry now
+  takes a key (`#staff key`), stored sealed (migration 0087), write-only over
+  the API with an explicit keep action, never carried to a new destination,
+  and edited in the network dialog.
+- **Replay and CHATHISTORY disagreed on time** on networks without
+  `server-time`: every line is stamped when it is taken in.
+- **Echoes**: a message to several targets is echoed per target, an echo the
+  upstream truncated still matches, and a labelled echo is routed by its label.
+- **The upstream's registration burst** (its own ISUPPORT, the MOTD) was replayed
+  over the bouncer's welcome; it is read, not relayed or retained.
+- **Rejoin**: a refused rejoin is dropped instead of retried forever, a client's
+  `PART` removes a channel the session is not in, and keyed channels are
+  rejoined with their keys.
+- **Reconnects** left no mark in the ring (a replay showed two JOINs without the
+  PART between); `CAP NEW`/`CAP DEL` mid-session were ignored; bouncer-made
+  lines could exceed the line limit.
+- **Attach**: a synthesized JOIN is followed by the channel's real topic and
+  member list, asked of the upstream for that client alone, and a raw client's
+  replay starts each conversation at its account's read marker.
+
+A 2026-09-25 review of the HTTP, WebSocket and console surface found, and this
+change fixes:
+
+- **A live chat socket outlived its credential.** `/ws/ui` kept streaming and
+  sending after logout, session revocation, a password change, provider logout,
+  the session cap, token revocation or expiry. The credential tables announce
+  every change themselves (migration 0077); a listener closes the sockets a
+  change ends (1008), and expiry closes them too.
+- **A stored network secret followed an edited address.** Keeping a password
+  while pointing a network (or a bridge base) somewhere else sent it there; the
+  one function that applies credentials refuses it (409).
+- **Account activity showed other principals' rows.** Audit rows record the
+  kind of each name (migration 0078); an account's activity and export show
+  only rows naming it as an account, and an IRC ban's row names the operator.
+- **OpenID Connect.** A rotated key is followed at once (one throttled refresh);
+  a failed discovery is remembered for 30 s; the callback is rate-limited and a
+  flow is answered once; provider calls obey the egress rule within the
+  configured issuer's trust domain; an email names a new account only when
+  verified under a domain policy.
+- **Step-up re-authentication** guards the self-service changes that mint or
+  redirect lasting access (migration 0079), with a console confirm-and-retry.
+- **The session's CSRF value left URLs** (sign-out is a form post, linking a
+  POST); revoking one browser session refuses a bearer as the bulk revocation
+  does; administrator pages spend the administrator budget; the configuration
+  view is an allowlist.
+- **The contract.** Pre-handler statuses (429 for rate-limited handlers, 408,
+  413, the re-authentication 403) are derived from handler signatures; the body
+  limit's and the monitoring endpoint's refusals are problem documents; `/ws/ui`
+  is described; a REST topic is stored whole or refused.
+
+A review of the database layer found, and this change (migration 0080) fixes,
+each with a test that failed before:
+
+- **CHATHISTORY TARGETS read every stored direct message of the requester** on
+  the serial database worker, so one account with a large DM history could
+  stall every other client's history. A `dm_conversations` summary kept by
+  triggers on `messages` (backfilled by the migration) answers the
+  conversation half in at most the request's limit of rows.
+- **The 200-channel founder cap was per core shard, and transfers bypassed
+  it.** Registration, ChanServ `SET FOUNDER`, the owner console's transfer and
+  deletion succession count the receiving account's channels under its row
+  lock; a transfer past the cap is refused, and so is a deletion whose
+  succession would take a successor past it, naming the channels.
+- **Expired personal access tokens held cap slots** until maintenance swept
+  them; only unexpired tokens are counted, as the account directory counts.
+- **The two password checks treated a failed "last used" write oppositely**;
+  one helper records it for both, and its failure fails the check.
+- **Storage did not hold the forms the code relies on**: BNC network names are
+  constrained to the token language on which `lower()` equals the RFC 1459
+  fold, and bouncer line and read-marker timestamps to the canonical
+  millisecond form their lexical comparisons need.
+- `account_invitations.accepted_account_id` (written, never read) and the
+  redundant `bnc_networks_account_idx` are dropped; DESIGN §8 now matches the
+  schema (the `messages` index, canonical `sent_at`, `login_attempts`).
+
+An IRCv3 conformance review, extension by extension, found, and this change
+fixes:
+
+- **A labeled NickServ IDENTIFY dropped its echo**: a second "deferred" flag
+  was set without counting the answer. A capture now has one count, and every
+  asynchronous answer is gathered into the one labeled response.
+- **900/901 only came from SASL**, and 901 never; they come from the one login
+  and logout path. A labeled `AUTHENTICATE` was ACKed before its verdict, and a
+  line sent mid-verify produced 904 followed by the real verdict.
+- **`REGISTER` stored an empty password** no login could ever use; one parser
+  (`NewPassword`) serves IRC, NickServ and the web. It answers `NEED_NICK` when
+  there is no nick to register.
+- **invite-notify reached every member**, not those who may invite; **WHOIS
+  ignored multi-prefix**; **multiline lines exceeded 512 bytes** inside the
+  batch (now split with `draft/multiline-concat`); **SETNAME cut** an over-long
+  realname (now refused; `NAMELEN` advertised); **`MODES` was not advertised**
+  (now `MODES=4`, enforced); pre-parse refusals lost their **label**; an **empty
+  multiline batch** was answered with silence; MONITOR's 421 had an extra
+  parameter; the attach listener took `AUTHENTICATE *` for a mechanism.
+
+Maintainer decision implemented on top: history keeps client-only tags and
+`TAGMSG` reactions (migration 0081), replayed to `message-tags` readers; typing
+indicators are never stored, on the server or the bouncer. CHATHISTORY TARGETS
+answers in the reader's scope, as the bouncer's does: for a reader without
+`message-tags` a buffer is dated by its newest text and one with only
+`TAGMSG`s in the window is not listed (ring times per scope, a second
+`dm_conversations` time, migration 0085).
+
+Maintainer decision implemented: `LIST` takes Libera's conditions and
+advertises them (`ELIST=CMNTU`, `SAFELIST`), as Solanum's `m_list` parses
+them — member counts, creation and topic times in minutes, name masks and
+their negations, comma-separated, all of which must hold; each shard applies
+them to the channels it owns. The reply, which could overrun the client's
+SendQ and disconnect it on a network with more channels than that holds, is
+now paced to half of it (DESIGN §7.2, §7.7). irctest's `testListMask`,
+`testListNotMask` and `testListUsers` run and pass; the creation- and
+topic-time cases still need a controller that can move the clock.
+
+Maintainer decision implemented: `WHO` is paced like `LIST`. A `WHO *`, or a
+`WHO` of a channel with more members than half the asker's SendQ, used to
+queue every row at once and disconnect the asker ("SendQ exceeded"); its rows
+now go out as the client reads, a remote channel's on the asker's shard, a
+labeled one as one batch, and later WHOs follow it in order within one SendQ
+— past that, `263 RPL_TRYAGAIN` (DESIGN §7.2).
+
+A review of whether the docs, tests, CI and guards tell the truth found, and
+this change fixes:
+
+- **SASL-required mode** was promised by DESIGN §7.2 and did not exist.
+  `limits.require_sasl` and `limits.require_sasl_from` (CIDRs) now refuse an
+  anonymous client at the end of registration as Libera refuses its SASL-only
+  ranges (465, `SASL access only`); both are console-owned and validated.
+- **OIDC provider endpoints are HTTPS under `secure_cookies`**: the
+  end-session endpoint in configuration, and every endpoint a discovery
+  document advertises.
+- **Guards that could be walked around.** The dead-public guard let a
+  same-named definition keep a dead item alive (two were deleted) and never
+  saw `pub mod`/`pub use`; the no-deferral guard missed ordinary rewordings
+  and read PLAN.md alone; the `--locked` guard missed `cargo check`/`run`,
+  toolchain-prefixed commands and most documents, and the fuzz build ran
+  unlocked; two scripts ran service images by tag; irctest skips were never
+  counted; the no-op guard read only Rust and took `panic!("")` as a message;
+  the journey guard took any function as evidence. Each has a contract test.
+- **Tests that could not fail**: a buffer-trim test settled by timing, a
+  secret test that passed when a key was set, an assertion-free test, two
+  `#[should_panic]` tests that took any panic, a contrast test of copied hex
+  values, and an unchecked snapshot checksum.
+- **Docs that disagreed with the code**: when a refused network parks (three
+  documents), DESIGN §5's dependency policy, the default flood limits, the
+  client's SASL mechanisms, and CI's PostgreSQL setup.
 
 ## Remaining qualification
 

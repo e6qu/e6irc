@@ -206,7 +206,11 @@ async fn full_oidc_login_provisions_account_and_session() {
         .send()
         .await
         .expect("logout");
-    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        resp.status(),
+        204,
+        "a script's sign-out ends this application's session only"
+    );
     let resp = client
         .get(format!("{base}/api/v1/me"))
         .send()
@@ -378,10 +382,10 @@ async fn oidc_identity_link_flow_and_conflict() {
             .build()
             .expect("client");
         let cookie = format!("e6irc_session={session}");
-        // Without the session's CSRF value the link is refused: a cross-site
-        // navigation carries the cookie but cannot know it.
+        // Without the session's CSRF header the link is refused: a cross-site
+        // form carries the cookie but cannot know it.
         let resp = client
-            .get(format!("{base}/api/v1/auth/oidc/dex/link"))
+            .post(format!("{base}/api/v1/auth/oidc/dex/link"))
             .header("cookie", &cookie)
             .send()
             .await
@@ -398,19 +402,17 @@ async fn oidc_identity_link_flow_and_conflict() {
             .expect("me json");
         let csrf = me["csrf_token"].as_str().expect("session CSRF value");
         let resp = client
-            .get(format!("{base}/api/v1/auth/oidc/dex/link"))
-            .query(&[("csrf", csrf)])
+            .post(format!("{base}/api/v1/auth/oidc/dex/link"))
+            .header("X-E6IRC-CSRF", csrf)
             .header("cookie", &cookie)
             .send()
             .await
             .expect("link start");
-        assert_eq!(resp.status(), 307, "link start not a redirect");
-        let mut location = resp
-            .headers()
-            .get("location")
-            .expect("location")
-            .to_str()
-            .unwrap()
+        assert_eq!(resp.status(), 200, "link start names the provider URL");
+        let flow: serde_json::Value = resp.json().await.expect("link start JSON");
+        let mut location = flow["authorization_url"]
+            .as_str()
+            .expect("authorization_url")
             .to_string();
         for _ in 0..10 {
             if location.starts_with(base) {
@@ -510,7 +512,11 @@ async fn oidc_silent_sso_reuses_provider_session() {
             client_secret: "e6irc-test-secret".into(),
             account_claim: e6ircd::config::OidcAccountClaim::Email,
             scopes: vec![],
-            allowed_email_domains: vec![],
+            allowed_email_domains: vec![
+                // An email names a new account only under a domain policy:
+                // dex's mock user is kilgore@kilgore.trout.
+                e6ircd::identity::EmailDomain::parse("kilgore.trout").expect("test domain"),
+            ],
             end_session_endpoint: None,
             token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],

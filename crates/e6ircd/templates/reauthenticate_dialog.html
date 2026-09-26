@@ -1,0 +1,19 @@
+{#- The step-up re-authentication dialog every console page carries. Its
+    password field is the e6irc login itself, so it alone among the console
+    shell's fields may invite the browser to fill that login. -#}
+    <dialog class="confirm-dialog" data-console-reauthenticate aria-labelledby="reauthenticate-title" aria-describedby="reauthenticate-message">
+      <form method="dialog" data-console-reauthenticate-form>
+        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <h2 id="reauthenticate-title">Confirm it is you</h2>
+        <p id="reauthenticate-message">This change creates or redirects lasting access to your account, and you last signed in more than 10 minutes ago. Confirm with your password, or sign in again with your identity provider.</p>
+        <label>Your e6irc password
+          <input type="password" name="password" autocomplete="current-password" maxlength="512" />
+        </label>
+        <p class="meta" role="status" data-console-reauthenticate-result></p>
+        <div class="confirm-dialog-menu" data-console-reauthenticate-providers></div>
+        <div class="confirm-dialog-menu">
+          <button type="submit" value="cancel" formnovalidate>Cancel</button>
+          <button class="primary" type="submit" value="password">Confirm with password</button>
+        </div>
+      </form>
+    </dialog>

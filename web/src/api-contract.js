@@ -2,14 +2,21 @@
 
 export const MAX_API_JSON_BYTES = 1024 * 1024;
 
+// The problem type of a refusal that asks the session's person to prove
+// themselves again (POST /api/v1/me/reauthenticate) and retry.
+export const REAUTHENTICATION_REQUIRED = "urn:e6irc:problem:reauthentication-required";
+
 export class ApiError extends Error {
   // `field` is the request field the server says is at fault, when the failure
-  // belongs to one, so a form can mark and focus that input.
-  constructor(status, message, field = null) {
+  // belongs to one, so a form can mark and focus that input. `type` is the
+  // problem type, for the one refusal a client acts on by kind
+  // (REAUTHENTICATION_REQUIRED).
+  constructor(status, message, field = null, type = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.field = field;
+    this.type = type;
   }
 }
 
@@ -431,7 +438,12 @@ async function apiFailure(response) {
       ? problem.title
       : "";
   if (!detail) throw new ApiError(response.status, "The server returned an invalid error response.");
-  throw new ApiError(response.status, detail, typeof problem.field === "string" ? problem.field : null);
+  throw new ApiError(
+    response.status,
+    detail,
+    typeof problem.field === "string" ? problem.field : null,
+    typeof problem.type === "string" ? problem.type : null,
+  );
 }
 
 export async function getApiObject(fetcher, url, options = {}) {

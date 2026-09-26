@@ -4,21 +4,19 @@
 /fuzz/artifacts
 node_modules/
 /.pnpm-store/
+# The web client build (`pnpm build` in web/; CI rebuilds it before
+# `cargo build --features embed-web`).
 /web/dist
 /web/test-results
+# Visual-regression renders from platforms other than macOS, whose renders are
+# the committed baselines (web/playwright.visual.config.js).
+/web/test/__snapshots__/*/linux/
+/web/test/__snapshots__/*/win32/
 # Failure diagnostics from tools/test-oidc-browser.mjs when
 # E6IRC_BROWSER_ARTIFACTS_DIR is given relative to the repository root.
 /test-results
 .DS_Store
 
-# Web client build artifacts (built by `pnpm build` in web/; CI rebuilds
-# before `cargo build --features embed-web`).
-web/node_modules/
-web/dist/
-web/public/htmx.min.js
-web/public/ws.min.js
-
 # Python bytecode (irctest controller, harnesses)
 __pycache__/
 *.pyc
-web/public/htmx.min.js

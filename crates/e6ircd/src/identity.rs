@@ -2,6 +2,61 @@
 
 use std::fmt;
 
+/// Longest password any surface accepts, in bytes.
+const MAX_PASSWORD_LEN: usize = 512;
+
+/// Why a password cannot be set on an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordRefusal {
+    /// Nothing to log in with: SASL PLAIN, the web login and the REST API all
+    /// refuse an empty password, so an account created with one could never be
+    /// logged in to — or dropped — again.
+    Empty,
+    /// Longer than [`MAX_PASSWORD_LEN`].
+    TooLong,
+}
+
+impl PasswordRefusal {
+    /// The one wording every surface uses for the rule.
+    pub fn explanation(self) -> &'static str {
+        "Passwords must contain 1–512 bytes."
+    }
+}
+
+/// A password an account may be given: 1–[`MAX_PASSWORD_LEN`] bytes. Every
+/// surface that sets one — IRC `REGISTER`, NickServ `REGISTER`, the web and
+/// the REST API — parses it here, and account creation takes only this type,
+/// so no path can store a password the others would refuse to verify.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewPassword(String);
+
+impl NewPassword {
+    pub fn parse(raw: &str) -> Result<Self, PasswordRefusal> {
+        if raw.is_empty() {
+            Err(PasswordRefusal::Empty)
+        } else if raw.len() > MAX_PASSWORD_LEN {
+            Err(PasswordRefusal::TooLong)
+        } else {
+            Ok(Self(raw.to_owned()))
+        }
+    }
+}
+
+impl std::ops::Deref for NewPassword {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A secret: never printed, even in a debug dump of the request carrying it.
+impl fmt::Debug for NewPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NewPassword(..)")
+    }
+}
+
 /// Lifetime authentication budget for one IRC or BNC connection.
 ///
 /// Keeping the counter and limit together prevents a new authentication edge
@@ -25,13 +80,30 @@ impl CredentialAttemptBudget {
     }
 }
 
-/// Account names that only privileged flows may bring into being: the
-/// configured administrators (`http.admin_accounts` / `E6IRC_ADMIN_ACCOUNTS`).
-/// Such a name carries administrator authority the moment an account holds it,
-/// so whoever registered it first — over NickServ `REGISTER`, the IRCv3
-/// `REGISTER` command, or an account invitation — would be an administrator.
-/// Only OIDC provisioning and the bootstrap/recovery flows may create one.
-/// Names are held casefolded, so no spelling of one slips past.
+/// Casefolded nicks the built-in services pseudo-clients occupy. No session may
+/// take one (NICK refuses it, and PRIVMSG to it is intercepted), and no account
+/// may be named after one.
+pub(crate) const SERVICE_NICKS: [&str; 2] = ["nickserv", "chanserv"];
+
+/// Why a name cannot become an account's (see
+/// [`ReservedAccountNames::claimable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameClaimRefusal {
+    /// A services pseudo-client's nick.
+    ServiceNick,
+    /// A configured administrator's name, which only a privileged flow creates.
+    ConfiguredAdministrator,
+}
+
+/// The configured administrators (`http.admin_accounts` /
+/// `E6IRC_ADMIN_ACCOUNTS`), and so the account names only privileged flows may
+/// bring into being. Such a name carries administrator authority the moment an
+/// account holds it, so whoever claimed it first — over NickServ `REGISTER` or
+/// `GROUP`, the IRCv3 `REGISTER` command, or an account invitation — would be
+/// an administrator. Only OIDC provisioning and the bootstrap/recovery flows
+/// may create one. Names are held casefolded, so no spelling of one slips past.
+/// Built once from the configuration and shared by the core, the HTTP state,
+/// and the deletion procedure.
 #[derive(Debug, Clone, Default)]
 pub struct ReservedAccountNames(std::sync::Arc<std::collections::HashSet<String>>);
 
@@ -45,10 +117,31 @@ impl ReservedAccountNames {
         ))
     }
 
-    /// Whether `name`, in any spelling, is reserved.
+    /// Whether `name`, in any spelling, is a configured administrator.
     pub fn reserves(&self, name: &str) -> bool {
         self.0
             .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name))
+    }
+
+    /// The configured administrators, casefolded, for storage queries.
+    pub fn folded_names(&self) -> Vec<String> {
+        self.0.iter().cloned().collect()
+    }
+
+    /// The one answer to "may an ordinary claim make `name` an account's name
+    /// or nick?" — NickServ `REGISTER` and `GROUP`, the IRCv3 `REGISTER`
+    /// command, an account an administrator creates, and an invitation all ask
+    /// it, so a new claim path cannot forget one of the rules. (Storage refuses
+    /// a services nick to every creation path, the privileged ones included.)
+    pub fn claimable(&self, name: &str) -> Result<(), NameClaimRefusal> {
+        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name);
+        if SERVICE_NICKS.contains(&folded.as_str()) {
+            return Err(NameClaimRefusal::ServiceNick);
+        }
+        if self.0.contains(&folded) {
+            return Err(NameClaimRefusal::ConfiguredAdministrator);
+        }
+        Ok(())
     }
 }
 
@@ -333,6 +426,24 @@ bounded_lifetime_days!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_password_holds_one_to_512_bytes() {
+        assert_eq!(NewPassword::parse("").err(), Some(PasswordRefusal::Empty));
+        assert_eq!(
+            NewPassword::parse(&"p".repeat(513)).err(),
+            Some(PasswordRefusal::TooLong)
+        );
+        assert_eq!(
+            &*NewPassword::parse(&"p".repeat(512)).expect("fits"),
+            "p".repeat(512)
+        );
+        assert_eq!(
+            format!("{:?}", NewPassword::parse("hunter2").expect("fits")),
+            "NewPassword(..)",
+            "never printed"
+        );
+    }
 
     #[test]
     fn contact_email_parses_once_and_normalizes_only_the_domain() {

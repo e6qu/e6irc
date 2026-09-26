@@ -244,6 +244,15 @@ impl Registry {
                 })?,
                 NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => String::new(),
             };
+            // A server-level network's autojoin is public configuration (the
+            // administrator API returns it), so it names channels only: an
+            // entry with a key in it is refused by the channel grammar rather
+            // than read as a key nobody could keep secret.
+            let autojoin: Vec<super::AutojoinEntry> = e
+                .autojoin
+                .iter()
+                .map(|channel| super::AutojoinEntry::unkeyed(channel.as_str()))
+                .collect();
             let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
                 let identity_error = |error: super::UpstreamIdentityError| {
                     format!("network '{}' (kind=local) has invalid {error}", e.name)
@@ -257,7 +266,7 @@ impl Registry {
                     nick: e.nick.parse().map_err(identity_error)?,
                     username: username.parse().map_err(identity_error)?,
                     realname: realname.parse().map_err(identity_error)?,
-                    autojoin: super::UpstreamChannel::parse_list(&e.autojoin)
+                    autojoin: super::AutojoinChannel::parse_list(&autojoin)
                         .map_err(identity_error)?,
                     buffer_cap: e.buffer_cap,
                     sasl: None,
@@ -278,7 +287,7 @@ impl Registry {
                     nick: e.nick.clone(),
                     username: e.username.clone(),
                     realname,
-                    autojoin: e.autojoin.clone(),
+                    autojoin,
                     buffer_cap: e.buffer_cap,
                     sasl_account: e.sasl_account.clone(),
                     sasl_password: e.sasl_password.clone(),
@@ -623,11 +632,21 @@ fn spawn_persistence(
     // fast enough for that window to be real.
     let events = handle.subscribe();
     let task = tokio::spawn(async move {
-        match crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
+        match crate::db::recent_bnc_backlog(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
             Ok(lines) => handle.preload_front(lines),
             Err(e) => {
                 handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                 eprintln!("bnc: buffer restore failed for {owner_key}/{network}: {e}");
+            }
+        }
+        // Until the network says how it compares names, they are compared as
+        // its stored conversations were keyed, so CHATHISTORY finds them.
+        match crate::db::bnc_buffer_casemapping(&pool, &owner_key, &network).await {
+            Ok(Some(casemapping)) => handle.remember_casemapping(casemapping),
+            Ok(None) => {}
+            Err(e) => {
+                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                eprintln!("bnc: stored case mapping unreadable for {owner_key}/{network}: {e}");
             }
         }
         handle.history_restored();
@@ -656,6 +675,9 @@ fn spawn_persistence(
         // appends is what makes the amortized trim reach every network — see
         // `db::BNC_TRIM_INTERVAL`.
         let mut since_trim = 0u64;
+        // The case mapping every stored conversation is keyed under once
+        // this task has re-keyed what was not; `None` until it has.
+        let mut keyed_under = None;
         // Whether the last write failed, so an outage logs once, and its end
         // logs once.
         let mut storage_failing = false;
@@ -703,9 +725,33 @@ fn spawn_persistence(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            match persist_and_trim(&pool, &buffer, own_nick.as_deref(), &line, &mut since_trim)
+            // The echo of a typing indicator is told live and never stored,
+            // like the indicator itself (`publish_echo`).
+            if crate::sanitize::is_ephemeral_tagmsg(&line) {
+                continue;
+            }
+            let names = handle.names();
+            let stored = async {
+                // A conversation is keyed the network's way. When that way is
+                // not the one this buffer's rows were keyed under — the first
+                // line after a restart, or a network that changed its
+                // CASEMAPPING — they are re-keyed first, so a page never mixes
+                // the two.
+                if keyed_under != Some(names.casemapping()) {
+                    crate::db::rekey_bnc_targets(&pool, &buffer, names.casemapping()).await?;
+                    keyed_under = Some(names.casemapping());
+                }
+                persist_and_trim(
+                    &pool,
+                    &buffer,
+                    own_nick.as_deref(),
+                    &line,
+                    &names,
+                    &mut since_trim,
+                )
                 .await
-            {
+            };
+            match stored.await {
                 Err(e) => {
                     handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                     // One line per outage, not one per upstream message: a
@@ -777,9 +823,10 @@ async fn persist_and_trim(
     buffer: &crate::db::BncBuffer,
     own_nick: Option<&str>,
     line: &str,
+    names: &e6irc_client::NetworkNames,
     since_trim: &mut u64,
 ) -> Result<(), crate::db::DbError> {
-    crate::db::persist_bnc_line(pool, buffer, own_nick, line).await?;
+    crate::db::persist_bnc_line(pool, buffer, own_nick, line, names).await?;
     *since_trim += 1;
     if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
         *since_trim = 0;
@@ -936,26 +983,11 @@ where
     Ok(())
 }
 
-/// The ISUPPORT a network is welcomed with when it has told the bouncer
-/// nothing of its own — a bridge, which has no registration burst, or an
-/// upstream whose burst has not arrived yet.
-const BRIDGE_ISUPPORT: &[&str] = &[
-    "CASEMAPPING=rfc1459",
-    "CHANTYPES=#&",
-    "CHANNELLEN=64",
-    "NICKLEN=30",
-    "PREFIX=(qaohv)~&@%+",
-];
-
-/// RPL_MYINFO's mode lists to go with [`BRIDGE_ISUPPORT`]: no user modes the
+/// RPL_MYINFO's mode lists to go with [`super::BRIDGE_ISUPPORT`] (what a
+/// network that has said nothing of its own is welcomed with): no user modes the
 /// bridge implements beyond invisibility, and the membership modes its
 /// `PREFIX` names (each takes a nick).
 const BRIDGE_MYINFO_MODES: &[&str] = &["i", "qaohv", "qaohv"];
-
-/// Tokens the bouncer answers for itself rather than the network: it serves
-/// CHATHISTORY from its own store, so the network's limits and reference
-/// types say nothing about what an attached client can page.
-const BOUNCER_OWNED_ISUPPORT: &[&str] = &["CHATHISTORY", "MSGREFTYPES"];
 
 /// The most ISUPPORT tokens one 005 line carries: with the nick and the
 /// trailing text that is the 15 parameters a message may hold.
@@ -972,9 +1004,11 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// The mode lists and ISUPPORT are the network's own, as its registration
 /// burst reported them (the local network's are the core's, read the same
 /// way), so the client parses the network it is actually on — its prefixes,
-/// channel types and casemapping. The bouncer adds only what it serves itself:
-/// CHATHISTORY and MSGREFTYPES, and those only when the network has a history
-/// store to page.
+/// channel types and casemapping. The bouncer answers for itself only what it
+/// decides ([`super::BOUNCER_OWNED_ISUPPORT`]): CHATHISTORY and MSGREFTYPES,
+/// and those only when the network has a history store to page; and
+/// CLIENTTAGDENY, which is `*` while the network cannot carry client-only
+/// tags.
 pub(super) fn welcome(
     server_name: &str,
     network: &str,
@@ -985,18 +1019,23 @@ pub(super) fn welcome(
         .irc_session_snapshot()
         .map_or(requested_nick, |session| session.nick);
     let features = handle.upstream_features();
+    let client_tag_deny = features.client_tag_deny();
     let modes = features
         .myinfo_modes
         .unwrap_or_else(|| BRIDGE_MYINFO_MODES.iter().map(|m| m.to_string()).collect());
     let mut isupport = if features.isupport.is_empty() {
-        BRIDGE_ISUPPORT.iter().map(|t| t.to_string()).collect()
+        super::BRIDGE_ISUPPORT
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
     } else {
         features.isupport
     };
     isupport.retain(|token| {
         let key = token.split('=').next().unwrap_or(token);
-        !BOUNCER_OWNED_ISUPPORT.contains(&key)
+        !super::BOUNCER_OWNED_ISUPPORT.contains(&key)
     });
+    isupport.extend(client_tag_deny);
     if handle.history().is_some() {
         isupport.push(format!(
             "CHATHISTORY={}",
@@ -1208,7 +1247,22 @@ where
                         .await?;
                         continue;
                     }
-                    if !awaiting_payload {
+                    if arg == "*" {
+                        // Client abort — answered 906 whether or not an
+                        // exchange is open, as the core answers it: `*` is
+                        // never a mechanism name.
+                        awaiting_payload = false;
+                        sasl_buf.clear();
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            906,
+                            None,
+                            "SASL authentication aborted",
+                        )
+                        .await?;
+                    } else if !awaiting_payload {
                         // Mechanism selection. Only PLAIN is offered; any
                         // other is answered with the list (908) before the
                         // failure (904), as the SASL spec orders them.
@@ -1227,19 +1281,6 @@ where
                             .await?;
                             reject_sasl(write, server_name, nick.as_deref()).await?;
                         }
-                    } else if arg == "*" {
-                        // Client abort.
-                        awaiting_payload = false;
-                        sasl_buf.clear();
-                        handshake_numeric(
-                            write,
-                            server_name,
-                            nick.as_deref(),
-                            906,
-                            None,
-                            "SASL authentication aborted",
-                        )
-                        .await?;
                     } else {
                         // Continuation: a full 400-char line means more follows;
                         // a shorter line (or "+", the empty final chunk)
@@ -1267,15 +1308,15 @@ where
                                         reject_sasl(write, server_name, nick.as_deref()).await?;
                                     }
                                     PlainVerification::Throttled(retry_after) => {
-                                        write
-                                            .write_all(
-                                                format!(
-                                                    ":{server_name} 904 * :{}\r\n",
-                                                    retry_after.explanation()
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await?;
+                                        handshake_numeric(
+                                            write,
+                                            server_name,
+                                            nick.as_deref(),
+                                            904,
+                                            None,
+                                            &retry_after.explanation(),
+                                        )
+                                        .await?;
                                     }
                                     PlainVerification::Unavailable => {
                                         handshake_numeric(
@@ -1963,6 +2004,24 @@ mod handshake_tests {
             replies.contains(" 906 * :SASL authentication aborted\r\n"),
             "{replies}"
         );
+        assert!(matches!(registered, Registered::Closed));
+    }
+
+    /// `AUTHENTICATE *` is an abort whether or not an exchange is open — 906,
+    /// as the core answers it — never a mechanism name to be refused with the
+    /// mechanism list.
+    #[tokio::test]
+    async fn attach_sasl_abort_outside_an_exchange_is_906() {
+        let (replies, registered) = handshake_replies(
+            b"CAP REQ :sasl\r\nNICK alice/libera\r\nAUTHENTICATE *\r\nQUIT :done\r\n",
+        )
+        .await;
+        assert!(
+            replies.contains(":bnc.example 906 alice/libera :SASL authentication aborted\r\n"),
+            "{replies}"
+        );
+        assert!(!replies.contains(" 908 "), "{replies}");
+        assert!(!replies.contains(" 904 "), "{replies}");
         assert!(matches!(registered, Registered::Closed));
     }
 

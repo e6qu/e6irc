@@ -18,6 +18,23 @@ mod deadline;
 mod membership;
 use membership::{wait_joined, whois_until};
 
+/// `line` without the `time` tag the bouncer stamps on every line it takes in
+/// that carries none of its own.
+fn untimed(line: &str) -> String {
+    let Some((tags, body)) = line.strip_prefix('@').and_then(|rest| rest.split_once(' ')) else {
+        return line.to_string();
+    };
+    let kept: Vec<&str> = tags
+        .split(';')
+        .filter(|tag| !tag.starts_with("time="))
+        .collect();
+    if kept.is_empty() {
+        body.to_string()
+    } else {
+        format!("@{} {body}", kept.join(";"))
+    }
+}
+
 async fn upstream() -> std::net::SocketAddr {
     let config = Config {
         server_name: "irc.upstream.example".into(),
@@ -1062,9 +1079,15 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         .expect("stored settings");
     let mut moved = stored.settings.clone();
     moved.networks[0].addr = UNREACHABLE.into();
-    e6ircd::db::save_managed_config(&pool, stored.revision, &moved, "test", "move up")
-        .await
-        .expect("move the network");
+    e6ircd::db::save_managed_config(
+        &pool,
+        stored.revision,
+        &moved,
+        &e6ircd::db::AuditPrincipal::account("test"),
+        "move up",
+    )
+    .await
+    .expect("move the network");
     drop(pool);
     let mut config_b = bnc_config(up, url.clone());
     config_b.networks[0].addr = UNREACHABLE.into();
@@ -1214,19 +1237,47 @@ async fn local_driver_presents_the_in_process_network() {
                         && m.params.get(1).map(String::as_str)
                             == Some("hi from the main listener") =>
                 {
-                    return true;
+                    return Some(m);
                 }
                 Some(_) => {}
-                None => return false,
+                None => return None,
             }
         }
     })
     .await
-    .expect("timeout");
-    assert!(
-        got,
-        "local network did not relay in-process channel traffic"
-    );
+    .expect("timeout")
+    .expect("local network did not relay in-process channel traffic");
+    // The in-process session negotiated `message-tags` and `server-time` with
+    // the core: the message carries the core's msgid and time, and a reaction
+    // naming that msgid, and a typing indicator, reach the other client with
+    // their client-only tags.
+    let msgid = got.tag("msgid").expect("the core's msgid").to_string();
+    assert!(got.tag("time").is_some(), "{got:?}");
+    for (line, tag, value) in [
+        (
+            "@+typing=active TAGMSG #local".to_string(),
+            "+typing",
+            "active".to_string(),
+        ),
+        (
+            format!("@+draft/react=\u{1f44d};+draft/reply={msgid} TAGMSG #local"),
+            "+draft/reply",
+            msgid.clone(),
+        ),
+    ] {
+        client.send_line(&line).await.unwrap();
+        let tagged = tokio::time::timeout(deadline::HANG, async {
+            loop {
+                let m = peer.next_message().await.unwrap().expect("peer open");
+                if m.command == "TAGMSG" {
+                    return m;
+                }
+            }
+        })
+        .await
+        .expect("the TAGMSG reaches the other client");
+        assert_eq!(tagged.tag(tag), Some(value.as_str()), "{tagged:?}");
+    }
 }
 
 /// The persistence task must actually reach the trim. Driven through the real
@@ -1280,10 +1331,39 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
         }
     };
 
+    // Whether `text`, a PRIVMSG the peer sent, is stored yet. One task stores
+    // a network's lines in order and trims in line, so once a line is stored,
+    // every line sent before it, and every trim they were owed, is done.
+    let stored = |text: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM bnc_buffer WHERE owner = 'alice' \
+                 AND network = 'up' AND line LIKE '%PRIVMSG #lobby :' || $1)",
+            )
+            .bind(text)
+            .fetch_one(&pool)
+            .await
+            .expect("stored-line query")
+        }
+    };
+    let wait_stored = |text: String| async move {
+        tokio::time::timeout(deadline::HANG, async {
+            while !stored(text.clone()).await {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{text:?} was never stored"));
+    };
+
     // Enough traffic to cross the retention cap and reach a trim beyond it.
-    // Sent in paced batches: the persistence task reads from a bounded
-    // broadcast, so an unpaced flood makes it lag and drop lines (it says so on
-    // stderr) and the test would measure the lag rather than the trim.
+    // Each batch waits for its own last line to be stored before the next is
+    // sent: the persistence task reads from a bounded broadcast, so an
+    // unpaced flood makes it lag and drop lines (it says so on stderr) and the
+    // test would measure the lag rather than the trim. Pacing on the row
+    // count, as this used to, stopped pacing at all once the count reached
+    // the cap and the trim held it there.
     let target = 5_000 + 2 * e6ircd::db::BNC_TRIM_INTERVAL as i64 + 100;
     let mut sent = 0i64;
     while sent < target {
@@ -1293,35 +1373,16 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
                 .expect("send");
         }
         sent += 250;
-        // Let persistence catch up before sending more.
-        let want = sent.min(5_000);
-        tokio::time::timeout(deadline::HANG, async {
-            while rows().await < want {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("persistence fell behind at {sent} lines"));
+        wait_stored(format!("line {}", sent - 1)).await;
     }
 
-    // Everything is sent; wait for the count to stop moving before asserting.
-    // Sampling while it is still climbing would pass on a buffer that is merely
-    // *passing through* the bound on its way past it — which is exactly what an
-    // earlier version of this test did, and it stayed green with the trim
-    // disabled.
-    let settled = tokio::time::timeout(deadline::HANG, async {
-        let mut last = -1i64;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let n = rows().await;
-            if n == last {
-                return n;
-            }
-            last = n;
-        }
-    })
-    .await
-    .expect("the persisted buffer never stopped growing");
+    // Everything is sent and stored. Counting now, rather than while the
+    // count still climbs, is what makes this a test of the trim: a sample
+    // taken mid-flight passes on a buffer merely *passing through* the bound
+    // (an earlier version did, and stayed green with the trim disabled), and
+    // so does waiting for a quiet spell whenever persistence stalls that long
+    // on a busy runner.
+    let settled = rows().await;
     let bound = 5_000 + e6ircd::db::BNC_TRIM_INTERVAL as i64;
     assert!(
         settled > 5_000 - e6ircd::db::BNC_TRIM_INTERVAL as i64 && settled <= bound,
@@ -1920,7 +1981,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
         .collect();
     assert_eq!(notices.len(), 1, "one notice per rename: {notices:?}");
     assert!(
-        notices[0].starts_with(":*bnc* NOTICE * :")
+        untimed(&notices[0]).starts_with(":*bnc* NOTICE * :")
             && notices[0].contains("(renamed_by_upstream); upstream: upstream renamed this session from bncbot to renamed"),
         "{notices:?}"
     );
@@ -2041,17 +2102,24 @@ async fn events_within(
 /// An upstream that offers `echo-message` is asked for it, and its echo is
 /// the one the originator sees: an upstream that refuses the message (404)
 /// sends no echo, so the refusal — not a bouncer-made echo written before the
-/// upstream answered — is the verdict an attached `e6irc send` reads.
+/// upstream answered — is the verdict an attached `e6irc send` reads. The
+/// refusal answers that one attachment's line: it reaches that attachment,
+/// and neither the others nor the backlog.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
     let handle = echo_message_upstream(&[":up 404 bncbot #room :Cannot send to channel"]).await;
     let mut events = handle.subscribe();
+    let mut replies = handle.route_replies(7);
     wait_connected(&handle, &mut events).await;
     assert_eq!(
         handle.send_from(7, "PRIVMSG #room :hello"),
         SendOutcome::Sent
     );
-    let seen = events_within(&mut events, std::time::Duration::from_secs(2)).await;
+    let refusal = tokio::time::timeout(deadline::HANG, replies.recv())
+        .await
+        .expect("the refusal reaches the attachment that sent the line");
+    assert!(refusal.contains(" 404 bncbot #room "), "{refusal}");
+    let seen = events_within(&mut events, std::time::Duration::from_secs(1)).await;
     assert!(
         !seen
             .iter()
@@ -2059,11 +2127,18 @@ async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
         "a refused message was echoed: {seen:?}"
     );
     assert!(
-        seen.iter().any(|event| matches!(
+        !seen.iter().any(|event| matches!(
             event,
             DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }) if line.contains(" 404 ")
         )),
-        "the refusal reaches the attached clients: {seen:?}"
+        "the refusal is not everyone's: {seen:?}"
+    );
+    assert!(
+        !handle
+            .buffer_snapshot()
+            .iter()
+            .any(|line| line.contains(" 404 ")),
+        "the refusal is not history"
     );
 }
 
@@ -3558,11 +3633,12 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
     .await
     .unwrap_or_else(|_| panic!("no notice about the closed link: {read:?}"));
     assert_eq!(
-        read.last().map(String::as_str),
+        read.last().map(|line| untimed(line)).as_deref(),
         Some(":*bnc* NOTICE * :upstream closed the link: Closing Link: 127.0.0.1 (Excess Flood)"),
         "{read:?}"
     );
     let is_error_command = |line: &str| {
+        let line = untimed(line);
         line.strip_prefix(':')
             .and_then(|rest| rest.split_once(' '))
             .map_or(line.starts_with("ERROR"), |(_, rest)| {
@@ -4010,8 +4086,616 @@ async fn bnc_attach_refuses_a_throttled_account_with_the_wait() {
     })
     .await
     .expect("timed out waiting for the SASL verdict");
+    // Addressed to the nick the client gave, like every other attach verdict.
     assert!(
-        verdict.contains(" 904 * :Too many failed login attempts"),
+        verdict.contains(" 904 alice/up :Too many failed login attempts"),
         "{verdict}"
+    );
+}
+
+/// Register as `nick` against an upstream that offers `offered` and
+/// acknowledges exactly the capabilities in `acknowledged`, answering each
+/// request the driver makes, whatever its order.
+async fn register_offering(
+    session: &mut FakeSession,
+    nick: &str,
+    offered: &str,
+    acknowledged: &[&str],
+) {
+    assert_eq!(session.read_line().await, "CAP LS 302");
+    session.send(&format!(":up CAP * LS :{offered}")).await;
+    loop {
+        let line = session.read_line().await;
+        if let Some(requested) = line.strip_prefix("CAP REQ :") {
+            let verdict = if requested
+                .split(' ')
+                .all(|capability| acknowledged.contains(&capability))
+            {
+                "ACK"
+            } else {
+                "NAK"
+            };
+            session
+                .send(&format!(":up CAP * {verdict} :{requested}"))
+                .await;
+        } else if line.starts_with("USER ") {
+            session.send(&format!(":up 001 {nick} :welcome")).await;
+            return;
+        }
+    }
+}
+
+/// Start a driver for `nick` against the fake upstream on `listener`'s address.
+fn driver_at(addr: std::net::SocketAddr, nick: &str) -> NetworkHandle {
+    IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: nick.parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    })
+}
+
+/// The next line the fake upstream reads that is not the end of the driver's
+/// registration or its own correlation `PING` (answered here).
+async fn next_command(session: &mut FakeSession) -> String {
+    loop {
+        let line = session.read_line().await;
+        if line == "CAP END" {
+            continue;
+        }
+        if let Some(token) = line.strip_prefix("PING :e6bnc-route-") {
+            session
+                .send(&format!(":up PONG up :e6bnc-route-{token}"))
+                .await;
+            continue;
+        }
+        return line;
+    }
+}
+
+/// A `/LIST` of a large network, asked for by one client, reaches that client
+/// alone: no other attached client reads it, it enters neither the ring nor
+/// the stored backlog, and — tens of thousands of lines, sent faster than any
+/// client reads — it cannot overrun the broadcast every client shares and
+/// detach them, nor evict the conversation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_list_reaches_only_the_client_that_asked_for_it() {
+    const CHANNELS: usize = 5000;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        session.send(":peer!u@h PRIVMSG #room :before").await;
+        loop {
+            let line = next_command(&mut session).await;
+            if line == "LIST" {
+                session.send(":up 321 bncbot Channel :Users  Name").await;
+                for index in 0..CHANNELS {
+                    session
+                        .send(&format!(":up 322 bncbot #channel{index} 3 :a topic"))
+                        .await;
+                }
+                session.send(":up 323 bncbot :End of /LIST").await;
+                session.send(":peer!u@h PRIVMSG #room :after").await;
+            } else if line == "WHO #room" {
+                session
+                    .send(":up 352 bncbot #room u h up peer H :0 Peer")
+                    .await;
+                session
+                    .send(":up 315 bncbot #room :End of /WHO list.")
+                    .await;
+            }
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    let mut asker = handle.route_replies(7);
+    let mut bystander = handle.route_replies(8);
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(handle.send_from(7, "LIST"), SendOutcome::Sent);
+    let mut listed = 0;
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let line = untimed(&asker.recv().await);
+            assert!(!line.contains("dropped"), "{line}");
+            if line.contains(" 322 ") {
+                listed += 1;
+            }
+            if line.contains(" 323 ") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the LIST reached the client that asked");
+    assert_eq!(listed, CHANNELS);
+    assert_eq!(handle.send_from(8, "WHO #room"), SendOutcome::Sent);
+    let who = tokio::time::timeout(deadline::HANG, bystander.recv())
+        .await
+        .expect("the WHO reached the client that asked");
+    assert!(who.contains(" 352 bncbot #room "), "{who}");
+    // Everyone else read the conversation, and nothing of either reply.
+    let mut conversation = Vec::new();
+    tokio::time::timeout(deadline::HANG, async {
+        while conversation.len() < 2 {
+            match events.recv().await {
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) => {
+                    assert!(
+                        !line.contains(" 322 ") && !line.contains(" 352 "),
+                        "a reply was broadcast: {line}"
+                    );
+                    if line.contains("PRIVMSG #room") {
+                        conversation.push(untimed(&line));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the shared broadcast failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the conversation continued");
+    assert_eq!(
+        conversation,
+        [
+            ":peer!u@h PRIVMSG #room :before",
+            ":peer!u@h PRIVMSG #room :after"
+        ]
+    );
+    assert!(
+        handle
+            .buffer_snapshot()
+            .iter()
+            .all(|line| !line.contains(" 322 ") && !line.contains(" 352 ")),
+        "a reply entered the ring"
+    );
+}
+
+/// With `labeled-response` the upstream names the command each line answers:
+/// the driver labels what it forwards, a labelled answer reaches the client
+/// that sent the command (its batch unwrapped), and a labelled echo is routed
+/// to its sender by the label alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn labelled_replies_reach_the_client_whose_command_they_answer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        let offered = "server-time message-tags account-tag echo-message batch labeled-response";
+        register_offering(
+            &mut session,
+            "bncbot",
+            offered,
+            &offered.split(' ').collect::<Vec<_>>(),
+        )
+        .await;
+        loop {
+            let line = session.read_line().await;
+            let Some((tags, command)) =
+                line.strip_prefix('@').and_then(|rest| rest.split_once(' '))
+            else {
+                continue;
+            };
+            let label = tags
+                .split(';')
+                .find_map(|tag| tag.strip_prefix("label="))
+                .expect("a labelled command")
+                .to_string();
+            heard_tx.send(line.clone()).await.unwrap();
+            if command == "WHO #room" {
+                session
+                    .send(&format!("@label={label} :up BATCH +w labeled-response"))
+                    .await;
+                session
+                    .send("@batch=w :up 352 bncbot #room u h up peer H :0 Peer")
+                    .await;
+                session
+                    .send("@batch=w :up 315 bncbot #room :End of /WHO list.")
+                    .await;
+                session.send(":up BATCH -w").await;
+            } else if command == "PRIVMSG #room :same words" {
+                session
+                    .send(&format!(
+                        "@label={label};time=2026-09-21T10:00:00.000Z :bncbot!~b@up PRIVMSG #room :same words"
+                    ))
+                    .await;
+            }
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    let mut replies = handle.route_replies(7);
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(handle.send_from(7, "WHO #room"), SendOutcome::Sent);
+    let sent = tokio::time::timeout(deadline::HANG, heard_rx.recv())
+        .await
+        .expect("forwarded")
+        .expect("heard");
+    assert!(
+        sent.starts_with("@label=") && sent.ends_with(" WHO #room"),
+        "{sent}"
+    );
+    for expected in [" 352 bncbot #room ", " 315 bncbot #room "] {
+        let line = tokio::time::timeout(deadline::HANG, replies.recv())
+            .await
+            .expect("routed");
+        assert!(line.contains(expected), "{line}");
+        assert!(
+            !line.contains("batch=") && !line.contains("label="),
+            "{line}"
+        );
+    }
+    // Two clients say the same words: the echo is the one the label names.
+    assert_eq!(
+        handle.send_from(3, "PRIVMSG #room :same words"),
+        SendOutcome::Sent
+    );
+    tokio::time::timeout(deadline::HANG, heard_rx.recv())
+        .await
+        .expect("forwarded");
+    let echo = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            if let Ok(DriverEvent::Echo { line, origin }) = events.recv().await {
+                return (line.line, origin);
+            }
+        }
+    })
+    .await
+    .expect("echoed");
+    assert_eq!(echo.1, 3, "{echo:?}");
+    assert!(!echo.0.contains("label="), "{echo:?}");
+    assert!(
+        handle
+            .buffer_snapshot()
+            .iter()
+            .all(|line| !line.contains(" 352 ")),
+        "a labelled reply entered the ring"
+    );
+}
+
+/// An upstream without `message-tags` cannot carry a tag: a client's tags are
+/// stripped before its line is written (a server that does not parse tags
+/// would take the tag section for the command), its `TAGMSG` is answered by
+/// the bouncer to that client alone rather than refused in front of everyone,
+/// and the echo of what was sent shows no tag the upstream never saw.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_tags_never_reach_an_upstream_that_cannot_carry_them() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        register_offering(&mut session, "bncbot", "server-time", &["server-time"]).await;
+        loop {
+            let line = next_command(&mut session).await;
+            heard_tx.send(line).await.unwrap();
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    let mut replies = handle.route_replies(7);
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(
+        handle.send_from(7, "@+typing=active TAGMSG #room"),
+        SendOutcome::Sent
+    );
+    let refusal = tokio::time::timeout(deadline::HANG, replies.recv())
+        .await
+        .expect("the bouncer answers the TAGMSG");
+    assert!(
+        refusal.contains("FAIL TAGMSG CLIENT_TAGS_UNSUPPORTED #room"),
+        "{refusal}"
+    );
+    assert_eq!(
+        handle.send_from(7, "@+draft/reply=abc PRIVMSG #room :hi"),
+        SendOutcome::Sent
+    );
+    let heard = tokio::time::timeout(deadline::HANG, heard_rx.recv())
+        .await
+        .expect("forwarded")
+        .expect("heard");
+    assert_eq!(
+        heard, "PRIVMSG #room :hi",
+        "only the message, tags stripped"
+    );
+    let echo = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            if let Ok(DriverEvent::Echo { line, .. }) = events.recv().await {
+                return line.line;
+            }
+        }
+    })
+    .await
+    .expect("echoed");
+    assert!(!echo.contains("draft/reply"), "{echo}");
+    assert!(echo.ends_with(" PRIVMSG #room :hi"), "{echo}");
+}
+
+/// A channel whose rejoin the upstream refuses is not rejoined after every
+/// reconnect from then on, and a channel the intent holds that this session is
+/// not in can be dropped from it with PART, with a truthful reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_rejoin_is_not_retried_forever() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<(u8, String)>(32);
+    let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(4);
+    tokio::spawn(async move {
+        for session_number in 1u8.. {
+            let mut session = fake_accept(&listener).await;
+            session.complete_registration("bncbot").await;
+            loop {
+                tokio::select! {
+                    _ = drop_rx.recv() => break,
+                    line = next_command(&mut session) => {
+                        heard_tx.send((session_number, line.clone())).await.unwrap();
+                        match (session_number, line.as_str()) {
+                            (1, "JOIN #keyed,#banned hunter2") => {
+                                session.send(":bncbot!~b@up JOIN #keyed").await;
+                                session.send(":bncbot!~b@up JOIN #banned").await;
+                                session.send(":bncbot!~b@up JOIN #stale").await;
+                            }
+                            (2, join) if join.starts_with("JOIN ") => {
+                                session.send(":bncbot!~b@up JOIN #keyed").await;
+                                session
+                                    .send(":up 474 bncbot #banned :Cannot join channel (+b)")
+                                    .await;
+                                // #stale: the upstream says nothing at all.
+                            }
+                            (_, part) if part.starts_with("PART ") => {
+                                session
+                                    .send(":up 442 bncbot #stale :You're not on that channel")
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    let mut replies = handle.route_replies(7);
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(
+        handle.send_from(7, "JOIN #keyed,#banned hunter2"),
+        SendOutcome::Sent
+    );
+    let wait_session = |channels: usize| {
+        let handle = &handle;
+        async move {
+            tokio::time::timeout(deadline::HANG, async {
+                while handle
+                    .irc_session_snapshot()
+                    .is_none_or(|session| session.channels.len() != channels)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("membership never settled");
+        }
+    };
+    wait_session(3).await;
+    drop_tx.send(()).await.unwrap();
+    // The second session rejoins every channel, the keyed one with its key.
+    let rejoin = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let (session, line) = heard_rx.recv().await.expect("heard");
+            if session == 2 {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("rejoined");
+    assert!(rejoin.starts_with("JOIN #keyed,"), "{rejoin}");
+    assert!(rejoin.ends_with(" hunter2"), "{rejoin}");
+    assert!(
+        rejoin.contains("#banned") && rejoin.contains("#stale"),
+        "{rejoin}"
+    );
+    wait_session(1).await;
+    tokio::time::timeout(deadline::HANG, async {
+        while !handle
+            .buffer_snapshot()
+            .iter()
+            .any(|line| line.contains("#banned will not be rejoined"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refused channel is announced as dropped");
+    // #stale was never rejoined, and nothing says why: the client's PART is
+    // the one way to drop it, answered truthfully — by the bouncer, and by
+    // the upstream, which never had it.
+    assert_eq!(handle.send_from(7, "PART #stale"), SendOutcome::Sent);
+    for expected in [
+        "#stale: no longer rejoined after a reconnect",
+        " 442 bncbot #stale ",
+    ] {
+        let answer = tokio::time::timeout(deadline::HANG, replies.recv())
+            .await
+            .expect("answered");
+        assert!(answer.contains(expected), "{answer}");
+    }
+    drop_tx.send(()).await.unwrap();
+    let third = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let (session, line) = heard_rx.recv().await.expect("heard");
+            if session == 3 {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("the third session rejoined");
+    assert_eq!(
+        third, "JOIN #keyed hunter2",
+        "refused channels are not rejoined"
+    );
+    let notices: Vec<String> = handle
+        .buffer_snapshot()
+        .into_iter()
+        .filter(|line| line.contains("will not be rejoined"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+}
+
+/// The upstream can withdraw `echo-message` at any time (`CAP DEL`): the
+/// driver then makes the echo itself instead of waiting for one that will
+/// never come, and a capability the upstream newly offers is asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_echo_message_is_followed_mid_session() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session
+            .complete_registration_with_echo_message("bncbot")
+            .await;
+        go_rx.recv().await;
+        session.send(":up CAP bncbot DEL :echo-message").await;
+        session.send(":up CAP bncbot NEW :batch").await;
+        loop {
+            let line = next_command(&mut session).await;
+            if line == "CAP REQ :batch" {
+                session.send(":up CAP bncbot ACK :batch").await;
+            }
+            heard_tx.send(line).await.unwrap();
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    go_tx.send(()).await.unwrap();
+    let requested = tokio::time::timeout(deadline::HANG, heard_rx.recv())
+        .await
+        .expect("asked")
+        .expect("heard");
+    assert_eq!(requested, "CAP REQ :batch");
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG #room :hello"),
+        SendOutcome::Sent
+    );
+    let echo = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            if let Ok(DriverEvent::Echo { line, origin }) = events.recv().await {
+                return (line.line, origin);
+            }
+        }
+    })
+    .await
+    .expect("the bouncer echoes once the upstream no longer does");
+    assert_eq!(echo.1, 7);
+    assert!(echo.0.ends_with(" PRIVMSG #room :hello"), "{echo:?}");
+}
+
+/// A raw client has no cursor; its account's read markers are its position.
+/// Each conversation is replayed from where the account stopped reading it —
+/// a message at or before the marker is not replayed, and the client is told
+/// how many were left to CHATHISTORY — and a conversation with no marker is
+/// replayed whole.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_attach_replays_each_conversation_from_its_read_marker() {
+    let url = bnc_account_db(
+        "an_attach_replays_each_conversation_from_its_read_marker",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    wait_joined(up, "bncnick", "#lobby").await;
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+        server_password: None,
+    })
+    .await
+    .unwrap();
+    peer.send_line("JOIN #lobby").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    // A marker is a time: messages a millisecond apart are told apart by it.
+    for text in ["first read", "second read", "third unread"] {
+        peer.send_line(&format!("PRIVMSG #lobby :{text}"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    peer.send_line("PRIVMSG bncnick :a direct message")
+        .await
+        .unwrap();
+    let pool = observer_pool(&url).await;
+    let stored = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let lines = e6ircd::db::recent_bnc_backlog(&pool, "alice", "up", 100)
+                .await
+                .expect("read");
+            if lines
+                .iter()
+                .any(|(line, _)| line.contains("a direct message"))
+            {
+                return lines;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the backlog was never persisted");
+    let read_up_to = stored
+        .iter()
+        .find(|(line, _)| line.contains("second read"))
+        .map(|(_, sent_at)| sent_at.clone())
+        .expect("stored");
+    e6ircd::db::set_bnc_read_marker(
+        &pool,
+        "alice",
+        "up",
+        "#LOBBY",
+        e6irc_proto::casemap::CaseMapping::Rfc1459,
+        &read_up_to,
+    )
+    .await
+    .expect("marker");
+
+    let mut client = bnc_attach_with_history(bnc, "alice/up", "alice", "s3cr3t").await;
+    let mut replayed = Vec::new();
+    while let Ok(Ok(Some(message))) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), client.next_message()).await
+    {
+        replayed.push(message);
+    }
+    let texts: Vec<&str> = replayed
+        .iter()
+        .filter(|message| message.command == "PRIVMSG")
+        .filter_map(|message| message.params.last().map(String::as_str))
+        .collect();
+    assert_eq!(texts, ["third unread", "a direct message"], "{replayed:#?}");
+    assert!(
+        replayed.iter().any(|message| message.command == "NOTICE"
+            && message
+                .params
+                .last()
+                .is_some_and(|text| text.starts_with("2 message(s) before your read markers"))),
+        "{replayed:#?}"
     );
 }
