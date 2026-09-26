@@ -4209,6 +4209,30 @@ mod client_ip_tests {
         assert_eq!(got, client("203.0.113.7"));
     }
 
+    /// A WebSocket is secure (umode +Z) only when a trusted proxy says every
+    /// hop was HTTPS: a direct client's own header, a mixed chain, or a
+    /// missing header is plaintext.
+    #[test]
+    fn only_a_trusted_all_https_forwarded_proto_is_secure() {
+        let trusted = [net("10.0.0.0/8")];
+        let proto = |values: &[&str]| {
+            let mut headers = axum::http::HeaderMap::new();
+            for value in values {
+                headers.append("x-forwarded-proto", value.parse().expect("header"));
+            }
+            headers
+        };
+        let secure = |peer: &str, values: &[&str]| {
+            super::oidc::forwarded_https(ip(peer), &proto(values), &trusted)
+        };
+        assert!(secure("10.0.0.1", &["https"]));
+        assert!(secure("10.0.0.1", &["HTTPS", "https"]));
+        assert!(!secure("203.0.113.7", &["https"]), "untrusted peer");
+        assert!(!secure("10.0.0.1", &["https, http"]), "a plaintext hop");
+        assert!(!secure("10.0.0.1", &["https", "http"]), "a plaintext hop");
+        assert!(!secure("10.0.0.1", &[]), "no header");
+    }
+
     #[test]
     fn trusted_proxy_without_header_falls_back_to_peer() {
         let trusted = [net("10.0.0.0/8")];

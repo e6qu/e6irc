@@ -146,8 +146,10 @@ pub(super) const CHANMODES_FLAGS: &str = crate::core::state::ChanModes::FLAGS;
 /// Membership prefix modes, in rank order, with their `PREFIX` sigils.
 pub(super) const PREFIX_MODES: &str = "ov";
 pub(super) const PREFIX_SIGILS: &str = "@+";
-/// User modes, as [`user_mode`] applies them and RPL_UMODEIS reports them.
-pub(super) const USER_MODES: &str = "iowB";
+/// User modes, as [`user_mode`] applies them and RPL_UMODEIS reports them:
+/// `+R` (only logged-in users may message you) and `+Z` (a TLS connection,
+/// set by the server alone) as Solanum has them.
+pub(super) const USER_MODES: &str = "iowBRZ";
 
 /// `CHANMODES=A,B,C,D` from the tables above.
 pub(super) fn chanmodes_isupport() -> String {
@@ -532,8 +534,9 @@ pub(super) fn join_on_owner(
             letters.push('v');
             args.push_str(&format!(" {nick}"));
         }
-        let server = &state.config.server_name;
-        let line = EventLine::by_server(now, format!(":{server} MODE {display} {letters}{args}"));
+        // ChanServ grants the access, so ChanServ sets the mode.
+        let source = state.service_prefix("ChanServ");
+        let line = EventLine::by_server(now, format!(":{source} MODE {display} {letters}{args}"));
         state.broadcast_channel(&key, &line, Some(conn));
         own_modes.push(line);
     }
@@ -1079,17 +1082,13 @@ fn topic_set_on_owner(
     if chan.modes.topic_ops_only && !member.op {
         return Some(crate::core::state::ChannelTopicResult::NotOperator { target });
     }
-    // A quieted or banned member can't set the topic (which would evade the
-    // quiet by defacing the channel), unless op/voice. This is deliberately
-    // only the ban/quiet part of `Channel::may_speak`, not the whole gate: +m
-    // (moderated) governs messages, not topic changes, so it must NOT be folded
-    // in here — a regular member of a +m, -t channel may still set the topic.
-    let exempt = member.op || member.voice;
-    if !exempt {
-        let blocked = state.channels[&key].is_silenced(state.casemap, &actor.mask_subject());
-        if blocked {
-            return Some(crate::core::state::ChannelTopicResult::CannotSend { target });
-        }
+    // Setting the topic is speaking to the channel: a member who may not send
+    // to it may not set its topic either (Solanum's `m_topic` requires
+    // `can_send`). So a banned or quieted member cannot deface the channel to
+    // evade the quiet, and an unvoiced member of a `+m -t` channel cannot use
+    // the topic to talk past the moderation; an op or voice always may.
+    if !chan.may_speak(Some(member), state.casemap, &actor.mask_subject()) {
+        return Some(crate::core::state::ChannelTopicResult::CannotSend { target });
     }
     let new_text = truncate_chars(&raw_text, TOPICLEN);
     let prefix = actor.identity.prefix.clone();
@@ -1602,7 +1601,7 @@ pub(super) fn mode_list_query_on_owner(
         .chars()
         .map(|mode| crate::core::state::ChannelModeList {
             mode,
-            masks: channel_list_masks(chan, mode, is_op).expect("validated list mode"),
+            entries: channel_list_entries(chan, mode, is_op).expect("validated list mode"),
         })
         .collect();
     crate::core::state::ChannelModeListQueryResult::Lists {
@@ -1708,7 +1707,7 @@ fn emit_mode_list_query_result_now(
         ),
         crate::core::state::ChannelModeListQueryResult::Lists { display, lists } => {
             for list in lists {
-                emit_channel_list_rows(state, conn, &display, list.mode, &list.masks);
+                emit_channel_list_rows(state, conn, &display, list.mode, &list.entries);
             }
         }
     }
@@ -1771,7 +1770,8 @@ fn enforce_mlock(state: &mut ServerState, key: &ChanKey) -> Option<EventLine> {
         spec.push('-');
         spec.push_str(&off_changes);
     }
-    Some(state.server_line(format!(":ChanServ MODE {display} {spec}")))
+    let source = state.service_prefix("ChanServ");
+    Some(state.server_line(format!(":{source} MODE {display} {spec}")))
 }
 
 /// Whether user mode `c` is set on `session`; `None` for a char that is not a
@@ -1784,6 +1784,8 @@ pub(super) fn user_mode_is_set(session: &crate::core::state::Session, c: char) -
         'o' => session.oper.is_some(),
         'w' => session.wallops,
         'B' => session.bot,
+        'R' => session.registered_only,
+        'Z' => session.secure(),
         _ => return None,
     })
 }
@@ -1827,15 +1829,21 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
     let mut adding = true;
     let mut unknown = false;
     let session = state.sessions.get_mut(&conn).expect("registered");
-    for c in rest.join("").chars() {
+    // Only the first argument is a mode string; no user mode here takes a
+    // parameter, so the rest are ignored (Solanum's `user_mode` reads
+    // `parv[2]` alone). Joining them would read `MODE me +i foo` as `+ifoo`.
+    for c in rest[0].chars() {
         match c {
             '+' => adding = true,
             '-' => adding = false,
             'i' => session.invisible = adding,
             'w' => session.wallops = adding,
             'B' => session.bot = adding,
+            'R' => session.registered_only = adding,
             'o' if !adding => session.oper = None,
-            'o' => {} // +o only via OPER
+            // +o only via OPER; +Z follows the transport, set by the server
+            // alone (Solanum ignores a client's +Z/-Z the same way).
+            'o' | 'Z' => {}
             _ => unknown = true,
         }
     }
@@ -1861,9 +1869,9 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
     }
     let server = state.config.server_name.clone();
     state.send(conn, &format!(":{server} MODE {self_nick} :{applied}"));
-    // Every user mode but +w is part of what channel peers see (WHO flags,
-    // the bot tag, oper status), so any change republishes the member.
-    if applied.chars().any(|c| c != 'w' && c != '+' && c != '-') {
+    // Every user mode but +w and +R is part of what channel peers see (WHO
+    // flags, the bot tag, oper status), so any change republishes the member.
+    if applied.chars().any(|c| !matches!(c, 'w' | 'R' | '+' | '-')) {
         state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 }
@@ -1894,21 +1902,21 @@ fn emit_channel_list(
     is_op: bool,
 ) -> ListQuery {
     let chan = &state.channels[key];
-    let Some(masks) = channel_list_masks(chan, mode, is_op) else {
+    let Some(entries) = channel_list_entries(chan, mode, is_op) else {
         return ListQuery::NotAList;
     };
     if matches!(mode, 'e' | 'I') && !is_op {
         return ListQuery::Forbidden;
     }
-    emit_channel_list_rows(state, conn, display, mode, &masks);
+    emit_channel_list_rows(state, conn, display, mode, &entries);
     ListQuery::Dumped
 }
 
-fn channel_list_masks(
+fn channel_list_entries(
     chan: &crate::core::state::Channel,
     mode: char,
     is_op: bool,
-) -> Option<Vec<String>> {
+) -> Option<Vec<crate::core::state::ListEntry>> {
     let masks = match mode {
         'b' => &chan.bans,
         'q' => &chan.quiets,
@@ -1917,7 +1925,7 @@ fn channel_list_masks(
         'e' | 'I' => return Some(Vec::new()),
         _ => return None,
     };
-    Some(masks.iter().map(|mask| mask.as_str().to_string()).collect())
+    Some(masks.clone())
 }
 
 fn emit_channel_list_rows(
@@ -1925,7 +1933,7 @@ fn emit_channel_list_rows(
     conn: ConnId,
     display: &str,
     mode: char,
-    masks: &[String],
+    entries: &[crate::core::state::ListEntry],
 ) {
     let (item_code, end_code, infix, end_text) = match mode {
         'b' => (
@@ -1954,10 +1962,14 @@ fn emit_channel_list_rows(
         ),
         _ => unreachable!("MODE list rows require a list mode"),
     };
-    for mask in masks {
+    // Each row names the mask's setter and when it was set, as Solanum's
+    // `367 <me> <channel> <mask> <setter> <set-at>` does.
+    for entry in entries {
+        let (mask, setter) = (entry.mask.as_str(), entry.set_by.as_str());
+        let set_at = entry.set_at_secs.to_string();
         match infix {
-            Some(ch) => state.numeric(conn, item_code, &[display, ch, mask], None),
-            None => state.numeric(conn, item_code, &[display, mask], None),
+            Some(ch) => state.numeric(conn, item_code, &[display, ch, mask, setter, &set_at], None),
+            None => state.numeric(conn, item_code, &[display, mask, setter, &set_at], None),
         }
     }
     match infix {
@@ -2053,6 +2065,7 @@ fn channel_mode_by(
     let mut parameter_modes = 0;
     let mut over_limit = String::new();
     let mut over_limit_sign = ' ';
+    let mut unknown_reported = false;
 
     for c in rest[0].chars() {
         let takes_parameter = match c {
@@ -2111,6 +2124,13 @@ fn channel_mode_by(
                 if *field != adding {
                     *field = adding;
                     changes.push((adding, c, None));
+                    // Opening the channel revokes the invitations it held, so
+                    // none is stocked to be honoured after it is locked again
+                    // (ircd-hybrid's `-i`); `-l` does the same unless `+i`
+                    // still needs them (see `invite_on_owner`).
+                    if c == 'i' && !adding {
+                        chan.invited.clear();
+                    }
                 }
             }
             'k' => {
@@ -2190,6 +2210,9 @@ fn channel_mode_by(
                     }
                 } else if chan.modes.limit.take().is_some() {
                     changes.push((false, 'l', None));
+                    if !chan.modes.invite_only {
+                        chan.invited.clear();
+                    }
                 }
             }
             'b' | 'q' | 'e' | 'I' => {
@@ -2240,7 +2263,7 @@ fn channel_mode_by(
                     'I' => &chan_ref.invite_exceptions,
                     _ => unreachable!("outer arm matched only these list-mode chars"),
                 };
-                let is_new = !list_ref.contains(&mask_key);
+                let is_new = !list_ref.iter().any(|entry| entry.mask == mask_key);
                 let combined = chan_ref.bans.len()
                     + chan_ref.quiets.len()
                     + chan_ref.ban_exceptions.len()
@@ -2270,12 +2293,16 @@ fn channel_mode_by(
                 // ways: don't drop real changes, don't invent phantom ones).
                 let changed = if adding {
                     if is_new {
-                        list.push(mask_key);
+                        list.push(crate::core::state::ListEntry {
+                            mask: mask_key,
+                            set_by: actor.identity.prefix.clone(),
+                            set_at_secs: (state.config.clock)().as_secs(),
+                        });
                     }
                     is_new
                 } else {
                     let before = list.len();
-                    list.retain(|b| *b != mask_key);
+                    list.retain(|entry| entry.mask != mask_key);
                     list.len() != before
                 };
                 if changed {
@@ -2318,7 +2345,12 @@ fn channel_mode_by(
                     changes.push((adding, c, Some(member_nick)));
                 }
             }
+            // One ERR_UNKNOWNMODE per command, naming the first unknown letter
+            // (Solanum's `chm_nosuch` and its `SM_ERR_UNKNOWN` flag): a string
+            // of junk letters is one mistake, not one reply per byte.
+            _ if unknown_reported => {}
             other => {
+                unknown_reported = true;
                 // A mode char echoed as a middle; a ':' mode char (reachable
                 // via `MODE #c ::x`) would open the trailing early, so route it
                 // through the framing-safe echo like the other client echoes.

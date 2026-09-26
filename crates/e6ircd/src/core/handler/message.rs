@@ -237,6 +237,17 @@ fn speak_refusal(
     None
 }
 
+/// ERR_NONONREG: `nick`'s +R refused the sender, who is not logged in
+/// (Solanum's `um_regonlymsg` wording).
+pub(super) fn err_nonreg(state: &mut ServerState, conn: ConnId, nick: &str) {
+    state.numeric(
+        conn,
+        ERR_NONONREG,
+        &[nick],
+        Some("You must log in with services to message this user"),
+    );
+}
+
 /// Tell the sender why [`speak_refusal`] refused its message to `target`.
 fn emit_speak_refusal(state: &mut ServerState, conn: ConnId, target: &str, why: SpeakRefusal) {
     let (numeric, text) = match why {
@@ -292,6 +303,14 @@ pub(super) fn resolve_message_target(
             }
             return None;
         };
+        // +R: only a logged-in sender (or an operator) reaches this user. A
+        // NOTICE is refused silently, as every NOTICE refusal is.
+        if peer.refuses_unregistered(conn, &state.sessions[&conn]) {
+            if loud {
+                err_nonreg(state, conn, &peer.nick);
+            }
+            return None;
+        }
         return Some(ResolvedTarget {
             recipients: vec![peer.recipient],
             kind: ResolvedKind::User { peer },

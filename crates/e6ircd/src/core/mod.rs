@@ -963,6 +963,8 @@ pub enum AdminRequest {
         kind: String,
         reason: String,
         actor: String,
+        /// A temporary ban's length; `None` for a permanent one.
+        duration_minutes: Option<std::num::NonZeroU32>,
     },
     /// Remove a K/D/X-line by (mask, kind).
     RemoveServerBan {
@@ -1116,7 +1118,13 @@ pub enum ChannelRegistrationResult {
 pub enum ConnectionTransport {
     Tcp,
     Tls,
+    /// A WebSocket whose upgrade did not come over HTTPS through a trusted
+    /// proxy: plaintext somewhere between the client and this server.
     WebSocket,
+    /// A WebSocket a trusted proxy says its client reached over HTTPS (every
+    /// `X-Forwarded-Proto` entry is `https`); the listener itself never
+    /// terminates TLS.
+    SecureWebSocket,
     Local,
 }
 
@@ -1126,6 +1134,7 @@ impl ConnectionTransport {
             Self::Tcp => "tcp",
             Self::Tls => "tls",
             Self::WebSocket => "websocket",
+            Self::SecureWebSocket => "wss",
             Self::Local => "local",
         }
     }
@@ -1276,6 +1285,31 @@ impl ServerBanRequester {
     }
 }
 
+/// How long a temporary server ban lasts: set for `minutes`, in force until
+/// `expires_at_secs` (Unix seconds on the wall clock). Decided once, where the
+/// ban was set, and carried to the database and every shard, so they all lift
+/// it at the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerBanExpiry {
+    pub minutes: u32,
+    pub expires_at_secs: u64,
+}
+
+impl ServerBanExpiry {
+    /// The longest temporary ban, in minutes: 52 weeks, Solanum's
+    /// `MAX_TEMP_TIME`. A longer request is held to it, as Solanum holds it.
+    pub const MAX_MINUTES: u32 = 52 * 7 * 24 * 60;
+
+    /// A ban of `minutes` (at most [`Self::MAX_MINUTES`]) set at `now_secs`.
+    pub fn starting(now_secs: u64, minutes: std::num::NonZeroU32) -> Self {
+        let minutes = minutes.get().min(Self::MAX_MINUTES);
+        Self {
+            minutes,
+            expires_at_secs: now_secs.saturating_add(u64::from(minutes) * 60),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerBanMutation {
     Add {
@@ -1284,6 +1318,8 @@ pub enum ServerBanMutation {
         reason: String,
         set_by: String,
         kind: String,
+        /// `None` for a permanent ban.
+        expiry: Option<ServerBanExpiry>,
     },
     Remove {
         expected_id: Option<i64>,
@@ -1309,6 +1345,7 @@ impl ServerBanMutation {
         kind: state::BanKind,
         reason: String,
         set_by: String,
+        expiry: Option<ServerBanExpiry>,
     ) -> Self {
         Self::Add {
             mask: mask.folded().to_string(),
@@ -1316,6 +1353,7 @@ impl ServerBanMutation {
             reason,
             set_by,
             kind: kind.as_str().to_string(),
+            expiry,
         }
     }
 
@@ -2836,7 +2874,7 @@ impl Core {
     /// (see [`ServerState::preload_server_bans`]).
     pub fn preload_server_bans(
         &mut self,
-        rows: Vec<(String, String, String, String)>,
+        rows: Vec<crate::db::PersistedServerBan>,
     ) -> Result<(), String> {
         self.state.preload_server_bans(rows)
     }
@@ -3183,6 +3221,7 @@ impl Core {
             Input::Tick { now } => {
                 handler::reap_idle(&mut self.state, now);
                 handler::services::enforce_nick_protection(&mut self.state, now);
+                handler::oper::expire_server_bans(&mut self.state);
             }
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
             Input::AccountDeleted {
@@ -3776,12 +3815,13 @@ mod ingress_tests {
     fn corrupt_persisted_server_ban_aborts_preload() {
         let TwoWorkerHarness { mut first, .. } = two_worker_harness();
         let error = first
-            .preload_server_bans(vec![(
-                "bad@host".into(),
-                "reason".into(),
-                "oper".into(),
-                "unknown".into(),
-            )])
+            .preload_server_bans(vec![crate::db::PersistedServerBan {
+                mask: "bad@host".into(),
+                reason: "reason".into(),
+                set_by: "oper".into(),
+                kind: "unknown".into(),
+                expires_at: None,
+            }])
             .expect_err("unknown server-ban kind must abort startup");
         assert!(error.contains("server-ban kind"), "{error}");
     }
@@ -5322,6 +5362,45 @@ mod ingress_tests {
         );
     }
 
+    /// A temporary ban lapses on every shard on the same tick, and each
+    /// operator hears of it once — from the shard its own session lives on.
+    #[test]
+    fn a_temporary_server_ban_lapses_on_every_shard() {
+        let mut shards = operators_on_each_shard(Shards::new());
+        shards.line(2, "KLINE 1 bad@host.example :spam");
+        for conn in [2, 1] {
+            shards.drain(conn);
+        }
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.len() == 1),
+            "every shard enforces the ban"
+        );
+        Shards::advance_clock(60);
+        let now = thread_mono_clock();
+        for core in &mut shards.cores {
+            core.handle(Input::Tick { now });
+        }
+        shards.settle();
+        for conn in [2, 1] {
+            let out = shards.drain(conn);
+            assert_eq!(
+                lines_with(&out, "Temporary K-Line for bad@host.example expired").len(),
+                1,
+                "connection {conn}: {out:#?}"
+            );
+        }
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.is_empty()),
+            "every shard stopped enforcing the ban"
+        );
+    }
+
     /// Answer the one server-ban mutation alice's shard queued.
     fn answer_server_ban(shards: &mut Shards, result: super::ServerBanResult) {
         let shard = shards.shard_of(2);
@@ -5740,7 +5819,7 @@ mod ingress_tests {
         let join_at = two[start..].iter().position(|l| l.contains(" JOIN #"));
         let lock_at = two[start..]
             .iter()
-            .position(|l| l.contains(":ChanServ MODE #"));
+            .position(|l| l.contains(":ChanServ!ChanServ@services.irc.test MODE #"));
         assert!(
             join_at.is_some() && join_at < lock_at,
             "the joiner hears its JOIN, then the lock it brought about: {two:#?}"
@@ -5771,7 +5850,7 @@ mod ingress_tests {
         assert_eq!(one, two);
         assert_eq!(lines_with(&two, "label=v1").len(), 1, "{two:#?}");
         assert_eq!(
-            lines_with(&two, "@batch=* :irc.test MODE ").len(),
+            lines_with(&two, "@batch=* :ChanServ!ChanServ@services.irc.test MODE ").len(),
             1,
             "{two:#?}"
         );
@@ -6337,7 +6416,7 @@ mod ingress_tests {
             operator
                 .payload
                 .0
-                .ends_with(b" 710 alice #chat bob!bob@host.test :has asked for an invite\r\n")
+                .ends_with(b" 710 #chat #chat bob!bob@host.test :has asked for an invite.\r\n")
         );
         let result = next_output(&mut bob_rx).await;
         assert!(
@@ -6419,7 +6498,12 @@ mod ingress_tests {
             })
             .expect("mode list queued");
         let ban = next_output(&mut bob_rx).await;
-        assert!(ban.payload.0.ends_with(b" 367 robert #chat bad!*@*\r\n"));
+        // The row names who set the ban (the time is the wall clock's).
+        let ban = String::from_utf8_lossy(&ban.payload.0).into_owned();
+        assert!(
+            ban.contains(" 367 robert #chat bad!*@* alice!alice@host.test "),
+            "{ban}"
+        );
         let end = next_output(&mut bob_rx).await;
         assert!(
             end.payload

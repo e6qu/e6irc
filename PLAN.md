@@ -947,6 +947,45 @@ this change fixes:
   documents), DESIGN §5's dependency policy, the default flood limits, the
   client's SASL mechanisms, and CI's PostgreSQL setup.
 
+A review of the operator commands and channel modes against Solanum found,
+and this change fixes, each with a test that failed before:
+
+- **`KLINE 60 *@host` banned `*@60`**, and **`KLINE <nick>` banned
+  `*@<nick>`**, a host nobody has. A leading duration is now minutes (below),
+  and a bare nick bans that user's host or is refused with 401.
+- **Unknown channel modes answered 472 once per letter**; now once per
+  command, as Solanum does.
+- **Ban, quiet, exception and invite-exception rows** carried no setter or
+  time; each entry now records both and 367/728/348/346 report them.
+- **A second OPER announced `+o` again and switched the audited operator
+  identity**; it is answered 381 and changes nothing.
+- **KNOCK on a `+g` channel reached only its operators, and RPL_KNOCK named
+  the recipient**; every member of a `+g` channel hears it, in Solanum's
+  `710 #c #c nick!user@host` shape.
+- **SETHOST accepted globs and commas**; it takes Solanum's `clean_host`
+  alphabet.
+- **A KILL victim never saw the KILL line**; it is sent before the `ERROR`.
+- **ChanServ spoke as three sources** (bare `ChanServ` for a mode lock, the
+  server name for OP/VOICE and access on join, `ChanServ!ChanServ@services.*`
+  for notices); one helper now names it for all of them.
+- **DESIGN §7.6 promised user modes `+R` and `+Z` that did not exist**; both
+  are implemented (below).
+
+Maintainer decisions implemented: temporary K/D/X-lines (`KLINE <minutes>
+<mask>`, at most 52 weeks) stored with their expiry (migration 0088), audited
+with their length, shown in STATS with the lowercase letter and the time left,
+lapsed on every shard on its tick with one notice per operator, never loaded or
+listed once lapsed, and swept by storage maintenance; the administrator API
+takes `duration_minutes` and lists `expires_at`, and the console has both.
+`+R` refuses messages, notices, TAGMSG and INVITE from users not logged in
+(486; operators pass); `+Z` is set on TLS connections, a trusted proxy's HTTPS
+WebSocket included (transport `wss`), and WHOIS shows 671; both are in the
+published user record and in RPL_MYINFO. TOPIC needs `can_send`, so an
+unvoiced member of a `+m -t` channel cannot set it; `-i` (and `-l` without
+`+i`) revokes recorded invites; `MODE me +i foo` applies `+i` only; `MODE #c`
+from a non-member shows `+k`/`+l` without their arguments. `+l 10abc` and
+`+l 0` stay refused with 696, a documented difference from Solanum.
+
 A review of the web client and the console script found, and this change
 fixes, each with a test that failed before:
 

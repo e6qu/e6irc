@@ -32,6 +32,11 @@
         <span>Mask</span>
         <input name="mask" maxlength="512" placeholder="*@bad.example" required />
       </label>
+      <label class="field">
+        <span>Duration (minutes)</span>
+        <input type="number" name="duration_minutes" min="1" max="524160" inputmode="numeric"
+               placeholder="Permanent" />
+      </label>
       <label class="field field-wide">
         <span>Reason</span>
         <input name="reason" maxlength="512" placeholder="Policy reason (optional)" />
@@ -89,9 +94,9 @@
     <div class="scroll" tabindex="0" role="region" aria-label="Persisted server-ban policy">
       <table>
         <caption class="sr-only">Persisted server-ban policy</caption>
-        <thead><tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th>Actions</th></tr></thead>
+        <thead><tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th>Expires (UTC)</th><th>Actions</th></tr></thead>
         <tbody id="admin-ban-rows" data-api-admin-ban-list data-csrf="{{ shell.csrf }}">
-          <tr><td colspan="7" class="empty">Loading server bans…</td></tr>
+          <tr><td colspan="8" class="empty">Loading server bans…</td></tr>
         </tbody>
       </table>
     </div>

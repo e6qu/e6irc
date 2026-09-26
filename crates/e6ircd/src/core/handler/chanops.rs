@@ -196,6 +196,14 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_nosuchnick(conn, who);
         return;
     };
+    // +R keeps a user who is not logged in from inviting this one too
+    // (Solanum's `um_regonlymsg` hooks INVITE as it hooks PRIVMSG).
+    if let Some(peer) = state.registered_user(&state.nick_key(who))
+        && peer.refuses_unregistered(conn, &state.sessions[&conn])
+    {
+        err_nonreg(state, conn, &peer.nick);
+        return;
+    }
     let owner = state.channel_owner(target);
     let label = state.channel_reply_label(conn, &owner);
     let command = crate::core::state::ChannelCommand::new(
@@ -264,8 +272,9 @@ pub(super) fn invite_on_owner(
     // An invitation is a pass through `+i` and past `+l`, so one is recorded
     // only while the channel has either (Solanum stores an invite exactly when
     // it "could affect the ability to join"). One sent while the channel is
-    // open is delivered but passes nothing: it cannot be stocked to be honoured
-    // after operators later lock the channel.
+    // open is delivered but passes nothing, and `-i` (or `-l` on a channel
+    // without `+i`) revokes those held (`channel_mode_by`): none can be
+    // stocked to be honoured after operators later lock the channel.
     let chan = state.channels.get_mut(&key).expect("checked");
     if chan.modes.invite_only || chan.modes.limit.is_some() {
         let invited = &mut chan.invited;
@@ -764,28 +773,49 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     );
 }
 
-/// One STATS line per server ban of `kind`, in Solanum's shapes: a K-line is
-/// `216 K <host> * <user> :<reason>`, a D-line `225 D <address> :<reason>`, an
-/// X-line `247 X 0 <mask> :<reason>` (every ban here is permanent, so the
-/// letter is the uppercase one and the X-line hold is 0). Each mask part is
-/// spelled by [`crate::sanitize::mask_middle`], so an X-line mask with spaces
-/// or an IPv6 address stays one readable parameter.
+/// One STATS line per server ban of `kind` in force, in Solanum's shapes: a
+/// K-line is `216 K <host> * <user> :<reason>`, a D-line
+/// `225 D <address> :<reason>`, an X-line `247 X 0 <mask> :<reason>`. A
+/// temporary ban has the lowercase letter, as Solanum marks one, and its
+/// reason starts with the time it has left, as ratbox and charybdis wrote it:
+/// `Temporary K-Line 42 min. - <reason>`. Each mask part is spelled by
+/// [`crate::sanitize::mask_middle`], so an X-line mask with spaces or an IPv6
+/// address stays one readable parameter.
 fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::state::BanKind) {
     use crate::sanitize::mask_middle;
-    let bans: Vec<(String, String)> = state
-        .server_bans
-        .iter()
+    let now_secs = (state.config.clock)().as_secs();
+    let bans: Vec<(String, String, bool)> = state
+        .server_bans_in_force()
         .filter(|ban| ban.kind == kind)
-        .map(|ban| (ban.mask.as_str().to_string(), ban.reason.clone()))
+        .map(|ban| match ban.minutes_left(now_secs) {
+            Some(left) => (
+                ban.mask.as_str().to_string(),
+                format!("Temporary {} {left} min. - {}", kind.label(), ban.reason),
+                true,
+            ),
+            None => (ban.mask.as_str().to_string(), ban.reason.clone(), false),
+        })
         .collect();
-    for (mask, reason) in bans {
+    for (mask, reason, temporary) in bans {
+        let letter = |permanent: &'static str, temporary_letter: &'static str| {
+            if temporary {
+                temporary_letter
+            } else {
+                permanent
+            }
+        };
         match kind {
             crate::core::state::BanKind::Kline => {
                 let (user, host) = mask.split_once('@').unwrap_or(("*", mask.as_str()));
                 state.numeric(
                     conn,
                     RPL_STATSKLINE,
-                    &["K", &mask_middle(host), "*", &mask_middle(user)],
+                    &[
+                        letter("K", "k"),
+                        &mask_middle(host),
+                        "*",
+                        &mask_middle(user),
+                    ],
                     Some(&reason),
                 );
             }
@@ -793,7 +823,7 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                 state.numeric(
                     conn,
                     RPL_STATSDLINE,
-                    &["D", &mask_middle(&mask)],
+                    &[letter("D", "d"), &mask_middle(&mask)],
                     Some(&reason),
                 );
             }
@@ -801,7 +831,7 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                 state.numeric(
                     conn,
                     RPL_STATSXLINE,
-                    &["X", "0", &mask_middle(&mask)],
+                    &[letter("X", "x"), "0", &mask_middle(&mask)],
                     Some(&reason),
                 );
             }
@@ -908,23 +938,24 @@ pub(super) fn knock_on_owner(
             scope: "channel",
         };
     }
-    // Deliver the knock to the channel's operators, then confirm to the knocker.
-    let ops = chan.operator_recipients();
+    // Deliver the knock to whoever could let the knocker in — every member of
+    // a `+g` channel, else its operators (Solanum's `m_knock`) — then confirm
+    // to the knocker. Solanum's RPL_KNOCK names the channel where the
+    // recipient's nick would go, so one line serves every recipient.
+    let free_invite = chan.modes.free_invite;
+    let recipients = chan.recipients_where(|_, modes| free_invite || modes.op);
     state
         .channels
         .get_mut(&key)
         .expect("checked above")
         .last_knock = Some(now);
-    for (recipient, nick) in ops {
-        let line = format!(
-            ":{} {} {} {} {} :has asked for an invite",
-            state.config.server_name,
-            e6irc_proto::numerics::code_str(RPL_KNOCK),
-            nick,
-            display,
-            actor.identity.prefix,
-        );
-        let line = state.server_line(line);
+    let line = state.server_line(format!(
+        ":{} {} {display} {display} {} :has asked for an invite.",
+        state.config.server_name,
+        e6irc_proto::numerics::code_str(RPL_KNOCK),
+        actor.identity.prefix,
+    ));
+    for recipient in recipients {
         state.send_event_recipient(recipient, &line);
     }
     crate::core::state::ChannelKnockResult::KnockDelivered { display }

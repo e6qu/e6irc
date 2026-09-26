@@ -9,6 +9,14 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "OPER");
         return;
     };
+    // An operator already is one: RPL_YOUREOPER again and nothing else
+    // (Solanum's `m_oper`). Checking the credentials would let a second OPER
+    // switch the identity privileged actions are audited under, and announce a
+    // `MODE +o` that changes nothing.
+    if state.sessions[&conn].oper.is_some() {
+        you_are_oper(state, conn);
+        return;
+    }
     // OPER is a password check like SASL and IDENTIFY, so every attempt spends
     // the same per-connection budget: a registered client cannot pipeline
     // guesses at line rate, and the link closes when the budget runs out.
@@ -57,14 +65,18 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     state.sessions.get_mut(&conn).expect("registered").oper = Some(name.to_string());
+    you_are_oper(state, conn);
+    let server = state.config.server_name.clone();
+    state.send(conn, &format!(":{server} MODE {nick} :+o"));
+}
+
+fn you_are_oper(state: &mut ServerState, conn: ConnId) {
     state.numeric(
         conn,
         RPL_YOUREOPER,
         &[],
         Some("You are now an IRC operator"),
     );
-    let server = state.config.server_name.clone();
-    state.send(conn, &format!(":{server} MODE {nick} :+o"));
 }
 
 /// Length-independent constant-time comparison: both inputs are reduced to a
@@ -120,6 +132,7 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .nick()
         .map(String::from)
         .expect("registered");
+    let killer_prefix = state.sessions[&conn].prefix();
     let operator = operator_name(state, conn);
     let comment = p.get(1).copied().unwrap_or("Killed").to_string();
     // Recorded here, where the operator is, before the kill is carried out on
@@ -140,7 +153,11 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     session_action(
         state,
         victim.conn(),
-        crate::core::state::SessionAction::Kill { comment, killer },
+        crate::core::state::SessionAction::Kill {
+            comment,
+            killer,
+            killer_prefix,
+        },
     );
 }
 
@@ -191,8 +208,12 @@ pub(crate) fn session_action(
     }
     match action {
         // Audited by the shard that decided it (see `cmd_kill`).
-        crate::core::state::SessionAction::Kill { comment, killer } => {
-            close_killed(state, conn, &comment, &killer);
+        crate::core::state::SessionAction::Kill {
+            comment,
+            killer,
+            killer_prefix,
+        } => {
+            close_killed(state, conn, &comment, &killer, &killer_prefix);
         }
         crate::core::state::SessionAction::Ghost { by } => {
             let server = state.config.server_name.clone();
@@ -249,7 +270,8 @@ pub(crate) fn kill_connection(
     {
         return KillOutcome::AuditUnavailable;
     }
-    close_killed(state, victim, comment, actor);
+    let server = state.config.server_name.clone();
+    close_killed(state, victim, comment, actor, &server);
     KillOutcome::Killed
 }
 
@@ -266,7 +288,8 @@ pub(crate) fn disconnect_suspended(
     if registered_nick(state, victim).is_none() {
         return false;
     }
-    close_killed(state, victim, reason, actor);
+    let server = state.config.server_name.clone();
+    close_killed(state, victim, reason, actor, &server);
     true
 }
 
@@ -280,8 +303,16 @@ fn registered_nick(state: &ServerState, conn: ConnId) -> Option<String> {
 }
 
 /// Close a killed connection on the shard that holds it: tell the other
-/// operators, then the victim. The caller has already recorded the kill.
-fn close_killed(state: &mut ServerState, victim: ConnId, comment: &str, killer: &str) {
+/// operators, then the victim — the `KILL` line from `source` (the operator's
+/// prefix, or the server name for a control-plane kill), as Solanum sends it,
+/// and the closing `ERROR`. The caller has already recorded the kill.
+fn close_killed(
+    state: &mut ServerState,
+    victim: ConnId,
+    comment: &str,
+    killer: &str,
+    source: &str,
+) {
     let Some(target) = registered_nick(state, victim) else {
         return;
     };
@@ -298,6 +329,8 @@ fn close_killed(state: &mut ServerState, victim: ConnId, comment: &str, killer: 
     // or the victim's framing discards the whole close notice (and the debug wire
     // check would abort the core worker on an oper-typed line). The trailing `)`
     // is part of the head's cost: include it before fitting, re-append after.
+    let kill = fitted_line(format!(":{source} KILL {target} :"), comment);
+    state.send(victim, &kill);
     let head = format!("ERROR :Closing Link: {server} (");
     let fitted = fit_trailing(&format!("{head})"), &reason);
     state.send(victim, &format!("{head}{fitted})"));
@@ -540,15 +573,18 @@ pub(super) fn cmd_add_ban(
     let nick = oper_nick(state, conn);
     if p.is_empty() {
         // List current bans of this kind.
+        let now_secs = (state.config.clock)().as_secs();
         let lines: Vec<String> = state
-            .server_bans
-            .iter()
+            .server_bans_in_force()
             .filter(|b| b.kind == kind)
             .map(|b| {
+                let temporary = b.minutes_left(now_secs).map_or(String::new(), |left| {
+                    format!(" (temporary, {left} min. left)")
+                });
                 state.server_notice_line(
                     conn,
                     &format!(
-                        "{label} {} (by {}) :{}",
+                        "{label} {}{temporary} (by {}) :{}",
                         b.mask.as_str(),
                         b.set_by,
                         b.reason
@@ -571,32 +607,100 @@ pub(super) fn cmd_add_ban(
     // keys, and matching all agree — the same discipline the channel
     // `+b/+q/+e/+I` lists use.
     let casemap = state.casemap;
+    // A leading all-digits argument is a temporary ban's length in minutes
+    // (Solanum's `valid_temp_time`), `0` a permanent ban; a mask must follow.
+    let (minutes, p) = match p.split_first() {
+        Some((first, rest)) => match temporary_minutes(first) {
+            Some(minutes) => (Some(minutes), rest),
+            None => (None, p),
+        },
+        None => (None, p),
+    };
+    if p.is_empty() {
+        state.err_needmoreparams(conn, &kind.as_str().to_ascii_uppercase());
+        return;
+    }
+    // A K-line target that can only be a nick — no `@`, nothing a host or an
+    // address holds, no glob — bans that user's host, `*@<host>`, and needs
+    // the user online to find it (the ratbox-family nick K-line).
+    let nick_host;
+    let mut params = p.to_vec();
+    if kind == BanKind::Kline && names_a_nick(params[0]) {
+        let Some(user) = state.registered_user(&state.nick_key(params[0])) else {
+            state.err_nosuchnick(conn, params[0]);
+            return;
+        };
+        nick_host = format!("*@{}", user.host);
+        params[0] = &nick_host;
+    }
     // Parse the params into a guaranteed-well-formed target: the reason/mask
     // split (XLINE-aware, keyed on the trailing marker), the `*@host`
-    // normalization, and the match-everyone refusal all happen inside
-    // `BanMask::parse`, so nothing below can see a mis-split fragment or a
-    // netban mask. A rejection is reported loudly, never silently narrowed.
-    let (parsed_mask, reason) = match BanMask::parse(kind, p, has_trailing) {
+    // normalization, the length bound and the match-everyone refusal all
+    // happen inside `BanMask::parse`, so nothing below can see a mis-split
+    // fragment or a netban mask. A rejection is reported loudly, never
+    // silently narrowed.
+    let (parsed_mask, reason) = match BanMask::parse(kind, &params, has_trailing) {
         Ok(parsed) => parsed,
         Err(reject) => {
             send_server_notice(state, conn, &reject.describe(label));
             return;
         }
     };
+    let now_secs = (state.config.clock)().as_secs();
+    let expiry = minutes
+        .and_then(std::num::NonZeroU32::new)
+        .map(|minutes| crate::core::ServerBanExpiry::starting(now_secs, minutes));
     // A MaskKey folds for comparison (so a differently-cased UN*LINE removes it)
     // while keeping the operator's casing for STATS and the confirmation — the
     // same discipline the channel ban lists use.
     let mask = crate::core::state::MaskKey::new(parsed_mask.as_str(), casemap);
+    let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick.clone(), expiry);
     if !state.config.sasl_enabled {
-        send_server_notice(state, conn, &format!("Added {label} for {}", mask.as_str()));
-        commit_server_ban(
-            state,
-            crate::core::ServerBanMutation::add(&mask, kind, reason, nick),
-        );
+        send_server_notice(state, conn, &ban_added_text(kind, mask.as_str(), expiry));
+        commit_server_ban(state, mutation);
         return;
     }
-    let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick);
     begin_oper_server_ban(state, conn, label, &mask, mutation);
+}
+
+/// A KLINE/DLINE/XLINE's leading duration (Solanum's `valid_temp_time`): an
+/// all-digits argument is minutes, held to
+/// [`crate::core::ServerBanExpiry::MAX_MINUTES`] as Solanum holds a longer
+/// one; `Some(0)` is a permanent ban. `None` when `arg` is not a duration.
+fn temporary_minutes(arg: &str) -> Option<u32> {
+    if arg.is_empty() || !arg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // All digits, so only a number too long for `u64` fails to parse — and it
+    // is past the maximum like any other long one.
+    let minutes = arg.parse::<u64>().unwrap_or(u64::MAX);
+    let max = crate::core::ServerBanExpiry::MAX_MINUTES;
+    Some(u32::try_from(minutes).map_or(max, |minutes| minutes.min(max)))
+}
+
+/// Whether a K-line target can only be a nick: no `@` (a `user@host`), no
+/// `.` `:` `/` (a host, an address, a range) and no glob (`*`, `?`), none of
+/// which a nick may hold.
+fn names_a_nick(target: &str) -> bool {
+    !target.is_empty() && !target.contains(['@', '.', ':', '/', '*', '?'])
+}
+
+/// The confirmation of an added ban, as the operator and the console are told
+/// it: `Added K-Line for <mask>`, or Solanum's `Added temporary <n> min.
+/// K-Line for <mask>`.
+pub(super) fn ban_added_text(
+    kind: BanKind,
+    mask: &str,
+    expiry: Option<crate::core::ServerBanExpiry>,
+) -> String {
+    match expiry {
+        Some(expiry) => format!(
+            "Added temporary {} min. {} for {mask}",
+            expiry.minutes,
+            kind.label()
+        ),
+        None => format!("Added {} for {mask}", kind.label()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -668,38 +772,29 @@ fn begin_oper_server_ban(
 }
 
 /// Apply a database-confirmed server ban to live state and disconnect matches.
-pub(crate) fn apply_server_ban_hot(
-    state: &mut ServerState,
-    mask: crate::core::state::MaskKey,
-    kind: BanKind,
-    reason: &str,
-    set_by: &str,
-    label: &str,
-) -> usize {
+fn apply_server_ban_hot(state: &mut ServerState, ban: ServerBan) {
     let casemap = state.casemap;
+    let label = ban.kind.label();
     // Replace any existing ban of this kind on the same mask (folded equality).
     state
         .server_bans
-        .retain(|b| !(b.kind == kind && b.mask == mask));
-    state.server_bans.push(ServerBan {
-        mask: mask.clone(),
-        reason: reason.to_string(),
-        set_by: set_by.to_string(),
-        kind,
-    });
+        .retain(|b| !(b.kind == ban.kind && b.mask == ban.mask));
+    state.server_bans.push(ban.clone());
+    // A temporary ban that lapsed on its way here bans no one.
+    if !ban.in_force((state.config.clock)().as_secs()) {
+        return;
+    }
     // Disconnect any matching registered sessions (possibly including the setter
     // when driven by an oper).
-    let ban = state.server_bans.last().expect("pushed above").clone();
     let victims: Vec<ConnId> = state
         .sessions
         .iter()
         .filter(|(_, s)| s.is_registered())
         .filter_map(|(&c, s)| ban.matches(casemap, &s.server_ban_subject()).then_some(c))
         .collect();
-    let disconnected = victims.len();
     // The victim, and the peers its QUIT reaches, see only the public half of
     // a `public|private` reason.
-    let reason = crate::core::state::public_ban_reason(reason);
+    let reason = crate::core::state::public_ban_reason(&ban.reason);
     for victim in victims {
         // A stored reason is bounded where a ban is set, but a row written by
         // an older build or by hand is not: fit it like the KILL close.
@@ -708,7 +803,38 @@ pub(crate) fn apply_server_ban_hot(
         state.send(victim, &format!("{head}{fitted})"));
         state.close(victim, &format!("{label}d: {reason}"));
     }
-    disconnected
+}
+
+/// Stop enforcing the temporary server bans that have lapsed, and tell this
+/// shard's operators (Solanum's `Temporary K-line for [mask] expired`). Every
+/// shard runs this on the same tick against its own copy of the list, so each
+/// operator hears of an expiry once, from the shard its session lives on. The
+/// database row is left to storage maintenance.
+pub(crate) fn expire_server_bans(state: &mut ServerState) {
+    let now_secs = (state.config.clock)().as_secs();
+    if state.server_bans.iter().all(|ban| ban.in_force(now_secs)) {
+        return;
+    }
+    let (lapsed, kept): (Vec<ServerBan>, Vec<ServerBan>) = std::mem::take(&mut state.server_bans)
+        .into_iter()
+        .partition(|ban| !ban.in_force(now_secs));
+    state.server_bans = kept;
+    let operators: Vec<ConnId> = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.is_registered() && session.oper.is_some())
+        .map(|(&conn, _)| conn)
+        .collect();
+    for ban in lapsed {
+        let text = format!(
+            "*** Notice -- Temporary {} for {} expired",
+            ban.kind.label(),
+            ban.mask.as_str()
+        );
+        for &conn in &operators {
+            send_server_notice(state, conn, &text);
+        }
+    }
 }
 
 /// Remove a database-confirmed server ban from the hot list.
@@ -806,12 +932,16 @@ pub(crate) fn server_ban_result(
         };
     }
 
-    let (mask_display, action) = match &mutation {
-        crate::core::ServerBanMutation::Add { mask_display, .. } => (mask_display, "Added"),
-        crate::core::ServerBanMutation::Remove { mask_display, .. } => (mask_display, "Removed"),
+    let text = match &mutation {
+        crate::core::ServerBanMutation::Add {
+            mask_display,
+            expiry,
+            ..
+        } => ban_added_text(kind, mask_display, *expiry),
+        crate::core::ServerBanMutation::Remove { mask_display, .. } => {
+            format!("Removed {} for {mask_display}", kind.label())
+        }
     };
-    let mask = crate::core::state::MaskKey::new(mask_display, state.casemap);
-    let text = format!("{action} {} for {}", kind.label(), mask.as_str());
     finish_server_ban(
         state,
         requester,
@@ -871,10 +1001,20 @@ pub(crate) fn apply_committed_server_ban(
             reason,
             set_by,
             kind,
+            expiry,
             ..
         } => {
-            let (kind, mask, label) = committed_ban_parts(state, &kind, &mask_display);
-            apply_server_ban_hot(state, mask, kind, &reason, &set_by, label);
+            let (kind, mask, _) = committed_ban_parts(state, &kind, &mask_display);
+            apply_server_ban_hot(
+                state,
+                ServerBan {
+                    mask,
+                    reason,
+                    set_by,
+                    kind,
+                    expires_at_secs: expiry.map(|expiry| expiry.expires_at_secs),
+                },
+            );
         }
         crate::core::ServerBanMutation::Remove {
             mask_display, kind, ..
@@ -893,10 +1033,17 @@ fn announce_server_ban(state: &mut ServerState, mutation: &crate::core::ServerBa
             reason,
             set_by,
             kind,
+            expiry,
             ..
         } => {
             let (_, mask, label) = committed_ban_parts(state, kind, mask_display);
-            format!("{set_by} added {label} for {} ({reason})", mask.as_str())
+            let temporary = expiry.map_or(String::new(), |expiry| {
+                format!("temporary {} min. ", expiry.minutes)
+            });
+            format!(
+                "{set_by} added {temporary}{label} for {} ({reason})",
+                mask.as_str()
+            )
         }
         crate::core::ServerBanMutation::Remove {
             mask_display,
@@ -983,8 +1130,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
     let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
     let nick = oper_nick(state, conn);
     let exists = state
-        .server_bans
-        .iter()
+        .server_bans_in_force()
         .any(|ban| ban.kind == kind && ban.mask == mask);
     if !exists {
         send_server_notice(
@@ -1022,17 +1168,7 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let oper_nick = oper_nick(state, conn);
-    // A host must be a single non-empty token without user/prefix chars, and
-    // may not start with `:`: it rides as a middle parameter (CHGHOST, 396,
-    // WHO), where a leading `:` would open the trailing early. A host rides
-    // in every future prefix built for this user, so an unbounded one makes
-    // every subsequent line unfittable at the source — bound it here (63
-    // bytes, the DNS label/hostname norm) alongside the character rules.
-    if newhost.is_empty()
-        || newhost.len() > 63
-        || newhost.starts_with(':')
-        || newhost.contains([' ', '@', '!', '\0'])
-    {
+    if !valid_visible_host(newhost) {
         send_server_notice(state, conn, &format!("Invalid host: {newhost}"));
         return;
     }
@@ -1063,6 +1199,27 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             oper_nick,
         },
     );
+}
+
+/// Whether `host` may be set as a user's visible host: Solanum's `clean_host`
+/// whitelist. Only letters, digits and `.` `-` `:` `/`, so it can never be a
+/// glob (`*`, `?`) that makes every ban on the user ambiguous, a list (`,`), or
+/// a prefix or parameter breaker (`@`, `!`, space). It may not start with `:`
+/// — it rides as a middle parameter (CHGHOST, 396, WHO), where a leading `:`
+/// would open the trailing early — and the part after its last `/` may not
+/// start with a digit, so it cannot read as a CIDR range. It rides in every
+/// prefix built for the user, so it is bounded too: 63 bytes, the DNS
+/// hostname norm.
+fn valid_visible_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 63
+        && !host.starts_with(':')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'/'))
+        && host
+            .rsplit_once('/')
+            .is_none_or(|(_, tail)| !tail.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// Apply a SETHOST on the shard the target's session lives on.

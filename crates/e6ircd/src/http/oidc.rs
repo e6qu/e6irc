@@ -2167,6 +2167,31 @@ pub(super) fn client_ip(
     peer
 }
 
+/// Whether a request reached this server over HTTPS, which only a trusted
+/// proxy can say: the direct peer must be in `trusted`, and every
+/// `X-Forwarded-Proto` entry it passed on — all headers, all comma-separated
+/// values — must be `https`. A client's own `https` to which a plaintext hop
+/// appended `http` is plaintext, and so is an entry that is not text, a
+/// request with no such header, or one from any other peer: the HTTP listener
+/// itself never terminates TLS.
+pub(super) fn forwarded_https(
+    peer: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[ipnet::IpNet],
+) -> bool {
+    let peer = crate::net::ClientIp::new(peer);
+    if !trusted.iter().any(|net| net.contains(&peer.ip())) {
+        return false;
+    }
+    let mut entries = headers
+        .get_all("x-forwarded-proto")
+        .iter()
+        .flat_map(|value| value.to_str().unwrap_or("").split(','))
+        .map(str::trim)
+        .peekable();
+    entries.peek().is_some() && entries.all(|entry| entry.eq_ignore_ascii_case("https"))
+}
+
 /// Parse one `X-Forwarded-For` entry to an IP, tolerating the `ip:port` and
 /// bracketed-IPv6 forms some proxies emit (`203.0.113.9:443`, `[2001:db8::1]`,
 /// `[2001:db8::1]:443`). A bare `parse::<IpAddr>()` rejects all of those, which

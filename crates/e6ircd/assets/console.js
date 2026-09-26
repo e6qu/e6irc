@@ -1622,7 +1622,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (!bans.length) {
           const row = document.createElement("tr");
           const cell = document.createElement("td");
-          cell.colSpan = 7;
+          cell.colSpan = 8;
           cell.className = "empty";
           cell.textContent = "No server bans match this view.";
           row.append(cell);
@@ -1631,7 +1631,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
         for (const ban of bans) {
           const row = document.createElement("tr");
-          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at].forEach((value) => {
+          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at, ban.expires_at || "Permanent"].forEach((value) => {
             const cell = document.createElement("td");
             cell.textContent = String(value || "");
             row.append(cell);
@@ -1654,7 +1654,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           adminBanRows.append(row);
         }
       } catch (error) {
-        tableLoadFailure(adminBanRows, 7, error, () => void refreshBanDirectory());
+        tableLoadFailure(adminBanRows, 8, error, () => void refreshBanDirectory());
         return false;
       }
       return true;
@@ -1687,11 +1687,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         setBanResult("Choose a policy kind and enter a mask.", false);
         return;
       }
-      void mutateBan(form, "/api/v1/admin/bans", "POST", {
-        kind,
-        mask,
-        reason: fieldValue(fields, "reason"),
-      });
+      const duration = fieldValue(fields, "duration_minutes");
+      const body = { kind, mask, reason: fieldValue(fields, "reason") };
+      if (duration) {
+        const minutes = Number(duration);
+        if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > 524160) {
+          setBanResult("A duration is a whole number of minutes, from 1 to 524160 (52 weeks).", false);
+          return;
+        }
+        body.duration_minutes = minutes;
+      }
+      void mutateBan(form, "/api/v1/admin/bans", "POST", body);
     });
   }
 

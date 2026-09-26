@@ -450,6 +450,14 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             if user.oper {
                 state.numeric(conn, RPL_WHOISOPERATOR, &[nick], Some("is an IRC operator"));
             }
+            if user.secure {
+                state.numeric(
+                    conn,
+                    RPL_WHOISSECURE,
+                    &[nick],
+                    Some("is using a secure connection"),
+                );
+            }
             state.numeric(conn, RPL_WHOISSERVER, &[nick, &server], Some(&network));
             // RPL_WHOISIDLE reports seconds idle (elapsed monotonic time since
             // last activity) and a Unix-*second* signon *timestamp* (wall

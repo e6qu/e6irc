@@ -916,6 +916,10 @@ pub(crate) struct PublicUser {
     pub(crate) bot: bool,
     pub(crate) invisible: bool,
     pub(crate) wallops: bool,
+    /// Umode +R: see [`Session::registered_only`].
+    pub(crate) registered_only: bool,
+    /// Umode +Z: the connection is TLS end to end ([`Session::secure`]).
+    pub(crate) secure: bool,
     pub(crate) signon: e6irc_proto::time::Millis,
     pub(crate) last_active: LastActive,
 }
@@ -935,6 +939,8 @@ impl PublicUser {
             bot: session.bot,
             invisible: session.invisible,
             wallops: session.wallops,
+            registered_only: session.registered_only,
+            secure: session.secure(),
             signon: session.signon,
             last_active: session.last_active.clone(),
         }
@@ -953,11 +959,23 @@ impl PublicUser {
             && self.bot == session.bot
             && self.invisible == session.invisible
             && self.wallops == session.wallops
+            && self.registered_only == session.registered_only
+            && self.secure == session.secure()
             && self.signon == session.signon
     }
 
     pub(crate) fn conn(&self) -> ConnId {
         self.recipient.conn()
+    }
+
+    /// Whether this user's `+R` refuses a message, notice, TAGMSG or INVITE
+    /// from `sender` (Solanum's `um_regonlymsg`): only a sender logged in to
+    /// an account, an operator, or the user itself gets through.
+    pub(crate) fn refuses_unregistered(&self, sender_conn: ConnId, sender: &Session) -> bool {
+        self.registered_only
+            && sender_conn != self.conn()
+            && sender.account().is_none()
+            && sender.oper.is_none()
     }
 
     pub(crate) fn prefix(&self) -> String {
@@ -1716,6 +1734,9 @@ pub(crate) struct Session {
     pub wallops: bool,
     /// Bot (umode +B).
     pub bot: bool,
+    /// Only users logged in to an account may message, notice, TAGMSG or
+    /// invite this one (umode +R, Solanum's `um_regonlymsg`).
+    pub registered_only: bool,
     /// Joined channels.
     pub channels: HashSet<ChanKey>,
     /// JOINs routed to a channel owned by another shard and not yet answered,
@@ -2190,6 +2211,17 @@ impl Session {
     }
 
     /// What a server ban is tested against for this session.
+    /// Umode +Z: whether this connection is TLS all the way to its client —
+    /// a TLS listener, or a WebSocket a trusted proxy says reached it over
+    /// HTTPS. Derived from the transport, so no client can set or clear it.
+    pub(crate) fn secure(&self) -> bool {
+        matches!(
+            self.transport,
+            crate::core::ConnectionTransport::Tls
+                | crate::core::ConnectionTransport::SecureWebSocket
+        )
+    }
+
     pub(crate) fn server_ban_subject(&self) -> ServerBanSubject<'_> {
         ServerBanSubject {
             user: self.user().unwrap_or("*"),
@@ -2571,8 +2603,13 @@ impl HostChangeFallback {
 /// any shard; [`ServerState::act_on_session`] gets it there.
 #[derive(Debug)]
 pub enum SessionAction {
-    /// Oper KILL: `killer` is the name the reason and the audit attribute it to.
-    Kill { comment: String, killer: String },
+    /// Oper KILL: `killer` is the name the reason and the audit attribute it
+    /// to, `killer_prefix` the source of the `KILL` line the victim is sent.
+    Kill {
+        comment: String,
+        killer: String,
+        killer_prefix: String,
+    },
     /// NickServ GHOST, by the owner of the nick's account.
     Ghost { by: String },
     /// NickServ REGAIN of `nick`, which this session holds, by the session
@@ -3066,7 +3103,7 @@ pub enum ChannelModeListQueryResult {
 #[derive(Debug)]
 pub struct ChannelModeList {
     pub(crate) mode: char,
-    pub(crate) masks: Vec<String>,
+    pub(crate) entries: Vec<ListEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -3460,11 +3497,11 @@ impl ChanModes {
         })
     }
 
-    /// `+nt`-style string with key/limit args appended. `reveal_key` gates
-    /// the `+k` argument: only channel members may see the key, so that
-    /// `MODE #chan` from an outsider cannot disclose it and bypass `+k`.
-    /// The limit is not secret and is always shown.
-    pub fn to_string_with_args(&self, reveal_key: bool) -> String {
+    /// `+nt`-style string with key/limit args appended. `member` gates both
+    /// arguments, as Solanum's `channel_modes` does: a member sees
+    /// `+kl key 10`, an outsider `+kl` — told that a key and a limit are set,
+    /// but shown neither the key (which would bypass `+k`) nor the limit.
+    pub fn to_string_with_args(&self, member: bool) -> String {
         let mut modes = String::from("+");
         let mut args = String::new();
         for c in Self::FLAGS.chars() {
@@ -3473,15 +3510,17 @@ impl ChanModes {
             }
         }
         if let Some(k) = &self.key {
-            // Members see the key; outsiders see `*` (Solanum behaviour) so
-            // MODE #chan reveals that +k is set without disclosing the value.
             modes.push('k');
-            args.push(' ');
-            args.push_str(if reveal_key { k } else { "*" });
+            if member {
+                args.push(' ');
+                args.push_str(k);
+            }
         }
         if let Some(l) = self.limit {
             modes.push('l');
-            args.push_str(&format!(" {l}"));
+            if member {
+                args.push_str(&format!(" {l}"));
+            }
         }
         modes + &args
     }
@@ -3725,6 +3764,9 @@ pub struct ServerBan {
     pub reason: String,
     pub set_by: String,
     pub kind: BanKind,
+    /// When a temporary ban lapses, in Unix seconds on the wall clock;
+    /// `None` for a permanent ban.
+    pub expires_at_secs: Option<u64>,
 }
 
 /// The part of a server-ban `reason` the banned user and their peers are
@@ -3747,6 +3789,19 @@ pub(crate) struct ServerBanSubject<'a> {
 }
 
 impl ServerBan {
+    /// Whether this ban is enforced at `now_secs` (Unix seconds): a permanent
+    /// ban always, a temporary one until the second it lapses.
+    pub(crate) fn in_force(&self, now_secs: u64) -> bool {
+        self.expires_at_secs.is_none_or(|at| now_secs < at)
+    }
+
+    /// Whole minutes left of a temporary ban at `now_secs`, rounded up so a
+    /// ban in force never reads as 0; `None` for a permanent ban.
+    pub(crate) fn minutes_left(&self, now_secs: u64) -> Option<u64> {
+        self.expires_at_secs
+            .map(|at| at.saturating_sub(now_secs).div_ceil(60))
+    }
+
     /// Whether this ban matches `subject`. A K-line is a `user@host` mask whose
     /// host may be an address or CIDR range (matched against the real
     /// address) or a glob (tried against the shown host and the address); a
@@ -3773,6 +3828,18 @@ impl ServerBan {
     }
 }
 
+/// One entry of a channel's `+b`/`+q`/`+e`/`+I` list: the mask, and who set
+/// it when, as RPL_BANLIST and its siblings report them (Solanum's
+/// `367 <me> <channel> <mask> <setter> <set-at>`).
+#[derive(Clone, Debug)]
+pub(crate) struct ListEntry {
+    pub mask: MaskKey,
+    /// The setter's `nick!user@host`.
+    pub set_by: String,
+    /// Unix seconds, as the list replies report it.
+    pub set_at_secs: u64,
+}
+
 pub(crate) struct Channel {
     /// Display name (creator's casing).
     pub name: String,
@@ -3780,10 +3847,10 @@ pub(crate) struct Channel {
     members: HashMap<ConnId, ChannelMember>,
     recipients: RefCell<Option<Arc<[Recipient]>>>,
     pub modes: ChanModes,
-    pub bans: Vec<MaskKey>,
-    pub quiets: Vec<MaskKey>,
-    pub ban_exceptions: Vec<MaskKey>,
-    pub invite_exceptions: Vec<MaskKey>,
+    pub bans: Vec<ListEntry>,
+    pub quiets: Vec<ListEntry>,
+    pub ban_exceptions: Vec<ListEntry>,
+    pub invite_exceptions: Vec<ListEntry>,
     /// Connections holding a pending INVITE into this channel (consumed on
     /// join), which admits past `+i` and `+l`. Recorded only while the channel
     /// has one of those, from an operator or, on a `+g` channel, any member.
@@ -3993,14 +4060,6 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes, &member.identity, &member.profile))
     }
 
-    pub fn operator_recipients(&self) -> Vec<(Recipient, String)> {
-        self.members
-            .values()
-            .filter(|member| member.modes.op)
-            .map(|member| (member.recipient, member.identity.nick.clone()))
-            .collect()
-    }
-
     /// Resolve a member from channel-owned identity data.
     pub fn member_named(
         &self,
@@ -4028,19 +4087,28 @@ impl Channel {
         (self.modes.secret && !self.is_member(conn)).then_some(Hidden(()))
     }
 
-    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &MaskSubject<'_>) -> bool {
-        masks.iter().any(|m| m.matches(casemap, subject))
+    fn any_match<'a>(
+        casemap: CaseMapping,
+        masks: impl IntoIterator<Item = &'a MaskKey>,
+        subject: &MaskSubject<'_>,
+    ) -> bool {
+        masks.into_iter().any(|m| m.matches(casemap, subject))
+    }
+
+    /// The masks of one of this channel's lists.
+    fn masks(list: &[ListEntry]) -> impl Iterator<Item = &MaskKey> {
+        list.iter().map(|entry| &entry.mask)
     }
 
     pub(crate) fn is_banned(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
-        Self::any_match(casemap, &self.bans, subject)
-            && !Self::any_match(casemap, &self.ban_exceptions, subject)
+        Self::any_match(casemap, Self::masks(&self.bans), subject)
+            && !Self::any_match(casemap, Self::masks(&self.ban_exceptions), subject)
     }
 
     /// Quiets share the ban-exception machinery (Solanum semantics).
     pub(crate) fn is_quieted(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
-        Self::any_match(casemap, &self.quiets, subject)
-            && !Self::any_match(casemap, &self.ban_exceptions, subject)
+        Self::any_match(casemap, Self::masks(&self.quiets), subject)
+            && !Self::any_match(casemap, Self::masks(&self.ban_exceptions), subject)
     }
 
     pub(crate) fn is_invite_excepted(
@@ -4048,7 +4116,7 @@ impl Channel {
         casemap: CaseMapping,
         subject: &MaskSubject<'_>,
     ) -> bool {
-        Self::any_match(casemap, &self.invite_exceptions, subject)
+        Self::any_match(casemap, Self::masks(&self.invite_exceptions), subject)
     }
 
     /// Whether a sender with membership `member` (its `MemberModes`, or `None`
@@ -4930,9 +4998,9 @@ impl ServerState {
                 latest_message: self.latest_channel_message(key),
                 created_at: channel.created_at,
                 silencing: SilencingMasks {
-                    bans: channel.bans.clone(),
-                    quiets: channel.quiets.clone(),
-                    exceptions: channel.ban_exceptions.clone(),
+                    bans: Channel::masks(&channel.bans).cloned().collect(),
+                    quiets: Channel::masks(&channel.quiets).cloned().collect(),
+                    exceptions: Channel::masks(&channel.ban_exceptions).cloned().collect(),
                 },
             });
             self.memberships.publish_channel(key, published);
@@ -5906,31 +5974,48 @@ impl ServerState {
         }
     }
 
-    /// Load persisted server bans as `(mask, reason, set_by, kind)` rows.
+    /// Load the persisted server bans still in force.
     pub fn preload_server_bans(
         &mut self,
-        rows: Vec<(String, String, String, String)>,
+        rows: Vec<crate::db::PersistedServerBan>,
     ) -> Result<(), String> {
         let casemap = self.casemap;
         let mut bans = Vec::with_capacity(rows.len());
-        for (mask, reason, set_by, kind) in rows {
-            let kind = BanKind::from_token(&kind)
-                .ok_or_else(|| format!("invalid persisted server-ban kind {kind:?}"))?;
+        for row in rows {
+            let kind = BanKind::from_token(&row.kind)
+                .ok_or_else(|| format!("invalid persisted server-ban kind {:?}", row.kind))?;
+            let expires_at_secs = row
+                .expires_at
+                .map(|at| {
+                    u64::try_from(at)
+                        .map_err(|_| format!("invalid persisted server-ban expiry {at}"))
+                })
+                .transpose()?;
             bans.push(ServerBan {
-                mask: MaskKey::new(&mask, casemap),
-                reason,
-                set_by,
+                mask: MaskKey::new(&row.mask, casemap),
+                reason: row.reason,
+                set_by: row.set_by,
                 kind,
+                expires_at_secs,
             });
         }
         self.server_bans = bans;
         Ok(())
     }
 
-    /// The `(kind, reason)` of the first server ban matching `subject`, if any.
-    pub(crate) fn ban_match(&self, subject: &ServerBanSubject<'_>) -> Option<(BanKind, String)> {
+    /// The server bans in force now, the ones every surface acts on: a
+    /// temporary ban past its expiry bans no one and is listed nowhere, even
+    /// before the next tick drops it (`oper::expire_server_bans`).
+    pub(crate) fn server_bans_in_force(&self) -> impl Iterator<Item = &ServerBan> {
+        let now_secs = (self.config.clock)().as_secs();
         self.server_bans
             .iter()
+            .filter(move |ban| ban.in_force(now_secs))
+    }
+
+    /// The `(kind, reason)` of the first server ban matching `subject`, if any.
+    pub(crate) fn ban_match(&self, subject: &ServerBanSubject<'_>) -> Option<(BanKind, String)> {
+        self.server_bans_in_force()
             .find(|ban| ban.matches(self.casemap, subject))
             .map(|ban| (ban.kind, ban.reason.clone()))
     }
@@ -6231,6 +6316,7 @@ impl ServerState {
                 invisible: false,
                 wallops: false,
                 bot: false,
+                registered_only: false,
                 channels: HashSet::new(),
                 pending_joins: HashMap::new(),
                 part_on_join: HashMap::new(),
@@ -7027,6 +7113,14 @@ impl ServerState {
         }
     }
 
+    /// The prefix a services pseudo-client (NickServ, ChanServ) speaks with,
+    /// `Service!Service@services.<server>` — the one source for its notices
+    /// and for the channel modes ChanServ sets (a mode lock, OP/VOICE, access
+    /// on join), so a client sees one ChanServ however it acted.
+    pub(crate) fn service_prefix(&self, service: &str) -> String {
+        format!("{service}!{service}@services.{}", self.config.server_name)
+    }
+
     /// A notice from a services pseudo-client (NickServ, ChanServ).
     pub fn service_notice(&mut self, conn: ConnId, service: &str, text: &str) {
         let nick = self
@@ -7034,13 +7128,10 @@ impl ServerState {
             .get(&conn)
             .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| "*".into());
-        let host = format!("services.{}", self.config.server_name);
+        let source = self.service_prefix(service);
         // The text can quote the user's own input back (an unknown flag, a
         // channel name), so it is fitted like any other relayed trailing.
-        let line = crate::core::handler::fitted_line(
-            format!(":{service}!{service}@{host} NOTICE {nick} :"),
-            text,
-        );
+        let line = crate::core::handler::fitted_line(format!(":{source} NOTICE {nick} :"), text);
         let line = self.server_line(line);
         self.send_event(conn, &line);
     }

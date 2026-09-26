@@ -1104,6 +1104,41 @@ fn mode_multichar_list_query_dumps_each_list() {
     assert!(has_numeric(&out, "349"), "end of exception list: {out:#?}");
 }
 
+/// Every list row names the mask's setter and when it was set, as Solanum's
+/// `367 <me> <channel> <mask> <setter> <set-at>` does (the test clock reads
+/// 1,000,000 seconds).
+#[test]
+fn channel_list_rows_carry_setter_and_time() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #ml");
+    s.line(
+        alice,
+        "MODE #ml +bqeI bad!*@* hush!*@* friend!*@* guest!*@*",
+    );
+    s.drain(alice);
+    s.line(alice, "MODE #ml bqeI");
+    let rows: Vec<String> = s
+        .drain(alice)
+        .into_iter()
+        .filter(|l| {
+            [" 367 ", " 728 ", " 348 ", " 346 "]
+                .iter()
+                .any(|n| l.contains(n))
+        })
+        .collect();
+    let by = "alice!alice@host1.example 1000000";
+    assert_eq!(
+        rows,
+        [
+            format!(":irc.test.example 367 alice #ml bad!*@* {by}"),
+            format!(":irc.test.example 728 alice #ml q hush!*@* {by}"),
+            format!(":irc.test.example 348 alice #ml friend!*@* {by}"),
+            format!(":irc.test.example 346 alice #ml guest!*@* {by}"),
+        ]
+    );
+}
+
 #[test]
 fn ban_removal_is_case_insensitive_like_matching() {
     // A ban matches subjects case-insensitively, so removing it must compare
@@ -2513,6 +2548,142 @@ fn stats_lists_server_bans_to_operators_only() {
     }
 }
 
+static BAN_CLOCK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1_000_000_000);
+
+fn ban_clock() -> Millis {
+    Millis::from_millis(BAN_CLOCK_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Solanum's temporary bans: a leading all-digits argument is minutes. The ban
+/// is stored with its expiry and audited with its length, STATS shows it with
+/// the lowercase letter and the time it has left, and when it lapses every
+/// shard stops enforcing it and tells its operators; UNKLINE still lifts one
+/// early. One test, since the clock is shared.
+#[test]
+fn temporary_server_bans_expire() {
+    let mut s = TestServer::configured(true, ban_clock, |_| {});
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+
+    s.line(op, "KLINE 60 *@flood.example :flooding");
+    let mutation = commit_server_ban(&mut s);
+    assert!(
+        matches!(
+            &mutation,
+            e6ircd::core::ServerBanMutation::Add { mask_display, expiry: Some(expiry), .. }
+                if mask_display == "*@flood.example"
+                    && *expiry == e6ircd::core::ServerBanExpiry {
+                        minutes: 60,
+                        expires_at_secs: 1_000_000 + 3600,
+                    }
+        ),
+        "{mutation:?}"
+    );
+    let out = s.drain(op);
+    assert!(
+        out.contains(
+            &":irc.test.example NOTICE god :Added temporary 60 min. K-Line for *@flood.example"
+                .to_string()
+        ),
+        "{out:#?}"
+    );
+    s.line(op, "XLINE 5 *spambot* :no bots");
+    commit_server_ban(&mut s);
+    s.drain(op);
+
+    // Twenty minutes on, forty are left.
+    BAN_CLOCK_MS.fetch_add(20 * 60_000, std::sync::atomic::Ordering::Relaxed);
+    s.line(op, "STATS k");
+    assert_eq!(
+        s.drain(op)[0],
+        ":irc.test.example 216 god k flood.example * * :Temporary K-Line 40 min. - flooding"
+    );
+    // The X-line lapsed, even before a tick has dropped it: it bans no one.
+    s.line(op, "STATS x");
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example 219 god x :End of /STATS report"]
+    );
+    let bot = s.connect(2);
+    s.line(bot, "NICK bot");
+    s.line(bot, "USER bot 0 * :a spambot");
+    assert!(
+        has_numeric(&s.drain(bot), "001"),
+        "a lapsed X-line bans no one"
+    );
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(1_000_000_000),
+    });
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example NOTICE god :*** Notice -- Temporary X-Line for *spambot* expired"]
+    );
+
+    // Until it lapses the K-line is enforced; then it is not.
+    let flooder = s.connect_from(3, "flood.example", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(flooder, "NICK flooder");
+    s.line(flooder, "USER flooder 0 * :F");
+    assert!(has_numeric(&s.drain(flooder), "465"), "the K-line holds");
+    BAN_CLOCK_MS.fetch_add(40 * 60_000, std::sync::atomic::Ordering::Relaxed);
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(1_000_000_000),
+    });
+    assert_eq!(
+        s.drain(op),
+        [
+            ":irc.test.example NOTICE god :*** Notice -- Temporary K-Line for *@flood.example expired"
+        ]
+    );
+    let returning = s.connect_from(4, "flood.example", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(returning, "NICK flooder");
+    s.line(returning, "USER flooder 0 * :F");
+    assert!(has_numeric(&s.drain(returning), "001"), "the K-line lapsed");
+
+    // UNKLINE lifts a temporary ban before it lapses.
+    s.line(op, "KLINE 10 *@again.example :again");
+    commit_server_ban(&mut s);
+    s.drain(op);
+    s.line(op, "UNKLINE *@again.example");
+    commit_server_ban(&mut s);
+    assert!(
+        s.drain(op)
+            .contains(&":irc.test.example NOTICE god :Removed K-Line for *@again.example".into())
+    );
+    // A duration with nothing after it names no mask.
+    s.line(op, "KLINE 60");
+    assert!(has_numeric(&s.drain(op), "461"));
+}
+
+/// `KLINE <nick>` bans that user's host, `*@<host>` — a token with no `@`, no
+/// host or address character and no glob can only be a nick — and is refused
+/// with ERR_NOSUCHNICK when nobody holds the nick.
+#[test]
+fn kline_of_a_nick_bans_its_host() {
+    let mut s = TestServer::new_no_persistence();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let victim = s.register(2, "victim");
+    s.line(op, "KLINE victim :go away");
+    assert!(
+        s.drain(op)
+            .contains(&":irc.test.example NOTICE god :Added K-Line for *@host2.example".into())
+    );
+    assert!(
+        s.drain(victim)
+            .iter()
+            .any(|l| l.starts_with("ERROR :Closing Link")),
+        "the victim's host is banned"
+    );
+    s.line(op, "KLINE nobody :x");
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example 401 god nobody :No such nick/channel"]
+    );
+}
+
 /// A ban mask that cannot stand as a middle parameter as stored — an X-line
 /// mask with spaces, an IPv6 address starting with `:` — is listed in
 /// Solanum's spellings (`\s`, a leading `0`), not split into two parameters or
@@ -2621,6 +2792,44 @@ fn knock_delivers_to_ops_of_invite_only_channel() {
         has_numeric(&s.drain(carol), "713"),
         "an open channel → ERR_CHANOPEN"
     );
+}
+
+/// Solanum's `m_knock`: RPL_KNOCK goes to every member of a `+g` channel (any
+/// of whom may invite), to the operators only otherwise, and names the channel
+/// where a recipient's nick would go.
+#[test]
+fn knock_reaches_every_member_of_a_free_invite_channel() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let member = s.register(2, "member");
+    for channel in ["#vip", "#free"] {
+        s.line(op, &format!("JOIN {channel}"));
+        s.line(member, &format!("JOIN {channel}"));
+    }
+    s.line(op, "MODE #vip +i");
+    s.line(op, "MODE #free +ig");
+    s.drain(op);
+    s.drain(member);
+
+    let knocker = s.register(3, "knocker");
+    s.line(knocker, "KNOCK #vip");
+    s.drain(knocker);
+    assert_eq!(
+        s.drain(op),
+        [
+            ":irc.test.example 710 #vip #vip knocker!knocker@host3.example \
+          :has asked for an invite."
+        ],
+        "an op hears a knock"
+    );
+    assert!(s.drain(member).is_empty(), "a plain member does not, on -g");
+
+    let late = s.register(4, "late");
+    s.line(late, "KNOCK #free");
+    let knock = ":irc.test.example 710 #free #free late!late@host4.example \
+                 :has asked for an invite.";
+    assert_eq!(s.drain(op), [knock]);
+    assert_eq!(s.drain(member), [knock], "+g: every member hears it");
 }
 
 #[test]
@@ -4278,6 +4487,64 @@ fn invite_does_not_survive_channel_teardown() {
         has_numeric(&s.drain(bob), "473"),
         "an invite into a destroyed channel admitted into its successor"
     );
+}
+
+/// Opening a channel revokes the invitations it held: `-i` does, and `-l`
+/// does on a channel without `+i`, so an invite cannot be stocked while the
+/// channel is locked and spent after it is locked again.
+#[test]
+fn opening_a_channel_revokes_its_invites() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let carol = s.register(3, "carol");
+    s.line(alice, "JOIN #inv");
+    s.line(alice, "MODE #inv +i");
+    s.line(alice, "INVITE bob #inv");
+    s.line(alice, "MODE #inv -i");
+    s.line(alice, "MODE #inv +i");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(bob, "JOIN #inv");
+    assert!(has_numeric(&s.drain(bob), "473"), "-i revoked the invite");
+
+    s.line(alice, "MODE #inv -i+l 1");
+    s.line(alice, "INVITE carol #inv");
+    s.line(alice, "MODE #inv -l");
+    s.line(alice, "MODE #inv +l 1");
+    s.drain(alice);
+    s.drain(carol);
+    s.line(carol, "JOIN #inv");
+    assert!(has_numeric(&s.drain(carol), "471"), "-l revoked the invite");
+}
+
+/// One ERR_UNKNOWNMODE per MODE command, naming the first unknown letter
+/// (Solanum's `chm_nosuch`); the known modes around it still apply.
+#[test]
+fn unknown_channel_modes_are_reported_once_per_command() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(alice, "MODE #c +XmYZ");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 472 alice X :is unknown mode char to me",
+            ":alice!alice@host1.example MODE #c +m",
+        ]
+    );
+}
+
+/// A user MODE reads only its first argument as the mode string (Solanum's
+/// `user_mode`): `MODE me +i foo` sets +i and ignores `foo`, rather than
+/// reading `+ifoo`.
+#[test]
+fn user_mode_ignores_arguments_after_the_mode_string() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "MODE alice +i foo");
+    assert_eq!(s.drain(alice), [":irc.test.example MODE alice :+i"]);
 }
 
 /// A list-mode mask is clipped to BANMASKLEN at store time, so the stored mask
@@ -6808,10 +7075,14 @@ fn kill_requires_oper() {
     s.line(alice, "OPER god letmein");
     s.drain(alice);
     s.line(alice, "KILL bob :bye");
-    let bob_out = s.drain(bob);
-    assert!(
-        bob_out.iter().any(|l| l.starts_with("ERROR :")),
-        "{bob_out:#?}"
+    // The victim is told who killed it and why before the link closes, with
+    // the KILL line Solanum sends it.
+    assert_eq!(
+        s.drain(bob),
+        [
+            ":alice!alice@host1.example KILL bob :bye",
+            "ERROR :Closing Link: irc.test.example (Killed (alice (bye)))",
+        ]
     );
     assert!(
         s.drain(alice).iter().any(|l| l.contains("QUIT")),
@@ -8687,8 +8958,11 @@ fn chanserv_set_mlock_enforces_modes() {
         "no MLOCK confirmation: {out:#?}"
     );
     assert!(
-        out.iter()
-            .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
+        out.iter().any(
+            |l| l.starts_with(":ChanServ!ChanServ@services.irc.test.example MODE #reg")
+                && l.contains("+m")
+                && l.contains("-t")
+        ),
         "lock not applied on set: {out:#?}"
     );
 
@@ -8731,8 +9005,11 @@ fn chanserv_set_mlock_enforces_modes() {
     s.line(boss, "JOIN #reg");
     let out = s.drain(boss);
     assert!(
-        out.iter()
-            .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
+        out.iter().any(
+            |l| l.starts_with(":ChanServ!ChanServ@services.irc.test.example MODE #reg")
+                && l.contains("+m")
+                && l.contains("-t")
+        ),
         "lock not re-applied on recreate: {out:#?}"
     );
 }
@@ -10471,10 +10748,10 @@ fn chanserv_deop_voice_and_devoice_are_gated_on_access() {
         ["Devoiced \x02carol\x02 on \x02#chan\x02."]
     );
     s.line(carol, "PRIVMSG ChanServ :VOICE #chan");
+    // From ChanServ, the source its notices and mode-lock changes carry too.
     assert!(
         s.drain(boss)
-            .iter()
-            .any(|line| line.ends_with("MODE #chan +v carol"))
+            .contains(&":ChanServ!ChanServ@services.irc.test.example MODE #chan +v carol".into())
     );
     assert_eq!(
         notices(&s.drain(carol)),
@@ -12398,6 +12675,35 @@ fn oper_actions_are_audited() {
     );
 }
 
+/// Solanum's `m_oper`: an operator's second OPER is answered RPL_YOUREOPER and
+/// changes nothing — no second `MODE +o`, and no switch of the operator
+/// identity its later actions are audited under.
+#[test]
+fn reoper_changes_nothing() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.opers.push(("root".into(), "hunter2".into()));
+        },
+    );
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "OPER root hunter2");
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example 381 god :You are now an IRC operator"]
+    );
+    s.db_requests();
+    s.line(op, "KILL god :bye");
+    let actor = s.db_requests().into_iter().find_map(|r| match r {
+        e6ircd::core::DbRequest::AuditLog { actor, action, .. } if action == "KILL" => Some(actor),
+        _ => None,
+    });
+    assert_eq!(actor, Some(e6ircd::db::AuditPrincipal::operator("god")));
+}
+
 /// A self-KILL removes the actor's own session; the audit row must still name
 /// the actor — recording after the close resolved the actor to an empty string,
 /// an unattributed row in a log whose whole purpose is attribution.
@@ -12583,6 +12889,39 @@ fn oper_sethost_changes_host_and_chghosts() {
     assert!(
         s.drain(plain).iter().any(|l| l.contains(" 481 ")),
         "non-oper allowed to SETHOST"
+    );
+}
+
+/// SETHOST takes Solanum's `clean_host` characters only: a glob, a list, or a
+/// trailing `/<digit>` (a CIDR look-alike) would make every ban on the user
+/// ambiguous.
+#[test]
+fn sethost_refuses_hosts_outside_the_hostname_alphabet() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    let target = s.register(2, "user");
+    s.drain(op);
+    s.drain(target);
+    for bad in [
+        "*.example",
+        "a?b.example",
+        "a,b.example",
+        "a_b.example",
+        "net/24",
+    ] {
+        s.line(op, &format!("SETHOST user {bad}"));
+        assert_eq!(
+            s.drain(op),
+            [format!(":irc.test.example NOTICE god :Invalid host: {bad}")],
+        );
+        assert!(s.drain(target).is_empty(), "{bad} was applied");
+    }
+    s.line(op, "SETHOST user user/staff:2001-db8.example");
+    assert!(
+        s.drain(op)
+            .iter()
+            .any(|l| l.ends_with("Set host of user to user/staff:2001-db8.example"))
     );
 }
 
@@ -13016,33 +13355,28 @@ fn multi_target_message_delivers_and_caps() {
     );
 }
 
+/// Solanum's `channel_modes`: a member sees the `+k` and `+l` arguments, an
+/// outsider only the letters.
 #[test]
-fn channel_key_hidden_from_non_members() {
+fn channel_key_and_limit_hidden_from_non_members() {
     let mut s = TestServer::new();
     let op = s.register(1, "op");
     s.line(op, "JOIN #k");
     s.drain(op);
-    s.line(op, "MODE #k +k sekrit");
+    s.line(op, "MODE #k +kl sekrit 10");
     s.drain(op);
-    // A member sees the real key.
+    // A member sees the real key and limit.
     s.line(op, "MODE #k");
-    let out = s.drain(op);
-    let line = out
-        .iter()
-        .find(|l| l.split(' ').nth(1) == Some("324"))
-        .expect("324");
-    assert!(line.contains("sekrit"), "member should see key: {line}");
-    // A non-member sees `*`, never the value.
+    assert!(
+        s.drain(op)
+            .contains(&":irc.test.example 324 op #k +ntkl sekrit 10".to_string())
+    );
+    // A non-member sees that both are set, and neither argument.
     let bob = s.register(2, "bob");
     s.line(bob, "MODE #k");
-    let out = s.drain(bob);
-    let line = out
-        .iter()
-        .find(|l| l.split(' ').nth(1) == Some("324"))
-        .expect("324");
     assert!(
-        line.contains('*') && !line.contains("sekrit"),
-        "non-member must not see key value: {line}"
+        s.drain(bob)
+            .contains(&":irc.test.example 324 bob #k +ntkl".to_string())
     );
 }
 
@@ -13230,7 +13564,7 @@ fn myinfo_reflects_implemented_modes() {
         .find(|l| l.split(' ').nth(1) == Some("004"))
         .expect("004 MYINFO");
     assert!(
-        myinfo.contains("iowB") && myinfo.contains('C'),
+        myinfo.contains("iowBRZ") && myinfo.contains('C'),
         "MYINFO must advertise the umodes/chanmodes actually implemented: {myinfo}"
     );
 }
@@ -13508,11 +13842,10 @@ fn monitor_online_reply_splits_to_fit_the_wire_limit() {
 }
 
 #[test]
-fn moderated_channel_still_allows_a_regular_member_to_set_the_topic() {
-    // +m governs messages, not topic changes: a non-op/voice member of a +m,
-    // -t channel may still set the topic. This pins the deliberate difference
-    // between the TOPIC gate and Channel::may_speak — a "cleanup" that routed
-    // TOPIC through may_speak would make +m wrongly block it, and this fails.
+fn moderated_channel_refuses_an_unvoiced_members_topic() {
+    // Setting the topic is speaking to the channel (Solanum's `m_topic`
+    // requires `can_send`): an unvoiced member of a +m, -t channel may not
+    // talk past the moderation through the topic. A voiced one may.
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     let bob = s.register(2, "bob");
@@ -13531,16 +13864,24 @@ fn moderated_channel_still_allows_a_regular_member_to_set_the_topic() {
         has_numeric(&s.drain(bob), "404"),
         "a +m channel must block a regular member's PRIVMSG"
     );
-    // … but may still set the topic.
+    // … nor set the topic.
+    s.line(bob, "TOPIC #c :bob's topic");
+    let out = s.drain(bob);
+    assert_eq!(
+        out,
+        [":irc.test.example 404 bob #c :Cannot send to channel"],
+        "an unvoiced member may not set the topic of a +m -t channel"
+    );
+    assert!(s.drain(alice).is_empty(), "no topic change was broadcast");
+    // Voiced, bob may.
+    s.line(alice, "MODE #c +v bob");
+    s.drain(alice);
+    s.drain(bob);
     s.line(bob, "TOPIC #c :bob's topic");
     let out = s.drain(bob);
     assert!(
-        !has_numeric(&out, "482") && !has_numeric(&out, "404"),
-        "a regular member must be able to set the topic of a +m -t channel: {out:#?}"
-    );
-    assert!(
         out.iter().any(|l| l.contains("TOPIC #c :bob's topic")),
-        "the topic change should be broadcast: {out:#?}"
+        "a voiced member sets the topic: {out:#?}"
     );
 }
 
@@ -15509,7 +15850,7 @@ fn myinfo_mode_lists_agree_with_isupport() {
         v.sort_unstable();
         v
     };
-    assert_eq!(myinfo[5], "iowB", "user modes");
+    assert_eq!(myinfo[5], "iowBRZ", "user modes");
     assert_eq!(
         sorted(myinfo[6]),
         sorted(&format!("{}{prefix_modes}", groups.concat())),
@@ -15631,15 +15972,97 @@ fn user_mode_reports_only_real_changes() {
     let out = s.drain(alice);
     assert!(has_numeric(&out, "502"), "{out:#?}");
     // Every advertised user mode (RPL_MYINFO's first mode list) is one the
-    // server can hold and report.
+    // server can hold and report; +Z follows the transport (a TLS one in
+    // `tls_connections_hold_umode_z_and_whois_says_so`), so a client's +Z
+    // changes nothing.
     s.line(alice, "OPER god letmein");
-    s.line(alice, "MODE alice +iB");
+    s.line(alice, "MODE alice +iBRZ");
     s.drain(alice);
     s.line(alice, "MODE alice");
     let out = s.drain(alice);
     assert!(
-        out.iter().any(|l| l.ends_with(" 221 alice +iowB")),
+        out.iter().any(|l| l.ends_with(" 221 alice +iowBR")),
         "{out:#?}"
+    );
+}
+
+/// Umode +Z is the server's to set, on a TLS connection (Solanum): the
+/// client is told at registration, RPL_UMODEIS and WHOIS (RPL_WHOISSECURE)
+/// report it, and neither a TLS client's -Z nor a plaintext one's +Z
+/// changes anything.
+#[test]
+fn tls_connections_hold_umode_z_and_whois_says_so() {
+    let mut s = TestServer::new();
+    let tls = s.connect_with_transport(1, e6ircd::core::ConnectionTransport::Tls);
+    s.line(tls, "NICK alice");
+    s.line(tls, "USER alice 0 * :Alice");
+    let burst = s.drain(tls);
+    assert!(
+        burst.contains(&":alice MODE alice :+Z".to_string()),
+        "{burst:#?}"
+    );
+    let plain = s.register(2, "bob");
+    s.line(tls, "MODE alice -Z");
+    assert!(s.drain(tls).is_empty(), "-Z changes nothing");
+    s.line(tls, "MODE alice");
+    assert_eq!(s.drain(tls), [":irc.test.example 221 alice +Z"]);
+    s.line(plain, "MODE bob +Z");
+    assert!(s.drain(plain).is_empty(), "+Z changes nothing");
+
+    s.line(plain, "WHOIS alice");
+    assert!(
+        s.drain(plain)
+            .contains(&":irc.test.example 671 bob alice :is using a secure connection".to_string())
+    );
+    s.line(tls, "WHOIS bob");
+    assert!(!has_numeric(&s.drain(tls), "671"), "bob is plaintext");
+}
+
+/// Umode +R (Solanum's `um_regonlymsg`): a user who is not logged in cannot
+/// PRIVMSG, TAGMSG or INVITE a +R user (ERR_NONONREG), nor NOTICE one (silently);
+/// a logged-in user and an operator can.
+#[test]
+fn umode_r_admits_only_logged_in_senders() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    s.line(alice, "MODE alice +R");
+    assert_eq!(s.drain(alice), [":irc.test.example MODE alice :+R"]);
+    s.line(alice, "JOIN #priv");
+    s.drain(alice);
+    let guest = register_with_caps(&mut s, 2, "guest", "message-tags");
+    s.line(guest, "JOIN #priv");
+    s.drain(guest);
+    s.drain(alice);
+
+    let refusal =
+        ":irc.test.example 486 guest alice :You must log in with services to message this user";
+    for line in [
+        "PRIVMSG alice :hi",
+        "@+typing=active TAGMSG alice",
+        "INVITE alice #priv",
+    ] {
+        s.line(guest, line);
+        assert_eq!(s.drain(guest), [refusal], "{line}");
+    }
+    s.line(guest, "NOTICE alice :hi");
+    assert!(s.drain(guest).is_empty(), "a NOTICE is refused silently");
+    assert!(s.drain(alice).is_empty(), "nothing reached alice");
+
+    identify(&mut s, guest, "guest");
+    s.line(guest, "PRIVMSG alice :hi");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.ends_with("PRIVMSG alice :hi"))
+    );
+    let oper = s.register(3, "oper");
+    s.line(oper, "OPER god letmein");
+    s.drain(oper);
+    s.line(oper, "PRIVMSG alice :hello");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.ends_with("PRIVMSG alice :hello"))
     );
 }
 

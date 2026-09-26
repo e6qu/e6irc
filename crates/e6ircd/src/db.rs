@@ -576,6 +576,9 @@ pub struct StorageMaintenanceReport {
     pub device_grants: u64,
     pub logout_tokens: u64,
     pub account_invitations: u64,
+    /// Temporary server bans past their expiry. Every shard already stopped
+    /// enforcing each one when it lapsed; this removes the row.
+    pub server_bans: u64,
     /// Historical monitoring samples past `observability.retention_hours`,
     /// pruned here whether or not sampling is currently on.
     pub observability_samples: u64,
@@ -607,6 +610,7 @@ impl StorageMaintenanceReport {
             device_grants,
             logout_tokens,
             account_invitations,
+            server_bans,
             observability_samples,
             read_markers,
             expired_read_markers,
@@ -620,6 +624,7 @@ impl StorageMaintenanceReport {
         self.device_grants += device_grants;
         self.logout_tokens += logout_tokens;
         self.account_invitations += account_invitations;
+        self.server_bans += server_bans;
         self.observability_samples += observability_samples;
         self.read_markers += read_markers;
         self.expired_read_markers.extend(expired_read_markers);
@@ -636,6 +641,7 @@ impl StorageMaintenanceReport {
             MaintenanceCollection::DeviceGrants => &mut self.device_grants,
             MaintenanceCollection::LogoutTokens => &mut self.logout_tokens,
             MaintenanceCollection::AccountInvitations => &mut self.account_invitations,
+            MaintenanceCollection::ServerBans => &mut self.server_bans,
             MaintenanceCollection::ObservabilitySamples => &mut self.observability_samples,
             MaintenanceCollection::ReadMarkers | MaintenanceCollection::BncReadMarkers => {
                 &mut self.read_markers
@@ -691,13 +697,14 @@ pub enum MaintenanceCollection {
     DeviceGrants,
     LogoutTokens,
     AccountInvitations,
+    ServerBans,
     ObservabilitySamples,
     ReadMarkers,
     BncReadMarkers,
 }
 
 impl MaintenanceCollection {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Messages,
         Self::BncBuffer,
         Self::AuditLog,
@@ -706,6 +713,7 @@ impl MaintenanceCollection {
         Self::DeviceGrants,
         Self::LogoutTokens,
         Self::AccountInvitations,
+        Self::ServerBans,
         Self::ObservabilitySamples,
         Self::ReadMarkers,
         Self::BncReadMarkers,
@@ -721,6 +729,7 @@ impl MaintenanceCollection {
             Self::DeviceGrants => "device_grants",
             Self::LogoutTokens => "oidc_logout_tokens",
             Self::AccountInvitations => "account_invitations",
+            Self::ServerBans => "server_bans",
             Self::ObservabilitySamples => "observability_samples",
             Self::ReadMarkers => "read_markers",
             Self::BncReadMarkers => "bnc_read_markers",
@@ -789,6 +798,12 @@ impl MaintenanceCollection {
                      SELECT id FROM account_invitations
                      WHERE consumed_at IS NOT NULL OR expires_at <= now()
                      ORDER BY COALESCE(consumed_at, expires_at), id LIMIT $1))"
+            }
+            Self::ServerBans => {
+                "DELETE FROM server_bans WHERE id = ANY(ARRAY(
+                     SELECT id FROM server_bans
+                     WHERE expires_at <= now()
+                     ORDER BY expires_at, id LIMIT $1))"
             }
             Self::ObservabilitySamples => {
                 "DELETE FROM observability_samples WHERE sampled_at_ms = ANY(ARRAY(
@@ -5683,8 +5698,9 @@ pub async fn nickserv_account_info(
 /// Add or remove a server ban (KLINE/DLINE/XLINE) together with its audit
 /// record, in one transaction: a ban nobody is on record for cannot exist. An
 /// add upserts on `(mask, kind)`, so re-banning a mask of the same kind
-/// refreshes its reason and setter. Returns whether anything changed — `false`
-/// when the ban to remove was not there.
+/// refreshes its reason, setter and expiry. A temporary ban's audit detail
+/// names its length after the reason. Returns whether anything changed —
+/// `false` when the ban to remove was not there.
 pub async fn mutate_server_ban_audited(
     pool: &PgPool,
     mutation: &crate::core::ServerBanMutation,
@@ -5698,28 +5714,38 @@ pub async fn mutate_server_ban_audited(
             reason,
             set_by,
             kind,
+            expiry,
         } => {
+            let expires_at = expiry
+                .map(|expiry| {
+                    i64::try_from(expiry.expires_at_secs).map_err(|_| {
+                        DbError::InvalidDatabaseTimestamp("server-ban expiry exceeds BIGINT".into())
+                    })
+                })
+                .transpose()?;
             sqlx::query(
-                "INSERT INTO server_bans (mask, mask_display, reason, set_by, kind)
-                 VALUES ($1, $2, $3, $4, $5)
+                "INSERT INTO server_bans (mask, mask_display, reason, set_by, kind, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
                  ON CONFLICT (mask, kind) DO UPDATE
                     SET mask_display = EXCLUDED.mask_display,
                         reason = EXCLUDED.reason,
-                        set_by = EXCLUDED.set_by",
+                        set_by = EXCLUDED.set_by,
+                        expires_at = EXCLUDED.expires_at",
             )
             .bind(mask)
             .bind(mask_display)
             .bind(reason)
             .bind(set_by)
             .bind(kind)
+            .bind(expires_at)
             .execute(&mut *transaction)
             .await
             .map_err(query_error)?;
-            (
-                kind.to_ascii_uppercase(),
-                mask_display.as_str(),
-                reason.as_str(),
-            )
+            let detail = match expiry {
+                Some(expiry) => format!("{reason} (temporary, {} min.)", expiry.minutes),
+                None => reason.clone(),
+            };
+            (kind.to_ascii_uppercase(), mask_display.as_str(), detail)
         }
         crate::core::ServerBanMutation::Remove {
             expected_id,
@@ -5746,7 +5772,7 @@ pub async fn mutate_server_ban_audited(
             (
                 format!("UN{}", kind.to_ascii_uppercase()),
                 mask_display.as_str(),
-                "",
+                String::new(),
             )
         }
     };
@@ -5755,7 +5781,7 @@ pub async fn mutate_server_ban_audited(
         actor,
         &action,
         &AuditPrincipal::mask(target),
-        detail,
+        &detail,
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
@@ -6376,15 +6402,31 @@ fn join_page(first: bool, page: &[String]) -> String {
     if first { body } else { format!(", {body}") }
 }
 
-/// Every server ban as `(mask_display, reason, set_by, kind)` — boot-loaded
-/// into the hot server-ban list. The first field is the display casing
-/// (`COALESCE(mask_display, mask)` so a row predating the display column falls
-/// back to its folded mask); `MaskKey::new` re-derives the fold for comparison.
-pub async fn list_server_bans(
-    pool: &PgPool,
-) -> Result<Vec<(String, String, String, String)>, DbError> {
+/// One stored server ban, as the hot server-ban list is seeded from it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PersistedServerBan {
+    /// The display casing (`COALESCE(mask_display, mask)`, so a row predating
+    /// the display column falls back to its folded mask); `MaskKey::new`
+    /// re-derives the fold for comparison.
+    pub mask: String,
+    pub reason: String,
+    pub set_by: String,
+    pub kind: String,
+    /// When a temporary ban lapses, in Unix seconds; `None` for a permanent
+    /// one.
+    pub expires_at: Option<i64>,
+}
+
+/// Every server ban still in force — boot-loaded into the hot server-ban
+/// list. A temporary ban already past its expiry is not loaded: storage
+/// maintenance deletes its row, and until then it bans no one.
+pub async fn list_server_bans(pool: &PgPool) -> Result<Vec<PersistedServerBan>, DbError> {
     sqlx::query_as(
-        "SELECT COALESCE(mask_display, mask), reason, set_by, kind FROM server_bans ORDER BY id",
+        "SELECT COALESCE(mask_display, mask) AS mask, reason, set_by, kind,
+                EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at
+         FROM server_bans
+         WHERE expires_at IS NULL OR expires_at > now()
+         ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -7016,7 +7058,23 @@ pub struct ServerBanDirectoryRow {
     pub reason: String,
     pub set_by: String,
     pub created_at: String,
+    /// When a temporary ban lapses (RFC 3339, UTC); `None` for a permanent
+    /// one.
+    pub expires_at: Option<String>,
 }
+
+/// The server-ban directory's columns and table, shared by the one-row lookup
+/// and the page query so the two cannot disagree about a row's shape. A
+/// temporary ban already past its expiry is not in force, so it is not listed
+/// (storage maintenance deletes its row).
+const SERVER_BAN_DIRECTORY_SELECT: &str =
+    "SELECT b.id, b.kind, COALESCE(b.mask_display, b.mask) AS mask,
+        b.reason, b.set_by,
+        to_char(b.created_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+        to_char(b.expires_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at
+ FROM server_bans b WHERE (b.expires_at IS NULL OR b.expires_at > now())";
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServerBanDirectoryFilter<'a> {
@@ -7039,17 +7097,13 @@ pub async fn server_ban_directory_entry(
     pool: &PgPool,
     id: i64,
 ) -> Result<Option<ServerBanDirectoryRow>, DbError> {
-    sqlx::query_as(
-        "SELECT b.id, b.kind, COALESCE(b.mask_display, b.mask) AS mask,
-                b.reason, b.set_by,
-                to_char(b.created_at AT TIME ZONE 'UTC',
-                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
-         FROM server_bans b WHERE b.id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .map_err(query_error)
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(SERVER_BAN_DIRECTORY_SELECT);
+    query.push(" AND b.id = ").push_bind(id);
+    query
+        .build_query_as()
+        .fetch_optional(pool)
+        .await
+        .map_err(query_error)
 }
 
 bounded_page_size!(
@@ -7066,13 +7120,7 @@ pub async fn query_server_ban_directory(
 ) -> Result<ServerBanDirectoryPage, DbError> {
     let page_size = filter.page_size.value();
     let fetch_limit = page_size + 1;
-    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT b.id, b.kind, COALESCE(b.mask_display, b.mask) AS mask,
-                b.reason, b.set_by,
-                to_char(b.created_at AT TIME ZONE 'UTC',
-                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
-         FROM server_bans b WHERE TRUE",
-    );
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(SERVER_BAN_DIRECTORY_SELECT);
     if let Some(before_id) = filter.before_id {
         query.push(" AND b.id < ").push_bind(before_id);
     }
