@@ -2819,15 +2819,22 @@ mod tests {
         let mut handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
         handle.bnc_registry = Some(registry.clone());
         assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
-        // What the upstream had read by the time `run` returned.
+        // What the upstream reads once `run` has returned: the driver has sent
+        // its goodbye and closed the link by then, but the mock upstream is its
+        // own task and may not have been scheduled to read the close yet, so
+        // it is awaited rather than polled. The registry is still alive here,
+        // so the end of stream can only be the driver's own close.
         let mut heard = Vec::new();
-        while let Ok(line) = heard_rx.try_recv() {
-            heard.push(line);
+        while heard.last() != Some(&None) {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), heard_rx.recv()).await {
+                Ok(Some(line)) => heard.push(line),
+                Ok(None) | Err(_) => break,
+            }
         }
         assert_eq!(
             heard,
             vec![Some("QUIT :e6irc bouncer stopping".to_string()), None],
-            "the upstream reads the goodbye, then end of stream, before shutdown completes"
+            "the upstream reads the goodbye, then end of stream, while the registry still lives"
         );
         drop(registry);
     }
