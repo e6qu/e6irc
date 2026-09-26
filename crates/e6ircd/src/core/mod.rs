@@ -5767,7 +5767,7 @@ mod ingress_tests {
         let join_at = two[start..].iter().position(|l| l.contains(" JOIN #"));
         let lock_at = two[start..]
             .iter()
-            .position(|l| l.contains(":ChanServ MODE #"));
+            .position(|l| l.contains(":ChanServ!ChanServ@services.irc.test MODE #"));
         assert!(
             join_at.is_some() && join_at < lock_at,
             "the joiner hears its JOIN, then the lock it brought about: {two:#?}"
@@ -5798,7 +5798,7 @@ mod ingress_tests {
         assert_eq!(one, two);
         assert_eq!(lines_with(&two, "label=v1").len(), 1, "{two:#?}");
         assert_eq!(
-            lines_with(&two, "@batch=* :irc.test MODE ").len(),
+            lines_with(&two, "@batch=* :ChanServ!ChanServ@services.irc.test MODE ").len(),
             1,
             "{two:#?}"
         );
