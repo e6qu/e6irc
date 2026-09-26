@@ -2175,8 +2175,8 @@ async function openNetworkDialog(name = null) {
   el("nf-clear-server-password-row").hidden = !editing;
   showStoredChannelKeys([]);
   el("nf-autojoin-note").textContent = editing
-    ? "Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. A stored key is never shown; it is kept unless you write a new one or remove it below."
-    : "Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.";
+    ? "Separate channels with commas. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. A stored key is never shown; it is kept unless you write a new one or remove it below."
+    : "Separate channels with commas. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.";
   // Editing shows the whole connection: the server, TLS, and the names sent to
   // it are what a person came here to change, and a closed section reads as
   // "these settings do not exist".
