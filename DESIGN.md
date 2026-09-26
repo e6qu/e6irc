@@ -2162,7 +2162,9 @@ two-parameter `NICK`; an autojoin entry of `0` means "leave every channel";
 `#a,#b` is two channels; a key with a space, a comma, or a leading `:` is not
 one `JOIN` parameter) — not a network's nickname policy, which still comes
 back as a loud 432. An account network's autojoin entry is `#channel` or
-`#channel key`; the key is a secret of the channel's members, stored sealed
+`#channel key` (the chat client's settings box separates entries by commas
+only, so the word after a channel is its key whatever it begins with, and an
+entry of three words is refused); the key is a secret of the channel's members, stored sealed
 under the owner's context in `bnc_networks.autojoin_keys_sealed` (migration
 0087: one entry per `autojoin` channel, NULL for none, held to one length and
 to IRC networks by table constraints), re-sealed by key rotation, opened only
@@ -3334,7 +3336,13 @@ the active route is brought into the horizontal console-navigation viewport on
 load. The console works
 in the default build and `embed-web`; its private pages permit only that
 same-origin script. The shared browser contract parser validates each path,
-query, JSON request, and JSON response before a request or view uses it.
+query, JSON request, and JSON response before a request or view uses it. A
+directory page (sessions, accounts, channels, bans, audit) never forwards its
+own query string: its API query and its pager links are built by the shared
+`directoryQuery` from the keys that directory's operation declares, keeping
+only non-empty values, so a filter form's "All kinds" (`kind=`) or a
+page-only parameter (a second pager cursor, a one-shot notice flag) cannot
+fail the contract before the request is made.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle
@@ -3401,7 +3409,13 @@ network (a test scans the chat shell and every template for it). A failure of so
 did not enter the socket, a join that was not sent, backlog that would not
 load, a refused notification permission -- is reported once, as an alert above
 the chat, which is read whatever conversation is open and is deduplicated by
-key. The console conversation keeps the connection's own record (what it sent
+key. A live connection opening clears only the alerts that report the
+connection being down (`ALERTS_RESOLVED_BY_CONNECTING`, with "Not connected"
+under a key of its own); a refused message, or messages not confirmed before a
+connection closed, stay until the person dismisses the alert or acts on it,
+since reconnecting delivers neither. Alert text is stripped of bidirectional
+controls where it is shown, because it names channels and nicks. The console
+conversation keeps the connection's own record (what it sent
 and received, what was enabled, why a socket was not opened); it is not a
 second place for failures, which used to be written there as well, in wording
 that had drifted from the alert's. The
@@ -3445,7 +3459,10 @@ old nick, mode table or membership. Raw line events preserve IRCv3 `time` and `m
 persisted timelines use the same clock and have stable overlap identity. The
 client applies the protocol parser's last-duplicate-tag rule, parses each line,
 routes it to the right buffer (channel / DM / server), with STATUSMSG targets
-such as `@#ops` routed to the underlying channel,
+such as `@#ops` routed to the underlying channel -- only the sigils the
+network's `005 STATUSMSG` advertises, none before it does, taken off exactly as
+`NetworkNames::conversation` takes them (the fewest that leave a channel, so
+with `&` a sigil `&#dev` is `#dev`'s),
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
@@ -3453,7 +3470,12 @@ inject markup). Bidirectional embedding, override and isolate controls
 (U+202A–U+202E, U+2066–U+2069) are removed from rendered text, and the
 sender, the text and each link are separate bidi isolates (a link laid out
 left to right), so a line cannot display a link as an address other than the
-one it opens. The transcript is `aria-busy` and `aria-live="off"` from each
+one it opens. Channel and nick names are drawn the same way wherever they
+appear -- the conversation list, the header, the member list, alerts and
+desktop notifications -- while the name sent back to the network keeps its
+own spelling; each drawn name is its own isolate. mIRC formatting is removed
+from chat text, topics, and the reason a PART, KICK or QUIT carries, which is
+rendered by one helper (`reasonSuffix`). The transcript is `aria-busy` and `aria-live="off"` from each
 connect until the replay boundary, so a screen reader announces live traffic,
 not the replayed backlog. The conversation and member lists are reconciled in
 place, keyed by conversation and member, so a new line or a JOIN, PART or MODE

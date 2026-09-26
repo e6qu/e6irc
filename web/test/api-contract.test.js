@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   ApiError,
   ApiSchemaError,
   apiContractLoader,
+  directoryQuery,
   getOperationJson,
   operationRequestSchema,
   operationResponseSchema,
@@ -571,4 +573,41 @@ test("contract loader rejects a failed response without preserving stale state",
   await assert.rejects(load());
   assert.deepEqual(await load(), { paths: {} });
   assert.equal(attempts, 2);
+});
+
+const servedContract = JSON.parse(await readFile(new URL("fixtures/openapi.json", import.meta.url), "utf8"));
+
+test("console directory queries drop empty filters and page-only parameters", () => {
+  // The ban filter form submits "All kinds" as an empty kind; the contract's
+  // enum refuses it, so forwarding the page query verbatim failed the load.
+  const bans = "?kind=&mask=&limit=100";
+  assert.throws(() => parseOperationQuery(servedContract, "GET", `/api/v1/admin/bans${bans}`), ApiSchemaError);
+  const banQuery = directoryQuery(bans, ["kind", "mask", "limit", "before_id"]);
+  assert.equal(banQuery.toString(), "limit=100");
+  parseOperationQuery(servedContract, "GET", `/api/v1/admin/bans?${banQuery}`);
+
+  // A page-only parameter is not a declared query parameter of the API.
+  const accounts = "?name=&invitation_before_id=7&reauthenticated=1";
+  assert.throws(() => parseOperationQuery(servedContract, "GET", `/api/v1/admin/accounts${accounts}`), ApiSchemaError);
+  const accountQuery = directoryQuery(accounts, ["name", "limit", "before_id"], { limit: "50" });
+  assert.equal(accountQuery.toString(), "limit=50");
+  parseOperationQuery(servedContract, "GET", `/api/v1/admin/accounts?${accountQuery}`);
+
+  // A default never overrides a value the page carries, and the source may be
+  // an existing query rather than a search string.
+  assert.equal(directoryQuery(new URLSearchParams("limit=5&x=1"), ["limit"], { limit: "50" }).toString(), "limit=5");
+});
+
+test("the console builds every directory query through the allow-list", async () => {
+  const source = await readFile(new URL("../../crates/e6ircd/assets/console.js", import.meta.url), "utf8");
+  const uses = [...source.matchAll(/window\.location\.search/g)];
+  assert.ok(uses.length > 0);
+  for (const use of uses) {
+    const before = source.slice(Math.max(0, use.index - 40), use.index);
+    const after = source.slice(use.index, use.index + 60);
+    // Either the allow-list's input, or a single named flag read.
+    const allowed = /directoryQuery\(\s*$/.test(before)
+      || /^window\.location\.search\)\.get\("[a-z_]+"\)/.test(after);
+    assert.ok(allowed, `console.js reads the page query outside directoryQuery: ${before}${after}`);
+  }
 });

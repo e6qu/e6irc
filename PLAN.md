@@ -930,6 +930,31 @@ this change fixes:
   documents), DESIGN §5's dependency policy, the default flood limits, the
   client's SASL mechanisms, and CI's PostgreSQL setup.
 
+A review of the web client and the console script found, and this change
+fixes, each with a test that failed before:
+
+- **The ban directory failed on "All kinds".** The filter form submits
+  `kind=`, and the console forwarded its page query verbatim, so the
+  contract's enum refused the read before it was sent; the accounts page sent
+  its invitation cursor and the reauthentication flag to an operation that
+  declares neither. Every directory's API query and pager link now come from
+  one allow-list helper, `directoryQuery`, and a test pins that the console
+  reads its page query nowhere else.
+- **STATUSMSG sigils were hard-coded `@+`.** The chat client now reads
+  `005 STATUSMSG` and takes off only advertised sigils, as the server's
+  `NetworkNames::conversation` does, with its test cases (`%#dev`, `&#dev`).
+- **A reconnect cleared "messages were not confirmed".** The socket's open
+  handler cleared the key that alert shared with "Not connected"; the two
+  have separate keys and only connection-down alerts clear on open.
+- **PART, KICK and QUIT reasons kept their colour codes.** One helper renders
+  every such reason.
+- **Channel and nick names were drawn with bidi controls** in the
+  conversation list, header, member list and alerts; they are stripped where
+  drawn and each name is a bidi isolate.
+- **An auto-join key beginning with `#`, `&`, `+` or `!` was saved as a
+  channel.** The settings box separates entries by commas, and the word after
+  a channel is its key, as the server's entry grammar reads it.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

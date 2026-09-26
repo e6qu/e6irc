@@ -107,3 +107,15 @@ export function errorMessage(action, error) {
   const detail = sentence ? ` ${/[.!?]$/.test(sentence) ? sentence : `${sentence}.`}` : "";
   return `Could not ${action}.${detail}`;
 }
+
+// The alerts a live connection opening resolves, by key. Each reports the
+// connection being down ("Not connected — ..." is the not-connected key), so
+// the connection coming up answers it. A message that was refused, or never
+// confirmed before a connection closed, is not in this list: reconnecting does
+// not deliver it, so its alert stays until the person dismisses it or acts.
+export const ALERTS_RESOLVED_BY_CONNECTING = Object.freeze([
+  "socket",
+  "socket-close",
+  "network-unavailable",
+  "not-connected",
+]);
