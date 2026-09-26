@@ -4558,7 +4558,12 @@ mod ingress_tests {
 
         /// Connect and register `nick` as connection `conn`, requesting `caps`.
         fn client(&mut self, conn: u64, nick: &str, caps: &str) {
-            let (tx, rx) = crate::core::send_queue("shards-client", 256 * 512);
+            self.client_with_sendq(conn, nick, caps, 256 * 512);
+        }
+
+        /// [`Self::client`] with a send queue of `sendq_bytes`.
+        fn client_with_sendq(&mut self, conn: u64, nick: &str, caps: &str, sendq_bytes: usize) {
+            let (tx, rx) = crate::core::send_queue("shards-client", sendq_bytes);
             self.outputs.insert(conn, rx);
             let shard = conn as usize % self.cores.len();
             self.cores[shard].handle(Input::Open {
@@ -5640,9 +5645,18 @@ mod ingress_tests {
         );
     }
 
+    /// The lister's send queue: small, so a LIST of four hundred rows needs
+    /// many turns (half of it, the room a paced reply may fill, is a few
+    /// dozen rows).
+    const LISTER_SENDQ: usize = 8 * 1024;
+
+    /// The most rows a LIST asks one shard for at once: a row is at most one
+    /// line, so the room of the lister's queue holds this many.
+    const LISTER_PAGE: usize = (LISTER_SENDQ / 2).div_ceil(e6irc_proto::message::MAX_LINE_LEN);
+
     /// Four hundred channels, `#room000` on, spread over both shards: two
     /// members on shard 0 hold two hundred each (the channel limit is 250).
-    /// The lister is connection 1, on shard 1.
+    /// The lister is connection 1, on shard 1, with a small send queue.
     fn four_hundred_channels() -> Shards {
         let mut shards = Shards::new();
         shards.client(2, "member", "");
@@ -5652,7 +5666,7 @@ mod ingress_tests {
             shards.line(member, &format!("JOIN #room{room:03}"));
             shards.drain(member);
         }
-        shards.client(1, "lister", "");
+        shards.client_with_sendq(1, "lister", "", LISTER_SENDQ);
         shards
     }
 
@@ -5693,11 +5707,19 @@ mod ingress_tests {
         let mut shards = four_hundred_channels();
         shards.line(1, "LIST");
         let first = shards.drain(1);
-        // The client's queue holds 256 lines: half of it goes at once, the
-        // reply's start and 127 rows.
-        assert_eq!(listed(&first).len(), 127, "{first:#?}");
+        // Some rows go at once, within the room half the queue leaves, and
+        // what is held is at most a page from each shard.
+        let sent: usize = first.iter().map(|line| line.len() + 2).sum();
         assert!(
-            held_rows(&shards) <= 128,
+            !listed(&first).is_empty() && listed(&first).len() < 400,
+            "{first:#?}"
+        );
+        assert!(
+            sent <= LISTER_SENDQ / 2 + e6irc_proto::message::MAX_LINE_LEN,
+            "{sent} bytes: {first:#?}"
+        );
+        assert!(
+            held_rows(&shards) <= 2 * LISTER_PAGE,
             "a page, not the channel list: {}",
             held_rows(&shards)
         );
@@ -5719,7 +5741,10 @@ mod ingress_tests {
         let mut shards = four_hundred_channels();
         shards.line(1, "LIST");
         let first = shards.drain(1);
-        assert_eq!(listed(&first).last().map(String::as_str), Some("#room126"));
+        // The cursor is past #room001 and well short of #room390.
+        let reached = listed(&first);
+        assert!(reached.contains(&"#room001".to_string()), "{first:#?}");
+        assert!(reached.len() < 390, "{first:#?}");
         // Behind the cursor, ahead of it, and removed ahead of it.
         shards.line(2, "JOIN #room000a");
         shards.line(2, "JOIN #room999");
