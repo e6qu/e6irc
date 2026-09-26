@@ -37,7 +37,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
-            &["KICK"],
+            &[Middle::own("KICK")],
             Some("Channel and user lists must be one channel or of equal length"),
         );
         return;
@@ -55,7 +55,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[clip_echo(who)],
+                &[Middle::echo(who)],
                 Some("Too many targets; not kicked"),
             );
             break;
@@ -178,7 +178,7 @@ fn emit_kick_result_now(
         crate::core::state::ChannelKickResult::NotOperator { target } => state.numeric(
             conn,
             ERR_CHANOPRIVSNEEDED,
-            &[&target],
+            &[Middle::echo(&target)],
             Some("You're not a channel operator"),
         ),
         crate::core::state::ChannelKickResult::UserNotInChannel { victim, channel } => {
@@ -344,9 +344,12 @@ pub(super) fn emit_invite_result_now(
     result: crate::core::state::ChannelInviteResult,
 ) {
     match result {
-        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => {
-            state.numeric(conn, RPL_INVITING, &[&invitee, &channel], None)
-        }
+        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => state.numeric(
+            conn,
+            RPL_INVITING,
+            &[Middle::echo(&invitee), Middle::own(&channel)],
+            None,
+        ),
         crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, &target)
         }
@@ -359,14 +362,14 @@ pub(super) fn emit_invite_result_now(
         crate::core::state::ChannelInviteResult::NotOperator { target } => state.numeric(
             conn,
             ERR_CHANOPRIVSNEEDED,
-            &[&target],
+            &[Middle::echo(&target)],
             Some("You're not a channel operator"),
         ),
         crate::core::state::ChannelInviteResult::UserOnChannel { invitee, channel } => state
             .numeric(
                 conn,
                 ERR_USERONCHANNEL,
-                &[&invitee, &channel],
+                &[Middle::echo(&invitee), Middle::own(&channel)],
                 Some("is already on channel"),
             ),
     }
@@ -434,7 +437,12 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let filter = match ListFilter::parse(p.first().copied(), now_secs, state.casemap) {
         Ok(filter) => filter,
         Err(InvalidListParameters) => {
-            state.numeric(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
+            state.numeric(
+                conn,
+                RPL_LISTSTART,
+                &[Middle::own("Channel")],
+                Some("Users  Name"),
+            );
             let notice = state.server_notice_line(conn, "Invalid parameters for /LIST");
             state.send(conn, &notice);
             state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
@@ -463,7 +471,12 @@ fn open_channel_list(
         state.send_unheld(conn, bytes::Bytes::from(format!("{open}\r\n")));
         batch
     });
-    let start = state.numeric_line(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
+    let start = state.numeric_line(
+        conn,
+        RPL_LISTSTART,
+        &[Middle::own("Channel")],
+        Some("Users  Name"),
+    );
     send_list_line(state, conn, batch.as_deref(), start);
     batch
 }
@@ -605,7 +618,7 @@ pub(super) fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
                 let line = state.numeric_line(
                     conn,
                     RPL_LIST,
-                    &[&row.name, &row.members.to_string()],
+                    &[Middle::own(&row.name), Middle::from(row.members)],
                     Some(&row.topic),
                 );
                 let sent = send_list_line(state, conn, cursor.batch.as_deref(), line);
@@ -668,14 +681,7 @@ fn pack_userhost_entries(
     code: u16,
     entries: &[String],
 ) -> String {
-    let target = state.sessions[&conn].nick().unwrap_or("*");
-    let head_len = format!(
-        ":{} {} {} :",
-        state.config.server_name,
-        e6irc_proto::numerics::code_str(code),
-        target,
-    )
-    .len();
+    let head_len = state.numeric_head_len(conn, code, &[]);
     crate::core::handler::pack_trailing_list(entries, head_len)
 }
 
@@ -698,10 +704,15 @@ pub(super) fn cmd_links(state: &mut ServerState, conn: ConnId) {
     state.numeric(
         conn,
         RPL_LINKS,
-        &[&server, &server],
+        &[Middle::own(&server), Middle::own(&server)],
         Some(&format!("0 {info}")),
     );
-    state.numeric(conn, RPL_ENDOFLINKS, &["*"], Some("End of /LINKS list"));
+    state.numeric(
+        conn,
+        RPL_ENDOFLINKS,
+        &[Middle::own("*")],
+        Some("End of /LINKS list"),
+    );
 }
 
 pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -748,7 +759,7 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.numeric(
         conn,
         RPL_ENDOFSTATS,
-        &[&letter],
+        &[Middle::echo(&letter)],
         Some("End of /STATS report"),
     );
 }
@@ -791,10 +802,10 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                     conn,
                     RPL_STATSKLINE,
                     &[
-                        letter("K", "k"),
-                        &mask_middle(host),
-                        "*",
-                        &mask_middle(user),
+                        Middle::own(letter("K", "k")),
+                        Middle::own(mask_middle(host)),
+                        Middle::own("*"),
+                        Middle::own(mask_middle(user)),
                     ],
                     Some(&reason),
                 );
@@ -803,7 +814,10 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                 state.numeric(
                     conn,
                     RPL_STATSDLINE,
-                    &[letter("D", "d"), &mask_middle(&mask)],
+                    &[
+                        Middle::own(letter("D", "d")),
+                        Middle::own(mask_middle(&mask)),
+                    ],
                     Some(&reason),
                 );
             }
@@ -811,7 +825,11 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                 state.numeric(
                     conn,
                     RPL_STATSXLINE,
-                    &[letter("X", "x"), "0", &mask_middle(&mask)],
+                    &[
+                        Middle::own(letter("X", "x")),
+                        Middle::own("0"),
+                        Middle::own(mask_middle(&mask)),
+                    ],
                     Some(&reason),
                 );
             }
@@ -967,14 +985,14 @@ fn emit_knock_result_now(
             state.numeric(
                 conn,
                 RPL_KNOCKDLVR,
-                &[&display],
+                &[Middle::own(&display)],
                 Some("Your KNOCK has been delivered"),
             );
         }
         crate::core::state::ChannelKnockResult::TooManyKnocks { display, scope } => state.numeric(
             conn,
             ERR_TOOMANYKNOCK,
-            &[&display],
+            &[Middle::own(&display)],
             Some(&format!("Too many KNOCKs ({scope}).")),
         ),
         crate::core::state::ChannelKnockResult::NoSuchChannel { target } => {
@@ -986,16 +1004,19 @@ fn emit_knock_result_now(
         crate::core::state::ChannelKnockResult::AlreadyOnChannel { display } => state.numeric(
             conn,
             ERR_KNOCKONCHAN,
-            &[&display],
+            &[Middle::own(&display)],
             Some("You are on that channel"),
         ),
-        crate::core::state::ChannelKnockResult::ChannelOpen { display } => {
-            state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"))
-        }
+        crate::core::state::ChannelKnockResult::ChannelOpen { display } => state.numeric(
+            conn,
+            ERR_CHANOPEN,
+            &[Middle::own(&display)],
+            Some("Channel is open"),
+        ),
         crate::core::state::ChannelKnockResult::CannotSend { display } => state.numeric(
             conn,
             ERR_CANNOTSENDTOCHAN,
-            &[&display],
+            &[Middle::own(&display)],
             Some("Cannot knock on channel (+b/+q)"),
         ),
     }

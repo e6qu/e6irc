@@ -1032,6 +1032,20 @@ decoding):
   targets) go through a fitted `bnc_notice`, where a multi-byte reason used to
   turn them into the rejection notice. `core_dispatch` now also fuzzes with
   accounts enabled.
+- **The core's numerics still took their middles as strings**, and let a space
+  through for the one pre-joined mode string, so every call site echoing a
+  client token had to remember to render it — and three did not: an invalid
+  `+l` limit (`MODE #c +l :a b` answered `696 … l a b :…`), a WHOX query token
+  (`WHO #c :%nt,a b` shifted every field of each 354 row), and the STATS letter
+  (`STATS : u` sent an empty parameter). The refused target of a JOIN past the
+  channel limit was echoed unclipped. The funnel now takes `core::Middle`
+  values — `Middle::echo` for client or upstream text, `Middle::own` for the
+  server's, `From` an integer — each written as exactly one parameter, and
+  `RPL_CHANNELMODEIS` passes each mode argument as its own; `clip_echo` is
+  gone. The remaining `FAIL TOPIC`/`SETNAME`/`INVALID_MESSAGE` lines built by
+  hand now go through `fail_line`, and USERHOST, ISON and the HELP index
+  measure their packed trailing against the line the funnel frames rather
+  than a head rebuilt beside it.
 
 A review of the client library, the TUI and the CLI found, and this change
 fixes, each with a test that failed before:

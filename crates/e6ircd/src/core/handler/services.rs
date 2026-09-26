@@ -2675,14 +2675,14 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         conn,
         RPL_MYINFO,
         &[
-            &server,
-            &format!("e6ircd-{}", version()),
+            Middle::own(&server),
+            Middle::own(format!("e6ircd-{}", version())),
             // Derived from the same mode tables as ISUPPORT CHANMODES/PREFIX, so
             // the two cannot drift: user modes, every channel mode (list and
             // prefix modes included), then the channel modes taking a parameter.
-            USER_MODES,
-            &myinfo_channel_modes(),
-            &myinfo_param_channel_modes(),
+            Middle::own(USER_MODES),
+            Middle::own(myinfo_channel_modes()),
+            Middle::own(myinfo_param_channel_modes()),
         ],
         None,
     );
@@ -2728,7 +2728,7 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         state.numeric(
             conn,
             RPL_LUSEROP,
-            &[&opers.to_string()],
+            &[Middle::from(opers)],
             Some("operator(s) online"),
         );
     }
@@ -2736,7 +2736,7 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         state.numeric(
             conn,
             RPL_LUSERUNKNOWN,
-            &[&unknown.to_string()],
+            &[Middle::from(unknown)],
             Some("unknown connection(s)"),
         );
     }
@@ -2744,7 +2744,7 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         state.numeric(
             conn,
             RPL_LUSERCHANNELS,
-            &[&channels.to_string()],
+            &[Middle::from(channels)],
             Some("channels formed"),
         );
     }
@@ -2757,13 +2757,13 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
     state.numeric(
         conn,
         RPL_LOCALUSERS,
-        &[&users.to_string(), &max.to_string()],
+        &[Middle::from(users), Middle::from(max)],
         Some(&format!("Current local users {users}, max {max}")),
     );
     state.numeric(
         conn,
         RPL_GLOBALUSERS,
-        &[&users.to_string(), &max.to_string()],
+        &[Middle::from(users), Middle::from(max)],
         Some(&format!("Current global users {users}, max {max}")),
     );
 }

@@ -2487,6 +2487,35 @@ fn stats_uptime_and_terminator() {
         has_numeric(&out, "219"),
         "STATS with a leading 3-byte char still terminates without panic"
     );
+    // The letter is the client's text: a space (the argument in trailing
+    // form) is the `*` placeholder, not an empty parameter.
+    s.line(alice, "STATS : u");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 219 alice * :End of /STATS report"],
+    );
+}
+
+/// `MODE #c +l <limit>` answers a limit that is not a positive number with
+/// ERR_INVALIDMODEPARAM naming it; the limit is the client's text, so one
+/// that cannot stand as a parameter (`+l :a b`) is the `*` placeholder rather
+/// than two parameters that push the reply's fields a column right.
+#[test]
+fn an_invalid_limit_is_echoed_as_one_parameter() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #lim");
+    s.drain(alice);
+    s.line(alice, "MODE #lim +l zero");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 696 alice #lim l zero :Invalid channel limit"],
+    );
+    s.line(alice, "MODE #lim +l :a b");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 696 alice #lim l * :Invalid channel limit"],
+    );
 }
 
 /// STATS k/d/x list the server bans for an operator with the whole reason —
@@ -4283,6 +4312,15 @@ fn whox_token_that_breaks_framing_is_defaulted() {
     let out = s.drain(alice);
     let row = out.iter().find(|l| l.contains(" 354 ")).expect("354");
     assert!(row.ends_with(" 0 alice"), "colon token mis-echoed: {row}");
+    // A token with a space (the spec in trailing form) → "0", not two
+    // parameters that shift the nick a column right.
+    s.line(alice, "WHO #wx :%tn,a b");
+    let out = s.drain(alice);
+    let row = out.iter().find(|l| l.contains(" 354 ")).expect("354");
+    assert!(
+        row.ends_with(" 354 alice 0 alice"),
+        "spaced token split: {row}"
+    );
     // Fieldless % → plain WHO.
     s.line(alice, "WHO #wx %");
     let out = s.drain(alice);
@@ -13101,6 +13139,13 @@ fn channels_per_session_is_capped() {
     assert!(
         has_numeric(&out, "405"),
         "the 251st channel must be ERR_TOOMANYCHANNELS: {out:#?}"
+    );
+    // The refused target is the client's own text, echoed as one parameter:
+    // a trailing-form target with a space is the `*` placeholder, not two.
+    s.line(a, "JOIN :#one more");
+    assert_eq!(
+        s.drain(a),
+        [":irc.test.example 405 alice * :You have joined too many channels"],
     );
 }
 

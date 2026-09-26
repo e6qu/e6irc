@@ -104,7 +104,7 @@ pub(super) fn cmd_message(
                 state.numeric(
                     conn,
                     ERR_TOOMANYTARGETS,
-                    &[clip_echo(&target)],
+                    &[Middle::echo(&target)],
                     Some("Too many targets; message not delivered"),
                 );
             }
@@ -243,7 +243,7 @@ pub(super) fn err_nonreg(state: &mut ServerState, conn: ConnId, nick: &str) {
     state.numeric(
         conn,
         ERR_NONONREG,
-        &[nick],
+        &[Middle::own(nick)],
         Some("You must log in with services to message this user"),
     );
 }
@@ -255,7 +255,7 @@ fn emit_speak_refusal(state: &mut ServerState, conn: ConnId, target: &str, why: 
         SpeakRefusal::CannotSend => (ERR_CANNOTSENDTOCHAN, "Cannot send to channel"),
         SpeakRefusal::NoCtcp => (ERR_CANNOTSENDTOCHAN, "Cannot send to channel (+C, no CTCP)"),
     };
-    state.numeric(conn, numeric, &[target], Some(text));
+    state.numeric(conn, numeric, &[Middle::echo(target)], Some(text));
 }
 
 /// What a message target resolved to, once the sender was allowed to speak.
@@ -598,7 +598,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &["TAGMSG"],
+            &[Middle::own("TAGMSG")],
             Some("Unknown command"),
         );
         return;
@@ -638,7 +638,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[clip_echo(&target)],
+                &[Middle::echo(&target)],
                 Some("Too many targets; message not delivered"),
             );
             break;
@@ -1217,7 +1217,7 @@ fn away_reply(
         && peer.conn() != conn
         && let Some(away) = &peer.away
     {
-        state.numeric(conn, RPL_AWAY, &[&peer.nick], Some(away));
+        state.numeric(conn, RPL_AWAY, &[Middle::own(&peer.nick)], Some(away));
     }
 }
 
@@ -1655,7 +1655,7 @@ pub(super) fn multiline_collect(
             state,
             conn,
             "MULTILINE_INVALID_TARGET",
-            &[clip_echo(&batch_target), clip_echo(line_target)],
+            &[&batch_target, line_target],
             "Multiline batch target does not match message target",
         );
         return true;

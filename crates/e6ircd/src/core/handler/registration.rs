@@ -18,7 +18,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
-            &[clip_echo(nick)],
+            &[Middle::echo(nick)],
             Some("Erroneous nickname"),
         );
         return;
@@ -31,7 +31,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
-            &[clip_echo(nick)],
+            &[Middle::echo(nick)],
             Some("Nickname is reserved"),
         );
         return;
@@ -52,7 +52,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_BANNICKCHANGE,
-            &[nick, &channel],
+            &[Middle::echo(nick), Middle::own(&channel)],
             Some("Cannot change nickname while banned on channel"),
         );
         return;
@@ -66,7 +66,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_NICKNAMEINUSE,
-            &[nick],
+            &[Middle::echo(nick)],
             Some("Nickname is already in use"),
         );
         return;
@@ -185,7 +185,7 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             e6irc_proto::numerics::ERR_INVALIDUSERNAME,
-            &[p[0]],
+            &[Middle::echo(p[0])],
             Some("Invalid username"),
         );
         return;
@@ -635,12 +635,10 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
         _ => {
-            // clip_echo renders an empty or ':'-leading subcommand as the
-            // safe "*" placeholder, so the echo can't break the reply's framing.
             state.numeric(
                 conn,
                 ERR_INVALIDCAPCMD,
-                &[crate::core::handler::clip_echo(&sub)],
+                &[Middle::echo(&sub)],
                 Some("Invalid CAP command"),
             );
         }
