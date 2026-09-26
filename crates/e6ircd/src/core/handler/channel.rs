@@ -313,8 +313,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // the client wrote it, the JOIN and then its PART.
     if targets == "0" {
         let session = state.sessions.get_mut(&conn).expect("dispatching session");
-        let pending: Vec<ChanKey> = session.pending_joins.iter().cloned().collect();
-        session.part_on_join.extend(pending);
+        session.part_joins_in_flight();
         let names: Vec<&str> = session.channels.iter().map(ChanKey::as_str).collect();
         if !names.is_empty() {
             let joined = names.join(",");
@@ -334,9 +333,13 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         // before either a local or remote channel-owner request. A JOIN sent
         // to another shard holds its place until answered.
         let session = &state.sessions[&conn];
+        let in_flight = session
+            .joins_in_flight()
+            .filter(|key| !session.channels.contains(*key))
+            .count();
         if !session.channels.contains(&key)
-            && !session.pending_joins.contains(&key)
-            && session.channels.len() + session.pending_joins.len() >= MAX_CHANNELS_PER_SESSION
+            && !session.join_in_flight(&key)
+            && session.channels.len() + in_flight >= MAX_CHANNELS_PER_SESSION
         {
             state.numeric(
                 conn,
@@ -356,8 +359,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .sessions
                 .get_mut(&conn)
                 .expect("checked above")
-                .pending_joins
-                .insert(key);
+                .join_sent(key);
             let label = state.defer_captured_reply(conn);
             state.route_join(
                 owner,
@@ -516,7 +518,8 @@ pub(super) fn join_on_owner(
     // the newcomer as an ordinary user while the server treats them as an
     // operator: a silent membership-state desync. The channel creator (`first`)
     // needs no broadcast — nobody else is present to desync.
-    let own_mode = if !first && (is_founder || access_op || access_voice) {
+    let mut own_modes = Vec::new();
+    if !first && (is_founder || access_op || access_voice) {
         let nick = actor.identity.nick.clone();
         let mut letters = String::from("+");
         let mut args = String::new();
@@ -532,15 +535,15 @@ pub(super) fn join_on_owner(
         let server = &state.config.server_name;
         let line = EventLine::by_server(now, format!(":{server} MODE {display} {letters}{args}"));
         state.broadcast_channel(&key, &line, Some(conn));
-        Some(line)
-    } else {
-        None
-    };
+        own_modes.push(line);
+    }
 
     // A registered channel with a mode lock enforces it the moment it is
-    // (re)created, so its locked modes survive the channel going empty.
-    if newly_created {
-        apply_mlock(state, &key);
+    // (re)created, so its locked modes survive the channel going empty. The
+    // joiner is told after its JOIN, like its own modes.
+    if newly_created && let Some(line) = enforce_mlock(state, &key) {
+        state.broadcast_channel(&key, &line, Some(conn));
+        own_modes.push(line);
     }
 
     let chan = &state.channels[&key];
@@ -558,7 +561,7 @@ pub(super) fn join_on_owner(
         } else {
             plain_join
         },
-        own_mode,
+        own_modes,
     }))
 }
 
@@ -573,10 +576,7 @@ pub(super) fn emit_join_result(
     // under the channel limit is given back. A session that has since left
     // took its reservations with it.
     let part_now = match state.sessions.get_mut(&conn) {
-        Some(session) => {
-            session.pending_joins.remove(&requested);
-            session.part_on_join.remove(&requested)
-        }
+        Some(session) => session.join_answered(&requested),
         None => false,
     };
     let joined = match &result {
@@ -647,7 +647,7 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
             session.channels.insert(join.key.clone());
             state.membership_join(conn, join.key.clone());
             state.send_event(conn, &join.own_join);
-            if let Some(mode) = &join.own_mode {
+            for mode in &join.own_modes {
                 state.send_event(conn, mode);
             }
             if let Some(topic) = &join.topic {
@@ -1731,12 +1731,17 @@ fn set_chan_bool_mode(modes: &mut crate::core::state::ChanModes, c: char, v: boo
 /// that differ from the lock and broadcast the resulting MODE from ChanServ.
 /// A no-op when the channel has no lock or is already compliant.
 pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
-    let Some(m) = state.channel_options.mlock(key) else {
-        return;
-    };
-    let Some(chan) = state.channels.get(key) else {
-        return;
-    };
+    if let Some(line) = enforce_mlock(state, key) {
+        state.broadcast_channel(key, &line, None);
+    }
+}
+
+/// Change the modes of `key`'s live channel that differ from its mode lock,
+/// and return the MODE from ChanServ announcing them; `None` when the channel
+/// has no lock or is already compliant.
+fn enforce_mlock(state: &mut ServerState, key: &ChanKey) -> Option<EventLine> {
+    let m = state.channel_options.mlock(key)?;
+    let chan = state.channels.get(key)?;
     let on_changes: String =
         m.on.chars()
             .filter(|&c| chan_bool_mode(&chan.modes, c) == Some(false))
@@ -1747,7 +1752,7 @@ pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
         .filter(|&c| chan_bool_mode(&chan.modes, c) == Some(true))
         .collect();
     if on_changes.is_empty() && off_changes.is_empty() {
-        return;
+        return None;
     }
     let display = chan.name.clone();
     let chan = state.channels.get_mut(key).expect("checked");
@@ -1766,8 +1771,7 @@ pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
         spec.push('-');
         spec.push_str(&off_changes);
     }
-    let line = state.server_line(format!(":ChanServ MODE {display} {spec}"));
-    state.broadcast_channel(key, &line, None);
+    Some(state.server_line(format!(":ChanServ MODE {display} {spec}")))
 }
 
 /// Whether user mode `c` is set on `session`; `None` for a char that is not a

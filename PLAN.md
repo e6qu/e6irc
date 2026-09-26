@@ -1005,6 +1005,28 @@ fixes, each with a test that failed before:
 - **The SCRAM-to-PLAIN step after a refusal before any credential was said
   only by the bouncer**; the TUI and the CLI now say it too.
 
+A review of the sharded core found, and this change fixes, each with
+a test that failed before:
+
+- **A remote WHO answered after its asker closed aborted the worker.** The
+  reply was queued to be paced to a connection that no longer existed, and the
+  pacer's "only an open connection is paced" expectation killed the daemon.
+  Paced LIST and WHO replies now live on the session itself, so none can be
+  queued for, or paced to, a closed connection (DESIGN §7.2).
+- **A second JOIN in flight to one channel lost member updates.** The session
+  kept the channels with a JOIN in flight as a set, so the first answer (a
+  refused key) ended the window of the JOIN behind it: a NICK sent between
+  them never reached the owner that then admitted the user, a `JOIN 0` sent
+  after both was spent on the refusal and left the user in the channel, and
+  the channel limit undercounted. Both are counted per channel now.
+- **A labeled MODE or KICK of a channel on another shard broke its labeled
+  response**: the actor's own echo came after an empty `ACK`, untagged, where
+  one worker sends it as the labeled answer. The owner now returns the actor's
+  copy in the result; a ChanServ OP/VOICE of a remote channel had the same
+  split, and a mode lock enforced by the JOIN that recreated its channel was
+  told before that JOIN on one worker and after its labeled response on two —
+  it now follows the JOIN inside it, alike on both.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
