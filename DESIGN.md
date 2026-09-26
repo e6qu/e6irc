@@ -415,7 +415,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     inline with `AppState::csrf_valid`; the token rides in the body, so a
     standard browser submission works without a client runtime.
   - `RateLimited` — a request that has spent one token from the per-IP
-    auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
+    auth-rate budget (`limits.auth_rate_burst`, on by default, §7.2), as a
+    `FromRequestParts` extractor. Every unauthenticated,
     work-inducing route declares the throttle by asking for `_: RateLimited`
     instead of opening with the `client_ip` + `spend_auth_budget` prologue (and
     pulling in `ConnectInfo` + `HeaderMap`) by hand — so the gate lives in one
@@ -806,10 +807,21 @@ strip = "symbols"
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
-  No unbounded buffering, no silent drops.
+  No unbounded buffering, no silent drops. The bound is in **bytes**, like
+  Solanum's class `sendq`: `sendq_bytes`, default 512 KiB — the 1,024 lines the
+  queue held when it counted lines, at a full 512-byte line each, so ordinary
+  traffic queues what it did — at least two of the longest lines the server
+  sends (17,406 bytes) and at most 32 MiB. A count of lines let a reader that
+  stopped reading pin 1,024 lines of up to 8,703 bytes each (8.5 MiB); in
+  bytes, a few dozen maximum-size lines are what overrun it. Output held
+  behind a deferred reply (§11) is counted in the same bytes against the same
+  bound. The queue is made only by `core::send_queue`, which weighs each line
+  by its length (`e6irc_queue::weighted_queue`), so no connection can be given
+  a queue measured in anything else.
 - The replies a client cannot bound — `LIST` of every channel, and a `WHO *`
   or a `WHO` of a large channel — are paced instead (`SAFELIST`): their rows
-  go out only while the client's SendQ is under half full, and the rest follow
+  go out only while the client's SendQ is under half full — in bytes, the
+  line that crosses the half being the last of a turn — and the rest follow
   as the client reads — on the next event its shard handles, or on the
   worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
   Other traffic keeps flowing beside the rows, and a labeled one stays one
@@ -818,7 +830,8 @@ strip = "symbols"
   room left, with none paced ahead of it, goes out at once; otherwise it waits
   behind the connection's paced WHO replies and follows them whole, in order
   (`core/paced.rs`). What waits is bounded: once one is paced, more may queue
-  behind it only while everything waiting fits one SendQ, and a `WHO` past
+  behind it only while the bytes of everything waiting fit one SendQ, and a
+  `WHO` past
   that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
   channel's `WHO` is paced on the asker's shard, from the rows its owner sent
   back. What is being paced lives on the session (`Session::channel_list`,
@@ -848,7 +861,21 @@ strip = "symbols"
   per-address bounds are off unless configured: `limits.max_connections_per_ip`
   caps simultaneous connections from one address (the excess is refused at
   accept), and `limits.registration_burst` throttles account creation
-  (REGISTER and NickServ REGISTER) per address.
+  (REGISTER and NickServ REGISTER) per address. The HTTP authentication
+  throttle, `limits.auth_rate_burst`, is on by default: twenty requests a
+  minute from one address (an IPv6 client's `/64`) to the routes that take
+  `RateLimited` (§2) — password login, the OIDC starts and callback, the
+  device grant's start and polling, invitation and bootstrap acceptance, app
+  passwords, password changes and re-authentication. A sign-in spends two or
+  three, a device polling every five seconds twelve a minute. The per-account
+  attempt window (ten in fifteen minutes) bounds guessing at one account; this
+  bounds what one address can drive across all of them — names sprayed, argon2
+  checks, OIDC round trips, device grants. It was
+  off unless configured, so every `RateLimited` route's promise to cap a flood
+  held only where an operator had turned it on. `"off"` turns it off (a
+  deployment whose reverse proxy throttles these routes itself); `0` is
+  refused, and a stored `null` from before (the old unset) is migrated to the
+  default (0088).
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with
@@ -917,6 +944,12 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   sequence number. The bound is an admission limit, not an eager allocation:
   storage grows only with admitted envelopes, which prevents every empty
   per-connection SendQ from reserving its maximum capacity.
+- **Bounded by weight**: `weighted_queue` bounds the sum of its events'
+  weights (a SendQ weighs each line by its bytes) where `queue` weighs each
+  event 1; depth, capacity, the adaptive watermarks and every admission are in
+  that one unit. An event heavier than the whole capacity is admitted only into
+  an empty queue, so none is unsendable and the bound is exceeded by at most
+  one event.
 - **No silent loss**: `try_push` returns `Err(Full(event))` — the
   producer decides (kill the slow consumer's connection, exert
   backpressure, or shed *with accounting*). Delivered-or-returned is an
@@ -1515,8 +1548,16 @@ Principal tables (columns abridged):
   cap one entry to the IRC wire limit. A replay cannot inject a second line or
   make the bounded buffer retain an unbounded entry.
   Retention is per (owner, network): the persistence task counts its own
-  appends and trims to the newest `BNC_BUFFER_CAP` at every
-  `BNC_TRIM_INTERVAL`, and rows older than `storage.history_retention_days`
+  appends and trims to the newest `BNC_BUFFER_CAP` (5,000) rows, and of those
+  to the newest `BNC_BUFFER_BYTES` (5,000 × 512 bytes), at every
+  `BNC_TRIM_INTERVAL` — a thousand ordinary lines, each line weighing one per
+  512 bytes it holds (`bnc_trim_weight`), so a trim is also due after half a
+  megabyte of long ones. The upstream decides how long its lines are; counted
+  only in rows, 5,000 lines of eight kilobytes of tags each stood. The
+  in-memory backlog is held to the same rate: `buffer_cap` lines and
+  `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), oldest first,
+  its newest line always kept, on every push and when a stored backlog is
+  restored. Rows older than `storage.history_retention_days`
   are deleted by storage maintenance in bounded batches (index
   `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
   bouncer history, direct messages included, not only the server's own. Read
@@ -3223,8 +3264,9 @@ Design constraints recorded now:
   later output is held behind it — replies must reach a client in the order it
   issued the commands, or a client that pipelines CHATHISTORY and PING sees the
   PONG first and concludes the history was empty. Held output carries the same
-  bound as the send queue it is waiting to enter, so a connection blocked on the
-  database is still killed for SendQ overrun rather than buffering without limit.
+  bound as the send queue it is waiting to enter, in the same bytes, so a
+  connection blocked on the database is still killed for SendQ overrun rather
+  than buffering without limit.
   **Rings are lazy and LRU-evicted** so hot-history RAM
   is bounded by *activity*, not target count: only the
   `max_hot_channels` (default 8192) most-recently-active targets hold a
@@ -3234,6 +3276,24 @@ Design constraints recorded now:
   upstream sessions — at 100k channels an always-on 500-entry ring per
   channel would be tens of GB, so eviction is load-bearing, not an
   optimization.
+  **Rings are bounded in bytes as well as entries and count.** An entry can
+  hold kilobytes a client chose (4,094 bytes of client-only tags are kept with
+  every message but a typing indicator), so 500 entries × 8,192 rings bounded
+  nothing in bytes — some fifty gigabytes of twelve-kilobyte entries. Each
+  ring holds at most `max_history_ring_bytes` (default 500 KiB: its 500 entries
+  at a kilobyte, which an ordinary line stays under), its oldest entries going
+  first and its newest always kept; all rings together hold at most
+  `max_hot_history_bytes` (default 512 MiB, a thousand full rings of ordinary
+  lines), beyond which the least recently active rings are evicted, as beyond
+  `max_hot_channels` and in the same order — never the ring just written. An
+  entry counts its own fields and every string it owns
+  (`hot_history::footprint`); the ring's and the store's byte counts are
+  running sums kept where entries come and go. A shed or evicted ring is
+  incomplete as ever, and CHATHISTORY falls back to Postgres. A multiline
+  message's text is held once, in its encoded lines: the joined single line the
+  `body` column and the REST history carry is derived from them
+  (`HistoryRow::plain_body`) when the row is persisted or served, so what is
+  stored and replayed is unchanged.
   The store (`core::hot_history::HotHistory`) keeps what each event asks of
   it as an index updated where a ring comes or goes: the LRU order is a
   `Recency` (a stamp per touch, stale stamps skipped and periodically
@@ -4335,9 +4395,14 @@ Layers, bottom to top:
   binds `[::]` dual-stack on every platform (Linux defaults a v6 socket to
   dual-stack, Windows and several BSDs to v6-only), so `[::]` also collides
   with any IPv4 address on its port. Sizes have upper bounds as well as lower ones: `core_workers`
-  ≤ 64, `core_queue` ≤ 1,048,576, `sendq` ≤ 65,536, `max_hot_channels` ≤
-  1,048,576, a network's `buffer_cap` ≤ 100,000. `usize::MAX` workers used to
-  validate.
+  ≤ 64, `core_queue` ≤ 1,048,576, 17,406 ≤ `sendq_bytes` ≤ 33,554,432,
+  `max_hot_channels` ≤ 1,048,576, `max_history_ring_bytes` ≤ 65,536,000,
+  `max_hot_history_bytes` ≤ 68,719,476,736 and at least
+  `max_history_ring_bytes`, a network's `buffer_cap` ≤ 100,000. `usize::MAX`
+  workers used to validate. `sendq` counted lines until migration 0088 renamed
+  it `sendq_bytes` (a stored count became that many 512-byte lines); a
+  configuration file that still states `sendq` is refused by name rather than
+  read as a byte count a five-hundredth of what it meant.
 - The BNC registry exists whenever PostgreSQL does, independently of the raw
   attach listener. Its listener is runtime-managed: enabling or rebinding first
   binds the replacement socket, swaps only after success, and retains the

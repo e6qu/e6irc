@@ -14,6 +14,11 @@
 //!   that dequeues LIFO above a high watermark (freshest-first under
 //!   overload) and returns to FIFO below a low watermark. Mode changes
 //!   are observable, never silent.
+//! - **Bounded by weight**: a queue built with [`weighted_queue`] bounds the
+//!   sum of its events' weights (a SendQ, its lines' bytes) rather than their
+//!   number; [`queue`] weighs every event 1. Depth, capacity, the watermarks
+//!   and every admission decision are in that one unit, so a queue cannot be
+//!   bounded in one unit and reported or paced in another.
 
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
@@ -34,7 +39,8 @@ use std::sync::{Arc, Mutex};
 pub struct Config {
     /// Diagnostic name included in construction failures.
     pub name: &'static str,
-    /// Maximum number of buffered events; `try_push` fails beyond it.
+    /// Most total weight buffered (events, for a [`queue`]); `try_push` fails
+    /// beyond it.
     pub capacity: usize,
     pub policy: Policy,
 }
@@ -122,10 +128,20 @@ pub enum PushError<T> {
     Closed(T),
 }
 
-/// Create a queue. Panics on nonsensical configuration (zero capacity,
-/// watermarks out of order or beyond capacity) — misconfiguration is a
-/// programmer error and fails loudly at construction.
+/// Create a queue whose capacity counts events. Panics on nonsensical
+/// configuration (zero capacity, watermarks out of order or beyond capacity) —
+/// misconfiguration is a programmer error and fails loudly at construction.
 pub fn queue<T>(config: Config) -> (Sender<T>, Receiver<T>) {
+    weighted_queue(config, |_| 1)
+}
+
+/// Create a queue whose capacity, depth and watermarks are in the unit `weigh`
+/// measures each event in (at least 1 each, so no event is free). An event is
+/// admitted while the total stays within capacity — or into an empty queue,
+/// so an event heavier than the whole capacity is not unsendable, and the
+/// queue holds at most `capacity` plus one event's weight. `weigh` is asked
+/// once per event, when it is pushed.
+pub fn weighted_queue<T>(config: Config, weigh: fn(&T) -> usize) -> (Sender<T>, Receiver<T>) {
     assert!(
         config.capacity > 0,
         "queue {:?}: capacity must be > 0",
@@ -144,6 +160,7 @@ pub fn queue<T>(config: Config) -> (Sender<T>, Receiver<T>) {
     }
     let shared = Arc::new(Shared {
         config,
+        weigh,
         metrics: Arc::new(QueueMetrics {
             enabled: AtomicBool::new(false),
             depth: AtomicUsize::new(0),
@@ -156,6 +173,7 @@ pub fn queue<T>(config: Config) -> (Sender<T>, Receiver<T>) {
             // default 1,024 output envelopes here would consume gigabytes of
             // idle memory at the server's target connection count.
             buf: VecDeque::new(),
+            load: 0,
             next_seq: 0,
             mode: Mode::Fifo,
             mode_switches: 0,
@@ -186,12 +204,16 @@ pub struct Receiver<T> {
 
 struct Shared<T> {
     config: Config,
+    weigh: fn(&T) -> usize,
     metrics: Arc<QueueMetrics>,
     state: Mutex<State<T>>,
 }
 
 struct State<T> {
-    buf: VecDeque<Envelope<T>>,
+    /// Each event with the weight it was admitted at.
+    buf: VecDeque<(Envelope<T>, usize)>,
+    /// The sum of `buf`'s weights: the queue's depth.
+    load: usize,
     next_seq: u64,
     mode: Mode,
     mode_switches: u64,
@@ -213,6 +235,26 @@ impl<T> State<T> {
         sequence
     }
 
+    /// Whether an event of `weight` fits now: within capacity, or into an
+    /// empty queue (see [`weighted_queue`]).
+    fn admits(&self, weight: usize, capacity: usize) -> bool {
+        self.load == 0 || self.load.saturating_add(weight) <= capacity
+    }
+
+    fn enqueue(&mut self, envelope: Envelope<T>, weight: usize) {
+        self.load += weight;
+        self.buf.push_back((envelope, weight));
+    }
+
+    fn dequeue(&mut self) -> Option<Envelope<T>> {
+        let (envelope, weight) = match self.mode {
+            Mode::Fifo => self.buf.pop_front(),
+            Mode::Lifo => self.buf.pop_back(),
+        }?;
+        self.load -= weight;
+        Some(envelope)
+    }
+
     fn update_mode(&mut self, policy: Policy) {
         let Policy::AdaptiveLifo {
             high_watermark,
@@ -222,11 +264,11 @@ impl<T> State<T> {
             return;
         };
         match self.mode {
-            Mode::Fifo if self.buf.len() >= high_watermark => {
+            Mode::Fifo if self.load >= high_watermark => {
                 self.mode = Mode::Lifo;
                 self.mode_switches += 1;
             }
-            Mode::Lifo if self.buf.len() <= low_watermark => {
+            Mode::Lifo if self.load <= low_watermark => {
                 self.mode = Mode::Fifo;
                 self.mode_switches += 1;
             }
@@ -236,6 +278,10 @@ impl<T> State<T> {
 }
 
 impl<T> Shared<T> {
+    fn weight_of(&self, payload: &T) -> usize {
+        (self.weigh)(payload).max(1)
+    }
+
     fn lock(&self) -> impl std::ops::DerefMut<Target = State<T>> + '_ {
         self.state.lock().expect("queue mutex poisoned")
     }
@@ -248,7 +294,7 @@ impl<T> Shared<T> {
     }
 
     fn publish_unconditionally(&self, state: &State<T>) {
-        self.metrics.depth.store(state.buf.len(), Ordering::Relaxed);
+        self.metrics.depth.store(state.load, Ordering::Relaxed);
         self.metrics.mode.store(state.mode as u8, Ordering::Relaxed);
         self.metrics
             .mode_switches
@@ -262,16 +308,17 @@ impl<T> Sender<T> {
     pub fn try_push(&self, payload: T) -> Result<u64, PushError<T>> {
         let waker;
         let seq;
+        let weight = self.shared.weight_of(&payload);
         {
             let mut state = self.shared.lock();
             if !state.receiver_alive {
                 return Err(PushError::Closed(payload));
             }
-            if state.buf.len() == self.shared.config.capacity {
+            if !state.admits(weight, self.shared.config.capacity) {
                 return Err(PushError::Full(payload));
             }
             seq = state.next_sequence();
-            state.buf.push_back(Envelope { seq, payload });
+            state.enqueue(Envelope { seq, payload }, weight);
             state.update_mode(self.shared.config.policy);
             self.shared.publish(&state);
             waker = state.waker.take();
@@ -282,11 +329,12 @@ impl<T> Sender<T> {
         Ok(seq)
     }
 
+    /// The total weight buffered (events, for a [`queue`]).
     pub fn depth(&self) -> usize {
-        self.shared.lock().buf.len()
+        self.shared.lock().load
     }
 
-    /// The most events the queue buffers ([`Config::capacity`]).
+    /// The most weight the queue buffers ([`Config::capacity`]).
     pub fn capacity(&self) -> usize {
         self.shared.config.capacity
     }
@@ -389,7 +437,7 @@ impl<T> Drop for ParkedProducer<'_, T> {
             // never use the slot, so the next parked producer must be told —
             // nothing else will wake it while the consumer waits on an empty
             // queue.
-            next = (!still_parked && state.buf.len() < self.sender.shared.config.capacity)
+            next = (!still_parked && state.load < self.sender.shared.config.capacity)
                 .then(|| state.push_wakers.pop_front())
                 .flatten();
         }
@@ -427,13 +475,16 @@ impl<T> Future for Push<'_, T> {
                     .take()
                     .expect("push future polled after ready")));
             }
-            if state.buf.len() < sender.shared.config.capacity {
+            let payload = this
+                .payload
+                .as_ref()
+                .expect("push future polled after ready");
+            let weight = sender.shared.weight_of(payload);
+            if state.admits(weight, sender.shared.config.capacity) {
                 this.parked.served(&mut state);
                 let seq = state.next_sequence();
-                state.buf.push_back(Envelope {
-                    seq,
-                    payload: this.payload.take().expect("push future polled after ready"),
-                });
+                let payload = this.payload.take().expect("push future polled after ready");
+                state.enqueue(Envelope { seq, payload }, weight);
                 state.update_mode(sender.shared.config.policy);
                 sender.shared.publish(&state);
                 receiver_waker = state.waker.take();
@@ -463,7 +514,7 @@ impl<T> Future for Room<'_, T> {
         let this = self.get_mut();
         let sender = this.parked.sender;
         let mut state = sender.shared.lock();
-        if !state.receiver_alive || state.buf.len() < sender.shared.config.capacity {
+        if !state.receiver_alive || state.load < sender.shared.config.capacity {
             this.parked.served(&mut state);
             Poll::Ready(())
         } else {
@@ -492,10 +543,7 @@ impl<T> Receiver<T> {
         let (env, waker);
         {
             let mut state = self.shared.lock();
-            env = match state.mode {
-                Mode::Fifo => state.buf.pop_front(),
-                Mode::Lifo => state.buf.pop_back(),
-            }?;
+            env = state.dequeue()?;
             state.update_mode(self.shared.config.policy);
             self.shared.publish(&state);
             waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
@@ -516,10 +564,7 @@ impl<T> Receiver<T> {
         let (popped, waker);
         {
             let mut state = self.shared.lock();
-            popped = match state.mode {
-                Mode::Fifo => state.buf.pop_front(),
-                Mode::Lifo => state.buf.pop_back(),
-            };
+            popped = state.dequeue();
             match popped {
                 Some(_) => {
                     state.update_mode(self.shared.config.policy);
@@ -541,8 +586,9 @@ impl<T> Receiver<T> {
         Poll::Ready(popped)
     }
 
+    /// The total weight buffered (events, for a [`queue`]).
     pub fn depth(&self) -> usize {
-        self.shared.lock().buf.len()
+        self.shared.lock().load
     }
 
     pub fn mode(&self) -> Mode {
@@ -690,6 +736,57 @@ mod tests {
         assert_eq!(rx.try_pop().unwrap().payload, 1);
         // space freed: push succeeds again, seq keeps counting
         assert_eq!(tx.try_push(3).unwrap(), 2);
+    }
+
+    /// A weighted queue is bounded by the sum of its events' weights, not
+    /// their number: two heavy events fill what a hundred light ones would
+    /// not, and depth reports the same unit the bound is in.
+    #[test]
+    fn a_weighted_queue_is_bounded_by_weight_not_count() {
+        let (tx, mut rx) = weighted_queue::<Vec<u8>>(
+            Config {
+                name: "bytes",
+                capacity: 100,
+                policy: Policy::Fifo,
+            },
+            Vec::len,
+        );
+        tx.try_push(vec![0; 60]).unwrap();
+        assert_eq!(tx.depth(), 60);
+        assert_eq!(
+            tx.try_push(vec![0; 41]),
+            Err(PushError::Full(vec![0; 41])),
+            "60 + 41 bytes exceed a 100-byte queue"
+        );
+        tx.try_push(vec![0; 40]).unwrap();
+        assert_eq!(rx.depth(), 100);
+        assert_eq!(rx.try_pop().unwrap().payload.len(), 60);
+        assert_eq!(tx.depth(), 40);
+        // An empty event still weighs something, so a flood of them is bounded.
+        for _ in 0..60 {
+            tx.try_push(Vec::new()).unwrap();
+        }
+        assert!(matches!(tx.try_push(Vec::new()), Err(PushError::Full(_))));
+    }
+
+    /// An event heavier than the whole capacity is admitted into an empty
+    /// queue — otherwise it could never be sent — and nowhere else.
+    #[test]
+    fn an_event_heavier_than_the_capacity_enters_only_an_empty_queue() {
+        let (tx, mut rx) = weighted_queue::<Vec<u8>>(
+            Config {
+                name: "bytes",
+                capacity: 10,
+                policy: Policy::Fifo,
+            },
+            Vec::len,
+        );
+        tx.try_push(vec![0; 25]).unwrap();
+        assert!(matches!(tx.try_push(vec![0; 1]), Err(PushError::Full(_))));
+        rx.try_pop().unwrap();
+        assert_eq!(tx.depth(), 0);
+        tx.try_push(vec![0; 1]).unwrap();
+        assert!(matches!(tx.try_push(vec![0; 25]), Err(PushError::Full(_))));
     }
 
     #[test]

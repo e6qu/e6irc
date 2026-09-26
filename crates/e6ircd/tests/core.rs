@@ -13,8 +13,23 @@ fn test_mono() -> MonoMillis {
 }
 use e6ircd::core::{CommandFlood, ConnId, Core, CoreConfig, Input, Output};
 
+/// A test connection's send queue: the 256 lines it held when it counted
+/// lines, at a full 512-byte line each, so every reply that fitted then fits.
+const TEST_SENDQ_BYTES: usize = 256 * 512;
+
+/// A send queue small enough that a few hundred LIST or WHO rows fill more
+/// than half of it, for the paced replies.
+const PACED_SENDQ_BYTES: usize = 8 * 1024;
+
+/// The bytes `lines` took in a send queue, their CRLFs included.
+fn wire_bytes(lines: &[String]) -> usize {
+    lines.iter().map(|line| line.len() + 2).sum()
+}
+
 struct TestServer {
     core: Core,
+    /// Each connection's send queue, in bytes (the configured `sendq_bytes`).
+    sendq_bytes: usize,
     conns: Vec<(ConnId, Receiver<Output>)>,
     db_rx: Receiver<e6ircd::core::DbRequest>,
     channel_service_route: Option<(e6ircd::core::ChannelOwner, e6ircd::core::SessionOwner)>,
@@ -46,32 +61,45 @@ impl TestServer {
             static NOW_MS: AtomicU64 = AtomicU64::new(1_000_000_000);
             Millis::from_millis(NOW_MS.fetch_add(1, Ordering::Relaxed))
         }
-        Self::with_config(false, advancing, 256)
+        Self::with_config(false, advancing, TEST_SENDQ_BYTES)
     }
 
     /// A database-backed server with a deliberately small per-connection
-    /// output bound, for exercising SendQ-style limits.
-    fn with_sendq(sendq: usize) -> Self {
-        Self::with_config(true, || Millis::from_millis(1_000_000_000), sendq)
+    /// output bound, in bytes, for exercising SendQ-style limits.
+    fn with_sendq(sendq_bytes: usize) -> Self {
+        Self::with_config(true, || Millis::from_millis(1_000_000_000), sendq_bytes)
+    }
+
+    /// A server whose connections' send queues are [`PACED_SENDQ_BYTES`].
+    fn with_paced_sendq(sasl_enabled: bool) -> Self {
+        Self::with_config(
+            sasl_enabled,
+            || Millis::from_millis(1_000_000_000),
+            PACED_SENDQ_BYTES,
+        )
     }
 
     fn with_persistence(sasl_enabled: bool) -> Self {
-        Self::with_config(sasl_enabled, || Millis::from_millis(1_000_000_000), 256)
+        Self::with_config(
+            sasl_enabled,
+            || Millis::from_millis(1_000_000_000),
+            TEST_SENDQ_BYTES,
+        )
     }
 
-    fn with_config(sasl_enabled: bool, clock: fn() -> Millis, sendq: usize) -> Self {
-        Self::with_full_config(sasl_enabled, clock, sendq, "irc.test.example", 16)
+    fn with_config(sasl_enabled: bool, clock: fn() -> Millis, sendq_bytes: usize) -> Self {
+        Self::with_full_config(sasl_enabled, clock, sendq_bytes, "irc.test.example", 16)
     }
 
     fn with_full_config(
         sasl_enabled: bool,
         clock: fn() -> Millis,
-        sendq: usize,
+        sendq_bytes: usize,
         server_name: &str,
         nicklen: usize,
     ) -> Self {
         Self::configured(sasl_enabled, clock, |config| {
-            config.sendq = sendq;
+            config.sendq_bytes = sendq_bytes;
             config.server_name = server_name.into();
             config.nicklen = nicklen;
         })
@@ -94,11 +122,13 @@ impl TestServer {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: TEST_SENDQ_BYTES,
             motd: vec!["Welcome to the test net".into()],
             nicklen: 16,
             sasl_enabled,
             max_hot_channels: 8192,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             opers: vec![("god".into(), "letmein".into())],
             clock,
             mono_clock: test_mono,
@@ -109,6 +139,7 @@ impl TestServer {
         };
         adjust(&mut config);
         Self {
+            sendq_bytes: config.sendq_bytes,
             core: Core::new(config, db_tx),
             conns: Vec::new(),
             db_rx,
@@ -222,11 +253,7 @@ impl TestServer {
         transport: e6ircd::core::ConnectionTransport,
     ) -> ConnId {
         let conn = ConnId(id);
-        let (tx, rx) = queue(Config {
-            name: "test-sendq",
-            capacity: 256,
-            policy: Policy::Fifo,
-        });
+        let (tx, rx) = e6ircd::core::send_queue("test-sendq", self.sendq_bytes);
         self.core.handle(Input::Open {
             conn,
             tx,
@@ -3985,7 +4012,7 @@ fn whox_reply_never_exceeds_the_wire_limit() {
     let mut s = TestServer::with_full_config(
         true, // SASL: lets us identify to a wide account for the `a` field
         || Millis::from_millis(1_000_000_000),
-        512,
+        TEST_SENDQ_BYTES,
         &server,
         64,
     );
@@ -4648,8 +4675,9 @@ fn list_conditions_never_reveal_a_secret_channel() {
     assert_eq!(list(&mut s, bob, "LIST !#chan*"), Vec::<String>::new());
 }
 
-/// Channels enough that one LIST fills more than half of a test connection's
-/// 256-line send queue: `count` of them, `#room000` on, across three members.
+/// Channels enough that one LIST fills more than half of a
+/// [`PACED_SENDQ_BYTES`] send queue: `count` of them, `#room000` on, across
+/// three members.
 fn many_channels(s: &mut TestServer, count: usize) -> ConnId {
     let members: Vec<ConnId> = (0..3)
         .map(|index| s.register(10 + index, &format!("member{index}")))
@@ -4662,14 +4690,24 @@ fn many_channels(s: &mut TestServer, count: usize) -> ConnId {
     s.register(20, "lister")
 }
 
+/// Whether `out` fills half a [`PACED_SENDQ_BYTES`] queue — and no more than
+/// the one line that crossed the half — as a turn of a paced reply may.
+fn fills_half_the_paced_queue(out: &[String]) -> bool {
+    let half = PACED_SENDQ_BYTES / 2;
+    let longest = out.iter().map(|line| line.len() + 2).max().unwrap_or(0);
+    let sent = wire_bytes(out);
+    sent >= half && sent < half + longest
+}
+
 #[test]
 fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let lister = many_channels(&mut s, 300);
     s.line(lister, "LIST");
     let mut out = s.drain(lister);
-    // Half of the 256-line queue: the RPL_LISTSTART and 127 rows.
-    assert_eq!(out.len(), 128, "{out:#?}");
+    // Half of the queue, in bytes: the RPL_LISTSTART and the rows that fit,
+    // the last one crossing the half.
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
     assert!(!has_numeric(&out, "323"), "{out:#?}");
     // Each turn sends what the client's queue has room for now: the drained
     // queue takes another half.
@@ -4682,12 +4720,16 @@ fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
             .any(|l| l.contains("PONG") && l.contains("mid-list")),
         "{next:#?}"
     );
-    assert!(next.len() <= 129, "{next:#?}");
-    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    let rows: Vec<String> = next.into_iter().filter(|l| !l.contains("PONG")).collect();
+    assert!(fills_half_the_paced_queue(&rows), "{rows:#?}");
+    out.extend(rows);
     while !has_numeric(&out, "323") {
         s.core.handle(Input::PaceReplies);
         let more = s.drain(lister);
-        assert!(!more.is_empty() && more.len() <= 129, "{more:#?}");
+        assert!(
+            !more.is_empty() && wire_bytes(&more) < PACED_SENDQ_BYTES / 2 + 128,
+            "{more:#?}"
+        );
         out.extend(more);
     }
     let listed = list_reply(&out);
@@ -4698,7 +4740,7 @@ fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
 
 #[test]
 fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
-    let mut s = TestServer::new_no_persistence();
+    let mut s = TestServer::with_paced_sendq(false);
     let lister = register_with_caps(&mut s, 20, "lister", "batch labeled-response");
     let members: Vec<ConnId> = (0..3)
         .map(|index| s.register(10 + index, &format!("member{index}")))
@@ -4722,10 +4764,10 @@ fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
 
 #[test]
 fn a_list_sent_during_a_paced_list_aborts_it() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let lister = many_channels(&mut s, 300);
     s.line(lister, "LIST");
-    assert_eq!(s.drain(lister).len(), 128);
+    assert!(fills_half_the_paced_queue(&s.drain(lister)));
     s.line(lister, "LIST");
     let out = s.drain(lister);
     assert_eq!(
@@ -4742,8 +4784,9 @@ fn a_list_sent_during_a_paced_list_aborts_it() {
     assert_eq!(list(&mut s, lister, "LIST #room001"), ["#room001"]);
 }
 
-/// Users enough that a `WHO *` fills more than half of a test connection's
-/// 256-line send queue: `count` of them, `user000` on, and the one asking.
+/// Users enough that a `WHO *` fills more than half of a
+/// [`PACED_SENDQ_BYTES`] send queue: `count` of them, `user000` on, and the
+/// one asking.
 fn many_users(s: &mut TestServer, count: u64) -> ConnId {
     for index in 0..count {
         s.register(100 + index, &format!("user{index:03}"));
@@ -4767,12 +4810,12 @@ fn who_nicks(out: &[String]) -> Vec<String> {
 
 #[test]
 fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let watcher = many_users(&mut s, 300);
     s.line(watcher, "WHO *");
     let mut out = s.drain(watcher);
-    // Half of the 256-line queue, all rows.
-    assert_eq!(out.len(), 128, "{out:#?}");
+    // Half of the queue, in bytes, all rows.
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
     assert!(!has_numeric(&out, "315"), "{out:#?}");
     s.core.handle(Input::PaceReplies);
     // Other traffic keeps flowing meanwhile, beside the rows.
@@ -4783,12 +4826,16 @@ fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
             .any(|l| l.contains("PONG") && l.contains("mid-who")),
         "{next:#?}"
     );
-    assert!(next.len() <= 129, "{next:#?}");
-    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    let rows: Vec<String> = next.into_iter().filter(|l| !l.contains("PONG")).collect();
+    assert!(fills_half_the_paced_queue(&rows), "{rows:#?}");
+    out.extend(rows);
     while !has_numeric(&out, "315") {
         s.core.handle(Input::PaceReplies);
         let more = s.drain(watcher);
-        assert!(!more.is_empty() && more.len() <= 128, "{more:#?}");
+        assert!(
+            !more.is_empty() && wire_bytes(&more) < PACED_SENDQ_BYTES / 2 + 128,
+            "{more:#?}"
+        );
         out.extend(more);
     }
     let mut expected: Vec<String> = (0..300).map(|index| format!("user{index:03}")).collect();
@@ -4806,7 +4853,7 @@ fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
 
 #[test]
 fn a_paced_labeled_who_stays_one_batch_across_its_turns() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     for index in 0..200 {
         s.register(100 + index, &format!("user{index:03}"));
     }
@@ -4825,14 +4872,16 @@ fn a_paced_labeled_who_stays_one_batch_across_its_turns() {
 
 #[test]
 fn whos_asked_during_a_paced_who_answer_after_it_within_a_send_queue() {
-    let mut s = TestServer::new();
-    let watcher = many_users(&mut s, 300);
+    let mut s = TestServer::with_paced_sendq(true);
+    // A reply of some nine kilobytes: more than half the queue goes at once,
+    // and what is left is less than a whole queue.
+    let watcher = many_users(&mut s, 100);
     s.line(watcher, "WHO *");
-    assert_eq!(s.drain(watcher).len(), 128);
+    assert!(fills_half_the_paced_queue(&s.drain(watcher)));
     // Lines of it are still to go: a two-line reply waits behind them...
     s.line(watcher, "WHO user007");
-    // ...but another 302 would hold more than a send queue, so it is refused,
-    // at once and closed, while the first is still going out.
+    // ...but another 102 rows would hold more than a send queue's bytes, so
+    // it is refused, at once and closed, while the first is still going out.
     s.line(watcher, "WHO *");
     let mut out = s.drain(watcher);
     assert_eq!(
@@ -4867,7 +4916,7 @@ fn whos_asked_during_a_paced_who_answer_after_it_within_a_send_queue() {
 
 #[test]
 fn a_large_channel_who_is_paced_too() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let members: Vec<ConnId> = (0..150)
         .map(|index| s.register(100 + index, &format!("user{index:03}")))
         .collect();
@@ -4880,7 +4929,7 @@ fn a_large_channel_who_is_paced_too() {
     let watcher = s.register(20, "watcher");
     s.line(watcher, "WHO #crowd");
     let mut out = s.drain(watcher);
-    assert_eq!(out.len(), 128, "{out:#?}");
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
     while !has_numeric(&out, "315") {
         s.core.handle(Input::PaceReplies);
         out.extend(s.drain(watcher));
@@ -6913,12 +6962,14 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: 256 * 512,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: false,
             opers: vec![],
             max_hot_channels: 8,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: early_mono,
             command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
@@ -6929,11 +6980,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
         db_tx,
     );
     let conn = ConnId(1);
-    let (tx, mut rx) = queue(Config {
-        name: "s",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
+    let (tx, mut rx) = e6ircd::core::send_queue("s", 512 * 512);
     core.handle(Input::Open {
         conn,
         tx,
@@ -7001,12 +7048,14 @@ fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive
                 description: "test server".into(),
                 registration_before_connect: false,
                 registration_require_email: false,
-                sendq: 1024,
+                sendq_bytes: 1024 * 512,
                 motd: vec![],
                 nicklen: 16,
                 sasl_enabled: false,
                 opers: vec![],
                 max_hot_channels: 8,
+                max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+                max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: ticking_mono,
                 command_flood: Some(flood),
@@ -7016,11 +7065,7 @@ fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive
             },
             db_tx,
         );
-        let (tx, mut rx) = queue(Config {
-            name: "s",
-            capacity: 4096,
-            policy: Policy::Fifo,
-        });
+        let (tx, mut rx) = e6ircd::core::send_queue("s", 4096 * 512);
         core.handle(Input::Open {
             conn,
             tx,
@@ -7132,12 +7177,14 @@ fn account_creation_is_rate_limited_per_ip() {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: 256 * 512,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: true,
             opers: vec![],
             max_hot_channels: 8,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
             command_flood: None,
@@ -7148,11 +7195,7 @@ fn account_creation_is_rate_limited_per_ip() {
         db_tx,
     );
     let conn = ConnId(1);
-    let (tx, _rx) = queue(Config {
-        name: "s",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
+    let (tx, _rx) = e6ircd::core::send_queue("s", 512 * 512);
     core.handle(Input::Open {
         conn,
         tx,
@@ -7208,12 +7251,14 @@ fn hot_history_ring_is_lru_evicted() {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: 256 * 512,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: false,
             opers: vec![],
             max_hot_channels: 2,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
             command_flood: None,
@@ -7226,11 +7271,7 @@ fn hot_history_ring_is_lru_evicted() {
     let _ = db_rx;
     // a capable observer to read CHATHISTORY
     let conn = ConnId(1);
-    let (tx, mut rx) = queue(Config {
-        name: "s",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
+    let (tx, mut rx) = e6ircd::core::send_queue("s", 512 * 512);
     core.handle(Input::Open {
         conn,
         tx,
@@ -9301,6 +9342,41 @@ fn register_reply_waits_behind_nothing_but_arrives_in_order() {
     );
 }
 
+/// The SendQ is bounded in bytes: a client that stops reading is closed for
+/// SendQ once a few dozen maximum-size lines are waiting, far fewer lines than
+/// the queue would take of ordinary ones.
+#[test]
+fn a_few_huge_lines_overrun_the_sendq_by_bytes() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    s.drain(alice);
+    s.drain(bob);
+    // Bob stops reading. Each message reaches him with four kilobytes of tags.
+    let tags = "t".repeat(4_000);
+    let mut sent = 0;
+    let mut quit = Vec::new();
+    while quit.is_empty() && sent < 256 {
+        s.line(alice, &format!("@+x={tags} PRIVMSG #c :{sent}"));
+        sent += 1;
+        quit = s
+            .drain(alice)
+            .into_iter()
+            .filter(|line| line.contains(" QUIT ") && line.starts_with(":bob!"))
+            .collect();
+    }
+    assert!(
+        quit.iter().any(|line| line.contains("SendQ exceeded")),
+        "{quit:?} after {sent} lines"
+    );
+    // A queue of TEST_SENDQ_BYTES holds about thirty such lines; counting
+    // lines, it took 256 of them.
+    assert!(sent <= TEST_SENDQ_BYTES / 4_000 + 1, "{sent} lines");
+}
+
 #[test]
 fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
     // A CHATHISTORY page that reaches PostgreSQL is answered asynchronously,
@@ -9308,8 +9384,10 @@ fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
     // command order. That held output has not entered the send queue yet, so
     // it must carry the same bound: without one, a connection waiting on the
     // database could accumulate lines without limit and escape the SendQ kill.
-    const SENDQ: usize = 8;
-    const FLOOD: usize = 200;
+    // The bound is the queue's own, in bytes: sixteen kilobytes hold the
+    // registration burst and a hundred-odd echoed lines, not four hundred.
+    const SENDQ: usize = 16 * 1024;
+    const FLOOD: usize = 400;
     let mut s = TestServer::with_sendq(SENDQ);
     // echo-message so the connection's own traffic is output *to it*, which is
     // what accumulates behind the hold.
@@ -9365,12 +9443,14 @@ fn history_logmessage_gated_on_database() {
                 description: "test server".into(),
                 registration_before_connect: false,
                 registration_require_email: false,
-                sendq: 256,
+                sendq_bytes: 256 * 512,
                 motd: vec![],
                 nicklen: 16,
                 sasl_enabled,
                 opers: vec![],
                 max_hot_channels: 8,
+                max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+                max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: test_mono,
                 command_flood: None,
@@ -9381,11 +9461,7 @@ fn history_logmessage_gated_on_database() {
             db_tx,
         );
         let conn = ConnId(1);
-        let (tx, _rx) = queue(Config {
-            name: "s",
-            capacity: 512,
-            policy: Policy::Fifo,
-        });
+        let (tx, _rx) = e6ircd::core::send_queue("s", 512 * 512);
         core.handle(Input::Open {
             conn,
             tx,
@@ -12820,6 +12896,41 @@ fn statusmsg_is_not_stored_in_history() {
         s.db_requests().into_iter().any(|r| matches!(r,
             e6ircd::core::DbRequest::LogMessage { body, .. } if body == "normal")),
         "a normal channel message must be persisted"
+    );
+}
+
+/// A multiline message's text is held once in memory, and what is persisted
+/// is unchanged by that: its encoded lines, and the plain line joining them
+/// (blanks included) that the `body` column and REST history carry.
+#[test]
+fn a_multiline_message_is_persisted_with_its_lines_and_their_plain_line() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
+    s.line(alice, "JOIN #m");
+    s.drain(alice);
+    s.db_requests();
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(alice, "@batch=7 PRIVMSG #m :hello");
+    s.line(alice, "@batch=7 PRIVMSG #m :");
+    s.line(alice, "@batch=7;draft/multiline-concat PRIVMSG #m :world");
+    s.line(alice, "BATCH -7");
+    s.drain(alice);
+    let logged: Vec<(String, Option<String>)> = s
+        .db_requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            e6ircd::core::DbRequest::LogMessage {
+                body, multiline, ..
+            } => Some((body, multiline)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        logged,
+        [(
+            "hello  world".to_string(),
+            Some("0hello\n0\n1world".to_string())
+        )]
     );
 }
 

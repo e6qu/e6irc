@@ -998,10 +998,11 @@ pub struct BncCapSweep {
 /// Buffers one sweep step checks against [`BNC_BUFFER_CAP`].
 const BNC_CAP_SWEEP_BUFFERS: usize = 64;
 
-/// Trim buffers that exceed [`BNC_BUFFER_CAP`], [`BNC_CAP_SWEEP_BUFFERS`] of
-/// them per call, resuming where the previous call stopped and wrapping around
-/// at the end. Each buffer loses at most one bounded batch per call. A running
-/// network trims itself (at start and every [`BNC_TRIM_INTERVAL`] lines); this
+/// Trim buffers that exceed [`BNC_BUFFER_CAP`] or [`BNC_BUFFER_BYTES`],
+/// [`BNC_CAP_SWEEP_BUFFERS`] of them per call, resuming where the previous
+/// call stopped and wrapping around at the end. Each buffer loses at most one
+/// bounded batch per call. A running network trims itself (at start and every
+/// [`BNC_TRIM_INTERVAL`] of [`bnc_trim_weight`]); this
 /// catches whatever that leaves over — a buffer written before a restart that
 /// never reached the interval, lines from a stopped network — without a whole
 /// table `GROUP BY`: each step is an index probe for the next buffer key and
@@ -4569,7 +4570,14 @@ fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbE
         sender_account: row.sender_account,
         kind: crate::core::HistoryKind::from_db(&row.kind)
             .expect("messages.kind is constrained to known message kinds"),
-        body: row.body,
+        // A multiline message's text is its `multiline` alone, in memory as in
+        // the ring; the `body` column's joined copy is derived from it again
+        // wherever a plain line is wanted (`HistoryRow::plain_body`).
+        body: if row.multiline.is_some() {
+            String::new()
+        } else {
+            row.body
+        },
         sender_is_bot: row.sender_is_bot,
         multiline: row.multiline,
         client_tags: row.client_tags,
@@ -8229,7 +8237,26 @@ pub async fn delete_bnc_network(
 /// ever replayed (see `PRELOAD_LIMIT`); the rest are dead weight.
 const BNC_BUFFER_CAP: i64 = 5000;
 
-/// Lines one network may append before [`trim_bnc_buffer`] is due for it.
+/// Bytes of lines to retain per (owner, network) in `bnc_buffer`: the row cap
+/// at [`crate::bouncer::BACKLOG_BYTES_PER_LINE`] a line, the rate the
+/// in-memory backlog is held to. The upstream decides how long its lines are;
+/// a count alone let 5,000 lines of eight kilobytes of tags each stand.
+pub const BNC_BUFFER_BYTES: i64 = BNC_BUFFER_CAP * crate::bouncer::BACKLOG_BYTES_PER_LINE as i64;
+
+/// How far one stored line brings its network's next [`trim_bnc_buffer`]
+/// (due at [`BNC_TRIM_INTERVAL`]): one for every
+/// [`crate::bouncer::BACKLOG_BYTES_PER_LINE`] bytes it holds, and at least
+/// one. A trim is then due after a thousand ordinary lines or half a megabyte
+/// of long ones, whichever comes first, so what a network holds between trims
+/// is bounded in bytes as well as in lines.
+pub fn bnc_trim_weight(line: &str) -> u64 {
+    line.len()
+        .div_ceil(crate::bouncer::BACKLOG_BYTES_PER_LINE)
+        .max(1) as u64
+}
+
+/// Weight ([`bnc_trim_weight`]) one network may append before
+/// [`trim_bnc_buffer`] is due for it: a thousand ordinary lines.
 ///
 /// The trim is amortized rather than run per insert, and the count belongs to
 /// the caller — there is one persistence task per network, so each network
@@ -8488,11 +8515,12 @@ fn bnc_line_sent_at(line: &str) -> String {
 }
 
 /// Drop all but the newest [`BNC_BUFFER_CAP`] lines of one network's buffer,
-/// so an always-on network cannot grow the table forever. The persistence task
-/// calls this once when it starts (after restoring the backlog) and every
-/// [`BNC_TRIM_INTERVAL`] lines after; maintenance sweeps whatever that leaves
-/// ([`trim_bnc_buffers_over_cap`]). Deletes in bounded batches until the
-/// buffer is within the cap.
+/// and of those all but the newest [`BNC_BUFFER_BYTES`] of them, so an
+/// always-on network cannot grow the table forever, in rows or in bytes. The
+/// persistence task calls this once when it starts (after restoring the
+/// backlog) and every [`BNC_TRIM_INTERVAL`] of [`bnc_trim_weight`] after;
+/// maintenance sweeps whatever that leaves ([`trim_bnc_buffers_over_cap`]).
+/// Deletes in bounded batches until the buffer is within both caps.
 pub async fn trim_bnc_buffer(pool: &PgPool, buffer: &BncBuffer) -> Result<(), DbError> {
     let key = &buffer.key;
     while trim_bnc_buffer_batch(pool, &key.owner, &key.network, STORAGE_MAINTENANCE_BATCH).await?
@@ -8501,10 +8529,13 @@ pub async fn trim_bnc_buffer(pool: &PgPool, buffer: &BncBuffer) -> Result<(), Db
     Ok(())
 }
 
-/// Delete up to `limit` of the oldest lines beyond the cap of one canonical
-/// (owner, network) buffer; returns how many went. The cap boundary is one
-/// index probe (`OFFSET cap` into `bnc_buffer_lookup_idx`, newest first) and
-/// the batch is named by primary key.
+/// Delete up to `limit` of the oldest lines beyond the caps of one canonical
+/// (owner, network) buffer; returns how many went. The row-cap boundary is one
+/// index probe (`OFFSET cap` into `bnc_buffer_lookup_idx`, newest first); the
+/// byte-cap boundary is the newest row at which the lines from the newest back
+/// pass [`BNC_BUFFER_BYTES`], a running sum over at most the row cap's rows
+/// (older ones are beyond the row cap anyway). Everything at or below the
+/// later boundary goes, and the batch is named by primary key.
 async fn trim_bnc_buffer_batch(
     pool: &PgPool,
     owner: &str,
@@ -8514,10 +8545,18 @@ async fn trim_bnc_buffer_batch(
     sqlx::query(
         "DELETE FROM bnc_buffer WHERE id = ANY(ARRAY(
              SELECT id FROM bnc_buffer
-             WHERE owner = $1 AND network = $2 AND id <= (
-                 SELECT id FROM bnc_buffer
-                 WHERE owner = $1 AND network = $2
-                 ORDER BY id DESC OFFSET $3 LIMIT 1
+             WHERE owner = $1 AND network = $2 AND id <= greatest(
+                 (SELECT id FROM bnc_buffer
+                  WHERE owner = $1 AND network = $2
+                  ORDER BY id DESC OFFSET $3 LIMIT 1),
+                 (SELECT id FROM (
+                      SELECT id, sum(octet_length(line)) OVER (ORDER BY id DESC) AS newer
+                      FROM (SELECT id, line FROM bnc_buffer
+                            WHERE owner = $1 AND network = $2
+                            ORDER BY id DESC LIMIT $3) newest
+                  ) running
+                  WHERE newer > $5
+                  ORDER BY id DESC LIMIT 1)
              )
              ORDER BY id LIMIT $4))",
     )
@@ -8525,6 +8564,7 @@ async fn trim_bnc_buffer_batch(
     .bind(network)
     .bind(BNC_BUFFER_CAP)
     .bind(limit as i64)
+    .bind(BNC_BUFFER_BYTES)
     .execute(pool)
     .await
     .map(|result| result.rows_affected())

@@ -904,6 +904,23 @@ now go out as the client reads, a remote channel's on the asker's shard, a
 labeled one as one batch, and later WHOs follow it in order within one SendQ
 — past that, `263 RPL_TRYAGAIN` (DESIGN §7.2).
 
+Maintainer decisions implemented: history, SendQ and backlog are bounded in
+bytes, and the authentication throttle is on by default. A resource-bounds
+review found every memory cap counted items, not bytes. Each hot history ring
+now also holds at most `max_history_ring_bytes` (500 KiB) and all of them
+`max_hot_history_bytes` (512 MiB), shedding a ring's oldest entries and then
+the least recently active rings; a multiline message's text is held once and
+its plain line derived where it is stored. The SendQ is `sendq_bytes` (512
+KiB, the 1,024 lines it held at a full line each; migration 0088 converts the
+stored count), held output and paced LIST/WHO counted in the same bytes. A
+network's backlog holds `buffer_cap` lines of at most 512 bytes' worth each,
+in memory and in storage (5,000 rows, 2.5 MB), trimmed oldest first.
+`limits.auth_rate_burst` defaults to twenty a minute per address and is turned
+off only by `"off"`; a stored unset is migrated to the default (0088). The
+bouncer-shutdown test's upstream now closes the link on `QUIT` as a server
+does, where it had waited for the driver to close first and raced the end of
+the shutdown (DESIGN §7.2, §7.3, §11, §18).
+
 A review of whether the docs, tests, CI and guards tell the truth found, and
 this change fixes:
 

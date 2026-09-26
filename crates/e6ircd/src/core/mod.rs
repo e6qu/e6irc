@@ -595,7 +595,7 @@ pub enum Input {
     /// A connection was accepted; `tx` is its send queue.
     Open {
         conn: ConnId,
-        tx: Sender<Output>,
+        tx: SendQueue,
         host: String,
         transport: ConnectionTransport,
     },
@@ -2104,7 +2104,8 @@ pub struct HistoryRow {
     /// correspondent, not to themselves.
     pub sender_account: Option<String>,
     pub kind: HistoryKind,
-    /// The text; empty for a `TAGMSG`.
+    /// The text; empty for a `TAGMSG`, and for a multiline message, whose text
+    /// is `multiline` alone (held once, not twice: see [`Self::plain_body`]).
     pub body: String,
     /// The sender was a bot (+B) at send time; replay re-emits the `bot` tag.
     pub sender_is_bot: bool,
@@ -2121,6 +2122,20 @@ pub struct HistoryRow {
     /// negotiated `message-tags`, as live delivery sent them, so a reply or a
     /// reaction keeps what it refers to.
     pub client_tags: String,
+}
+
+impl HistoryRow {
+    /// The text as one plain line: `body`, or a multiline message's lines
+    /// joined with spaces — what the database's `body` column and the REST
+    /// history carry.
+    pub(crate) fn plain_body(&self) -> std::borrow::Cow<'_, str> {
+        match &self.multiline {
+            Some(encoded) => {
+                std::borrow::Cow::Owned(handler::message::multiline_plain_text(encoded))
+            }
+            None => std::borrow::Cow::Borrowed(&self.body),
+        }
+    }
 }
 
 /// Capability state that determines the wire shape of a CHATHISTORY reply.
@@ -2291,6 +2306,59 @@ pub enum AccountDropOutcome {
 /// an in-band event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output(pub Bytes);
+
+/// The core's end of one connection's send queue: bounded in the bytes its
+/// lines hold (`sendq_bytes`), like Solanum's class `sendq`, never in their
+/// number — a count lets a few maximum-size lines pin as much as a thousand
+/// short ones. Made only by [`send_queue`], so no connection can be given a
+/// queue measured in anything else.
+#[derive(Debug)]
+pub struct SendQueue(pub(crate) Sender<Output>);
+
+/// A connection's send queue of `bytes` bytes (named `name` in diagnostics):
+/// the core's end, and the receiver its writer drains.
+pub fn send_queue(name: &'static str, bytes: usize) -> (SendQueue, Receiver<Output>) {
+    let (tx, rx) = e6irc_queue::weighted_queue(
+        e6irc_queue::Config {
+            name,
+            capacity: bytes,
+            policy: e6irc_queue::Policy::Fifo,
+        },
+        |output: &Output| output.0.len(),
+    );
+    (SendQueue(tx), rx)
+}
+
+/// Output withheld behind a deferred reply (see `Session::deferred_replies`),
+/// with the bytes it holds counted where lines enter it, so the bound on it is
+/// the send queue's own, in the send queue's unit.
+#[derive(Debug, Default)]
+pub(crate) struct HeldOutput {
+    lines: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl HeldOutput {
+    /// Hold `line` if the held output stays within `sendq_bytes`; `false`
+    /// (and nothing held) when it would not, which is a SendQ kill.
+    pub(crate) fn hold(&mut self, line: Bytes, sendq_bytes: usize) -> bool {
+        if self.bytes + line.len() > sendq_bytes {
+            return false;
+        }
+        self.bytes += line.len();
+        self.lines.push(line);
+        true
+    }
+}
+
+impl IntoIterator for HeldOutput {
+    type Item = Bytes;
+    type IntoIter = std::vec::IntoIter<Bytes>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.lines.into_iter()
+    }
+}
 
 /// A wire line with no embedded CR, LF, or NUL.
 ///
@@ -3336,7 +3404,7 @@ impl Core {
 /// they have all stopped. The marker lives here, on the handle every path must
 /// use, so no delivery site has to remember it.
 pub(crate) struct SessionOutput {
-    tx: Sender<Output>,
+    tx: SendQueue,
     said_goodbye: bool,
 }
 
@@ -3348,7 +3416,7 @@ pub(crate) enum Written {
 }
 
 impl SessionOutput {
-    pub(crate) fn new(tx: Sender<Output>) -> Self {
+    pub(crate) fn new(tx: SendQueue) -> Self {
         Self {
             tx,
             said_goodbye: false,
@@ -3362,7 +3430,7 @@ impl SessionOutput {
         if self.said_goodbye {
             return Ok(Written::AfterGoodbye);
         }
-        match self.tx.try_push(Output(line.0)) {
+        match self.tx.0.try_push(Output(line.0)) {
             Ok(_) => Ok(Written::Queued),
             Err(PushError::Full(_)) => Err(SendqExceeded),
             // Receiver gone: the I/O task is already dead. On the common
@@ -3376,15 +3444,17 @@ impl SessionOutput {
         }
     }
 
-    /// How many more lines the queue takes before it is half full: the most
-    /// a paced reply (a LIST, a long WHO) may occupy, leaving the other half
-    /// for whatever else the connection is sent meanwhile. Solanum's SAFELIST
-    /// bound.
+    /// How many more bytes the queue takes before it is half full: the most a
+    /// paced reply (a LIST, a long WHO) may occupy, leaving the other half for
+    /// whatever else the connection is sent meanwhile. Solanum's SAFELIST
+    /// bound. A paced reply sends while any room is left, so it may pass the
+    /// half by at most the one line that crossed it.
     pub(crate) fn paced_room(&self) -> usize {
         self.tx
+            .0
             .capacity()
             .div_ceil(2)
-            .saturating_sub(self.tx.depth())
+            .saturating_sub(self.tx.0.depth())
     }
 
     /// Queue the connection's closing line; nothing is written after it.
@@ -3476,11 +3546,13 @@ mod ingress_tests {
             description: "test".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 1,
+            sendq_bytes: 512,
             motd: Vec::new(),
             nicklen: 30,
             sasl_enabled: false,
             max_hot_channels: 1,
+            max_history_ring_bytes: crate::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: crate::config::DEFAULT_HOT_HISTORY_BYTES,
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
@@ -3560,11 +3632,7 @@ mod ingress_tests {
         first: &mut Core,
         name: &'static str,
     ) -> (SessionOwner, Receiver<Output>) {
-        let (output_tx, output_rx) = queue(Config {
-            name,
-            capacity: 2,
-            policy: Policy::Fifo,
-        });
+        let (output_tx, output_rx) = crate::core::send_queue(name, 2 * 512);
         let session = SessionOwner::new(ConnId(2), CoreShardId(0));
         first.state.open(
             session.conn(),
@@ -3675,11 +3743,7 @@ mod ingress_tests {
             ..
         } = two_worker_harness();
         let (session, _output) = open_session_on_first(&mut first, "account-index-first");
-        let (second_tx, _second_output) = queue(Config {
-            name: "account-index-second",
-            capacity: 2,
-            policy: Policy::Fifo,
-        });
+        let (second_tx, _second_output) = crate::core::send_queue("account-index-second", 2 * 512);
         second.state.open(
             ConnId(9),
             second_tx,
@@ -4052,11 +4116,7 @@ mod ingress_tests {
 
     /// Open and register `nick` as connection 2 on the first shard.
     fn register_on_first(first: &mut Core, nick: &str) -> (ConnId, Receiver<Output>) {
-        let (tx, rx) = queue(Config {
-            name: "registered-on-first-output",
-            capacity: 64,
-            policy: Policy::Fifo,
-        });
+        let (tx, rx) = crate::core::send_queue("registered-on-first-output", 64 * 512);
         let conn = ConnId(2);
         first
             .state
@@ -4170,7 +4230,7 @@ mod ingress_tests {
                 policy: Policy::Fifo,
             });
             let mut config = core_config();
-            config.sendq = 4096;
+            config.sendq_bytes = 4096 * 512;
             config.max_hot_channels = 16;
             cores.push(Core::with_telemetry_on_shard_with_directories(
                 config,
@@ -4204,11 +4264,7 @@ mod ingress_tests {
         /// Connect and register `nick` as connection `conn` (its shard is
         /// `conn % 2`), returning its output.
         async fn client(&self, conn: u64, nick: &str) -> Receiver<Output> {
-            let (tx, mut rx) = queue(Config {
-                name: "live-pair-client",
-                capacity: 4096,
-                policy: Policy::Fifo,
-            });
+            let (tx, mut rx) = crate::core::send_queue("live-pair-client", 4096 * 512);
             self.ingress
                 .push(Input::Open {
                     conn: ConnId(conn),
@@ -4400,7 +4456,7 @@ mod ingress_tests {
                     }
                     let mut config = core_config();
                     config.sasl_enabled = database;
-                    config.sendq = 256;
+                    config.sendq_bytes = 256 * 512;
                     config.max_hot_channels = 16;
                     config.mono_clock = thread_mono_clock;
                     config.clock = thread_wall_clock;
@@ -4435,11 +4491,7 @@ mod ingress_tests {
 
         /// Connect and register `nick` as connection `conn`, requesting `caps`.
         fn client(&mut self, conn: u64, nick: &str, caps: &str) {
-            let (tx, rx) = queue(Config {
-                name: "shards-client",
-                capacity: 256,
-                policy: Policy::Fifo,
-            });
+            let (tx, rx) = crate::core::send_queue("shards-client", 256 * 512);
             self.outputs.insert(conn, rx);
             let shard = conn as usize % self.cores.len();
             self.cores[shard].handle(Input::Open {
@@ -5978,15 +6030,10 @@ mod ingress_tests {
             second_rx,
             ingress,
         } = two_worker_harness();
-        // Thirty-two lines: a LIST of more than fifteen rows needs several
-        // turns.
-        let output_config = Config {
-            name: "list-output",
-            capacity: 32,
-            policy: Policy::Fifo,
-        };
-        let (alice_tx, mut alice_rx) = queue(output_config);
-        let (bob_tx, mut bob_rx) = queue(output_config);
+        // Four kilobytes: room for the registration burst, while a LIST of a
+        // hundred and twenty rows of some thirty-five bytes needs several turns.
+        let (alice_tx, mut alice_rx) = crate::core::send_queue("list-output", 4096);
+        let (bob_tx, mut bob_rx) = crate::core::send_queue("list-output", 4096);
         first.state.open(
             ConnId(2),
             alice_tx,
@@ -6011,7 +6058,7 @@ mod ingress_tests {
                 while rx.try_pop().is_some() {}
             }
         }
-        // Twenty channels on each shard, more than the queue holds, and a
+        // Sixty channels on each shard, more than the queue holds, and a
         // secret one.
         let on_shard = |shard: usize, count: usize| -> Vec<String> {
             (0..)
@@ -6020,8 +6067,8 @@ mod ingress_tests {
                 .take(count)
                 .collect()
         };
-        let mut rooms = on_shard(0, 20);
-        rooms.extend(on_shard(1, 20));
+        let mut rooms = on_shard(0, 60);
+        rooms.extend(on_shard(1, 60));
         rooms.sort();
         let secret = (0..)
             .map(|index| format!("#secret{index}"))
@@ -6060,10 +6107,10 @@ mod ingress_tests {
         send(&first_tx, ConnId(2), "LIST >1");
         let crowded = output_until(&mut alice_rx, ":End of /LIST").await;
         assert_eq!(listed(&crowded), [rooms[0].clone()]);
-        let last = &rooms[39];
+        let last = &rooms[119];
         send(&first_tx, ConnId(2), &format!("LIST #room*,!{last},<2"));
         let narrowed = output_until(&mut alice_rx, ":End of /LIST").await;
-        assert_eq!(listed(&narrowed), rooms[1..39]);
+        assert_eq!(listed(&narrowed), rooms[1..119]);
         send(&first_tx, ConnId(2), "LIST #secret*");
         let hidden = output_until(&mut alice_rx, ":End of /LIST").await;
         assert!(listed(&hidden).is_empty(), "{hidden:#?}");
@@ -6100,12 +6147,9 @@ mod ingress_tests {
             .map(|index| format!("#crowd{index}"))
             .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
             .expect("a channel on shard one");
-        // Thirty-two lines: a WHO of forty members needs several turns.
-        let (alice_tx, mut alice_rx) = queue(Config {
-            name: "who-output",
-            capacity: 32,
-            policy: Policy::Fifo,
-        });
+        // Three kilobytes: room for the registration burst, while a WHO of
+        // forty members at some eighty-five bytes a row needs several turns.
+        let (alice_tx, mut alice_rx) = crate::core::send_queue("who-output", 3072);
         first.state.open(
             ConnId(2),
             alice_tx,
@@ -6128,11 +6172,7 @@ mod ingress_tests {
         let mut members = Vec::new();
         for index in 0..40 {
             let conn = ConnId(10 + index);
-            let (tx, mut rx) = queue(Config {
-                name: "who-member-output",
-                capacity: 128,
-                policy: Policy::Fifo,
-            });
+            let (tx, mut rx) = crate::core::send_queue("who-member-output", 128 * 512);
             second
                 .state
                 .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
@@ -6216,13 +6256,8 @@ mod ingress_tests {
             second_rx,
             ingress,
         } = two_worker_harness();
-        let output_config = Config {
-            name: "remote-knock-output",
-            capacity: 64,
-            policy: Policy::Fifo,
-        };
-        let (alice_tx, mut alice_rx) = queue(output_config);
-        let (bob_tx, mut bob_rx) = queue(output_config);
+        let (alice_tx, mut alice_rx) = crate::core::send_queue("remote-knock-output", 64 * 512);
+        let (bob_tx, mut bob_rx) = crate::core::send_queue("remote-knock-output", 64 * 512);
         first.state.open(
             ConnId(2),
             alice_tx,
@@ -6587,22 +6622,14 @@ mod ingress_tests {
             second_rx,
             ingress,
         } = two_worker_harness();
-        let (out_tx, mut out_rx) = queue(Config {
-            name: "remote-member-sendq",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
+        let (out_tx, mut out_rx) = crate::core::send_queue("remote-member-sendq", 8 * 512);
         second.state.open(
             ConnId(1),
             out_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
         );
-        let (sender_tx, _sender_rx) = queue(Config {
-            name: "local-member-sendq",
-            capacity: 64,
-            policy: Policy::Fifo,
-        });
+        let (sender_tx, _sender_rx) = crate::core::send_queue("local-member-sendq", 64 * 512);
         first.state.open(
             ConnId(2),
             sender_tx,
@@ -6671,11 +6698,7 @@ mod ingress_tests {
         } = two_worker_harness();
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
 
-        let (peer_tx, mut peer_rx) = queue(Config {
-            name: "join-peer-sendq",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
+        let (peer_tx, mut peer_rx) = crate::core::send_queue("join-peer-sendq", 8 * 512);
         first.state.open(
             ConnId(2),
             peer_tx,
@@ -6698,11 +6721,7 @@ mod ingress_tests {
         );
         first.state.channels.entry(key).or_insert(channel);
 
-        let (joiner_tx, mut joiner_rx) = queue(Config {
-            name: "joiner-sendq",
-            capacity: 16,
-            policy: Policy::Fifo,
-        });
+        let (joiner_tx, mut joiner_rx) = crate::core::send_queue("joiner-sendq", 16 * 512);
         second.state.open(
             ConnId(1),
             joiner_tx,

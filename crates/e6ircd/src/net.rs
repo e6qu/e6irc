@@ -786,7 +786,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 crate::bouncer::CoreHandles {
                     core_tx: core_tx.clone(),
                     next_conn: next_conn.clone(),
-                    sendq: config.sendq,
+                    sendq_bytes: config.sendq_bytes,
                 },
                 telemetry.clone(),
                 config.internal_upstreams,
@@ -997,7 +997,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             spent_oidc_flows: crate::http::SpentFlows::new(),
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),
-            sendq: config.sendq,
+            sendq_bytes: config.sendq_bytes,
             bnc_registry: bnc_registry.clone(),
             bnc_listener: bnc_listener.clone(),
             managed_config: managed_config.clone(),
@@ -1013,7 +1013,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 k
             },
             trusted_proxies: trusted_proxies.clone(),
-            auth_rate_burst: config.limits.auth_rate_burst,
+            auth_rate_burst: config.limits.auth_rate_burst.burst(),
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             api_rate_burst: config.limits.api_rate_burst,
             administrator_api_rate_burst: config.limits.administrator_api_rate_burst,
@@ -1093,11 +1093,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         description: config.description.clone(),
         registration_before_connect: config.registration.before_connect,
         registration_require_email: config.registration.require_email,
-        sendq: config.sendq,
+        sendq_bytes: config.sendq_bytes,
         motd: config.motd.clone(),
         nicklen: config.nicklen,
         sasl_enabled,
         max_hot_channels: config.max_hot_channels,
+        max_history_ring_bytes: config.max_history_ring_bytes,
+        max_hot_history_bytes: config.max_hot_history_bytes,
         opers: config
             .opers
             .iter()
@@ -1271,7 +1273,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             acceptor,
             core_tx.clone(),
             next_conn.clone(),
-            config.sendq,
+            config.sendq_bytes,
             limiter.clone(),
             telemetry.clone(),
         ));
@@ -1768,7 +1770,7 @@ async fn accept_loop(
     tls: Option<TlsAcceptor>,
     core_tx: CoreIngress,
     next_conn: Arc<ConnectionIdAllocator>,
-    sendq: usize,
+    sendq_bytes: usize,
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
 ) {
@@ -1776,7 +1778,7 @@ async fn accept_loop(
         tls: &tls,
         core_tx: &core_tx,
         next_conn: &next_conn,
-        sendq,
+        sendq_bytes,
         limiter: &limiter,
         telemetry: &telemetry,
     };
@@ -1817,7 +1819,7 @@ struct AcceptContext<'a> {
     tls: &'a Option<TlsAcceptor>,
     core_tx: &'a CoreIngress,
     next_conn: &'a Arc<ConnectionIdAllocator>,
-    sendq: usize,
+    sendq_bytes: usize,
     limiter: &'a ConnLimiter,
     telemetry: &'a Arc<Telemetry>,
 }
@@ -1841,7 +1843,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     let core_tx = context.core_tx.clone();
     let tls = context.tls.clone();
     let telemetry = context.telemetry.clone();
-    let sendq = context.sendq;
+    let sendq_bytes = context.sendq_bytes;
     tokio::spawn(async move {
         let _guard = guard;
         if let Err(e) = stream.set_nodelay(true) {
@@ -1864,7 +1866,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                             peer,
                             crate::core::ConnectionTransport::Tls,
                             core_tx,
-                            Outbound::with_sendq(sendq),
+                            Outbound::with_sendq(sendq_bytes),
                             telemetry,
                         )
                         .await
@@ -1886,7 +1888,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     peer,
                     crate::core::ConnectionTransport::Tcp,
                     core_tx,
-                    Outbound::with_sendq(sendq),
+                    Outbound::with_sendq(sendq_bytes),
                     telemetry,
                 )
                 .await
@@ -1895,17 +1897,17 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     });
 }
 
-/// The bounds on what a connection is sent: its SendQ capacity, and how long
-/// one write may wait for a client that has stopped reading.
+/// The bounds on what a connection is sent: its SendQ capacity in bytes, and
+/// how long one write may wait for a client that has stopped reading.
 struct Outbound {
-    sendq: usize,
+    sendq_bytes: usize,
     write_deadline: std::time::Duration,
 }
 
 impl Outbound {
-    fn with_sendq(sendq: usize) -> Self {
+    fn with_sendq(sendq_bytes: usize) -> Self {
         Self {
-            sendq,
+            sendq_bytes,
             write_deadline: crate::peer_write::PEER_WRITE_DEADLINE,
         }
     }
@@ -1923,11 +1925,7 @@ async fn serve_conn<S>(
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (read_half, write_half) = tokio::io::split(stream);
-    let (out_tx, out_rx) = queue::<Output>(e6irc_queue::Config {
-        name: "sendq",
-        capacity: outbound.sendq,
-        policy: Policy::Fifo,
-    });
+    let (out_tx, out_rx) = crate::core::send_queue("sendq", outbound.sendq_bytes);
     if core_tx
         .push(Input::Open {
             conn,
@@ -2563,7 +2561,7 @@ mod tests {
             peer,
             crate::core::ConnectionTransport::Tcp,
             CoreIngress::single(core_tx),
-            Outbound::with_sendq(8),
+            Outbound::with_sendq(4096),
             Arc::new(Telemetry::new()),
         ));
         (core_rx, served)
@@ -2601,7 +2599,7 @@ mod tests {
             crate::core::ConnectionTransport::Tcp,
             CoreIngress::single(core_tx),
             Outbound {
-                sendq: 4096,
+                sendq_bytes: 4096 * 512,
                 write_deadline: std::time::Duration::from_millis(300),
             },
             Arc::new(Telemetry::new()),
@@ -2612,7 +2610,7 @@ mod tests {
         // Far more than both kernel buffers hold: the writer parks mid-write.
         let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
         for _ in 0..4096 {
-            if tx.try_push(Output(line.clone())).is_err() {
+            if tx.0.try_push(Output(line.clone())).is_err() {
                 break;
             }
         }
@@ -2698,11 +2696,13 @@ mod tests {
             description: "test".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 64,
+            sendq_bytes: 64 * 512,
             motd: vec!["hi".into()],
             nicklen: 30,
             sasl_enabled: false,
             max_hot_channels: 64,
+            max_history_ring_bytes: crate::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: crate::config::DEFAULT_HOT_HISTORY_BYTES,
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
@@ -2813,7 +2813,7 @@ mod tests {
                     next_conn: Arc::new(ConnectionIdAllocator::new(
                         std::num::NonZeroU64::new(1).unwrap(),
                     )),
-                    sendq: 64,
+                    sendq_bytes: 64 * 512,
                 },
                 Arc::new(Telemetry::new()),
                 crate::egress::InternalUpstreams::Allow,
@@ -2910,11 +2910,7 @@ mod tests {
 
         // Register one client so there is a session to notify. Its send queue's
         // receiver is held here to observe the ERROR.
-        let (out_tx, mut out_rx) = queue::<Output>(e6irc_queue::Config {
-            name: "t-sendq",
-            capacity: 64,
-            policy: Policy::Fifo,
-        });
+        let (out_tx, mut out_rx) = crate::core::send_queue("t-sendq", 64 * 512);
         core_tx
             .push(Input::Open {
                 conn: ConnId(1),

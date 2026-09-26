@@ -629,7 +629,7 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
         }),
         limits: LimitsConfig {
             // Two requests per client IP, then the bucket is empty.
-            auth_rate_burst: Some(2),
+            auth_rate_burst: e6ircd::config::AuthRateBurst::PerMinute(2),
             ..LimitsConfig::default()
         },
         ..Config::default()
@@ -4767,9 +4767,9 @@ async fn channel_mlock_migration_normalizes_historical_rows() {
     );
 }
 
-fn managed_settings_with_oidc_providers(
-    providers: Option<Vec<serde_json::Value>>,
-) -> serde_json::Value {
+/// Today's default settings in the shape 0052 stored: its fields only, each
+/// spelled as it was then.
+fn managed_settings_as_of_0052() -> serde_json::Value {
     let managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None)
         .expect("bootstrap managed settings");
     let mut settings = serde_json::to_value(managed).expect("serialize managed settings");
@@ -4777,6 +4777,15 @@ fn managed_settings_with_oidc_providers(
         .as_object_mut()
         .expect("managed settings object")
         .retain(|field, _| MANAGED_CONFIG_0052_FIELDS.contains(&field.as_str()));
+    // A count of lines until 0088 made it `sendq_bytes`.
+    settings["sendq"] = 1024.into();
+    settings
+}
+
+fn managed_settings_with_oidc_providers(
+    providers: Option<Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut settings = managed_settings_as_of_0052();
     match providers {
         Some(providers) => settings["oidc_providers"] = serde_json::Value::Array(providers),
         None => {
@@ -5083,13 +5092,7 @@ async fn username_migration_backfills_what_each_network_was_already_sending() {
     .await
     .expect("legacy bridge");
 
-    let managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None)
-        .expect("bootstrap managed settings");
-    let mut settings = serde_json::to_value(managed).expect("serialize managed settings");
-    settings
-        .as_object_mut()
-        .expect("managed settings object")
-        .retain(|field, _| MANAGED_CONFIG_0052_FIELDS.contains(&field.as_str()));
+    let mut settings = managed_settings_as_of_0052();
     let legacy_entry = |kind: &str, name: &str, nick: &str| {
         serde_json::json!({
             "name": name, "kind": kind, "owner": null, "addr": "irc.example:6697",
@@ -7256,6 +7259,58 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
         .await
         .expect("read");
     assert_eq!(kept, vec!["line 5999"]);
+}
+
+/// The upstream decides how long its lines are: a backlog of long lines is
+/// trimmed to its byte cap, oldest first, well before its row cap.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_buffer_trim_bounds_the_bytes_stored() {
+    let url = support::test_db("bnc_buffer_trim_bounds_the_bytes_stored").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("owner"),
+        "long",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    let names = e6irc_client::NetworkNames::default();
+    // 1,000 lines of four kilobytes: a fifth of the row cap, and
+    // four megabytes, past the byte cap.
+    let tags = "t".repeat(4_000);
+    for i in 0..1_000 {
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            None,
+            &format!("@+x={tags} :n!u@h PRIVMSG #c :line {i}"),
+            &names,
+        )
+        .await
+        .expect("persist");
+    }
+    db::trim_bnc_buffer(&pool, &buffer).await.expect("trim");
+    let (rows, bytes): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), coalesce(sum(octet_length(line)), 0)::bigint
+         FROM bnc_buffer WHERE owner = 'owner' AND network = 'long'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("measure");
+    assert!(bytes <= db::BNC_BUFFER_BYTES, "{bytes} bytes kept");
+    assert!(
+        bytes > db::BNC_BUFFER_BYTES - 4_100,
+        "only what was over the cap went: {bytes} bytes in {rows} rows"
+    );
+    let kept = db::recent_bnc_lines(&pool, "owner", "long", 1)
+        .await
+        .expect("read");
+    assert!(kept[0].ends_with("line 999"), "the newest survive");
+    // A long line brings the next trim nearer in proportion to its bytes.
+    assert_eq!(db::bnc_trim_weight("short"), 1);
+    assert_eq!(db::bnc_trim_weight(&tags), 8);
 }
 
 #[tokio::test]
@@ -9909,6 +9964,45 @@ async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
         loaded.settings.limits.command_burst,
         e6ircd::config::DEFAULT_COMMAND_BURST
     );
+}
+
+/// A settings row that counted the SendQ in lines, with the authentication
+/// throttle unset (`null`, then off), loads after 0088 with the lines as full
+/// 512-byte lines and the throttle at its new default.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_settings_row_counting_the_sendq_in_lines_loads_in_bytes_after_0088() {
+    for (sendq, expected) in [(2048_i64, 2048 * 512), (1, 17_406), (65_536, 33_554_432)] {
+        let pool = sqlx::PgPool::connect(
+            &support::test_db(&format!("a_settings_row_counting_the_sendq_{sendq}")).await,
+        )
+        .await
+        .expect("connect");
+        MIGRATIONS.run_to(87, &pool).await.expect("through 0087");
+        let mut row: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/server_settings/0087-8c7f06b3e17b.json"
+        ))
+        .expect("fixture");
+        row["sendq"] = sendq.into();
+        sqlx::query(
+            "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+             VALUES (TRUE, 1, $1, 'fixture')",
+        )
+        .bind(&row)
+        .execute(&pool)
+        .await
+        .expect("store the old shape");
+        MIGRATIONS.run(&pool).await.expect("migrate to latest");
+        let loaded = db::load_managed_config(&pool)
+            .await
+            .expect("loads after 0088");
+        assert_eq!(loaded.settings.sendq_bytes, expected, "sendq = {sendq}");
+        assert_eq!(
+            loaded.settings.limits.auth_rate_burst,
+            e6ircd::config::AuthRateBurst::default()
+        );
+        pool.close().await;
+    }
 }
 
 /// 0066 folds the targets 0059 wrote under display names, so a mixed-case

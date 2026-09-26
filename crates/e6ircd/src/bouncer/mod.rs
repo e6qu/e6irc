@@ -3944,10 +3944,23 @@ impl RingEntry {
     }
 }
 
-/// Bounded ring of recent upstream lines, for playback on attach.
+/// The bytes a network's backlog may hold per line of its `buffer_cap`: a full
+/// 512-byte IRC line (RFC 1459's limit on a line without tags). A backlog of
+/// `buffer_cap` ordinary lines is held whole; one whose upstream sends
+/// kilobytes of tags with every line keeps fewer of them, never more than
+/// `buffer_cap` × 512 bytes. The same rate bounds the stored backlog
+/// (`crate::db::BNC_BUFFER_BYTES`).
+pub(crate) const BACKLOG_BYTES_PER_LINE: usize = e6irc_proto::message::MAX_LINE_LEN;
+
+/// Bounded ring of recent upstream lines, for playback on attach: at most
+/// `cap` positions and `byte_cap` bytes of lines, the oldest going first.
 pub struct Buffer {
     entries: std::collections::VecDeque<RingEntry>,
     cap: usize,
+    /// `cap` lines of [`BACKLOG_BYTES_PER_LINE`].
+    byte_cap: usize,
+    /// The bytes of the lines held.
+    bytes: usize,
     /// Identifies this ring's lifetime; part of every cursor it hands out.
     epoch: u64,
     /// The position the next pushed line takes. Starts above `cap` so the
@@ -3967,8 +3980,17 @@ impl Buffer {
         Self {
             entries: std::collections::VecDeque::new(),
             cap,
+            byte_cap: cap.max(1).saturating_mul(BACKLOG_BYTES_PER_LINE),
+            bytes: 0,
             epoch,
             next_seq: cap as u64 + 1,
+        }
+    }
+
+    /// Drop the oldest entry.
+    fn evict_oldest(&mut self) {
+        if let Some(RingEntry::Line(line)) = self.entries.pop_front() {
+            self.bytes -= line.line.len();
         }
     }
 
@@ -3977,18 +3999,24 @@ impl Buffer {
         // `>=` (not `==`) so a zero/under-filled cap can never let the ring
         // grow without bound.
         while self.entries.len() >= self.cap.max(1) {
-            self.entries.pop_front();
+            self.evict_oldest();
         }
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
     }
 
-    /// Retain `line` as the newest, returning the position it took.
+    /// Retain `line` as the newest, returning the position it took. Older
+    /// entries go while the lines held pass `byte_cap` — never this one, so a
+    /// ring always holds its newest line.
     fn push(&mut self, line: String) -> u64 {
         let seq = self.next_position();
+        self.bytes += line.len();
         self.entries
             .push_back(RingEntry::Line(BufferedLine { seq, line }));
+        while self.bytes > self.byte_cap && self.entries.len() > 1 {
+            self.evict_oldest();
+        }
         seq
     }
 
@@ -4665,7 +4693,8 @@ impl NetworkHandle {
     /// Prepend older (oldest-first) lines to the front of the buffer,
     /// used once at start to restore persisted backlog. Never evicts
     /// lines already present (they are newer); only the remaining
-    /// capacity is filled, keeping the most recent of `older`.
+    /// capacity, in lines and in bytes, is filled, keeping the most recent
+    /// of `older`.
     ///
     /// Each stored line comes with the time it was stored under, which it is
     /// stamped with when it carries no `time` of its own. A network's
@@ -4678,8 +4707,7 @@ impl NetworkHandle {
             .collect();
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         let room = buf.cap.saturating_sub(buf.entries.len());
-        let skip = older.len().saturating_sub(room);
-        for (line, stored_at) in older[skip..].iter().rev() {
+        for (line, stored_at) in older.iter().rev().take(room) {
             // Each restored line takes the position just below the current
             // oldest: older than everything pushed, in storage order.
             let seq = buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1;
@@ -4690,6 +4718,10 @@ impl NetworkHandle {
             // Both ways into the buffer sanitize, so no reader has to ask which
             // one a line arrived through.
             let line = stamp_time(crate::sanitize::upstream_line(line.clone()), stored_at);
+            if buf.bytes + line.len() > buf.byte_cap {
+                break;
+            }
+            buf.bytes += line.len();
             buf.entries
                 .push_front(RingEntry::Line(BufferedLine { seq, line }));
         }
@@ -9217,6 +9249,61 @@ mod tests {
             None,
             "TAGMSG itself is gated by message-tags"
         );
+    }
+
+    /// Lines carrying kilobytes of tags fill a backlog's bytes long before
+    /// its line cap: the ring keeps `cap` lines' worth of bytes, oldest going
+    /// first, and always its newest line.
+    #[test]
+    fn a_backlog_is_bounded_in_bytes_as_well_as_lines() {
+        let cap = 100;
+        let mut ring = Buffer::new(cap);
+        let tagged = |i: usize| format!("@+x={} :n!u@h PRIVMSG #c :line{i}", "t".repeat(4_000));
+        for i in 0..cap {
+            ring.push(tagged(i));
+            let held: usize = ring.lines().map(|entry| entry.line.len()).sum();
+            assert_eq!(held, ring.bytes);
+            assert!(
+                held <= cap * BACKLOG_BYTES_PER_LINE,
+                "{held} bytes after {i}"
+            );
+        }
+        let kept = ring.snapshot();
+        assert!(
+            kept.len() < cap / 5,
+            "{} four-kilobyte lines kept",
+            kept.len()
+        );
+        assert!(kept.last().is_some_and(|line| line.ends_with("line99")));
+        // Ordinary lines are held to the line cap, as before.
+        let mut plain = Buffer::new(cap);
+        for i in 0..3 * cap {
+            plain.push(format!(":n!u@h PRIVMSG #c :line{i}"));
+        }
+        assert_eq!(plain.snapshot().len(), cap);
+        // One line larger than the whole budget is still the newest line held.
+        let mut tiny = Buffer::new(1);
+        tiny.push(tagged(1));
+        tiny.push(tagged(2));
+        assert_eq!(tiny.snapshot().len(), 1);
+    }
+
+    /// Restoring a stored backlog fills only the bytes left, newest first.
+    #[test]
+    fn a_restored_backlog_fills_only_the_bytes_left() {
+        let (handle, _ends) = NetworkHandle::channels(10);
+        let big = format!("@+x={} :n!u@h PRIVMSG #c :old", "t".repeat(2_000));
+        let stored: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("{big}{i}"), "2026-01-01T00:00:00.000Z".to_string()))
+            .collect();
+        handle.preload_front(stored);
+        let buffer = handle.buffer.lock().expect("buffer");
+        let held: usize = buffer.lines().map(|entry| entry.line.len()).sum();
+        assert_eq!(held, buffer.bytes);
+        assert!(held <= buffer.byte_cap, "{held} bytes");
+        let lines = buffer.snapshot();
+        assert!(lines.len() < 10 && !lines.is_empty(), "{}", lines.len());
+        assert!(lines.last().is_some_and(|line| line.ends_with("old9")));
     }
 
     #[test]

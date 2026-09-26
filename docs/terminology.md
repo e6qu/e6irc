@@ -115,8 +115,9 @@ line with `@`. `server-time` stamps a message with its origin time so
 history and bouncer playback are ordered.
 
 **SendQ** — the per-connection outbound send queue. A client too slow to
-drain its SendQ past the configured cap is disconnected ("SendQ exceeded")
-so one slow client cannot stall the server.
+drain its SendQ past the configured cap (`sendq_bytes`, in bytes, as
+Solanum's class `sendq`) is disconnected ("SendQ exceeded") so one slow client
+cannot stall the server.
 
 **ELIST / SAFELIST** — the `005` tokens describing `LIST`. `ELIST` (extended
 LIST) names the conditions it takes, one letter each: `C` creation time, `M`

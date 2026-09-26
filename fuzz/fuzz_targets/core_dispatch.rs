@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
             server_name: "irc.fuzz.example".into(),
             network_name: "Fuzz".into(),
             description: "fuzz server".into(),
-            sendq: 512,
+            sendq_bytes: 512 * 512,
             motd: vec!["motd".into()],
             nicklen: 16,
             // No database answers here (`db_rx` is never drained), which
@@ -48,6 +48,8 @@ fuzz_target!(|data: &[u8]| {
             sasl_enabled: selector & 1 != 0,
             opers: vec![("o".into(), "p".into())],
             max_hot_channels: 4,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || e6irc_proto::time::Millis::from_millis(1_000_000_000),
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(1_000_000_000),
             command_flood: None,
@@ -60,11 +62,7 @@ fuzz_target!(|data: &[u8]| {
         db_tx,
     );
     let conn = ConnId(1);
-    let (tx, mut rx) = queue(Config {
-        name: "fuzz-sendq",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
+    let (tx, mut rx) = e6ircd::core::send_queue("fuzz-sendq", 512 * 512);
     core.handle(Input::Open {
         conn,
         tx,
