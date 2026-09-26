@@ -729,7 +729,29 @@ strip = "symbols"
   many middles *and* a client-influenced trailing (WHOX's `RPL_WHOSPCRPL`, a
   realname) can't sum past 512 and be discarded whole. `server_name`/
   `network_name` are length-bounded at config load so the fixed head they sit in
-  can't inflate that budget.
+  can't inflate that budget. A client token echoed into a middle parameter (an
+  unknown command, a refused nick, a FAIL's context, a bridge's JOIN target) is
+  an `e6irc_proto::message::MiddleParam`, whose one constructor renders an
+  empty, `:`-leading, spaced or control-bearing token as `*` and clips the rest
+  to 64 bytes; the core's echoes and the bouncer's attach numerics
+  (`handshake_numeric`, `write_attach_numeric`, which take only that type) share
+  it, so `NICK :a b` cannot become `432 * a b :…` on either side. Lines that
+  carry free text are built by the funnels that fit it — `fitted_line`, the
+  `server_notice` every server NOTICE goes through (operator notices echo
+  masks, hosts and stored reasons), the `fail_line` every `FAIL` goes through
+  (it clips its context and fits its detail), and the bouncer's `bnc_notice` —
+  never by a `format!` of the text. A server-ban mask is bounded where it is
+  parsed (100 bytes, a realname mask 150), like a channel ban's.
+- Decoding relayed upstream text: IRC bodies are arbitrary bytes and a relay
+  cannot know the sender's encoding, so each invalid byte becomes U+FFFD
+  (guessing one legacy code page, say CP1252, would render Shift-JIS or KOI8-R
+  as plausible-looking wrong text; U+FFFD marks the loss). U+FFFD is three
+  bytes, so `decode_server_line` fits the decoded line again — a tag section
+  that grew drops the tags that carry U+FFFD, the traditional part is cut on a
+  character boundary — and a line that fits the budgets as bytes is always
+  relayed, never replaced by the bouncer's `*bnc*` "upstream input rejected"
+  notice, which only a line over a budget as received earns. The
+  `bouncer_lines` fuzz target pins that.
 - Casemapping: **`rfc1459`** (what Libera/Solanum advertises), implemented
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL

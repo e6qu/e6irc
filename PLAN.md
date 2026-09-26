@@ -930,6 +930,28 @@ this change fixes:
   documents), DESIGN §5's dependency policy, the default flood limits, the
   client's SASL mechanisms, and CI's PostgreSQL setup.
 
+A review of wire safety found, and this change fixes (DESIGN §7.1, limits and
+decoding):
+
+- **A channel message of high bytes was replaced by a rejection notice.** Two
+  hundred Latin-1 bytes fit the frame but decode to six hundred bytes of
+  U+FFFD, and the bouncer replaced the whole line with an `:e6irc` "upstream
+  input rejected" NOTICE. Decoding now fits the text again, so a line that fits
+  as bytes is always relayed, and the notice speaks as `*bnc*`; the
+  `bouncer_lines` fuzz target asserts it.
+- **Echoed client tokens could split a bouncer reply** (`NICK :a b` answered
+  `432 * a b :…`; `CAP :a b`, `JOIN :#a b` and `JOIN ::x` on a bridge alike).
+  The core's echo rule is now `MiddleParam` in `e6irc-proto`, the only type the
+  bouncer's attach numerics take.
+- **Over-long lines that aborted the debug worker**: a `FAIL REGISTER` echoing
+  a 480-byte account, and operator NOTICEs echoing an unbounded K/D/X-line mask
+  or SETHOST host. `fail_line` clips and fits, every server NOTICE goes through
+  one fitted `server_notice`, and server-ban masks are bounded. The bouncer's
+  own notices carrying upstream text (a closing reason, SASL notes, bridge
+  targets) go through a fitted `bnc_notice`, where a multi-byte reason used to
+  turn them into the rejection notice. `core_dispatch` now also fuzzes with
+  accounts enabled.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

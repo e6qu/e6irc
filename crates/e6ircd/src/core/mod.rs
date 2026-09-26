@@ -17,7 +17,8 @@ mod state;
 mod timer;
 
 pub(crate) use handler::{
-    HistoryFail, cap_reply_lines, cap_version_302, fit_trailing, invalid_utf8_fail,
+    HistoryFail, cap_reply_lines, cap_version_302, fail_line, fit_trailing, fitted_line,
+    invalid_utf8_fail, server_notice,
 };
 
 /// How long an unregistered connection may hold its slot before the core
