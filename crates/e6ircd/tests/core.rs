@@ -11,7 +11,7 @@ use e6irc_queue::{Config, Policy, Receiver, queue};
 fn test_mono() -> MonoMillis {
     MonoMillis::from_millis(1_000_000_000)
 }
-use e6ircd::core::{CommandFlood, ConnId, Core, CoreConfig, Input, Output};
+use e6ircd::core::{ConnId, Core, CoreConfig, Input, Output};
 
 /// A test connection's send queue: the 256 lines it held when it counted
 /// lines, at a full 512-byte line each, so every reply that fitted then fits.
@@ -132,7 +132,6 @@ impl TestServer {
             opers: vec![("god".into(), "letmein".into())],
             clock,
             mono_clock: test_mono,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -7209,228 +7208,6 @@ fn bot_mode_tags_and_whois() {
 }
 
 #[test]
-fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
-    // The monotonic clock's epoch is process start, so a session opened a few
-    // seconds into uptime must STILL start with the full command burst — not
-    // `min(uptime_seconds, burst)`. Regression for a fresh bucket under-filled
-    // during the first burst-many seconds after a restart, which would
-    // wrongly Excess-Flood-kill a client pipelining a legitimate burst — the
-    // worst case being a post-restart reconnect storm. A fixed clock only 3s
-    // into "uptime" reproduces it (the usual 1e9-ms test clock masks it, since
-    // uptime then dwarfs any burst).
-    fn early_mono() -> MonoMillis {
-        MonoMillis::from_millis(3_000)
-    }
-    let (db_tx, _db_rx) = queue(Config {
-        name: "d",
-        capacity: 8,
-        policy: Policy::Fifo,
-    });
-    let mut core = Core::new(
-        CoreConfig {
-            server_name: "irc.test.example".into(),
-            network_name: "T".into(),
-            description: "test server".into(),
-            registration_before_connect: false,
-            registration_require_email: false,
-            sendq_bytes: 256 * 512,
-            motd: vec![],
-            nicklen: 16,
-            sasl_enabled: false,
-            opers: vec![],
-            max_hot_channels: 8,
-            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
-            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
-            clock: || Millis::from_millis(1_000_000_000),
-            mono_clock: early_mono,
-            command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
-            registration_burst: None,
-            sasl_requirement: Default::default(),
-            reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
-        },
-        db_tx,
-    );
-    let conn = ConnId(1);
-    let (tx, mut rx) = e6ircd::core::send_queue("s", 512 * 512);
-    core.handle(Input::Open {
-        conn,
-        tx,
-        host: "h".into(),
-        transport: e6ircd::core::ConnectionTransport::Tcp,
-    });
-    for line in ["NICK alice", "USER a 0 * :A"] {
-        core.handle(Input::Line {
-            conn,
-            line: line.as_bytes().to_vec(),
-        });
-    }
-    while rx.try_pop().is_some() {}
-
-    // Send exactly one burst of floodable commands in the same tick. With a
-    // full fresh bucket all ten are credited; with the old uptime-seeded bucket
-    // (3 tokens) the fourth would be dropped with Excess Flood.
-    for _ in 0..10 {
-        core.handle(Input::Line {
-            conn,
-            line: b"AWAY :busy".to_vec(),
-        });
-    }
-    let out: Vec<String> = std::iter::from_fn(|| {
-        rx.try_pop().map(|e| {
-            String::from_utf8(e.payload.0.to_vec())
-                .unwrap()
-                .trim_end()
-                .to_string()
-        })
-    })
-    .collect();
-    assert!(
-        !out.iter().any(|l| l.contains("Excess Flood")),
-        "a fresh session must start with the full burst, not min(uptime, burst): {out:#?}"
-    );
-}
-
-#[test]
-fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive() {
-    // The shipped default is Solanum's shape: 40 tokens, 20 per second. In one
-    // clock instant a registered session may pipeline exactly 40 floodable
-    // commands; the 41st closes the link with Excess Flood. PING and PONG never
-    // spend a token, so a keepalive-heavy client is never killed for it, and
-    // 50 ms later (one token at 20/s) one more command is admitted.
-    static NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000_000);
-    fn ticking_mono() -> MonoMillis {
-        MonoMillis::from_millis(NOW_MS.load(std::sync::atomic::Ordering::Relaxed))
-    }
-    let flood = CommandFlood::new(
-        e6ircd::config::DEFAULT_COMMAND_BURST,
-        e6ircd::config::DEFAULT_COMMAND_RATE,
-    )
-    .expect("the shipped defaults are a valid bucket");
-    let open_session = |conn: ConnId| {
-        let (db_tx, _db_rx) = queue(Config {
-            name: "d",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
-        let mut core = Core::new(
-            CoreConfig {
-                server_name: "irc.test.example".into(),
-                network_name: "T".into(),
-                description: "test server".into(),
-                registration_before_connect: false,
-                registration_require_email: false,
-                sendq_bytes: 1024 * 512,
-                motd: vec![],
-                nicklen: 16,
-                sasl_enabled: false,
-                opers: vec![],
-                max_hot_channels: 8,
-                max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
-                max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
-                clock: || Millis::from_millis(1_000_000_000),
-                mono_clock: ticking_mono,
-                command_flood: Some(flood),
-                registration_burst: None,
-                sasl_requirement: Default::default(),
-                reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
-            },
-            db_tx,
-        );
-        let (tx, mut rx) = e6ircd::core::send_queue("s", 4096 * 512);
-        core.handle(Input::Open {
-            conn,
-            tx,
-            host: "h".into(),
-            transport: e6ircd::core::ConnectionTransport::Tcp,
-        });
-        for line in ["NICK alice", "USER a 0 * :A"] {
-            core.handle(Input::Line {
-                conn,
-                line: line.as_bytes().to_vec(),
-            });
-        }
-        while rx.try_pop().is_some() {}
-        (core, rx)
-    };
-    let drain = |rx: &mut e6irc_queue::Receiver<Output>| -> Vec<String> {
-        std::iter::from_fn(|| {
-            rx.try_pop().map(|e| {
-                String::from_utf8(e.payload.0.to_vec())
-                    .unwrap()
-                    .trim_end()
-                    .to_string()
-            })
-        })
-        .collect()
-    };
-
-    let conn = ConnId(1);
-    let (mut core, mut rx) = open_session(conn);
-    // Keepalive first, and plenty of it: none of these may cost a token.
-    for _ in 0..100 {
-        core.handle(Input::Line {
-            conn,
-            line: b"PING :keepalive".to_vec(),
-        });
-        core.handle(Input::Line {
-            conn,
-            line: b"PONG :keepalive".to_vec(),
-        });
-    }
-    for _ in 0..40 {
-        core.handle(Input::Line {
-            conn,
-            line: b"AWAY :busy".to_vec(),
-        });
-    }
-    let out = drain(&mut rx);
-    assert!(
-        !out.iter().any(|l| l.contains("Excess Flood")),
-        "40 commands plus any amount of keepalive fit the default burst: {out:#?}"
-    );
-    core.handle(Input::Line {
-        conn,
-        line: b"AWAY :busy".to_vec(),
-    });
-    let out = drain(&mut rx);
-    assert!(
-        out.iter()
-            .any(|l| l.starts_with("ERROR :Closing Link:") && l.contains("Excess Flood")),
-        "the 41st command in one instant must close the link with Excess Flood: {out:#?}"
-    );
-
-    // A fresh session that spent its burst regains one token 50 ms later.
-    let conn = ConnId(2);
-    let (mut core, mut rx) = open_session(conn);
-    for _ in 0..40 {
-        core.handle(Input::Line {
-            conn,
-            line: b"AWAY :busy".to_vec(),
-        });
-    }
-    drain(&mut rx);
-    NOW_MS.fetch_add(50, std::sync::atomic::Ordering::Relaxed);
-    core.handle(Input::Line {
-        conn,
-        line: b"AWAY :busy".to_vec(),
-    });
-    let out = drain(&mut rx);
-    assert!(
-        !out.iter().any(|l| l.contains("Excess Flood")),
-        "50 ms at 20 tokens/s refills exactly one token: {out:#?}"
-    );
-    core.handle(Input::Line {
-        conn,
-        line: b"AWAY :busy".to_vec(),
-    });
-    let out = drain(&mut rx);
-    assert!(
-        out.iter().any(|l| l.contains("Excess Flood")),
-        "the refilled token was the only one: {out:#?}"
-    );
-}
-
-#[test]
 fn account_creation_is_rate_limited_per_ip() {
     // With registration_burst=1, one client IP may create at most one account
     // before the bucket empties; the second REGISTER is refused without ever
@@ -7458,7 +7235,6 @@ fn account_creation_is_rate_limited_per_ip() {
             max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
-            command_flood: None,
             registration_burst: Some(1),
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -7532,7 +7308,6 @@ fn hot_history_ring_is_lru_evicted() {
             max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -9730,7 +9505,6 @@ fn history_logmessage_gated_on_database() {
                 max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: test_mono,
-                command_flood: None,
                 registration_burst: None,
                 sasl_requirement: Default::default(),
                 reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),

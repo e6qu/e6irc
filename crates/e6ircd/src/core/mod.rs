@@ -11,6 +11,7 @@
 mod banmask;
 mod handler;
 mod hot_history;
+pub(crate) mod line_meter;
 mod list;
 mod paced;
 mod state;
@@ -147,6 +148,9 @@ pub struct CoreIngress {
     count: CoreShardCount,
     directories: CoreDirectories,
     traffic: Arc<CrossShardTraffic>,
+    /// Every connection's command allowance ([`line_meter`]); `None` only for
+    /// the test harnesses' ingress, which nothing meters.
+    command_flood: Option<CommandFlood>,
 }
 
 /// What the workers know together about the events passing between them. It
@@ -195,6 +199,7 @@ impl CoreIngress {
             count: CoreShardCount::single(),
             directories: CoreDirectories::default(),
             traffic: Arc::default(),
+            command_flood: None,
         }
     }
 
@@ -214,7 +219,27 @@ impl CoreIngress {
             count: CoreShardCount::new(count),
             directories: CoreDirectories::default(),
             traffic: Arc::default(),
+            command_flood: None,
         }
+    }
+
+    /// Meter every connection's lines with `flood`.
+    pub fn with_command_flood(self, flood: CommandFlood) -> Self {
+        Self {
+            command_flood: Some(flood),
+            ..self
+        }
+    }
+
+    /// A new connection's meter, which whatever hands its lines to this
+    /// ingress spends a token of for each ([`line_meter`]).
+    pub(crate) fn line_meter(&self, conn: ConnId) -> line_meter::LineMeter {
+        line_meter::LineMeter::new(
+            conn,
+            self.command_flood,
+            self.directories.flood_exemptions.clone(),
+            tokio::time::Instant::now(),
+        )
     }
 
     pub async fn push(&self, input: Input) -> Result<u64, Box<Input>> {
@@ -361,7 +386,7 @@ impl Input {
             Input::ChannelCommandResult { session, .. } => session.shard(),
             Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
             Input::ChannelListResult { result } => result.session.shard(),
-            Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
+            Input::ChannelList { request } => request.shard(),
             Input::ChannelSessionEvent { session, .. } => session.shard(),
             Input::ChannelMemberUpdate { update } => update.shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
@@ -730,11 +755,11 @@ pub enum Input {
         label: Option<String>,
         result: ChannelRegistrationResult,
     },
-    /// One shard's answer to a whole-network LIST request.
+    /// One channel shard's page of a LIST, for the shard of its connection.
     ChannelListResult {
         result: ChannelListResult,
     },
-    /// A whole-network LIST request, delivered once to every channel shard.
+    /// A LIST's request for one page of the channel shard it names.
     ChannelList {
         request: ChannelListRequest,
     },
@@ -935,6 +960,7 @@ pub enum Input {
 /// than queueing into a void. Shared by the TCP and WebSocket read loops.
 pub(crate) async fn push_framed(
     core_tx: &CoreIngress,
+    meter: &mut line_meter::LineMeter,
     conn: ConnId,
     events: &mut Vec<e6irc_proto::framing::LineEvent>,
 ) -> bool {
@@ -943,6 +969,7 @@ pub(crate) async fn push_framed(
             e6irc_proto::framing::LineEvent::Line(line) => Input::Line { conn, line },
             e6irc_proto::framing::LineEvent::TooLong => Input::OverlongLine { conn },
         };
+        meter.spend().await;
         if core_tx.push(input).await.is_err() {
             return false;
         }
@@ -2434,11 +2461,9 @@ pub struct Core {
 /// the emitting shard never appears here: [`Core::handle`] runs it inline, so
 /// a worker is never asked to push into the queue only it can drain.
 pub(crate) enum CoreEffect {
-    /// A typed event for another core owner.
-    Input(Input),
-    BroadcastChannelList {
-        request: ChannelListRequest,
-    },
+    /// A typed event for another core owner. Boxed: an `Input` is several
+    /// times the size of any broadcast here.
+    Input(Box<Input>),
     BroadcastServerBan {
         mutation: ServerBanMutation,
     },
@@ -2470,18 +2495,16 @@ pub(crate) enum CoreEffect {
 }
 
 impl CoreEffect {
+    pub(crate) fn input(input: Input) -> Self {
+        Self::Input(Box::new(input))
+    }
+
     /// One shard's copy of a broadcast, and whether the emitting shard needs a
     /// copy too (it does unless the code that emitted it already applied it
     /// there). `None` for an effect that has a single owner.
     fn broadcast_copy(&self) -> Option<(Input, bool)> {
         Some(match self {
             CoreEffect::Input(_) | CoreEffect::Delivery { .. } => return None,
-            CoreEffect::BroadcastChannelList { request } => (
-                Input::ChannelList {
-                    request: request.clone(),
-                },
-                true,
-            ),
             CoreEffect::BroadcastAdminConnectionList { request_id, query } => (
                 Input::AdminConnectionList {
                     request_id: *request_id,
@@ -2821,7 +2844,7 @@ impl Core {
             return;
         }
         let input = match effect {
-            CoreEffect::Input(input) => input,
+            CoreEffect::Input(input) => *input,
             CoreEffect::Delivery { owner, line } => Input::Delivery {
                 conn: owner.conn(),
                 line,
@@ -2937,7 +2960,12 @@ impl Core {
                 host,
                 transport,
             } => self.state.open(conn, tx, host, transport),
-            Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
+            Input::Line { conn, line } => {
+                handler::dispatch(&mut self.state, conn, &line);
+                // A line is what makes (or unmakes) an IRC operator, whose
+                // lines are not metered.
+                self.state.sync_flood_exemption(conn);
+            }
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
             Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
             Input::ChannelJoin {
@@ -3595,7 +3623,6 @@ mod ingress_tests {
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
@@ -5611,6 +5638,135 @@ mod ingress_tests {
             shards.cores[1].state.channels.get(&key).is_none(),
             "the channel is held open by a member whose session is gone"
         );
+    }
+
+    /// Four hundred channels, `#room000` on, spread over both shards: two
+    /// members on shard 0 hold two hundred each (the channel limit is 250).
+    /// The lister is connection 1, on shard 1.
+    fn four_hundred_channels() -> Shards {
+        let mut shards = Shards::new();
+        shards.client(2, "member", "");
+        shards.client(4, "other", "");
+        for room in 0..400 {
+            let member = if room < 200 { 2 } else { 4 };
+            shards.line(member, &format!("JOIN #room{room:03}"));
+            shards.drain(member);
+        }
+        shards.client(1, "lister", "");
+        shards
+    }
+
+    /// The channels of `out`'s `RPL_LIST` rows, in order.
+    fn listed(out: &[String]) -> Vec<String> {
+        out.iter()
+            .filter(|line| line.split(' ').nth(1) == Some("322"))
+            .map(|line| line.split(' ').nth(3).expect("channel").to_string())
+            .collect()
+    }
+
+    /// Pace the lister's LIST to its end, reading everything it is sent.
+    fn read_list_to_the_end(shards: &mut Shards, mut out: Vec<String>) -> Vec<String> {
+        while !out.iter().any(|line| line.contains(" 323 ")) {
+            shards.cores[1].handle(Input::PaceReplies);
+            shards.settle();
+            let more = shards.drain(1);
+            assert!(!more.is_empty(), "a paced LIST makes progress: {out:#?}");
+            out.extend(more);
+        }
+        out
+    }
+
+    /// Rows a LIST holds on its session, waiting to be sent.
+    fn held_rows(shards: &Shards) -> usize {
+        shards.cores[1].state.sessions[&ConnId(1)]
+            .channel_list
+            .as_ref()
+            .expect("a LIST in progress")
+            .held_rows()
+    }
+
+    /// A LIST keeps a cursor, not a copy: what its session holds is at most a
+    /// page — the room its send queue had — however many channels there are,
+    /// and the rows of both shards still come out whole, merged in order.
+    #[test]
+    fn a_list_holds_at_most_a_page_and_is_complete_and_ordered_across_shards() {
+        let mut shards = four_hundred_channels();
+        shards.line(1, "LIST");
+        let first = shards.drain(1);
+        // The client's queue holds 256 lines: half of it goes at once, the
+        // reply's start and 127 rows.
+        assert_eq!(listed(&first).len(), 127, "{first:#?}");
+        assert!(
+            held_rows(&shards) <= 128,
+            "a page, not the channel list: {}",
+            held_rows(&shards)
+        );
+        let out = read_list_to_the_end(&mut shards, first);
+        let expected: Vec<String> = (0..400).map(|room| format!("#room{room:03}")).collect();
+        assert_eq!(listed(&out), expected);
+        assert!(
+            shards.cores[1].state.sessions[&ConnId(1)]
+                .channel_list
+                .is_none()
+        );
+    }
+
+    /// A channel is listed if it exists when the LIST's cursor reaches its
+    /// name: one created past the cursor is, one removed before it is reached
+    /// is not, and one created behind the cursor is not. None is listed twice.
+    #[test]
+    fn channels_created_or_removed_during_a_list_are_listed_as_the_cursor_finds_them() {
+        let mut shards = four_hundred_channels();
+        shards.line(1, "LIST");
+        let first = shards.drain(1);
+        assert_eq!(listed(&first).last().map(String::as_str), Some("#room126"));
+        // Behind the cursor, ahead of it, and removed ahead of it.
+        shards.line(2, "JOIN #room000a");
+        shards.line(2, "JOIN #room999");
+        shards.line(4, "PART #room390");
+        shards.drain(2);
+        shards.drain(4);
+        let out = read_list_to_the_end(&mut shards, first);
+        let mut expected: Vec<String> = (0..400)
+            .filter(|room| *room != 390)
+            .map(|room| format!("#room{room:03}"))
+            .collect();
+        expected.push("#room999".into());
+        assert_eq!(listed(&out), expected);
+    }
+
+    /// A LIST sent while another's page is still on its way from the other
+    /// shard aborts that one at once; the page, when it lands, finds no LIST
+    /// to join and is dropped, and nothing more of the aborted one is sent.
+    #[test]
+    fn a_list_during_a_cross_shard_list_aborts_it_before_its_pages_are_in() {
+        let mut shards = four_hundred_channels();
+        shards.push_line(1, "LIST");
+        shards.push_line(1, "LIST");
+        let out = shards.drain(1);
+        assert!(out[0].contains(" 321 lister "), "{out:#?}");
+        assert!(
+            out.ends_with(&[
+                ":irc.test NOTICE lister :/LIST aborted".to_string(),
+                ":irc.test 323 lister :End of /LIST".to_string(),
+            ]),
+            "{out:#?}"
+        );
+        assert!(
+            listed(&out).is_empty(),
+            "no row can go before every shard's first page: {out:#?}"
+        );
+        shards.settle();
+        shards.cores[1].handle(Input::PaceReplies);
+        shards.settle();
+        assert!(shards.drain(1).is_empty());
+        assert!(
+            shards.cores[1].state.sessions[&ConnId(1)]
+                .channel_list
+                .is_none()
+        );
+        shards.line(1, "LIST #room001");
+        assert_eq!(listed(&shards.drain(1)), ["#room001"]);
     }
 
     /// A WHO or LIST answered by another shard after the asking connection

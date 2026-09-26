@@ -134,14 +134,34 @@ struct Welcome {
     line: String,
 }
 
-/// Queue one line for the core. `false` means the core is gone.
-async fn say(core: &CoreIngress, conn: ConnId, line: String) -> bool {
-    core.push(Input::Line {
-        conn,
-        line: line.into_bytes(),
-    })
-    .await
-    .is_ok()
+/// The in-process session's lines to the core, metered like any client's
+/// (`core::line_meter`): an owner's paste is paced, not refused.
+struct CoreLines<'a> {
+    core: &'a CoreIngress,
+    conn: ConnId,
+    meter: crate::core::line_meter::LineMeter,
+}
+
+impl<'a> CoreLines<'a> {
+    fn new(core: &'a CoreIngress, conn: ConnId) -> Self {
+        Self {
+            core,
+            conn,
+            meter: core.line_meter(conn),
+        }
+    }
+
+    /// Queue one line for the core. `false` means the core is gone.
+    async fn say(&mut self, line: String) -> bool {
+        self.meter.spend().await;
+        self.core
+            .push(Input::Line {
+                conn: self.conn,
+                line: line.into_bytes(),
+            })
+            .await
+            .is_ok()
+    }
 }
 
 /// Read the core's replies until it welcomes the session under the configured
@@ -151,7 +171,7 @@ async fn say(core: &CoreIngress, conn: ConnId, line: String) -> bool {
 /// that are neither are the core talking to its new client, and are relayed.
 async fn await_welcome(
     session: &LocalSession,
-    conn: ConnId,
+    lines: &mut CoreLines<'_>,
     out_rx: &mut Receiver<Output>,
     ends: &DriverEnds,
 ) -> Result<Welcome, super::SessionOutcome> {
@@ -211,7 +231,7 @@ async fn await_welcome(
             }
             "PING" => {
                 let token = message.params.first().cloned().unwrap_or_default();
-                if !say(&session.core.core_tx, conn, format!("PONG :{token}")).await {
+                if !lines.say(format!("PONG :{token}")).await {
                     return Err(Stopped);
                 }
             }
@@ -273,7 +293,7 @@ async fn drive_session(
     out_rx: &mut Receiver<Output>,
 ) -> super::SessionOutcome {
     use super::SessionOutcome::Stopped;
-    let core = &session.core.core_tx;
+    let mut lines = CoreLines::new(&session.core.core_tx, conn);
     // Register in-process. Queueing NICK and USER is only a request: the core
     // answers like any server, and it is the welcome that makes a session. The
     // capability request holds registration until `CAP END`, so the core has
@@ -284,7 +304,7 @@ async fn drive_session(
         format!("USER {} 0 * :{}", session.username, session.realname),
         "CAP END".to_string(),
     ] {
-        if !say(core, conn, line).await {
+        if !lines.say(line).await {
             return Stopped;
         }
     }
@@ -292,7 +312,7 @@ async fn drive_session(
         _ = ends.stop_signal() => Err(Stopped),
         welcome = tokio::time::timeout(
             WELCOME_DEADLINE,
-            await_welcome(session, conn, out_rx, ends),
+            await_welcome(session, &mut lines, out_rx, ends),
         ) => welcome.unwrap_or(Err(super::SessionOutcome::Dropped(
             super::NetworkFailure::RegistrationTimedOut,
         ))),
@@ -302,11 +322,11 @@ async fn drive_session(
         Err(outcome) => return outcome,
     };
     // Comma-joined within the wire limit, as the IRC driver joins upstream:
-    // the in-process session is a registered non-oper client of the core, so
-    // one JOIN per channel would spend the command-flood burst on a long
-    // autojoin list and be closed with Excess Flood before it finished.
+    // the in-process session is metered like any client of the core, so one
+    // JOIN per channel would spend the command-flood burst on a long autojoin
+    // list and wait out its refill before it finished.
     for line in super::irc_driver::join_lines(&session.autojoin) {
-        if !say(core, conn, line).await {
+        if !lines.say(line).await {
             return Stopped;
         }
     }
@@ -324,7 +344,11 @@ async fn drive_session(
     let mut echoes = super::irc_driver::UpstreamEchoes::default();
 
     loop {
+        // Past the session's command allowance, the attachments' commands
+        // wait until a token is back; the core's output keeps flowing.
+        let blocked = lines.meter.blocked_until(tokio::time::Instant::now());
         tokio::select! {
+            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
             // Core output -> buffer + broadcast (attach playback/live).
             out = out_rx.pop() => match out {
                 Some(env) => {
@@ -350,7 +374,7 @@ async fn drive_session(
                                 .as_ref()
                                 .and_then(|message| message.params.first().cloned())
                                 .unwrap_or_default();
-                            if !say(core, conn, format!("PONG :{token}")).await {
+                            if !lines.say(format!("PONG :{token}")).await {
                                 return Stopped;
                             }
                             continue;
@@ -380,7 +404,7 @@ async fn drive_session(
                         // want one of their own.
                         super::replies::Upstream::Consumed => {
                             if let Some(barrier) = router.barrier_due()
-                                && !say(core, conn, barrier).await
+                                && !lines.say(barrier).await
                             {
                                 return Stopped;
                             }
@@ -417,7 +441,7 @@ async fn drive_session(
                 }
             },
             // Downstream command -> core.
-            cmd = ends.next_command() => match cmd {
+            cmd = ends.next_command(), if blocked.is_none() => match cmd {
                 Some(cmd) => {
                     let Some(line) = super::carriable(&cmd, super::ClientTags::Relayed, ends) else {
                         continue;
@@ -430,7 +454,7 @@ async fn drive_session(
                         std::time::Instant::now(),
                     );
                     for line in std::iter::once(written).chain(router.barrier_due()) {
-                        if !say(core, conn, line).await {
+                        if !lines.say(line).await {
                             return Stopped;
                         }
                     }

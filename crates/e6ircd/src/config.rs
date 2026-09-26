@@ -337,11 +337,13 @@ pub struct LimitsConfig {
     /// Excess connections are refused at accept (before registration).
     #[serde(default)]
     pub max_connections_per_ip: Option<usize>,
-    /// Per-session command-flood bucket size (Solanum's
-    /// `client_flood_burst_max` shape). A registered non-oper session spends
-    /// one token per command (PING/PONG exempt) and is closed with Excess
-    /// Flood when the bucket is empty. Always on: it is the bound on every
-    /// output-amplifying command class. Must be at least `command_rate`.
+    /// Per-connection command-flood bucket size (Solanum's
+    /// `client_flood_burst_max` shape). Every line a non-oper connection sends,
+    /// PING/PONG and pre-registration lines included, spends one token; when
+    /// the bucket is empty the server stops reading that connection until a
+    /// token is regained (DESIGN §7.2). Always on: it is the bound on every
+    /// output-amplifying command class and on what one connection can queue
+    /// for the core. Must be at least `command_rate`.
     #[serde(default = "default_command_burst")]
     pub command_burst: usize,
     /// Tokens the command-flood bucket regains per second, up to
@@ -3895,7 +3897,7 @@ mod tests {
         let error = with(0, 20).validate().unwrap_err().to_string();
         assert!(
             error.contains("limits.command_burst"),
-            "command_burst=0 flood-kills every command and must be rejected: {error}"
+            "command_burst=0 never admits a line and must be rejected: {error}"
         );
         let error = with(10, 20).validate().unwrap_err().to_string();
         assert!(

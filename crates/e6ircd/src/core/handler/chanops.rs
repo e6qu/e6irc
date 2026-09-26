@@ -441,90 +441,22 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             return;
         }
     };
-    if state.has_single_core_shard() {
-        // One worker sees every channel, so the rows are all in now; the
-        // reply is paced from here without holding anything behind it.
-        let rows = visible_channel_rows(state, conn, &filter);
-        let label = state.defer_captured_label(conn);
-        send_channel_list(state, conn, label, rows, false);
-        return;
-    }
-    // Later output waits for the reply to open, so the LIST still answers
-    // before what the client sent after it.
-    let label = state.defer_captured_reply(conn);
-    let request = state.start_channel_list(conn, label, filter);
-    state.route_channel_list(request);
-}
-
-/// This shard's channels that `conn` may see and `filter` admits.
-fn visible_channel_rows(
-    state: &ServerState,
-    conn: ConnId,
-    filter: &crate::core::list::ListFilter,
-) -> Vec<crate::core::state::ChannelListRow> {
-    state
-        .channels
-        .iter()
-        .filter(|(_, channel)| channel.hidden_from(conn).is_none())
-        .filter(|(key, channel)| {
-            filter.admits(&crate::core::list::ListCandidate {
-                key,
-                members: channel.member_count(),
-                created_secs: channel.created_at.as_secs(),
-                topic_set_secs: channel.topic.as_ref().map(|topic| topic.set_at_secs),
-            })
-        })
-        .map(|(_, channel)| crate::core::state::ChannelListRow {
-            name: channel.name.clone(),
-            members: channel.member_count(),
-            topic: channel
-                .topic
-                .as_ref()
-                .map(|topic| topic.text.clone())
-                .unwrap_or_default(),
-        })
-        .collect()
-}
-
-pub(crate) fn channel_list(
-    state: &mut ServerState,
-    request: crate::core::state::ChannelListRequest,
-) {
-    let rows = visible_channel_rows(state, request.actor().recipient.conn(), request.filter());
-    state.route_channel_list_result(crate::core::state::ChannelListResult {
-        id: request.id(),
-        session: request.session(),
-        rows,
-    });
-}
-
-pub(crate) fn channel_list_result(
-    state: &mut ServerState,
-    result: crate::core::state::ChannelListResult,
-) {
-    let conn = result.session.conn();
-    let Some(gathered) = state.take_channel_list(result) else {
-        return;
-    };
-    // The reply opens through the hold later output waits behind, which is
-    // then released: what the client sent after the LIST follows its start.
-    state.emit_deferred(conn, |state| {
-        send_channel_list(state, conn, gathered.label, gathered.rows, gathered.aborted);
-    });
+    // The reply opens now, ahead of whatever the client sent after the LIST;
+    // its rows follow page by page as its send queue has room, inside its
+    // batch when it is labeled.
+    let label = state.defer_captured_label(conn);
+    let batch = open_channel_list(state, conn, label);
+    state.start_channel_list(conn, batch, filter);
+    pace_channel_list(state, conn);
 }
 
 /// Open `conn`'s LIST reply — inside a labeled-response batch when the LIST
-/// was labeled — and send as many of `rows` as its send queue has room for;
-/// [`pace_channel_lists`] sends the rest as the queue drains. An `aborted`
-/// LIST (a later one arrived before its rows were in) says so and closes.
-fn send_channel_list(
+/// was labeled — and return that batch.
+fn open_channel_list(
     state: &mut ServerState,
     conn: ConnId,
     label: Option<String>,
-    mut rows: Vec<crate::core::state::ChannelListRow>,
-    aborted: bool,
-) {
-    use crate::core::list::ListProgress;
+) -> Option<String> {
     let batch = label.map(|label| {
         let batch = state.next_msgid();
         let open = labeled_batch_open(&state.config.server_name, &label, &batch);
@@ -533,19 +465,75 @@ fn send_channel_list(
     });
     let start = state.numeric_line(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
     send_list_line(state, conn, batch.as_deref(), start);
-    if aborted {
-        return finish_channel_list(state, conn, batch, true);
+    batch
+}
+
+/// Answer one page request of a LIST with this shard's channels after its
+/// cursor.
+pub(crate) fn channel_list(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelListRequest,
+) {
+    let (rows, next) = channel_list_page(state, &request);
+    state.route_channel_list_result(crate::core::state::ChannelListResult {
+        id: request.id(),
+        session: request.session(),
+        shard: request.shard(),
+        rows,
+        next,
+    });
+}
+
+/// The rows of this shard's channels after the request's cursor, in key
+/// order, that its connection may see and its conditions admit — at most its
+/// limit, from at most [`LIST_PAGE_SCAN`](crate::core::list::LIST_PAGE_SCAN)
+/// channels examined — and the key the next page starts after (`None`: no
+/// channel is left past them).
+fn channel_list_page(
+    state: &ServerState,
+    request: &crate::core::state::ChannelListRequest,
+) -> (Vec<crate::core::state::ChannelListRow>, Option<ChanKey>) {
+    use crate::core::list::{LIST_PAGE_SCAN, ListCandidate};
+    let conn = request.session().conn();
+    let mut rows = Vec::new();
+    let mut last: Option<&ChanKey> = None;
+    for (examined, (key, channel)) in state.channels.after(request.after()).enumerate() {
+        if rows.len() == request.limit() || examined == LIST_PAGE_SCAN {
+            return (rows, last.cloned());
+        }
+        last = Some(key);
+        let admitted = channel.hidden_from(conn).is_none()
+            && request.filter().admits(&ListCandidate {
+                key,
+                members: channel.member_count(),
+                created_secs: channel.created_at.as_secs(),
+                topic_set_secs: channel.topic.as_ref().map(|topic| topic.set_at_secs),
+            });
+        if admitted {
+            rows.push(crate::core::state::ChannelListRow {
+                key: key.clone(),
+                name: channel.name.clone(),
+                members: channel.member_count(),
+                topic: channel
+                    .topic
+                    .as_ref()
+                    .map(|topic| topic.text.clone())
+                    .unwrap_or_default(),
+            });
+        }
     }
-    rows.sort_by(|left, right| left.name.cmp(&right.name));
-    state.resume_paced(
-        conn,
-        |session| &mut session.channel_list,
-        ListProgress::Sending {
-            batch,
-            rows: rows.into_iter(),
-        },
-    );
-    pace_channel_list(state, conn);
+    (rows, None)
+}
+
+/// A page of `conn`'s LIST is in: send what it lets through.
+pub(crate) fn channel_list_result(
+    state: &mut ServerState,
+    result: crate::core::state::ChannelListResult,
+) {
+    let conn = result.session.conn();
+    if state.accept_channel_list_page(result) {
+        pace_channel_list(state, conn);
+    }
 }
 
 /// One line of a LIST reply, tagged into its batch if it has one. It is
@@ -587,65 +575,57 @@ fn finish_channel_list(
     }
 }
 
-/// Abort `conn`'s LIST if it has one in progress; whether it had.
+/// Abort `conn`'s LIST if it has one in progress; whether it had. Its cursor
+/// is dropped; a page still on its way finds no LIST to join.
 fn abort_channel_list(state: &mut ServerState, conn: ConnId) -> bool {
-    use crate::core::list::ListProgress;
-    let Some(session) = state.sessions.get_mut(&conn) else {
+    let Some(cursor) = state
+        .sessions
+        .get_mut(&conn)
+        .and_then(|session| session.channel_list.take())
+    else {
         return false;
     };
-    match &mut session.channel_list {
-        None => false,
-        // Its rows are still arriving; the reply says it was aborted once
-        // they are all in.
-        Some(ListProgress::Gathering { aborted, .. }) => {
-            *aborted = true;
-            true
-        }
-        Some(ListProgress::Sending { batch, .. }) => {
-            let batch = batch.take();
-            session.channel_list = None;
-            finish_channel_list(state, conn, batch, true);
-            true
-        }
-    }
+    finish_channel_list(state, conn, cursor.batch, true);
+    true
 }
 
-/// Send `conn`'s paced LIST rows while its send queue is under half full,
-/// closing the reply after the last.
+/// Send `conn`'s LIST rows while its send queue is under half full, merging
+/// the shards' pages in key order, and ask for the next page of every shard
+/// whose rows are all out; close the reply after the last row.
 pub(super) fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
-    use crate::core::list::ListProgress;
-    // Nothing to pace: no LIST, or one whose rows are still being gathered.
-    let Some((mut room, (batch, mut rows))) =
-        state.take_paced(conn, |session| match session.channel_list.take() {
-            Some(ListProgress::Sending { batch, rows }) => Some((batch, rows)),
-            gathering => {
-                session.channel_list = gathering;
-                None
-            }
-        })
+    use crate::core::list::NextRow;
+    let Some((mut room, mut cursor)) =
+        state.take_paced(conn, |session| session.channel_list.take())
     else {
         return;
     };
     while room > 0 {
-        let Some(row) = rows.next() else {
-            return finish_channel_list(state, conn, batch, false);
-        };
-        let line = state.numeric_line(
-            conn,
-            RPL_LIST,
-            &[&row.name, &row.members.to_string()],
-            Some(&row.topic),
-        );
-        room = room.saturating_sub(send_list_line(state, conn, batch.as_deref(), line));
+        match cursor.next_row() {
+            NextRow::Row(row) => {
+                let line = state.numeric_line(
+                    conn,
+                    RPL_LIST,
+                    &[&row.name, &row.members.to_string()],
+                    Some(&row.topic),
+                );
+                let sent = send_list_line(state, conn, cursor.batch.as_deref(), line);
+                room = room.saturating_sub(sent);
+            }
+            NextRow::Waiting => break,
+            NextRow::Finished => return finish_channel_list(state, conn, cursor.batch, false),
+        }
     }
-    if rows.as_slice().is_empty() {
-        return finish_channel_list(state, conn, batch, false);
+    // A page is asked for only while the client is reading, and no larger
+    // than the room it has made: one that is not reading holds nothing. The
+    // room is in bytes; a row is at most one line, so this many rows fit.
+    if let Some(limit) =
+        std::num::NonZeroUsize::new(room.div_ceil(e6irc_proto::message::MAX_LINE_LEN))
+    {
+        for (shard, after) in cursor.pages_wanted() {
+            state.route_channel_list_page(conn, &cursor, shard, after, limit);
+        }
     }
-    state.resume_paced(
-        conn,
-        |session| &mut session.channel_list,
-        ListProgress::Sending { batch, rows },
-    );
+    state.resume_paced(conn, |session| &mut session.channel_list, cursor);
 }
 
 /// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP

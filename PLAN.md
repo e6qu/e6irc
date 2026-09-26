@@ -1088,6 +1088,25 @@ a test that failed before:
   told before that JOIN on one worker and after its labeled response on two —
   it now follows the JOIN inside it, alike on both.
 
+Maintainer decisions implemented from a review of resource bounds (DESIGN
+§7.2):
+
+- **LIST keeps a cursor, not a copy.** A LIST used to clone the name and topic
+  of every channel it admitted into one sorted list held on the session until
+  it was paced out — some 65 MB per LIST at 100k channels, rebuilt by every
+  `LIST`/`LIST` abort. It now holds its conditions and one resume key per
+  shard, and each turn asks the shards for the next page after it, no larger
+  than the room the client's send queue has; rows come out in casemapped name
+  order across all shards, and an abort drops the cursor.
+- **Every line is metered, and reads are paced.** PING and PONG were exempt
+  from the command allowance and unregistered connections were never metered,
+  so one client streaming PONGs (or churning NICK) could fill its shard's
+  queue. Every line now spends a token where it enters the core — over TCP,
+  `/ws/irc` and from the bouncer's in-process session — and an empty bucket
+  stops the connection's reader until one is back instead of closing it with
+  Excess Flood. The allowance keeps Solanum's shape (40, then 20 a second) and
+  its operator exemption.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

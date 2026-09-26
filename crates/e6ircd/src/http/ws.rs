@@ -162,8 +162,13 @@ pub(super) async fn ws_irc_conn(
         return;
     }
     let core_tx = state.core_tx.clone();
+    let mut meter = core_tx.line_meter(conn);
     'conn: loop {
+        // Past its command allowance the connection is not read until a
+        // token is back, while what the core sends it keeps flowing.
+        let blocked = meter.blocked_until(tokio::time::Instant::now());
         tokio::select! {
+            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
             // Outbound: a core Output line becomes one text frame.
             out = out_rx.pop() => {
                 let Some(env) = out else { break };
@@ -198,7 +203,7 @@ pub(super) async fn ws_irc_conn(
                 }
             }
             // Inbound: frame(s) -> lines -> core.
-            frame = socket.recv() => {
+            frame = socket.recv(), if blocked.is_none() => {
                 let data: Vec<u8> = match frame {
                     Some(Ok(WsMessage::Text(t))) => t.as_bytes().to_vec(),
                     Some(Ok(WsMessage::Binary(b))) => b.to_vec(),
@@ -222,6 +227,7 @@ pub(super) async fn ws_irc_conn(
                 } else {
                     Input::OverlongLine { conn }
                 };
+                meter.spend().await;
                 if core_tx.push(input).await.is_err() {
                     break 'conn; // core gone: stop the connection directly
                 }
