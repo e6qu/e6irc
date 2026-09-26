@@ -13,6 +13,7 @@ mod handler;
 mod hot_history;
 pub(crate) mod line_meter;
 mod list;
+mod middle;
 mod paced;
 mod state;
 mod timer;

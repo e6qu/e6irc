@@ -16,6 +16,7 @@ use e6irc_queue::Sender;
 
 use super::banmask::{MaskShape, MaskSubject};
 use super::hot_history::HotHistory;
+use super::middle::Middle;
 use super::{
     CoreEffect, CoreShardCount, CoreShardId, SessionOutput, SessionOwner, WireLine, Written,
 };
@@ -3073,8 +3074,10 @@ pub enum ChannelModeQueryResult {
     },
     Modes {
         display: String,
-        modes: String,
-        created: String,
+        /// The mode string, then each of its arguments.
+        modes: Vec<String>,
+        /// Unix seconds.
+        created: u64,
     },
 }
 
@@ -3493,13 +3496,14 @@ impl ChanModes {
         })
     }
 
-    /// `+nt`-style string with key/limit args appended. `member` gates both
-    /// arguments, as Solanum's `channel_modes` does: a member sees
-    /// `+kl key 10`, an outsider `+kl` — told that a key and a limit are set,
-    /// but shown neither the key (which would bypass `+k`) nor the limit.
-    pub fn to_string_with_args(&self, member: bool) -> String {
+    /// The `+nt`-style mode string, then the key and limit arguments, each a
+    /// parameter of its own. `member` gates both arguments, as Solanum's
+    /// `channel_modes` does: a member sees `+kl key 10`, an outsider `+kl` —
+    /// told that a key and a limit are set, but shown neither the key (which
+    /// would bypass `+k`) nor the limit.
+    pub(crate) fn with_args(&self, member: bool) -> Vec<String> {
         let mut modes = String::from("+");
-        let mut args = String::new();
+        let mut args = Vec::new();
         for c in Self::FLAGS.chars() {
             if self.flag(c) == Some(true) {
                 modes.push(c);
@@ -3508,17 +3512,18 @@ impl ChanModes {
         if let Some(k) = &self.key {
             modes.push('k');
             if member {
-                args.push(' ');
-                args.push_str(k);
+                args.push(k.clone());
             }
         }
         if let Some(l) = self.limit {
             modes.push('l');
             if member {
-                args.push_str(&format!(" {l}"));
+                args.push(l.to_string());
             }
         }
-        modes + &args
+        let mut params = vec![modes];
+        params.extend(args);
+        params
     }
 }
 
@@ -3733,6 +3738,24 @@ impl BanKind {
             "dline" => Some(BanKind::Dline),
             "xline" => Some(BanKind::Xline),
             _ => None,
+        }
+    }
+
+    /// The command that adds a ban of this kind, as replies name it.
+    pub(crate) fn add_command(self) -> &'static str {
+        match self {
+            BanKind::Kline => "KLINE",
+            BanKind::Dline => "DLINE",
+            BanKind::Xline => "XLINE",
+        }
+    }
+
+    /// The command that removes a ban of this kind, as replies name it.
+    pub(crate) fn remove_command(self) -> &'static str {
+        match self {
+            BanKind::Kline => "UNKLINE",
+            BanKind::Dline => "UNDLINE",
+            BanKind::Xline => "UNXLINE",
         }
     }
 
@@ -6655,20 +6678,6 @@ impl ServerState {
         }
     }
 
-    /// `:<server> <code> <target> <params…>`; the last param gets the
-    /// trailing `:` if given as `trailing`.
-    /// Longest middle parameter `numeric` passes through unclipped. Every
-    /// legitimate middle is a short token by construction — a nick (≤ nicklen),
-    /// a channel display name (≤ 50), a mode/ISUPPORT string, a number, a
-    /// USERLEN-bounded username or 63-byte host. Anything longer is a
-    /// client-supplied token being echoed for attribution (an unknown command,
-    /// a bad target, a rejected list), whose length is bounded only by the
-    /// input frame; unclipped it can push the reply explaining an error past
-    /// the wire limit, and the recipient's framing then discards that very
-    /// reply. Clipping at this one funnel closes the whole echo family rather
-    /// than each numeric separately.
-    const NUMERIC_MIDDLE_MAX: usize = 100;
-
     fn reply_target(&self, conn: ConnId) -> String {
         self.capture
             .as_ref()
@@ -6690,7 +6699,17 @@ impl ServerState {
             .or_else(|| self.sessions.get(&conn).map(|session| session.caps))
     }
 
-    pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {
+    /// `:<server> <code> <target> <middles…>`, then ` :<trailing>` when given.
+    /// Each [`Middle`] is written as exactly one parameter, so no middle can
+    /// split, shift or end the reply's parameters; free text (a realname, a
+    /// reason) goes in the trailing.
+    pub(crate) fn numeric(
+        &mut self,
+        conn: ConnId,
+        code: u16,
+        middle: &[Middle<'_>],
+        trailing: Option<&str>,
+    ) {
         let line = self.numeric_line(conn, code, middle, trailing);
         self.send(conn, &line);
     }
@@ -6700,7 +6719,7 @@ impl ServerState {
         &self,
         conn: ConnId,
         code: u16,
-        middle: &[&str],
+        middle: &[Middle<'_>],
         trailing: Option<&str>,
     ) -> String {
         let target = self.reply_target(conn);
@@ -6730,25 +6749,13 @@ impl ServerState {
             if avail <= 1 {
                 break;
             }
-            line.push(' ');
-            // A middle that can't stand as a wire parameter would corrupt the
-            // reply's framing — an empty one collapses into the separator, a
-            // ':'-leading one opens the trailing early, CR/LF/NUL break the line
-            // (the WHOX-token class, and every error numeric that echoes a raw
-            // client target/nick/mode-char). Since one worker serves every
-            // client, the funnel renders such a segment as the conventional "*"
-            // placeholder rather than ship a line the client misparses — the
-            // same wire-safety normalization as the length clip right below it,
-            // and it makes the whole framing-corruption class unrepresentable at
-            // this single choke point instead of one echo site at a time. A
-            // segment carrying a mode-string joined to its (space-validated)
-            // args is unaffected: only the leading byte and control bytes matter.
-            if numeric_middle_violation(p).is_some() {
-                line.push('*');
-                continue;
+            // A cut inside the first character would leave an empty parameter.
+            let fitted = e6irc_proto::message::truncate_on_char_boundary(p.wire(), avail - 1);
+            if fitted.is_empty() {
+                break;
             }
-            let cap = Self::NUMERIC_MIDDLE_MAX.min(avail - 1);
-            line.push_str(e6irc_proto::message::truncate_on_char_boundary(p, cap));
+            line.push(' ');
+            line.push_str(fitted);
         }
         if let Some(t) = trailing {
             line.push_str(" :");
@@ -6829,55 +6836,68 @@ impl ServerState {
         self.pacing.insert(conn);
     }
 
-    /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`.
-    pub fn err_needmoreparams(&mut self, conn: ConnId, cmd: &str) {
+    /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`. `cmd` is the
+    /// server's own spelling of the command, never the client's.
+    pub(crate) fn err_needmoreparams(&mut self, conn: ConnId, cmd: &'static str) {
         self.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
-            &[cmd],
+            &[Middle::own(cmd)],
             Some("Not enough parameters"),
         );
     }
 
     /// `ERR_NOSUCHNICK (<nick>) :No such nick/channel`.
     ///
-    /// This and the two helpers below echo a name the *client* typed, so each
-    /// renders it through [`clip_echo`](crate::core::handler::clip_echo) itself:
-    /// no call site can forget to, and a trailing-form token with a space
+    /// This and the helpers below echo a name the *client* typed, so each
+    /// takes it as [`Middle::echo`] itself: a trailing-form token with a space
     /// (`INVITE x :a b`) cannot split the reply's parameters.
-    pub fn err_nosuchnick(&mut self, conn: ConnId, nick: &str) {
-        let nick = crate::core::handler::clip_echo(nick);
-        self.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
+    pub(crate) fn err_nosuchnick(&mut self, conn: ConnId, nick: &str) {
+        self.numeric(
+            conn,
+            ERR_NOSUCHNICK,
+            &[Middle::echo(nick)],
+            Some("No such nick/channel"),
+        );
     }
 
     /// `ERR_NOSUCHCHANNEL (<chan>) :No such channel`.
-    pub fn err_nosuchchannel(&mut self, conn: ConnId, chan: &str) {
-        let chan = crate::core::handler::clip_echo(chan);
-        self.numeric(conn, ERR_NOSUCHCHANNEL, &[chan], Some("No such channel"));
+    pub(crate) fn err_nosuchchannel(&mut self, conn: ConnId, chan: &str) {
+        self.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[Middle::echo(chan)],
+            Some("No such channel"),
+        );
     }
 
     /// `ERR_NOTONCHANNEL (<chan>) :You're not on that channel`.
-    pub fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
-        let chan = crate::core::handler::clip_echo(chan);
+    pub(crate) fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
         self.numeric(
             conn,
             ERR_NOTONCHANNEL,
-            &[chan],
+            &[Middle::echo(chan)],
             Some("You're not on that channel"),
         );
     }
 
-    /// `ERR_USERNOTINCHANNEL (<nick> <chan>) :They aren't on that channel`.
-    /// `nick` is the client's token, rendered through
-    /// [`clip_echo`](crate::core::handler::clip_echo) like the helpers above.
-    pub fn err_usernotinchannel(&mut self, conn: ConnId, nick: &str, chan: &str) {
-        let nick = crate::core::handler::clip_echo(nick);
+    /// `ERR_USERNOTINCHANNEL (<nick> <chan>) :They aren't on that channel`,
+    /// for the client's `nick` and the channel's display name.
+    pub(crate) fn err_usernotinchannel(&mut self, conn: ConnId, nick: &str, display: &str) {
         self.numeric(
             conn,
             ERR_USERNOTINCHANNEL,
-            &[nick, chan],
+            &[Middle::echo(nick), Middle::own(display)],
             Some("They aren't on that channel"),
         );
+    }
+
+    /// The length of the line [`Self::numeric`] frames around an empty
+    /// trailing, ` :` included: what every byte of a trailing is added to, so a
+    /// reply packing its trailing to the wire limit measures against the line
+    /// actually sent.
+    pub(crate) fn numeric_head_len(&self, conn: ConnId, code: u16, middle: &[Middle<'_>]) -> usize {
+        self.numeric_line(conn, code, middle, Some("")).len()
     }
 
     /// Emit `code` one or more times, packing `items` into the trailing
@@ -6894,29 +6914,19 @@ impl ServerState {
     /// Nothing is emitted for an empty `items`. A caller that must always send
     /// something (an empty NAMES is still closed by its own ENDOF numeric) does
     /// that itself.
-    pub fn numeric_list(
+    pub(crate) fn numeric_list(
         &mut self,
         conn: ConnId,
         code: u16,
-        middle: &[&str],
+        middle: &[Middle<'_>],
         items: &[String],
         sep: char,
     ) {
-        // Measure the fixed part of every line exactly as `numeric` frames it —
-        // ":{server} {code} {target}" + each middle + " :" + CRLF — so the
-        // budget can never drift from the line actually sent.
-        let target = self.reply_target(conn);
-        let mut overhead = 1
-            + self.config.server_name.len()
-            + 1
-            + e6irc_proto::numerics::code_str(code).len()
-            + 1
-            + target.len();
-        for m in middle {
-            overhead += 1 + m.len();
-        }
-        overhead += 2 /* " :" */ + 2 /* CRLF */;
-        let budget = 512usize.saturating_sub(overhead).max(1);
+        let budget = e6irc_proto::message::MAX_LINE_LEN
+            .saturating_sub(
+                self.numeric_head_len(conn, code, middle) + 2, /* CRLF */
+            )
+            .max(1);
 
         let mut line = String::new();
         for item in items {
@@ -7280,7 +7290,7 @@ impl ServerState {
         self.numeric(
             conn,
             RPL_LOGGEDIN,
-            &[&mask, &account],
+            &[Middle::own(&mask), Middle::own(&account)],
             Some(&format!("You are now logged in as {account}")),
         );
         // Identifying to the account protecting a nick settles its clock
@@ -7322,7 +7332,7 @@ impl ServerState {
         self.numeric(
             conn,
             RPL_LOGGEDOUT,
-            &[&mask],
+            &[Middle::own(&mask)],
             Some("You are now logged out"),
         );
     }
@@ -7366,43 +7376,6 @@ impl ServerState {
         }
         self.send_user_event_parts(&quit.event, peers);
     }
-}
-
-/// The structural rule for a numeric *middle* segment, pure so it can be pinned
-/// by unit tests: `Some(reason)` when `middle` cannot stand where `numeric`
-/// places it and would corrupt the reply's framing. [`ServerState::numeric`]
-/// consults it to render such a segment safely (as `*`) rather than emit a
-/// mis-framed line — making the framing-corruption class unrepresentable at
-/// that one funnel.
-///
-/// A middle precedes the trailing and is space-delimited, so it must be
-/// **non-empty** (an empty one collapses into the adjacent separator, shifting
-/// every later field left a column — the WHOX empty-token bug), must **not begin
-/// with `:`** (which starts the trailing early, swallowing the rest of the line —
-/// the WHOX `:`-leading-token bug), and must carry **no CR/LF/NUL** (which break
-/// the line or inject a second one). These are exactly the numeric-framing
-/// corruptions found and fixed by hand across the sweeps; the funnel now closes
-/// the class for every present and future echo site at once.
-///
-/// An internal space is deliberately *allowed*: a few replies pass a
-/// mode-string joined to its space-separated arguments as one segment
-/// (`RPL_CHANNELMODEIS` "+ntk sekrit", `RPL_MYINFO`), which frames correctly —
-/// each sub-argument is itself space-validated at its own ingress (a `+k` key or
-/// `+l` limit with a space is refused). Forbidding the space would only force a
-/// join-then-resplit at those call sites for no framing benefit. Callers with
-/// genuine free text (a realname, a message, a reason) pass it as the
-/// *trailing*, which has none of these restrictions.
-fn numeric_middle_violation(middle: &str) -> Option<&'static str> {
-    if middle.is_empty() {
-        return Some("numeric middle parameter is empty (collapses into the field separator)");
-    }
-    if middle.starts_with(':') {
-        return Some("numeric middle parameter starts with ':' (starts the trailing early)");
-    }
-    if middle.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
-        return Some("numeric middle parameter contains CR/LF/NUL (breaks or injects a line)");
-    }
-    None
 }
 
 /// The wire-limit rule behind [`ServerState::debug_check_wire_line`], pure so
@@ -7454,36 +7427,6 @@ mod mlock_tests {
         assert_eq!(MlockModes::parse("+tn-i").unwrap().render(), "+nt-i");
         assert_eq!(MlockModes::parse("-i+tn").unwrap().render(), "+nt-i");
         assert_eq!(MlockModes::parse("+n+t-i").unwrap().render(), "+nt-i");
-    }
-}
-
-#[cfg(test)]
-mod numeric_middle_tests {
-    use super::numeric_middle_violation;
-
-    #[test]
-    fn accepts_ordinary_middles_and_rejects_frame_breakers() {
-        // Ordinary middle parameters pass.
-        for ok in ["alice", "#chan", "+o", "0", "255.255.255.255", "H@", "*"] {
-            assert!(
-                numeric_middle_violation(ok).is_none(),
-                "rejected a valid middle: {ok:?}"
-            );
-        }
-        // A pre-joined modestring+args segment is allowed — it frames correctly.
-        assert!(
-            numeric_middle_violation("+ntk sekrit").is_none(),
-            "a pre-joined modestring+args segment must be allowed"
-        );
-        // The frame-breaking shapes each fail — the exact WHOX-token class.
-        assert!(numeric_middle_violation("").is_some(), "empty must fail");
-        assert!(
-            numeric_middle_violation(":x").is_some(),
-            "leading colon must fail"
-        );
-        assert!(numeric_middle_violation("a\rb").is_some());
-        assert!(numeric_middle_violation("a\nb").is_some());
-        assert!(numeric_middle_violation("a\0b").is_some());
     }
 }
 

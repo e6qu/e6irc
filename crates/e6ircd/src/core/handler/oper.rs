@@ -617,7 +617,7 @@ pub(super) fn cmd_add_ban(
         None => (None, p),
     };
     if p.is_empty() {
-        state.err_needmoreparams(conn, &kind.as_str().to_ascii_uppercase());
+        state.err_needmoreparams(conn, kind.add_command());
         return;
     }
     // A K-line target that can only be a nick — no `@`, nothing a host or an
@@ -1109,12 +1109,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
     }
     let label = kind.label();
     if p.is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &[&format!("UN{}", kind.as_str().to_uppercase())],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, kind.remove_command());
         return;
     }
     // Fold to match the folded storage (see cmd_add_ban) so removal is
@@ -1265,7 +1260,7 @@ fn set_host(
         state.numeric(
             target,
             RPL_VISIBLEHOST,
-            &[newhost],
+            &[Middle::own(newhost)],
             Some("is now your visible host"),
         );
     }

@@ -428,6 +428,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     tag escape and cannot ride a wire line) is dropped, so no line this system
     tags can carry a raw NUL onto the wire and truncate it. The single choke
     point for tag-value wire safety, rather than a guard one call path can skip.
+  - `Middle` — a middle parameter of a core numeric is typed by where its text
+    came from (`Middle::echo` for a client's or an upstream's, `Middle::own`
+    for the server's, `From` an integer), and each is written as exactly one
+    parameter. The funnel used to take strings and let a space through for the
+    pre-joined mode string of `RPL_CHANNELMODEIS`, so a call site that forgot
+    to echo a client token (a `+l` limit, a WHOX token, a STATS letter) split
+    the reply's parameters; that call site can no longer be written (§7.1).
   - *No argon2 on the serial DB-worker loop* — both credential-verifying and
     account-creating requests are intercepted in `run_worker` and spawned under
     the `verify_sem` bound; their inline `handle_request` arms are `unreachable!`.
@@ -751,7 +758,18 @@ strip = "symbols"
   empty, `:`-leading, spaced or control-bearing token as `*` and clips the rest
   to 64 bytes; the core's echoes and the bouncer's attach numerics
   (`handshake_numeric`, `write_attach_numeric`, which take only that type) share
-  it, so `NICK :a b` cannot become `432 * a b :…` on either side. Lines that
+  it, so `NICK :a b` cannot become `432 * a b :…` on either side. The core's
+  numeric funnel takes its middles as `core::Middle` values, never strings:
+  `Middle::echo` for text a client or an upstream supplied (the `MiddleParam`
+  rule), `Middle::own` for a value the server holds (validated where it
+  entered, held to 100 bytes), and `From` an integer. Every `Middle` is written
+  as exactly one parameter — a value that cannot stand as one is `*` whatever
+  its constructor, and a server-owned one that cannot is also a debug
+  assertion, since it is a server bug — and there is no constructor for a
+  pre-joined run of parameters: `RPL_CHANNELMODEIS` passes its mode string and
+  each argument as a `Middle` of its own. So a call site that forgets which of
+  its values came from the client cannot split a reply; it can only clip one
+  differently. Lines that
   carry free text are built by the funnels that fit it — `fitted_line`, the
   `server_notice` every server NOTICE goes through (operator notices echo
   masks, hosts and stored reasons), the `fail_line` every `FAIL` goes through

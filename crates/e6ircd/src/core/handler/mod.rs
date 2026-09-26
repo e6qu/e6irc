@@ -1,9 +1,10 @@
 //! Command dispatch: one inbound line → state transitions + replies.
 
-use e6irc_proto::message::Message;
+use e6irc_proto::message::{Message, MiddleParam};
 use e6irc_proto::numerics::*;
 
 use super::ConnId;
+use super::middle::Middle;
 use super::state::{
     BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult,
@@ -362,10 +363,8 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         Ok(m) => m,
         Err(_) => {
             return refuse_line(state, conn, line, |state| {
-                state.send(
-                    conn,
-                    &format!(":{server} FAIL * INVALID_MESSAGE :Malformed line"),
-                );
+                let fail = fail_line(&server, "*", "INVALID_MESSAGE", &[], "Malformed line");
+                state.send(conn, &fail);
             });
         }
     };
@@ -537,18 +536,6 @@ pub(crate) fn pack_trailing_list(items: &[String], head_len: usize) -> String {
     out
 }
 
-/// A client-supplied token echoed inside a reply, as the core's `&str`
-/// middles take it: the shared [`MiddleParam::echo`] rule (the bouncer's
-/// attach listener uses the same one), so an empty, `:`-leading or spaced
-/// token (`KICK #c :a b` makes the nick `a b`) is the `*` placeholder and the
-/// rest is clipped to [`MiddleParam::ECHO_MAX`] bytes.
-///
-/// [`MiddleParam::echo`]: e6irc_proto::message::MiddleParam::echo
-/// [`MiddleParam::ECHO_MAX`]: e6irc_proto::message::MiddleParam::ECHO_MAX
-pub(crate) fn clip_echo(token: &str) -> &str {
-    e6irc_proto::message::MiddleParam::echo(token).as_str()
-}
-
 /// `:{server} NOTICE {target} :{text}`, with `text` fitted to the line. The
 /// one shape every server-sourced NOTICE takes, so none can carry an
 /// oper-typed mask or a client's host past the wire limit — where the
@@ -561,8 +548,9 @@ pub(crate) fn server_notice(server: &str, target: &str, text: &str) -> String {
 /// The shared `:{server} FAIL <command> <code> [context] :<detail>` wire
 /// shape. Each context parameter is the client's own text echoed for
 /// attribution (an account name, a subcommand, a target), so it is rendered
-/// through [`clip_echo`] here, and the detail is fitted to the line: no caller
-/// can hand a raw token to a middle position or push the line past the limit.
+/// through [`MiddleParam::echo`] here, and the detail is fitted to the line: no
+/// caller can hand a raw token to a middle position or push the line past the
+/// limit.
 pub(crate) fn fail_line(
     server: &str,
     command: &str,
@@ -573,7 +561,7 @@ pub(crate) fn fail_line(
     let mut head = format!(":{server} FAIL {command} {code}");
     for param in context {
         head.push(' ');
-        head.push_str(clip_echo(param));
+        head.push_str(MiddleParam::echo(param).as_str());
     }
     head.push_str(" :");
     fitted_line(head, detail)
@@ -850,7 +838,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         _ => state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &[clip_echo(&command)],
+            &[Middle::echo(&command)],
             Some("Unknown command"),
         ),
     }
@@ -1118,15 +1106,6 @@ mod tests {
         assert!(!cap_version_302(Some("301")));
         assert!(!cap_version_302(Some("v302")));
         assert!(!cap_version_302(None));
-    }
-
-    #[test]
-    fn clip_echo_renders_every_unframeable_token_as_a_placeholder() {
-        for token in ["", ":x", "a b", " ", "trailing "] {
-            assert_eq!(clip_echo(token), "*", "{token:?}");
-        }
-        assert_eq!(clip_echo("nick"), "nick");
-        assert_eq!(clip_echo(&"x".repeat(100)).len(), 64);
     }
 
     #[test]

@@ -178,15 +178,20 @@ impl<'a> MiddleParam<'a> {
     /// `token`, or `*` when it cannot stand as a middle parameter, clipped to
     /// [`Self::ECHO_MAX`] bytes on a character boundary.
     pub fn echo(token: &'a str) -> Self {
-        let unframeable = token.is_empty()
-            || token.starts_with(':')
-            || token
-                .bytes()
-                .any(|byte| matches!(byte, b' ' | b'\r' | b'\n' | 0));
-        if unframeable {
+        if !Self::stands_alone(token) {
             return Self("*");
         }
         Self(truncate_on_char_boundary(token, Self::ECHO_MAX))
+    }
+
+    /// Whether `token` can stand as one middle parameter as it is: non-empty,
+    /// not `:`-leading, and free of space, CR, LF and NUL.
+    pub fn stands_alone(token: &str) -> bool {
+        !token.is_empty()
+            && !token.starts_with(':')
+            && !token
+                .bytes()
+                .any(|byte| matches!(byte, b' ' | b'\r' | b'\n' | 0))
     }
 
     pub fn as_str(self) -> &'a str {
