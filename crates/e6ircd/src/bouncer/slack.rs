@@ -2174,18 +2174,30 @@ mod tests {
             })
             .await
             .expect("the bridge announces it connected");
-            // Real sockets, virtual time: the clock jumps to the next timer
-            // whenever every task is waiting.
+            // Real sockets, virtual time. Letting the paused clock run by
+            // itself raced the socket: it jumps to the next timer whenever
+            // every task is waiting, including while the ping is still
+            // crossing the real socket, so a virtual-time bound on the wait
+            // expired first (seen on macOS CI). The clock is moved past the
+            // ping interval by hand instead, and the wait for the ping is
+            // bounded in real time, on a blocking thread (which also keeps the
+            // paused clock from moving on by itself meanwhile).
             tokio::time::pause();
-            tokio::time::timeout(std::time::Duration::from_secs(40), async {
+            tokio::time::advance(super::PING_INTERVAL + std::time::Duration::from_secs(1)).await;
+            let ping = async {
                 loop {
                     if let Some(OracleEvent::Ping(0)) = b.oracle.events.recv().await {
                         return;
                     }
                 }
-            })
-            .await
-            .expect("no ping within 40 seconds of quiet");
+            };
+            let watchdog = tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            });
+            tokio::select! {
+                () = ping => {}
+                _ = watchdog => panic!("no ping while the workspace was quiet"),
+            }
         }
 
         /// An event the bridge cannot read is acked and said in its channel,
