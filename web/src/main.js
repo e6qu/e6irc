@@ -12,6 +12,7 @@
 
 import "./style.css";
 import {
+  ALERTS_RESOLVED_BY_CONNECTING,
   ApiError,
   backlogFrom,
   errorMessage,
@@ -223,6 +224,12 @@ function clearAlert(key) {
   alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`)?.remove();
 }
 
+// Being offline has its own alert key: the connection opening resolves it, and it
+// must not take a refused or unconfirmed message's alert down with it.
+function showNotConnected(what) {
+  showAlert("not-connected", `Not connected — ${what}`, "error");
+}
+
 // A setting that could not be stored is reported once, as an alert: the same
 // sentence also sat inside the Preferences menu, where it was invisible unless
 // the menu happened to be open -- two places to keep in step, one of them
@@ -363,7 +370,7 @@ function rejectAllPendingSends(reason) {
   for (const pending of pendingSends.values()) rememberSentText(pending.typed);
   pendingSends.clear();
   showAlert(
-    "send",
+    "unconfirmed",
     `${count} message(s) were not confirmed before ${reason}; use input history to retry.`,
     "error",
   );
@@ -970,12 +977,12 @@ bufferActionEl.addEventListener("click", () => {
     return;
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    showAlert("send", `Not connected — ${buffer.display} was not left.`, "error");
+    showNotConnected(`${buffer.display} was not left.`);
     return;
   }
   try {
     if (!sendComposer("", `/part ${buffer.display}`)) {
-      showAlert("send", `Not connected — ${buffer.display} was not left.`, "error");
+      showNotConnected(`${buffer.display} was not left.`);
     }
   } catch {
     showAlert("send", `The request to leave ${buffer.display} was not sent.`, "error");
@@ -1541,10 +1548,7 @@ function connect() {
     reconnectAttempt = 0;
     setComposerAvailable(true);
     setStatus(`${network}: open`, "ok");
-    clearAlert("socket");
-    clearAlert("send");
-    clearAlert("socket-close");
-    clearAlert("network-unavailable");
+    for (const key of ALERTS_RESOLVED_BY_CONNECTING) clearAlert(key);
   });
   // No alert here: a `close` always follows, and its wording is the one this
   // alert carries. Two sentences under one key alternated, so the repeat guard
@@ -1708,7 +1712,7 @@ composer.addEventListener("submit", (e) => {
     text = message;
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    showAlert("send", "Not connected — your message was not sent.", "error");
+    showNotConnected("your message was not sent.");
     return;
   }
   // The server maps correlated {id, target, message} requests (including
@@ -1776,17 +1780,17 @@ composer.addEventListener("submit", (e) => {
 // True when the request entered the live connection.
 function requestJoin(chan) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    showAlert("send", "Not connected — cannot join yet.", "error");
+    showNotConnected("cannot join yet.");
     return false;
   }
   rememberRequestedJoins(chan);
   try {
     if (!sendComposer("", `/join ${chan}`)) {
-      showAlert("send", "Not connected — cannot join yet.", "error");
+      showNotConnected("cannot join yet.");
       return false;
     }
   } catch {
-    showAlert("send", "Not connected — cannot join yet.", "error");
+    showNotConnected("cannot join yet.");
     return false;
   }
   return true;
