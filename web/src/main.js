@@ -191,7 +191,12 @@ function bindAlertAction(alert, action) {
   alert.insertBefore(control, alert.lastElementChild);
 }
 
-function showAlert(key, text, tone = "warning", action = null) {
+// Alert text names channels and nicks, which are the network's to choose: their
+// bidirectional controls are removed here, once, so none can reorder the
+// sentence around it.
+function showAlert(key, unsafeText, tone = "warning", unsafeAction = null) {
+  const text = stripBidiControls(unsafeText);
+  const action = unsafeAction && { ...unsafeAction, label: stripBidiControls(unsafeAction.label) };
   const report = `${tone}\n${text}\n${action?.label ?? ""}`;
   let alert = alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`);
   if (reportedAlerts.get(key) === report) {
@@ -596,6 +601,14 @@ let channelModes = DEFAULT_CHANNEL_MODES;
 // ---- rendering ----------------------------------------------------------
 
 // Reflect total unread in the tab title so a background tab shows activity.
+// A conversation's name as the page draws it. `display` stays the network's
+// own spelling, the target every request is sent to; only what is shown loses
+// bidirectional controls, which in a channel or nick would reorder the label
+// and the text beside it (the stylesheet also isolates each name).
+function bufferLabel(b) {
+  return !b || b.key === SERVER ? CONSOLE_NAME : stripBidiControls(b.display);
+}
+
 function updateTitle() {
   let unread = 0;
   for (const b of buffers.values()) if (b.key !== active) unread += b.unread;
@@ -647,7 +660,7 @@ function updateBufferListItem(li, b) {
   button.className = "buf" + (b.key === active ? " active" : "") + (archived ? " archived" : "");
   if (b.key === active) button.setAttribute("aria-current", "true");
   else button.removeAttribute("aria-current");
-  const bufferName = b.key === SERVER ? CONSOLE_NAME : b.display;
+  const bufferName = bufferLabel(b);
   const inactive = b.key !== active;
   const unreadLabel = b.unread > 0 && inactive
     ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
@@ -772,14 +785,14 @@ function messageRow(line) {
 function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
   routeNetworkEl.textContent = network || "";
-  bufnameEl.textContent = !b || b.key === SERVER ? CONSOLE_NAME : b.display;
+  bufnameEl.textContent = bufferLabel(b);
   buftopicEl.textContent = b ? b.topic : "";
   const action = bufferAction(b, memberTracking);
   bufferActionEl.hidden = action === null;
   if (action !== null) {
     const canLeave = action === "leave";
     bufferActionEl.textContent = canLeave ? "Leave" : "Close";
-    const label = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    const label = canLeave ? `Leave ${bufferLabel(b)}` : `Close conversation with ${bufferLabel(b)}`;
     bufferActionEl.title = label;
     bufferActionEl.setAttribute("aria-label", label);
   }
@@ -886,11 +899,14 @@ function renderNickList() {
     create: nickListItem,
     update: (li, m) => {
       const button = li.firstElementChild;
-      const action = `Open conversation with ${m.name}`;
+      // The dataset keeps the nick as the network spells it: it is what a click
+      // opens a conversation with. Only what is shown loses bidi controls.
+      const shown = stripBidiControls(m.name);
+      const action = `Open conversation with ${shown}`;
       button.title = action;
       button.setAttribute("aria-label", action);
       button.dataset.nick = m.name;
-      button.textContent = nickPrefix(m.modes, channelModes) + m.name;
+      button.textContent = nickPrefix(m.modes, channelModes) + shown;
     },
   });
 }
@@ -1188,10 +1204,11 @@ function maybeNotify(b, line) {
   }
   const isDM = b.kind === "dm";
   if (!(line.mention || isDM)) return;
-  const title = isDM ? `DM from ${line.sender ?? "?"}` : `${b.display}: ${line.sender ?? ""}`;
+  const sender = stripBidiControls(line.sender ?? (isDM ? "?" : ""));
+  const title = isDM ? `DM from ${sender}` : `${bufferLabel(b)}: ${sender}`;
   try {
     // eslint-disable-next-line no-new
-    new Notification(title, { body: line.text, tag: b.key });
+    new Notification(title, { body: stripBidiControls(line.text), tag: b.key });
   } catch (error) {
     settings.notifications = false;
     persistSetting("notifications");

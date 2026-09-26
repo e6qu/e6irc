@@ -280,6 +280,29 @@ test("bidirectional override and isolate controls are removed from displayed tex
   assert.equal(stripBidiControls(undefined), "");
 });
 
+// A channel named `#a‮b` drew reversed in the sidebar, the header and
+// the member list, which showed buffer and member names unfiltered.
+test("channel and nick names are drawn without bidi controls, in isolation", async () => {
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const drawn = source.split("\n").filter((line) =>
+    /textContent\s*=|\.title\s*=|setAttribute\("aria-label"|const (label|action) = /.test(line));
+  for (const line of drawn) {
+    assert.doesNotMatch(line, /\b(b|buffer)\.display\b|\bm\.name\b/, `drawn unfiltered: ${line.trim()}`);
+  }
+  assert.match(source, /function bufferLabel\(b\) \{\n\s*return [^\n]*stripBidiControls\(b\.display\);/);
+  assert.match(source, /const shown = stripBidiControls\(m\.name\);/);
+  // Alerts name channels too: their text is filtered once, where it is shown.
+  assert.match(source, /function showAlert\(key, unsafeText[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*const text = stripBidiControls\(unsafeText\);/);
+
+  const styles = await readFile(new URL("../src/style.css", import.meta.url), "utf8");
+  for (const selector of [".buf-name", "#bufname", ".nick"]) {
+    const escaped = selector.replace(/[.#]/g, "\\$&");
+    const rule = styles.match(new RegExp(`^${escaped} \\{([^}]*)\\}`, "m"));
+    assert.ok(rule, selector);
+    assert.match(rule[1], /unicode-bidi: isolate;/, selector);
+  }
+});
+
 test("history merge never replaces live or unidentified lines", () => {
   const history = [
     { identity: "old", text: "old" },
