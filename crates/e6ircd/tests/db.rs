@@ -52,6 +52,7 @@ async fn add_server_ban(
             reason: reason.into(),
             set_by: set_by.into(),
             kind: kind.into(),
+            expiry: None,
         },
         &e6ircd::db::AuditPrincipal::operator(set_by),
     )
@@ -5562,12 +5563,22 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         CoreIngress::single(core_tx),
     ));
     let conn = e6ircd::core::ConnId(9);
+    // A temporary ban: its expiry is stored and its length audited.
+    let expires_at_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+        + 3600;
     let add = e6ircd::core::ServerBanMutation::Add {
         mask: "baddie@*".into(),
         mask_display: "Baddie@*".into(),
         reason: "spam".into(),
         set_by: "godnick".into(),
         kind: "kline".into(),
+        expiry: Some(e6ircd::core::ServerBanExpiry {
+            minutes: 60,
+            expires_at_secs,
+        }),
     };
     // The operator block `god`, using the nick `godnick`: STATS shows the
     // nick, the audit trail the operator.
@@ -5596,12 +5607,13 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
     ));
     assert_eq!(
         db::list_server_bans(&pool).await.expect("bans"),
-        vec![(
-            "Baddie@*".to_string(),
-            "spam".to_string(),
-            "godnick".to_string(),
-            "kline".to_string(),
-        )]
+        vec![db::PersistedServerBan {
+            mask: "Baddie@*".to_string(),
+            reason: "spam".to_string(),
+            set_by: "godnick".to_string(),
+            kind: "kline".to_string(),
+            expires_at: Some(i64::try_from(expires_at_secs).expect("fits")),
+        }]
     );
     let kinds: (String, String) =
         sqlx::query_as("SELECT actor_kind, target_kind FROM audit_log WHERE action = 'KLINE'")
@@ -5623,7 +5635,7 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
             &"god".to_string(),
             &"KLINE".to_string(),
             &"Baddie@*".to_string(),
-            &"spam".to_string()
+            &"spam (temporary, 60 min.)".to_string()
         )
     );
 
@@ -5693,7 +5705,7 @@ async fn server_bans_persist_and_load() {
     add_server_ban(&pool, "baddie@*", "baddie@*", "gecos", "god", "xline")
         .await
         .expect("add3");
-    let mut list = db::list_server_bans(&pool).await.expect("list");
+    let mut list = permanent_server_bans(&pool).await;
     list.sort();
     assert_eq!(
         list,
@@ -5723,7 +5735,7 @@ async fn server_bans_persist_and_load() {
     add_server_ban(&pool, "baddie@*", "baddie@*", "spam again", "root", "kline")
         .await
         .expect("upsert");
-    let list = db::list_server_bans(&pool).await.expect("list");
+    let list = permanent_server_bans(&pool).await;
     assert_eq!(
         list.iter()
             .filter(|(m, _, _, k)| m == "baddie@*" && k == "kline")
@@ -5748,7 +5760,7 @@ async fn server_bans_persist_and_load() {
         .expect("remove"),
         "the K-line existed"
     );
-    let mut list = db::list_server_bans(&pool).await.expect("list");
+    let mut list = permanent_server_bans(&pool).await;
     list.sort();
     assert_eq!(
         list,
@@ -5767,6 +5779,97 @@ async fn server_bans_persist_and_load() {
             ),
         ]
     );
+}
+
+/// The stored server bans as `(mask, reason, set_by, kind)`, each asserted
+/// permanent.
+async fn permanent_server_bans(pool: &sqlx::PgPool) -> Vec<(String, String, String, String)> {
+    db::list_server_bans(pool)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|ban| {
+            assert_eq!(ban.expires_at, None, "{ban:?}");
+            (ban.mask, ban.reason, ban.set_by, ban.kind)
+        })
+        .collect()
+}
+
+/// A temporary ban past its expiry is not loaded at boot nor listed in the
+/// administrator directory, and storage maintenance deletes its row; one still
+/// in force survives all three.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn expired_temporary_server_bans_are_not_loaded_and_are_swept() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("expired_temporary_server_bans_are_not_loaded_and_are_swept").await,
+    )
+    .await
+    .expect("connect");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    for (mask, expires_at_secs) in [
+        ("*@lapsed.example", now - 60),
+        ("*@live.example", now + 3600),
+    ] {
+        db::mutate_server_ban_audited(
+            &pool,
+            &e6ircd::core::ServerBanMutation::Add {
+                mask: mask.into(),
+                mask_display: mask.into(),
+                reason: "flood".into(),
+                set_by: "god".into(),
+                kind: "kline".into(),
+                expiry: Some(e6ircd::core::ServerBanExpiry {
+                    minutes: 60,
+                    expires_at_secs,
+                }),
+            },
+            &e6ircd::db::AuditPrincipal::operator("god"),
+        )
+        .await
+        .expect("add");
+    }
+    let loaded: Vec<String> = db::list_server_bans(&pool)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|ban| ban.mask)
+        .collect();
+    assert_eq!(loaded, ["*@live.example"]);
+    let directory = db::query_server_ban_directory(
+        &pool,
+        db::ServerBanDirectoryFilter {
+            before_id: None,
+            exact_kind: None,
+            exact_mask: None,
+            page_size: db::ServerBanDirectoryPageSize::new(10).expect("page size"),
+        },
+    )
+    .await
+    .expect("directory");
+    assert_eq!(directory.entries.len(), 1, "{directory:?}");
+    assert_eq!(directory.entries[0].mask, "*@live.example");
+    assert!(directory.entries[0].expires_at.is_some());
+
+    let report = db::run_storage_maintenance(
+        &pool,
+        db::StorageRetention {
+            history_days: 30,
+            audit_days: 30,
+            observability_hours: 24,
+        },
+    )
+    .await
+    .expect("maintenance");
+    assert_eq!(report.server_bans, 1);
+    let stored: Vec<String> = sqlx::query_scalar("SELECT mask FROM server_bans")
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+    assert_eq!(stored, ["*@live.example"]);
 }
 
 #[tokio::test]

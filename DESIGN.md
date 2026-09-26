@@ -1133,7 +1133,17 @@ subset's exact behavior.
   for a key a `,`, which would split JOIN's key list) is refused, not rewritten.
   Implemented today: lists `+b +q +e +I`, `+k`, `+l`, and the flags
   `+g +i +m +n +s +t +C` (`ChanModes::FLAGS` is the one flag table; MLOCK can
-  lock each); the rest of Solanum's set answers 472.
+  lock each); the rest of Solanum's set answers 472 — once per MODE command,
+  naming the first unknown letter (Solanum's `chm_nosuch`), while the known
+  modes around it apply. `MODE #c` from a non-member shows `+k` and `+l`
+  without their arguments (Solanum's `channel_modes`); a member sees both.
+  Deliberate difference from Solanum: `+l 10abc` and `+l 0` are refused with
+  696 (`ERR_INVALIDMODEPARAM`) rather than read as `+l 10` and ignored — a
+  limit the operator did not type is never enforced silently.
+- Each list-mode entry records who set it (`nick!user@host`) and when, and
+  RPL_BANLIST, RPL_QUIETLIST, RPL_EXCEPTLIST and RPL_INVITELIST report both,
+  as Solanum does: `367 <me> <channel> <mask> <setter> <set-at>`. The lists
+  live with the channel and are not persisted, registered or not.
 - List-mode masks follow Solanum's `pretty_mask`: `nick` → `nick!*@*`, and a
   bare token with a `.` or `:` (a host or an address) → `*!*@token`. A host
   that is an address or a CIDR range (`*!*@203.0.113.0/24`,
@@ -1150,14 +1160,22 @@ subset's exact behavior.
   casefolded, in constant time), `+i` (an invite or `+I` passes), `+l` (an
   invite passes). INVITE takes channel-operator status unless the channel is
   `+g`; an invite is recorded only while the channel is `+i` or `+l`, the
-  modes it lets its holder past. `+k` on a keyed channel replaces the key.
+  modes it lets its holder past, and opening the channel revokes those held:
+  `-i` always (ircd-hybrid's rule; Solanum keeps them until the channel is
+  destroyed), `-l` when the channel is not `+i`, so an invite cannot be
+  stocked and spent after the channel is locked again. `+k` on a keyed
+  channel replaces the key. TOPIC needs what a message does (Solanum's
+  `m_topic` calls `can_send`): a banned or quieted member, or an unvoiced one
+  under `+m`, is refused with 404 even on a `-t` channel.
   A STATUSMSG (`@#c`/`+#c`) — PRIVMSG, NOTICE, TAGMSG or multiline — needs
   op or voice in the channel (482 otherwise). A PART reason is dropped
   whenever the member could not say it as a message (banned, quieted, or
   unvoiced under `+m`). KNOCK is for a channel that is `+i`, keyed or full;
   the banned and the quieted are refused, and each user may knock once per
   five minutes and each channel be knocked on once per minute (712,
-  Solanum's `knock_delay` / `knock_delay_channel`). `QUIT` with no comment
+  Solanum's `knock_delay` / `knock_delay_channel`). RPL_KNOCK goes to every
+  member of a `+g` channel, to the operators otherwise, in Solanum's shape:
+  `710 <channel> <channel> <nick!user@host> :has asked for an invite.` `QUIT` with no comment
   leaves as `Quit: <nick>`, `QUIT :` with an empty reason. PART of a channel
   that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
@@ -1167,9 +1185,22 @@ subset's exact behavior.
 - The first joiner of an unregistered channel creates it and is opped. A
   *registered* channel recreated after it emptied opens no ops by arrival:
   only the founder or an access holder is opped on join (Atheme semantics).
-- User modes: Solanum-compatible core (`+i +w +Z +R …`) plus oper modes. A
-  user MODE reports only the net change (nothing when nothing changed), and
-  `MODE <nick>` for a nick nobody holds is `ERR_NOSUCHNICK`, not 502.
+- User modes: `+i +o +w +B +R +Z` (`USER_MODES`, which RPL_MYINFO
+  advertises). `+R` (Solanum's `um_regonlymsg`) admits a PRIVMSG, NOTICE,
+  TAGMSG or INVITE only from a user logged in to an account or an operator;
+  anyone else gets 486 `ERR_NONONREG` (`You must log in with services to
+  message this user`), a NOTICE nothing. `+Z` is the server's: set on a TLS
+  connection — a TLS listener, or a WebSocket a trusted proxy reports reached
+  over HTTPS (every `X-Forwarded-Proto` entry `https`; the HTTP listener never
+  terminates TLS itself, and such a session's transport is `wss` in the
+  connection directory) — told to the client after the MOTD
+  (`:<nick> MODE <nick> :+Z`), shown in WHOIS as 671 `RPL_WHOISSECURE`, and a
+  client's own `+Z`/`-Z` changes nothing, as in Solanum. Both are part of
+  the published user record, so every shard judges and reports them alike.
+  Only a user MODE's first argument is its mode string (`MODE me +i foo` sets
+  `+i`). A user MODE reports only the net change (nothing when nothing
+  changed), and `MODE <nick>` for a nick nobody holds is `ERR_NOSUCHNICK`,
+  not 502.
 - An over-long `USER` name is truncated to `USERLEN`, never refused (Modern
   IRC); only a character the source prefix cannot carry is refused (468).
 - Oper system: config-defined opers, privileges (kline/dline/xline-style
@@ -1177,12 +1208,38 @@ subset's exact behavior.
   that is an address or CIDR range matches the connection's real address; a
   D-line must be an IP address, CIDR range or address glob (anything else is
   refused) and matches only that address; so a SETHOST lifts neither. A
-  reason `public|private` shows the banned user and their peers only the
-  public part; the operator listing and the audit trail keep both. `STATS k`,
-  `STATS d` and `STATS x` (either case) are that operator listing in Solanum's
-  numerics — `216 K <host> * <user>`, `225 D <address>`, `247 X 0 <mask>`,
-  each with the whole reason, then 219; a non-operator gets 481 and the 219
-  terminator, as Solanum's stats access table answers. A mask part is spelled
+  K-line target that can only be a nick (no `@`, `.`, `:`, `/` or glob) bans
+  that user's host, `*@<host>`, and is refused with 401 when nobody holds
+  the nick (the ratbox-family nick K-line; current Solanum refuses a bare nick
+  outright). A mask is at most `BANMASKLEN` bytes (100), an X-line's at most
+  `REALLEN` (150), longer ones refused. A leading all-digits argument
+  (`KLINE 60 *@host :spam`, likewise DLINE and XLINE) makes the ban temporary
+  for that many minutes (Solanum's `valid_temp_time`: at most 52 weeks, `0`
+  permanent): its expiry is decided where it is set and carried to the
+  database (`server_bans.expires_at`, migration 0088) and every shard, the
+  audit row names its length, the confirmation and the operators' notice say
+  `temporary <n> min.`, and when it lapses every shard stops enforcing it on
+  the next tick — a lapsed ban bans no one even before then — and tells its
+  own operators (`Temporary K-Line for <mask> expired`), so each hears it
+  once. A lapsed row is not loaded at boot nor listed by the administrator
+  API, and storage maintenance deletes it. `UNKLINE` lifts a temporary ban
+  early. The administrator API takes the same as `duration_minutes` and lists
+  `expires_at`. A reason `public|private` shows the banned user and their
+  peers only the public part; the operator listing and the audit trail keep
+  both. `STATS k`, `STATS d` and `STATS x` (either case) are that operator
+  listing in Solanum's numerics — `216 K <host> * <user>`,
+  `225 D <address>`, `247 X 0 <mask>`, each with the whole reason, then 219; a
+  temporary ban has the lowercase letter, as Solanum marks one, and its reason
+  starts with the time left, as ratbox and charybdis wrote it
+  (`Temporary K-Line 40 min. - <reason>`). A non-operator gets 481 and the 219
+  terminator, as Solanum's stats access table answers. A second OPER by an
+  operator is answered 381 and changes nothing — not the operator identity its
+  actions are audited under (Solanum's `m_oper`). A KILL victim is sent the
+  `:<killer!user@host> KILL <victim> :<reason>` line before its closing
+  `ERROR` (the server name is the source of a console kill). SETHOST takes
+  Solanum's `clean_host` alphabet — letters, digits, `.` `-` `:` `/`, the
+  part after the last `/` not starting with a digit — so a host can never be
+  a glob or a list. A mask part is spelled
   as Solanum spells it so it stays one middle parameter
   (`sanitize::mask_middle`): a space (X-line masks hold them) as `\s`, and a
   leading `:` (an IPv6 address such as `::1`) with a `0` in front. A session's
@@ -1197,6 +1254,10 @@ subset's exact behavior.
   created via NickServ and via web/OIDC are the same account rows (§9.1).
   `SASL` and `IDENTIFY` set the same account state; `account-notify`/WHOIS
   reflect it identically to Libera. Each command's `HELP` line lists it.
+  A pseudo-client speaks as `<Service>!<Service>@services.<server>` — its
+  notices and every channel mode ChanServ sets (a mode lock's correction,
+  `OP`/`VOICE` and their inverses, an access holder's op or voice on join)
+  alike, from one helper (`ServerState::service_prefix`).
   - NickServ: `REGISTER`, `IDENTIFY`, `LOGOUT`; `GROUP`/`UNGROUP` add the
     current nick to the identified account or remove a grouped one (an account
     holds at most five nicks, its name included — Atheme's `maxnicks`; a nick

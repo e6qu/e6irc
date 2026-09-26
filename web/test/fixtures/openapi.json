@@ -777,6 +777,13 @@
                           "created_at": {
                             "type": "string"
                           },
+                          "expires_at": {
+                            "description": "When a temporary ban lapses (UTC); null for a permanent ban. A lapsed ban is not listed.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "id": {
                             "minimum": 1,
                             "type": "integer"
@@ -805,7 +812,8 @@
                           "reason",
                           "set_by",
                           "kind",
-                          "created_at"
+                          "created_at",
+                          "expires_at"
                         ],
                         "type": "object"
                       },
@@ -872,6 +880,12 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
+                  "duration_minutes": {
+                    "description": "A temporary ban's length in minutes; omitted for a permanent ban. Every shard stops enforcing the ban when it lapses.",
+                    "maximum": 524160,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
                   "kind": {
                     "enum": [
                       "kline",
@@ -918,7 +932,7 @@
             "description": "server ban created"
           },
           "400": {
-            "description": "invalid kind or mask"
+            "description": "invalid kind, mask, or duration"
           },
           "401": {
             "description": "not signed in, or the token or session is invalid or expired"
@@ -3263,6 +3277,7 @@
                 "tcp",
                 "tls",
                 "websocket",
+                "wss",
                 "local"
               ],
               "type": "string"
@@ -3328,10 +3343,12 @@
                             "type": "boolean"
                           },
                           "transport": {
+                            "description": "wss is a WebSocket a trusted proxy reports reached over HTTPS; websocket is any other.",
                             "enum": [
                               "tcp",
                               "tls",
                               "websocket",
+                              "wss",
                               "local"
                             ],
                             "type": "string"
@@ -7174,6 +7191,7 @@
                 "tcp",
                 "tls",
                 "websocket",
+                "wss",
                 "local"
               ],
               "type": "string"
@@ -7231,10 +7249,12 @@
                             "type": "boolean"
                           },
                           "transport": {
+                            "description": "wss is a WebSocket a trusted proxy reports reached over HTTPS; websocket is any other.",
                             "enum": [
                               "tcp",
                               "tls",
                               "websocket",
+                              "wss",
                               "local"
                             ],
                             "type": "string"

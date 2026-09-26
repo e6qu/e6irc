@@ -67,6 +67,13 @@ pub(super) async fn ws_irc(
     // /ws/irc can't be used to sidestep it. The guard is held for the
     // connection's lifetime and releases the slot on drop.
     let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    // Umode +Z: this listener never terminates TLS, so a connection is secure
+    // only when a trusted proxy says its client reached it over HTTPS.
+    let transport = if super::oidc::forwarded_https(peer.ip(), &headers, &state.trusted_proxies) {
+        crate::core::ConnectionTransport::SecureWebSocket
+    } else {
+        crate::core::ConnectionTransport::WebSocket
+    };
     let Some(guard) = state.conn_limiter.try_acquire(ip) else {
         state.telemetry.record_connection_rejected();
         // A slot frees only when a connection closes, which nothing here can
@@ -117,7 +124,7 @@ pub(super) async fn ws_irc(
             );
         }
     };
-    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode, conn))
+    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode, transport, conn))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -131,6 +138,7 @@ pub(super) async fn ws_irc_conn(
     _conn_guard: crate::net::ConnGuard,
     ip: crate::net::ClientIp,
     mode: WsFrameMode,
+    transport: crate::core::ConnectionTransport,
     conn: crate::core::ConnId,
 ) {
     use crate::core::{Input, Output};
@@ -150,7 +158,7 @@ pub(super) async fn ws_irc_conn(
             // give every WS user the same hostmask, letting a banned user evade
             // KLINE/DLINE through /ws/irc and making per-user host bans impossible.
             host: ip.to_string(),
-            transport: crate::core::ConnectionTransport::WebSocket,
+            transport,
         })
         .await
         .is_err()

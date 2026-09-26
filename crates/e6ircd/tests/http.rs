@@ -49,6 +49,7 @@ async fn add_server_ban(
             reason: reason.into(),
             set_by: set_by.into(),
             kind: kind.into(),
+            expiry: None,
         },
         &e6ircd::db::AuditPrincipal::account(set_by),
     )
@@ -6457,9 +6458,57 @@ async fn admin_console_ban_and_channel_actions() {
     );
     let (status, _, body) = request(http, &directory).await;
     assert_eq!(status, 200, "{body}");
-    let ban_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["bans"][0]["id"]
+    let listed = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    let ban_id = listed["bans"][0]["id"]
         .as_i64()
         .expect("stable server-ban id");
+    assert!(listed["bans"][0]["expires_at"].is_null(), "{body}");
+
+    // A temporary ban carries its expiry; a zero or over-long duration is
+    // refused before anything is changed.
+    let post_ban = |body: &str| {
+        format!(
+            "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    for duration in [0, 524_161] {
+        let body =
+            format!(r#"{{"kind":"kline","mask":"*@brief.example","duration_minutes":{duration}}}"#);
+        let (status, _, refusal) = request(http, &post_ban(&body)).await;
+        assert_eq!(status, 400, "{refusal}");
+    }
+    let (status, _, _) = request(
+        http,
+        &post_ban(r#"{"kind":"kline","mask":"*@brief.example","duration_minutes":60}"#),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let temporary = format!(
+        "GET /api/v1/admin/bans?kind=kline&mask=%2A%40brief.example HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &temporary).await;
+    assert_eq!(status, 200, "{body}");
+    let expires_at =
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["bans"][0]["expires_at"]
+            .as_str()
+            .map(str::to_owned);
+    assert!(
+        expires_at.is_some_and(|at| at.ends_with('Z')),
+        "a temporary ban lists its expiry: {body}"
+    );
+    assert!(
+        policy_page_has(
+            "/api/v1/admin/audit?action=KLINE&target=%2A%40brief.example",
+            "(temporary, 60 min.)",
+            true,
+        )
+        .await,
+        "the audit row names the duration"
+    );
 
     // Delete that exact immutable policy resource; a client never selects a
     // mutable visible mask for removal.

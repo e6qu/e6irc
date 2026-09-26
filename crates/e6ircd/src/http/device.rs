@@ -215,6 +215,7 @@ struct ServerBanResponse {
     set_by: String,
     kind: String,
     created_at: String,
+    expires_at: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -2219,6 +2220,7 @@ pub(super) async fn admin_server_bans(
                     set_by: entry.set_by,
                     kind: entry.kind,
                     created_at: entry.created_at,
+                    expires_at: entry.expires_at,
                 })
                 .collect(),
             next_before_id: page.next_before_id,
@@ -2234,6 +2236,9 @@ pub(super) struct AdminServerBanBody {
     mask: String,
     #[serde(default)]
     reason: String,
+    /// A temporary ban's length in minutes; absent for a permanent ban.
+    #[serde(default)]
+    duration_minutes: Option<u32>,
 }
 
 pub(super) async fn admin_create_server_ban(
@@ -2245,6 +2250,24 @@ pub(super) async fn admin_create_server_ban(
         Ok(body) => body,
         Err(response) => return response.into(),
     };
+    let duration_minutes = match body.duration_minutes {
+        None => None,
+        Some(minutes) => match std::num::NonZeroU32::new(minutes)
+            .filter(|minutes| minutes.get() <= crate::core::ServerBanExpiry::MAX_MINUTES)
+        {
+            Some(minutes) => Some(minutes),
+            None => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid server ban",
+                    Some(&format!(
+                        "duration_minutes must be between 1 and {} (52 weeks).",
+                        crate::core::ServerBanExpiry::MAX_MINUTES
+                    )),
+                );
+            }
+        },
+    };
     server_ban_response(
         &state,
         crate::core::AdminRequest::AddServerBan {
@@ -2252,6 +2275,7 @@ pub(super) async fn admin_create_server_ban(
             kind: body.kind,
             reason: body.reason,
             actor,
+            duration_minutes,
         },
         StatusCode::CREATED,
     )

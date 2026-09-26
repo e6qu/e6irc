@@ -546,7 +546,7 @@ fn operations() -> serde_json::Value {
                         "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
                         "nick": { "type": "string" }, "user": { "type": "string" }, "host": { "type": "string" },
                         "account": { "type": ["string", "null"] }, "oper": { "type": "boolean" },
-                        "transport": { "type": "string", "enum": ["tcp", "tls", "websocket", "local"] },
+                        "transport": { "type": "string", "enum": ["tcp", "tls", "websocket", "wss", "local"], "description": "wss is a WebSocket a trusted proxy reports reached over HTTPS; websocket is any other." },
                         "connected_at": { "type": "string" }, "idle_seconds": { "type": "integer", "minimum": 0 },
                         "channels": { "type": "array", "items": { "type": "string" } }
                     }
@@ -677,8 +677,8 @@ fn operations() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["bans", "next_before_id"],
             "properties": { "bans": { "type": "array", "items": { "type": "object", "additionalProperties": false,
-                "required": ["id", "mask", "reason", "set_by", "kind", "created_at"],
-                "properties": { "id": { "type": "integer", "minimum": 1 }, "mask": { "type": "string" }, "reason": { "type": "string" }, "set_by": { "type": "string" }, "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "created_at": { "type": "string" } }
+                "required": ["id", "mask", "reason", "set_by", "kind", "created_at", "expires_at"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "mask": { "type": "string" }, "reason": { "type": "string" }, "set_by": { "type": "string" }, "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "created_at": { "type": "string" }, "expires_at": { "type": ["string", "null"], "description": "When a temporary ban lapses (UTC); null for a permanent ban. A lapsed ban is not listed." } }
             } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
         }),
     );
@@ -773,7 +773,7 @@ fn operations() -> serde_json::Value {
             "schema": { "type": "string", "maxLength": 64 } }),
         serde_json::json!({ "name": "transport", "in": "query",
             "schema": { "type": "string",
-                "enum": ["tcp", "tls", "websocket", "local"] } }),
+                "enum": ["tcp", "tls", "websocket", "wss", "local"] } }),
         serde_json::json!({ "name": "oper", "in": "query",
             "schema": { "type": "boolean" } }),
     ]);
@@ -2205,9 +2205,9 @@ fn operations() -> serde_json::Value {
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": {
                         "type": "object", "additionalProperties": false, "required": ["kind", "mask"],
-                        "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" } }
+                        "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" }, "duration_minutes": { "type": "integer", "minimum": 1, "maximum": crate::core::ServerBanExpiry::MAX_MINUTES, "description": "A temporary ban's length in minutes; omitted for a permanent ban. Every shard stops enforcing the ban when it lapses." } }
                     } } } },
-                    "responses": { "201": json_response_status(201, "server ban created", message_schema.clone())["201"], "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
+                    "responses": { "201": json_response_status(201, "server ban created", message_schema.clone())["201"], "400": { "description": "invalid kind, mask, or duration" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/bans/{id}": {
                 "delete": { "summary": "Delete one immutable server-ban resource (admin only)",
