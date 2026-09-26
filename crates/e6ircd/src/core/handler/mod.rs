@@ -30,12 +30,21 @@ pub(crate) use history::*;
 use message::*;
 pub(crate) use monitor::*;
 pub(crate) use oper::*;
-pub(crate) use query::pace_who_replies;
 use query::*;
 pub(crate) use read_marker::*;
 use registration::*;
 pub(crate) use sasl::*;
 use services::*;
+
+/// Send what every LIST and WHO reply being paced out on this shard has room
+/// for now. A connection whose paced output is not finished is put back in
+/// `pacing` as it is resumed.
+pub(crate) fn pace_replies(state: &mut ServerState) {
+    for conn in std::mem::take(&mut state.pacing) {
+        chanops::pace_channel_list(state, conn);
+        query::pace_who_replies_to(state, conn);
+    }
+}
 
 fn replace_registered_topic(
     state: &mut ServerState,

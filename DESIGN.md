@@ -356,14 +356,29 @@ These are project-wide rules, enforced in review and (where possible) CI:
     critical failure it is.
   - One worker and N workers give the same answers by construction. The
     session's shard counts the JOINs it has routed to another shard
-    (`Session::pending_joins`) from the moment they are sent, so a pipelined
-    burst meets the channel limit exactly as on one worker. A change to the
-    user while such a JOIN is in flight (NICK, AWAY, SETNAME, CHGHOST, QUIT)
-    is sent to that channel's owner too: owner queues are FIFO, so it lands
-    after the JOIN and corrects the member the JOIN's snapshot created (an
-    owner that refused the JOIN has no member and tells no one). `JOIN 0`
-    parts every channel whichever shard owns it, and parts an in-flight JOIN
-    as soon as it is answered (`Session::part_on_join`). What a
+    (`Session::pending_joins`, a count per channel) from the moment they are
+    sent, so a pipelined burst meets the channel limit exactly as on one
+    worker, and a channel stays in flight until the *last* JOIN to it is
+    answered — a refused `JOIN #c wrong` answered first does not end the
+    window of the `JOIN #c right` behind it. A change to the user while such a
+    JOIN is in flight (NICK, AWAY, SETNAME, CHGHOST, QUIT) is sent to that
+    channel's owner too: owner queues are FIFO, so it lands after the JOIN and
+    corrects the member the JOIN's snapshot created (an owner that refused the
+    JOIN has no member and tells no one). `JOIN 0` parts every channel
+    whichever shard owns it, and parts each JOIN in flight when it was sent as
+    that JOIN is answered, if it admitted the user (`Session::part_on_join`,
+    counted the same way, so it is spent answer by answer and a refusal does
+    not use up the part owed to the admission after it). The actor's own
+    copy of what its command broadcast (a KICK, a MODE, the MODE of a ChanServ
+    OP/VOICE or of a mode lock its JOIN enforced) is part of that command's
+    response, where one worker's capture puts it: the owner leaves the actor
+    out of the broadcast and returns the copy in the result
+    (`ChannelKickResult::Kicked { echo }`,
+    `ServerState::broadcast_channel_answering`), and a broadcast made under a
+    capture sends the capture's connection its copy there whichever shard it
+    lives on (a remote MODE's echo is among its captured lines). Left to the
+    broadcast, it reached the session as a delivery held behind the deferred
+    reply and came out after the labeled `ACK`, untagged. What a
     command needs to know about a user or channel on another shard (WHOIS,
     ISON, USERHOST, MONITOR, WHOWAS, LUSERS, a labeled away reply) is read
     from process-wide directories that every shard — including a lone one —
@@ -784,7 +799,11 @@ strip = "symbols"
   behind it only while everything waiting fits one SendQ, and a `WHO` past
   that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
   channel's `WHO` is paced on the asker's shard, from the rows its owner sent
-  back.
+  back. What is being paced lives on the session (`Session::channel_list`,
+  `Session::paced_who`), so it cannot outlive the connection: a remote
+  channel's WHO rows or LIST rows that arrive after the asker closed find no
+  session and are dropped with it, where a paced reply once queued for a
+  closed connection aborted the worker.
 - Every write to a peer is bounded (`peer_write`): a write, flush or shutdown
   that makes no progress for 30 s fails, so a client with a shut receive
   window is closed ("Write timeout") instead of parking its writer forever —
