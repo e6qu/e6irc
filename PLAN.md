@@ -972,7 +972,7 @@ and this change fixes, each with a test that failed before:
   are implemented (below).
 
 Maintainer decisions implemented: temporary K/D/X-lines (`KLINE <minutes>
-<mask>`, at most 52 weeks) stored with their expiry (migration 0088), audited
+<mask>`, at most 52 weeks) stored with their expiry (migration 0089), audited
 with their length, shown in STATS with the lowercase letter and the time left,
 lapsed on every shard on its tick with one notice per operator, never loaded or
 listed once lapsed, and swept by storage maintenance; the administrator API

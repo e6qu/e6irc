@@ -1290,7 +1290,7 @@ subset's exact behavior.
   (`KLINE 60 *@host :spam`, likewise DLINE and XLINE) makes the ban temporary
   for that many minutes (Solanum's `valid_temp_time`: at most 52 weeks, `0`
   permanent): its expiry is decided where it is set and carried to the
-  database (`server_bans.expires_at`, migration 0088) and every shard, the
+  database (`server_bans.expires_at`, migration 0089) and every shard, the
   audit row names its length, the confirmation and the operators' notice say
   `temporary <n> min.`, and when it lapses every shard stops enforcing it on
   the next tick — a lapsed ban bans no one even before then — and tells its
