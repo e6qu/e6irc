@@ -20,12 +20,36 @@ pub const MIN_NICKLEN: usize = 10;
 pub const MAX_CORE_WORKERS: usize = 64;
 /// Most inbound events one core shard may have queued (16× the default).
 pub const MAX_CORE_QUEUE: usize = 1 << 20;
-/// Most outbound events queued for one connection before it is killed for
-/// SendQ (64× the default). This is per connection: it bounds what one slow
-/// reader can pin.
-pub const MAX_SENDQ: usize = 1 << 16;
+/// The default SendQ: the 1,024 lines the send queue held when it counted
+/// lines, at a full 512-byte line each (RFC 1459's limit on a line without
+/// tags). Ordinary traffic queues as much as it did; what changed is that a
+/// few maximum-size tagged lines can no longer pin sixteen times that.
+pub const DEFAULT_SENDQ_BYTES: usize = 1024 * e6irc_proto::message::MAX_LINE_LEN;
+/// Most bytes queued for one connection before it is killed for SendQ (64×
+/// the default). This is per connection: it bounds what one slow reader can
+/// pin.
+pub const MAX_SENDQ_BYTES: usize = 64 * DEFAULT_SENDQ_BYTES;
+/// Fewest bytes a SendQ may hold: two of the longest lines the server sends
+/// (8,191 bytes of tags and a 512-byte line), so the half a paced LIST or WHO
+/// may take still holds one.
+pub const MIN_SENDQ_BYTES: usize = 2 * (e6irc_proto::message::MAX_SERVER_FRAME_LEN + 2);
 /// Most channels that may hold an in-memory history ring at once.
 pub const MAX_HOT_CHANNELS: usize = 1 << 20;
+/// The default byte budget of one hot history ring: its 500 entries at a
+/// kilobyte each, which an ordinary line (512 bytes of text, its msgid, its
+/// sender and the entry's own fields) stays under. Only entries carrying
+/// kilobytes of client tags, or long multiline messages, shorten a ring.
+pub const DEFAULT_HISTORY_RING_BYTES: usize = 500 * 1024;
+/// Most bytes one hot history ring may hold (128× the default).
+pub const MAX_HISTORY_RING_BYTES: usize = 128 * DEFAULT_HISTORY_RING_BYTES;
+/// The default byte budget of every hot history ring together: 512 MiB, a
+/// thousand full rings of ordinary lines — far more than the few hundred
+/// channels busy at once on a network this server is sized for — where a
+/// count of rings alone let 8,192 rings of twelve-kilobyte entries pin
+/// fifty gigabytes.
+pub const DEFAULT_HOT_HISTORY_BYTES: usize = 512 << 20;
+/// Most bytes every hot history ring together may hold (128× the default).
+pub const MAX_HOT_HISTORY_BYTES: usize = 128 * DEFAULT_HOT_HISTORY_BYTES;
 /// Most lines one configured network keeps in memory for replay (100× the
 /// default). Every attach copies the whole buffer.
 pub const MAX_NETWORK_BUFFER_CAP: usize = 100_000;
@@ -34,8 +58,8 @@ pub const MAX_NETWORK_BUFFER_CAP: usize = 100_000;
 /// to it at their respective ingresses.
 pub const MAX_ACCOUNT_NAME_LEN: usize = 64;
 
-fn default_sendq() -> usize {
-    1024
+fn default_sendq_bytes() -> usize {
+    DEFAULT_SENDQ_BYTES
 }
 fn default_core_queue() -> usize {
     65536
@@ -123,6 +147,14 @@ fn default_max_hot_channels() -> usize {
     8192
 }
 
+fn default_max_history_ring_bytes() -> usize {
+    DEFAULT_HISTORY_RING_BYTES
+}
+
+fn default_max_hot_history_bytes() -> usize {
+    DEFAULT_HOT_HISTORY_BYTES
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -140,10 +172,11 @@ pub struct Config {
     /// Maximum nick length (ISUPPORT NICKLEN).
     #[serde(default = "default_nicklen")]
     pub nicklen: usize,
-    /// Per-connection outbound queue capacity (events); overflow kills
+    /// Per-connection outbound queue capacity, in bytes (Solanum's class
+    /// `sendq`), output held behind a deferred reply included; overflow kills
     /// the client ("SendQ exceeded").
-    #[serde(default = "default_sendq")]
-    pub sendq: usize,
+    #[serde(default = "default_sendq_bytes")]
+    pub sendq_bytes: usize,
     /// Core worker inbound queue capacity; when full, connection
     /// readers stop reading their sockets (backpressure).
     #[serde(default = "default_core_queue")]
@@ -156,6 +189,14 @@ pub struct Config {
     /// beyond this; evicted channels serve CHATHISTORY from Postgres).
     #[serde(default = "default_max_hot_channels")]
     pub max_hot_channels: usize,
+    /// Byte budget of one channel's or conversation's history ring: its
+    /// oldest entries go first once it is exceeded.
+    #[serde(default = "default_max_history_ring_bytes")]
+    pub max_history_ring_bytes: usize,
+    /// Byte budget of every history ring together: the least recently active
+    /// rings are evicted once it is exceeded, as beyond `max_hot_channels`.
+    #[serde(default = "default_max_hot_history_bytes")]
+    pub max_hot_history_bytes: usize,
     /// `draft/account-registration` policy. Only meaningful with a database,
     /// since there are no accounts without one.
     #[serde(default)]
@@ -296,11 +337,13 @@ pub struct LimitsConfig {
     /// Excess connections are refused at accept (before registration).
     #[serde(default)]
     pub max_connections_per_ip: Option<usize>,
-    /// Per-session command-flood bucket size (Solanum's
-    /// `client_flood_burst_max` shape). A registered non-oper session spends
-    /// one token per command (PING/PONG exempt) and is closed with Excess
-    /// Flood when the bucket is empty. Always on: it is the bound on every
-    /// output-amplifying command class. Must be at least `command_rate`.
+    /// Per-connection command-flood bucket size (Solanum's
+    /// `client_flood_burst_max` shape). Every line a non-oper connection sends,
+    /// PING/PONG and pre-registration lines included, spends one token; when
+    /// the bucket is empty the server stops reading that connection until a
+    /// token is regained (DESIGN §7.2). Always on: it is the bound on every
+    /// output-amplifying command class and on what one connection can queue
+    /// for the core. Must be at least `command_rate`.
     #[serde(default = "default_command_burst")]
     pub command_burst: usize,
     /// Tokens the command-flood bucket regains per second, up to
@@ -313,11 +356,14 @@ pub struct LimitsConfig {
     /// when the configuration is read: an invalid CIDR is a hard error.
     #[serde(default)]
     pub trusted_proxies: Vec<ipnet::IpNet>,
-    /// Token-bucket size for the auth endpoints (credential issue + OIDC login
-    /// start), per client IP; the bucket refills to full over 60 seconds.
-    /// `None` disables auth rate limiting.
+    /// Token-bucket size for the unauthenticated, work-inducing endpoints
+    /// (password login, OIDC starts and callbacks, device authorization,
+    /// invitation and bootstrap acceptance), per client address (an IPv6
+    /// client's whole `/64`); the bucket refills to full over 60 seconds. On
+    /// by default ([`DEFAULT_AUTH_RATE_BURST`]); `"off"` disables it, for a
+    /// deployment whose reverse proxy throttles these routes itself.
     #[serde(default)]
-    pub auth_rate_burst: Option<usize>,
+    pub auth_rate_burst: AuthRateBurst,
     /// Authenticated REST requests per account per minute.
     #[serde(default = "default_api_rate_burst")]
     pub api_rate_burst: usize,
@@ -339,6 +385,87 @@ pub struct LimitsConfig {
     /// `require_sasl` already covers everyone.
     #[serde(default)]
     pub require_sasl_from: Vec<ipnet::IpNet>,
+}
+
+/// The default `limits.auth_rate_burst`: twenty requests a minute from one
+/// address. A person signing in spends two or three (the login page's POST,
+/// an OIDC start and its callback); a device polling its authorization every
+/// five seconds spends twelve a minute. The per-account attempt window bounds
+/// guessing at one account; this bounds what one address drives across all of
+/// them — names sprayed, argon2 checks, OIDC round trips, device grants.
+pub const DEFAULT_AUTH_RATE_BURST: usize = 20;
+
+/// `limits.auth_rate_burst`: how many authentication requests one client
+/// address may make at once, refilling over a minute, or `"off"`.
+///
+/// A number in a document or the stored settings, or the string `"off"`: a
+/// throttle that is on by default needs a spelling for off that no one writes
+/// by accident, and `0` (which reads as "none allowed") or a missing key
+/// (which means the default) are not it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRateBurst {
+    /// No throttle on the authentication endpoints.
+    Off,
+    /// A bucket of this many requests per client address.
+    PerMinute(usize),
+}
+
+impl Default for AuthRateBurst {
+    fn default() -> Self {
+        Self::PerMinute(DEFAULT_AUTH_RATE_BURST)
+    }
+}
+
+impl AuthRateBurst {
+    /// The bucket size, or `None` when the throttle is off.
+    pub fn burst(self) -> Option<usize> {
+        match self {
+            Self::Off => None,
+            Self::PerMinute(burst) => Some(burst),
+        }
+    }
+}
+
+impl Serialize for AuthRateBurst {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => serializer.serialize_str("off"),
+            Self::PerMinute(burst) => serializer.serialize_u64(*burst as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthRateBurst {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = AuthRateBurst;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a request count, or \"off\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<AuthRateBurst, E> {
+                usize::try_from(value)
+                    .map(AuthRateBurst::PerMinute)
+                    .map_err(|_| E::custom("auth_rate_burst is too large"))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<AuthRateBurst, E> {
+                u64::try_from(value)
+                    .map_err(|_| E::custom("auth_rate_burst must not be negative"))
+                    .and_then(|value| self.visit_u64(value))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<AuthRateBurst, E> {
+                match value {
+                    "off" => Ok(AuthRateBurst::Off),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 impl LimitsConfig {
@@ -409,7 +536,7 @@ impl Default for LimitsConfig {
             command_burst: DEFAULT_COMMAND_BURST,
             command_rate: DEFAULT_COMMAND_RATE,
             trusted_proxies: Vec::new(),
-            auth_rate_burst: None,
+            auth_rate_burst: AuthRateBurst::default(),
             api_rate_burst: DEFAULT_API_RATE_BURST,
             administrator_api_rate_burst: DEFAULT_ADMINISTRATOR_API_RATE_BURST,
             registration_burst: None,
@@ -437,11 +564,15 @@ pub struct ManagedConfig {
     pub description: String,
     pub motd: Vec<String>,
     pub nicklen: usize,
-    pub sendq: usize,
+    pub sendq_bytes: usize,
     pub core_queue: usize,
     #[serde(default = "default_core_workers")]
     pub core_workers: usize,
     pub max_hot_channels: usize,
+    #[serde(default = "default_max_history_ring_bytes")]
+    pub max_history_ring_bytes: usize,
+    #[serde(default = "default_max_hot_history_bytes")]
+    pub max_hot_history_bytes: usize,
     pub listeners: Vec<ListenerConfig>,
     pub registration: RegistrationConfig,
     pub limits: LimitsConfig,
@@ -553,10 +684,12 @@ impl ManagedConfig {
             description: config.description.clone(),
             motd: config.motd.clone(),
             nicklen: config.nicklen,
-            sendq: config.sendq,
+            sendq_bytes: config.sendq_bytes,
             core_queue: config.core_queue,
             core_workers: config.core_workers,
             max_hot_channels: config.max_hot_channels,
+            max_history_ring_bytes: config.max_history_ring_bytes,
+            max_hot_history_bytes: config.max_hot_history_bytes,
             listeners: config.listeners.clone(),
             registration: config.registration.clone(),
             limits: config.limits.clone(),
@@ -623,10 +756,12 @@ impl ManagedConfig {
         config.description.clone_from(&self.description);
         config.motd.clone_from(&self.motd);
         config.nicklen = self.nicklen;
-        config.sendq = self.sendq;
+        config.sendq_bytes = self.sendq_bytes;
         config.core_queue = self.core_queue;
         config.core_workers = self.core_workers;
         config.max_hot_channels = self.max_hot_channels;
+        config.max_history_ring_bytes = self.max_history_ring_bytes;
+        config.max_hot_history_bytes = self.max_hot_history_bytes;
         config.listeners.clone_from(&self.listeners);
         config.registration = self.registration.clone();
         config.limits = self.limits.clone();
@@ -1673,10 +1808,12 @@ impl Default for Config {
             motd: Vec::new(),
             listeners: Vec::new(),
             nicklen: default_nicklen(),
-            sendq: default_sendq(),
+            sendq_bytes: default_sendq_bytes(),
             core_queue: default_core_queue(),
             core_workers: default_core_workers(),
             max_hot_channels: default_max_hot_channels(),
+            max_history_ring_bytes: default_max_history_ring_bytes(),
+            max_hot_history_bytes: default_max_hot_history_bytes(),
             database: None,
             http: None,
             bootstrap: None,
@@ -2072,20 +2209,48 @@ impl Config {
                 "network_name must be at most 64 bytes".into(),
             ));
         }
-        if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 || self.core_workers == 0 {
+        if self.nicklen == 0
+            || self.core_queue == 0
+            || self.core_workers == 0
+            || self.max_history_ring_bytes == 0
+        {
             return Err(ConfigError::Invalid("limits must be nonzero".into()));
         }
         for (knob, value, most) in [
             ("core_workers", self.core_workers, MAX_CORE_WORKERS),
             ("core_queue", self.core_queue, MAX_CORE_QUEUE),
-            ("sendq", self.sendq, MAX_SENDQ),
+            ("sendq_bytes", self.sendq_bytes, MAX_SENDQ_BYTES),
             ("max_hot_channels", self.max_hot_channels, MAX_HOT_CHANNELS),
+            (
+                "max_history_ring_bytes",
+                self.max_history_ring_bytes,
+                MAX_HISTORY_RING_BYTES,
+            ),
+            (
+                "max_hot_history_bytes",
+                self.max_hot_history_bytes,
+                MAX_HOT_HISTORY_BYTES,
+            ),
         ] {
             if value > most {
                 return Err(ConfigError::Invalid(format!(
                     "{knob} must be at most {most} (it is {value})"
                 )));
             }
+        }
+        if self.sendq_bytes < MIN_SENDQ_BYTES {
+            return Err(ConfigError::Invalid(format!(
+                "sendq_bytes must be at least {MIN_SENDQ_BYTES}, two of the longest lines the \
+                 server sends (it is {})",
+                self.sendq_bytes
+            )));
+        }
+        if self.max_hot_history_bytes < self.max_history_ring_bytes {
+            return Err(ConfigError::Invalid(format!(
+                "max_hot_history_bytes ({}) must be at least max_history_ring_bytes ({}): the \
+                 budget of every ring together holds at least one full ring",
+                self.max_hot_history_bytes, self.max_history_ring_bytes
+            )));
         }
         self.refuse_colliding_listeners()?;
         // The advertised NICKLEN rides every relayed line's source prefix, so an
@@ -2139,9 +2304,11 @@ impl Config {
         {
             return Err(ConfigError::Invalid(error));
         }
-        if self.limits.auth_rate_burst == Some(0) {
+        if self.limits.auth_rate_burst == AuthRateBurst::PerMinute(0) {
             return Err(ConfigError::Invalid(
-                "limits.auth_rate_burst must be nonzero when set".into(),
+                "limits.auth_rate_burst must be nonzero (0 refuses every login); \"off\" turns \
+                 the throttle off"
+                    .into(),
             ));
         }
         if self.limits.api_rate_burst == 0 {
@@ -2676,9 +2843,15 @@ mod tests {
                 (|config, value| config.core_workers = value) as fn(&mut Config, usize),
             ),
             ("core_queue", |config, value| config.core_queue = value),
-            ("sendq", |config, value| config.sendq = value),
+            ("sendq_bytes", |config, value| config.sendq_bytes = value),
             ("max_hot_channels", |config, value| {
                 config.max_hot_channels = value
+            }),
+            ("max_history_ring_bytes", |config, value| {
+                config.max_history_ring_bytes = value
+            }),
+            ("max_hot_history_bytes", |config, value| {
+                config.max_hot_history_bytes = value
             }),
         ] {
             let mut config = listening_config();
@@ -2689,9 +2862,76 @@ mod tests {
         let mut config = listening_config();
         config.core_workers = MAX_CORE_WORKERS;
         config.core_queue = MAX_CORE_QUEUE;
-        config.sendq = MAX_SENDQ;
+        config.sendq_bytes = MAX_SENDQ_BYTES;
         config.max_hot_channels = MAX_HOT_CHANNELS;
+        config.max_history_ring_bytes = MAX_HISTORY_RING_BYTES;
+        config.max_hot_history_bytes = MAX_HOT_HISTORY_BYTES;
         assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    /// The authentication throttle is on unless a document says `"off"`; a
+    /// number sets it, zero is refused, and nothing else is read as off.
+    #[test]
+    fn the_auth_throttle_is_on_by_default_and_off_only_by_name() {
+        let parse = |limits: &str| {
+            toml::from_str::<Config>(&format!(
+                "server_name = \"irc.x.example\"\nnetwork_name = \"X\"\n[limits]\n{limits}"
+            ))
+        };
+        let default = parse("").expect("parse");
+        assert_eq!(
+            default.limits.auth_rate_burst,
+            AuthRateBurst::PerMinute(DEFAULT_AUTH_RATE_BURST)
+        );
+        assert_eq!(default.limits.auth_rate_burst.burst(), Some(20));
+        let off = parse("auth_rate_burst = \"off\"").expect("parse");
+        assert_eq!(off.limits.auth_rate_burst.burst(), None);
+        let set = parse("auth_rate_burst = 5").expect("parse");
+        assert_eq!(set.limits.auth_rate_burst, AuthRateBurst::PerMinute(5));
+        assert!(parse("auth_rate_burst = \"none\"").is_err());
+        assert!(parse("auth_rate_burst = -1").is_err());
+        let mut zero = listening_config();
+        zero.limits.auth_rate_burst = AuthRateBurst::PerMinute(0);
+        assert!(refusal(&zero).contains("auth_rate_burst"));
+        // The stored form round-trips both spellings.
+        for burst in [AuthRateBurst::Off, AuthRateBurst::PerMinute(7)] {
+            let json = serde_json::to_value(burst).expect("serialize");
+            assert_eq!(
+                serde_json::from_value::<AuthRateBurst>(json).expect("read"),
+                burst
+            );
+        }
+        assert_eq!(serde_json::to_value(AuthRateBurst::Off).unwrap(), "off");
+    }
+
+    /// The SendQ counts bytes now: the old line-count key is refused by name
+    /// rather than read as a byte count, and a SendQ too small for two of the
+    /// longest lines is refused.
+    #[test]
+    fn the_sendq_is_configured_in_bytes() {
+        let err = toml::from_str::<Config>(
+            "server_name = \"irc.x.example\"\nnetwork_name = \"X\"\nsendq = 1024",
+        )
+        .expect_err("the line count is gone");
+        assert!(err.to_string().contains("sendq"), "{err}");
+        assert_eq!(Config::default().sendq_bytes, 1024 * 512);
+        let mut config = listening_config();
+        config.sendq_bytes = MIN_SENDQ_BYTES - 1;
+        assert!(refusal(&config).contains("sendq_bytes"));
+        config.sendq_bytes = MIN_SENDQ_BYTES;
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    /// The budget of every history ring together holds at least one full
+    /// ring, and a ring's budget is not zero.
+    #[test]
+    fn hot_history_budgets_are_consistent() {
+        let mut config = listening_config();
+        config.max_hot_history_bytes = config.max_history_ring_bytes - 1;
+        assert!(refusal(&config).contains("max_hot_history_bytes"));
+        let mut config = listening_config();
+        config.max_history_ring_bytes = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -3657,7 +3897,7 @@ mod tests {
         let error = with(0, 20).validate().unwrap_err().to_string();
         assert!(
             error.contains("limits.command_burst"),
-            "command_burst=0 flood-kills every command and must be rejected: {error}"
+            "command_burst=0 never admits a line and must be rejected: {error}"
         );
         let error = with(10, 20).validate().unwrap_err().to_string();
         assert!(
@@ -4490,7 +4730,7 @@ account_claim = "preferred_username"
         renamed.server_name = "irc.other.example".into();
         assert!(current.requires_restart_to_reach(&renamed));
         let mut resized = current.clone();
-        resized.sendq += 1;
+        resized.sendq_bytes += 1;
         assert!(current.requires_restart_to_reach(&resized));
     }
 
@@ -4506,10 +4746,12 @@ account_claim = "preferred_username"
             description = "d"
             motd = ["m"]
             nicklen = 16
-            sendq = 1024
+            sendq_bytes = 524288
             core_queue = 1024
             core_workers = 1
             max_hot_channels = 8
+            max_history_ring_bytes = 512000
+            max_hot_history_bytes = 536870912
             [[listeners]]
             addr = "127.0.0.1:6667"
             [registration]

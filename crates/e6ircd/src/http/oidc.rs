@@ -1711,7 +1711,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
     }
 }
 
-/// A request that has spent one token from the per-IP auth-rate budget. Every
+/// A request that has spent one token from the per-address auth-rate budget
+/// (`limits.auth_rate_burst`: on by default, off only when the operator says
+/// `"off"`). Every
 /// unauthenticated, work-inducing route asks for this in its signature instead
 /// of opening with the `client_ip` + `spend_auth_budget` prologue (and pulling in
 /// `ConnectInfo` + `HeaderMap`) by hand — so the throttle is declared in one
@@ -2165,6 +2167,31 @@ pub(super) fn client_ip(
     peer
 }
 
+/// Whether a request reached this server over HTTPS, which only a trusted
+/// proxy can say: the direct peer must be in `trusted`, and every
+/// `X-Forwarded-Proto` entry it passed on — all headers, all comma-separated
+/// values — must be `https`. A client's own `https` to which a plaintext hop
+/// appended `http` is plaintext, and so is an entry that is not text, a
+/// request with no such header, or one from any other peer: the HTTP listener
+/// itself never terminates TLS.
+pub(super) fn forwarded_https(
+    peer: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[ipnet::IpNet],
+) -> bool {
+    let peer = crate::net::ClientIp::new(peer);
+    if !trusted.iter().any(|net| net.contains(&peer.ip())) {
+        return false;
+    }
+    let mut entries = headers
+        .get_all("x-forwarded-proto")
+        .iter()
+        .flat_map(|value| value.to_str().unwrap_or("").split(','))
+        .map(str::trim)
+        .peekable();
+    entries.peek().is_some() && entries.all(|entry| entry.eq_ignore_ascii_case("https"))
+}
+
 /// Parse one `X-Forwarded-For` entry to an IP, tolerating the `ip:port` and
 /// bracketed-IPv6 forms some proxies emit (`203.0.113.9:443`, `[2001:db8::1]`,
 /// `[2001:db8::1]:443`). A bare `parse::<IpAddr>()` rejects all of those, which
@@ -2196,7 +2223,7 @@ const MAX_AUTH_BUCKETS: usize = 4096;
 /// Spend one token from `client`'s auth bucket, keyed by its
 /// [`PeerLimitKey`](crate::net::PeerLimitKey) (an IPv6 client's whole `/64`).
 /// A refusal is the whole seconds until the bucket holds a token again, for
-/// the `Retry-After` header; always `Ok` when `auth_rate_burst` is unset. The
+/// the `Retry-After` header; always `Ok` when `auth_rate_burst` is `"off"`. The
 /// bucket refills to full over [`API_RATE_WINDOW`]; fully-refilled entries are
 /// pruned, and the map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow
 /// without bound even under a distinct-IP flood.

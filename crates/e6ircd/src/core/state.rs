@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
 
@@ -15,8 +16,9 @@ use e6irc_queue::Sender;
 
 use super::banmask::{MaskShape, MaskSubject};
 use super::hot_history::HotHistory;
+use super::middle::Middle;
 use super::{
-    CoreEffect, CoreShardCount, CoreShardId, Output, SessionOutput, SessionOwner, WireLine, Written,
+    CoreEffect, CoreShardCount, CoreShardId, SessionOutput, SessionOwner, WireLine, Written,
 };
 use crate::observability::Telemetry;
 
@@ -26,7 +28,7 @@ pub struct ConnId(pub u64);
 /// Casefolded channel-name key. Constructible only via
 /// [`ServerState::chan_key`], so a display-cased name can never index
 /// the channel table — that bug class is unrepresentable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChanKey(String);
 
 impl ChanKey {
@@ -915,6 +917,10 @@ pub(crate) struct PublicUser {
     pub(crate) bot: bool,
     pub(crate) invisible: bool,
     pub(crate) wallops: bool,
+    /// Umode +R: see [`Session::registered_only`].
+    pub(crate) registered_only: bool,
+    /// Umode +Z: the connection is TLS end to end ([`Session::secure`]).
+    pub(crate) secure: bool,
     pub(crate) signon: e6irc_proto::time::Millis,
     pub(crate) last_active: LastActive,
 }
@@ -934,6 +940,8 @@ impl PublicUser {
             bot: session.bot,
             invisible: session.invisible,
             wallops: session.wallops,
+            registered_only: session.registered_only,
+            secure: session.secure(),
             signon: session.signon,
             last_active: session.last_active.clone(),
         }
@@ -952,11 +960,23 @@ impl PublicUser {
             && self.bot == session.bot
             && self.invisible == session.invisible
             && self.wallops == session.wallops
+            && self.registered_only == session.registered_only
+            && self.secure == session.secure()
             && self.signon == session.signon
     }
 
     pub(crate) fn conn(&self) -> ConnId {
         self.recipient.conn()
+    }
+
+    /// Whether this user's `+R` refuses a message, notice, TAGMSG or INVITE
+    /// from `sender` (Solanum's `um_regonlymsg`): only a sender logged in to
+    /// an account, an operator, or the user itself gets through.
+    pub(crate) fn refuses_unregistered(&self, sender_conn: ConnId, sender: &Session) -> bool {
+        self.registered_only
+            && sender_conn != self.conn()
+            && sender.account().is_none()
+            && sender.oper.is_none()
     }
 
     pub(crate) fn prefix(&self) -> String {
@@ -1211,13 +1231,15 @@ pub(crate) struct CoreDirectories {
     pub(crate) topics: RetainedTopicDirectory,
     pub(crate) channel_options: ChannelOptionsDirectory,
     pub(crate) nick_registrations: NickRegistrationDirectory,
+    /// Which connections their readers let past the line meter.
+    pub(crate) flood_exemptions: crate::core::line_meter::FloodExemptions,
 }
 
 /// A validated command-flood bucket shape: `burst` tokens at most, refilling
 /// `rate` per second. Constructed only through [`CommandFlood::new`], so a
-/// bucket that never refills (`rate = 0`), that kills every command
+/// bucket that never refills (`rate = 0`), that never admits a line
 /// (`burst = 0`), or that cannot hold one second of its own rate
-/// (`burst < rate`) cannot reach the dispatcher.
+/// (`burst < rate`) cannot reach a connection's line meter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandFlood {
     burst: u32,
@@ -1245,7 +1267,7 @@ impl std::fmt::Display for CommandFloodError {
             }
             Self::BurstZero => write!(
                 f,
-                "limits.command_burst must be at least 1 (0 flood-kills every command)"
+                "limits.command_burst must be at least 1 (0 never admits a line)"
             ),
             Self::BurstBelowRate { burst, rate } => write!(
                 f,
@@ -1308,12 +1330,12 @@ pub struct CoreConfig {
     /// as the capability's value so a client knows the rules up front.
     pub registration_before_connect: bool,
     pub registration_require_email: bool,
-    /// Per-connection outbound queue capacity. The queue itself enforces this,
-    /// but output *withheld* behind a deferred reply has not reached the queue
-    /// yet, so the same bound is applied to it here — otherwise a connection
-    /// waiting on the database could accumulate lines without limit and escape
-    /// the SendQ kill entirely.
-    pub sendq: usize,
+    /// Per-connection outbound queue capacity, in bytes (`sendq_bytes`). The
+    /// queue itself enforces this, but output *withheld* behind a deferred
+    /// reply has not reached the queue yet, so the same bound is applied to it
+    /// here — otherwise a connection waiting on the database could accumulate
+    /// lines without limit and escape the SendQ kill entirely.
+    pub sendq_bytes: usize,
     pub motd: Vec<String>,
     pub nicklen: usize,
     /// Advertise and accept SASL. Off when no database is configured —
@@ -1326,6 +1348,11 @@ pub struct CoreConfig {
     /// CHATHISTORY from Postgres. Bounds hot-history RAM independently
     /// of total channel count (DESIGN §7.4, §11.3).
     pub max_hot_channels: usize,
+    /// Bytes one history ring may hold before its oldest entries go.
+    pub max_history_ring_bytes: usize,
+    /// Bytes every history ring together may hold before the least recently
+    /// active rings are evicted, as beyond `max_hot_channels`.
+    pub max_hot_history_bytes: usize,
     /// Unix-**milliseconds** clock, injected so tests are deterministic.
     /// Millisecond resolution is required, not cosmetic: `server-time` is
     /// specified to milliseconds and CHATHISTORY pages by timestamp, so a
@@ -1341,13 +1368,6 @@ pub struct CoreConfig {
     /// reaper). The wall clock stays the source only for real timestamps
     /// (`server-time`, msgids, signon).
     pub mono_clock: fn() -> e6irc_proto::time::MonoMillis,
-    /// Per-session command-flood bucket. Registered non-oper sessions spend
-    /// one token per command (PING/PONG exempt) and are closed with Excess
-    /// Flood when the bucket is empty. The server always sets it (see
-    /// `limits.command_burst`/`limits.command_rate`); `None` exists for the
-    /// in-process drivers of the test and fuzz harnesses, which pipeline
-    /// whole scripted sessions in one clock instant.
-    pub command_flood: Option<CommandFlood>,
     /// Per-client-IP account-creation bucket size; `None` disables the throttle.
     /// One token is spent per REGISTER/NickServ-REGISTER that reaches account
     /// creation; the bucket refills to full over an hour (account creation is
@@ -1710,18 +1730,27 @@ pub(crate) struct Session {
     pub wallops: bool,
     /// Bot (umode +B).
     pub bot: bool,
+    /// Only users logged in to an account may message, notice, TAGMSG or
+    /// invite this one (umode +R, Solanum's `um_regonlymsg`).
+    pub registered_only: bool,
     /// Joined channels.
     pub channels: HashSet<ChanKey>,
-    /// JOINs routed to a channel owned by another shard and not yet answered.
-    /// They count towards the per-session channel limit from the moment they
-    /// are sent: the limit is enforced here, before routing, and a pipelined
-    /// burst would otherwise be admitted without bound while its answers are
-    /// in flight. A channel this shard owns is joined in the same step and
-    /// never appears here.
-    pub pending_joins: HashSet<ChanKey>,
-    /// The subset of `pending_joins` a later `JOIN 0` must part once answered:
-    /// the JOIN reached its owner first, so it is honoured, then left.
-    pub part_on_join: HashSet<ChanKey>,
+    /// JOINs routed to a channel owned by another shard and not yet answered,
+    /// counted per channel: a client may send several to one channel before
+    /// the first is answered (a wrong key, then the right one), and the
+    /// channel is in flight until the last of them is. They count towards the
+    /// per-session channel limit from the moment they are sent: the limit is
+    /// enforced here, before routing, and a pipelined burst would otherwise
+    /// be admitted without bound while its answers are in flight. A channel
+    /// this shard owns is joined in the same step and never appears here.
+    /// Written only through [`Session::join_sent`] and
+    /// [`Session::join_answered`].
+    pending_joins: HashMap<ChanKey, NonZeroUsize>,
+    /// How many of a channel's `pending_joins` — the oldest, as the owner
+    /// answers in order — a later `JOIN 0` must part once answered: each
+    /// reached its owner first, so it is honoured, then left. Never more than
+    /// the channel's `pending_joins`.
+    part_on_join: HashMap<ChanKey, NonZeroUsize>,
     /// When this session's last KNOCK was delivered, on the monotonic clock: a
     /// user may knock once per `KNOCK_DELAY` (Solanum's `knock_delay`).
     pub last_knock: Option<e6irc_proto::time::MonoMillis>,
@@ -1729,6 +1758,13 @@ pub(crate) struct Session {
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
     pub multiline: Option<MultilineBatch>,
+    /// This connection's LIST still answering: its place in each shard's
+    /// channels and the rows of the pages not yet sent. On the session, so a
+    /// LIST cannot be paced to a connection that is gone.
+    pub(crate) channel_list: Option<crate::core::list::ChannelListCursor>,
+    /// This connection's WHO replies too long to queue at once, still going
+    /// out as its send queue drains. On the session for the same reason.
+    pub(crate) paced_who: Option<crate::core::paced::PacedReplies>,
     /// Labeled commands whose one response is being assembled from several
     /// channel owners' answers, by label.
     pub(crate) label_groups: HashMap<String, LabelGroup>,
@@ -1740,13 +1776,10 @@ pub(crate) struct Session {
     /// would write a persisted marker the client never asked to associate with the
     /// account (same reason the DM-history identity key is not back-filled).
     pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
-    /// Command-flood token bucket: tokens remaining, and the clock-millisecond
-    /// through which refill has already been credited (it advances by whole
-    /// tokens' worth only, so a sub-token remainder carries forward instead of
-    /// being discarded).
-    pub flood_tokens: u32,
-    /// Monotonic — the flood refill is a timer, not a timestamp.
-    pub flood_refilled_to_ms: e6irc_proto::time::MonoMillis,
+    /// Whether this connection's reader is told it is exempt from the line
+    /// meter ([`crate::core::line_meter`]): what `oper` was when it was last
+    /// published there.
+    flood_exempt: bool,
     /// Monotonic millisecond of the last non-keepalive command — the elapsed
     /// idle duration since it (WHOIS idle / WHOX `l`) and the reaper's idle-ping
     /// cadence both read it. (WHOIS *signon*, a real timestamp, is `signon`.)
@@ -1784,7 +1817,7 @@ pub(crate) struct Session {
     /// each reply by its own label regardless of arrival order. Only the
     /// ambiguous-overtake case above is a real hazard, and that one is closed.
     pub deferred_replies: usize,
-    pub held: Vec<Bytes>,
+    pub held: crate::core::HeldOutput,
     /// CHATHISTORY requests this session has waiting on the database, bounded
     /// by [`MAX_HISTORY_REQUESTS_IN_FLIGHT`].
     history_requests_in_flight: usize,
@@ -2010,6 +2043,59 @@ impl Index<&ConnId> for SessionStore {
 }
 
 impl Session {
+    /// A JOIN to `key` was routed to the shard that owns it.
+    pub(crate) fn join_sent(&mut self, key: ChanKey) {
+        self.pending_joins
+            .entry(key)
+            .and_modify(|count| *count = count.checked_add(1).expect("JOINs in flight counted"))
+            .or_insert(NonZeroUsize::MIN);
+    }
+
+    /// Whether a JOIN to `key` is still waiting for its answer.
+    pub(crate) fn join_in_flight(&self, key: &ChanKey) -> bool {
+        self.pending_joins.contains_key(key)
+    }
+
+    /// The channels with a JOIN still waiting for its answer.
+    pub(crate) fn joins_in_flight(&self) -> impl Iterator<Item = &ChanKey> {
+        self.pending_joins.keys()
+    }
+
+    /// `JOIN 0`: every JOIN still in flight is parted once it is answered.
+    pub(crate) fn part_joins_in_flight(&mut self) {
+        self.part_on_join.clone_from(&self.pending_joins);
+    }
+
+    /// The oldest JOIN to `key` still in flight was answered — the owner
+    /// answers a session's JOINs to one channel in the order they were sent.
+    /// Whether a `JOIN 0` was sent after it, so what it admitted must be
+    /// parted.
+    pub(crate) fn join_answered(&mut self, key: &ChanKey) -> bool {
+        fn take_one(counts: &mut HashMap<ChanKey, NonZeroUsize>, key: &ChanKey) -> bool {
+            let Some(count) = counts.get_mut(key) else {
+                return false;
+            };
+            match NonZeroUsize::new(count.get() - 1) {
+                Some(left) => *count = left,
+                None => {
+                    counts.remove(key);
+                }
+            }
+            true
+        }
+        assert!(
+            take_one(&mut self.pending_joins, key),
+            "a JOIN was answered that this session never sent"
+        );
+        take_one(&mut self.part_on_join, key)
+    }
+
+    /// How many more bytes this connection's send queue takes before it is
+    /// half full: the most a paced reply may occupy.
+    pub(crate) fn paced_room(&self) -> usize {
+        self.output.paced_room()
+    }
+
     /// Whether registration has completed.
     pub fn is_registered(&self) -> bool {
         matches!(self.reg, Registration::Registered { .. })
@@ -2119,6 +2205,17 @@ impl Session {
     }
 
     /// What a server ban is tested against for this session.
+    /// Umode +Z: whether this connection is TLS all the way to its client —
+    /// a TLS listener, or a WebSocket a trusted proxy says reached it over
+    /// HTTPS. Derived from the transport, so no client can set or clear it.
+    pub(crate) fn secure(&self) -> bool {
+        matches!(
+            self.transport,
+            crate::core::ConnectionTransport::Tls
+                | crate::core::ConnectionTransport::SecureWebSocket
+        )
+    }
+
     pub(crate) fn server_ban_subject(&self) -> ServerBanSubject<'_> {
         ServerBanSubject {
             user: self.user().unwrap_or("*"),
@@ -2363,7 +2460,10 @@ pub struct ChannelJoinSuccess {
     pub(crate) secret: bool,
     pub(crate) members: Vec<(MemberModes, MemberIdentity)>,
     pub(crate) own_join: EventLine,
-    pub(crate) own_mode: Option<EventLine>,
+    /// The MODE lines the joining brought about, in order — the joiner's
+    /// automatic op or voice, a mode lock enforced on the channel it created
+    /// — which the broadcast left the joiner out of: they follow its JOIN.
+    pub(crate) own_modes: Vec<EventLine>,
 }
 
 #[derive(Debug, Clone)]
@@ -2497,8 +2597,13 @@ impl HostChangeFallback {
 /// any shard; [`ServerState::act_on_session`] gets it there.
 #[derive(Debug)]
 pub enum SessionAction {
-    /// Oper KILL: `killer` is the name the reason and the audit attribute it to.
-    Kill { comment: String, killer: String },
+    /// Oper KILL: `killer` is the name the reason and the audit attribute it
+    /// to, `killer_prefix` the source of the `KILL` line the victim is sent.
+    Kill {
+        comment: String,
+        killer: String,
+        killer_prefix: String,
+    },
     /// NickServ GHOST, by the owner of the nick's account.
     Ghost { by: String },
     /// NickServ REGAIN of `nick`, which this session holds, by the session
@@ -2664,33 +2769,23 @@ pub struct ChannelHistoryRequest {
     pub(crate) parameters: Vec<String>,
 }
 
-/// One whole-network LIST request. Each channel shard answers once.
+/// A request for one page of a LIST: the rows of one channel shard's channels
+/// after `after`, in key order, that the LIST's conditions admit and its
+/// connection may see — at most `limit` of them.
 #[derive(Debug, Clone)]
 pub struct ChannelListRequest {
     id: ChannelListRequestId,
     session: SessionOwner,
-    actor: ChannelActor,
-    filter: crate::core::list::ListFilter,
+    shard: CoreShardId,
+    filter: Arc<crate::core::list::ListFilter>,
+    after: Option<ChanKey>,
+    limit: NonZeroUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelListRequestId(u64);
 
 impl ChannelListRequest {
-    fn new(
-        id: ChannelListRequestId,
-        session: SessionOwner,
-        actor: ChannelActor,
-        filter: crate::core::list::ListFilter,
-    ) -> Self {
-        Self {
-            id,
-            session,
-            actor,
-            filter,
-        }
-    }
-
     pub(crate) fn id(&self) -> ChannelListRequestId {
         self.id
     }
@@ -2699,29 +2794,42 @@ impl ChannelListRequest {
         self.session
     }
 
-    pub(crate) fn actor(&self) -> &ChannelActor {
-        &self.actor
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.shard
     }
 
     pub(crate) fn filter(&self) -> &crate::core::list::ListFilter {
         &self.filter
+    }
+
+    pub(crate) fn after(&self) -> Option<&ChanKey> {
+        self.after.as_ref()
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.get()
     }
 }
 
 /// One visible channel row returned by a channel shard.
 #[derive(Debug, Clone)]
 pub struct ChannelListRow {
+    pub(crate) key: ChanKey,
     pub(crate) name: String,
     pub(crate) members: usize,
     pub(crate) topic: String,
 }
 
-/// A channel shard's complete contribution to a whole-network LIST request.
+/// One page of a LIST, from the shard it was asked of.
 #[derive(Debug)]
 pub struct ChannelListResult {
     pub(crate) id: ChannelListRequestId,
     pub(crate) session: SessionOwner,
+    pub(crate) shard: CoreShardId,
     pub(crate) rows: Vec<ChannelListRow>,
+    /// The key the shard's next page starts after; `None` when it has no
+    /// channel past this page.
+    pub(crate) next: Option<ChanKey>,
 }
 
 /// A parsed channel MODE mutation, with its mode token separate from arguments.
@@ -2946,6 +3054,9 @@ pub enum ChanServStatusResult {
         target: String,
         channel: String,
         change: StatusChange,
+        /// The requester's own copy of the MODE, when it is a member: the
+        /// broadcast left it out, as it is part of the command's response.
+        echo: Option<EventLine>,
     },
     /// The change could not be recorded in the audit trail, so it was not
     /// made.
@@ -2963,8 +3074,10 @@ pub enum ChannelModeQueryResult {
     },
     Modes {
         display: String,
-        modes: String,
-        created: String,
+        /// The mode string, then each of its arguments.
+        modes: Vec<String>,
+        /// Unix seconds.
+        created: u64,
     },
 }
 
@@ -2989,7 +3102,7 @@ pub enum ChannelModeListQueryResult {
 #[derive(Debug)]
 pub struct ChannelModeList {
     pub(crate) mode: char,
-    pub(crate) masks: Vec<String>,
+    pub(crate) entries: Vec<ListEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -3138,12 +3251,28 @@ impl ChannelKick {
 
 #[derive(Debug)]
 pub enum ChannelKickResult {
-    Kicked,
-    NoSuchChannel { target: String },
-    Hidden { target: String, proof: Hidden },
-    NotOnChannel { target: String },
-    NotOperator { target: String },
-    UserNotInChannel { victim: String, channel: String },
+    /// The kicker's own copy of the KICK, which the broadcast left out: it
+    /// is the command's response, emitted by the kicker's session.
+    Kicked {
+        echo: EventLine,
+    },
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+        proof: Hidden,
+    },
+    NotOnChannel {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    UserNotInChannel {
+        victim: String,
+        channel: String,
+    },
 }
 
 /// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
@@ -3367,30 +3496,34 @@ impl ChanModes {
         })
     }
 
-    /// `+nt`-style string with key/limit args appended. `reveal_key` gates
-    /// the `+k` argument: only channel members may see the key, so that
-    /// `MODE #chan` from an outsider cannot disclose it and bypass `+k`.
-    /// The limit is not secret and is always shown.
-    pub fn to_string_with_args(&self, reveal_key: bool) -> String {
+    /// The `+nt`-style mode string, then the key and limit arguments, each a
+    /// parameter of its own. `member` gates both arguments, as Solanum's
+    /// `channel_modes` does: a member sees `+kl key 10`, an outsider `+kl` —
+    /// told that a key and a limit are set, but shown neither the key (which
+    /// would bypass `+k`) nor the limit.
+    pub(crate) fn with_args(&self, member: bool) -> Vec<String> {
         let mut modes = String::from("+");
-        let mut args = String::new();
+        let mut args = Vec::new();
         for c in Self::FLAGS.chars() {
             if self.flag(c) == Some(true) {
                 modes.push(c);
             }
         }
         if let Some(k) = &self.key {
-            // Members see the key; outsiders see `*` (Solanum behaviour) so
-            // MODE #chan reveals that +k is set without disclosing the value.
             modes.push('k');
-            args.push(' ');
-            args.push_str(if reveal_key { k } else { "*" });
+            if member {
+                args.push(k.clone());
+            }
         }
         if let Some(l) = self.limit {
             modes.push('l');
-            args.push_str(&format!(" {l}"));
+            if member {
+                args.push(l.to_string());
+            }
         }
-        modes + &args
+        let mut params = vec![modes];
+        params.extend(args);
+        params
     }
 }
 
@@ -3608,6 +3741,24 @@ impl BanKind {
         }
     }
 
+    /// The command that adds a ban of this kind, as replies name it.
+    pub(crate) fn add_command(self) -> &'static str {
+        match self {
+            BanKind::Kline => "KLINE",
+            BanKind::Dline => "DLINE",
+            BanKind::Xline => "XLINE",
+        }
+    }
+
+    /// The command that removes a ban of this kind, as replies name it.
+    pub(crate) fn remove_command(self) -> &'static str {
+        match self {
+            BanKind::Kline => "UNKLINE",
+            BanKind::Dline => "UNDLINE",
+            BanKind::Xline => "UNXLINE",
+        }
+    }
+
     /// Human label used in NOTICE/ERROR lines ("K-Line", "D-Line", …).
     pub fn label(self) -> &'static str {
         match self {
@@ -3632,6 +3783,9 @@ pub struct ServerBan {
     pub reason: String,
     pub set_by: String,
     pub kind: BanKind,
+    /// When a temporary ban lapses, in Unix seconds on the wall clock;
+    /// `None` for a permanent ban.
+    pub expires_at_secs: Option<u64>,
 }
 
 /// The part of a server-ban `reason` the banned user and their peers are
@@ -3654,6 +3808,19 @@ pub(crate) struct ServerBanSubject<'a> {
 }
 
 impl ServerBan {
+    /// Whether this ban is enforced at `now_secs` (Unix seconds): a permanent
+    /// ban always, a temporary one until the second it lapses.
+    pub(crate) fn in_force(&self, now_secs: u64) -> bool {
+        self.expires_at_secs.is_none_or(|at| now_secs < at)
+    }
+
+    /// Whole minutes left of a temporary ban at `now_secs`, rounded up so a
+    /// ban in force never reads as 0; `None` for a permanent ban.
+    pub(crate) fn minutes_left(&self, now_secs: u64) -> Option<u64> {
+        self.expires_at_secs
+            .map(|at| at.saturating_sub(now_secs).div_ceil(60))
+    }
+
     /// Whether this ban matches `subject`. A K-line is a `user@host` mask whose
     /// host may be an address or CIDR range (matched against the real
     /// address) or a glob (tried against the shown host and the address); a
@@ -3680,6 +3847,18 @@ impl ServerBan {
     }
 }
 
+/// One entry of a channel's `+b`/`+q`/`+e`/`+I` list: the mask, and who set
+/// it when, as RPL_BANLIST and its siblings report them (Solanum's
+/// `367 <me> <channel> <mask> <setter> <set-at>`).
+#[derive(Clone, Debug)]
+pub(crate) struct ListEntry {
+    pub mask: MaskKey,
+    /// The setter's `nick!user@host`.
+    pub set_by: String,
+    /// Unix seconds, as the list replies report it.
+    pub set_at_secs: u64,
+}
+
 pub(crate) struct Channel {
     /// Display name (creator's casing).
     pub name: String,
@@ -3687,10 +3866,10 @@ pub(crate) struct Channel {
     members: HashMap<ConnId, ChannelMember>,
     recipients: RefCell<Option<Arc<[Recipient]>>>,
     pub modes: ChanModes,
-    pub bans: Vec<MaskKey>,
-    pub quiets: Vec<MaskKey>,
-    pub ban_exceptions: Vec<MaskKey>,
-    pub invite_exceptions: Vec<MaskKey>,
+    pub bans: Vec<ListEntry>,
+    pub quiets: Vec<ListEntry>,
+    pub ban_exceptions: Vec<ListEntry>,
+    pub invite_exceptions: Vec<ListEntry>,
     /// Connections holding a pending INVITE into this channel (consumed on
     /// join), which admits past `+i` and `+l`. Recorded only while the channel
     /// has one of those, from an operator or, on a `+g` channel, any member.
@@ -3900,14 +4079,6 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes, &member.identity, &member.profile))
     }
 
-    pub fn operator_recipients(&self) -> Vec<(Recipient, String)> {
-        self.members
-            .values()
-            .filter(|member| member.modes.op)
-            .map(|member| (member.recipient, member.identity.nick.clone()))
-            .collect()
-    }
-
     /// Resolve a member from channel-owned identity data.
     pub fn member_named(
         &self,
@@ -3935,19 +4106,28 @@ impl Channel {
         (self.modes.secret && !self.is_member(conn)).then_some(Hidden(()))
     }
 
-    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &MaskSubject<'_>) -> bool {
-        masks.iter().any(|m| m.matches(casemap, subject))
+    fn any_match<'a>(
+        casemap: CaseMapping,
+        masks: impl IntoIterator<Item = &'a MaskKey>,
+        subject: &MaskSubject<'_>,
+    ) -> bool {
+        masks.into_iter().any(|m| m.matches(casemap, subject))
+    }
+
+    /// The masks of one of this channel's lists.
+    fn masks(list: &[ListEntry]) -> impl Iterator<Item = &MaskKey> {
+        list.iter().map(|entry| &entry.mask)
     }
 
     pub(crate) fn is_banned(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
-        Self::any_match(casemap, &self.bans, subject)
-            && !Self::any_match(casemap, &self.ban_exceptions, subject)
+        Self::any_match(casemap, Self::masks(&self.bans), subject)
+            && !Self::any_match(casemap, Self::masks(&self.ban_exceptions), subject)
     }
 
     /// Quiets share the ban-exception machinery (Solanum semantics).
     pub(crate) fn is_quieted(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
-        Self::any_match(casemap, &self.quiets, subject)
-            && !Self::any_match(casemap, &self.ban_exceptions, subject)
+        Self::any_match(casemap, Self::masks(&self.quiets), subject)
+            && !Self::any_match(casemap, Self::masks(&self.ban_exceptions), subject)
     }
 
     pub(crate) fn is_invite_excepted(
@@ -3955,7 +4135,7 @@ impl Channel {
         casemap: CaseMapping,
         subject: &MaskSubject<'_>,
     ) -> bool {
-        Self::any_match(casemap, &self.invite_exceptions, subject)
+        Self::any_match(casemap, Self::masks(&self.invite_exceptions), subject)
     }
 
     /// Whether a sender with membership `member` (its `MemberModes`, or `None`
@@ -4037,7 +4217,8 @@ impl ChannelOwner {
 
 pub(crate) struct ChannelDirectory {
     shards: CoreShardCount,
-    channels: HashMap<ChanKey, Channel>,
+    /// Ordered, so a LIST can keep its place in it as a key (§7.2).
+    channels: std::collections::BTreeMap<ChanKey, Channel>,
     /// Channels handed out mutably, or removed, since the last
     /// [`ChannelDirectory::take_touched`]: the only ones whose published
     /// description can have changed.
@@ -4053,7 +4234,7 @@ impl ChannelDirectory {
     pub(crate) fn new(shards: CoreShardCount) -> Self {
         Self {
             shards,
-            channels: HashMap::new(),
+            channels: std::collections::BTreeMap::new(),
             touched: Vec::new(),
             activity_touched: Vec::new(),
         }
@@ -4100,7 +4281,7 @@ impl ChannelDirectory {
     pub(crate) fn entry(
         &mut self,
         key: ChanKey,
-    ) -> std::collections::hash_map::Entry<'_, ChanKey, Channel> {
+    ) -> std::collections::btree_map::Entry<'_, ChanKey, Channel> {
         self.touched.push(key.clone());
         self.channels.entry(key)
     }
@@ -4114,8 +4295,14 @@ impl ChannelDirectory {
         self.channels.len()
     }
 
-    pub(crate) fn iter(&self) -> std::collections::hash_map::Iter<'_, ChanKey, Channel> {
-        self.channels.iter()
+    /// This shard's channels in key order, from the first after `after` (from
+    /// the very first when `None`).
+    pub(crate) fn after(
+        &self,
+        after: Option<&ChanKey>,
+    ) -> std::collections::btree_map::Range<'_, ChanKey, Channel> {
+        let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        self.channels.range((start, std::ops::Bound::Unbounded))
     }
 }
 
@@ -4147,6 +4334,9 @@ pub(crate) struct ServerState {
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
+    /// The line meter's exemptions, which this shard publishes for its own
+    /// sessions ([`Self::sync_flood_exemption`]).
+    flood_exemptions: crate::core::line_meter::FloodExemptions,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
@@ -4265,12 +4455,12 @@ pub(crate) struct ServerState {
     pub pending_channel_controls: HashMap<u64, PendingChannelControl>,
     /// Monotonic request ID source for `pending_channel_controls`.
     pub channel_control_id: u64,
-    /// Each connection's LIST still answering, gathering or sending.
-    pub(crate) channel_lists: HashMap<ConnId, crate::core::list::ListProgress>,
     channel_list_id: u64,
-    /// Each connection's WHO replies too long to queue at once, still going
-    /// out as its send queue drains.
-    pub(crate) paced_replies: HashMap<ConnId, crate::core::paced::PacedReplies>,
+    /// The connections with a LIST or WHO reply being paced out: which
+    /// sessions the pacing turn visits. The paced output itself lives on the
+    /// session ([`Session::channel_list`], [`Session::paced_who`]), so it
+    /// cannot outlive the connection it answers.
+    pub(crate) pacing: HashSet<ConnId>,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -4438,7 +4628,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelJoin {
+            .push(CoreEffect::input(crate::core::Input::ChannelJoin {
                 owner,
                 actor,
                 name,
@@ -4455,7 +4645,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelJoinResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelJoinResult {
                 session,
                 requested,
                 result,
@@ -4472,7 +4662,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelPart {
+            .push(CoreEffect::input(crate::core::Input::ChannelPart {
                 owner,
                 actor,
                 name,
@@ -4488,7 +4678,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelPartResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelPartResult {
                 session,
                 result,
                 label,
@@ -4497,12 +4687,12 @@ impl ServerState {
 
     pub fn route_quit(&mut self, quit: ChannelQuit) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelQuit { quit }));
+            .push(CoreEffect::input(crate::core::Input::ChannelQuit { quit }));
     }
 
     pub fn route_topic(&mut self, topic: ChannelTopic) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTopic {
+            .push(CoreEffect::input(crate::core::Input::ChannelTopic {
                 topic,
             }));
     }
@@ -4514,7 +4704,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTopicResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelTopicResult {
                 session,
                 result,
                 label,
@@ -4523,13 +4713,13 @@ impl ServerState {
 
     pub fn route_channel_command(&mut self, command: ChannelCommand) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelCommand {
+            .push(CoreEffect::input(crate::core::Input::ChannelCommand {
                 command,
             }));
     }
 
     pub(crate) fn route_input(&mut self, input: crate::core::Input) {
-        self.effects.push(CoreEffect::Input(input));
+        self.effects.push(CoreEffect::input(input));
     }
 
     pub fn route_channel_command_result(
@@ -4538,7 +4728,7 @@ impl ServerState {
         result: ChannelCommandResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::Input(
+        self.effects.push(CoreEffect::input(
             crate::core::Input::ChannelCommandResult {
                 session,
                 result,
@@ -4547,38 +4737,55 @@ impl ServerState {
         ));
     }
 
-    /// Ask every channel shard for `conn`'s LIST rows; the connection has no
-    /// LIST in progress.
+    /// Begin `conn`'s LIST, whose reply is already open (inside `batch` when
+    /// labeled): a cursor at the start of every channel shard. The connection
+    /// has no LIST in progress.
     pub fn start_channel_list(
         &mut self,
         conn: ConnId,
-        label: Option<String>,
+        batch: Option<String>,
         filter: crate::core::list::ListFilter,
-    ) -> ChannelListRequest {
+    ) {
         let id = ChannelListRequestId(self.channel_list_id);
         self.channel_list_id = self
             .channel_list_id
             .checked_add(1)
             .expect("channel LIST request identifiers exhausted");
-        let session = SessionOwner::new(conn, self.shard);
-        let request = ChannelListRequest::new(id, session, self.channel_actor(conn), filter);
-        let previous = self.channel_lists.insert(
-            conn,
-            crate::core::list::ListProgress::Gathering {
-                id,
-                label,
-                remaining: self.channels.shard_count(),
-                rows: Vec::new(),
-                aborted: false,
-            },
-        );
+        let shards = self.channels.shard_count();
+        let session = self
+            .sessions
+            .output_mut(&conn)
+            .expect("a LIST is started by the session sending it");
+        let previous = session
+            .channel_list
+            .replace(crate::core::list::ChannelListCursor::new(
+                id, filter, batch, shards,
+            ));
         assert!(previous.is_none(), "a connection has one LIST in progress");
-        request
     }
 
-    pub fn route_channel_list(&mut self, request: ChannelListRequest) {
+    /// Ask channel shard `shard` for the next page of `conn`'s LIST: at most
+    /// `limit` rows after `after`.
+    pub(crate) fn route_channel_list_page(
+        &mut self,
+        conn: ConnId,
+        cursor: &crate::core::list::ChannelListCursor,
+        shard: usize,
+        after: Option<ChanKey>,
+        limit: NonZeroUsize,
+    ) {
+        let request = ChannelListRequest {
+            id: cursor.id,
+            session: SessionOwner::new(conn, self.shard),
+            shard: CoreShardId::new(shard),
+            filter: Arc::clone(&cursor.filter),
+            after,
+            limit,
+        };
         self.effects
-            .push(CoreEffect::BroadcastChannelList { request });
+            .push(CoreEffect::input(crate::core::Input::ChannelList {
+                request,
+            }));
     }
 
     pub(crate) fn has_single_core_shard(&self) -> bool {
@@ -4587,58 +4794,28 @@ impl ServerState {
 
     pub fn route_channel_list_result(&mut self, result: ChannelListResult) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelListResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelListResult {
                 result,
             }));
     }
 
-    /// Add one shard's rows to the LIST they answer: the whole LIST once the
-    /// last shard's are in. `None` while others are outstanding, or when the
-    /// connection closed in the meantime.
-    pub fn take_channel_list(
-        &mut self,
-        result: ChannelListResult,
-    ) -> Option<crate::core::list::GatheredList> {
-        use crate::core::list::{GatheredList, ListProgress};
-        let conn = result.session.conn();
-        let Some(ListProgress::Gathering {
-            id,
-            remaining,
-            rows,
-            ..
-        }) = self.channel_lists.get_mut(&conn)
-        else {
-            // Rows reach only a connection still gathering them: it has at
-            // most one LIST, which stops gathering once the last shard's rows
-            // are in. A closed connection's LIST is simply gone.
-            assert!(
-                !self.channel_lists.contains_key(&conn),
-                "LIST rows reached a connection that is not gathering them"
-            );
-            return None;
+    /// Hand one shard's page to the LIST that asked for it. `false` when there
+    /// is none to take it: the connection closed, or the LIST that asked was
+    /// aborted by another since — the page answers a question nobody is
+    /// asking any more, and goes with it.
+    pub fn accept_channel_list_page(&mut self, result: ChannelListResult) -> bool {
+        let Some(session) = self.sessions.output_mut(&result.session.conn()) else {
+            return false;
         };
-        assert_eq!(*id, result.id, "LIST rows reached another LIST");
-        *remaining = remaining
-            .checked_sub(1)
-            .expect("LIST received too many shard results");
-        rows.extend(result.rows);
-        if *remaining > 0 {
-            return None;
-        }
-        let Some(ListProgress::Gathering {
-            label,
-            rows,
-            aborted,
-            ..
-        }) = self.channel_lists.remove(&conn)
+        let Some(cursor) = session
+            .channel_list
+            .as_mut()
+            .filter(|cursor| cursor.id == result.id)
         else {
-            unreachable!("the LIST was gathering a moment ago");
+            return false;
         };
-        Some(GatheredList {
-            label,
-            rows,
-            aborted,
-        })
+        cursor.accept(result.shard.0, result.rows, result.next);
+        true
     }
 
     pub fn route_channel_session_event(
@@ -4647,20 +4824,20 @@ impl ServerState {
         event: ChannelSessionEvent,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelSessionEvent {
+            .push(CoreEffect::input(crate::core::Input::ChannelSessionEvent {
                 session,
                 event,
             }));
     }
 
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
-        self.effects.push(crate::core::CoreEffect::Input(
+        self.effects.push(crate::core::CoreEffect::input(
             crate::core::Input::SessionChannelRemoved { session, key },
         ));
     }
 
     pub fn route_kick(&mut self, kick: ChannelKick) {
-        self.effects.push(crate::core::CoreEffect::Input(
+        self.effects.push(crate::core::CoreEffect::input(
             crate::core::Input::ChannelKick { kick },
         ));
     }
@@ -4671,7 +4848,7 @@ impl ServerState {
         result: ChannelKickResult,
         label: Option<String>,
     ) {
-        self.effects.push(crate::core::CoreEffect::Input(
+        self.effects.push(crate::core::CoreEffect::input(
             crate::core::Input::ChannelKickResult {
                 session,
                 result,
@@ -4705,7 +4882,7 @@ impl ServerState {
 
     pub fn route_message(&mut self, message: ChannelMessage) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelMessage {
+            .push(CoreEffect::input(crate::core::Input::ChannelMessage {
                 message,
             }));
     }
@@ -4716,7 +4893,7 @@ impl ServerState {
         result: ChannelMessageResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::Input(
+        self.effects.push(CoreEffect::input(
             crate::core::Input::ChannelMessageResult {
                 session,
                 result,
@@ -4727,7 +4904,7 @@ impl ServerState {
 
     pub fn route_multiline(&mut self, message: ChannelMultiline) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelMultiline {
+            .push(CoreEffect::input(crate::core::Input::ChannelMultiline {
                 message,
             }));
     }
@@ -4737,14 +4914,14 @@ impl ServerState {
         session: SessionOwner,
         result: ChannelMultilineResult,
     ) {
-        self.effects.push(CoreEffect::Input(
+        self.effects.push(CoreEffect::input(
             crate::core::Input::ChannelMultilineResult { session, result },
         ));
     }
 
     pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsg {
+            .push(CoreEffect::input(crate::core::Input::ChannelTagmsg {
                 tagmsg,
             }));
     }
@@ -4756,7 +4933,7 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects
-            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsgResult {
+            .push(CoreEffect::input(crate::core::Input::ChannelTagmsgResult {
                 session,
                 result,
                 label,
@@ -4810,7 +4987,7 @@ impl ServerState {
                 self.apply_channel_member_update(update);
             } else {
                 self.effects
-                    .push(CoreEffect::Input(crate::core::Input::ChannelMemberUpdate {
+                    .push(CoreEffect::input(crate::core::Input::ChannelMemberUpdate {
                         update,
                     }));
             }
@@ -4836,9 +5013,9 @@ impl ServerState {
                 latest_message: self.latest_channel_message(key),
                 created_at: channel.created_at,
                 silencing: SilencingMasks {
-                    bans: channel.bans.clone(),
-                    quiets: channel.quiets.clone(),
-                    exceptions: channel.ban_exceptions.clone(),
+                    bans: Channel::masks(&channel.bans).cloned().collect(),
+                    quiets: Channel::masks(&channel.quiets).cloned().collect(),
+                    exceptions: Channel::masks(&channel.ban_exceptions).cloned().collect(),
                 },
             });
             self.memberships.publish_channel(key, published);
@@ -4908,7 +5085,11 @@ impl ServerState {
         let mut by_shard: std::collections::BTreeMap<usize, Vec<ChannelOwner>> =
             std::collections::BTreeMap::new();
         let session = &self.sessions[&conn];
-        for key in session.channels.iter().chain(&session.pending_joins) {
+        // A channel rejoined while a member is in both: it is named once.
+        let in_flight = session
+            .joins_in_flight()
+            .filter(|key| !session.channels.contains(*key));
+        for key in session.channels.iter().chain(in_flight) {
             let owner = self.channels.owner(key);
             by_shard.entry(owner.shard().0).or_default().push(owner);
         }
@@ -5222,6 +5403,7 @@ impl ServerState {
             pending_server_bans: HashSet::new(),
             whowas: directories.whowas,
             census: directories.census,
+            flood_exemptions: directories.flood_exemptions,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,
@@ -5235,8 +5417,7 @@ impl ServerState {
             admin_connection_list_id: 0,
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
-            channel_lists: HashMap::new(),
-            paced_replies: HashMap::new(),
+            pacing: HashSet::new(),
             channel_list_id: 0,
         }
     }
@@ -5278,7 +5459,7 @@ impl ServerState {
         }
         let entry = buckets.entry(key).or_insert((burst, now));
         // The refill watermark is monotonic; guard against a non-monotonic
-        // source as defense in depth (same as the command-flood bucket).
+        // source as defense in depth.
         if now < entry.1 {
             entry.1 = now;
         }
@@ -5294,8 +5475,10 @@ impl ServerState {
     }
 
     /// Append to a target's hot ring, creating it if absent, and keep the
-    /// global LRU within `max_hot_channels`: this target is touched to MRU and
-    /// the least-recently-active ring is evicted once the cap is exceeded. An
+    /// global LRU within `max_hot_channels` and `max_hot_history_bytes`: this
+    /// target is touched to MRU and the least-recently-active rings are
+    /// evicted once either is exceeded, as its own oldest entries are past
+    /// `max_history_ring_bytes`. An
     /// evicted or overflowed ring is marked incomplete, so CHATHISTORY pages
     /// the remainder from Postgres rather than reporting a short history.
     ///
@@ -5313,9 +5496,12 @@ impl ServerState {
         let whole_record = !self.config.sasl_enabled;
         // Evicted targets keep no ring at all; their history is served from
         // Postgres.
-        let evicted = self
-            .history
-            .push(key, entry, whole_record, self.config.max_hot_channels);
+        let bounds = crate::core::hot_history::HotHistoryBounds {
+            rings: self.config.max_hot_channels,
+            ring_bytes: self.config.max_history_ring_bytes,
+            bytes: self.config.max_hot_history_bytes,
+        };
+        let evicted = self.history.push(key, entry, whole_record, bounds);
         self.channel_ring_changed(key);
         for cold in evicted {
             self.channel_ring_changed(&cold);
@@ -5804,31 +5990,48 @@ impl ServerState {
         }
     }
 
-    /// Load persisted server bans as `(mask, reason, set_by, kind)` rows.
+    /// Load the persisted server bans still in force.
     pub fn preload_server_bans(
         &mut self,
-        rows: Vec<(String, String, String, String)>,
+        rows: Vec<crate::db::PersistedServerBan>,
     ) -> Result<(), String> {
         let casemap = self.casemap;
         let mut bans = Vec::with_capacity(rows.len());
-        for (mask, reason, set_by, kind) in rows {
-            let kind = BanKind::from_token(&kind)
-                .ok_or_else(|| format!("invalid persisted server-ban kind {kind:?}"))?;
+        for row in rows {
+            let kind = BanKind::from_token(&row.kind)
+                .ok_or_else(|| format!("invalid persisted server-ban kind {:?}", row.kind))?;
+            let expires_at_secs = row
+                .expires_at
+                .map(|at| {
+                    u64::try_from(at)
+                        .map_err(|_| format!("invalid persisted server-ban expiry {at}"))
+                })
+                .transpose()?;
             bans.push(ServerBan {
-                mask: MaskKey::new(&mask, casemap),
-                reason,
-                set_by,
+                mask: MaskKey::new(&row.mask, casemap),
+                reason: row.reason,
+                set_by: row.set_by,
                 kind,
+                expires_at_secs,
             });
         }
         self.server_bans = bans;
         Ok(())
     }
 
-    /// The `(kind, reason)` of the first server ban matching `subject`, if any.
-    pub(crate) fn ban_match(&self, subject: &ServerBanSubject<'_>) -> Option<(BanKind, String)> {
+    /// The server bans in force now, the ones every surface acts on: a
+    /// temporary ban past its expiry bans no one and is listed nowhere, even
+    /// before the next tick drops it (`oper::expire_server_bans`).
+    pub(crate) fn server_bans_in_force(&self) -> impl Iterator<Item = &ServerBan> {
+        let now_secs = (self.config.clock)().as_secs();
         self.server_bans
             .iter()
+            .filter(move |ban| ban.in_force(now_secs))
+    }
+
+    /// The `(kind, reason)` of the first server ban matching `subject`, if any.
+    pub(crate) fn ban_match(&self, subject: &ServerBanSubject<'_>) -> Option<(BanKind, String)> {
+        self.server_bans_in_force()
             .find(|ban| ban.matches(self.casemap, subject))
             .map(|ban| (ban.kind, ban.reason.clone()))
     }
@@ -6086,7 +6289,7 @@ impl ServerState {
     pub fn open(
         &mut self,
         conn: ConnId,
-        tx: Sender<Output>,
+        tx: crate::core::SendQueue,
         host: String,
         transport: crate::core::ConnectionTransport,
     ) {
@@ -6129,24 +6332,18 @@ impl ServerState {
                 invisible: false,
                 wallops: false,
                 bot: false,
+                registered_only: false,
                 channels: HashSet::new(),
-                pending_joins: HashSet::new(),
-                part_on_join: HashSet::new(),
+                pending_joins: HashMap::new(),
+                part_on_join: HashMap::new(),
                 last_knock: None,
                 monitoring: HashMap::new(),
                 multiline: None,
+                channel_list: None,
+                paced_who: None,
                 label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
-                // Seed the flood bucket full, with its refill watermark at the
-                // open time — NOT a zero `MonoMillis` sentinel. The monotonic
-                // clock's epoch is process start, so a zero watermark makes the
-                // first refill credit `now - 0 = uptime` seconds: within the
-                // first burst-many seconds of uptime the bucket would start
-                // at only `min(uptime, burst)` tokens and wrongly kill a client
-                // that pipelines a legitimate burst — worst exactly during a
-                // post-restart reconnect storm.
-                flood_tokens: self.config.command_flood.map_or(0, CommandFlood::burst),
-                flood_refilled_to_ms: opened_at,
+                flood_exempt: false,
                 // Every monotonic watermark is seeded from the open time, never a
                 // zero `MonoMillis` sentinel. A zero would be indistinguishable
                 // from a real early reading (the mono epoch IS process start), so
@@ -6162,7 +6359,7 @@ impl ServerState {
                 deferred_replies: 0,
                 history_requests_in_flight: 0,
                 published: None,
-                held: Vec::new(),
+                held: crate::core::HeldOutput::default(),
                 last_ping_sent: opened_at,
             },
         );
@@ -6237,12 +6434,10 @@ impl ServerState {
         // like the queue it is waiting to enter: overflowing it is a SendQ
         // kill, not unbounded growth.
         if self.emitting_deferred != Some(conn) {
-            let sendq = self.config.sendq;
+            let sendq_bytes = self.config.sendq_bytes;
             match self.sessions.output_mut(&conn) {
                 Some(session) if session.deferred_replies > 0 => {
-                    if session.held.len() < sendq {
-                        session.held.push(bytes);
-                    } else {
+                    if !session.held.hold(bytes, sendq_bytes) {
                         self.doomed.push(conn);
                     }
                     return;
@@ -6483,20 +6678,6 @@ impl ServerState {
         }
     }
 
-    /// `:<server> <code> <target> <params…>`; the last param gets the
-    /// trailing `:` if given as `trailing`.
-    /// Longest middle parameter `numeric` passes through unclipped. Every
-    /// legitimate middle is a short token by construction — a nick (≤ nicklen),
-    /// a channel display name (≤ 50), a mode/ISUPPORT string, a number, a
-    /// USERLEN-bounded username or 63-byte host. Anything longer is a
-    /// client-supplied token being echoed for attribution (an unknown command,
-    /// a bad target, a rejected list), whose length is bounded only by the
-    /// input frame; unclipped it can push the reply explaining an error past
-    /// the wire limit, and the recipient's framing then discards that very
-    /// reply. Clipping at this one funnel closes the whole echo family rather
-    /// than each numeric separately.
-    const NUMERIC_MIDDLE_MAX: usize = 100;
-
     fn reply_target(&self, conn: ConnId) -> String {
         self.capture
             .as_ref()
@@ -6518,7 +6699,17 @@ impl ServerState {
             .or_else(|| self.sessions.get(&conn).map(|session| session.caps))
     }
 
-    pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {
+    /// `:<server> <code> <target> <middles…>`, then ` :<trailing>` when given.
+    /// Each [`Middle`] is written as exactly one parameter, so no middle can
+    /// split, shift or end the reply's parameters; free text (a realname, a
+    /// reason) goes in the trailing.
+    pub(crate) fn numeric(
+        &mut self,
+        conn: ConnId,
+        code: u16,
+        middle: &[Middle<'_>],
+        trailing: Option<&str>,
+    ) {
         let line = self.numeric_line(conn, code, middle, trailing);
         self.send(conn, &line);
     }
@@ -6528,7 +6719,7 @@ impl ServerState {
         &self,
         conn: ConnId,
         code: u16,
-        middle: &[&str],
+        middle: &[Middle<'_>],
         trailing: Option<&str>,
     ) -> String {
         let target = self.reply_target(conn);
@@ -6558,25 +6749,13 @@ impl ServerState {
             if avail <= 1 {
                 break;
             }
-            line.push(' ');
-            // A middle that can't stand as a wire parameter would corrupt the
-            // reply's framing — an empty one collapses into the separator, a
-            // ':'-leading one opens the trailing early, CR/LF/NUL break the line
-            // (the WHOX-token class, and every error numeric that echoes a raw
-            // client target/nick/mode-char). Since one worker serves every
-            // client, the funnel renders such a segment as the conventional "*"
-            // placeholder rather than ship a line the client misparses — the
-            // same wire-safety normalization as the length clip right below it,
-            // and it makes the whole framing-corruption class unrepresentable at
-            // this single choke point instead of one echo site at a time. A
-            // segment carrying a mode-string joined to its (space-validated)
-            // args is unaffected: only the leading byte and control bytes matter.
-            if numeric_middle_violation(p).is_some() {
-                line.push('*');
-                continue;
+            // A cut inside the first character would leave an empty parameter.
+            let fitted = e6irc_proto::message::truncate_on_char_boundary(p.wire(), avail - 1);
+            if fitted.is_empty() {
+                break;
             }
-            let cap = Self::NUMERIC_MIDDLE_MAX.min(avail - 1);
-            line.push_str(e6irc_proto::message::truncate_on_char_boundary(p, cap));
+            line.push(' ');
+            line.push_str(fitted);
         }
         if let Some(t) = trailing {
             line.push_str(" :");
@@ -6593,12 +6772,13 @@ impl ServerState {
     }
 
     /// `:<server> NOTICE <target> :<text>`, from the server itself, without
-    /// sending it.
+    /// sending it; `text` is fitted to the line
+    /// ([`server_notice`](crate::core::handler::server_notice)).
     pub(crate) fn server_notice_line(&self, conn: ConnId, text: &str) -> String {
-        format!(
-            ":{} NOTICE {} :{text}",
-            self.config.server_name,
-            self.reply_target(conn)
+        crate::core::handler::server_notice(
+            &self.config.server_name,
+            &self.reply_target(conn),
+            text,
         )
     }
 
@@ -6612,63 +6792,112 @@ impl ServerState {
         self.emitting_deferred = previous;
     }
 
-    /// How many more lines `conn`'s send queue takes before it is half full,
-    /// the most a paced reply may occupy (`None` when the session is gone).
-    pub(crate) fn paced_room(&self, conn: ConnId) -> Option<usize> {
-        self.sessions
-            .get(&conn)
-            .map(|session| session.output.paced_room())
+    /// `conn`'s session's paced output of one kind, taken out by `take` to be
+    /// sent, with how many more bytes its send queue takes before it is half
+    /// full: the most a paced reply may occupy. `None` when there is none to
+    /// send — which is also what a closed connection has, its paced output
+    /// having gone with its session. What is left over goes back through
+    /// [`Self::resume_paced`].
+    pub(crate) fn take_paced<T>(
+        &mut self,
+        conn: ConnId,
+        take: impl FnOnce(&mut Session) -> Option<T>,
+    ) -> Option<(usize, T)> {
+        let session = self.sessions.output_mut(&conn)?;
+        let paced = take(session)?;
+        Some((session.paced_room(), paced))
     }
 
-    /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`.
-    pub fn err_needmoreparams(&mut self, conn: ConnId, cmd: &str) {
+    /// Queue a WHO reply to be paced out to `conn`, behind any already
+    /// going. A closed connection's paced output went with its session
+    /// (`ServerState::close`); so does this.
+    pub(crate) fn queue_paced_who(&mut self, conn: ConnId, reply: crate::core::paced::PacedReply) {
+        let Some(session) = self.sessions.output_mut(&conn) else {
+            return;
+        };
+        session.paced_who.get_or_insert_default().push(reply);
+        self.pacing.insert(conn);
+    }
+
+    /// Put `conn`'s paced output back, to be paced on as its send queue
+    /// drains. A session that closed while it was out had its paced output
+    /// go with it (`ServerState::close`); so does this.
+    pub(crate) fn resume_paced<T>(
+        &mut self,
+        conn: ConnId,
+        field: impl FnOnce(&mut Session) -> &mut Option<T>,
+        paced: T,
+    ) {
+        let Some(session) = self.sessions.output_mut(&conn) else {
+            return;
+        };
+        let previous = field(session).replace(paced);
+        assert!(previous.is_none(), "paced output resumed over another");
+        self.pacing.insert(conn);
+    }
+
+    /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`. `cmd` is the
+    /// server's own spelling of the command, never the client's.
+    pub(crate) fn err_needmoreparams(&mut self, conn: ConnId, cmd: &'static str) {
         self.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
-            &[cmd],
+            &[Middle::own(cmd)],
             Some("Not enough parameters"),
         );
     }
 
     /// `ERR_NOSUCHNICK (<nick>) :No such nick/channel`.
     ///
-    /// This and the two helpers below echo a name the *client* typed, so each
-    /// renders it through [`clip_echo`](crate::core::handler::clip_echo) itself:
-    /// no call site can forget to, and a trailing-form token with a space
+    /// This and the helpers below echo a name the *client* typed, so each
+    /// takes it as [`Middle::echo`] itself: a trailing-form token with a space
     /// (`INVITE x :a b`) cannot split the reply's parameters.
-    pub fn err_nosuchnick(&mut self, conn: ConnId, nick: &str) {
-        let nick = crate::core::handler::clip_echo(nick);
-        self.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
+    pub(crate) fn err_nosuchnick(&mut self, conn: ConnId, nick: &str) {
+        self.numeric(
+            conn,
+            ERR_NOSUCHNICK,
+            &[Middle::echo(nick)],
+            Some("No such nick/channel"),
+        );
     }
 
     /// `ERR_NOSUCHCHANNEL (<chan>) :No such channel`.
-    pub fn err_nosuchchannel(&mut self, conn: ConnId, chan: &str) {
-        let chan = crate::core::handler::clip_echo(chan);
-        self.numeric(conn, ERR_NOSUCHCHANNEL, &[chan], Some("No such channel"));
+    pub(crate) fn err_nosuchchannel(&mut self, conn: ConnId, chan: &str) {
+        self.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[Middle::echo(chan)],
+            Some("No such channel"),
+        );
     }
 
     /// `ERR_NOTONCHANNEL (<chan>) :You're not on that channel`.
-    pub fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
-        let chan = crate::core::handler::clip_echo(chan);
+    pub(crate) fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
         self.numeric(
             conn,
             ERR_NOTONCHANNEL,
-            &[chan],
+            &[Middle::echo(chan)],
             Some("You're not on that channel"),
         );
     }
 
-    /// `ERR_USERNOTINCHANNEL (<nick> <chan>) :They aren't on that channel`.
-    /// `nick` is the client's token, rendered through
-    /// [`clip_echo`](crate::core::handler::clip_echo) like the helpers above.
-    pub fn err_usernotinchannel(&mut self, conn: ConnId, nick: &str, chan: &str) {
-        let nick = crate::core::handler::clip_echo(nick);
+    /// `ERR_USERNOTINCHANNEL (<nick> <chan>) :They aren't on that channel`,
+    /// for the client's `nick` and the channel's display name.
+    pub(crate) fn err_usernotinchannel(&mut self, conn: ConnId, nick: &str, display: &str) {
         self.numeric(
             conn,
             ERR_USERNOTINCHANNEL,
-            &[nick, chan],
+            &[Middle::echo(nick), Middle::own(display)],
             Some("They aren't on that channel"),
         );
+    }
+
+    /// The length of the line [`Self::numeric`] frames around an empty
+    /// trailing, ` :` included: what every byte of a trailing is added to, so a
+    /// reply packing its trailing to the wire limit measures against the line
+    /// actually sent.
+    pub(crate) fn numeric_head_len(&self, conn: ConnId, code: u16, middle: &[Middle<'_>]) -> usize {
+        self.numeric_line(conn, code, middle, Some("")).len()
     }
 
     /// Emit `code` one or more times, packing `items` into the trailing
@@ -6685,29 +6914,19 @@ impl ServerState {
     /// Nothing is emitted for an empty `items`. A caller that must always send
     /// something (an empty NAMES is still closed by its own ENDOF numeric) does
     /// that itself.
-    pub fn numeric_list(
+    pub(crate) fn numeric_list(
         &mut self,
         conn: ConnId,
         code: u16,
-        middle: &[&str],
+        middle: &[Middle<'_>],
         items: &[String],
         sep: char,
     ) {
-        // Measure the fixed part of every line exactly as `numeric` frames it —
-        // ":{server} {code} {target}" + each middle + " :" + CRLF — so the
-        // budget can never drift from the line actually sent.
-        let target = self.reply_target(conn);
-        let mut overhead = 1
-            + self.config.server_name.len()
-            + 1
-            + e6irc_proto::numerics::code_str(code).len()
-            + 1
-            + target.len();
-        for m in middle {
-            overhead += 1 + m.len();
-        }
-        overhead += 2 /* " :" */ + 2 /* CRLF */;
-        let budget = 512usize.saturating_sub(overhead).max(1);
+        let budget = e6irc_proto::message::MAX_LINE_LEN
+            .saturating_sub(
+                self.numeric_head_len(conn, code, middle) + 2, /* CRLF */
+            )
+            .max(1);
 
         let mut line = String::new();
         for item in items {
@@ -6797,6 +7016,26 @@ impl ServerState {
         );
     }
 
+    /// Broadcast `line` to `key`'s members for a command `actor` sent,
+    /// leaving the actor out, and return the actor's copy when it is a
+    /// member. That copy is part of the command's response: the actor's
+    /// session emits it, inside the labeled response when the command was
+    /// labeled, exactly where one worker's capture puts it — whichever shard
+    /// owns the channel.
+    pub(crate) fn broadcast_channel_answering(
+        &mut self,
+        key: &ChanKey,
+        line: EventLine,
+        actor: ConnId,
+    ) -> Option<EventLine> {
+        let member = self
+            .channels
+            .get(key)
+            .is_some_and(|channel| channel.is_member(actor));
+        self.broadcast_channel(key, &line, Some(actor));
+        member.then_some(line)
+    }
+
     /// Serialize once per capability variant, deliver to each recipient.
     fn broadcast_recipients(
         &mut self,
@@ -6809,7 +7048,17 @@ impl ServerState {
             let bytes = rendered[line.variant(recipient.caps())]
                 .get_or_insert_with(|| line.render(recipient.caps()))
                 .clone();
-            if recipient.shard() != self.shard {
+            // The connection a capture collects a response for is sent its
+            // copy there, on whichever shard its session lives: a channel
+            // owner answering another shard's command captures the actor's
+            // copy of what the command broadcast, as one worker's dispatch
+            // capture does, so it goes out inside the command's response
+            // rather than after it.
+            let captured = self
+                .capture
+                .as_ref()
+                .is_some_and(|capture| capture.conn == recipient.conn());
+            if recipient.shard() != self.shard && !captured {
                 self.effects.push(CoreEffect::Delivery {
                     owner: recipient.owner,
                     line: bytes,
@@ -6858,6 +7107,14 @@ impl ServerState {
         }
     }
 
+    /// The prefix a services pseudo-client (NickServ, ChanServ) speaks with,
+    /// `Service!Service@services.<server>` — the one source for its notices
+    /// and for the channel modes ChanServ sets (a mode lock, OP/VOICE, access
+    /// on join), so a client sees one ChanServ however it acted.
+    pub(crate) fn service_prefix(&self, service: &str) -> String {
+        format!("{service}!{service}@services.{}", self.config.server_name)
+    }
+
     /// A notice from a services pseudo-client (NickServ, ChanServ).
     pub fn service_notice(&mut self, conn: ConnId, service: &str, text: &str) {
         let nick = self
@@ -6865,13 +7122,10 @@ impl ServerState {
             .get(&conn)
             .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| "*".into());
-        let host = format!("services.{}", self.config.server_name);
+        let source = self.service_prefix(service);
         // The text can quote the user's own input back (an unknown flag, a
         // channel name), so it is fitted like any other relayed trailing.
-        let line = crate::core::handler::fitted_line(
-            format!(":{service}!{service}@{host} NOTICE {nick} :"),
-            text,
-        );
+        let line = crate::core::handler::fitted_line(format!(":{source} NOTICE {nick} :"), text);
         let line = self.server_line(line);
         self.send_event(conn, &line);
     }
@@ -6904,6 +7158,19 @@ impl ServerState {
         true
     }
 
+    /// Tell `conn`'s reader whether its lines are metered: an IRC operator's
+    /// are not. Run after each of its lines, which are what change it.
+    pub(crate) fn sync_flood_exemption(&mut self, conn: ConnId) {
+        let Some(session) = self.sessions.get_mut(&conn) else {
+            return;
+        };
+        let exempt = session.oper.is_some();
+        if session.flood_exempt != exempt {
+            session.flood_exempt = exempt;
+            self.flood_exemptions.set(conn, exempt);
+        }
+    }
+
     // ---- teardown -------------------------------------------------------
 
     /// Remove a session: broadcast QUIT to channel peers, free the nick,
@@ -6912,8 +7179,11 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return;
         };
-        self.channel_lists.remove(&conn);
-        self.paced_replies.remove(&conn);
+        // Its paced LIST and WHO replies go with the session itself.
+        self.pacing.remove(&conn);
+        if session.flood_exempt {
+            self.flood_exemptions.set(conn, false);
+        }
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the
@@ -6928,8 +7198,8 @@ impl ServerState {
                 self.send_bytes_uncaptured(conn, line);
             }
         }
-        // A teardown initiated from inside a labeled command (QUIT, flood
-        // kill, credential-budget close) has its terminal `ERROR` sitting in
+        // A teardown initiated from inside a labeled command (QUIT, a
+        // credential-budget close) has its terminal `ERROR` sitting in
         // the labeled-response capture buffer; the dispatch wrapper would only
         // try to deliver it after this session is gone and silently drop it.
         // Flush the capture now, while the connection can still receive the
@@ -7020,7 +7290,7 @@ impl ServerState {
         self.numeric(
             conn,
             RPL_LOGGEDIN,
-            &[&mask, &account],
+            &[Middle::own(&mask), Middle::own(&account)],
             Some(&format!("You are now logged in as {account}")),
         );
         // Identifying to the account protecting a nick settles its clock
@@ -7062,7 +7332,7 @@ impl ServerState {
         self.numeric(
             conn,
             RPL_LOGGEDOUT,
-            &[&mask],
+            &[Middle::own(&mask)],
             Some("You are now logged out"),
         );
     }
@@ -7106,43 +7376,6 @@ impl ServerState {
         }
         self.send_user_event_parts(&quit.event, peers);
     }
-}
-
-/// The structural rule for a numeric *middle* segment, pure so it can be pinned
-/// by unit tests: `Some(reason)` when `middle` cannot stand where `numeric`
-/// places it and would corrupt the reply's framing. [`ServerState::numeric`]
-/// consults it to render such a segment safely (as `*`) rather than emit a
-/// mis-framed line — making the framing-corruption class unrepresentable at
-/// that one funnel.
-///
-/// A middle precedes the trailing and is space-delimited, so it must be
-/// **non-empty** (an empty one collapses into the adjacent separator, shifting
-/// every later field left a column — the WHOX empty-token bug), must **not begin
-/// with `:`** (which starts the trailing early, swallowing the rest of the line —
-/// the WHOX `:`-leading-token bug), and must carry **no CR/LF/NUL** (which break
-/// the line or inject a second one). These are exactly the numeric-framing
-/// corruptions found and fixed by hand across the sweeps; the funnel now closes
-/// the class for every present and future echo site at once.
-///
-/// An internal space is deliberately *allowed*: a few replies pass a
-/// mode-string joined to its space-separated arguments as one segment
-/// (`RPL_CHANNELMODEIS` "+ntk sekrit", `RPL_MYINFO`), which frames correctly —
-/// each sub-argument is itself space-validated at its own ingress (a `+k` key or
-/// `+l` limit with a space is refused). Forbidding the space would only force a
-/// join-then-resplit at those call sites for no framing benefit. Callers with
-/// genuine free text (a realname, a message, a reason) pass it as the
-/// *trailing*, which has none of these restrictions.
-fn numeric_middle_violation(middle: &str) -> Option<&'static str> {
-    if middle.is_empty() {
-        return Some("numeric middle parameter is empty (collapses into the field separator)");
-    }
-    if middle.starts_with(':') {
-        return Some("numeric middle parameter starts with ':' (starts the trailing early)");
-    }
-    if middle.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
-        return Some("numeric middle parameter contains CR/LF/NUL (breaks or injects a line)");
-    }
-    None
 }
 
 /// The wire-limit rule behind [`ServerState::debug_check_wire_line`], pure so
@@ -7194,36 +7427,6 @@ mod mlock_tests {
         assert_eq!(MlockModes::parse("+tn-i").unwrap().render(), "+nt-i");
         assert_eq!(MlockModes::parse("-i+tn").unwrap().render(), "+nt-i");
         assert_eq!(MlockModes::parse("+n+t-i").unwrap().render(), "+nt-i");
-    }
-}
-
-#[cfg(test)]
-mod numeric_middle_tests {
-    use super::numeric_middle_violation;
-
-    #[test]
-    fn accepts_ordinary_middles_and_rejects_frame_breakers() {
-        // Ordinary middle parameters pass.
-        for ok in ["alice", "#chan", "+o", "0", "255.255.255.255", "H@", "*"] {
-            assert!(
-                numeric_middle_violation(ok).is_none(),
-                "rejected a valid middle: {ok:?}"
-            );
-        }
-        // A pre-joined modestring+args segment is allowed — it frames correctly.
-        assert!(
-            numeric_middle_violation("+ntk sekrit").is_none(),
-            "a pre-joined modestring+args segment must be allowed"
-        );
-        // The frame-breaking shapes each fail — the exact WHOX-token class.
-        assert!(numeric_middle_violation("").is_some(), "empty must fail");
-        assert!(
-            numeric_middle_violation(":x").is_some(),
-            "leading colon must fail"
-        );
-        assert!(numeric_middle_violation("a\rb").is_some());
-        assert!(numeric_middle_violation("a\nb").is_some());
-        assert!(numeric_middle_violation("a\0b").is_some());
     }
 }
 
@@ -7306,15 +7509,16 @@ mod session_store_tests {
                 description: "test".into(),
                 registration_before_connect: false,
                 registration_require_email: false,
-                sendq: 1,
+                sendq_bytes: 512,
                 motd: Vec::new(),
                 nicklen: 30,
                 sasl_enabled: false,
                 max_hot_channels: 1,
+                max_history_ring_bytes: crate::config::DEFAULT_HISTORY_RING_BYTES,
+                max_hot_history_bytes: crate::config::DEFAULT_HOT_HISTORY_BYTES,
                 opers: Vec::new(),
                 clock: wall_clock,
                 mono_clock,
-                command_flood: None,
                 registration_burst: None,
                 sasl_requirement: Default::default(),
                 reserved_account_names: crate::identity::ReservedAccountNames::default(),
@@ -7379,11 +7583,7 @@ mod session_store_tests {
     }
 
     fn open(state: &mut ServerState, conn: ConnId) {
-        let (tx, _rx) = queue(QueueConfig {
-            name: "session-store-output",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
+        let (tx, _rx) = crate::core::send_queue("session-store-output", 512);
         state.open(
             conn,
             tx,

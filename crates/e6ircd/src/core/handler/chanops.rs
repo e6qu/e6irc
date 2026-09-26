@@ -37,7 +37,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
-            &["KICK"],
+            &[Middle::own("KICK")],
             Some("Channel and user lists must be one channel or of equal length"),
         );
         return;
@@ -55,7 +55,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[clip_echo(who)],
+                &[Middle::echo(who)],
                 Some("Too many targets; not kicked"),
             );
             break;
@@ -131,7 +131,8 @@ pub(super) fn kick_on_owner(
         ),
     };
     let line = actor.line((state.config.clock)(), line);
-    state.broadcast_channel(&key, &line, None);
+    // The kicker's copy is its command's response (see `ChannelKickResult`).
+    state.broadcast_channel(&key, &line, Some(conn));
     let chan = state.channels.get_mut(&key).expect("checked");
     chan.remove_member(victim);
     let empty = !chan.has_members();
@@ -144,7 +145,7 @@ pub(super) fn kick_on_owner(
     } else {
         state.route_session_channel_removed(owner, key);
     }
-    crate::core::state::ChannelKickResult::Kicked
+    crate::core::state::ChannelKickResult::Kicked { echo: line }
 }
 
 pub(super) fn emit_kick_result(
@@ -164,7 +165,7 @@ fn emit_kick_result_now(
     result: crate::core::state::ChannelKickResult,
 ) {
     match result {
-        crate::core::state::ChannelKickResult::Kicked => {}
+        crate::core::state::ChannelKickResult::Kicked { echo } => state.send_event(conn, &echo),
         crate::core::state::ChannelKickResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, &target)
         }
@@ -177,7 +178,7 @@ fn emit_kick_result_now(
         crate::core::state::ChannelKickResult::NotOperator { target } => state.numeric(
             conn,
             ERR_CHANOPRIVSNEEDED,
-            &[&target],
+            &[Middle::echo(&target)],
             Some("You're not a channel operator"),
         ),
         crate::core::state::ChannelKickResult::UserNotInChannel { victim, channel } => {
@@ -195,6 +196,14 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_nosuchnick(conn, who);
         return;
     };
+    // +R keeps a user who is not logged in from inviting this one too
+    // (Solanum's `um_regonlymsg` hooks INVITE as it hooks PRIVMSG).
+    if let Some(peer) = state.registered_user(&state.nick_key(who))
+        && peer.refuses_unregistered(conn, &state.sessions[&conn])
+    {
+        err_nonreg(state, conn, &peer.nick);
+        return;
+    }
     let owner = state.channel_owner(target);
     let label = state.channel_reply_label(conn, &owner);
     let command = crate::core::state::ChannelCommand::new(
@@ -263,8 +272,9 @@ pub(super) fn invite_on_owner(
     // An invitation is a pass through `+i` and past `+l`, so one is recorded
     // only while the channel has either (Solanum stores an invite exactly when
     // it "could affect the ability to join"). One sent while the channel is
-    // open is delivered but passes nothing: it cannot be stocked to be honoured
-    // after operators later lock the channel.
+    // open is delivered but passes nothing, and `-i` (or `-l` on a channel
+    // without `+i`) revokes those held (`channel_mode_by`): none can be
+    // stocked to be honoured after operators later lock the channel.
     let chan = state.channels.get_mut(&key).expect("checked");
     if chan.modes.invite_only || chan.modes.limit.is_some() {
         let invited = &mut chan.invited;
@@ -334,9 +344,12 @@ pub(super) fn emit_invite_result_now(
     result: crate::core::state::ChannelInviteResult,
 ) {
     match result {
-        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => {
-            state.numeric(conn, RPL_INVITING, &[&invitee, &channel], None)
-        }
+        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => state.numeric(
+            conn,
+            RPL_INVITING,
+            &[Middle::echo(&invitee), Middle::own(&channel)],
+            None,
+        ),
         crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, &target)
         }
@@ -349,14 +362,14 @@ pub(super) fn emit_invite_result_now(
         crate::core::state::ChannelInviteResult::NotOperator { target } => state.numeric(
             conn,
             ERR_CHANOPRIVSNEEDED,
-            &[&target],
+            &[Middle::echo(&target)],
             Some("You're not a channel operator"),
         ),
         crate::core::state::ChannelInviteResult::UserOnChannel { invitee, channel } => state
             .numeric(
                 conn,
                 ERR_USERONCHANNEL,
-                &[&invitee, &channel],
+                &[Middle::echo(&invitee), Middle::own(&channel)],
                 Some("is already on channel"),
             ),
     }
@@ -424,128 +437,135 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let filter = match ListFilter::parse(p.first().copied(), now_secs, state.casemap) {
         Ok(filter) => filter,
         Err(InvalidListParameters) => {
-            state.numeric(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
+            state.numeric(
+                conn,
+                RPL_LISTSTART,
+                &[Middle::own("Channel")],
+                Some("Users  Name"),
+            );
             let notice = state.server_notice_line(conn, "Invalid parameters for /LIST");
             state.send(conn, &notice);
             state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
             return;
         }
     };
-    if state.has_single_core_shard() {
-        // One worker sees every channel, so the rows are all in now; the
-        // reply is paced from here without holding anything behind it.
-        let rows = visible_channel_rows(state, conn, &filter);
-        let label = state.defer_captured_label(conn);
-        send_channel_list(state, conn, label, rows, false);
-        return;
-    }
-    // Later output waits for the reply to open, so the LIST still answers
-    // before what the client sent after it.
-    let label = state.defer_captured_reply(conn);
-    let request = state.start_channel_list(conn, label, filter);
-    state.route_channel_list(request);
-}
-
-/// This shard's channels that `conn` may see and `filter` admits.
-fn visible_channel_rows(
-    state: &ServerState,
-    conn: ConnId,
-    filter: &crate::core::list::ListFilter,
-) -> Vec<crate::core::state::ChannelListRow> {
-    state
-        .channels
-        .iter()
-        .filter(|(_, channel)| channel.hidden_from(conn).is_none())
-        .filter(|(key, channel)| {
-            filter.admits(&crate::core::list::ListCandidate {
-                key,
-                members: channel.member_count(),
-                created_secs: channel.created_at.as_secs(),
-                topic_set_secs: channel.topic.as_ref().map(|topic| topic.set_at_secs),
-            })
-        })
-        .map(|(_, channel)| crate::core::state::ChannelListRow {
-            name: channel.name.clone(),
-            members: channel.member_count(),
-            topic: channel
-                .topic
-                .as_ref()
-                .map(|topic| topic.text.clone())
-                .unwrap_or_default(),
-        })
-        .collect()
-}
-
-pub(crate) fn channel_list(
-    state: &mut ServerState,
-    request: crate::core::state::ChannelListRequest,
-) {
-    let rows = visible_channel_rows(state, request.actor().recipient.conn(), request.filter());
-    state.route_channel_list_result(crate::core::state::ChannelListResult {
-        id: request.id(),
-        session: request.session(),
-        rows,
-    });
-}
-
-pub(crate) fn channel_list_result(
-    state: &mut ServerState,
-    result: crate::core::state::ChannelListResult,
-) {
-    let conn = result.session.conn();
-    let Some(gathered) = state.take_channel_list(result) else {
-        return;
-    };
-    // The reply opens through the hold later output waits behind, which is
-    // then released: what the client sent after the LIST follows its start.
-    state.emit_deferred(conn, |state| {
-        send_channel_list(state, conn, gathered.label, gathered.rows, gathered.aborted);
-    });
+    // The reply opens now, ahead of whatever the client sent after the LIST;
+    // its rows follow page by page as its send queue has room, inside its
+    // batch when it is labeled.
+    let label = state.defer_captured_label(conn);
+    let batch = open_channel_list(state, conn, label);
+    state.start_channel_list(conn, batch, filter);
+    pace_channel_list(state, conn);
 }
 
 /// Open `conn`'s LIST reply — inside a labeled-response batch when the LIST
-/// was labeled — and send as many of `rows` as its send queue has room for;
-/// [`pace_channel_lists`] sends the rest as the queue drains. An `aborted`
-/// LIST (a later one arrived before its rows were in) says so and closes.
-fn send_channel_list(
+/// was labeled — and return that batch.
+fn open_channel_list(
     state: &mut ServerState,
     conn: ConnId,
     label: Option<String>,
-    mut rows: Vec<crate::core::state::ChannelListRow>,
-    aborted: bool,
-) {
-    use crate::core::list::ListProgress;
+) -> Option<String> {
     let batch = label.map(|label| {
         let batch = state.next_msgid();
         let open = labeled_batch_open(&state.config.server_name, &label, &batch);
         state.send_unheld(conn, bytes::Bytes::from(format!("{open}\r\n")));
         batch
     });
-    let start = state.numeric_line(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
-    send_list_line(state, conn, batch.as_deref(), start);
-    if aborted {
-        return finish_channel_list(state, conn, batch, true);
-    }
-    rows.sort_by(|left, right| left.name.cmp(&right.name));
-    state.channel_lists.insert(
+    let start = state.numeric_line(
         conn,
-        ListProgress::Sending {
-            batch,
-            rows: rows.into_iter(),
-        },
+        RPL_LISTSTART,
+        &[Middle::own("Channel")],
+        Some("Users  Name"),
     );
-    pace_channel_list(state, conn);
+    send_list_line(state, conn, batch.as_deref(), start);
+    batch
+}
+
+/// Answer one page request of a LIST with this shard's channels after its
+/// cursor.
+pub(crate) fn channel_list(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelListRequest,
+) {
+    let (rows, next) = channel_list_page(state, &request);
+    state.route_channel_list_result(crate::core::state::ChannelListResult {
+        id: request.id(),
+        session: request.session(),
+        shard: request.shard(),
+        rows,
+        next,
+    });
+}
+
+/// The rows of this shard's channels after the request's cursor, in key
+/// order, that its connection may see and its conditions admit — at most its
+/// limit, from at most [`LIST_PAGE_SCAN`](crate::core::list::LIST_PAGE_SCAN)
+/// channels examined — and the key the next page starts after (`None`: no
+/// channel is left past them).
+fn channel_list_page(
+    state: &ServerState,
+    request: &crate::core::state::ChannelListRequest,
+) -> (Vec<crate::core::state::ChannelListRow>, Option<ChanKey>) {
+    use crate::core::list::{LIST_PAGE_SCAN, ListCandidate};
+    let conn = request.session().conn();
+    let mut rows = Vec::new();
+    let mut last: Option<&ChanKey> = None;
+    for (examined, (key, channel)) in state.channels.after(request.after()).enumerate() {
+        if rows.len() == request.limit() || examined == LIST_PAGE_SCAN {
+            return (rows, last.cloned());
+        }
+        last = Some(key);
+        let admitted = channel.hidden_from(conn).is_none()
+            && request.filter().admits(&ListCandidate {
+                key,
+                members: channel.member_count(),
+                created_secs: channel.created_at.as_secs(),
+                topic_set_secs: channel.topic.as_ref().map(|topic| topic.set_at_secs),
+            });
+        if admitted {
+            rows.push(crate::core::state::ChannelListRow {
+                key: key.clone(),
+                name: channel.name.clone(),
+                members: channel.member_count(),
+                topic: channel
+                    .topic
+                    .as_ref()
+                    .map(|topic| topic.text.clone())
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    (rows, None)
+}
+
+/// A page of `conn`'s LIST is in: send what it lets through.
+pub(crate) fn channel_list_result(
+    state: &mut ServerState,
+    result: crate::core::state::ChannelListResult,
+) {
+    let conn = result.session.conn();
+    if state.accept_channel_list_page(result) {
+        pace_channel_list(state, conn);
+    }
 }
 
 /// One line of a LIST reply, tagged into its batch if it has one. It is
-/// sent past any hold: the LIST is older than whatever that waits on.
-fn send_list_line(state: &mut ServerState, conn: ConnId, batch: Option<&str>, line: String) {
+/// sent past any hold: the LIST is older than whatever that waits on. Returns
+/// the bytes it took in the send queue.
+fn send_list_line(
+    state: &mut ServerState,
+    conn: ConnId,
+    batch: Option<&str>,
+    line: String,
+) -> usize {
     let line = bytes::Bytes::from(format!("{line}\r\n"));
     let line = match batch {
         Some(batch) => inject_tag(&line, &format!("batch={batch}")),
         None => line,
     };
+    let size = line.len();
     state.send_unheld(conn, line);
+    size
 }
 
 /// Close a LIST reply: `RPL_LISTEND`, after a notice when it was aborted, and
@@ -568,70 +588,57 @@ fn finish_channel_list(
     }
 }
 
-/// Abort `conn`'s LIST if it has one in progress; whether it had.
+/// Abort `conn`'s LIST if it has one in progress; whether it had. Its cursor
+/// is dropped; a page still on its way finds no LIST to join.
 fn abort_channel_list(state: &mut ServerState, conn: ConnId) -> bool {
-    use crate::core::list::ListProgress;
-    match state.channel_lists.get_mut(&conn) {
-        None => false,
-        // Its rows are still arriving; the reply says it was aborted once
-        // they are all in.
-        Some(ListProgress::Gathering { aborted, .. }) => {
-            *aborted = true;
-            true
-        }
-        Some(ListProgress::Sending { .. }) => {
-            let Some(ListProgress::Sending { batch, .. }) = state.channel_lists.remove(&conn)
-            else {
-                unreachable!("the LIST was sending a moment ago");
-            };
-            finish_channel_list(state, conn, batch, true);
-            true
-        }
-    }
-}
-
-/// Send `conn`'s paced LIST rows while its send queue is under half full,
-/// closing the reply after the last.
-fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
-    use crate::core::list::ListProgress;
-    // A closing connection's LIST goes with it (`ServerState::close`).
-    let room = state
-        .paced_room(conn)
-        .expect("a LIST is paced only to an open connection");
-    let Some(ListProgress::Sending { batch, mut rows }) = state.channel_lists.remove(&conn) else {
-        panic!("only a LIST that is sending is paced");
+    let Some(cursor) = state
+        .sessions
+        .get_mut(&conn)
+        .and_then(|session| session.channel_list.take())
+    else {
+        return false;
     };
-    for _ in 0..room {
-        let Some(row) = rows.next() else {
-            return finish_channel_list(state, conn, batch, false);
-        };
-        let line = state.numeric_line(
-            conn,
-            RPL_LIST,
-            &[&row.name, &row.members.to_string()],
-            Some(&row.topic),
-        );
-        send_list_line(state, conn, batch.as_deref(), line);
-    }
-    if rows.as_slice().is_empty() {
-        return finish_channel_list(state, conn, batch, false);
-    }
-    state
-        .channel_lists
-        .insert(conn, ListProgress::Sending { batch, rows });
+    finish_channel_list(state, conn, cursor.batch, true);
+    true
 }
 
-/// Send what every paced LIST on this shard has room for now.
-pub(crate) fn pace_channel_lists(state: &mut ServerState) {
-    let sending: Vec<ConnId> = state
-        .channel_lists
-        .iter()
-        .filter(|(_, progress)| progress.is_sending())
-        .map(|(conn, _)| *conn)
-        .collect();
-    for conn in sending {
-        pace_channel_list(state, conn);
+/// Send `conn`'s LIST rows while its send queue is under half full, merging
+/// the shards' pages in key order, and ask for the next page of every shard
+/// whose rows are all out; close the reply after the last row.
+pub(super) fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
+    use crate::core::list::NextRow;
+    let Some((mut room, mut cursor)) =
+        state.take_paced(conn, |session| session.channel_list.take())
+    else {
+        return;
+    };
+    while room > 0 {
+        match cursor.next_row() {
+            NextRow::Row(row) => {
+                let line = state.numeric_line(
+                    conn,
+                    RPL_LIST,
+                    &[Middle::own(&row.name), Middle::from(row.members)],
+                    Some(&row.topic),
+                );
+                let sent = send_list_line(state, conn, cursor.batch.as_deref(), line);
+                room = room.saturating_sub(sent);
+            }
+            NextRow::Waiting => break,
+            NextRow::Finished => return finish_channel_list(state, conn, cursor.batch, false),
+        }
     }
+    // A page is asked for only while the client is reading, and no larger
+    // than the room it has made: one that is not reading holds nothing. The
+    // room is in bytes; a row is at most one line, so this many rows fit.
+    if let Some(limit) =
+        std::num::NonZeroUsize::new(room.div_ceil(e6irc_proto::message::MAX_LINE_LEN))
+    {
+        for (shard, after) in cursor.pages_wanted() {
+            state.route_channel_list_page(conn, &cursor, shard, after, limit);
+        }
+    }
+    state.resume_paced(conn, |session| &mut session.channel_list, cursor);
 }
 
 /// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP
@@ -674,14 +681,7 @@ fn pack_userhost_entries(
     code: u16,
     entries: &[String],
 ) -> String {
-    let target = state.sessions[&conn].nick().unwrap_or("*");
-    let head_len = format!(
-        ":{} {} {} :",
-        state.config.server_name,
-        e6irc_proto::numerics::code_str(code),
-        target,
-    )
-    .len();
+    let head_len = state.numeric_head_len(conn, code, &[]);
     crate::core::handler::pack_trailing_list(entries, head_len)
 }
 
@@ -704,10 +704,15 @@ pub(super) fn cmd_links(state: &mut ServerState, conn: ConnId) {
     state.numeric(
         conn,
         RPL_LINKS,
-        &[&server, &server],
+        &[Middle::own(&server), Middle::own(&server)],
         Some(&format!("0 {info}")),
     );
-    state.numeric(conn, RPL_ENDOFLINKS, &["*"], Some("End of /LINKS list"));
+    state.numeric(
+        conn,
+        RPL_ENDOFLINKS,
+        &[Middle::own("*")],
+        Some("End of /LINKS list"),
+    );
 }
 
 pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -754,33 +759,54 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.numeric(
         conn,
         RPL_ENDOFSTATS,
-        &[&letter],
+        &[Middle::echo(&letter)],
         Some("End of /STATS report"),
     );
 }
 
-/// One STATS line per server ban of `kind`, in Solanum's shapes: a K-line is
-/// `216 K <host> * <user> :<reason>`, a D-line `225 D <address> :<reason>`, an
-/// X-line `247 X 0 <mask> :<reason>` (every ban here is permanent, so the
-/// letter is the uppercase one and the X-line hold is 0). Each mask part is
-/// spelled by [`crate::sanitize::mask_middle`], so an X-line mask with spaces
-/// or an IPv6 address stays one readable parameter.
+/// One STATS line per server ban of `kind` in force, in Solanum's shapes: a
+/// K-line is `216 K <host> * <user> :<reason>`, a D-line
+/// `225 D <address> :<reason>`, an X-line `247 X 0 <mask> :<reason>`. A
+/// temporary ban has the lowercase letter, as Solanum marks one, and its
+/// reason starts with the time it has left, as ratbox and charybdis wrote it:
+/// `Temporary K-Line 42 min. - <reason>`. Each mask part is spelled by
+/// [`crate::sanitize::mask_middle`], so an X-line mask with spaces or an IPv6
+/// address stays one readable parameter.
 fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::state::BanKind) {
     use crate::sanitize::mask_middle;
-    let bans: Vec<(String, String)> = state
-        .server_bans
-        .iter()
+    let now_secs = (state.config.clock)().as_secs();
+    let bans: Vec<(String, String, bool)> = state
+        .server_bans_in_force()
         .filter(|ban| ban.kind == kind)
-        .map(|ban| (ban.mask.as_str().to_string(), ban.reason.clone()))
+        .map(|ban| match ban.minutes_left(now_secs) {
+            Some(left) => (
+                ban.mask.as_str().to_string(),
+                format!("Temporary {} {left} min. - {}", kind.label(), ban.reason),
+                true,
+            ),
+            None => (ban.mask.as_str().to_string(), ban.reason.clone(), false),
+        })
         .collect();
-    for (mask, reason) in bans {
+    for (mask, reason, temporary) in bans {
+        let letter = |permanent: &'static str, temporary_letter: &'static str| {
+            if temporary {
+                temporary_letter
+            } else {
+                permanent
+            }
+        };
         match kind {
             crate::core::state::BanKind::Kline => {
                 let (user, host) = mask.split_once('@').unwrap_or(("*", mask.as_str()));
                 state.numeric(
                     conn,
                     RPL_STATSKLINE,
-                    &["K", &mask_middle(host), "*", &mask_middle(user)],
+                    &[
+                        Middle::own(letter("K", "k")),
+                        Middle::own(mask_middle(host)),
+                        Middle::own("*"),
+                        Middle::own(mask_middle(user)),
+                    ],
                     Some(&reason),
                 );
             }
@@ -788,7 +814,10 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                 state.numeric(
                     conn,
                     RPL_STATSDLINE,
-                    &["D", &mask_middle(&mask)],
+                    &[
+                        Middle::own(letter("D", "d")),
+                        Middle::own(mask_middle(&mask)),
+                    ],
                     Some(&reason),
                 );
             }
@@ -796,7 +825,11 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
                 state.numeric(
                     conn,
                     RPL_STATSXLINE,
-                    &["X", "0", &mask_middle(&mask)],
+                    &[
+                        Middle::own(letter("X", "x")),
+                        Middle::own("0"),
+                        Middle::own(mask_middle(&mask)),
+                    ],
                     Some(&reason),
                 );
             }
@@ -903,23 +936,24 @@ pub(super) fn knock_on_owner(
             scope: "channel",
         };
     }
-    // Deliver the knock to the channel's operators, then confirm to the knocker.
-    let ops = chan.operator_recipients();
+    // Deliver the knock to whoever could let the knocker in — every member of
+    // a `+g` channel, else its operators (Solanum's `m_knock`) — then confirm
+    // to the knocker. Solanum's RPL_KNOCK names the channel where the
+    // recipient's nick would go, so one line serves every recipient.
+    let free_invite = chan.modes.free_invite;
+    let recipients = chan.recipients_where(|_, modes| free_invite || modes.op);
     state
         .channels
         .get_mut(&key)
         .expect("checked above")
         .last_knock = Some(now);
-    for (recipient, nick) in ops {
-        let line = format!(
-            ":{} {} {} {} {} :has asked for an invite",
-            state.config.server_name,
-            e6irc_proto::numerics::code_str(RPL_KNOCK),
-            nick,
-            display,
-            actor.identity.prefix,
-        );
-        let line = state.server_line(line);
+    let line = state.server_line(format!(
+        ":{} {} {display} {display} {} :has asked for an invite.",
+        state.config.server_name,
+        e6irc_proto::numerics::code_str(RPL_KNOCK),
+        actor.identity.prefix,
+    ));
+    for recipient in recipients {
         state.send_event_recipient(recipient, &line);
     }
     crate::core::state::ChannelKnockResult::KnockDelivered { display }
@@ -951,14 +985,14 @@ fn emit_knock_result_now(
             state.numeric(
                 conn,
                 RPL_KNOCKDLVR,
-                &[&display],
+                &[Middle::own(&display)],
                 Some("Your KNOCK has been delivered"),
             );
         }
         crate::core::state::ChannelKnockResult::TooManyKnocks { display, scope } => state.numeric(
             conn,
             ERR_TOOMANYKNOCK,
-            &[&display],
+            &[Middle::own(&display)],
             Some(&format!("Too many KNOCKs ({scope}).")),
         ),
         crate::core::state::ChannelKnockResult::NoSuchChannel { target } => {
@@ -970,16 +1004,19 @@ fn emit_knock_result_now(
         crate::core::state::ChannelKnockResult::AlreadyOnChannel { display } => state.numeric(
             conn,
             ERR_KNOCKONCHAN,
-            &[&display],
+            &[Middle::own(&display)],
             Some("You are on that channel"),
         ),
-        crate::core::state::ChannelKnockResult::ChannelOpen { display } => {
-            state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"))
-        }
+        crate::core::state::ChannelKnockResult::ChannelOpen { display } => state.numeric(
+            conn,
+            ERR_CHANOPEN,
+            &[Middle::own(&display)],
+            Some("Channel is open"),
+        ),
         crate::core::state::ChannelKnockResult::CannotSend { display } => state.numeric(
             conn,
             ERR_CANNOTSENDTOCHAN,
-            &[&display],
+            &[Middle::own(&display)],
             Some("Cannot knock on channel (+b/+q)"),
         ),
     }

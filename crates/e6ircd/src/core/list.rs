@@ -20,10 +20,16 @@
 //! The reply is paced (`SAFELIST`): rows go out only while the client's send
 //! queue is under half full, and the rest follow as it drains, so a LIST of
 //! every channel on a large network cannot overflow the queue and cost the
-//! client its connection.
+//! client its connection. Nor is the list copied to be paced out: the LIST
+//! keeps a cursor per channel shard ([`ChannelListCursor`]) and reads the next
+//! page after it as there is room, as Solanum's SAFELIST keeps its place in
+//! the channel hash rather than a copy of it.
 
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::mask::FoldedMask;
+
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::state::{ChanKey, ChannelListRequestId, ChannelListRow};
 
@@ -174,38 +180,143 @@ impl ListFilter {
     }
 }
 
-/// A connection's LIST that has not finished answering. A connection has at
-/// most one: a LIST sent while one is in progress aborts it instead (Solanum).
-pub(crate) enum ListProgress {
-    /// Waiting on the channel shards' rows.
-    Gathering {
+/// Most channels one page request examines on its shard, whatever it finds:
+/// a LIST whose conditions admit few channels must not cost its owner shard a
+/// scan of every channel in one event. The page then comes back short, with
+/// its resume point, and the next one continues from there.
+pub(crate) const LIST_PAGE_SCAN: usize = 1024;
+
+/// A connection's LIST that has not finished answering: a cursor, not a copy
+/// of the channel list. A connection has at most one: a LIST sent while one is
+/// in progress aborts it instead (Solanum), which costs nothing — the cursor
+/// is dropped, and a page still on its way finds no LIST of its `id` to join.
+///
+/// The reply is open from the start (its `RPL_LISTSTART` sent, inside `batch`
+/// for a labeled LIST). Each channel shard is read in pages of the rows after
+/// the last key it reported, in casemapped key order, and the rows of every
+/// shard are merged in that order as they are sent. What the session holds is
+/// at most one page per shard, each no larger than the room its send queue had
+/// when the page was asked for — never the network's channel list.
+pub(crate) struct ChannelListCursor {
+    pub(crate) id: ChannelListRequestId,
+    pub(crate) filter: Arc<ListFilter>,
+    pub(crate) batch: Option<String>,
+    shards: Vec<ShardCursor>,
+}
+
+/// One channel shard's part of a LIST in progress.
+struct ShardCursor {
+    /// Rows of its last page not yet sent, in key order.
+    rows: VecDeque<ChannelListRow>,
+    page: ShardPage,
+}
+
+enum ShardPage {
+    /// No page is on its way; the next starts after `after` (at the first
+    /// channel when `None`).
+    Idle { after: Option<ChanKey> },
+    /// A page was asked for and has not arrived.
+    Requested,
+    /// The shard has reported its last channel.
+    Exhausted,
+}
+
+/// What a LIST sends next.
+pub(crate) enum NextRow {
+    Row(ChannelListRow),
+    /// A shard's next row is not in yet, and it may sort first.
+    Waiting,
+    /// Every shard's channels have been listed.
+    Finished,
+}
+
+impl ChannelListCursor {
+    pub(crate) fn new(
         id: ChannelListRequestId,
-        label: Option<String>,
-        remaining: usize,
-        rows: Vec<ChannelListRow>,
-        /// A later LIST aborted this one before its rows were in.
-        aborted: bool,
-    },
-    /// The reply is open (its `RPL_LISTSTART` sent, inside `batch` for a
-    /// labeled LIST) and these rows, in order, are still to go.
-    Sending {
+        filter: ListFilter,
         batch: Option<String>,
-        rows: std::vec::IntoIter<ChannelListRow>,
-    },
-}
-
-impl ListProgress {
-    /// Whether the reply is open and rows remain to be paced out.
-    pub(crate) fn is_sending(&self) -> bool {
-        matches!(self, Self::Sending { .. })
+        shards: usize,
+    ) -> Self {
+        Self {
+            id,
+            filter: Arc::new(filter),
+            batch,
+            shards: (0..shards)
+                .map(|_| ShardCursor {
+                    rows: VecDeque::new(),
+                    page: ShardPage::Idle { after: None },
+                })
+                .collect(),
+        }
     }
-}
 
-/// A LIST whose rows are all in: what [`ListProgress::Gathering`] becomes.
-pub(crate) struct GatheredList {
-    pub label: Option<String>,
-    pub rows: Vec<ChannelListRow>,
-    pub aborted: bool,
+    /// The row that sorts first among every shard's, once no shard still to
+    /// report can have one before it.
+    pub(crate) fn next_row(&mut self) -> NextRow {
+        let mut first: Option<(usize, &ChanKey)> = None;
+        for (index, shard) in self.shards.iter().enumerate() {
+            match shard.rows.front() {
+                Some(row) => {
+                    if first.is_none_or(|(_, best)| row.key.as_str() < best.as_str()) {
+                        first = Some((index, &row.key));
+                    }
+                }
+                None if matches!(shard.page, ShardPage::Exhausted) => {}
+                None => return NextRow::Waiting,
+            }
+        }
+        match first.map(|(index, _)| index) {
+            Some(index) => NextRow::Row(
+                self.shards[index]
+                    .rows
+                    .pop_front()
+                    .expect("the chosen shard has a row"),
+            ),
+            None => NextRow::Finished,
+        }
+    }
+
+    /// The shards whose next page is needed now — every row of theirs is
+    /// sent and none is on its way — each with the key it starts after. They
+    /// are marked as asked.
+    pub(crate) fn pages_wanted(&mut self) -> Vec<(usize, Option<ChanKey>)> {
+        let mut wanted = Vec::new();
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            if shard.rows.is_empty()
+                && let ShardPage::Idle { after } = &mut shard.page
+            {
+                wanted.push((index, after.take()));
+                shard.page = ShardPage::Requested;
+            }
+        }
+        wanted
+    }
+
+    /// Take shard `index`'s page: its rows in key order, and the key the next
+    /// page starts after — `None` when the shard has no channel past them.
+    pub(crate) fn accept(
+        &mut self,
+        index: usize,
+        rows: Vec<ChannelListRow>,
+        next: Option<ChanKey>,
+    ) {
+        let shard = &mut self.shards[index];
+        assert!(
+            matches!(shard.page, ShardPage::Requested) && shard.rows.is_empty(),
+            "a LIST page arrived that was not asked for"
+        );
+        shard.rows.extend(rows);
+        shard.page = match next {
+            Some(after) => ShardPage::Idle { after: Some(after) },
+            None => ShardPage::Exhausted,
+        };
+    }
+
+    /// Rows the cursor holds, waiting to be sent.
+    #[cfg(test)]
+    pub(crate) fn held_rows(&self) -> usize {
+        self.shards.iter().map(|shard| shard.rows.len()).sum()
+    }
 }
 
 #[cfg(test)]

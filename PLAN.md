@@ -904,6 +904,23 @@ now go out as the client reads, a remote channel's on the asker's shard, a
 labeled one as one batch, and later WHOs follow it in order within one SendQ
 — past that, `263 RPL_TRYAGAIN` (DESIGN §7.2).
 
+Maintainer decisions implemented: history, SendQ and backlog are bounded in
+bytes, and the authentication throttle is on by default. A resource-bounds
+review found every memory cap counted items, not bytes. Each hot history ring
+now also holds at most `max_history_ring_bytes` (500 KiB) and all of them
+`max_hot_history_bytes` (512 MiB), shedding a ring's oldest entries and then
+the least recently active rings; a multiline message's text is held once and
+its plain line derived where it is stored. The SendQ is `sendq_bytes` (512
+KiB, the 1,024 lines it held at a full line each; migration 0088 converts the
+stored count), held output and paced LIST/WHO counted in the same bytes. A
+network's backlog holds `buffer_cap` lines of at most 512 bytes' worth each,
+in memory and in storage (5,000 rows, 2.5 MB), trimmed oldest first.
+`limits.auth_rate_burst` defaults to twenty a minute per address and is turned
+off only by `"off"`; a stored unset is migrated to the default (0088). The
+bouncer-shutdown test's upstream now closes the link on `QUIT` as a server
+does, where it had waited for the driver to close first and raced the end of
+the shutdown (DESIGN §7.2, §7.3, §11, §18).
+
 A review of whether the docs, tests, CI and guards tell the truth found, and
 this change fixes:
 
@@ -929,6 +946,180 @@ this change fixes:
 - **Docs that disagreed with the code**: when a refused network parks (three
   documents), DESIGN §5's dependency policy, the default flood limits, the
   client's SASL mechanisms, and CI's PostgreSQL setup.
+
+A review of the operator commands and channel modes against Solanum found,
+and this change fixes, each with a test that failed before:
+
+- **`KLINE 60 *@host` banned `*@60`**, and **`KLINE <nick>` banned
+  `*@<nick>`**, a host nobody has. A leading duration is now minutes (below),
+  and a bare nick bans that user's host or is refused with 401.
+- **Unknown channel modes answered 472 once per letter**; now once per
+  command, as Solanum does.
+- **Ban, quiet, exception and invite-exception rows** carried no setter or
+  time; each entry now records both and 367/728/348/346 report them.
+- **A second OPER announced `+o` again and switched the audited operator
+  identity**; it is answered 381 and changes nothing.
+- **KNOCK on a `+g` channel reached only its operators, and RPL_KNOCK named
+  the recipient**; every member of a `+g` channel hears it, in Solanum's
+  `710 #c #c nick!user@host` shape.
+- **SETHOST accepted globs and commas**; it takes Solanum's `clean_host`
+  alphabet.
+- **A KILL victim never saw the KILL line**; it is sent before the `ERROR`.
+- **ChanServ spoke as three sources** (bare `ChanServ` for a mode lock, the
+  server name for OP/VOICE and access on join, `ChanServ!ChanServ@services.*`
+  for notices); one helper now names it for all of them.
+- **DESIGN §7.6 promised user modes `+R` and `+Z` that did not exist**; both
+  are implemented (below).
+
+Maintainer decisions implemented: temporary K/D/X-lines (`KLINE <minutes>
+<mask>`, at most 52 weeks) stored with their expiry (migration 0089), audited
+with their length, shown in STATS with the lowercase letter and the time left,
+lapsed on every shard on its tick with one notice per operator, never loaded or
+listed once lapsed, and swept by storage maintenance; the administrator API
+takes `duration_minutes` and lists `expires_at`, and the console has both.
+`+R` refuses messages, notices, TAGMSG and INVITE from users not logged in
+(486; operators pass); `+Z` is set on TLS connections, a trusted proxy's HTTPS
+WebSocket included (transport `wss`), and WHOIS shows 671; both are in the
+published user record and in RPL_MYINFO. TOPIC needs `can_send`, so an
+unvoiced member of a `+m -t` channel cannot set it; `-i` (and `-l` without
+`+i`) revokes recorded invites; `MODE me +i foo` applies `+i` only; `MODE #c`
+from a non-member shows `+k`/`+l` without their arguments. `+l 10abc` and
+`+l 0` stay refused with 696, a documented difference from Solanum.
+
+A review of the web client and the console script found, and this change
+fixes, each with a test that failed before:
+
+- **The ban directory failed on "All kinds".** The filter form submits
+  `kind=`, and the console forwarded its page query verbatim, so the
+  contract's enum refused the read before it was sent; the accounts page sent
+  its invitation cursor and the reauthentication flag to an operation that
+  declares neither. Every directory's API query and pager link now come from
+  one allow-list helper, `directoryQuery`, and a test pins that the console
+  reads its page query nowhere else.
+- **STATUSMSG sigils were hard-coded `@+`.** The chat client now reads
+  `005 STATUSMSG` and takes off only advertised sigils, as the server's
+  `NetworkNames::conversation` does, with its test cases (`%#dev`, `&#dev`).
+- **A reconnect cleared "messages were not confirmed".** The socket's open
+  handler cleared the key that alert shared with "Not connected"; the two
+  have separate keys and only connection-down alerts clear on open.
+- **PART, KICK and QUIT reasons kept their colour codes.** One helper renders
+  every such reason.
+- **Channel and nick names were drawn with bidi controls** in the
+  conversation list, header, member list and alerts; they are stripped where
+  drawn and each name is a bidi isolate.
+- **An auto-join key beginning with `#`, `&`, `+` or `!` was saved as a
+  channel.** The settings box separates entries by commas, and the word after
+  a channel is its key, as the server's entry grammar reads it.
+
+A review of wire safety found, and this change fixes (DESIGN §7.1, limits and
+decoding):
+
+- **A channel message of high bytes was replaced by a rejection notice.** Two
+  hundred Latin-1 bytes fit the frame but decode to six hundred bytes of
+  U+FFFD, and the bouncer replaced the whole line with an `:e6irc` "upstream
+  input rejected" NOTICE. Decoding now fits the text again, so a line that fits
+  as bytes is always relayed, and the notice speaks as `*bnc*`; the
+  `bouncer_lines` fuzz target asserts it.
+- **Echoed client tokens could split a bouncer reply** (`NICK :a b` answered
+  `432 * a b :…`; `CAP :a b`, `JOIN :#a b` and `JOIN ::x` on a bridge alike).
+  The core's echo rule is now `MiddleParam` in `e6irc-proto`, the only type the
+  bouncer's attach numerics take.
+- **Over-long lines that aborted the debug worker**: a `FAIL REGISTER` echoing
+  a 480-byte account, and operator NOTICEs echoing an unbounded K/D/X-line mask
+  or SETHOST host. `fail_line` clips and fits, every server NOTICE goes through
+  one fitted `server_notice`, and server-ban masks are bounded. The bouncer's
+  own notices carrying upstream text (a closing reason, SASL notes, bridge
+  targets) go through a fitted `bnc_notice`, where a multi-byte reason used to
+  turn them into the rejection notice. `core_dispatch` now also fuzzes with
+  accounts enabled.
+- **The core's numerics still took their middles as strings**, and let a space
+  through for the one pre-joined mode string, so every call site echoing a
+  client token had to remember to render it — and three did not: an invalid
+  `+l` limit (`MODE #c +l :a b` answered `696 … l a b :…`), a WHOX query token
+  (`WHO #c :%nt,a b` shifted every field of each 354 row), and the STATS letter
+  (`STATS : u` sent an empty parameter). The refused target of a JOIN past the
+  channel limit was echoed unclipped. The funnel now takes `core::Middle`
+  values — `Middle::echo` for client or upstream text, `Middle::own` for the
+  server's, `From` an integer — each written as exactly one parameter, and
+  `RPL_CHANNELMODEIS` passes each mode argument as its own; `clip_echo` is
+  gone. The remaining `FAIL TOPIC`/`SETNAME`/`INVALID_MESSAGE` lines built by
+  hand now go through `fail_line`, and USERHOST, ISON and the HELP index
+  measure their packed trailing against the line the funnel frames rather
+  than a head rebuilt beside it.
+
+A review of the client library, the TUI and the CLI found, and this change
+fixes, each with a test that failed before:
+
+- **A server could grow the connection's capability state without end.**
+  Every name in every `CAP ACK` was enabled, requested or not, each by a
+  linear scan: a peer streaming acknowledgements (an upstream network the
+  bouncer connects to included) cost unbounded memory and quadratic time. A
+  verdict now counts only for a name awaiting one, and the enabled set holds
+  the program's own names, so the server cannot add one.
+- **One Latin-1 line in the welcome burst failed the TUI's connect and
+  `e6irc history`**, and the TUI never saw the MOTD or the 005 read while its
+  capabilities were requested. That request now reads the burst as the
+  steady-state stream does and hands every line back; the TUI shows it and
+  takes the connection's naming rules (CASEMAPPING, CHANTYPES, STATUSMSG) on
+  every connect, and its second copy of the STATUSMSG sigils is gone.
+- **What a server said while a client connected was gathered in a list the
+  server sized** — the TUI's whole connect, `tail`'s welcome burst — and a
+  bouncer's playback there is thousands of lines. The waits now hand each
+  line on as it is read (`e6irc_client::LineSink`): the TUI's state or its
+  bounded queue, `tail`'s output.
+- **`--history-lines` above the server's limit broke every connect**, and a
+  server that cut pages to its own limit made the client mark unread lines
+  read everywhere. Pages fit the 005 `CHATHISTORY` limit, a refused history
+  request costs only that channel's history, and `history --count` is cut to
+  the limit with a warning.
+- **`--no-read-markers` still sent `MARKREAD`**: markers now follow whether
+  the connection has `draft/read-marker` enabled.
+- **A server that dropped the TUI right after welcoming it was reconnected to
+  every two seconds forever**: the backoff starts afresh only after a session
+  stays up for one liveness window.
+- **The SCRAM-to-PLAIN step after a refusal before any credential was said
+  only by the bouncer**; the TUI and the CLI now say it too.
+
+A review of the sharded core found, and this change fixes, each with
+a test that failed before:
+
+- **A remote WHO answered after its asker closed aborted the worker.** The
+  reply was queued to be paced to a connection that no longer existed, and the
+  pacer's "only an open connection is paced" expectation killed the daemon.
+  Paced LIST and WHO replies now live on the session itself, so none can be
+  queued for, or paced to, a closed connection (DESIGN §7.2).
+- **A second JOIN in flight to one channel lost member updates.** The session
+  kept the channels with a JOIN in flight as a set, so the first answer (a
+  refused key) ended the window of the JOIN behind it: a NICK sent between
+  them never reached the owner that then admitted the user, a `JOIN 0` sent
+  after both was spent on the refusal and left the user in the channel, and
+  the channel limit undercounted. Both are counted per channel now.
+- **A labeled MODE or KICK of a channel on another shard broke its labeled
+  response**: the actor's own echo came after an empty `ACK`, untagged, where
+  one worker sends it as the labeled answer. The owner now returns the actor's
+  copy in the result; a ChanServ OP/VOICE of a remote channel had the same
+  split, and a mode lock enforced by the JOIN that recreated its channel was
+  told before that JOIN on one worker and after its labeled response on two —
+  it now follows the JOIN inside it, alike on both.
+
+Maintainer decisions implemented from a review of resource bounds (DESIGN
+§7.2):
+
+- **LIST keeps a cursor, not a copy.** A LIST used to clone the name and topic
+  of every channel it admitted into one sorted list held on the session until
+  it was paced out — some 65 MB per LIST at 100k channels, rebuilt by every
+  `LIST`/`LIST` abort. It now holds its conditions and one resume key per
+  shard, and each turn asks the shards for the next page after it, no larger
+  than the room the client's send queue has; rows come out in casemapped name
+  order across all shards, and an abort drops the cursor.
+- **Every line is metered, and reads are paced.** PING and PONG were exempt
+  from the command allowance and unregistered connections were never metered,
+  so one client streaming PONGs (or churning NICK) could fill its shard's
+  queue. Every line now spends a token where it enters the core — over TCP,
+  `/ws/irc` and from the bouncer's in-process session — and an empty bucket
+  stops the connection's reader until one is back instead of closing it with
+  Excess Flood. The allowance keeps Solanum's shape (40, then 20 a second) and
+  its operator exemption.
 
 ## Remaining qualification
 

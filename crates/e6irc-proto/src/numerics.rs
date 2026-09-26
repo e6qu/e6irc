@@ -72,6 +72,8 @@ numerics! {
     RPL_CREATIONTIME = 329,
     RPL_WHOISACCOUNT = 330,
     RPL_WHOISBOT = 335,
+    // Solanum: the WHOIS target is on a TLS connection (umode +Z).
+    RPL_WHOISSECURE = 671,
     RPL_NOTOPIC = 331,
     RPL_TOPIC = 332,
     RPL_TOPICWHOTIME = 333,
@@ -131,6 +133,8 @@ numerics! {
     ERR_BANLISTFULL = 478,
     ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
+    // Solanum (bahamut's ERR_NONONREG): a message refused by the target's +R.
+    ERR_NONONREG = 486,
     ERR_INVALIDKEY = 525,
     ERR_HELPNOTFOUND = 524,
     ERR_INVALIDMODEPARAM = 696,

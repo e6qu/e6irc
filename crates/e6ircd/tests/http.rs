@@ -49,6 +49,7 @@ async fn add_server_ban(
             reason: reason.into(),
             set_by: set_by.into(),
             kind: kind.into(),
+            expiry: None,
         },
         &e6ircd::db::AuditPrincipal::account(set_by),
     )
@@ -505,7 +506,12 @@ async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
 /// behind the service's work bounds.
 #[tokio::test]
 async fn one_address_saturating_its_requests_leaves_the_probes_answering() {
-    let running = net::start(test_config()).await.expect("start");
+    // The stalled requests are logins, which the per-address authentication
+    // budget (on by default) would refuse after twenty, before they could hold
+    // the thirty-two slots this bound is about.
+    let mut config = test_config();
+    config.limits.auth_rate_burst = e6ircd::config::AuthRateBurst::Off;
+    let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
     wait_http_ready(http).await;
 
@@ -1000,7 +1006,7 @@ async fn a_plain_get_of_the_websocket_endpoint_is_a_problem_document() {
 #[tokio::test]
 async fn the_per_address_authentication_budget_says_when_to_retry() {
     let mut config = test_config();
-    config.limits.auth_rate_burst = Some(1);
+    config.limits.auth_rate_burst = e6ircd::config::AuthRateBurst::PerMinute(1);
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
     let body = r#"{"account":"a","password":"p","label":"test"}"#;
@@ -1017,6 +1023,42 @@ async fn the_per_address_authentication_budget_says_when_to_retry() {
     // One token refills over a sixty-second window at a burst of one.
     let wait = retry_after(&head);
     assert!((1..=60).contains(&wait), "{head}");
+}
+
+/// The authentication throttle is on without being configured: the
+/// twenty-first request in a minute from one address is refused. `"off"`, and
+/// only that, turns it off.
+#[tokio::test]
+async fn the_authentication_budget_is_spent_by_default_and_off_only_when_said() {
+    let body = r#"{"account":"a","password":"p","label":"test"}"#;
+    let req = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let config = test_config();
+    assert_eq!(
+        config.limits.auth_rate_burst,
+        e6ircd::config::AuthRateBurst::PerMinute(e6ircd::config::DEFAULT_AUTH_RATE_BURST)
+    );
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    for attempt in 0..e6ircd::config::DEFAULT_AUTH_RATE_BURST {
+        // Each spends a token on a refusal for want of a database.
+        let (status, head, _) = request(http, &req).await;
+        assert_eq!(status, 503, "attempt {attempt}: {head}");
+    }
+    let (status, head, body) = request(http, &req).await;
+    assert_problem(status, &head, &body, 429);
+
+    let mut config = test_config();
+    config.limits.auth_rate_burst = e6ircd::config::AuthRateBurst::Off;
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    for attempt in 0..2 * e6ircd::config::DEFAULT_AUTH_RATE_BURST {
+        let (status, head, _) = request(http, &req).await;
+        assert_eq!(status, 503, "attempt {attempt}: {head}");
+    }
 }
 
 /// The body limit answers before any handler, in the same shape as every
@@ -1052,7 +1094,7 @@ async fn a_body_over_the_limit_is_a_problem_json_413() {
 #[tokio::test]
 async fn the_oidc_callback_spends_the_authentication_budget() {
     let mut config = test_config();
-    config.limits.auth_rate_burst = Some(1);
+    config.limits.auth_rate_burst = e6ircd::config::AuthRateBurst::PerMinute(1);
     config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
         name: "corp".into(),
         issuer_url: "https://idp.invalid".into(),
@@ -2743,10 +2785,12 @@ async fn openapi_spec_is_served() {
             "description",
             "motd",
             "nicklen",
-            "sendq",
+            "sendq_bytes",
             "core_queue",
             "core_workers",
             "max_hot_channels",
+            "max_history_ring_bytes",
+            "max_hot_history_bytes",
             "listeners",
             "registration",
             "limits",
@@ -2781,13 +2825,17 @@ async fn openapi_spec_is_served() {
         "max_connections_per_ip",
         "command_burst",
         "command_rate",
-        "auth_rate_burst",
         "api_rate_burst",
         "administrator_api_rate_burst",
         "registration_burst",
     ] {
         assert_eq!(limits_schema[field]["minimum"], 1, "{field}");
     }
+    // On by default, so off has a spelling of its own.
+    assert_eq!(
+        limits_schema["auth_rate_burst"]["oneOf"],
+        serde_json::json!([{ "type": "integer", "minimum": 1 }, { "const": "off" }])
+    );
     let observability_schema = &scalar_settings_schema["properties"]["observability"]["properties"];
     assert_eq!(
         observability_schema["sample_interval_seconds"],
@@ -6457,9 +6505,57 @@ async fn admin_console_ban_and_channel_actions() {
     );
     let (status, _, body) = request(http, &directory).await;
     assert_eq!(status, 200, "{body}");
-    let ban_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["bans"][0]["id"]
+    let listed = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    let ban_id = listed["bans"][0]["id"]
         .as_i64()
         .expect("stable server-ban id");
+    assert!(listed["bans"][0]["expires_at"].is_null(), "{body}");
+
+    // A temporary ban carries its expiry; a zero or over-long duration is
+    // refused before anything is changed.
+    let post_ban = |body: &str| {
+        format!(
+            "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    for duration in [0, 524_161] {
+        let body =
+            format!(r#"{{"kind":"kline","mask":"*@brief.example","duration_minutes":{duration}}}"#);
+        let (status, _, refusal) = request(http, &post_ban(&body)).await;
+        assert_eq!(status, 400, "{refusal}");
+    }
+    let (status, _, _) = request(
+        http,
+        &post_ban(r#"{"kind":"kline","mask":"*@brief.example","duration_minutes":60}"#),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let temporary = format!(
+        "GET /api/v1/admin/bans?kind=kline&mask=%2A%40brief.example HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &temporary).await;
+    assert_eq!(status, 200, "{body}");
+    let expires_at =
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["bans"][0]["expires_at"]
+            .as_str()
+            .map(str::to_owned);
+    assert!(
+        expires_at.is_some_and(|at| at.ends_with('Z')),
+        "a temporary ban lists its expiry: {body}"
+    );
+    assert!(
+        policy_page_has(
+            "/api/v1/admin/audit?action=KLINE&target=%2A%40brief.example",
+            "(temporary, 60 min.)",
+            true,
+        )
+        .await,
+        "the audit row names the duration"
+    );
 
     // Delete that exact immutable policy resource; a client never selects a
     // mutable visible mask for removal.
@@ -10648,6 +10744,10 @@ async fn a_provider_without_a_token_endpoint_is_a_bad_gateway() {
 async fn oidc_login_state_is_sealed_into_the_browser() {
     let provider = discovery_only_identity_provider(true).await;
     let mut config = test_config();
+    // Thousands of starts from one address: what the server holds per flow is
+    // the question, so the per-address budget that would refuse all but twenty
+    // of them is off.
+    config.limits.auth_rate_burst = e6ircd::config::AuthRateBurst::Off;
     config.http.as_mut().expect("http").public_url = Some("http://e6irc.example".into());
     config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
         name: "corp".into(),

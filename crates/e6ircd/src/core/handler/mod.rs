@@ -1,9 +1,10 @@
 //! Command dispatch: one inbound line → state transitions + replies.
 
-use e6irc_proto::message::Message;
+use e6irc_proto::message::{Message, MiddleParam};
 use e6irc_proto::numerics::*;
 
 use super::ConnId;
+use super::middle::Middle;
 use super::state::{
     BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult,
@@ -30,12 +31,21 @@ pub(crate) use history::*;
 use message::*;
 pub(crate) use monitor::*;
 pub(crate) use oper::*;
-pub(crate) use query::pace_who_replies;
 use query::*;
 pub(crate) use read_marker::*;
 use registration::*;
 pub(crate) use sasl::*;
 use services::*;
+
+/// Send what every LIST and WHO reply being paced out on this shard has room
+/// for now. A connection whose paced output is not finished is put back in
+/// `pacing` as it is resumed.
+pub(crate) fn pace_replies(state: &mut ServerState) {
+    for conn in std::mem::take(&mut state.pacing) {
+        chanops::pace_channel_list(state, conn);
+        query::pace_who_replies_to(state, conn);
+    }
+}
 
 fn replace_registered_topic(
     state: &mut ServerState,
@@ -353,10 +363,8 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         Ok(m) => m,
         Err(_) => {
             return refuse_line(state, conn, line, |state| {
-                state.send(
-                    conn,
-                    &format!(":{server} FAIL * INVALID_MESSAGE :Malformed line"),
-                );
+                let fail = fail_line(&server, "*", "INVALID_MESSAGE", &[], "Malformed line");
+                state.send(conn, &fail);
             });
         }
     };
@@ -528,48 +536,35 @@ pub(crate) fn pack_trailing_list(items: &[String], head_len: usize) -> String {
     out
 }
 
-/// Clip a client-supplied token for echoing inside a reply. Numerics that
-/// attribute an error echo the offending token (an unknown command, a bad CAP
-/// subcommand, a rejected target list); the token's length is bounded only by
-/// the input frame, so echoing it whole can push the reply past the wire limit
-/// and the recipient's framing then discards the very line explaining the
-/// error. 64 bytes identifies anything; every reply shape stays well inside
-/// the limit with room for its other, server-bounded parameters.
-pub(crate) fn clip_echo(token: &str) -> &str {
-    // A client token echoed back into a reply lands in a *middle* parameter
-    // position, so it must be able to stand as one: an empty token collapses
-    // into the field separator, a ':'-leading token opens the trailing early
-    // and swallows the rest of the line (the numeric-middle framing class —
-    // e.g. a fuzzer's `CAP :` echoed into ERR_INVALIDCAPCMD), and a token with
-    // a space splits into two parameters. A parsed parameter *can* hold a
-    // space: the last one may be in trailing form (`KICK #c :a b` makes the
-    // nick `a b`), so a space is refused like the other two, and each of them
-    // shows the conventional "*" placeholder. The rest is clipped to bound the
-    // echo. CR/LF/NUL never survive the parser.
-    if token.is_empty() || token.starts_with(':') || token.contains(' ') {
-        return "*";
-    }
-    e6irc_proto::message::truncate_on_char_boundary(token, 64)
+/// `:{server} NOTICE {target} :{text}`, with `text` fitted to the line. The
+/// one shape every server-sourced NOTICE takes, so none can carry an
+/// oper-typed mask or a client's host past the wire limit — where the
+/// recipient's framing discards it whole, and the debug wire check aborts the
+/// worker that built it.
+pub(crate) fn server_notice(server: &str, target: &str, text: &str) -> String {
+    fitted_line(format!(":{server} NOTICE {target} :"), text)
 }
 
 /// The shared `:{server} FAIL <command> <code> [context] :<detail>` wire
-/// shape. The CHATHISTORY and multiline failure paths differ in label
-/// handling and context clipping, not in the line itself.
-pub(super) fn fail_line(
+/// shape. Each context parameter is the client's own text echoed for
+/// attribution (an account name, a subcommand, a target), so it is rendered
+/// through [`MiddleParam::echo`] here, and the detail is fitted to the line: no
+/// caller can hand a raw token to a middle position or push the line past the
+/// limit.
+pub(crate) fn fail_line(
     server: &str,
     command: &str,
     code: &str,
     context: &[&str],
     detail: &str,
 ) -> String {
-    let mut line = format!(":{server} FAIL {command} {code}");
+    let mut head = format!(":{server} FAIL {command} {code}");
     for param in context {
-        line.push(' ');
-        line.push_str(param);
+        head.push(' ');
+        head.push_str(MiddleParam::echo(param).as_str());
     }
-    line.push_str(" :");
-    line.push_str(detail);
-    line
+    head.push_str(" :");
+    fitted_line(head, detail)
 }
 
 /// The standard-reply codes history surfaces (CHATHISTORY, MARKREAD) answer
@@ -604,9 +599,8 @@ impl HistoryFail {
         }
     }
 
-    /// `:{source} FAIL {command} {code} {context..} :{detail}`, each context
-    /// parameter (the client's own subcommand/target, echoed for attribution)
-    /// clipped so the line explaining an error is never discarded for length.
+    /// `:{source} FAIL {command} {code} {context..} :{detail}`, through
+    /// [`fail_line`], which clips each echoed context parameter.
     pub(crate) fn line(
         self,
         source: &str,
@@ -614,8 +608,7 @@ impl HistoryFail {
         context: &[&str],
         detail: &str,
     ) -> String {
-        let clipped: Vec<&str> = context.iter().map(|p| clip_echo(p)).collect();
-        fail_line(source, command, self.code(), &clipped, detail)
+        fail_line(source, command, self.code(), context, detail)
     }
 }
 
@@ -746,65 +739,9 @@ fn batch_command_ref(line: &[u8], sign: char) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Spend one command-flood token. Returns `true` if the command may
-/// proceed, `false` if the bucket is empty (the caller closes the link).
-/// Always `true` for pre-registered and oper sessions, and for a harness
-/// core built without a bucket. Refills `rate` tokens per elapsed second up
-/// to `burst`; a fresh session is seeded full at `open()` (with its
-/// watermark at the open time), so it starts with the whole burst available.
-fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
-    let Some(flood) = state.config.command_flood else {
-        return true;
-    };
-    {
-        let s = &state.sessions[&conn];
-        if !s.is_registered() || s.oper.is_some() {
-            return true;
-        }
-    }
-    let now = (state.config.mono_clock)();
-    let s = state.sessions.get_mut(&conn).expect("session present");
-    // The refill watermark is monotonic, so it can never end up ahead of `now`
-    // (that was the wall-clock NTP-backstep hazard sweep 70 re-anchored around);
-    // the guard remains as defense in depth should the monotonic source ever
-    // report non-monotonically.
-    if now < s.flood_refilled_to_ms {
-        s.flood_refilled_to_ms = now;
-    }
-    // Credit whole tokens only (`rate` per 1000 ms) and advance the watermark
-    // by exactly the milliseconds those tokens cost — never to `now` — so a
-    // sub-token remainder carries forward instead of being discarded. Resetting
-    // the watermark on every command would let a steady sub-interval stream
-    // starve the bucket of refill forever.
-    let rate = u64::from(flood.rate());
-    let elapsed_ms = now.saturating_sub(s.flood_refilled_to_ms).as_millis();
-    let credited = elapsed_ms.saturating_mul(rate) / 1000;
-    // `credited * 1000 / rate <= elapsed_ms`, so the watermark never passes `now`.
-    let credited_ms = credited.saturating_mul(1000) / rate;
-    let tokens = (u64::from(s.flood_tokens) + credited).min(u64::from(flood.burst())) as u32;
-    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add_millis(credited_ms);
-    if tokens == 0 {
-        return false;
-    }
-    s.flood_tokens = tokens - 1;
-    true
-}
-
 fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
-    let server = state.config.server_name.clone();
     let command = msg.command.to_ascii_uppercase();
     let p = &msg.params;
-
-    // Command-flood throttle. Keepalive is exempt; a depleted bucket closes
-    // the link loudly (Excess Flood), never silently drops.
-    if command != "PING" && command != "PONG" && !flood_ok(state, conn) {
-        state.send(
-            conn,
-            &format!("ERROR :Closing Link: {server} (Excess Flood)"),
-        );
-        state.close(conn, "Excess Flood");
-        return;
-    }
 
     // Any inbound line — *including* a keepalive PING/PONG — proves the socket
     // is alive, so it answers an outstanding liveness PING: the reaper must not
@@ -901,7 +838,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         _ => state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &[clip_echo(&command)],
+            &[Middle::echo(&command)],
             Some("Unknown command"),
         ),
     }
@@ -1169,15 +1106,6 @@ mod tests {
         assert!(!cap_version_302(Some("301")));
         assert!(!cap_version_302(Some("v302")));
         assert!(!cap_version_302(None));
-    }
-
-    #[test]
-    fn clip_echo_renders_every_unframeable_token_as_a_placeholder() {
-        for token in ["", ":x", "a b", " ", "trailing "] {
-            assert_eq!(clip_echo(token), "*", "{token:?}");
-        }
-        assert_eq!(clip_echo("nick"), "nick");
-        assert_eq!(clip_echo(&"x".repeat(100)).len(), 64);
     }
 
     #[test]

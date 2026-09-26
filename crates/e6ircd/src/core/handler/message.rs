@@ -104,7 +104,7 @@ pub(super) fn cmd_message(
                 state.numeric(
                     conn,
                     ERR_TOOMANYTARGETS,
-                    &[clip_echo(&target)],
+                    &[Middle::echo(&target)],
                     Some("Too many targets; message not delivered"),
                 );
             }
@@ -149,6 +149,7 @@ pub(super) fn record_history(
     }
     let stored = entry.clone();
     state.push_history(key, entry);
+    let body = stored.plain_body().into_owned();
     let log = crate::core::DbRequest::LogMessage {
         msgid: stored.msgid,
         target: key.as_str().to_string(),
@@ -156,7 +157,7 @@ pub(super) fn record_history(
         sender_prefix: stored.sender_prefix,
         sender_account: stored.sender_account,
         kind: stored.kind,
-        body: stored.body,
+        body,
         sender_is_bot: stored.sender_is_bot,
         multiline: stored.multiline,
         client_tags: stored.client_tags,
@@ -236,6 +237,17 @@ fn speak_refusal(
     None
 }
 
+/// ERR_NONONREG: `nick`'s +R refused the sender, who is not logged in
+/// (Solanum's `um_regonlymsg` wording).
+pub(super) fn err_nonreg(state: &mut ServerState, conn: ConnId, nick: &str) {
+    state.numeric(
+        conn,
+        ERR_NONONREG,
+        &[Middle::own(nick)],
+        Some("You must log in with services to message this user"),
+    );
+}
+
 /// Tell the sender why [`speak_refusal`] refused its message to `target`.
 fn emit_speak_refusal(state: &mut ServerState, conn: ConnId, target: &str, why: SpeakRefusal) {
     let (numeric, text) = match why {
@@ -243,7 +255,7 @@ fn emit_speak_refusal(state: &mut ServerState, conn: ConnId, target: &str, why: 
         SpeakRefusal::CannotSend => (ERR_CANNOTSENDTOCHAN, "Cannot send to channel"),
         SpeakRefusal::NoCtcp => (ERR_CANNOTSENDTOCHAN, "Cannot send to channel (+C, no CTCP)"),
     };
-    state.numeric(conn, numeric, &[target], Some(text));
+    state.numeric(conn, numeric, &[Middle::echo(target)], Some(text));
 }
 
 /// What a message target resolved to, once the sender was allowed to speak.
@@ -291,6 +303,14 @@ pub(super) fn resolve_message_target(
             }
             return None;
         };
+        // +R: only a logged-in sender (or an operator) reaches this user. A
+        // NOTICE is refused silently, as every NOTICE refusal is.
+        if peer.refuses_unregistered(conn, &state.sessions[&conn]) {
+            if loud {
+                err_nonreg(state, conn, &peer.nick);
+            }
+            return None;
+        }
         return Some(ResolvedTarget {
             recipients: vec![peer.recipient],
             kind: ResolvedKind::User { peer },
@@ -578,7 +598,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &["TAGMSG"],
+            &[Middle::own("TAGMSG")],
             Some("Unknown command"),
         );
         return;
@@ -618,7 +638,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[clip_echo(&target)],
+                &[Middle::echo(&target)],
                 Some("Too many targets; message not delivered"),
             );
             break;
@@ -1197,7 +1217,7 @@ fn away_reply(
         && peer.conn() != conn
         && let Some(away) = &peer.away
     {
-        state.numeric(conn, RPL_AWAY, &[&peer.nick], Some(away));
+        state.numeric(conn, RPL_AWAY, &[Middle::own(&peer.nick)], Some(away));
     }
 }
 
@@ -1314,10 +1334,12 @@ fn multiline_carries_blocked_ctcp(lines: &[(String, bool)]) -> bool {
 /// message under the id it was delivered with (per the CHATHISTORY spec: "msgid
 /// MUST be the msgid as originally sent") — rather than one row per line with
 /// fresh, never-delivered ids that a msgid-deduplicating client would replay as
-/// brand-new messages. `body` holds a plain-line fallback (a reader without the
-/// multiline field); `multiline` is authoritative on replay. All lines are
-/// kept, blanks included, so the reconstructed batch matches the live one; the
-/// flattened replay drops blanks as live does.
+/// brand-new messages. `multiline` holds the text, and `body` is left empty:
+/// the text is held once, and its plain-line form (what the database's `body`
+/// column and the REST history carry) is derived from it
+/// ([`crate::core::HistoryRow::plain_body`]). All lines are kept, blanks
+/// included, so the reconstructed batch matches the live one; the flattened
+/// replay drops blanks as live does.
 fn multiline_history_entry(message: &MultilineMessage) -> crate::core::state::HistoryEntry {
     crate::core::state::HistoryEntry {
         msgid: message.msgid.to_string(),
@@ -1325,12 +1347,7 @@ fn multiline_history_entry(message: &MultilineMessage) -> crate::core::state::Hi
         sender_prefix: message.prefix.to_string(),
         sender_account: message.account.map(str::to_owned),
         kind: message.kind.into(),
-        body: message
-            .lines
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
+        body: String::new(),
         sender_is_bot: message.bot,
         multiline: Some(encode_multiline(message.lines)),
         client_tags: crate::sanitize::history_client_tags(message.client_tags),
@@ -1519,6 +1536,16 @@ pub(super) fn encode_multiline(lines: &[(String, bool)]) -> String {
         .join("\n")
 }
 
+/// A multiline message's text as one plain line: its lines, blanks included,
+/// joined with spaces — what the database's `body` column holds for it.
+pub(crate) fn multiline_plain_text(encoded: &str) -> String {
+    decode_multiline(encoded)
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Decode what [`encode_multiline`] produced back into `(text, concat)` lines.
 pub(super) fn decode_multiline(encoded: &str) -> Vec<(String, bool)> {
     encoded
@@ -1628,7 +1655,7 @@ pub(super) fn multiline_collect(
             state,
             conn,
             "MULTILINE_INVALID_TARGET",
-            &[clip_echo(&batch_target), clip_echo(line_target)],
+            &[&batch_target, line_target],
             "Multiline batch target does not match message target",
         );
         return true;
@@ -1714,6 +1741,36 @@ pub(super) fn multiline_collect(
 #[cfg(test)]
 mod tests {
     use super::is_blocked_ctcp;
+
+    /// A multiline message's history entry holds its text once, in
+    /// `multiline`; the plain line the database stores is derived from it and
+    /// is what joining the lines always gave, blanks included.
+    #[test]
+    fn a_multiline_history_entry_holds_its_text_once() {
+        let lines = [
+            ("hello".to_string(), false),
+            (String::new(), false),
+            ("world".to_string(), true),
+        ];
+        let message = super::MultilineMessage {
+            prefix: "alice!a@host",
+            kind: crate::core::MessageKind::Privmsg,
+            target: "#m",
+            lines: &lines,
+            client_tags: "",
+            msgid: "id",
+            ts: e6irc_proto::time::Millis::from_millis(1),
+            account: None,
+            bot: false,
+        };
+        let entry = super::multiline_history_entry(&message);
+        assert!(entry.body.is_empty(), "{:?}", entry.body);
+        assert_eq!(
+            entry.multiline.as_deref(),
+            Some(super::encode_multiline(&lines).as_str())
+        );
+        assert_eq!(entry.plain_body(), "hello  world");
+    }
 
     #[test]
     fn ctcp_action_exemption_matches_the_exact_tag() {

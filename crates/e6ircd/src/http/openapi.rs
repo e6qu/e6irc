@@ -546,7 +546,7 @@ fn operations() -> serde_json::Value {
                         "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
                         "nick": { "type": "string" }, "user": { "type": "string" }, "host": { "type": "string" },
                         "account": { "type": ["string", "null"] }, "oper": { "type": "boolean" },
-                        "transport": { "type": "string", "enum": ["tcp", "tls", "websocket", "local"] },
+                        "transport": { "type": "string", "enum": ["tcp", "tls", "websocket", "wss", "local"], "description": "wss is a WebSocket a trusted proxy reports reached over HTTPS; websocket is any other." },
                         "connected_at": { "type": "string" }, "idle_seconds": { "type": "integer", "minimum": 0 },
                         "channels": { "type": "array", "items": { "type": "string" } }
                     }
@@ -677,8 +677,8 @@ fn operations() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["bans", "next_before_id"],
             "properties": { "bans": { "type": "array", "items": { "type": "object", "additionalProperties": false,
-                "required": ["id", "mask", "reason", "set_by", "kind", "created_at"],
-                "properties": { "id": { "type": "integer", "minimum": 1 }, "mask": { "type": "string" }, "reason": { "type": "string" }, "set_by": { "type": "string" }, "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "created_at": { "type": "string" } }
+                "required": ["id", "mask", "reason", "set_by", "kind", "created_at", "expires_at"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "mask": { "type": "string" }, "reason": { "type": "string" }, "set_by": { "type": "string" }, "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "created_at": { "type": "string" }, "expires_at": { "type": ["string", "null"], "description": "When a temporary ban lapses (UTC); null for a permanent ban. A lapsed ban is not listed." } }
             } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
         }),
     );
@@ -773,7 +773,7 @@ fn operations() -> serde_json::Value {
             "schema": { "type": "string", "maxLength": 64 } }),
         serde_json::json!({ "name": "transport", "in": "query",
             "schema": { "type": "string",
-                "enum": ["tcp", "tls", "websocket", "local"] } }),
+                "enum": ["tcp", "tls", "websocket", "wss", "local"] } }),
         serde_json::json!({ "name": "oper", "in": "query",
             "schema": { "type": "boolean" } }),
     ]);
@@ -836,7 +836,10 @@ fn operations() -> serde_json::Value {
             "command_burst": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "command_rate": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "trusted_proxies": { "type": "array", "items": { "type": "string" } },
-            "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "auth_rate_burst": {
+                "oneOf": [{ "type": "integer", "minimum": 1 }, { "const": "off" }],
+                "description": "Authentication requests one client address (an IPv6 client's /64) may make at once, refilling over a minute; \"off\" turns the throttle off. On by default."
+            },
             "api_rate_burst": { "type": "integer", "minimum": 1 },
             "administrator_api_rate_burst": { "type": "integer", "minimum": 1 },
             "registration_burst": { "type": ["integer", "null"], "minimum": 1 },
@@ -882,8 +885,9 @@ fn operations() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "server_name", "network_name", "description", "motd", "nicklen", "sendq",
-            "core_queue", "core_workers", "max_hot_channels", "listeners", "registration", "limits",
+            "server_name", "network_name", "description", "motd", "nicklen", "sendq_bytes",
+            "core_queue", "core_workers", "max_hot_channels", "max_history_ring_bytes",
+            "max_hot_history_bytes", "listeners", "registration", "limits",
             "observability", "storage", "bnc_addr", "bnc_tls", "public_url", "secure_cookies",
             "admin_accounts"
         ],
@@ -893,10 +897,12 @@ fn operations() -> serde_json::Value {
             "description": { "type": "string" },
             "motd": { "type": "array", "items": { "type": "string" } },
             "nicklen": { "type": "integer", "minimum": 10, "maximum": 64 },
-            "sendq": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_SENDQ },
+            "sendq_bytes": { "type": "integer", "minimum": crate::config::MIN_SENDQ_BYTES, "maximum": crate::config::MAX_SENDQ_BYTES, "description": "Bytes queued for one connection, output held behind a deferred reply included, before it is closed for SendQ." },
             "core_queue": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_QUEUE },
             "core_workers": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_WORKERS },
             "max_hot_channels": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HOT_CHANNELS },
+            "max_history_ring_bytes": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HISTORY_RING_BYTES, "description": "Bytes one channel's or conversation's in-memory history may hold; its oldest entries go first." },
+            "max_hot_history_bytes": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HOT_HISTORY_BYTES, "description": "Bytes every in-memory history together may hold; the least recently active are evicted first. At least max_history_ring_bytes." },
             "listeners": { "type": "array", "items": listener_schema },
             "registration": registration_schema,
             "limits": limits_schema,
@@ -2205,9 +2211,9 @@ fn operations() -> serde_json::Value {
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": {
                         "type": "object", "additionalProperties": false, "required": ["kind", "mask"],
-                        "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" } }
+                        "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" }, "duration_minutes": { "type": "integer", "minimum": 1, "maximum": crate::core::ServerBanExpiry::MAX_MINUTES, "description": "A temporary ban's length in minutes; omitted for a permanent ban. Every shard stops enforcing the ban when it lapses." } }
                     } } } },
-                    "responses": { "201": json_response_status(201, "server ban created", message_schema.clone())["201"], "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
+                    "responses": { "201": json_response_status(201, "server ban created", message_schema.clone())["201"], "400": { "description": "invalid kind, mask, or duration" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/bans/{id}": {
                 "delete": { "summary": "Delete one immutable server-ban resource (admin only)",

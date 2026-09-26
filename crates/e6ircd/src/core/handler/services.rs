@@ -1818,14 +1818,15 @@ pub(crate) fn chanserv_status_on_owner(
     }
     let line = state.server_line(format!(
         ":{} MODE {display} {} {target_nick}",
-        state.config.server_name,
+        state.service_prefix("ChanServ"),
         change.mode()
     ));
-    state.broadcast_channel(&key, &line, None);
+    let echo = state.broadcast_channel_answering(&key, line, actor.recipient.conn());
     ChanServStatusResult::Changed {
         target: target_nick,
         channel: display,
         change,
+        echo,
     }
 }
 
@@ -1859,7 +1860,11 @@ pub(crate) fn emit_chanserv_status_result(
             target,
             channel,
             change,
+            echo,
         } => {
+            if let Some(echo) = echo {
+                state.send_event(conn, &echo);
+            }
             let done = match change {
                 StatusChange::Op => "Opped",
                 StatusChange::Deop => "Deopped",
@@ -2670,14 +2675,14 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         conn,
         RPL_MYINFO,
         &[
-            &server,
-            &format!("e6ircd-{}", version()),
+            Middle::own(&server),
+            Middle::own(format!("e6ircd-{}", version())),
             // Derived from the same mode tables as ISUPPORT CHANMODES/PREFIX, so
             // the two cannot drift: user modes, every channel mode (list and
             // prefix modes included), then the channel modes taking a parameter.
-            USER_MODES,
-            &myinfo_channel_modes(),
-            &myinfo_param_channel_modes(),
+            Middle::own(USER_MODES),
+            Middle::own(myinfo_channel_modes()),
+            Middle::own(myinfo_param_channel_modes()),
         ],
         None,
     );
@@ -2688,6 +2693,11 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         .nick()
         .map(String::from)
         .expect("registered");
+    // The server sets +Z on a TLS connection; the client learns it the way
+    // Solanum's `send_umode` tells it, after the MOTD.
+    if state.sessions[&conn].secure() {
+        state.send(conn, &format!(":{nick} MODE {nick} :+Z"));
+    }
     monitor_notify(state, &nick, true);
     check_nick_protection(state, conn);
 }
@@ -2718,7 +2728,7 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         state.numeric(
             conn,
             RPL_LUSEROP,
-            &[&opers.to_string()],
+            &[Middle::from(opers)],
             Some("operator(s) online"),
         );
     }
@@ -2726,7 +2736,7 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         state.numeric(
             conn,
             RPL_LUSERUNKNOWN,
-            &[&unknown.to_string()],
+            &[Middle::from(unknown)],
             Some("unknown connection(s)"),
         );
     }
@@ -2734,7 +2744,7 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         state.numeric(
             conn,
             RPL_LUSERCHANNELS,
-            &[&channels.to_string()],
+            &[Middle::from(channels)],
             Some("channels formed"),
         );
     }
@@ -2747,13 +2757,13 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
     state.numeric(
         conn,
         RPL_LOCALUSERS,
-        &[&users.to_string(), &max.to_string()],
+        &[Middle::from(users), Middle::from(max)],
         Some(&format!("Current local users {users}, max {max}")),
     );
     state.numeric(
         conn,
         RPL_GLOBALUSERS,
-        &[&users.to_string(), &max.to_string()],
+        &[Middle::from(users), Middle::from(max)],
         Some(&format!("Current global users {users}, max {max}")),
     );
 }

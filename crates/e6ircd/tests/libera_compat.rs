@@ -122,15 +122,16 @@ fn our_isupport() -> HashMap<String, String> {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: 256 * 512,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: true,
             opers: vec![],
             max_hot_channels: 8192,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || e6irc_proto::time::Millis::from_millis(0),
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -138,11 +139,7 @@ fn our_isupport() -> HashMap<String, String> {
         db_tx,
     );
     let conn = ConnId(1);
-    let (tx, mut rx) = queue(Config {
-        name: "sendq",
-        capacity: 256,
-        policy: Policy::Fifo,
-    });
+    let (tx, mut rx) = e6ircd::core::send_queue("sendq", 256 * 512);
     core.handle(Input::Open {
         conn,
         tx,

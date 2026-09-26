@@ -11,10 +11,25 @@ use e6irc_queue::{Config, Policy, Receiver, queue};
 fn test_mono() -> MonoMillis {
     MonoMillis::from_millis(1_000_000_000)
 }
-use e6ircd::core::{CommandFlood, ConnId, Core, CoreConfig, Input, Output};
+use e6ircd::core::{ConnId, Core, CoreConfig, Input, Output};
+
+/// A test connection's send queue: the 256 lines it held when it counted
+/// lines, at a full 512-byte line each, so every reply that fitted then fits.
+const TEST_SENDQ_BYTES: usize = 256 * 512;
+
+/// A send queue small enough that a few hundred LIST or WHO rows fill more
+/// than half of it, for the paced replies.
+const PACED_SENDQ_BYTES: usize = 8 * 1024;
+
+/// The bytes `lines` took in a send queue, their CRLFs included.
+fn wire_bytes(lines: &[String]) -> usize {
+    lines.iter().map(|line| line.len() + 2).sum()
+}
 
 struct TestServer {
     core: Core,
+    /// Each connection's send queue, in bytes (the configured `sendq_bytes`).
+    sendq_bytes: usize,
     conns: Vec<(ConnId, Receiver<Output>)>,
     db_rx: Receiver<e6ircd::core::DbRequest>,
     channel_service_route: Option<(e6ircd::core::ChannelOwner, e6ircd::core::SessionOwner)>,
@@ -46,32 +61,45 @@ impl TestServer {
             static NOW_MS: AtomicU64 = AtomicU64::new(1_000_000_000);
             Millis::from_millis(NOW_MS.fetch_add(1, Ordering::Relaxed))
         }
-        Self::with_config(false, advancing, 256)
+        Self::with_config(false, advancing, TEST_SENDQ_BYTES)
     }
 
     /// A database-backed server with a deliberately small per-connection
-    /// output bound, for exercising SendQ-style limits.
-    fn with_sendq(sendq: usize) -> Self {
-        Self::with_config(true, || Millis::from_millis(1_000_000_000), sendq)
+    /// output bound, in bytes, for exercising SendQ-style limits.
+    fn with_sendq(sendq_bytes: usize) -> Self {
+        Self::with_config(true, || Millis::from_millis(1_000_000_000), sendq_bytes)
+    }
+
+    /// A server whose connections' send queues are [`PACED_SENDQ_BYTES`].
+    fn with_paced_sendq(sasl_enabled: bool) -> Self {
+        Self::with_config(
+            sasl_enabled,
+            || Millis::from_millis(1_000_000_000),
+            PACED_SENDQ_BYTES,
+        )
     }
 
     fn with_persistence(sasl_enabled: bool) -> Self {
-        Self::with_config(sasl_enabled, || Millis::from_millis(1_000_000_000), 256)
+        Self::with_config(
+            sasl_enabled,
+            || Millis::from_millis(1_000_000_000),
+            TEST_SENDQ_BYTES,
+        )
     }
 
-    fn with_config(sasl_enabled: bool, clock: fn() -> Millis, sendq: usize) -> Self {
-        Self::with_full_config(sasl_enabled, clock, sendq, "irc.test.example", 16)
+    fn with_config(sasl_enabled: bool, clock: fn() -> Millis, sendq_bytes: usize) -> Self {
+        Self::with_full_config(sasl_enabled, clock, sendq_bytes, "irc.test.example", 16)
     }
 
     fn with_full_config(
         sasl_enabled: bool,
         clock: fn() -> Millis,
-        sendq: usize,
+        sendq_bytes: usize,
         server_name: &str,
         nicklen: usize,
     ) -> Self {
         Self::configured(sasl_enabled, clock, |config| {
-            config.sendq = sendq;
+            config.sendq_bytes = sendq_bytes;
             config.server_name = server_name.into();
             config.nicklen = nicklen;
         })
@@ -94,21 +122,23 @@ impl TestServer {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: TEST_SENDQ_BYTES,
             motd: vec!["Welcome to the test net".into()],
             nicklen: 16,
             sasl_enabled,
             max_hot_channels: 8192,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             opers: vec![("god".into(), "letmein".into())],
             clock,
             mono_clock: test_mono,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         };
         adjust(&mut config);
         Self {
+            sendq_bytes: config.sendq_bytes,
             core: Core::new(config, db_tx),
             conns: Vec::new(),
             db_rx,
@@ -222,11 +252,7 @@ impl TestServer {
         transport: e6ircd::core::ConnectionTransport,
     ) -> ConnId {
         let conn = ConnId(id);
-        let (tx, rx) = queue(Config {
-            name: "test-sendq",
-            capacity: 256,
-            policy: Policy::Fifo,
-        });
+        let (tx, rx) = e6ircd::core::send_queue("test-sendq", self.sendq_bytes);
         self.core.handle(Input::Open {
             conn,
             tx,
@@ -1075,6 +1101,41 @@ fn mode_multichar_list_query_dumps_each_list() {
     );
     assert!(has_numeric(&out, "368"), "end of ban list: {out:#?}");
     assert!(has_numeric(&out, "349"), "end of exception list: {out:#?}");
+}
+
+/// Every list row names the mask's setter and when it was set, as Solanum's
+/// `367 <me> <channel> <mask> <setter> <set-at>` does (the test clock reads
+/// 1,000,000 seconds).
+#[test]
+fn channel_list_rows_carry_setter_and_time() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #ml");
+    s.line(
+        alice,
+        "MODE #ml +bqeI bad!*@* hush!*@* friend!*@* guest!*@*",
+    );
+    s.drain(alice);
+    s.line(alice, "MODE #ml bqeI");
+    let rows: Vec<String> = s
+        .drain(alice)
+        .into_iter()
+        .filter(|l| {
+            [" 367 ", " 728 ", " 348 ", " 346 "]
+                .iter()
+                .any(|n| l.contains(n))
+        })
+        .collect();
+    let by = "alice!alice@host1.example 1000000";
+    assert_eq!(
+        rows,
+        [
+            format!(":irc.test.example 367 alice #ml bad!*@* {by}"),
+            format!(":irc.test.example 728 alice #ml q hush!*@* {by}"),
+            format!(":irc.test.example 348 alice #ml friend!*@* {by}"),
+            format!(":irc.test.example 346 alice #ml guest!*@* {by}"),
+        ]
+    );
 }
 
 #[test]
@@ -2426,6 +2487,35 @@ fn stats_uptime_and_terminator() {
         has_numeric(&out, "219"),
         "STATS with a leading 3-byte char still terminates without panic"
     );
+    // The letter is the client's text: a space (the argument in trailing
+    // form) is the `*` placeholder, not an empty parameter.
+    s.line(alice, "STATS : u");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 219 alice * :End of /STATS report"],
+    );
+}
+
+/// `MODE #c +l <limit>` answers a limit that is not a positive number with
+/// ERR_INVALIDMODEPARAM naming it; the limit is the client's text, so one
+/// that cannot stand as a parameter (`+l :a b`) is the `*` placeholder rather
+/// than two parameters that push the reply's fields a column right.
+#[test]
+fn an_invalid_limit_is_echoed_as_one_parameter() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #lim");
+    s.drain(alice);
+    s.line(alice, "MODE #lim +l zero");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 696 alice #lim l zero :Invalid channel limit"],
+    );
+    s.line(alice, "MODE #lim +l :a b");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 696 alice #lim l * :Invalid channel limit"],
+    );
 }
 
 /// STATS k/d/x list the server bans for an operator with the whole reason —
@@ -2484,6 +2574,142 @@ fn stats_lists_server_bans_to_operators_only() {
             "{out:#?}"
         );
     }
+}
+
+static BAN_CLOCK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1_000_000_000);
+
+fn ban_clock() -> Millis {
+    Millis::from_millis(BAN_CLOCK_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Solanum's temporary bans: a leading all-digits argument is minutes. The ban
+/// is stored with its expiry and audited with its length, STATS shows it with
+/// the lowercase letter and the time it has left, and when it lapses every
+/// shard stops enforcing it and tells its operators; UNKLINE still lifts one
+/// early. One test, since the clock is shared.
+#[test]
+fn temporary_server_bans_expire() {
+    let mut s = TestServer::configured(true, ban_clock, |_| {});
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+
+    s.line(op, "KLINE 60 *@flood.example :flooding");
+    let mutation = commit_server_ban(&mut s);
+    assert!(
+        matches!(
+            &mutation,
+            e6ircd::core::ServerBanMutation::Add { mask_display, expiry: Some(expiry), .. }
+                if mask_display == "*@flood.example"
+                    && *expiry == e6ircd::core::ServerBanExpiry {
+                        minutes: 60,
+                        expires_at_secs: 1_000_000 + 3600,
+                    }
+        ),
+        "{mutation:?}"
+    );
+    let out = s.drain(op);
+    assert!(
+        out.contains(
+            &":irc.test.example NOTICE god :Added temporary 60 min. K-Line for *@flood.example"
+                .to_string()
+        ),
+        "{out:#?}"
+    );
+    s.line(op, "XLINE 5 *spambot* :no bots");
+    commit_server_ban(&mut s);
+    s.drain(op);
+
+    // Twenty minutes on, forty are left.
+    BAN_CLOCK_MS.fetch_add(20 * 60_000, std::sync::atomic::Ordering::Relaxed);
+    s.line(op, "STATS k");
+    assert_eq!(
+        s.drain(op)[0],
+        ":irc.test.example 216 god k flood.example * * :Temporary K-Line 40 min. - flooding"
+    );
+    // The X-line lapsed, even before a tick has dropped it: it bans no one.
+    s.line(op, "STATS x");
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example 219 god x :End of /STATS report"]
+    );
+    let bot = s.connect(2);
+    s.line(bot, "NICK bot");
+    s.line(bot, "USER bot 0 * :a spambot");
+    assert!(
+        has_numeric(&s.drain(bot), "001"),
+        "a lapsed X-line bans no one"
+    );
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(1_000_000_000),
+    });
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example NOTICE god :*** Notice -- Temporary X-Line for *spambot* expired"]
+    );
+
+    // Until it lapses the K-line is enforced; then it is not.
+    let flooder = s.connect_from(3, "flood.example", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(flooder, "NICK flooder");
+    s.line(flooder, "USER flooder 0 * :F");
+    assert!(has_numeric(&s.drain(flooder), "465"), "the K-line holds");
+    BAN_CLOCK_MS.fetch_add(40 * 60_000, std::sync::atomic::Ordering::Relaxed);
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(1_000_000_000),
+    });
+    assert_eq!(
+        s.drain(op),
+        [
+            ":irc.test.example NOTICE god :*** Notice -- Temporary K-Line for *@flood.example expired"
+        ]
+    );
+    let returning = s.connect_from(4, "flood.example", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(returning, "NICK flooder");
+    s.line(returning, "USER flooder 0 * :F");
+    assert!(has_numeric(&s.drain(returning), "001"), "the K-line lapsed");
+
+    // UNKLINE lifts a temporary ban before it lapses.
+    s.line(op, "KLINE 10 *@again.example :again");
+    commit_server_ban(&mut s);
+    s.drain(op);
+    s.line(op, "UNKLINE *@again.example");
+    commit_server_ban(&mut s);
+    assert!(
+        s.drain(op)
+            .contains(&":irc.test.example NOTICE god :Removed K-Line for *@again.example".into())
+    );
+    // A duration with nothing after it names no mask.
+    s.line(op, "KLINE 60");
+    assert!(has_numeric(&s.drain(op), "461"));
+}
+
+/// `KLINE <nick>` bans that user's host, `*@<host>` — a token with no `@`, no
+/// host or address character and no glob can only be a nick — and is refused
+/// with ERR_NOSUCHNICK when nobody holds the nick.
+#[test]
+fn kline_of_a_nick_bans_its_host() {
+    let mut s = TestServer::new_no_persistence();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let victim = s.register(2, "victim");
+    s.line(op, "KLINE victim :go away");
+    assert!(
+        s.drain(op)
+            .contains(&":irc.test.example NOTICE god :Added K-Line for *@host2.example".into())
+    );
+    assert!(
+        s.drain(victim)
+            .iter()
+            .any(|l| l.starts_with("ERROR :Closing Link")),
+        "the victim's host is banned"
+    );
+    s.line(op, "KLINE nobody :x");
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example 401 god nobody :No such nick/channel"]
+    );
 }
 
 /// A ban mask that cannot stand as a middle parameter as stored — an X-line
@@ -2594,6 +2820,44 @@ fn knock_delivers_to_ops_of_invite_only_channel() {
         has_numeric(&s.drain(carol), "713"),
         "an open channel → ERR_CHANOPEN"
     );
+}
+
+/// Solanum's `m_knock`: RPL_KNOCK goes to every member of a `+g` channel (any
+/// of whom may invite), to the operators only otherwise, and names the channel
+/// where a recipient's nick would go.
+#[test]
+fn knock_reaches_every_member_of_a_free_invite_channel() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let member = s.register(2, "member");
+    for channel in ["#vip", "#free"] {
+        s.line(op, &format!("JOIN {channel}"));
+        s.line(member, &format!("JOIN {channel}"));
+    }
+    s.line(op, "MODE #vip +i");
+    s.line(op, "MODE #free +ig");
+    s.drain(op);
+    s.drain(member);
+
+    let knocker = s.register(3, "knocker");
+    s.line(knocker, "KNOCK #vip");
+    s.drain(knocker);
+    assert_eq!(
+        s.drain(op),
+        [
+            ":irc.test.example 710 #vip #vip knocker!knocker@host3.example \
+          :has asked for an invite."
+        ],
+        "an op hears a knock"
+    );
+    assert!(s.drain(member).is_empty(), "a plain member does not, on -g");
+
+    let late = s.register(4, "late");
+    s.line(late, "KNOCK #free");
+    let knock = ":irc.test.example 710 #free #free late!late@host4.example \
+                 :has asked for an invite.";
+    assert_eq!(s.drain(op), [knock]);
+    assert_eq!(s.drain(member), [knock], "+g: every member hears it");
 }
 
 #[test]
@@ -2805,6 +3069,26 @@ fn account_registration_persists_only_valid_normalized_contact_email() {
         s.db_requests().is_empty(),
         "invalid contact data must not reach storage"
     );
+}
+
+/// The account a REGISTER names is echoed in its FAIL, and it is the client's
+/// own text: 480 bytes of it once built a 600-byte line, which the debug wire
+/// check turns into a panic of the worker every client shares. It is clipped
+/// like every other echo, and the line fits.
+#[test]
+fn register_fail_clips_the_echoed_account_name() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
+    s.drain(alice);
+    s.line(alice, &format!("REGISTER {} * hunter2", "a".repeat(480)));
+    let out = s.drain(alice);
+    let fail = out
+        .iter()
+        .find(|line| line.contains("FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK"))
+        .unwrap_or_else(|| panic!("no FAIL: {out:#?}"));
+    let echoed = fail.split(' ').nth(4).expect("the FAIL names the account");
+    assert_eq!(echoed, "a".repeat(64), "{fail}");
+    assert!(fail.len() <= 510, "{} bytes", fail.len());
 }
 
 #[test]
@@ -3965,7 +4249,7 @@ fn whox_reply_never_exceeds_the_wire_limit() {
     let mut s = TestServer::with_full_config(
         true, // SASL: lets us identify to a wide account for the `a` field
         || Millis::from_millis(1_000_000_000),
-        512,
+        TEST_SENDQ_BYTES,
         &server,
         64,
     );
@@ -4028,6 +4312,15 @@ fn whox_token_that_breaks_framing_is_defaulted() {
     let out = s.drain(alice);
     let row = out.iter().find(|l| l.contains(" 354 ")).expect("354");
     assert!(row.ends_with(" 0 alice"), "colon token mis-echoed: {row}");
+    // A token with a space (the spec in trailing form) → "0", not two
+    // parameters that shift the nick a column right.
+    s.line(alice, "WHO #wx :%tn,a b");
+    let out = s.drain(alice);
+    let row = out.iter().find(|l| l.contains(" 354 ")).expect("354");
+    assert!(
+        row.ends_with(" 354 alice 0 alice"),
+        "spaced token split: {row}"
+    );
     // Fieldless % → plain WHO.
     s.line(alice, "WHO #wx %");
     let out = s.drain(alice);
@@ -4231,6 +4524,64 @@ fn invite_does_not_survive_channel_teardown() {
         has_numeric(&s.drain(bob), "473"),
         "an invite into a destroyed channel admitted into its successor"
     );
+}
+
+/// Opening a channel revokes the invitations it held: `-i` does, and `-l`
+/// does on a channel without `+i`, so an invite cannot be stocked while the
+/// channel is locked and spent after it is locked again.
+#[test]
+fn opening_a_channel_revokes_its_invites() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let carol = s.register(3, "carol");
+    s.line(alice, "JOIN #inv");
+    s.line(alice, "MODE #inv +i");
+    s.line(alice, "INVITE bob #inv");
+    s.line(alice, "MODE #inv -i");
+    s.line(alice, "MODE #inv +i");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(bob, "JOIN #inv");
+    assert!(has_numeric(&s.drain(bob), "473"), "-i revoked the invite");
+
+    s.line(alice, "MODE #inv -i+l 1");
+    s.line(alice, "INVITE carol #inv");
+    s.line(alice, "MODE #inv -l");
+    s.line(alice, "MODE #inv +l 1");
+    s.drain(alice);
+    s.drain(carol);
+    s.line(carol, "JOIN #inv");
+    assert!(has_numeric(&s.drain(carol), "471"), "-l revoked the invite");
+}
+
+/// One ERR_UNKNOWNMODE per MODE command, naming the first unknown letter
+/// (Solanum's `chm_nosuch`); the known modes around it still apply.
+#[test]
+fn unknown_channel_modes_are_reported_once_per_command() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(alice, "MODE #c +XmYZ");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 472 alice X :is unknown mode char to me",
+            ":alice!alice@host1.example MODE #c +m",
+        ]
+    );
+}
+
+/// A user MODE reads only its first argument as the mode string (Solanum's
+/// `user_mode`): `MODE me +i foo` sets +i and ignores `foo`, rather than
+/// reading `+ifoo`.
+#[test]
+fn user_mode_ignores_arguments_after_the_mode_string() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "MODE alice +i foo");
+    assert_eq!(s.drain(alice), [":irc.test.example MODE alice :+i"]);
 }
 
 /// A list-mode mask is clipped to BANMASKLEN at store time, so the stored mask
@@ -4628,8 +4979,9 @@ fn list_conditions_never_reveal_a_secret_channel() {
     assert_eq!(list(&mut s, bob, "LIST !#chan*"), Vec::<String>::new());
 }
 
-/// Channels enough that one LIST fills more than half of a test connection's
-/// 256-line send queue: `count` of them, `#room000` on, across three members.
+/// Channels enough that one LIST fills more than half of a
+/// [`PACED_SENDQ_BYTES`] send queue: `count` of them, `#room000` on, across
+/// three members.
 fn many_channels(s: &mut TestServer, count: usize) -> ConnId {
     let members: Vec<ConnId> = (0..3)
         .map(|index| s.register(10 + index, &format!("member{index}")))
@@ -4642,14 +4994,24 @@ fn many_channels(s: &mut TestServer, count: usize) -> ConnId {
     s.register(20, "lister")
 }
 
+/// Whether `out` fills half a [`PACED_SENDQ_BYTES`] queue — and no more than
+/// the one line that crossed the half — as a turn of a paced reply may.
+fn fills_half_the_paced_queue(out: &[String]) -> bool {
+    let half = PACED_SENDQ_BYTES / 2;
+    let longest = out.iter().map(|line| line.len() + 2).max().unwrap_or(0);
+    let sent = wire_bytes(out);
+    sent >= half && sent < half + longest
+}
+
 #[test]
 fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let lister = many_channels(&mut s, 300);
     s.line(lister, "LIST");
     let mut out = s.drain(lister);
-    // Half of the 256-line queue: the RPL_LISTSTART and 127 rows.
-    assert_eq!(out.len(), 128, "{out:#?}");
+    // Half of the queue, in bytes: the RPL_LISTSTART and the rows that fit,
+    // the last one crossing the half.
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
     assert!(!has_numeric(&out, "323"), "{out:#?}");
     // Each turn sends what the client's queue has room for now: the drained
     // queue takes another half.
@@ -4662,12 +5024,16 @@ fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
             .any(|l| l.contains("PONG") && l.contains("mid-list")),
         "{next:#?}"
     );
-    assert!(next.len() <= 129, "{next:#?}");
-    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    let rows: Vec<String> = next.into_iter().filter(|l| !l.contains("PONG")).collect();
+    assert!(fills_half_the_paced_queue(&rows), "{rows:#?}");
+    out.extend(rows);
     while !has_numeric(&out, "323") {
         s.core.handle(Input::PaceReplies);
         let more = s.drain(lister);
-        assert!(!more.is_empty() && more.len() <= 129, "{more:#?}");
+        assert!(
+            !more.is_empty() && wire_bytes(&more) < PACED_SENDQ_BYTES / 2 + 128,
+            "{more:#?}"
+        );
         out.extend(more);
     }
     let listed = list_reply(&out);
@@ -4678,7 +5044,7 @@ fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
 
 #[test]
 fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
-    let mut s = TestServer::new_no_persistence();
+    let mut s = TestServer::with_paced_sendq(false);
     let lister = register_with_caps(&mut s, 20, "lister", "batch labeled-response");
     let members: Vec<ConnId> = (0..3)
         .map(|index| s.register(10 + index, &format!("member{index}")))
@@ -4702,10 +5068,10 @@ fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
 
 #[test]
 fn a_list_sent_during_a_paced_list_aborts_it() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let lister = many_channels(&mut s, 300);
     s.line(lister, "LIST");
-    assert_eq!(s.drain(lister).len(), 128);
+    assert!(fills_half_the_paced_queue(&s.drain(lister)));
     s.line(lister, "LIST");
     let out = s.drain(lister);
     assert_eq!(
@@ -4722,8 +5088,9 @@ fn a_list_sent_during_a_paced_list_aborts_it() {
     assert_eq!(list(&mut s, lister, "LIST #room001"), ["#room001"]);
 }
 
-/// Users enough that a `WHO *` fills more than half of a test connection's
-/// 256-line send queue: `count` of them, `user000` on, and the one asking.
+/// Users enough that a `WHO *` fills more than half of a
+/// [`PACED_SENDQ_BYTES`] send queue: `count` of them, `user000` on, and the
+/// one asking.
 fn many_users(s: &mut TestServer, count: u64) -> ConnId {
     for index in 0..count {
         s.register(100 + index, &format!("user{index:03}"));
@@ -4747,12 +5114,12 @@ fn who_nicks(out: &[String]) -> Vec<String> {
 
 #[test]
 fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let watcher = many_users(&mut s, 300);
     s.line(watcher, "WHO *");
     let mut out = s.drain(watcher);
-    // Half of the 256-line queue, all rows.
-    assert_eq!(out.len(), 128, "{out:#?}");
+    // Half of the queue, in bytes, all rows.
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
     assert!(!has_numeric(&out, "315"), "{out:#?}");
     s.core.handle(Input::PaceReplies);
     // Other traffic keeps flowing meanwhile, beside the rows.
@@ -4763,12 +5130,16 @@ fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
             .any(|l| l.contains("PONG") && l.contains("mid-who")),
         "{next:#?}"
     );
-    assert!(next.len() <= 129, "{next:#?}");
-    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    let rows: Vec<String> = next.into_iter().filter(|l| !l.contains("PONG")).collect();
+    assert!(fills_half_the_paced_queue(&rows), "{rows:#?}");
+    out.extend(rows);
     while !has_numeric(&out, "315") {
         s.core.handle(Input::PaceReplies);
         let more = s.drain(watcher);
-        assert!(!more.is_empty() && more.len() <= 128, "{more:#?}");
+        assert!(
+            !more.is_empty() && wire_bytes(&more) < PACED_SENDQ_BYTES / 2 + 128,
+            "{more:#?}"
+        );
         out.extend(more);
     }
     let mut expected: Vec<String> = (0..300).map(|index| format!("user{index:03}")).collect();
@@ -4786,7 +5157,7 @@ fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
 
 #[test]
 fn a_paced_labeled_who_stays_one_batch_across_its_turns() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     for index in 0..200 {
         s.register(100 + index, &format!("user{index:03}"));
     }
@@ -4805,14 +5176,16 @@ fn a_paced_labeled_who_stays_one_batch_across_its_turns() {
 
 #[test]
 fn whos_asked_during_a_paced_who_answer_after_it_within_a_send_queue() {
-    let mut s = TestServer::new();
-    let watcher = many_users(&mut s, 300);
+    let mut s = TestServer::with_paced_sendq(true);
+    // A reply of some nine kilobytes: more than half the queue goes at once,
+    // and what is left is less than a whole queue.
+    let watcher = many_users(&mut s, 100);
     s.line(watcher, "WHO *");
-    assert_eq!(s.drain(watcher).len(), 128);
+    assert!(fills_half_the_paced_queue(&s.drain(watcher)));
     // Lines of it are still to go: a two-line reply waits behind them...
     s.line(watcher, "WHO user007");
-    // ...but another 302 would hold more than a send queue, so it is refused,
-    // at once and closed, while the first is still going out.
+    // ...but another 102 rows would hold more than a send queue's bytes, so
+    // it is refused, at once and closed, while the first is still going out.
     s.line(watcher, "WHO *");
     let mut out = s.drain(watcher);
     assert_eq!(
@@ -4847,7 +5220,7 @@ fn whos_asked_during_a_paced_who_answer_after_it_within_a_send_queue() {
 
 #[test]
 fn a_large_channel_who_is_paced_too() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::with_paced_sendq(true);
     let members: Vec<ConnId> = (0..150)
         .map(|index| s.register(100 + index, &format!("user{index:03}")))
         .collect();
@@ -4860,7 +5233,7 @@ fn a_large_channel_who_is_paced_too() {
     let watcher = s.register(20, "watcher");
     s.line(watcher, "WHO #crowd");
     let mut out = s.drain(watcher);
-    assert_eq!(out.len(), 128, "{out:#?}");
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
     while !has_numeric(&out, "315") {
         s.core.handle(Input::PaceReplies);
         out.extend(s.drain(watcher));
@@ -6739,10 +7112,14 @@ fn kill_requires_oper() {
     s.line(alice, "OPER god letmein");
     s.drain(alice);
     s.line(alice, "KILL bob :bye");
-    let bob_out = s.drain(bob);
-    assert!(
-        bob_out.iter().any(|l| l.starts_with("ERROR :")),
-        "{bob_out:#?}"
+    // The victim is told who killed it and why before the link closes, with
+    // the KILL line Solanum sends it.
+    assert_eq!(
+        s.drain(bob),
+        [
+            ":alice!alice@host1.example KILL bob :bye",
+            "ERROR :Closing Link: irc.test.example (Killed (alice (bye)))",
+        ]
     );
     assert!(
         s.drain(alice).iter().any(|l| l.contains("QUIT")),
@@ -6869,232 +7246,6 @@ fn bot_mode_tags_and_whois() {
 }
 
 #[test]
-fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
-    // The monotonic clock's epoch is process start, so a session opened a few
-    // seconds into uptime must STILL start with the full command burst — not
-    // `min(uptime_seconds, burst)`. Regression for a fresh bucket under-filled
-    // during the first burst-many seconds after a restart, which would
-    // wrongly Excess-Flood-kill a client pipelining a legitimate burst — the
-    // worst case being a post-restart reconnect storm. A fixed clock only 3s
-    // into "uptime" reproduces it (the usual 1e9-ms test clock masks it, since
-    // uptime then dwarfs any burst).
-    fn early_mono() -> MonoMillis {
-        MonoMillis::from_millis(3_000)
-    }
-    let (db_tx, _db_rx) = queue(Config {
-        name: "d",
-        capacity: 8,
-        policy: Policy::Fifo,
-    });
-    let mut core = Core::new(
-        CoreConfig {
-            server_name: "irc.test.example".into(),
-            network_name: "T".into(),
-            description: "test server".into(),
-            registration_before_connect: false,
-            registration_require_email: false,
-            sendq: 256,
-            motd: vec![],
-            nicklen: 16,
-            sasl_enabled: false,
-            opers: vec![],
-            max_hot_channels: 8,
-            clock: || Millis::from_millis(1_000_000_000),
-            mono_clock: early_mono,
-            command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
-            registration_burst: None,
-            sasl_requirement: Default::default(),
-            reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
-        },
-        db_tx,
-    );
-    let conn = ConnId(1);
-    let (tx, mut rx) = queue(Config {
-        name: "s",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
-    core.handle(Input::Open {
-        conn,
-        tx,
-        host: "h".into(),
-        transport: e6ircd::core::ConnectionTransport::Tcp,
-    });
-    for line in ["NICK alice", "USER a 0 * :A"] {
-        core.handle(Input::Line {
-            conn,
-            line: line.as_bytes().to_vec(),
-        });
-    }
-    while rx.try_pop().is_some() {}
-
-    // Send exactly one burst of floodable commands in the same tick. With a
-    // full fresh bucket all ten are credited; with the old uptime-seeded bucket
-    // (3 tokens) the fourth would be dropped with Excess Flood.
-    for _ in 0..10 {
-        core.handle(Input::Line {
-            conn,
-            line: b"AWAY :busy".to_vec(),
-        });
-    }
-    let out: Vec<String> = std::iter::from_fn(|| {
-        rx.try_pop().map(|e| {
-            String::from_utf8(e.payload.0.to_vec())
-                .unwrap()
-                .trim_end()
-                .to_string()
-        })
-    })
-    .collect();
-    assert!(
-        !out.iter().any(|l| l.contains("Excess Flood")),
-        "a fresh session must start with the full burst, not min(uptime, burst): {out:#?}"
-    );
-}
-
-#[test]
-fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive() {
-    // The shipped default is Solanum's shape: 40 tokens, 20 per second. In one
-    // clock instant a registered session may pipeline exactly 40 floodable
-    // commands; the 41st closes the link with Excess Flood. PING and PONG never
-    // spend a token, so a keepalive-heavy client is never killed for it, and
-    // 50 ms later (one token at 20/s) one more command is admitted.
-    static NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000_000);
-    fn ticking_mono() -> MonoMillis {
-        MonoMillis::from_millis(NOW_MS.load(std::sync::atomic::Ordering::Relaxed))
-    }
-    let flood = CommandFlood::new(
-        e6ircd::config::DEFAULT_COMMAND_BURST,
-        e6ircd::config::DEFAULT_COMMAND_RATE,
-    )
-    .expect("the shipped defaults are a valid bucket");
-    let open_session = |conn: ConnId| {
-        let (db_tx, _db_rx) = queue(Config {
-            name: "d",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
-        let mut core = Core::new(
-            CoreConfig {
-                server_name: "irc.test.example".into(),
-                network_name: "T".into(),
-                description: "test server".into(),
-                registration_before_connect: false,
-                registration_require_email: false,
-                sendq: 1024,
-                motd: vec![],
-                nicklen: 16,
-                sasl_enabled: false,
-                opers: vec![],
-                max_hot_channels: 8,
-                clock: || Millis::from_millis(1_000_000_000),
-                mono_clock: ticking_mono,
-                command_flood: Some(flood),
-                registration_burst: None,
-                sasl_requirement: Default::default(),
-                reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
-            },
-            db_tx,
-        );
-        let (tx, mut rx) = queue(Config {
-            name: "s",
-            capacity: 4096,
-            policy: Policy::Fifo,
-        });
-        core.handle(Input::Open {
-            conn,
-            tx,
-            host: "h".into(),
-            transport: e6ircd::core::ConnectionTransport::Tcp,
-        });
-        for line in ["NICK alice", "USER a 0 * :A"] {
-            core.handle(Input::Line {
-                conn,
-                line: line.as_bytes().to_vec(),
-            });
-        }
-        while rx.try_pop().is_some() {}
-        (core, rx)
-    };
-    let drain = |rx: &mut e6irc_queue::Receiver<Output>| -> Vec<String> {
-        std::iter::from_fn(|| {
-            rx.try_pop().map(|e| {
-                String::from_utf8(e.payload.0.to_vec())
-                    .unwrap()
-                    .trim_end()
-                    .to_string()
-            })
-        })
-        .collect()
-    };
-
-    let conn = ConnId(1);
-    let (mut core, mut rx) = open_session(conn);
-    // Keepalive first, and plenty of it: none of these may cost a token.
-    for _ in 0..100 {
-        core.handle(Input::Line {
-            conn,
-            line: b"PING :keepalive".to_vec(),
-        });
-        core.handle(Input::Line {
-            conn,
-            line: b"PONG :keepalive".to_vec(),
-        });
-    }
-    for _ in 0..40 {
-        core.handle(Input::Line {
-            conn,
-            line: b"AWAY :busy".to_vec(),
-        });
-    }
-    let out = drain(&mut rx);
-    assert!(
-        !out.iter().any(|l| l.contains("Excess Flood")),
-        "40 commands plus any amount of keepalive fit the default burst: {out:#?}"
-    );
-    core.handle(Input::Line {
-        conn,
-        line: b"AWAY :busy".to_vec(),
-    });
-    let out = drain(&mut rx);
-    assert!(
-        out.iter()
-            .any(|l| l.starts_with("ERROR :Closing Link:") && l.contains("Excess Flood")),
-        "the 41st command in one instant must close the link with Excess Flood: {out:#?}"
-    );
-
-    // A fresh session that spent its burst regains one token 50 ms later.
-    let conn = ConnId(2);
-    let (mut core, mut rx) = open_session(conn);
-    for _ in 0..40 {
-        core.handle(Input::Line {
-            conn,
-            line: b"AWAY :busy".to_vec(),
-        });
-    }
-    drain(&mut rx);
-    NOW_MS.fetch_add(50, std::sync::atomic::Ordering::Relaxed);
-    core.handle(Input::Line {
-        conn,
-        line: b"AWAY :busy".to_vec(),
-    });
-    let out = drain(&mut rx);
-    assert!(
-        !out.iter().any(|l| l.contains("Excess Flood")),
-        "50 ms at 20 tokens/s refills exactly one token: {out:#?}"
-    );
-    core.handle(Input::Line {
-        conn,
-        line: b"AWAY :busy".to_vec(),
-    });
-    let out = drain(&mut rx);
-    assert!(
-        out.iter().any(|l| l.contains("Excess Flood")),
-        "the refilled token was the only one: {out:#?}"
-    );
-}
-
-#[test]
 fn account_creation_is_rate_limited_per_ip() {
     // With registration_burst=1, one client IP may create at most one account
     // before the bucket empties; the second REGISTER is refused without ever
@@ -7112,15 +7263,16 @@ fn account_creation_is_rate_limited_per_ip() {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: 256 * 512,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: true,
             opers: vec![],
             max_hot_channels: 8,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
-            command_flood: None,
             registration_burst: Some(1),
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -7128,11 +7280,7 @@ fn account_creation_is_rate_limited_per_ip() {
         db_tx,
     );
     let conn = ConnId(1);
-    let (tx, _rx) = queue(Config {
-        name: "s",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
+    let (tx, _rx) = e6ircd::core::send_queue("s", 512 * 512);
     core.handle(Input::Open {
         conn,
         tx,
@@ -7188,15 +7336,16 @@ fn hot_history_ring_is_lru_evicted() {
             description: "test server".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 256,
+            sendq_bytes: 256 * 512,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: false,
             opers: vec![],
             max_hot_channels: 2,
+            max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -7206,11 +7355,7 @@ fn hot_history_ring_is_lru_evicted() {
     let _ = db_rx;
     // a capable observer to read CHATHISTORY
     let conn = ConnId(1);
-    let (tx, mut rx) = queue(Config {
-        name: "s",
-        capacity: 512,
-        policy: Policy::Fifo,
-    });
+    let (tx, mut rx) = e6ircd::core::send_queue("s", 512 * 512);
     core.handle(Input::Open {
         conn,
         tx,
@@ -8626,8 +8771,11 @@ fn chanserv_set_mlock_enforces_modes() {
         "no MLOCK confirmation: {out:#?}"
     );
     assert!(
-        out.iter()
-            .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
+        out.iter().any(
+            |l| l.starts_with(":ChanServ!ChanServ@services.irc.test.example MODE #reg")
+                && l.contains("+m")
+                && l.contains("-t")
+        ),
         "lock not applied on set: {out:#?}"
     );
 
@@ -8670,8 +8818,11 @@ fn chanserv_set_mlock_enforces_modes() {
     s.line(boss, "JOIN #reg");
     let out = s.drain(boss);
     assert!(
-        out.iter()
-            .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
+        out.iter().any(
+            |l| l.starts_with(":ChanServ!ChanServ@services.irc.test.example MODE #reg")
+                && l.contains("+m")
+                && l.contains("-t")
+        ),
         "lock not re-applied on recreate: {out:#?}"
     );
 }
@@ -9281,6 +9432,41 @@ fn register_reply_waits_behind_nothing_but_arrives_in_order() {
     );
 }
 
+/// The SendQ is bounded in bytes: a client that stops reading is closed for
+/// SendQ once a few dozen maximum-size lines are waiting, far fewer lines than
+/// the queue would take of ordinary ones.
+#[test]
+fn a_few_huge_lines_overrun_the_sendq_by_bytes() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    s.drain(alice);
+    s.drain(bob);
+    // Bob stops reading. Each message reaches him with four kilobytes of tags.
+    let tags = "t".repeat(4_000);
+    let mut sent = 0;
+    let mut quit = Vec::new();
+    while quit.is_empty() && sent < 256 {
+        s.line(alice, &format!("@+x={tags} PRIVMSG #c :{sent}"));
+        sent += 1;
+        quit = s
+            .drain(alice)
+            .into_iter()
+            .filter(|line| line.contains(" QUIT ") && line.starts_with(":bob!"))
+            .collect();
+    }
+    assert!(
+        quit.iter().any(|line| line.contains("SendQ exceeded")),
+        "{quit:?} after {sent} lines"
+    );
+    // A queue of TEST_SENDQ_BYTES holds about thirty such lines; counting
+    // lines, it took 256 of them.
+    assert!(sent <= TEST_SENDQ_BYTES / 4_000 + 1, "{sent} lines");
+}
+
 #[test]
 fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
     // A CHATHISTORY page that reaches PostgreSQL is answered asynchronously,
@@ -9288,8 +9474,10 @@ fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
     // command order. That held output has not entered the send queue yet, so
     // it must carry the same bound: without one, a connection waiting on the
     // database could accumulate lines without limit and escape the SendQ kill.
-    const SENDQ: usize = 8;
-    const FLOOD: usize = 200;
+    // The bound is the queue's own, in bytes: sixteen kilobytes hold the
+    // registration burst and a hundred-odd echoed lines, not four hundred.
+    const SENDQ: usize = 16 * 1024;
+    const FLOOD: usize = 400;
     let mut s = TestServer::with_sendq(SENDQ);
     // echo-message so the connection's own traffic is output *to it*, which is
     // what accumulates behind the hold.
@@ -9345,15 +9533,16 @@ fn history_logmessage_gated_on_database() {
                 description: "test server".into(),
                 registration_before_connect: false,
                 registration_require_email: false,
-                sendq: 256,
+                sendq_bytes: 256 * 512,
                 motd: vec![],
                 nicklen: 16,
                 sasl_enabled,
                 opers: vec![],
                 max_hot_channels: 8,
+                max_history_ring_bytes: e6ircd::config::DEFAULT_HISTORY_RING_BYTES,
+                max_hot_history_bytes: e6ircd::config::DEFAULT_HOT_HISTORY_BYTES,
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: test_mono,
-                command_flood: None,
                 registration_burst: None,
                 sasl_requirement: Default::default(),
                 reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
@@ -9361,11 +9550,7 @@ fn history_logmessage_gated_on_database() {
             db_tx,
         );
         let conn = ConnId(1);
-        let (tx, _rx) = queue(Config {
-            name: "s",
-            capacity: 512,
-            policy: Policy::Fifo,
-        });
+        let (tx, _rx) = e6ircd::core::send_queue("s", 512 * 512);
         core.handle(Input::Open {
             conn,
             tx,
@@ -10375,10 +10560,10 @@ fn chanserv_deop_voice_and_devoice_are_gated_on_access() {
         ["Devoiced \x02carol\x02 on \x02#chan\x02."]
     );
     s.line(carol, "PRIVMSG ChanServ :VOICE #chan");
+    // From ChanServ, the source its notices and mode-lock changes carry too.
     assert!(
         s.drain(boss)
-            .iter()
-            .any(|line| line.ends_with("MODE #chan +v carol"))
+            .contains(&":ChanServ!ChanServ@services.irc.test.example MODE #chan +v carol".into())
     );
     assert_eq!(
         notices(&s.drain(carol)),
@@ -11844,6 +12029,46 @@ fn oper_kline_bans_disconnects_and_refuses() {
     );
 }
 
+/// A server-ban mask had no length bound, and every operator NOTICE was a
+/// `format!` of it: a 460-byte mask built a refusal or confirmation past the
+/// wire limit, which the debug wire check turns into a panic of the worker.
+/// The mask is bounded like a channel ban's, and every server NOTICE is fitted
+/// — SETHOST's refusal echoes a host of any length too.
+#[test]
+fn overlong_server_ban_masks_are_refused_within_the_line() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.db_requests();
+
+    for command in [
+        format!("KLINE *@{} :r", "a".repeat(460)),
+        format!("DLINE {}.* :r", "1".repeat(460)),
+        format!("XLINE {} :r", "b".repeat(460)),
+        format!("UNKLINE *@{}", "a".repeat(460)),
+        format!("SETHOST god {}", "h".repeat(460)),
+    ] {
+        s.line(op, &command);
+        let out = s.drain(op);
+        assert!(!out.is_empty(), "{command}: no answer");
+        for line in &out {
+            assert!(line.len() <= 510, "{command}: {} bytes", line.len());
+        }
+        assert!(
+            s.db_requests().is_empty(),
+            "{command}: an overlong mask reached storage"
+        );
+    }
+    s.line(op, &format!("KLINE *@{} :r", "a".repeat(460)));
+    let out = s.drain(op);
+    assert!(
+        out.iter()
+            .any(|line| line.contains("a mask is at most 100 bytes (BANMASKLEN)")),
+        "{out:#?}"
+    );
+}
+
 /// A server ban preserves the operator's original mask casing for STATS/the
 /// confirmation (a `MaskKey`, like the channel `+b` lists), while still removing
 /// case-insensitively — the display-fidelity the folded-`String` form lost.
@@ -12262,6 +12487,35 @@ fn oper_actions_are_audited() {
     );
 }
 
+/// Solanum's `m_oper`: an operator's second OPER is answered RPL_YOUREOPER and
+/// changes nothing — no second `MODE +o`, and no switch of the operator
+/// identity its later actions are audited under.
+#[test]
+fn reoper_changes_nothing() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.opers.push(("root".into(), "hunter2".into()));
+        },
+    );
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "OPER root hunter2");
+    assert_eq!(
+        s.drain(op),
+        [":irc.test.example 381 god :You are now an IRC operator"]
+    );
+    s.db_requests();
+    s.line(op, "KILL god :bye");
+    let actor = s.db_requests().into_iter().find_map(|r| match r {
+        e6ircd::core::DbRequest::AuditLog { actor, action, .. } if action == "KILL" => Some(actor),
+        _ => None,
+    });
+    assert_eq!(actor, Some(e6ircd::db::AuditPrincipal::operator("god")));
+}
+
 /// A self-KILL removes the actor's own session; the audit row must still name
 /// the actor — recording after the close resolved the actor to an empty string,
 /// an unattributed row in a log whose whole purpose is attribution.
@@ -12447,6 +12701,39 @@ fn oper_sethost_changes_host_and_chghosts() {
     assert!(
         s.drain(plain).iter().any(|l| l.contains(" 481 ")),
         "non-oper allowed to SETHOST"
+    );
+}
+
+/// SETHOST takes Solanum's `clean_host` characters only: a glob, a list, or a
+/// trailing `/<digit>` (a CIDR look-alike) would make every ban on the user
+/// ambiguous.
+#[test]
+fn sethost_refuses_hosts_outside_the_hostname_alphabet() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    let target = s.register(2, "user");
+    s.drain(op);
+    s.drain(target);
+    for bad in [
+        "*.example",
+        "a?b.example",
+        "a,b.example",
+        "a_b.example",
+        "net/24",
+    ] {
+        s.line(op, &format!("SETHOST user {bad}"));
+        assert_eq!(
+            s.drain(op),
+            [format!(":irc.test.example NOTICE god :Invalid host: {bad}")],
+        );
+        assert!(s.drain(target).is_empty(), "{bad} was applied");
+    }
+    s.line(op, "SETHOST user user/staff:2001-db8.example");
+    assert!(
+        s.drain(op)
+            .iter()
+            .any(|l| l.ends_with("Set host of user to user/staff:2001-db8.example"))
     );
 }
 
@@ -12763,6 +13050,41 @@ fn statusmsg_is_not_stored_in_history() {
     );
 }
 
+/// A multiline message's text is held once in memory, and what is persisted
+/// is unchanged by that: its encoded lines, and the plain line joining them
+/// (blanks included) that the `body` column and REST history carry.
+#[test]
+fn a_multiline_message_is_persisted_with_its_lines_and_their_plain_line() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
+    s.line(alice, "JOIN #m");
+    s.drain(alice);
+    s.db_requests();
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(alice, "@batch=7 PRIVMSG #m :hello");
+    s.line(alice, "@batch=7 PRIVMSG #m :");
+    s.line(alice, "@batch=7;draft/multiline-concat PRIVMSG #m :world");
+    s.line(alice, "BATCH -7");
+    s.drain(alice);
+    let logged: Vec<(String, Option<String>)> = s
+        .db_requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            e6ircd::core::DbRequest::LogMessage {
+                body, multiline, ..
+            } => Some((body, multiline)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        logged,
+        [(
+            "hello  world".to_string(),
+            Some("0hello\n0\n1world".to_string())
+        )]
+    );
+}
+
 // ---- sweep: DoS caps + fidelity regressions -----------------------------
 
 #[test]
@@ -12818,6 +13140,13 @@ fn channels_per_session_is_capped() {
         has_numeric(&out, "405"),
         "the 251st channel must be ERR_TOOMANYCHANNELS: {out:#?}"
     );
+    // The refused target is the client's own text, echoed as one parameter:
+    // a trailing-form target with a space is the `*` placeholder, not two.
+    s.line(a, "JOIN :#one more");
+    assert_eq!(
+        s.drain(a),
+        [":irc.test.example 405 alice * :You have joined too many channels"],
+    );
 }
 
 #[test]
@@ -12845,33 +13174,28 @@ fn multi_target_message_delivers_and_caps() {
     );
 }
 
+/// Solanum's `channel_modes`: a member sees the `+k` and `+l` arguments, an
+/// outsider only the letters.
 #[test]
-fn channel_key_hidden_from_non_members() {
+fn channel_key_and_limit_hidden_from_non_members() {
     let mut s = TestServer::new();
     let op = s.register(1, "op");
     s.line(op, "JOIN #k");
     s.drain(op);
-    s.line(op, "MODE #k +k sekrit");
+    s.line(op, "MODE #k +kl sekrit 10");
     s.drain(op);
-    // A member sees the real key.
+    // A member sees the real key and limit.
     s.line(op, "MODE #k");
-    let out = s.drain(op);
-    let line = out
-        .iter()
-        .find(|l| l.split(' ').nth(1) == Some("324"))
-        .expect("324");
-    assert!(line.contains("sekrit"), "member should see key: {line}");
-    // A non-member sees `*`, never the value.
+    assert!(
+        s.drain(op)
+            .contains(&":irc.test.example 324 op #k +ntkl sekrit 10".to_string())
+    );
+    // A non-member sees that both are set, and neither argument.
     let bob = s.register(2, "bob");
     s.line(bob, "MODE #k");
-    let out = s.drain(bob);
-    let line = out
-        .iter()
-        .find(|l| l.split(' ').nth(1) == Some("324"))
-        .expect("324");
     assert!(
-        line.contains('*') && !line.contains("sekrit"),
-        "non-member must not see key value: {line}"
+        s.drain(bob)
+            .contains(&":irc.test.example 324 bob #k +ntkl".to_string())
     );
 }
 
@@ -13059,7 +13383,7 @@ fn myinfo_reflects_implemented_modes() {
         .find(|l| l.split(' ').nth(1) == Some("004"))
         .expect("004 MYINFO");
     assert!(
-        myinfo.contains("iowB") && myinfo.contains('C'),
+        myinfo.contains("iowBRZ") && myinfo.contains('C'),
         "MYINFO must advertise the umodes/chanmodes actually implemented: {myinfo}"
     );
 }
@@ -13337,11 +13661,10 @@ fn monitor_online_reply_splits_to_fit_the_wire_limit() {
 }
 
 #[test]
-fn moderated_channel_still_allows_a_regular_member_to_set_the_topic() {
-    // +m governs messages, not topic changes: a non-op/voice member of a +m,
-    // -t channel may still set the topic. This pins the deliberate difference
-    // between the TOPIC gate and Channel::may_speak — a "cleanup" that routed
-    // TOPIC through may_speak would make +m wrongly block it, and this fails.
+fn moderated_channel_refuses_an_unvoiced_members_topic() {
+    // Setting the topic is speaking to the channel (Solanum's `m_topic`
+    // requires `can_send`): an unvoiced member of a +m, -t channel may not
+    // talk past the moderation through the topic. A voiced one may.
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     let bob = s.register(2, "bob");
@@ -13360,16 +13683,24 @@ fn moderated_channel_still_allows_a_regular_member_to_set_the_topic() {
         has_numeric(&s.drain(bob), "404"),
         "a +m channel must block a regular member's PRIVMSG"
     );
-    // … but may still set the topic.
+    // … nor set the topic.
+    s.line(bob, "TOPIC #c :bob's topic");
+    let out = s.drain(bob);
+    assert_eq!(
+        out,
+        [":irc.test.example 404 bob #c :Cannot send to channel"],
+        "an unvoiced member may not set the topic of a +m -t channel"
+    );
+    assert!(s.drain(alice).is_empty(), "no topic change was broadcast");
+    // Voiced, bob may.
+    s.line(alice, "MODE #c +v bob");
+    s.drain(alice);
+    s.drain(bob);
     s.line(bob, "TOPIC #c :bob's topic");
     let out = s.drain(bob);
     assert!(
-        !has_numeric(&out, "482") && !has_numeric(&out, "404"),
-        "a regular member must be able to set the topic of a +m -t channel: {out:#?}"
-    );
-    assert!(
         out.iter().any(|l| l.contains("TOPIC #c :bob's topic")),
-        "the topic change should be broadcast: {out:#?}"
+        "a voiced member sets the topic: {out:#?}"
     );
 }
 
@@ -13825,8 +14156,15 @@ fn malformed_client_tag_keys_are_not_relayed() {
         relayed.contains("+example.com/reply=abc"),
         "valid client tag dropped: {relayed}"
     );
+    // Judged on the tag section by key: the random msgid is hex, and a
+    // substring test for "bad" failed whenever the msgid happened to spell it.
+    let tags = relayed
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(tags, _)| tags)
+        .expect("the relayed line carries tags");
     assert!(
-        !relayed.contains("bad"),
+        !tags.split(';').any(|tag| tag.starts_with("+bad")),
         "malformed client tag key relayed: {relayed}"
     );
 }
@@ -15331,7 +15669,7 @@ fn myinfo_mode_lists_agree_with_isupport() {
         v.sort_unstable();
         v
     };
-    assert_eq!(myinfo[5], "iowB", "user modes");
+    assert_eq!(myinfo[5], "iowBRZ", "user modes");
     assert_eq!(
         sorted(myinfo[6]),
         sorted(&format!("{}{prefix_modes}", groups.concat())),
@@ -15453,15 +15791,97 @@ fn user_mode_reports_only_real_changes() {
     let out = s.drain(alice);
     assert!(has_numeric(&out, "502"), "{out:#?}");
     // Every advertised user mode (RPL_MYINFO's first mode list) is one the
-    // server can hold and report.
+    // server can hold and report; +Z follows the transport (a TLS one in
+    // `tls_connections_hold_umode_z_and_whois_says_so`), so a client's +Z
+    // changes nothing.
     s.line(alice, "OPER god letmein");
-    s.line(alice, "MODE alice +iB");
+    s.line(alice, "MODE alice +iBRZ");
     s.drain(alice);
     s.line(alice, "MODE alice");
     let out = s.drain(alice);
     assert!(
-        out.iter().any(|l| l.ends_with(" 221 alice +iowB")),
+        out.iter().any(|l| l.ends_with(" 221 alice +iowBR")),
         "{out:#?}"
+    );
+}
+
+/// Umode +Z is the server's to set, on a TLS connection (Solanum): the
+/// client is told at registration, RPL_UMODEIS and WHOIS (RPL_WHOISSECURE)
+/// report it, and neither a TLS client's -Z nor a plaintext one's +Z
+/// changes anything.
+#[test]
+fn tls_connections_hold_umode_z_and_whois_says_so() {
+    let mut s = TestServer::new();
+    let tls = s.connect_with_transport(1, e6ircd::core::ConnectionTransport::Tls);
+    s.line(tls, "NICK alice");
+    s.line(tls, "USER alice 0 * :Alice");
+    let burst = s.drain(tls);
+    assert!(
+        burst.contains(&":alice MODE alice :+Z".to_string()),
+        "{burst:#?}"
+    );
+    let plain = s.register(2, "bob");
+    s.line(tls, "MODE alice -Z");
+    assert!(s.drain(tls).is_empty(), "-Z changes nothing");
+    s.line(tls, "MODE alice");
+    assert_eq!(s.drain(tls), [":irc.test.example 221 alice +Z"]);
+    s.line(plain, "MODE bob +Z");
+    assert!(s.drain(plain).is_empty(), "+Z changes nothing");
+
+    s.line(plain, "WHOIS alice");
+    assert!(
+        s.drain(plain)
+            .contains(&":irc.test.example 671 bob alice :is using a secure connection".to_string())
+    );
+    s.line(tls, "WHOIS bob");
+    assert!(!has_numeric(&s.drain(tls), "671"), "bob is plaintext");
+}
+
+/// Umode +R (Solanum's `um_regonlymsg`): a user who is not logged in cannot
+/// PRIVMSG, TAGMSG or INVITE a +R user (ERR_NONONREG), nor NOTICE one (silently);
+/// a logged-in user and an operator can.
+#[test]
+fn umode_r_admits_only_logged_in_senders() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    s.line(alice, "MODE alice +R");
+    assert_eq!(s.drain(alice), [":irc.test.example MODE alice :+R"]);
+    s.line(alice, "JOIN #priv");
+    s.drain(alice);
+    let guest = register_with_caps(&mut s, 2, "guest", "message-tags");
+    s.line(guest, "JOIN #priv");
+    s.drain(guest);
+    s.drain(alice);
+
+    let refusal =
+        ":irc.test.example 486 guest alice :You must log in with services to message this user";
+    for line in [
+        "PRIVMSG alice :hi",
+        "@+typing=active TAGMSG alice",
+        "INVITE alice #priv",
+    ] {
+        s.line(guest, line);
+        assert_eq!(s.drain(guest), [refusal], "{line}");
+    }
+    s.line(guest, "NOTICE alice :hi");
+    assert!(s.drain(guest).is_empty(), "a NOTICE is refused silently");
+    assert!(s.drain(alice).is_empty(), "nothing reached alice");
+
+    identify(&mut s, guest, "guest");
+    s.line(guest, "PRIVMSG alice :hi");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.ends_with("PRIVMSG alice :hi"))
+    );
+    let oper = s.register(3, "oper");
+    s.line(oper, "OPER god letmein");
+    s.drain(oper);
+    s.line(oper, "PRIVMSG alice :hello");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.ends_with("PRIVMSG alice :hello"))
     );
 }
 

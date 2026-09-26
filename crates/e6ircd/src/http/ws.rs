@@ -67,6 +67,13 @@ pub(super) async fn ws_irc(
     // /ws/irc can't be used to sidestep it. The guard is held for the
     // connection's lifetime and releases the slot on drop.
     let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    // Umode +Z: this listener never terminates TLS, so a connection is secure
+    // only when a trusted proxy says its client reached it over HTTPS.
+    let transport = if super::oidc::forwarded_https(peer.ip(), &headers, &state.trusted_proxies) {
+        crate::core::ConnectionTransport::SecureWebSocket
+    } else {
+        crate::core::ConnectionTransport::WebSocket
+    };
     let Some(guard) = state.conn_limiter.try_acquire(ip) else {
         state.telemetry.record_connection_rejected();
         // A slot frees only when a connection closes, which nothing here can
@@ -117,7 +124,7 @@ pub(super) async fn ws_irc(
             );
         }
     };
-    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode, conn))
+    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode, transport, conn))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -131,15 +138,12 @@ pub(super) async fn ws_irc_conn(
     _conn_guard: crate::net::ConnGuard,
     ip: crate::net::ClientIp,
     mode: WsFrameMode,
+    transport: crate::core::ConnectionTransport,
     conn: crate::core::ConnId,
 ) {
-    use crate::core::{Input, Output};
+    use crate::core::Input;
     // Held for the whole connection; its Drop releases the per-IP slot.
-    let (out_tx, mut out_rx) = e6irc_queue::queue::<Output>(e6irc_queue::Config {
-        name: "ws-sendq",
-        capacity: state.sendq,
-        policy: e6irc_queue::Policy::Fifo,
-    });
+    let (out_tx, mut out_rx) = crate::core::send_queue("ws-sendq", state.sendq_bytes);
     if state
         .core_tx
         .push(Input::Open {
@@ -150,7 +154,7 @@ pub(super) async fn ws_irc_conn(
             // give every WS user the same hostmask, letting a banned user evade
             // KLINE/DLINE through /ws/irc and making per-user host bans impossible.
             host: ip.to_string(),
-            transport: crate::core::ConnectionTransport::WebSocket,
+            transport,
         })
         .await
         .is_err()
@@ -158,8 +162,13 @@ pub(super) async fn ws_irc_conn(
         return;
     }
     let core_tx = state.core_tx.clone();
+    let mut meter = core_tx.line_meter(conn);
     'conn: loop {
+        // Past its command allowance the connection is not read until a
+        // token is back, while what the core sends it keeps flowing.
+        let blocked = meter.blocked_until(tokio::time::Instant::now());
         tokio::select! {
+            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
             // Outbound: a core Output line becomes one text frame.
             out = out_rx.pop() => {
                 let Some(env) = out else { break };
@@ -194,7 +203,7 @@ pub(super) async fn ws_irc_conn(
                 }
             }
             // Inbound: frame(s) -> lines -> core.
-            frame = socket.recv() => {
+            frame = socket.recv(), if blocked.is_none() => {
                 let data: Vec<u8> = match frame {
                     Some(Ok(WsMessage::Text(t))) => t.as_bytes().to_vec(),
                     Some(Ok(WsMessage::Binary(b))) => b.to_vec(),
@@ -218,6 +227,7 @@ pub(super) async fn ws_irc_conn(
                 } else {
                     Input::OverlongLine { conn }
                 };
+                meter.spend().await;
                 if core_tx.push(input).await.is_err() {
                     break 'conn; // core gone: stop the connection directly
                 }

@@ -18,7 +18,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
-            &[clip_echo(nick)],
+            &[Middle::echo(nick)],
             Some("Erroneous nickname"),
         );
         return;
@@ -31,7 +31,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
-            &[clip_echo(nick)],
+            &[Middle::echo(nick)],
             Some("Nickname is reserved"),
         );
         return;
@@ -52,7 +52,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_BANNICKCHANGE,
-            &[nick, &channel],
+            &[Middle::echo(nick), Middle::own(&channel)],
             Some("Cannot change nickname while banned on channel"),
         );
         return;
@@ -66,7 +66,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_NICKNAMEINUSE,
-            &[nick],
+            &[Middle::echo(nick)],
             Some("Nickname is already in use"),
         );
         return;
@@ -185,7 +185,7 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             e6irc_proto::numerics::ERR_INVALIDUSERNAME,
-            &[p[0]],
+            &[Middle::echo(p[0])],
             Some("Invalid username"),
         );
         return;
@@ -209,7 +209,8 @@ pub(super) fn cap_target(state: &ServerState, conn: ConnId) -> String {
 }
 
 /// `FAIL REGISTER <code> <account> :<description>` — the spec's shape, with the
-/// account the client asked about so it can tell which attempt failed.
+/// account the client asked about so it can tell which attempt failed. The
+/// account is the client's own text, echoed through [`super::fail_line`].
 pub(super) fn register_fail(
     state: &mut ServerState,
     conn: ConnId,
@@ -217,11 +218,14 @@ pub(super) fn register_fail(
     account: &str,
     detail: &str,
 ) {
-    let server = state.config.server_name.clone();
-    state.send(
-        conn,
-        &format!(":{server} FAIL REGISTER {code} {account} :{detail}"),
+    let line = super::fail_line(
+        &state.config.server_name,
+        "REGISTER",
+        code,
+        &[account],
+        detail,
     );
+    state.send(conn, &line);
 }
 
 /// `REGISTER <account> <email> <password>` (draft/account-registration).
@@ -631,12 +635,10 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
         _ => {
-            // clip_echo renders an empty or ':'-leading subcommand as the
-            // safe "*" placeholder, so the echo can't break the reply's framing.
             state.numeric(
                 conn,
                 ERR_INVALIDCAPCMD,
-                &[crate::core::handler::clip_echo(&sub)],
+                &[Middle::echo(&sub)],
                 Some("Invalid CAP command"),
             );
         }

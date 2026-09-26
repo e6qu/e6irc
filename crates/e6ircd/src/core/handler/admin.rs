@@ -26,8 +26,15 @@ pub(crate) fn handle(
             kind,
             reason,
             actor,
+            duration_minutes,
         } => {
-            return begin_add_ban(state, &mask, &kind, &reason, actor, reply);
+            let ban = AdminBan {
+                mask: &mask,
+                kind: &kind,
+                reason: &reason,
+                duration_minutes,
+            };
+            return begin_add_ban(state, ban, actor, reply);
         }
         AdminRequest::RemoveServerBan {
             expected_id,
@@ -692,14 +699,26 @@ fn err_unknown_ban_kind(kind_in: &str) -> AdminReply {
     )
 }
 
+/// An administrator's server ban as the console asked for it.
+struct AdminBan<'a> {
+    mask: &'a str,
+    kind: &'a str,
+    reason: &'a str,
+    duration_minutes: Option<std::num::NonZeroU32>,
+}
+
 fn begin_add_ban(
     state: &mut ServerState,
-    mask_in: &str,
-    kind_in: &str,
-    reason_in: &str,
+    ban: AdminBan<'_>,
     actor: String,
     reply: tokio::sync::oneshot::Sender<AdminReply>,
 ) {
+    let AdminBan {
+        mask: mask_in,
+        kind: kind_in,
+        reason: reason_in,
+        duration_minutes,
+    } = ban;
     let Some(kind) = BanKind::from_token(kind_in) else {
         let _ = reply.send(err_unknown_ban_kind(kind_in));
         return;
@@ -723,20 +742,20 @@ fn begin_add_ban(
         reason
     };
     let mask = MaskKey::new(parsed.as_str(), state.casemap);
+    let now_secs = (state.config.clock)().as_secs();
+    let expiry =
+        duration_minutes.map(|minutes| crate::core::ServerBanExpiry::starting(now_secs, minutes));
+    let mutation =
+        crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor.clone(), expiry);
     if !state.config.sasl_enabled {
-        super::oper::commit_server_ban(
-            state,
-            crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor),
-        );
-        let _ = reply.send(AdminReply::Ok(format!(
-            "Added {} for {}",
-            kind.label(),
-            mask.as_str()
+        super::oper::commit_server_ban(state, mutation);
+        let _ = reply.send(AdminReply::Ok(super::oper::ban_added_text(
+            kind,
+            mask.as_str(),
+            expiry,
         )));
         return;
     }
-    let mutation =
-        crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor.clone());
     queue_admin_server_ban(state, kind, mutation, actor, reply);
 }
 
@@ -759,8 +778,7 @@ fn begin_remove_ban(
     // console removal still matches the stored ban.
     let mask = MaskKey::new(&ban_mask(kind, mask_in), state.casemap);
     if !state
-        .server_bans
-        .iter()
+        .server_bans_in_force()
         .any(|ban| ban.kind == kind && ban.mask == mask)
     {
         let _ = reply.send(ban_error(
