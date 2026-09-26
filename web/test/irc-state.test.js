@@ -136,7 +136,8 @@ test("IRC parsing distinguishes server and user notice sources", () => {
 });
 
 test("live and history chat routing understands STATUSMSG and server notices", () => {
-  const route = (line) => chatMessageRoute(parseIrc(line), "Alice");
+  const libera = namesFromIsupport(["STATUSMSG=@+"]);
+  const route = (line) => chatMessageRoute(parseIrc(line), "Alice", () => false, libera);
   assert.deepEqual(route(":bob!u@h PRIVMSG @#Ops :operators only"), {
     kind: "channel",
     target: "#Ops",
@@ -162,6 +163,44 @@ test("live and history chat routing understands STATUSMSG and server notices", (
     target: null,
   });
   assert.equal(route(":bob!u@h PRIVMSG #room"), null);
+});
+
+// The server's bnc_statusmsg_lines_belong_to_their_channel and NetworkNames'
+// statusmsg_sigils_come_from_the_network, read by the browser.
+test("STATUSMSG sigils are the network's own, never a hard-coded @+", () => {
+  const route = (line, names, known = () => false) => chatMessageRoute(parseIrc(line), "alice", known, names);
+  const ergo = namesFromIsupport(["STATUSMSG=~&@%+", "CHANTYPES=#&!"]);
+  for (const [addressed, channel] of [
+    ["@#Room", "#Room"],
+    ["+#Room", "#Room"],
+    ["@&local", "&local"],
+    ["%#dev", "#dev"],
+    ["@%#dev", "#dev"],
+    ["&#dev", "#dev"],
+    ["!ABCDEchan", "!ABCDEchan"],
+  ]) {
+    assert.deepEqual(route(`:Bob!u@h PRIVMSG ${addressed} :ops only`, ergo), { kind: "channel", target: channel }, addressed);
+  }
+  assert.deepEqual(route(":alice!u@h NOTICE @#Room :from us", ergo), { kind: "channel", target: "#Room" });
+  assert.deepEqual(
+    route(":Bob!u@h PRIVMSG +alice :a nick, not a STATUSMSG", namesFromIsupport(["STATUSMSG=~&@%+"])),
+    { kind: "dm", target: "Bob" },
+  );
+
+  // Under the default CHANTYPES `#&`, `&#dev` is still #dev's STATUSMSG when
+  // `&` is a status sigil, not a phantom `&#dev` channel.
+  const ampersand = namesFromIsupport(["STATUSMSG=&@"]);
+  assert.deepEqual(route(":Bob!u@h PRIVMSG &#dev :hi", ampersand), { kind: "channel", target: "#dev" });
+  assert.deepEqual(route(":Bob!u@h PRIVMSG &local :hi", ampersand), { kind: "channel", target: "&local" });
+
+  // A sigil the network does not advertise stays part of the target.
+  assert.deepEqual(route(":Bob!u@h PRIVMSG %#dev :hi", namesFromIsupport(["STATUSMSG=@+"])), { kind: "dm", target: "Bob" });
+  assert.deepEqual(route(":Bob!u@h PRIVMSG @#dev :hi", DEFAULT_NAMES), { kind: "dm", target: "Bob" }, "no STATUSMSG yet");
+  const retracted = namesFrom(["me", "-STATUSMSG", "x"], ergo);
+  assert.equal(retracted.statusmsg, "");
+  assert.deepEqual(route(":Bob!u@h PRIVMSG %#dev :hi", retracted), { kind: "dm", target: "Bob" });
+  // A buffer the page already holds as a channel counts, as before.
+  assert.deepEqual(route(":Bob!u@h PRIVMSG @odd :hi", ergo, (name) => name === "odd"), { kind: "channel", target: "odd" });
 });
 
 test("IRC tag values use the protocol escape rules", () => {
