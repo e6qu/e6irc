@@ -827,7 +827,7 @@ async fn persist_and_trim(
     since_trim: &mut u64,
 ) -> Result<(), crate::db::DbError> {
     crate::db::persist_bnc_line(pool, buffer, own_nick, line, names).await?;
-    *since_trim += 1;
+    *since_trim += crate::db::bnc_trim_weight(line);
     if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
         *since_trim = 0;
         crate::db::trim_bnc_buffer(pool, buffer).await?;

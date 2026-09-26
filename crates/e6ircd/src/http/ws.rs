@@ -133,13 +133,9 @@ pub(super) async fn ws_irc_conn(
     mode: WsFrameMode,
     conn: crate::core::ConnId,
 ) {
-    use crate::core::{Input, Output};
+    use crate::core::Input;
     // Held for the whole connection; its Drop releases the per-IP slot.
-    let (out_tx, mut out_rx) = e6irc_queue::queue::<Output>(e6irc_queue::Config {
-        name: "ws-sendq",
-        capacity: state.sendq,
-        policy: e6irc_queue::Policy::Fifo,
-    });
+    let (out_tx, mut out_rx) = crate::core::send_queue("ws-sendq", state.sendq_bytes);
     if state
         .core_tx
         .push(Input::Open {

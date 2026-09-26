@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use e6irc_queue::{Config as QueueConfig, Policy, Receiver, queue};
+use e6irc_queue::Receiver;
 
 use super::upstream_identity::ChannelKey;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
@@ -47,7 +47,8 @@ const LOCAL_CAPABILITIES: &str = "account-tag echo-message message-tags server-t
 pub struct CoreHandles {
     pub core_tx: CoreIngress,
     pub next_conn: Arc<ConnectionIdAllocator>,
-    pub sendq: usize,
+    /// Each session's SendQ capacity, in bytes.
+    pub sendq_bytes: usize,
 }
 
 pub struct LocalDriver {
@@ -228,11 +229,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             return Stopped;
         }
     };
-    let (out_tx, mut out_rx) = queue::<Output>(QueueConfig {
-        name: "local-sendq",
-        capacity: session.core.sendq,
-        policy: Policy::Fifo,
-    });
+    let (out_tx, mut out_rx) = crate::core::send_queue("local-sendq", session.core.sendq_bytes);
     if session
         .core
         .core_tx
@@ -453,7 +450,7 @@ async fn drive_session(
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use e6irc_queue::Sender;
+    use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
     use tokio::sync::broadcast;
 
     fn core_queue(capacity: usize) -> (Sender<Input>, Receiver<Input>) {
@@ -476,7 +473,7 @@ mod tests {
             core: CoreHandles {
                 core_tx: CoreIngress::single(core_tx),
                 next_conn: Arc::new(ConnectionIdAllocator::new(std::num::NonZeroU64::MIN)),
-                sendq: 8,
+                sendq_bytes: 8 * 512,
             },
             nick: "alice".into(),
             username: "ident".into(),
@@ -511,7 +508,7 @@ mod tests {
             };
             assert_eq!(String::from_utf8(line).unwrap(), expected);
         }
-        tx
+        tx.0
     }
 
     async fn finish_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {

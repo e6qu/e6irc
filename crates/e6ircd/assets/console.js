@@ -1102,6 +1102,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return value ? positiveInteger({ get: () => value }, name, label) : null;
   };
 
+  // A throttle that is on unless the operator writes "off".
+  const positiveIntegerOrOff = (fields, name, label) => {
+    const value = fieldValue(fields, name);
+    if (value === "off") return "off";
+    if (!value) throw new Error(`${label} must be a positive whole number, or off.`);
+    return positiveInteger({ get: () => value }, name, label);
+  };
+
   const parseListeners = (value) =>
     value
       .split("\n")
@@ -1146,10 +1154,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         description: fieldValue(fields, "description"),
         motd: textLines(String(fields.get("motd") || "")),
         nicklen: positiveInteger(fields, "nicklen", "Nickname length"),
-        sendq: positiveInteger(fields, "sendq", "Send queue"),
+        sendq_bytes: positiveInteger(fields, "sendq_bytes", "Send queue bytes"),
         core_queue: positiveInteger(fields, "core_queue", "Core queue"),
         core_workers: positiveInteger(fields, "core_workers", "Core workers"),
         max_hot_channels: positiveInteger(fields, "max_hot_channels", "Hot channels"),
+        max_history_ring_bytes: positiveInteger(fields, "max_history_ring_bytes", "History bytes per channel"),
+        max_hot_history_bytes: positiveInteger(fields, "max_hot_history_bytes", "History bytes in all"),
         listeners: parseListeners(String(fields.get("listeners") || "")),
         registration: {
           before_connect: fields.has("registration_before_connect"),
@@ -1162,7 +1172,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           trusted_proxies: splitValues(String(fields.get("trusted_proxies") || ""), "\n"),
           require_sasl: fields.has("require_sasl"),
           require_sasl_from: splitValues(String(fields.get("require_sasl_from") || ""), "\n"),
-          auth_rate_burst: optionalPositiveInteger(fields, "auth_rate_burst", "Authentication burst"),
+          auth_rate_burst: positiveIntegerOrOff(fields, "auth_rate_burst", "Authentication burst"),
           api_rate_burst: positiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
           administrator_api_rate_burst: positiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
           registration_burst: optionalPositiveInteger(fields, "registration_burst", "Registration burst"),
@@ -1521,7 +1531,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
-    for (const name of ["nicklen", "sendq", "core_queue", "core_workers", "max_hot_channels"]) configurationValue(form, name, settings[name]);
+    for (const name of ["nicklen", "sendq_bytes", "core_queue", "core_workers", "max_hot_channels", "max_history_ring_bytes", "max_hot_history_bytes"]) configurationValue(form, name, settings[name]);
     for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "require_sasl", settings.limits.require_sasl);

@@ -16,7 +16,7 @@ use e6irc_queue::Sender;
 use super::banmask::{MaskShape, MaskSubject};
 use super::hot_history::HotHistory;
 use super::{
-    CoreEffect, CoreShardCount, CoreShardId, Output, SessionOutput, SessionOwner, WireLine, Written,
+    CoreEffect, CoreShardCount, CoreShardId, SessionOutput, SessionOwner, WireLine, Written,
 };
 use crate::observability::Telemetry;
 
@@ -1308,12 +1308,12 @@ pub struct CoreConfig {
     /// as the capability's value so a client knows the rules up front.
     pub registration_before_connect: bool,
     pub registration_require_email: bool,
-    /// Per-connection outbound queue capacity. The queue itself enforces this,
-    /// but output *withheld* behind a deferred reply has not reached the queue
-    /// yet, so the same bound is applied to it here — otherwise a connection
-    /// waiting on the database could accumulate lines without limit and escape
-    /// the SendQ kill entirely.
-    pub sendq: usize,
+    /// Per-connection outbound queue capacity, in bytes (`sendq_bytes`). The
+    /// queue itself enforces this, but output *withheld* behind a deferred
+    /// reply has not reached the queue yet, so the same bound is applied to it
+    /// here — otherwise a connection waiting on the database could accumulate
+    /// lines without limit and escape the SendQ kill entirely.
+    pub sendq_bytes: usize,
     pub motd: Vec<String>,
     pub nicklen: usize,
     /// Advertise and accept SASL. Off when no database is configured —
@@ -1326,6 +1326,11 @@ pub struct CoreConfig {
     /// CHATHISTORY from Postgres. Bounds hot-history RAM independently
     /// of total channel count (DESIGN §7.4, §11.3).
     pub max_hot_channels: usize,
+    /// Bytes one history ring may hold before its oldest entries go.
+    pub max_history_ring_bytes: usize,
+    /// Bytes every history ring together may hold before the least recently
+    /// active rings are evicted, as beyond `max_hot_channels`.
+    pub max_hot_history_bytes: usize,
     /// Unix-**milliseconds** clock, injected so tests are deterministic.
     /// Millisecond resolution is required, not cosmetic: `server-time` is
     /// specified to milliseconds and CHATHISTORY pages by timestamp, so a
@@ -1784,7 +1789,7 @@ pub(crate) struct Session {
     /// each reply by its own label regardless of arrival order. Only the
     /// ambiguous-overtake case above is a real hazard, and that one is closed.
     pub deferred_replies: usize,
-    pub held: Vec<Bytes>,
+    pub held: crate::core::HeldOutput,
     /// CHATHISTORY requests this session has waiting on the database, bounded
     /// by [`MAX_HISTORY_REQUESTS_IN_FLIGHT`].
     history_requests_in_flight: usize,
@@ -5294,8 +5299,10 @@ impl ServerState {
     }
 
     /// Append to a target's hot ring, creating it if absent, and keep the
-    /// global LRU within `max_hot_channels`: this target is touched to MRU and
-    /// the least-recently-active ring is evicted once the cap is exceeded. An
+    /// global LRU within `max_hot_channels` and `max_hot_history_bytes`: this
+    /// target is touched to MRU and the least-recently-active rings are
+    /// evicted once either is exceeded, as its own oldest entries are past
+    /// `max_history_ring_bytes`. An
     /// evicted or overflowed ring is marked incomplete, so CHATHISTORY pages
     /// the remainder from Postgres rather than reporting a short history.
     ///
@@ -5313,9 +5320,12 @@ impl ServerState {
         let whole_record = !self.config.sasl_enabled;
         // Evicted targets keep no ring at all; their history is served from
         // Postgres.
-        let evicted = self
-            .history
-            .push(key, entry, whole_record, self.config.max_hot_channels);
+        let bounds = crate::core::hot_history::HotHistoryBounds {
+            rings: self.config.max_hot_channels,
+            ring_bytes: self.config.max_history_ring_bytes,
+            bytes: self.config.max_hot_history_bytes,
+        };
+        let evicted = self.history.push(key, entry, whole_record, bounds);
         self.channel_ring_changed(key);
         for cold in evicted {
             self.channel_ring_changed(&cold);
@@ -6086,7 +6096,7 @@ impl ServerState {
     pub fn open(
         &mut self,
         conn: ConnId,
-        tx: Sender<Output>,
+        tx: crate::core::SendQueue,
         host: String,
         transport: crate::core::ConnectionTransport,
     ) {
@@ -6162,7 +6172,7 @@ impl ServerState {
                 deferred_replies: 0,
                 history_requests_in_flight: 0,
                 published: None,
-                held: Vec::new(),
+                held: crate::core::HeldOutput::default(),
                 last_ping_sent: opened_at,
             },
         );
@@ -6237,12 +6247,10 @@ impl ServerState {
         // like the queue it is waiting to enter: overflowing it is a SendQ
         // kill, not unbounded growth.
         if self.emitting_deferred != Some(conn) {
-            let sendq = self.config.sendq;
+            let sendq_bytes = self.config.sendq_bytes;
             match self.sessions.output_mut(&conn) {
                 Some(session) if session.deferred_replies > 0 => {
-                    if session.held.len() < sendq {
-                        session.held.push(bytes);
-                    } else {
+                    if !session.held.hold(bytes, sendq_bytes) {
                         self.doomed.push(conn);
                     }
                     return;
@@ -7306,11 +7314,13 @@ mod session_store_tests {
                 description: "test".into(),
                 registration_before_connect: false,
                 registration_require_email: false,
-                sendq: 1,
+                sendq_bytes: 512,
                 motd: Vec::new(),
                 nicklen: 30,
                 sasl_enabled: false,
                 max_hot_channels: 1,
+                max_history_ring_bytes: crate::config::DEFAULT_HISTORY_RING_BYTES,
+                max_hot_history_bytes: crate::config::DEFAULT_HOT_HISTORY_BYTES,
                 opers: Vec::new(),
                 clock: wall_clock,
                 mono_clock,
@@ -7379,11 +7389,7 @@ mod session_store_tests {
     }
 
     fn open(state: &mut ServerState, conn: ConnId) {
-        let (tx, _rx) = queue(QueueConfig {
-            name: "session-store-output",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
+        let (tx, _rx) = crate::core::send_queue("session-store-output", 512);
         state.open(
             conn,
             tx,

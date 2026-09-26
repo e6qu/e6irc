@@ -836,7 +836,10 @@ fn operations() -> serde_json::Value {
             "command_burst": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "command_rate": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "trusted_proxies": { "type": "array", "items": { "type": "string" } },
-            "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "auth_rate_burst": {
+                "oneOf": [{ "type": "integer", "minimum": 1 }, { "const": "off" }],
+                "description": "Authentication requests one client address (an IPv6 client's /64) may make at once, refilling over a minute; \"off\" turns the throttle off. On by default."
+            },
             "api_rate_burst": { "type": "integer", "minimum": 1 },
             "administrator_api_rate_burst": { "type": "integer", "minimum": 1 },
             "registration_burst": { "type": ["integer", "null"], "minimum": 1 },
@@ -882,8 +885,9 @@ fn operations() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "server_name", "network_name", "description", "motd", "nicklen", "sendq",
-            "core_queue", "core_workers", "max_hot_channels", "listeners", "registration", "limits",
+            "server_name", "network_name", "description", "motd", "nicklen", "sendq_bytes",
+            "core_queue", "core_workers", "max_hot_channels", "max_history_ring_bytes",
+            "max_hot_history_bytes", "listeners", "registration", "limits",
             "observability", "storage", "bnc_addr", "bnc_tls", "public_url", "secure_cookies",
             "admin_accounts"
         ],
@@ -893,10 +897,12 @@ fn operations() -> serde_json::Value {
             "description": { "type": "string" },
             "motd": { "type": "array", "items": { "type": "string" } },
             "nicklen": { "type": "integer", "minimum": 10, "maximum": 64 },
-            "sendq": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_SENDQ },
+            "sendq_bytes": { "type": "integer", "minimum": crate::config::MIN_SENDQ_BYTES, "maximum": crate::config::MAX_SENDQ_BYTES, "description": "Bytes queued for one connection, output held behind a deferred reply included, before it is closed for SendQ." },
             "core_queue": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_QUEUE },
             "core_workers": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_WORKERS },
             "max_hot_channels": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HOT_CHANNELS },
+            "max_history_ring_bytes": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HISTORY_RING_BYTES, "description": "Bytes one channel's or conversation's in-memory history may hold; its oldest entries go first." },
+            "max_hot_history_bytes": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HOT_HISTORY_BYTES, "description": "Bytes every in-memory history together may hold; the least recently active are evicted first. At least max_history_ring_bytes." },
             "listeners": { "type": "array", "items": listener_schema },
             "registration": registration_schema,
             "limits": limits_schema,

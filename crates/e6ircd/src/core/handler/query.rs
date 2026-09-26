@@ -315,10 +315,10 @@ pub(super) fn deliver_who_reply(
     requester: WhoRequester,
     reply: crate::core::paced::WhoReply<bytes::Bytes>,
 ) {
-    let lines = reply.rows.len() + 1;
+    let size = reply.rows.iter().map(bytes::Bytes::len).sum::<usize>() + reply.end.len();
     let queued = state.paced_replies.get(&conn);
-    let immediate = queued.is_none() && state.paced_room(conn).is_some_and(|room| lines <= room);
-    let admitted = queued.is_none_or(|queued| queued.admits(lines, state.config.sendq));
+    let immediate = queued.is_none() && state.paced_room(conn).is_some_and(|room| size <= room);
+    let admitted = queued.is_none_or(|queued| queued.admits(size, state.config.sendq_bytes));
     let send_now = |state: &mut ServerState, lines: Vec<bytes::Bytes>| match &requester {
         WhoRequester::Local => {
             for line in lines {
@@ -405,9 +405,8 @@ fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
         if room == 0 {
             break;
         }
-        let line = reply.lines.pop_front().expect("the reply has lines left");
-        paced.lines -= 1;
-        room -= 1;
+        let line = paced.take_line().expect("the reply has lines left");
+        room = room.saturating_sub(line.len());
         let line = match &batch {
             Some(batch) => inject_tag(&line, &format!("batch={batch}")),
             None => line,

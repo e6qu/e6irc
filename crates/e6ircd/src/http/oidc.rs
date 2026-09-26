@@ -1711,7 +1711,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
     }
 }
 
-/// A request that has spent one token from the per-IP auth-rate budget. Every
+/// A request that has spent one token from the per-address auth-rate budget
+/// (`limits.auth_rate_burst`: on by default, off only when the operator says
+/// `"off"`). Every
 /// unauthenticated, work-inducing route asks for this in its signature instead
 /// of opening with the `client_ip` + `spend_auth_budget` prologue (and pulling in
 /// `ConnectInfo` + `HeaderMap`) by hand — so the throttle is declared in one
@@ -2196,7 +2198,7 @@ const MAX_AUTH_BUCKETS: usize = 4096;
 /// Spend one token from `client`'s auth bucket, keyed by its
 /// [`PeerLimitKey`](crate::net::PeerLimitKey) (an IPv6 client's whole `/64`).
 /// A refusal is the whole seconds until the bucket holds a token again, for
-/// the `Retry-After` header; always `Ok` when `auth_rate_burst` is unset. The
+/// the `Retry-After` header; always `Ok` when `auth_rate_burst` is `"off"`. The
 /// bucket refills to full over [`API_RATE_WINDOW`]; fully-refilled entries are
 /// pruned, and the map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow
 /// without bound even under a distinct-IP flood.

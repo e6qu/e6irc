@@ -538,14 +538,22 @@ fn send_channel_list(
 }
 
 /// One line of a LIST reply, tagged into its batch if it has one. It is
-/// sent past any hold: the LIST is older than whatever that waits on.
-fn send_list_line(state: &mut ServerState, conn: ConnId, batch: Option<&str>, line: String) {
+/// sent past any hold: the LIST is older than whatever that waits on. Returns
+/// the bytes it took in the send queue.
+fn send_list_line(
+    state: &mut ServerState,
+    conn: ConnId,
+    batch: Option<&str>,
+    line: String,
+) -> usize {
     let line = bytes::Bytes::from(format!("{line}\r\n"));
     let line = match batch {
         Some(batch) => inject_tag(&line, &format!("batch={batch}")),
         None => line,
     };
+    let size = line.len();
     state.send_unheld(conn, line);
+    size
 }
 
 /// Close a LIST reply: `RPL_LISTEND`, after a notice when it was aborted, and
@@ -595,13 +603,13 @@ fn abort_channel_list(state: &mut ServerState, conn: ConnId) -> bool {
 fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
     use crate::core::list::ListProgress;
     // A closing connection's LIST goes with it (`ServerState::close`).
-    let room = state
+    let mut room = state
         .paced_room(conn)
         .expect("a LIST is paced only to an open connection");
     let Some(ListProgress::Sending { batch, mut rows }) = state.channel_lists.remove(&conn) else {
         panic!("only a LIST that is sending is paced");
     };
-    for _ in 0..room {
+    while room > 0 {
         let Some(row) = rows.next() else {
             return finish_channel_list(state, conn, batch, false);
         };
@@ -611,7 +619,7 @@ fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
             &[&row.name, &row.members.to_string()],
             Some(&row.topic),
         );
-        send_list_line(state, conn, batch.as_deref(), line);
+        room = room.saturating_sub(send_list_line(state, conn, batch.as_deref(), line));
     }
     if rows.as_slice().is_empty() {
         return finish_channel_list(state, conn, batch, false);
