@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -33,6 +34,7 @@ import {
   outgoingChat,
   parseIrc,
   prependHistory,
+  reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
   seededNick,
@@ -349,6 +351,23 @@ test("authoritative session channels replace stale replay membership by casefold
       joined: ["#keep", "#New"],
     },
   );
+});
+
+test("PART, KICK and QUIT reasons are rendered without formatting codes", async () => {
+  assert.equal(reasonSuffix("\x0304,01flood\x03 limit"), " (flood limit)");
+  assert.equal(reasonSuffix("plain"), " (plain)");
+  assert.equal(reasonSuffix("\x02\x02"), "", "only formatting is no reason");
+  assert.equal(reasonSuffix(undefined), "");
+  // Each membership event renders its reason through the one helper, never a
+  // hand-built ` (${m.params[n]})`, which is how all three forgot the codes.
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /` \(\$\{m\.params/);
+  for (const command of ["PART", "KICK", "QUIT"]) {
+    const start = source.indexOf(`case "${command}":`);
+    assert.ok(start !== -1, command);
+    const body = source.slice(start, source.indexOf("case ", start + 6));
+    assert.match(body, /reasonSuffix\(m\.params\[\d\]\)/, command);
+  }
 });
 
 test("formatting codes are removed rather than shown as digits and control bytes", () => {

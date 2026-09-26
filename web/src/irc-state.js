@@ -420,6 +420,15 @@ export function stripFormatting(text) {
   return String(text ?? "").replace(FORMATTING, "");
 }
 
+// The reason a PART, KICK or QUIT carries, as the ` (reason)` its event line
+// ends with, or nothing. Every membership event renders its reason through
+// here, so none can show a bot's colour codes as `04,01text`; a reason that
+// is only formatting is no reason.
+export function reasonSuffix(reason) {
+  const text = stripFormatting(reason);
+  return text ? ` (${text})` : "";
+}
+
 // Bidirectional embedding, override and isolate controls (LRE, RLE, PDF, LRO,
 // RLO, LRI, RLI, FSI, PDI). In another person's text they reorder what follows
 // them, so a link can read as a different address than the one it opens, or a

@@ -63,6 +63,7 @@ import {
   outgoingChat,
   parseIrc,
   prependHistory,
+  reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
   seededNick,
@@ -1268,7 +1269,7 @@ function handleLine(raw) {
       if (!channels.length || !m.nick) {
         break;
       }
-      const reason = m.params[1] ? ` (${m.params[1]})` : "";
+      const reason = reasonSuffix(m.params[1]);
       for (const channel of channels) {
         if (isMe(m.nick)) {
           closeBuffer(channel);
@@ -1285,7 +1286,7 @@ function handleLine(raw) {
       if (!pairs.length) {
         break;
       }
-      const reason = m.params[2] ? ` (${m.params[2]})` : "";
+      const reason = reasonSuffix(m.params[2]);
       const by = m.nick ? ` by ${m.nick}` : "";
       for (const [channel, target] of pairs) {
         if (isMe(target)) {
@@ -1300,7 +1301,7 @@ function handleLine(raw) {
     }
     case "QUIT":
       if (m.nick) {
-        const reason = m.params[0] ? ` (${m.params[0]})` : "";
+        const reason = reasonSuffix(m.params[0]);
         removeNickEverywhere(m.nick, `${stripSigil(m.nick, channelModes)} quit${reason}`);
       }
       break;
