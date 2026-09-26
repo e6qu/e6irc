@@ -15,7 +15,7 @@ use e6irc_client::credentials::{
 use e6irc_client::liveness::{Heard, LIVENESS_WINDOW, Liveness};
 use e6irc_client::{
     CleartextCredentials, ClientEvent, Connection, ConnectionOptions, HistoryCoverage,
-    HistoryRefusal, JoinRefusal, NetworkNames, OwnedMessage, Registered, TerminalSafe,
+    HistoryRefusal, JoinRefusal, NetworkNames, OwnedMessage, Registered, RelayEvent, TerminalSafe,
 };
 use e6irc_tui::app::{App, LogLine, SCROLLBACK_LINES, SessionStart};
 use e6irc_tui::keys::{self, KeyOutcome};
@@ -249,18 +249,27 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     let history = HistoryWindow::new(cli.history_lines as usize);
     let read_markers = !cli.no_read_markers;
     let mut joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
-    let Session {
+    // The UI state exists before the connection does: what the server says
+    // while the client connects goes straight into it, never into a list.
+    let mut app = App::new(
+        cli.channel,
+        SessionStart {
+            nick: cli.nick.clone(),
+            names: NetworkNames::default(),
+            read_markers: false,
+        },
+    );
+    let Registered {
         connection: conn,
-        start,
-        events,
+        nick: confirmed_nick,
     } = connect_and_join(
         &connection_options,
         &mut joined_channels,
         history,
         read_markers,
+        &mut Ui::Starting(&mut app),
     )
     .await?;
-    let confirmed_nick = start.nick.clone();
 
     // Bounded: the server decides how fast this fills, and the render loop
     // only drains it between draws. A full queue makes the reader task wait,
@@ -292,10 +301,6 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     let mut signalled = quit_on_signal()?;
     let mut terminal = ratatui::init();
     restore_paste_on_panic();
-    let mut app = App::new(cli.channel, start);
-    for event in events {
-        apply(&mut app, event);
-    }
     let result = match crossterm::execute!(io::stdout(), event::EnableBracketedPaste) {
         Ok(()) => {
             run_ui(
@@ -542,10 +547,22 @@ async fn network_task(
             if sleep_unless_ui_leaves(delay, &mut out_rx, &mut stale).await {
                 return;
             }
-            let attempt =
-                connect_and_join(&options, &mut joined_channels, history, read_markers).await;
-            let session = match attempt {
-                Ok(session) => session,
+            let attempt = connect_and_join(
+                &options,
+                &mut joined_channels,
+                history,
+                read_markers,
+                &mut Ui::Running {
+                    net_tx: &net_tx,
+                    out_rx: &mut out_rx,
+                    stale: &mut stale,
+                },
+            )
+            .await;
+            let registered = match attempt {
+                Ok(registered) => registered,
+                // The UI left while the client was connecting.
+                Err(_) if net_tx.is_closed() => return,
                 Err(error) => match policy.after(&error) {
                     // Dropping `out_rx` with this task is what makes the UI
                     // refuse further input instead of queueing it for nobody.
@@ -567,24 +584,8 @@ async fn network_task(
                 },
             };
             policy.connected(std::time::Instant::now());
-            // Right before the new connection is handed to the relay: a line
-            // admitted after the last drain was typed against the old one.
-            stale.drain(&mut out_rx);
-            if !stale.report(&net_tx).await {
-                return;
-            }
-            let Session {
-                connection,
-                start,
-                events,
-            } = session;
-            conn = connection;
-            own_nick.clone_from(&start.nick);
-            for event in std::iter::once(Ev::Connected(start)).chain(events) {
-                if net_tx.send(event).await.is_err() {
-                    return;
-                }
-            }
+            conn = registered.connection;
+            own_nick = registered.nick;
             break;
         }
     }
@@ -683,16 +684,55 @@ async fn finish(conn: &mut Connection, out_rx: &mut mpsc::Receiver<Queued>) -> S
     SessionEnd::UiGone
 }
 
-/// A registered connection and everything the UI starts a session from.
-struct Session {
-    connection: Connection,
-    /// What the connection is: the nickname the server confirmed (not always
-    /// the one asked for), the network's naming rules, and whether it keeps
-    /// read markers.
-    start: SessionStart,
-    /// Everything read and learned on the way, in order: the welcome burst,
-    /// each join with its history, refusals, and SASL's notes.
-    events: Vec<Ev>,
+/// Where what the server says while the client connects goes, as each line
+/// is read. None of it is held for later: a bouncer attach can replay
+/// thousands of lines before the client has joined anything, and the server's
+/// pace must never become the client's memory.
+enum Ui<'a> {
+    /// Before the first draw: straight into the UI state.
+    Starting(&'a mut App),
+    /// The running UI, through its bounded queue, which pushes back on the
+    /// socket when full.
+    Running {
+        net_tx: &'a mpsc::Sender<Ev>,
+        /// Lines the UI queued against the previous connection are set aside
+        /// before it learns of this one, and never sent on it.
+        out_rx: &'a mut mpsc::Receiver<Queued>,
+        stale: &'a mut Stale,
+    },
+}
+
+/// A line read while a request waits for its answer is the UI's, as it is
+/// read.
+impl e6irc_client::LineSink for &mut Ui<'_> {
+    async fn take(&mut self, event: RelayEvent) -> io::Result<()> {
+        self.deliver(Ev::Net(event.into())).await
+    }
+}
+
+impl Ui<'_> {
+    async fn deliver(&mut self, event: Ev) -> io::Result<()> {
+        let ui_gone = || io::Error::new(io::ErrorKind::BrokenPipe, "the UI has closed");
+        match self {
+            Self::Starting(app) => {
+                apply(app, event);
+                Ok(())
+            }
+            Self::Running {
+                net_tx,
+                out_rx,
+                stale,
+            } => {
+                if matches!(event, Ev::Connected(_)) {
+                    stale.drain(out_rx);
+                    if !stale.report(net_tx).await {
+                        return Err(ui_gone());
+                    }
+                }
+                net_tx.send(event).await.map_err(|_| ui_gone())
+            }
+        }
+    }
 }
 
 /// What the UI must know about a channel's history: whether the read marker
@@ -705,25 +745,25 @@ fn coverage_event(channel: String, coverage: HistoryCoverage) -> Option<Ev> {
     }
 }
 
-/// Register and join `channels`. A channel the server refuses is taken out of
-/// the set and reported: one closed channel must not fail the whole session,
-/// or every reconnect registers, is refused the same channel, and drops again.
-/// A channel whose history the server refuses is joined without it, and said.
+/// Register and join `channels`, telling `ui` everything on the way as it
+/// happens. A channel the server refuses is taken out of the set and
+/// reported: one closed channel must not fail the whole session, or every
+/// reconnect registers, is refused the same channel, and drops again. A
+/// channel whose history the server refuses is joined without it, and said.
 async fn connect_and_join(
     options: &ConnectionOptions,
     channels: &mut std::collections::BTreeSet<String>,
     history: HistoryWindow,
     read_markers: bool,
-) -> io::Result<Session> {
+    ui: &mut Ui<'_>,
+) -> io::Result<Registered> {
     let Registered {
         mut connection,
         nick,
     } = options.connect_registered().await?;
-    let mut events: Vec<Ev> = connection
-        .sasl_notes()
-        .iter()
-        .map(|note| Ev::SaslNote(note.clone()))
-        .collect();
+    for note in connection.sasl_notes() {
+        ui.deliver(Ev::SaslNote(note.clone())).await?;
+    }
     let mut capabilities = Vec::new();
     if history.page_lines > 0 {
         capabilities.extend(["batch", "draft/chathistory", "server-time"]);
@@ -731,44 +771,45 @@ async fn connect_and_join(
     if read_markers {
         capabilities.push("draft/read-marker");
     }
-    // The welcome burst is still arriving: its MOTD and 005 are the UI's.
+    // The welcome burst is still arriving — its MOTD and 005, a bouncer's
+    // playback — and it is the UI's, up to a round trip, before any join.
     connection
-        .require_capabilities(&capabilities, |event| {
-            events.push(Ev::Net(event.into()));
-            Ok(())
-        })
+        .require_capabilities(&capabilities, &mut *ui)
         .await?;
+    connection.round_trip(&mut *ui).await?;
+    ui.deliver(Ev::Connected(SessionStart {
+        nick: nick.clone(),
+        names: connection.names().clone(),
+        read_markers: connection.enabled("draft/read-marker"),
+    }))
+    .await?;
     for channel in channels.clone() {
         match connection
             .join_with_history(&channel, history.page_lines, history.max_lines)
             .await
         {
             Ok(joined) => {
-                events.extend(joined.events.into_iter().map(Ev::Net));
-                if let Some(refusal) = joined.refusal {
-                    events.push(Ev::HistoryRefused(channel.clone(), refusal));
+                for event in joined.events {
+                    ui.deliver(Ev::Net(event)).await?;
                 }
-                events.extend(coverage_event(channel, joined.coverage));
+                if let Some(refusal) = joined.refusal {
+                    ui.deliver(Ev::HistoryRefused(channel.clone(), refusal))
+                        .await?;
+                }
+                if let Some(event) = coverage_event(channel, joined.coverage) {
+                    ui.deliver(event).await?;
+                }
             }
             Err(error) => {
                 let Some(refusal) = JoinRefusal::from_error(&error) else {
                     return Err(error);
                 };
                 channels.remove(&channel);
-                events.push(Ev::JoinRefused(refusal));
+                ui.deliver(Ev::JoinRefused(refusal)).await?;
             }
         }
     }
-    let start = SessionStart {
-        nick,
-        names: connection.names().clone(),
-        read_markers: connection.enabled("draft/read-marker"),
-    };
-    Ok(Session {
-        connection,
-        start,
-        events,
-    })
+    Ok(Registered { connection, nick })
 }
 
 /// Keep what a reconnect needs in step with the server: the channels this
@@ -893,7 +934,7 @@ fn apply(app: &mut App, event: Ev) {
             app.status(format!("server input rejected: {rejected}"));
         }
         Ev::Connected(start) => {
-            let status = format!("reconnected as {}", start.nick);
+            let status = format!("connected as {}", start.nick);
             app.begin_session(start);
             app.status(status);
         }
@@ -1633,6 +1674,7 @@ mod tests {
                     "CAP END" => ":bnc 001 upstream :Welcome",
                     "JOIN #closed" => ":bnc 473 upstream #closed :Cannot join channel (+i)",
                     "JOIN #open" => ":bnc 366 upstream #open :End of NAMES",
+                    "PING :e6irc-round-trip" => ":bnc PONG bnc :e6irc-round-trip",
                     _ => continue,
                 };
                 writer
@@ -1655,29 +1697,27 @@ mod tests {
         };
         let mut channels =
             std::collections::BTreeSet::from(["#closed".to_owned(), "#open".to_owned()]);
-        let session = connect_and_join(&options, &mut channels, HistoryWindow::new(0), false)
-            .await
-            .expect("a refused channel does not fail the session");
-        assert_eq!(session.start.nick, "upstream");
+        let mut app = test_app("#open", "requested");
+        let registered = connect_and_join(
+            &options,
+            &mut channels,
+            HistoryWindow::new(0),
+            false,
+            &mut Ui::Starting(&mut app),
+        )
+        .await
+        .expect("a refused channel does not fail the session");
+        assert_eq!(registered.nick, "upstream");
+        assert_eq!(app.nick, "upstream");
         assert_eq!(
             channels,
             std::collections::BTreeSet::from(["#open".to_owned()])
         );
-        let refused = session
-            .events
-            .into_iter()
-            .filter(|event| matches!(event, Ev::JoinRefused(_)))
-            .collect::<Vec<_>>();
-        assert_eq!(refused.len(), 1);
-
-        let mut app = App::new("#open".into(), session.start);
-        for event in refused {
-            apply(&mut app, event);
-        }
-        let shown = app.current().log.back().expect("status").text.to_string();
-        assert_eq!(
-            shown,
-            "cannot join #closed: Cannot join channel (+i); it will not be rejoined"
+        assert!(
+            app.current().log.iter().any(|line| line.text
+                == "cannot join #closed: Cannot join channel (+i); it will not be rejoined"),
+            "{:?}",
+            app.current().log
         );
 
         apply(
@@ -1723,6 +1763,7 @@ mod tests {
                     "CHATHISTORY LATEST #open * 5" => {
                         b":srv FAIL CHATHISTORY MESSAGE_ERROR #open :history store unavailable\r\n"
                     }
+                    "PING :e6irc-round-trip" => b":srv PONG srv :e6irc-round-trip\r\n",
                     _ => b"",
                 };
                 seen.push(line);
@@ -1743,28 +1784,37 @@ mod tests {
             server_password: None,
         };
         let mut channels = std::collections::BTreeSet::from(["#open".to_owned()]);
-        let session = connect_and_join(&options, &mut channels, HistoryWindow::new(50), true)
-            .await
-            .expect("a Latin-1 MOTD line and a refused history do not fail the connect");
-        assert!(session.start.read_markers);
-        assert!(!session.start.names.eq("#a[", "#a{"), "CASEMAPPING=ascii");
-        let Session {
-            connection,
-            start,
-            events,
-        } = session;
-        drop(connection);
+        let mut app = App::new(
+            "#open".into(),
+            SessionStart {
+                nick: "me".into(),
+                names: NetworkNames::default(),
+                read_markers: false,
+            },
+        );
+        let registered = connect_and_join(
+            &options,
+            &mut channels,
+            HistoryWindow::new(50),
+            true,
+            &mut Ui::Starting(&mut app),
+        )
+        .await
+        .expect("a Latin-1 MOTD line and a refused history do not fail the connect");
+        drop(registered);
         let seen = server.await.unwrap();
         assert!(
             seen.iter()
                 .any(|line| line == "CHATHISTORY LATEST #open * 5"),
             "the page fits the server's limit: {seen:?}"
         );
-
-        let mut app = App::new("#open".into(), start);
-        for event in events {
-            apply(&mut app, event);
-        }
+        app.on_message(&message(
+            "@time=2026-07-30T12:00:00.000Z :x!u@h PRIVMSG #open :hi",
+        ));
+        assert!(
+            app.take_read_marker_command().is_some(),
+            "the connection keeps read markers"
+        );
         let shown = |app: &App, name: &str| -> Vec<String> {
             app.buffers
                 .iter()
@@ -1792,6 +1842,113 @@ mod tests {
             shown(&app, "#open").last().map(String::as_str),
             Some("ops only")
         );
+    }
+
+    /// A bouncer attach can replay thousands of lines before it answers
+    /// anything the client asked. What the server says while the client
+    /// connects reaches the running UI as it is read, through the UI's bounded
+    /// queue, and none of it is held on the way: this server answers the
+    /// capability request only after the UI has received every line of its
+    /// burst, and the queue holds four.
+    #[tokio::test]
+    async fn a_reconnect_streams_the_welcome_burst_to_the_ui_as_it_arrives() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        const LINES: usize = 3000;
+        let (all_shown, shown) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let mut shown = Some(shown);
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply = match line.as_str() {
+                    "CAP LS 302" => ":bnc CAP * LS :draft/read-marker".to_owned(),
+                    "CAP END" => ":bnc 001 me :Welcome".to_owned(),
+                    "CAP REQ :draft/read-marker" => {
+                        let mut burst = String::new();
+                        for number in 0..LINES {
+                            burst.push_str(&format!(":bnc 372 me :- playback {number}\r\n"));
+                        }
+                        writer.write_all(burst.as_bytes()).await.unwrap();
+                        shown
+                            .take()
+                            .expect("one request")
+                            .await
+                            .expect("the UI received the whole burst first");
+                        ":bnc CAP me ACK :draft/read-marker".to_owned()
+                    }
+                    "PING :e6irc-round-trip" => ":bnc PONG bnc :e6irc-round-trip".to_owned(),
+                    "JOIN #open" => ":bnc 366 me #open :End of NAMES".to_owned(),
+                    _ => continue,
+                };
+                writer
+                    .write_all(format!("{reply}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let options = ConnectionOptions {
+            address,
+            tls: false,
+            tls_server_name: None,
+            nick: "me".into(),
+            username: "ident".into(),
+            realname: "real".into(),
+            authentication: e6irc_client::Authentication::None,
+            response_deadline: Duration::from_secs(10),
+            cleartext_credentials: CleartextCredentials::Refuse,
+            server_password: None,
+        };
+        let (net_tx, mut net_rx) = mpsc::channel(4);
+        let (_out_tx, mut out_rx) = mpsc::channel::<Queued>(4);
+        let ui = tokio::spawn(async move {
+            let mut all_shown = Some(all_shown);
+            let mut playback = 0;
+            let mut connected = false;
+            while let Some(event) = net_rx.recv().await {
+                match event {
+                    Ev::Net(ClientEvent::Message(message)) if message.command == "372" => {
+                        playback += 1;
+                        if playback == LINES {
+                            all_shown.take().expect("once").send(()).unwrap_or_default();
+                        }
+                    }
+                    Ev::Connected(start) => {
+                        assert_eq!(playback, LINES, "the burst comes before the session");
+                        assert!(start.read_markers);
+                        connected = true;
+                    }
+                    _ => {}
+                }
+            }
+            (playback, connected)
+        });
+        let mut channels = std::collections::BTreeSet::from(["#open".to_owned()]);
+        let mut stale = Stale::default();
+        let registered = tokio::time::timeout(
+            Duration::from_secs(20),
+            connect_and_join(
+                &options,
+                &mut channels,
+                HistoryWindow::new(0),
+                true,
+                &mut Ui::Running {
+                    net_tx: &net_tx,
+                    out_rx: &mut out_rx,
+                    stale: &mut stale,
+                },
+            ),
+        )
+        .await
+        .expect("the burst was held until the request was answered")
+        .expect("connected");
+        drop(registered);
+        drop(net_tx);
+        assert_eq!(ui.await.unwrap(), (LINES, true));
+        server.await.unwrap();
     }
 
     /// A half-open connection reads as nothing forever. The client asks after

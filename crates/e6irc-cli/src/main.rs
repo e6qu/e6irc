@@ -392,9 +392,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     match cli.command {
         Command::Send { target, message } => {
-            for event in learn_network(&mut conn).await? {
+            learn_network(&mut conn, |event: RelayEvent| {
                 reported(event.into());
-            }
+                Ok(())
+            })
+            .await?;
             send(&mut conn, &own_nick, &target, &message, response_timeout).await?;
             finish_quietly(&mut conn, response_timeout).await
         }
@@ -403,25 +405,32 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             count,
             json,
         } => {
-            let early = learn_network(&mut conn).await?;
-            let tail = Tail {
+            let mut tail = Tail {
                 target: &target,
                 wanted: (count != 0).then_some(count),
                 json,
-                names: conn.names().clone(),
+                names: NetworkNames::default(),
+                seen: 0,
             };
-            tail.follow(early, &mut conn, LIVENESS_WINDOW, &mut stdout)
-                .await
+            if let Some(end) = tail.follow_welcome(&mut conn, &mut stdout).await? {
+                return end;
+            }
+            tail.follow(&mut conn, LIVENESS_WINDOW, &mut stdout).await
         }
         Command::History { target, count } => {
-            conn.require_capabilities(&["batch", "draft/chathistory", "server-time"], |event| {
+            conn.require_capabilities(
+                &["batch", "draft/chathistory", "server-time"],
+                |event: RelayEvent| {
+                    reported(event.into());
+                    Ok(())
+                },
+            )
+            .await?;
+            learn_network(&mut conn, |event: RelayEvent| {
                 reported(event.into());
                 Ok(())
             })
             .await?;
-            for event in learn_network(&mut conn).await? {
-                reported(event.into());
-            }
             if let Some(limit) = conn.chathistory_limit().filter(|limit| count > *limit) {
                 eprintln!(
                     "warning: the server returns at most {limit} lines per history request; \
@@ -464,17 +473,16 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     }
 }
 
-/// Read the rest of the welcome burst, up to a round trip, and return what it
-/// held. The network's 005 is in it, and until it is read nothing can say
-/// which targets are channels on this network or when two names are the same
-/// ([`Connection::names`]).
-async fn learn_network(conn: &mut Connection) -> std::io::Result<Vec<RelayEvent>> {
-    let mut early = Vec::new();
-    conn.round_trip(|event| {
-        early.push(event);
-        Ok(())
-    })
-    .await?;
+/// Read the rest of the welcome burst, up to a round trip, handing each line
+/// to `each` as it is read — never holding it: a bouncer attach can replay
+/// thousands of lines here. The network's 005 is in it, and until it is read
+/// nothing can say which targets are channels on this network or when two
+/// names are the same ([`Connection::names`]).
+async fn learn_network(
+    conn: &mut Connection,
+    each: impl e6irc_client::LineSink,
+) -> std::io::Result<()> {
+    conn.round_trip(each).await?;
     if let Some(mapping) = conn.names().unrecognised_casemapping() {
         eprintln!(
             "warning: the server's CASEMAPPING={} is not one this client knows; names are \
@@ -482,7 +490,7 @@ async fn learn_network(conn: &mut Connection) -> std::io::Result<Vec<RelayEvent>
             terminal_safe(mapping)
         );
     }
-    Ok(early)
+    Ok(())
 }
 
 /// Deliver one PRIVMSG and wait for the server's verdict on it.
@@ -506,7 +514,7 @@ async fn send(
              refusal could arrive after the connection closed; the message was not sent",
         ));
     }
-    conn.require_capabilities(&["echo-message"], |event| {
+    conn.require_capabilities(&["echo-message"], |event: RelayEvent| {
         reported(event.into());
         Ok(())
     })
@@ -522,7 +530,7 @@ async fn send(
     // Everything the server says about registration and the join (a missing
     // MOTD is a 422) is behind this round trip, so any refusal after the
     // PRIVMSG is about the PRIVMSG.
-    conn.round_trip(|event| {
+    conn.round_trip(|event: RelayEvent| {
         reported(event.into());
         Ok(())
     })
@@ -610,37 +618,51 @@ struct Tail<'a> {
     /// Stop after this many messages; `None` follows until the server goes.
     wanted: Option<usize>,
     json: bool,
-    /// The network's naming rules, learned before the tail starts.
+    /// The network's naming rules, as the 005 lines read so far declared
+    /// them.
     names: NetworkNames,
+    /// Messages printed so far.
+    seen: usize,
 }
 
 impl Tail<'_> {
+    /// Print what the rest of the welcome burst holds for the target, up to a
+    /// round trip, as it is read. `Some` is the end of the tail: the
+    /// promised count reached, or the reader gone.
+    async fn follow_welcome(
+        &mut self,
+        conn: &mut Connection,
+        out: &mut impl std::io::Write,
+    ) -> std::io::Result<Option<std::io::Result<()>>> {
+        let mut ended = None;
+        learn_network(conn, |event: RelayEvent| {
+            if ended.is_none()
+                && let Some(message) = reported(event.into())
+            {
+                ended = self.observe(&message, out)?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(ended)
+    }
+
     /// Follow the target until the promised count is printed, the reader goes
     /// away, or the server does — the last being a failure: a server that
     /// closes, or stays silent through two liveness windows (the first ends
     /// with a PING), ends an unbounded tail that a supervisor must see end.
-    /// `early` is what was read before the tail started, oldest first.
     async fn follow(
-        &self,
-        early: Vec<RelayEvent>,
+        &mut self,
         conn: &mut Connection,
         liveness_window: std::time::Duration,
         out: &mut impl std::io::Write,
     ) -> std::io::Result<()> {
-        let mut seen = 0;
-        for event in early {
-            if let Some(message) = reported(event.into())
-                && let Some(end) = self.print(&message, &mut seen, out)?
-            {
-                return end;
-            }
-        }
         if self.names.is_channel(self.target) {
             // Messages relayed while the join is confirmed are part of the
             // stream being followed.
             for event in conn.join_with_latest_history(self.target, 0).await? {
                 if let Some(message) = reported(event)
-                    && let Some(end) = self.print(&message, &mut seen, out)?
+                    && let Some(end) = self.observe(&message, out)?
                 {
                     return end;
                 }
@@ -650,23 +672,33 @@ impl Tail<'_> {
         loop {
             let event = match liveness.next(conn).await {
                 Ok(Some(event)) => event,
-                Ok(None) => return Err(self.cut_short(seen, "the server closed the connection")),
-                Err(error) => return Err(self.cut_short(seen, &error.to_string())),
+                Ok(None) => return Err(self.cut_short("the server closed the connection")),
+                Err(error) => return Err(self.cut_short(&error.to_string())),
             };
             if let Some(message) = reported(event.into())
-                && let Some(end) = self.print(&message, &mut seen, out)?
+                && let Some(end) = self.observe(&message, out)?
             {
                 return end;
             }
         }
     }
 
+    /// Adopt what a 005 declares, then print `message` when it is one being
+    /// followed. `Some` is the end of the tail.
+    fn observe(
+        &mut self,
+        message: &OwnedMessage,
+        out: &mut impl std::io::Write,
+    ) -> std::io::Result<Option<std::io::Result<()>>> {
+        self.names.adopt_isupport(message);
+        self.print(message, out)
+    }
+
     /// Print `message` when it is one being followed. `Some` is the end of the
     /// tail: the promised count reached, or the reader gone.
     fn print(
-        &self,
+        &mut self,
         message: &OwnedMessage,
-        seen: &mut usize,
         out: &mut impl std::io::Write,
     ) -> std::io::Result<Option<std::io::Result<()>>> {
         // The server relays a channel message with the *sender's* spelling of
@@ -695,8 +727,8 @@ impl Tail<'_> {
                 ),
             )?
         };
-        *seen += 1;
-        if reader == Reader::Gone || self.wanted.is_some_and(|wanted| *seen >= wanted) {
+        self.seen += 1;
+        if reader == Reader::Gone || self.wanted.is_some_and(|wanted| self.seen >= wanted) {
             return Ok(Some(Ok(())));
         }
         Ok(None)
@@ -705,7 +737,8 @@ impl Tail<'_> {
     /// Only a bounded tail that printed everything it promised has a
     /// successful end. One cut short delivered less than a script reading N
     /// lines was told to expect.
-    fn cut_short(&self, seen: usize, why: &str) -> std::io::Error {
+    fn cut_short(&self, why: &str) -> std::io::Error {
+        let seen = self.seen;
         std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             match self.wanted {
@@ -744,7 +777,8 @@ async fn raw(conn: &mut Connection, out: &mut impl std::io::Write) -> std::io::R
     };
     // The rest of the registration burst is printed, but a refusal in it (a
     // missing MOTD is a 422) is not about any line from stdin.
-    conn.round_trip(|event| show(event, false)).await?;
+    conn.round_trip(|event: RelayEvent| show(event, false))
+        .await?;
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut liveness = Liveness::new(LIVENESS_WINDOW);
     loop {
@@ -964,17 +998,18 @@ mod tests {
         });
         let mut connection = Connection::connect(&address).await.unwrap();
         let window = std::time::Duration::from_millis(150);
-        let tail = Tail {
+        let mut tail = Tail {
             target: "bob",
             wanted: None,
             json: false,
             names: NetworkNames::default(),
+            seen: 0,
         };
         let mut out = Vec::new();
         let started = std::time::Instant::now();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tail.follow(Vec::new(), &mut connection, window, &mut out),
+            tail.follow(&mut connection, window, &mut out),
         )
         .await
         .expect("tail never gave up on a silent server")
@@ -989,6 +1024,95 @@ mod tests {
             server.await.unwrap(),
             [format!("PING :{}", e6irc_client::liveness::KEEPALIVE_TOKEN)]
         );
+    }
+
+    /// A bouncer attach can replay thousands of lines before it answers the
+    /// round trip that ends the welcome burst. `tail` prints what the burst
+    /// holds for its target as it is read, under the network's naming rules
+    /// as the burst declares them, and holds none of it: this server answers
+    /// the round trip only after the tail has printed every line.
+    #[tokio::test]
+    async fn tail_prints_the_welcome_burst_as_it_arrives() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        const LINES: usize = 2000;
+        /// Counts printed lines and says when all of them are out.
+        struct Printed {
+            lines: usize,
+            all_out: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl std::io::Write for Printed {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.lines += bytes.iter().filter(|byte| **byte == b'\n').count();
+                if self.lines == LINES
+                    && let Some(all_out) = self.all_out.take()
+                {
+                    all_out.send(()).unwrap_or_default();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (all_out, printed) = tokio::sync::oneshot::channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let ping = lines.next_line().await.unwrap().unwrap();
+            let token = ping.strip_prefix("PING ").expect("a round trip").to_owned();
+            writer
+                .write_all(b":srv 005 me CASEMAPPING=ascii :are supported by this server\r\n")
+                .await
+                .unwrap();
+            // Under ascii `#a{` is another channel than `#a[`.
+            writer
+                .write_all(b":x!u@h PRIVMSG #a{ :not ours\r\n")
+                .await
+                .unwrap();
+            for line in 0..LINES {
+                writer
+                    .write_all(format!(":x!u@h PRIVMSG #A[ :{line}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            printed
+                .await
+                .expect("every line was printed before the answer");
+            writer
+                .write_all(format!(":srv PONG srv {token}\r\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let mut connection = Connection::connect(&address).await.unwrap();
+        let mut tail = Tail {
+            target: "#a[",
+            wanted: Some(LINES),
+            json: false,
+            names: NetworkNames::default(),
+            seen: 0,
+        };
+        let mut out = Printed {
+            lines: 0,
+            all_out: Some(all_out),
+        };
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tail.follow_welcome(&mut connection, &mut out),
+        )
+        .await
+        .expect("the burst was held until the round trip was answered")
+        .expect("the round trip");
+        assert!(
+            matches!(end, Some(Ok(()))),
+            "the promised count was printed"
+        );
+        assert_eq!(out.lines, LINES, "#a{{ is not #a[ on an ascii network");
+        server.await.unwrap();
     }
 
     #[test]

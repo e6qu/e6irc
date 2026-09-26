@@ -529,6 +529,22 @@ pub enum ClientEvent {
     Rejected(RejectedLine),
 }
 
+/// Where a request's wait hands each line it reads that is not its answer
+/// ([`Connection::require_capabilities`], [`Connection::round_trip`]), as it
+/// reads it: nothing is held for the caller, and the next line is read only
+/// once the sink has taken this one, so a sink that waits (a UI's bounded
+/// queue) pushes back on the socket. Any `FnMut(RelayEvent) -> io::Result<()>`
+/// is one; an `Err` ends the wait with that error.
+pub trait LineSink {
+    fn take(&mut self, event: RelayEvent) -> impl Future<Output = io::Result<()>>;
+}
+
+impl<F: FnMut(RelayEvent) -> io::Result<()>> LineSink for F {
+    async fn take(&mut self, event: RelayEvent) -> io::Result<()> {
+        self(event)
+    }
+}
+
 /// An interactive client acts on a line's syntax, so a line that relays but
 /// does not parse is a rejection for it.
 impl From<RelayEvent> for ClientEvent {
@@ -2108,12 +2124,10 @@ impl Connection {
     /// Wait until the server has processed everything sent so far: a `PING`
     /// with a token of this client's own, answered by the matching `PONG`,
     /// which a server sends only after every earlier line. Every other line
-    /// read on the way is handed to `each` (a server `PING` is answered and
-    /// not handed on). Bounded by the response deadline.
-    pub async fn round_trip(
-        &mut self,
-        mut each: impl FnMut(RelayEvent) -> io::Result<()>,
-    ) -> io::Result<()> {
+    /// read on the way is handed to `each` as it is read, and none is held
+    /// (a server `PING` is answered and not handed on): a bouncer attach can
+    /// replay thousands of lines first. Bounded by the response deadline.
+    pub async fn round_trip(&mut self, mut each: impl LineSink) -> io::Result<()> {
         const TOKEN: &str = "e6irc-round-trip";
         within(self.response_deadline, "answering a PING", async {
             self.send_line(&format!("PING :{TOKEN}")).await?;
@@ -2138,7 +2152,7 @@ impl Connection {
                         continue;
                     }
                 }
-                each(event)?;
+                each.take(event).await?;
             }
         })
         .await
@@ -2173,13 +2187,16 @@ impl Connection {
     ///
     /// The request is made while the welcome burst (MOTD, 005, a bouncer's
     /// playback) is still arriving, so it is read as the steady-state stream
-    /// is: every line before the verdict is handed to `each`, a Latin-1 MOTD
-    /// line included, and a server `PING` is answered and not handed on.
-    /// Bounded by the response deadline.
+    /// is: every line before the verdict is handed to `each` as it is read, a
+    /// Latin-1 MOTD line included, and a server `PING` is answered and not
+    /// handed on. Nothing is held back for the caller: a bouncer's playback
+    /// can be thousands of lines, and `each` may wait (on a UI's bounded
+    /// queue, say) before the next line is read, so the server's pace is
+    /// never the client's memory. Bounded by the response deadline.
     pub async fn require_capabilities(
         &mut self,
         capabilities: &[&'static str],
-        mut each: impl FnMut(RelayEvent) -> io::Result<()>,
+        mut each: impl LineSink,
     ) -> io::Result<()> {
         if capabilities.is_empty() {
             return Ok(());
@@ -2221,7 +2238,7 @@ impl Connection {
                             continue;
                         }
                     }
-                    each(event)?;
+                    each.take(event).await?;
                 }
             },
         )
@@ -4942,7 +4959,8 @@ mod tests {
             let error = if join {
                 must_give_up(connection.join_with_history("#room", 0, 0)).await
             } else {
-                must_give_up(connection.require_capabilities(&["batch"], |_| Ok(()))).await
+                must_give_up(connection.require_capabilities(&["batch"], |_: RelayEvent| Ok(())))
+                    .await
             };
             assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
             peer.abort();
@@ -5185,7 +5203,7 @@ mod tests {
                 "server-time",
                 "draft/read-marker",
             ],
-            |_| Ok(()),
+            |_: RelayEvent| Ok(()),
         )
         .await
         .unwrap();
@@ -5439,7 +5457,7 @@ mod tests {
             .await
             .unwrap();
         let error = conn
-            .require_capabilities(&["draft/read-marker"], |_| Ok(()))
+            .require_capabilities(&["draft/read-marker"], |_: RelayEvent| Ok(()))
             .await
             .expect_err("NAK must be visible");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
@@ -5530,7 +5548,7 @@ mod tests {
         });
         let mut burst = Vec::new();
         connection
-            .require_capabilities(&["batch"], |event| {
+            .require_capabilities(&["batch"], |event: RelayEvent| {
                 burst.push(ClientEvent::from(event));
                 Ok(())
             })

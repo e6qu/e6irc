@@ -992,6 +992,11 @@ fixes, each with a test that failed before:
   steady-state stream does and hands every line back; the TUI shows it and
   takes the connection's naming rules (CASEMAPPING, CHANTYPES, STATUSMSG) on
   every connect, and its second copy of the STATUSMSG sigils is gone.
+- **What a server said while a client connected was gathered in a list the
+  server sized** — the TUI's whole connect, `tail`'s welcome burst — and a
+  bouncer's playback there is thousands of lines. The waits now hand each
+  line on as it is read (`e6irc_client::LineSink`): the TUI's state or its
+  bounded queue, `tail`'s output.
 - **`--history-lines` above the server's limit broke every connect**, and a
   server that cut pages to its own limit made the client mark unread lines
   read everywhere. Pages fit the 005 `CHATHISTORY` limit, a refused history

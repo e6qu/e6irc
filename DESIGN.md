@@ -3675,9 +3675,14 @@ connection, so an IRC-only global option given to them (`--server`, `--nick`,
 `--tls`, the SASL and server-password options, ...) is an argument error
 naming it, not a silently ignored flag.
 A capability a command requires is asked for while the welcome burst is
-still arriving, and that burst is read the way the steady-state stream is
-(`Connection::require_capabilities` hands each line back): a Latin-1 MOTD
-line cannot fail `history` or `send`. `history --count` is cut to the
+still arriving, and that burst is read the way the steady-state stream is: a
+Latin-1 MOTD line cannot fail `history` or `send`. Neither that wait nor the
+round trip that ends the burst holds what it reads:
+`Connection::require_capabilities` and `Connection::round_trip` hand each
+line to an `e6irc_client::LineSink` as it is read, and read the next only
+once the sink has taken it. A bouncer attach can replay thousands of lines
+there; `tail` prints those for its target as they arrive, under the naming
+rules the burst's 005 declares, and nothing waits in a list. `history --count` is cut to the
 server's 005 `CHATHISTORY` limit with a warning on stderr, instead of being
 sent and refused. A SASL mechanism the server refused before any credential,
 and the one offered instead (`Connection::sasl_notes`), is a warning on
@@ -3819,13 +3824,19 @@ closed: malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
-uses — reading the rest of the welcome burst on the way as the steady-state
-stream is read, so a Latin-1 MOTD line cannot fail the connect, and showing
-that burst (MOTD, 005) in `*server*` — rejoins every channel confirmed for
-the client, pages `CHATHISTORY AFTER`
+uses — reading the rest of the welcome burst on the way, up to a round trip,
+as the steady-state stream is read, so a Latin-1 MOTD line cannot fail the
+connect, and showing that burst (MOTD, 005, a bouncer's playback) in
+`*server*` — rejoins every channel confirmed for the client, pages
+`CHATHISTORY AFTER`
 the server's marker forward (by msgid, else time) until a short page — at most
 ten pages and never more than the scrollback — or loads the latest bounded
 window, and coalesces shared read-marker writes as buffer focus advances.
+Everything read while connecting reaches the UI as it is read, never
+gathered first: on the first connect straight into the UI state, which exists
+before the connection does; on a reconnect through the UI's bounded queue,
+whose backpressure stops the socket read. Lines the UI queued against the
+previous connection are set aside before it learns of the new one.
 No page asks for more than the server's 005 `CHATHISTORY` limit: a page the
 server cut to its own limit would read as short, and a short page is taken
 to mean every unread line is loaded. A `FAIL CHATHISTORY` costs that channel
