@@ -897,6 +897,13 @@ now paced to half of it (DESIGN §7.2, §7.7). irctest's `testListMask`,
 `testListNotMask` and `testListUsers` run and pass; the creation- and
 topic-time cases still need a controller that can move the clock.
 
+Maintainer decision implemented: `WHO` is paced like `LIST`. A `WHO *`, or a
+`WHO` of a channel with more members than half the asker's SendQ, used to
+queue every row at once and disconnect the asker ("SendQ exceeded"); its rows
+now go out as the client reads, a remote channel's on the asker's shard, a
+labeled one as one batch, and later WHOs follow it in order within one SendQ
+— past that, `263 RPL_TRYAGAIN` (DESIGN §7.2).
+
 A review of whether the docs, tests, CI and guards tell the truth found, and
 this change fixes:
 

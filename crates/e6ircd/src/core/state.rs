@@ -2802,7 +2802,7 @@ pub enum ChannelCommandResult {
     ChanServRegister(ChanServRegisterResult),
     ChanServStatus(ChanServStatusResult),
     Names(ChannelCommandReplies),
-    Who(ChannelCommandReplies),
+    Who(crate::core::paced::WhoReply<Bytes>),
     History(ChannelHistoryResult),
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
@@ -4268,6 +4268,9 @@ pub(crate) struct ServerState {
     /// Each connection's LIST still answering, gathering or sending.
     pub(crate) channel_lists: HashMap<ConnId, crate::core::list::ListProgress>,
     channel_list_id: u64,
+    /// Each connection's WHO replies too long to queue at once, still going
+    /// out as its send queue drains.
+    pub(crate) paced_replies: HashMap<ConnId, crate::core::paced::PacedReplies>,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -5233,6 +5236,7 @@ impl ServerState {
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
             channel_lists: HashMap::new(),
+            paced_replies: HashMap::new(),
             channel_list_id: 0,
         }
     }
@@ -6909,6 +6913,7 @@ impl ServerState {
             return;
         };
         self.channel_lists.remove(&conn);
+        self.paced_replies.remove(&conn);
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the

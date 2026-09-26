@@ -30,6 +30,7 @@ pub(crate) use history::*;
 use message::*;
 pub(crate) use monitor::*;
 pub(crate) use oper::*;
+pub(crate) use query::pace_who_replies;
 use query::*;
 pub(crate) use read_marker::*;
 use registration::*;
@@ -219,8 +220,8 @@ pub(crate) fn channel_command_result(
         crate::core::state::ChannelCommandResult::Names(result) => {
             channel::emit_channel_command_replies(state, conn, result, label)
         }
-        crate::core::state::ChannelCommandResult::Who(result) => {
-            channel::emit_channel_command_replies(state, conn, result, label)
+        crate::core::state::ChannelCommandResult::Who(reply) => {
+            query::deliver_who_reply(state, conn, query::WhoRequester::Remote { label }, reply)
         }
         crate::core::state::ChannelCommandResult::History(result) => match result {
             crate::core::state::ChannelHistoryResult::Replies(replies) => {

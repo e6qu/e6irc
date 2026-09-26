@@ -4653,7 +4653,7 @@ fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
     assert!(!has_numeric(&out, "323"), "{out:#?}");
     // Each turn sends what the client's queue has room for now: the drained
     // queue takes another half.
-    s.core.handle(Input::PaceChannelLists);
+    s.core.handle(Input::PaceReplies);
     // Other traffic keeps flowing meanwhile, beside the rows.
     s.line(lister, "PING mid-list");
     let next = s.drain(lister);
@@ -4665,7 +4665,7 @@ fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
     assert!(next.len() <= 129, "{next:#?}");
     out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
     while !has_numeric(&out, "323") {
-        s.core.handle(Input::PaceChannelLists);
+        s.core.handle(Input::PaceReplies);
         let more = s.drain(lister);
         assert!(!more.is_empty() && more.len() <= 129, "{more:#?}");
         out.extend(more);
@@ -4691,7 +4691,7 @@ fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
     s.line(lister, "@label=big LIST");
     let mut out = s.drain(lister);
     while !out.last().is_some_and(|l| l.contains(" BATCH -")) {
-        s.core.handle(Input::PaceChannelLists);
+        s.core.handle(Input::PaceReplies);
         out.extend(s.drain(lister));
     }
     let inside = labeled_response(&out, "big");
@@ -4717,9 +4717,156 @@ fn a_list_sent_during_a_paced_list_aborts_it() {
     );
     // Aborted means gone: nothing more of it is paced out, and the next LIST
     // is a new one.
-    s.core.handle(Input::PaceChannelLists);
+    s.core.handle(Input::PaceReplies);
     assert!(s.drain(lister).is_empty());
     assert_eq!(list(&mut s, lister, "LIST #room001"), ["#room001"]);
+}
+
+/// Users enough that a `WHO *` fills more than half of a test connection's
+/// 256-line send queue: `count` of them, `user000` on, and the one asking.
+fn many_users(s: &mut TestServer, count: u64) -> ConnId {
+    for index in 0..count {
+        s.register(100 + index, &format!("user{index:03}"));
+    }
+    s.register(20, "watcher")
+}
+
+/// The nicks of `out`'s WHO rows, in order.
+fn who_nicks(out: &[String]) -> Vec<String> {
+    out.iter()
+        .filter(|line| has_numeric(std::slice::from_ref(*line), "352"))
+        .map(|line| {
+            traditional_part(line)
+                .split(' ')
+                .nth(7)
+                .expect("a WHO row's nick")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_large_who_is_paced_to_half_the_send_queue_and_never_overflows_it() {
+    let mut s = TestServer::new();
+    let watcher = many_users(&mut s, 300);
+    s.line(watcher, "WHO *");
+    let mut out = s.drain(watcher);
+    // Half of the 256-line queue, all rows.
+    assert_eq!(out.len(), 128, "{out:#?}");
+    assert!(!has_numeric(&out, "315"), "{out:#?}");
+    s.core.handle(Input::PaceReplies);
+    // Other traffic keeps flowing meanwhile, beside the rows.
+    s.line(watcher, "PING mid-who");
+    let next = s.drain(watcher);
+    assert!(
+        next.iter()
+            .any(|l| l.contains("PONG") && l.contains("mid-who")),
+        "{next:#?}"
+    );
+    assert!(next.len() <= 129, "{next:#?}");
+    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    while !has_numeric(&out, "315") {
+        s.core.handle(Input::PaceReplies);
+        let more = s.drain(watcher);
+        assert!(!more.is_empty() && more.len() <= 128, "{more:#?}");
+        out.extend(more);
+    }
+    let mut expected: Vec<String> = (0..300).map(|index| format!("user{index:03}")).collect();
+    expected.push("watcher".into());
+    let mut nicks = who_nicks(&out);
+    nicks.sort();
+    expected.sort();
+    assert_eq!(nicks, expected);
+    assert_eq!(
+        out.last().map(String::as_str),
+        Some(":irc.test.example 315 watcher * :End of /WHO list")
+    );
+    assert_answers_ping(&mut s, watcher, "after a paced WHO");
+}
+
+#[test]
+fn a_paced_labeled_who_stays_one_batch_across_its_turns() {
+    let mut s = TestServer::new();
+    for index in 0..200 {
+        s.register(100 + index, &format!("user{index:03}"));
+    }
+    let watcher = register_with_caps(&mut s, 20, "watcher", "batch labeled-response");
+    s.line(watcher, "@label=big WHO *");
+    let mut out = s.drain(watcher);
+    while !out.last().is_some_and(|l| l.contains(" BATCH -")) {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(watcher));
+    }
+    let inside = labeled_response(&out, "big");
+    assert_eq!(inside.len(), 202, "201 rows and RPL_ENDOFWHO: {out:#?}");
+    assert_eq!(who_nicks(&inside).len(), 201);
+    assert_eq!(out.len(), 204, "the batch and nothing else: {out:#?}");
+}
+
+#[test]
+fn whos_asked_during_a_paced_who_answer_after_it_within_a_send_queue() {
+    let mut s = TestServer::new();
+    let watcher = many_users(&mut s, 300);
+    s.line(watcher, "WHO *");
+    assert_eq!(s.drain(watcher).len(), 128);
+    // Lines of it are still to go: a two-line reply waits behind them...
+    s.line(watcher, "WHO user007");
+    // ...but another 302 would hold more than a send queue, so it is refused,
+    // at once and closed, while the first is still going out.
+    s.line(watcher, "WHO *");
+    let mut out = s.drain(watcher);
+    assert_eq!(
+        out[out.len() - 2..],
+        [
+            ":irc.test.example 263 watcher WHO :Please wait a while and try again.",
+            ":irc.test.example 315 watcher * :End of /WHO list",
+        ]
+    );
+    assert_eq!(
+        out.iter().filter(|l| l.contains(" 315 ")).count(),
+        1,
+        "{out:#?}"
+    );
+    out.truncate(out.len() - 2);
+    while !out
+        .iter()
+        .any(|l: &String| l.contains(" 315 watcher user007 "))
+    {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(watcher));
+    }
+    let ends: Vec<&String> = out.iter().filter(|l| l.contains(" 315 ")).collect();
+    assert_eq!(ends.len(), 2, "{out:#?}");
+    assert!(ends[0].contains(" 315 watcher * "), "{out:#?}");
+    let tail = &out[out.len() - 2..];
+    assert!(tail[0].contains(" 352 watcher * user007 "), "{out:#?}");
+    // Nothing is left paced for the connection.
+    s.core.handle(Input::PaceReplies);
+    assert!(s.drain(watcher).is_empty());
+}
+
+#[test]
+fn a_large_channel_who_is_paced_too() {
+    let mut s = TestServer::new();
+    let members: Vec<ConnId> = (0..150)
+        .map(|index| s.register(100 + index, &format!("user{index:03}")))
+        .collect();
+    for member in &members {
+        s.line(*member, "JOIN #crowd");
+        for other in &members {
+            s.drain(*other);
+        }
+    }
+    let watcher = s.register(20, "watcher");
+    s.line(watcher, "WHO #crowd");
+    let mut out = s.drain(watcher);
+    assert_eq!(out.len(), 128, "{out:#?}");
+    while !has_numeric(&out, "315") {
+        s.core.handle(Input::PaceReplies);
+        out.extend(s.drain(watcher));
+    }
+    assert_eq!(who_nicks(&out).len(), 150);
+    assert_answers_ping(&mut s, watcher, "after a paced channel WHO");
 }
 
 #[test]

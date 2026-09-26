@@ -770,13 +770,21 @@ strip = "symbols"
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
   No unbounded buffering, no silent drops.
-- The one reply a client cannot bound, `LIST` of every channel, is paced
-  instead (`SAFELIST`): its rows go out only while the client's SendQ is under
-  half full, and the rest follow as the client reads — on the next event its
-  shard handles, or on the worker's own `PaceChannelLists` reminder every
-  20 ms while it is otherwise idle. Other traffic keeps flowing beside the
-  rows; a second `LIST` aborts the first (`/LIST aborted`), so a connection
-  paces at most one.
+- The replies a client cannot bound — `LIST` of every channel, and a `WHO *`
+  or a `WHO` of a large channel — are paced instead (`SAFELIST`): their rows
+  go out only while the client's SendQ is under half full, and the rest follow
+  as the client reads — on the next event its shard handles, or on the
+  worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
+  Other traffic keeps flowing beside the rows, and a labeled one stays one
+  labeled batch across its turns. A second `LIST` aborts the first (`/LIST
+  aborted`), so a connection paces at most one. A `WHO` whose reply fits the
+  room left, with none paced ahead of it, goes out at once; otherwise it waits
+  behind the connection's paced WHO replies and follows them whole, in order
+  (`core/paced.rs`). What waits is bounded: once one is paced, more may queue
+  behind it only while everything waiting fits one SendQ, and a `WHO` past
+  that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
+  channel's `WHO` is paced on the asker's shard, from the rows its owner sent
+  back.
 - Every write to a peer is bounded (`peer_write`): a write, flush or shutdown
   that makes no progress for 30 s fails, so a client with a shut receive
   window is closed ("Write timeout") instead of parking its writer forever —

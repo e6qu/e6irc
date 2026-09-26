@@ -44,6 +44,12 @@ its members. The reply is paced to the client's send queue (`SAFELIST`), so a
 client that lists every channel is never disconnected for it; a second `LIST`
 while one is still arriving aborts the first with a `/LIST aborted` notice.
 
+`WHO *` and a `WHO` of a large channel are paced the same way. A `WHO` sent
+while an earlier one is still arriving is answered after it; one that would
+leave more waiting than the send queue holds is answered `263 WHO :Please wait
+a while and try again.` and its `315`, and can be sent again once the first
+has arrived.
+
 ## Qualification boundary
 
 The server is tested against the Libera-compatible protocol surface, not against

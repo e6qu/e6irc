@@ -41,6 +41,9 @@ numerics! {
     RPL_ADMINLOC1 = 257,
     RPL_ADMINLOC2 = 258,
     RPL_ADMINEMAIL = 259,
+    // A command refused for now, to be sent again later (a WHO asked while
+    // the connection's earlier WHO replies still fill its queue).
+    RPL_TRYAGAIN = 263,
     RPL_LOCALUSERS = 265,
     RPL_GLOBALUSERS = 266,
     RPL_USERHOST = 302,
