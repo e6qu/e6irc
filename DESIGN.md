@@ -825,7 +825,11 @@ strip = "symbols"
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
-  No unbounded buffering, no silent drops. The bound is in **bytes**, like
+  No unbounded buffering, no silent drops. As in Solanum, the killed client's
+  backlog is discarded: its closing `ERROR :Closing Link: <host> (SendQ
+  exceeded)` is the one line it is still sent, where draining a full SendQ to
+  a client too slow to take it kept a dead session's socket open for as long
+  as it trickled. The bound is in **bytes**, like
   Solanum's class `sendq`: `sendq_bytes`, default 512 KiB — the 1,024 lines the
   queue held when it counted lines, at a full 512-byte line each, so ordinary
   traffic queues what it did — at least two of the longest lines the server
@@ -881,10 +885,21 @@ strip = "symbols"
   the core had already killed. The same bound covers the attach listener
   (§10.4), `/ws/irc` and `/ws/ui` frames, and bridge gateway sockets; slow but
   steady readers are never cut off, since progress resets it.
-- A client that half-closes (`nc -N`, a scripted client sending its whole
-  session and then EOF) still reads every reply to what it sent — its welcome,
-  its `ERROR` — for up to 5 s after its EOF, before the connection is torn
-  down.
+- A session that is over — ended by the core (QUIT, KILL, SendQ, shutdown),
+  or half-closed by its client (`nc -N`, a scripted client sending its whole
+  session and then EOF) — has 5 s (`CLOSING_DRAIN`) in all to receive what it
+  is still owed: the replies to what it sent, its welcome, its `ERROR`. The
+  write deadline above counts only a stall, so without this total a client
+  reading a byte at a time held a killed session's socket, task and per-IP
+  slot for about an hour. The core ending a session stops its reader at once
+  (the transport learns it from the send queue's senders going, not from the
+  queue running dry), so nothing more the client sends is pushed for, or
+  metered against, a session the core has forgotten. Once everything is
+  written, the socket closes lingering (`lingering_close`, as an HTTP refusal
+  does, §12): its write half is shut, and what the client is still sending is
+  read and discarded for at most 2 s or 8 MiB, since closing on unread input
+  sends a reset that can destroy the closing `ERROR` in the client's stack. The
+  same holds for `/ws/irc` (§13.4).
 - RecvQ/flood control: every line a connection sends is metered where it
   enters the core (`core/line_meter.rs`), by a token bucket per connection with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
@@ -3811,8 +3826,17 @@ requires valid UTF-8). A client offering neither gets per-line auto framing
 (text when valid UTF-8, else binary) — the original behavior.
 Each WebSocket message is exactly one IRC line without a CR/LF terminator, as
 required by IRCv3. An embedded delimiter rejects that whole message as
-malformed and can never be interpreted as a second command; the transport cap
-is the complete client tag-plus-body allowance.
+malformed and can never be interpreted as a second command. A message over the
+client tag-plus-body allowance is answered `417` and the connection kept, as an
+over-long TCP line is; since a message must be read whole to be judged, one
+over 64 KiB (`MAX_IRC_WS_MESSAGE`) is not read at all and closes the socket
+with 1009 (message too big), ending the session with that reason. A session
+the core ends gets what it is still owed and then a Close frame (1000), within
+the closing drain (§7.2), and its socket closes lingering: the upgraded stream
+is lent to hyper reclaimably (`Reclaimable`), since hyper drops an upgraded
+stream without shutting it down. The session's close carries the transport's
+reason as TCP's does: `Connection closed`, `Read error: …`, `Write timeout`,
+`Write error`, `Message too big`.
 
 A dedicated **WS-IRC listener** is also available: a `[[listeners]]` entry
 with `websocket = true` serves this same endpoint at the root path
@@ -4177,7 +4201,17 @@ but the CLI, TUI, and BNC must surface the rejection.
 - A client address is canonicalised once (`ClientIp`): IPv4-mapped IPv6
   becomes IPv4 for limiter keys, ban hosts, trusted-proxy matching and each
   forwarded entry, so a D-line on an IPv4 address matches a `/ws/irc` user on a
-  dual-stack listener and a proxy in a trusted IPv4 range is trusted.
+  dual-stack listener and a proxy in a trusted IPv4 range is trusted. The same
+  canonical address is what the attach listener shows in its `RPL_LOGGEDIN`.
+- Behind a trusted proxy (`limits.trusted_proxies`) the client is the
+  rightmost `X-Forwarded-For` entry that is not itself a trusted proxy. An
+  entry that is not an address, reached before that client, refuses the
+  request `400` ("Unusable X-Forwarded-For"), `/ws/irc` included, and the log
+  names the proxy and its misconfiguration once a minute (nginx writes `unix:`
+  for a client on a Unix socket; forward `$proxy_add_x_forwarded_for` from a
+  TCP listener). Skipping the entry walked on into entries the client wrote,
+  so a client could pick its own address — its per-IP slots, its
+  authentication budget, a K/D-line it evaded.
 - The master key is zeroized when dropped, and key text read from files or
   the environment is wiped; the process is non-dumpable on Linux
   (`PR_SET_DUMPABLE`) and the systemd unit sets `LimitCORE=0`, so an abort
@@ -4519,12 +4553,18 @@ Layers, bottom to top:
   binds the replacement socket, swaps only after success, and retains the
   working listener on failure. Disabling the attach socket does not stop
   always-on networks or the web client.
-- Graceful shutdown is four bounded steps in this order: the listeners stop
+- Graceful shutdown is five bounded steps in this order: the listeners stop
   accepting; every bouncer driver is stopped concurrently and says goodbye to
   its upstream (`QUIT`, or the Matrix logout; at most 15 s for all of them, a
   laggard is logged and the stop stands), so a restart never meets its own
-  ghost; the core drains; the bounded PostgreSQL write paths flush. Stopping the
-  core is a drain: a shard that has seen the shutdown stops taking outside
+  ghost; the core drains (at most 5 s, the shutdown request to its shards
+  included, so a shard that no longer takes from a full queue cannot hold the
+  request itself); every client connection delivers its closing `ERROR` and
+  closes (at most 8 s: the closing drain and the lingering close of §7.2, all
+  connections at once — every connection task, IRC plaintext or TLS, `/ws/irc`
+  and attach, holds a `ConnectionTask` that shutdown waits for, since ending
+  the runtime would cancel a write still in progress); the bounded PostgreSQL
+  write paths flush. Stopping the core is a drain: a shard that has seen the shutdown stops taking outside
   input but keeps serving the other shards until every shard has seen it and
   nothing is passing between them. Every shard is then joined; a shard that
   panicked or will not stop is ended and reported *after* the database flush,
@@ -4586,8 +4626,8 @@ Layers, bottom to top:
   `std::env` read anywhere else in the daemon.
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
   — the bouncer drivers' stop (their goodbye and their last backlog write),
-  then the core drain, then the PostgreSQL flush; the guard sums the three
-  constants. The unit sets `StartLimitIntervalSec=0` (asserted by the same
+  then the core drain, then the connection drain, then the PostgreSQL flush;
+  the guard sums the four constants. The unit sets `StartLimitIntervalSec=0` (asserted by the same
   guard): a refused first database connection fails the daemon in
   milliseconds, and systemd's default limit of five starts in ten seconds
   would otherwise leave the unit permanently failed after a reboot where

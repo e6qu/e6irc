@@ -278,10 +278,11 @@ the password.
 On SIGTERM the daemon stops accepting work, tells every bouncer network's
 upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so a
 restart never meets its own ghost), drains its core shards for at most 5
-seconds, then flushes buffered writes to PostgreSQL for at most 30 seconds.
-Give the container at least 55 seconds before it is killed, as
-`e6ircd.service` does: `stopTimeout: 55` (or more) in the ECS container
-definition, `docker stop --time 55`, or `stop_grace_period: 55s` in Compose.
+seconds, lets every client connection deliver its closing `ERROR` and close for
+at most 8 seconds, then flushes buffered writes to PostgreSQL for at most 30
+seconds. Give the container at least 65 seconds before it is killed, as
+`e6ircd.service` does: `stopTimeout: 65` (or more) in the ECS container
+definition, `docker stop --time 65`, or `stop_grace_period: 65s` in Compose.
 The Docker default of 10 seconds and the ECS default of 30 can both kill a
 shutdown that was still flushing cleanly.
 
@@ -342,7 +343,7 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   optional BNC listener an administrator can enable in the console is a TCP
   port of its own, needs a host that can publish one, and off loopback needs a
   certificate the container can read ([BNC attach listener](#bnc-attach-listener)).
-- **A stop timeout of at least 55 seconds** ([Stop timeout](#stop-timeout)).
+- **A stop timeout of at least 65 seconds** ([Stop timeout](#stop-timeout)).
 - **Outbound network access** to PostgreSQL, to the OpenID Connect issuer, and
   — for always-on networks and bridges — to the IRC networks (TCP 6697 for the
   curated ones), Matrix homeservers, Discord, and Slack. On an account's

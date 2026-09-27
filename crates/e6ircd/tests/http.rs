@@ -1003,6 +1003,32 @@ async fn a_plain_get_of_the_websocket_endpoint_is_a_problem_document() {
     assert_eq!(v["title"], "Invalid WebSocket upgrade", "{body}");
 }
 
+/// Behind a trusted proxy, a forwarded chain broken by an entry that is not an
+/// address (nginx's `unix:`) names no client: walking past it would read the
+/// client's own entries. Every request — an IRC WebSocket included — is
+/// refused rather than keyed by an address the client chose.
+#[tokio::test]
+async fn an_unusable_forwarded_entry_from_a_trusted_proxy_is_refused() {
+    let mut config = test_config();
+    config.limits.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let forwarded = |path: &str, extra: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             X-Forwarded-For: 198.51.100.66, unix:\r\n{extra}\r\n"
+        )
+    };
+    let (status, head, body) = request(http, &forwarded("/no-such-page", "")).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Unusable X-Forwarded-For", "{body}");
+    let upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    let (status, head, body) = request(http, &forwarded("/ws/irc", upgrade)).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Unusable X-Forwarded-For", "{body}");
+}
+
 #[tokio::test]
 async fn the_per_address_authentication_budget_says_when_to_retry() {
     let mut config = test_config();

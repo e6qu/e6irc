@@ -173,6 +173,9 @@ pub struct AppState {
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
+    /// Every client connection's task, which an `/ws/irc` session's joins, so
+    /// shutdown waits for its closing `ERROR` as for a raw socket's.
+    pub(crate) connections: crate::net::ConnectionTasks,
     /// The per-address in-flight request bound ([`RequestAdmission`]).
     pub(crate) request_admission: Arc<RequestAdmission>,
     /// `/readyz`'s shared database probe ([`DatabaseReadiness`]).
@@ -1815,14 +1818,21 @@ pub(crate) struct RequestAdmission {
     trusted_proxies: Vec<ipnet::IpNet>,
     limit: usize,
     in_flight: Mutex<HashMap<crate::net::PeerLimitKey, usize>>,
+    /// Where a request refused for an unusable forwarded address is logged.
+    refusals: Arc<crate::net::PeerRefusalLog>,
 }
 
 impl RequestAdmission {
-    pub(crate) fn new(trusted_proxies: Vec<ipnet::IpNet>, limit: usize) -> Self {
+    pub(crate) fn new(
+        trusted_proxies: Vec<ipnet::IpNet>,
+        limit: usize,
+        refusals: Arc<crate::net::PeerRefusalLog>,
+    ) -> Self {
         Self {
             trusted_proxies,
             limit,
             in_flight: Mutex::new(HashMap::new()),
+            refusals,
         }
     }
 
@@ -1879,7 +1889,15 @@ async fn admit_client_request(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             |info| info.0.ip(),
         );
-    let client = client_ip(peer, request.headers(), &admission.trusted_proxies);
+    let client = match resolve_client_ip(
+        peer,
+        request.headers(),
+        &admission.trusted_proxies,
+        &admission.refusals,
+    ) {
+        Ok(client) => client,
+        Err(refusal) => return refusal.into(),
+    };
     let Some(_slot) = admission.admit(client) else {
         return retry_later(
             "Too many requests in flight",
@@ -4157,13 +4175,27 @@ mod invitation_url_tests {
 
 #[cfg(test)]
 mod client_ip_tests {
-    use super::client_ip;
     use crate::net::ClientIp;
+
+    /// The client a request resolves to, when it resolves to one.
+    fn client_ip(
+        peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+        trusted: &[ipnet::IpNet],
+    ) -> ClientIp {
+        super::client_ip(peer, headers, trusted).expect("a resolvable forwarded chain")
+    }
 
     /// The in-flight request bound charges a client's whole IPv6 `/64`.
     #[test]
     fn request_admission_counts_an_ipv6_slash_64_as_one_client() {
-        let admission = std::sync::Arc::new(super::RequestAdmission::new(Vec::new(), 1));
+        let admission = std::sync::Arc::new(super::RequestAdmission::new(
+            Vec::new(),
+            1,
+            std::sync::Arc::new(crate::net::PeerRefusalLog::new(
+                std::time::Duration::from_secs(60),
+            )),
+        ));
         let _held = admission
             .admit(client("2001:db8::1"))
             .expect("the first request");
@@ -4326,6 +4358,48 @@ mod client_ip_tests {
             "an untrusted mapped peer is its own IPv4 address"
         );
         assert_eq!(client("::ffff:192.0.2.1").to_string(), "192.0.2.1");
+    }
+    /// An entry a trusted proxy passed on that is not an address — nginx
+    /// writes `unix:` for a client on a Unix socket — breaks the chain it
+    /// vouches for: what lies left of it is only what the client wrote.
+    /// Skipping it let a client choose its own address (its per-IP slots, its
+    /// authentication budget, a ban it evades); the request is refused.
+    #[test]
+    fn an_unusable_forwarded_entry_before_the_client_is_refused() {
+        let trusted = [net("10.0.0.0/8")];
+        for chain in [
+            "6.6.6.6, unix:",
+            "6.6.6.6, unix:, 10.0.0.2",
+            "6.6.6.6,, 10.0.0.2",
+            "6.6.6.6, garbage",
+        ] {
+            let refused = super::client_ip(ip("10.0.0.1"), &xff(chain), &trusted)
+                .expect_err("the chain is broken before any client address");
+            assert!(
+                refused.to_string().contains("is not an address"),
+                "{refused}"
+            );
+        }
+        // Past the client's own address nothing further left is read, so an
+        // unusable entry there is the client's own business.
+        assert_eq!(
+            client_ip(
+                ip("10.0.0.1"),
+                &xff("unix:, 203.0.113.7, 10.0.0.2"),
+                &trusted
+            ),
+            client("203.0.113.7")
+        );
+        // A header with no entries names no client, as no header does.
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &xff(" "), &trusted),
+            client("10.0.0.1")
+        );
+        // An untrusted peer's header is never read.
+        assert_eq!(
+            client_ip(ip("203.0.113.9"), &xff("unix:"), &trusted),
+            client("203.0.113.9")
+        );
     }
 }
 
@@ -4706,7 +4780,11 @@ mod request_bound_tests {
                             StatusCode::NO_CONTENT
                         }),
                     ),
-                    Arc::new(RequestAdmission::new(Vec::new(), 8)),
+                    Arc::new(RequestAdmission::new(
+                        Vec::new(),
+                        8,
+                        Arc::new(crate::net::PeerRefusalLog::new(Duration::from_secs(60))),
+                    )),
                     1,
                 ),
                 Duration::from_millis(50),
@@ -4791,7 +4869,11 @@ mod request_bound_tests {
                         held_route(entered.clone(), release.clone(), "first"),
                     )
                     .route("/second", held_route(entered, release.clone(), "second")),
-                Arc::new(RequestAdmission::new(Vec::new(), 8)),
+                Arc::new(RequestAdmission::new(
+                    Vec::new(),
+                    8,
+                    Arc::new(crate::net::PeerRefusalLog::new(Duration::from_secs(60))),
+                )),
                 1,
             ),
             Duration::from_secs(30),
