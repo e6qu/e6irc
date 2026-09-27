@@ -860,6 +860,7 @@ async fn readyz_reports_core_and_optional_database_state() {
     assert_eq!(body["ready"], true);
     assert_eq!(body["core"], "ready");
     assert_eq!(body["database"], "not_configured");
+    assert_eq!(body["lease"], "not_configured", "no database, no lease");
 }
 
 #[tokio::test]

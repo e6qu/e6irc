@@ -30,14 +30,15 @@ pub(crate) const REGISTRATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(handler::REGISTRATION_TIMEOUT_MS);
 pub(crate) use timer::TimerWheel;
 
+pub use e6irc_edge::connection::{ConnectionIdAllocator, ConnectionTransport, Output};
 pub use state::{
     ChannelOwner, CommandFlood, CommandFloodError, ConnId, CoreConfig, dm_conversation_key,
 };
 
 use std::collections::VecDeque;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -54,19 +55,6 @@ use state::{
 use state::{CoreDirectories, ServerState};
 
 use crate::observability::{LatencyKind, Telemetry};
-
-/// One process-wide source of live connection identifiers.
-///
-/// Production seeds this counter from the operating system's cryptographically
-/// secure random number generator on every boot. All ingress paths share the
-/// allocator, so identifiers remain ordered for keyset pagination, cannot
-/// collide within a process, and do not predictably name a different
-/// connection after a restart. Exhaustion is an explicit error instead of
-/// wrapping onto an existing identifier.
-#[derive(Debug)]
-pub struct ConnectionIdAllocator {
-    next: AtomicU64,
-}
 
 /// Number of core shards. Zero shards cannot be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,34 +649,6 @@ impl CoreScheduler {
     }
 }
 
-impl ConnectionIdAllocator {
-    pub fn new(first: NonZeroU64) -> Self {
-        Self {
-            next: AtomicU64::new(first.get()),
-        }
-    }
-
-    pub fn allocate(&self) -> Result<ConnId, ConnectionIdExhausted> {
-        self.next
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map(ConnId)
-            .map_err(|_| ConnectionIdExhausted)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectionIdExhausted;
-
-impl std::fmt::Display for ConnectionIdExhausted {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("live connection identifier space exhausted")
-    }
-}
-
-impl std::error::Error for ConnectionIdExhausted {}
-
 /// One stored read marker that storage maintenance deleted: the account's
 /// display name as stored, the target as kept (a `MarkerTarget`), and the
 /// value deleted.
@@ -1079,23 +1039,57 @@ impl Input {
     }
 }
 
-/// Drain framed line events into the core queue as [`Input`] lines. Returns
-/// `false` when the core is gone, so the connection stops directly rather
-/// than queueing into a void. Shared by the TCP and WebSocket read loops.
-pub(crate) async fn push_framed(
-    core_tx: &CoreIngress,
-    meter: &mut line_meter::LineMeter,
-    conn: ConnId,
-    events: &mut Vec<e6irc_proto::framing::LineEvent>,
-) -> bool {
-    for event in events.drain(..) {
-        let input = Input::framed(conn, event);
-        meter.spend().await;
-        if core_tx.push(input).await.is_err() {
-            return false;
-        }
+/// The core as the edge's connections reach it in the single process: each
+/// session opened, line framed and end reported becomes an [`Input`] on the
+/// owning shard's queue, as it always was.
+impl e6irc_edge::connection::CorePort for CoreIngress {
+    type Meter = line_meter::LineMeter;
+
+    async fn open(
+        &self,
+        conn: ConnId,
+        host: String,
+        transport: ConnectionTransport,
+        sendq_bytes: usize,
+    ) -> Option<Receiver<Output>> {
+        let (tx, rx) = send_queue("sendq", sendq_bytes);
+        let opened = self
+            .push(Input::Open {
+                conn,
+                tx,
+                host,
+                transport,
+            })
+            .await;
+        opened.ok().map(|_sequence| rx)
     }
-    true
+
+    fn line_meter(&self, conn: ConnId) -> Self::Meter {
+        CoreIngress::line_meter(self, conn)
+    }
+
+    /// Drain framed line events into the core queue as [`Input`] lines.
+    async fn push_framed(
+        &self,
+        meter: &mut Self::Meter,
+        conn: ConnId,
+        events: &mut Vec<e6irc_proto::framing::LineEvent>,
+    ) -> bool {
+        for event in events.drain(..) {
+            let input = Input::framed(conn, event);
+            meter.spend().await;
+            if self.push(input).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn closed(&self, conn: ConnId, reason: String) {
+        // Queue closure means the core has already removed all connection
+        // state.
+        drop(self.push(Input::Closed { conn, reason }).await);
+    }
 }
 
 /// A mutation or live-state query requested by an authenticated HTTP console
@@ -1276,33 +1270,6 @@ pub enum ChannelRegistrationResult {
     /// channels — counted where every shard's registrations meet.
     LimitReached,
     Unavailable,
-}
-
-/// The ingress path that owns one live core connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionTransport {
-    Tcp,
-    Tls,
-    /// A WebSocket whose upgrade did not come over HTTPS through a trusted
-    /// proxy: plaintext somewhere between the client and this server.
-    WebSocket,
-    /// A WebSocket a trusted proxy says its client reached over HTTPS (every
-    /// `X-Forwarded-Proto` entry is `https`); the listener itself never
-    /// terminates TLS.
-    SecureWebSocket,
-    Local,
-}
-
-impl ConnectionTransport {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Tls => "tls",
-            Self::WebSocket => "websocket",
-            Self::SecureWebSocket => "wss",
-            Self::Local => "local",
-        }
-    }
 }
 
 /// A non-zero connection-directory page size capped at the public API maximum.
@@ -2549,12 +2516,6 @@ pub enum AccountDropOutcome {
     /// A store or a live component failed; nothing was deleted.
     Unavailable,
 }
-
-/// One wire line out to a connection I/O task, CRLF included. Socket
-/// close is signaled by dropping the session's queue Sender, never by
-/// an in-band event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Output(pub Bytes);
 
 /// The core's end of one connection's send queue: bounded in the bytes its
 /// lines hold (`sendq_bytes`), like Solanum's class `sendq`, never in their
@@ -3958,29 +3919,6 @@ mod wire_line_tests {
         // A clean line is returned unchanged (fast path).
         let clean = Bytes::from(&b"PING :token\r\n"[..]);
         assert_eq!(WireLine::sanitized(clean.clone()).0, clean);
-    }
-}
-
-#[cfg(test)]
-mod connection_id_allocator_tests {
-    use std::num::NonZeroU64;
-
-    use super::ConnectionIdAllocator;
-
-    #[test]
-    fn allocation_is_ordered_and_refuses_to_wrap() {
-        let allocator =
-            ConnectionIdAllocator::new(NonZeroU64::new(7).expect("non-zero test start"));
-        assert_eq!(allocator.allocate().expect("first identifier").0, 7);
-        assert_eq!(allocator.allocate().expect("second identifier").0, 8);
-
-        let exhausted =
-            ConnectionIdAllocator::new(NonZeroU64::new(u64::MAX - 1).expect("non-zero"));
-        assert_eq!(
-            exhausted.allocate().expect("last identifier").0,
-            u64::MAX - 1
-        );
-        assert!(exhausted.allocate().is_err());
     }
 }
 

@@ -1,0 +1,67 @@
+[package]
+name = "e6irc-edge"
+description = "The connection-holding edge: accept, TLS, client addresses, framing and every write to a client (no database)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# DESIGN §2, "the edge cannot reach the database": nothing here may depend on
+# sqlx, the core crate e6ircd, or a bridge's HTTP client, directly or through
+# anything else. tools/check-edge-isolation.sh holds it over `cargo tree`.
+[dependencies]
+e6irc-proto = { path = "../e6irc-proto" }
+e6irc-queue = { path = "../e6irc-queue" }
+# The versions and features e6ircd takes (its manifest records each publish
+# date against the 24h cooldown); cargo unifies them into one build.
+bytes = { version = "1.12.1", default-features = false }
+# socket2 0.6.5 is already in the tree through tokio and hyper-util; named here
+# because `connection::bind_listener` makes the IPv6 wildcard dual-stack on
+# every platform, which tokio's `TcpListener::bind` cannot express.
+socket2 = "0.6.5"
+tokio = { version = "1.53.0", default-features = false, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    # SIGHUP reloads the served certificates (`certificate::Hangups`).
+    "signal",
+    "sync",
+] }
+rustls = { version = "0.23.45", default-features = false, features = [
+    "aws_lc_rs",
+    "tls12",
+    "std",
+] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "aws_lc_rs",
+    "tls12",
+] }
+rustls-pki-types = { version = "1.15.0", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+# SHA-256 of a certificate file's contents, to tell one version from another.
+aws-lc-rs = { version = "1.17.3", default-features = false, features = [
+    "aws-lc-sys",
+] }
+serde = { version = "1.0.228", default-features = false, features = [
+    "std",
+    "derive",
+] }
+# Operator-written address ranges, read in the canonical client spelling.
+ipnet = { version = "2.12.0", features = ["serde"] }
+# The WebSocket a `/ws/irc` or `/ws/ui` connection is framed on.
+axum = { version = "0.8.9", default-features = false, features = ["ws"] }
+
+[dev-dependencies]
+# Paused time for the deadline and lingering-close tests.
+tokio = { version = "1.53.0", default-features = false, features = [
+    "test-util",
+    "rt-multi-thread",
+] }
+# rcgen 0.14.8 (2026-05-11): self-signed certificates for the reload tests.
+rcgen = { version = "0.14.8", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }

@@ -7,6 +7,7 @@ use std::ops::Index;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+pub use e6irc_edge::connection::ConnId;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::numerics::{
     ERR_BADCHANNAME, ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL,
@@ -21,9 +22,6 @@ use super::{
     CoreEffect, CoreShardCount, CoreShardId, SessionOutput, SessionOwner, WireLine, Written,
 };
 use crate::observability::Telemetry;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConnId(pub u64);
 
 /// Casefolded channel-name key. Constructible only via
 /// [`ServerState::chan_key`], so a display-cased name can never index
@@ -1920,7 +1918,7 @@ pub(crate) struct Session {
     pub(crate) real_ip: Option<std::net::IpAddr>,
     /// What this session's per-address limits are charged to, fixed from the
     /// host it opened with (a later SETHOST changes only what is shown).
-    limit_key: crate::net::SessionLimitKey,
+    limit_key: e6irc_edge::address::SessionLimitKey,
     pub transport: crate::core::ConnectionTransport,
     /// Registration state and the identity fields, as one sum type (see
     /// [`Registration`]): a registered connection *has* a nick/user/realname.
@@ -4877,7 +4875,7 @@ pub(crate) struct ServerState {
     /// abuse from one address; hard-capped at `MAX_REGISTRATION_BUCKETS` so
     /// a distinct-IP flood can't grow it without bound.
     pub registration_buckets:
-        HashMap<crate::net::SessionLimitKey, (f64, e6irc_proto::time::MonoMillis)>,
+        HashMap<e6irc_edge::address::SessionLimitKey, (f64, e6irc_proto::time::MonoMillis)>,
     /// HTTP admin requests waiting for a registered-channel delete verdict.
     /// The DB queue carries only the numeric ID, keeping `DbRequest` clonable
     /// and comparable while the one-shot responder remains core-owned.
@@ -6925,7 +6923,7 @@ impl ServerState {
             conn,
             Session {
                 output: SessionOutput::new(tx),
-                limit_key: crate::net::PeerLimitKey::for_session_host(&host),
+                limit_key: e6irc_edge::address::PeerLimitKey::for_session_host(&host),
                 real_ip: host
                     .parse::<std::net::IpAddr>()
                     .ok()

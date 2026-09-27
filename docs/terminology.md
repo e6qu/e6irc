@@ -476,10 +476,12 @@ serves: it binds only its HTTP health answers and takes the lease over when
 the holder stops or dies. **Active/standby** is this arrangement; active/active
 (several processes serving one database) is not supported.
 
-**Fence** — what keeps a process that has lost the lease from acting as if it
-held it: the holder stops serving when it cannot confirm a renewal in time,
-and PostgreSQL refuses its new connections and ends its open ones at a
-takeover.
+**Fence** — what keeps a process that may have lost the lease from acting as
+if it held it: a holder that cannot confirm a renewal in time reports its
+lease unconfirmed and is not ready, keeping its clients until a renewal says
+whether the lease is still its own (it resumes) or another's (it stops
+serving); PostgreSQL refuses a non-holder's new connections and ends the
+previous holder's open ones at a takeover.
 
 **Universally unique identifier (UUID)** — a 128-bit random identifier; a
 process names itself as a lease holder by one.
@@ -503,6 +505,11 @@ with backpressure so a full core queue pauses socket reads.
 
 **`e6irc-proto`** — the protocol crate: message model, parser, tag escaping,
 casemapping, numerics, and time formatting.
+
+**`e6irc-edge`** — the crate that holds client connections: accept, TLS and
+certificate reload, client addresses and per-address limits, line and
+WebSocket framing, and every write to a client. It has no database
+dependency, which `tools/check-edge-isolation.sh` holds (see "Edge tier").
 
 **CLI / TUI** — the command-line client (`e6irc-cli`) and the terminal user
 interface client (`e6irc-tui`).
@@ -680,6 +687,11 @@ the older sense of "boundary": DESIGN says boundary for that.
 
 **Core** — the serving process (the [serving lease](#history-and-persistence)
 holder) seen from the edges: everything that interprets a line.
+
+**Core port** — `CorePort`, the edge's only way to reach the core: open a
+session with its send queue, hand over framed lines, report the end. In the
+single process e6ircd implements it over the core's own ingress; the core link
+takes its place across processes.
 
 **Edge mode** and **single-process mode** — edges as separate processes
 (opt-in), or the default one process with the edge in it over an in-memory

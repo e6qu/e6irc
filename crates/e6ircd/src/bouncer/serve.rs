@@ -1465,7 +1465,7 @@ pub(crate) async fn bnc_serve<S>(
     registry: Arc<Registry>,
     pool: &PgPool,
     server_name: &str,
-    peer: crate::net::ClientIp,
+    peer: e6irc_edge::address::ClientIp,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1473,8 +1473,10 @@ where
     let (mut read, write) = tokio::io::split(stream);
     // Every write here is bounded like `attach`'s, so a client that stops
     // reading during registration or its welcome is dropped at the deadline.
-    let mut write =
-        crate::peer_write::DeadlineWriter::new(write, crate::peer_write::PEER_WRITE_DEADLINE);
+    let mut write = e6irc_edge::peer_write::DeadlineWriter::new(
+        write,
+        e6irc_edge::peer_write::PEER_WRITE_DEADLINE,
+    );
 
     // Taken before any credential is checked, so a suspension, deletion or
     // password change that lands while this client registers refuses its
@@ -1797,7 +1799,7 @@ async fn handshake<R, W>(
     write: &mut W,
     pool: &PgPool,
     server_name: &str,
-    peer: crate::net::ClientIp,
+    peer: e6irc_edge::address::ClientIp,
 ) -> std::io::Result<Registered>
 where
     R: AsyncRead + Unpin,
@@ -2446,7 +2448,7 @@ where
 fn logged_in_mask(
     nick: Option<&str>,
     username: Option<&str>,
-    host: crate::net::ClientIp,
+    host: e6irc_edge::address::ClientIp,
 ) -> String {
     let nick = MiddleParam::echo(nick.map_or("*", |selector| {
         selector.split_once('/').map_or(selector, |(nick, _)| nick)
@@ -2699,7 +2701,7 @@ mod handshake_tests {
                 &mut server_write,
                 &pool,
                 "bnc.example",
-                crate::net::ClientIp::new("192.0.2.1".parse().expect("address")),
+                e6irc_edge::address::ClientIp::new("192.0.2.1".parse().expect("address")),
             )
             .await
         });
@@ -2850,7 +2852,7 @@ mod handshake_tests {
 
     #[test]
     fn logged_in_mask_names_what_is_known() {
-        let host = |text: &str| crate::net::ClientIp::new(text.parse().expect("address"));
+        let host = |text: &str| e6irc_edge::address::ClientIp::new(text.parse().expect("address"));
         assert_eq!(
             logged_in_mask(Some("alice/libera"), Some("al"), host("192.0.2.1")),
             "alice!al@192.0.2.1"

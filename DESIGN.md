@@ -629,7 +629,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     previous holder opened. Two processes each dialling every bouncer network
     and each holding its own in-memory mirror of single-writer state (§7.3)
     cannot be configured, and a stalled holder's in-flight writes cannot land
-    after another has taken over.
+    after another has taken over. A holder that cannot confirm a renewal is
+    fenced, not stopped: it keeps its clients until a renewal that reaches
+    the database says whether the lease is still its own (it resumes) or
+    another's (it drains and exits).
   - `BoundSession` — an OIDC link and a re-authentication flow both seal the
     session that started them, so neither can be built unbound; its callback
     acts only for that session, presented again, still live (§9).
@@ -698,7 +701,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     The one exception is an upstream `PING` during a core gap, answered on an
     edge-held bouncer upstream where the edge is the client.
   - *The edge cannot reach the database*: the `e6irc-edge` crate has no sqlx
-    in its dependency tree, held by a `tools/gate.sh` guard over `cargo tree`.
+    in its dependency tree, held by a `tools/gate.sh` guard over `cargo tree`
+    (`tools/check-edge-isolation.sh`, phase 1): its normal, build and dev
+    dependencies, with every feature and on every target platform, name no
+    sqlx crate or other PostgreSQL client, no `e6ircd` (the core, which holds
+    the database) and no `reqwest` (the bridges' client).
 
 - **The boy-scout rule (hard).** Leave the code cleaner than you found
   it; if you see something broken, fix it — even when it looks unrelated.
@@ -766,6 +773,10 @@ e6irc/
 │   ├── e6irc-queue/          # custom bounded queue: the core↔DB and SendQ
 │   │                         #   communication primitive (§7.3); loom-verified,
 │   │                         #   step-schedulable for deterministic tests
+│   ├── e6irc-edge/           # the connection-holding edge (§19): accept, TLS
+│   │                         #   and certificate reload, client addresses,
+│   │                         #   line and WebSocket framing, every write to a
+│   │                         #   client; no database dependency (§2)
 │   ├── e6ircd/               # the monolithic server binary
 │   ├── e6irc-client/         # client library: connection, TLS, SASL (SCRAM-
 │   │                         #   SHA-512/256, PLAIN, OAUTHBEARER), chathistory helpers
@@ -1022,6 +1033,13 @@ strip = "symbols"
 
 ### 7.2 Connection lifecycle
 
+- Where it lives: everything that holds a client connection — listening,
+  the batched accept, TLS termination and certificate reload, the client's
+  canonical address and per-address slot, the read and write loops, the
+  closing drain and lingering close, WebSocket framing — is the `e6irc-edge`
+  crate (§19.1); what a line means is the core's. A connection reaches the
+  core only through `CorePort` (open, framed lines, end), which e6ircd
+  implements over the core's ingress (`core::CoreIngress`).
 - Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
@@ -4311,7 +4329,9 @@ Surface (initial):
   idle core is not "stalled" in the moments before its first tick); database-free, so a database outage shows on
   `readyz` and never restart-loops the container, while a stalled shard is a
   503 the health check acts on. It used to be a constant.
-- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth).
+- `readyz` (the same core check plus configured-PostgreSQL readiness and, with
+  a database, a confirmed serving lease — `lease` is `unconfirmed` while the
+  process is fenced (§18); no auth).
   The database probe is shared: one request at a time runs it and its answer
   is reused for one second, so a flood of this unauthenticated route, which
   bypasses admission, holds at most one pool connection.
@@ -5011,8 +5031,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   dual-stack listener and a proxy in a trusted IPv4 range is trusted. Every
   operator-written range — a CIDR ban or D-line, `limits.trusted_proxies`,
   `limits.require_sasl_from` — is canonicalised the same way where it is read
-  (`net::canonical_network`): an IPv4-mapped range is its IPv4 range
-  (`::ffff:203.0.113.0/120` is `203.0.113.0/24`), and a mapped range shorter
+  (`e6irc_edge::address::canonical_network`): an IPv4-mapped range is its IPv4
+  range (`::ffff:203.0.113.0/120` is `203.0.113.0/24`), and a mapped range shorter
   than `/96`, which spans non-IPv4 addresses too, is refused, so no stored
   range can be one no canonical address falls in.
 - The attach listener shows that same canonical address in its
@@ -5151,7 +5171,8 @@ The snapshot is the sole source for:
   (`core_heartbeat_age_ms` is the stalest shard's age, so a silent shard is not
   masked by a healthy one) or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
-  query deadline (one shared probe, its answer reused for a second).
+  query deadline (one shared probe, its answer reused for a second), or the
+  serving lease is unconfirmed (`lease`, §18).
 
 The production image carries no HTTP client, so a container `HEALTHCHECK`
 cannot be a `curl`. `e6ircd healthcheck [--ready]
@@ -5310,23 +5331,48 @@ Layers, bottom to top:
   changes nothing means the lease was taken), and every comparison is the
   database's `now()`, so host clocks never have to agree. The TTL, the renewal
   interval and the 10-second fence are named constants, not settings.
-  *Fence.* The holder stops serving when no renewal has been confirmed for
-  10 s, counted on the monotonic clock from when the confirmed renewal's
-  request started, so it has stopped before the lease can expire and be
-  taken; a renewal that finds the lease another's does the same. Either is a
-  critical failure: the bounded drain below, and a non-zero exit. The database
-  fences it too: every connection of the serving pool runs
+  *Fence.* When no renewal has been confirmed for 10 s, counted on the
+  monotonic clock from when the confirmed renewal's request started, the
+  holder is fenced — before the lease can expire and be taken. It holds on:
+  it keeps every IRC connection and all hot state and serves them without
+  the database, as through any outage (the bounded write paths drop and
+  count what they cannot write, the core never waits on them); `/readyz`
+  answers 503 with `"lease":"unconfirmed"` (`database` is `unavailable`
+  while it cannot be reached); `e6irc_serving_lease_held` is 0; and it keeps
+  renewing on the lease's own connection. A renewal that reaches the
+  database and finds the row still naming this holder and epoch — nobody
+  took it, however long ago it expired — lifts the fence and `/readyz`
+  answers 200 again. The pool has opened connections since the database
+  answered (its after-connect check passes: the row names this process), and
+  every announcement follower, whose listening connection the outage ended,
+  reconnects and reads what it follows again (its reconnect hook first: the
+  account-authority follower refuses the sign-in verdicts in flight), so
+  nothing announced meanwhile is missed; a follower whose read fails
+  reconnects and reads again rather than wait for the next announcement. A renewal that finds the lease another's — at once, or when the
+  database answers again after a fence — is a critical failure: the bounded
+  drain below, and a non-zero exit. A PostgreSQL restart or outage on a
+  single server therefore disconnects nobody. The cost is a network split's:
+  the clients on the old holder stay there, served from hot state without
+  the database (and its bouncer networks stay connected), until it reaches
+  the database again and sees the takeover; only then does it drain and
+  exit. The process does not close its own pool while fenced: what still
+  reaches the database (the lease row held locked, say, rather than the
+  database gone) is the holder's, since the row still names it, and what
+  would reach it after a takeover cannot land, since the database fences it
+  too: every connection of the serving pool runs
   `serving_lease_register_backend` as it is made (the pool's after-connect
   hook), which refuses a process that is not the holder and records the
   connection (process id and backend start time — not `application_name`,
   which the operator may state) as the holder's; taking the lease ends every
   connection a previous holder recorded (`pg_terminate_backend`), inside the
   takeover's transaction. Nothing a stalled holder had in flight commits
-  after the takeover, and it cannot open another connection; once its lease
-  has ended it records why (`db::mark_fenced`), and a pool timeout or refused
-  connection then reads "this process no longer holds the serving lease (held
-  by …)" rather than a bare timeout, from the one place database errors are
-  made (`db::query_error`).
+  after the takeover, and it cannot open another connection. The renewal
+  task records the fence (`db::set_lease_fence`), per holder, and a pool
+  timeout or refused connection then reads, from the one place database
+  errors are made (`db::query_error`), "this process's serving lease is
+  unconfirmed: no renewal has reached the database for N s" while fenced,
+  and "this process no longer holds the serving lease (held by …)" once a
+  takeover is seen, rather than a bare timeout.
   *Standby.* A process that finds the lease held says so on stderr, binds only
   its HTTP address — `/healthz` 200, `/readyz` 503 with its role and the
   holder's label (address, process id, release), everything else 503, every
@@ -5656,9 +5702,10 @@ core — the process holding the serving lease (§18) — can be replaced, on th
 same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
-Status: designed, and built in the phases of `PLAN.md` "Edge tier". Until a
-phase lands, the rest of this document describes the running system; §19.9
-lists the sections each phase rewrites.
+Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
+(the `e6irc-edge` crate, "Phase 1 as built" below) has landed, and phase 2 is
+next. Until a phase lands, the rest of this document describes the running
+system; §19.9 lists the sections each phase rewrites.
 
 ### 19.1 The split
 
@@ -5715,6 +5762,28 @@ lists the sections each phase rewrites.
   then gets 503 with `Retry-After`; one in flight at a crash gets 502. A
   graceful stop finishes the requests in flight before the cut, so a deploy
   costs no HTTP error.
+- **Phase 1 as built.** `e6irc-edge` holds, moved unchanged from e6ircd:
+  `connection` (`bind_listener`, the batched accept with `TCP_NODELAY` and the
+  TLS handshake bound, `serve_conn` with its read and write loops and
+  vectored writes, the closing drain, `ConnectionTasks`, and the session
+  identity the accept assigns — `ConnId`, `ConnectionIdAllocator`,
+  `ConnectionTransport` and the `Output` line), `certificate` (the TLS files,
+  the reloading certificate, the hang-up signal, the process's rustls
+  provider), `address` (`ClientIp`, `canonical_network`, `PeerLimitKey`,
+  `SessionLimitKey`, `ConnLimiter`, the peer-refusal log), `peer_write`,
+  `lingering_close` and `websocket` (the `/ws/irc` message ceiling, the frame
+  mode, frame writes within the deadline, close frames). The crate names no
+  core type: a connection reaches the core through `CorePort` — open a
+  session with its send queue, hand over framed lines through the meter,
+  report the end — which e6ircd implements over `CoreIngress` by pushing the
+  very `Input` it pushed before, and counts through `TransportTelemetry`,
+  which e6ircd's telemetry implements as the error kinds of the same name.
+  Phase 2 puts the link's frames behind `CorePort` and moves the meter.
+  Still in e6ircd, each until the phase that moves it: the `/ws/irc` and
+  `/ws/ui` upgrade handlers and connection loops and the attach listener's
+  accept loop (phase 2, as link session kinds), and X-Forwarded-For
+  resolution (`http::oidc::client_ip`) with HTTP admission (phase 3, HTTP
+  proxying).
 
 ### 19.2 The core link
 
@@ -6073,9 +6142,12 @@ preference:
 ### 19.7 Serving lease, followers and the database-outage hold
 
 - **The lease keeps its role** (§18): it decides which core serves. The edge
-  adds the epoch fence (§19.2). A core whose lease ended (`LeaseEnd::Taken` or
-  `Fenced`) stops talking to edges — it never closes clients — and its links
-  are superseded by the new epoch. The critical-failure path becomes a stop
+  adds the epoch fence (§19.2). A core whose lease ended (`LeaseEnd::Taken`:
+  a renewal found another holder) stops talking to edges — it never closes
+  clients — and its links are superseded by the new epoch. A core fenced for
+  want of a confirmed renewal (`LeaseStanding::Unconfirmed`, §18) has not
+  lost the lease: it keeps its links and serves from hot state until a
+  renewal says which. The critical-failure path becomes a stop
   without a cut; the next holder rebuilds as after a crash.
 - **Announcement followers** (`follow_announcements`: settings, credentials,
   lease) run per core and restart with it; each re-reads its table at its
@@ -6084,8 +6156,11 @@ preference:
   they take their configuration from `Welcome` and its updates.
 - **The database-outage hold** (§18: the holder keeps its connections through
   a database outage unless it is taken over) composes with the edges. While
-  the database is down no standby can take the lease, and edges are
-  unaffected. A takeover after the database returns no longer drops clients:
+  the database is down for every process no standby can take the lease, and
+  edges are unaffected; in a split where only the holder is cut off, a
+  standby takes the expired lease and the edges' epoch fence moves them to it
+  at once, instead of the old holder's clients waiting until it reaches the
+  database again (§18's cost of the hold without edges). A takeover after the database returns no longer drops clients:
   B rebuilds from the edges, which hold the state as the old holder evolved it
   during the outage, including channel changes that lived only in memory.
   What the old holder could not persist follows the hold's own rules, and a

@@ -142,10 +142,14 @@ pub enum DbError {
     /// Taking the serving lease could not end this many connections of the
     /// previous holder; the lease was not taken.
     PreviousHolderLingers(i64),
-    /// This process has lost the serving lease (fenced, or taken over), so
-    /// the database refuses it connections: what a pool timeout or a refused
-    /// connection means once [`mark_fenced`] has recorded why.
+    /// This process has lost the serving lease (taken over), so the database
+    /// refuses it connections: what a pool timeout or a refused connection
+    /// means once the lease's end is recorded ([`LeaseFence::Lost`]).
     NotServing(String),
+    /// No renewal of this process's serving lease has been confirmed for this
+    /// long (the database is unreachable, or the lease row is held locked),
+    /// so it does not use the database until one is ([`LeaseFence::Unconfirmed`]).
+    LeaseUnconfirmed(Duration),
 }
 
 impl std::fmt::Display for DbError {
@@ -264,6 +268,12 @@ impl std::fmt::Display for DbError {
                 "this process no longer holds the serving lease ({why}); it cannot use the \
                  database"
             ),
+            Self::LeaseUnconfirmed(unconfirmed) => write!(
+                f,
+                "this process's serving lease is unconfirmed: no renewal has reached the \
+                 database for {}s; it uses the database again once one does",
+                unconfirmed.as_secs()
+            ),
             Self::PreviousHolderLingers(count) => write!(
                 f,
                 "{count} connection(s) of the previous serving-lease holder did not end when \
@@ -280,16 +290,49 @@ impl std::error::Error for DbError {}
 /// telemetry as `e6irc_database_pool_acquire_timeouts_total`.
 static POOL_ACQUIRE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Why this process lost the serving lease, once it has: set once, by the
-/// lease's renewal task when the lease ends ([`mark_fenced`]).
-static FENCED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Why this process's database errors are its serving lease's: the lease is
+/// unconfirmed, or has been lost. Set and cleared by the lease's renewal task
+/// ([`set_lease_fence`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseFence {
+    /// No renewal has been confirmed since the request of the last confirmed
+    /// one started, at `since`, and the fence has passed. The lease may still
+    /// be this process's: a renewal that reaches the database and finds it so
+    /// clears this.
+    Unconfirmed { since: tokio::time::Instant },
+    /// Another process holds the lease now (or it could not be kept): why.
+    Lost(String),
+}
 
-/// Record that this process no longer holds the serving lease, and why (who
-/// holds it now, or that it fenced itself). From then on a pool that cannot
-/// hand out a connection — the database refuses every new one this process
-/// opens — reports that, not a bare timeout. The first reason stands.
-pub(crate) fn mark_fenced(why: String) {
-    FENCED.get_or_init(|| why);
+/// Each lease holder's fence, by holder. One serving process holds one lease;
+/// a test process runs several servers, each with its own holder, and one's
+/// fence is not another's.
+static LEASE_FENCES: std::sync::Mutex<Vec<(String, LeaseFence)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn lease_fences() -> std::sync::MutexGuard<'static, Vec<(String, LeaseFence)>> {
+    // The guarded value is a plain list replaced whole under the lock: a
+    // panic elsewhere while it was held cannot have left it half-written.
+    LEASE_FENCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record where `holder`'s lease stands for its errors: fenced (unconfirmed
+/// or lost), or — `None` — serving again. While fenced, a pool that cannot
+/// hand out a connection, or a connection the database refuses, reports the
+/// fence rather than a bare timeout ([`query_error`]).
+pub(crate) fn set_lease_fence(holder: &crate::serving_lease::HolderId, fence: Option<LeaseFence>) {
+    let mut fences = lease_fences();
+    fences.retain(|(fenced, _)| fenced != holder.as_str());
+    if let Some(fence) = fence {
+        fences.push((holder.as_str().to_owned(), fence));
+    }
+}
+
+/// The fence a database error in this process reports: the most recent.
+fn current_lease_fence() -> Option<LeaseFence> {
+    lease_fences().last().map(|(_, fence)| fence.clone())
 }
 
 /// SQLSTATE `serving_lease_register_backend` (migration 0098) raises for a
@@ -298,12 +341,12 @@ const NOT_THE_LEASE_HOLDER: &str = "E6L01";
 
 /// Every query failure in this module passes through here on its way into a
 /// [`DbError`], so an exhausted pool is counted wherever it is met, and a
-/// process that has lost the serving lease says so.
+/// process whose serving lease is unconfirmed or lost says so.
 pub(crate) fn query_error(error: sqlx::Error) -> DbError {
-    classify_query_error(error, FENCED.get().map(String::as_str))
+    classify_query_error(error, current_lease_fence())
 }
 
-fn classify_query_error(error: sqlx::Error, fenced: Option<&str>) -> DbError {
+fn classify_query_error(error: sqlx::Error, fence: Option<LeaseFence>) -> DbError {
     let timed_out = matches!(error, sqlx::Error::PoolTimedOut);
     if timed_out {
         POOL_ACQUIRE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -312,8 +355,11 @@ fn classify_query_error(error: sqlx::Error, fenced: Option<&str>) -> DbError {
         .as_database_error()
         .and_then(sqlx::error::DatabaseError::code)
         .is_some_and(|code| code == NOT_THE_LEASE_HOLDER);
-    match fenced {
-        Some(why) if timed_out || refused => DbError::NotServing(why.to_owned()),
+    match fence {
+        Some(LeaseFence::Unconfirmed { since }) if timed_out || refused => {
+            DbError::LeaseUnconfirmed(since.elapsed())
+        }
+        Some(LeaseFence::Lost(why)) if timed_out || refused => DbError::NotServing(why),
         _ => DbError::Query(error),
     }
 }
@@ -773,7 +819,12 @@ const COMMAND_LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// connection is checked, as it is made, to belong to the serving lease's
 /// holder and recorded as the holder's (`serving_lease_register_backend`,
 /// migration 0098), so a process that has lost the lease cannot open one, and
-/// the next holder can end every one it has open.
+/// the next holder can end every one it has open. That check is the pool's
+/// whole fence: a holder whose renewal is unconfirmed is still the holder
+/// until another process takes the lease — which ends every connection it
+/// recorded — so its pool opens connections again the moment the database
+/// answers, and the followers' re-reads on reconnection
+/// ([`follow_announcements`]) are never refused by this process itself.
 pub async fn connect_pool(
     url: &DatabaseUrl,
     size: DatabasePoolSize,
@@ -11166,7 +11217,8 @@ mod fence_error_tests {
     #[test]
     fn a_fenced_process_s_refused_or_timed_out_pool_names_the_lease() {
         let why = "held by 10.0.0.2 pid 7, e6ircd 0.1.0";
-        let fenced = classify_query_error(sqlx::Error::PoolTimedOut, Some(why));
+        let lost = || Some(LeaseFence::Lost(why.to_owned()));
+        let fenced = classify_query_error(sqlx::Error::PoolTimedOut, lost());
         assert!(matches!(&fenced, DbError::NotServing(reason) if reason == why));
         assert!(
             fenced
@@ -11181,9 +11233,60 @@ mod fence_error_tests {
         ));
         // Fenced, but an unrelated failure is itself.
         assert!(matches!(
-            classify_query_error(sqlx::Error::RowNotFound, Some(why)),
+            classify_query_error(sqlx::Error::RowNotFound, lost()),
             DbError::Query(sqlx::Error::RowNotFound)
         ));
+    }
+
+    /// Fenced by an unconfirmed renewal but not taken over, the error says
+    /// the lease is unconfirmed and for how long — not that another process
+    /// holds it, which is not known.
+    #[test]
+    fn an_unconfirmed_lease_s_pool_timeout_says_it_is_unconfirmed() {
+        let since = tokio::time::Instant::now() - Duration::from_secs(12);
+        let fenced = classify_query_error(
+            sqlx::Error::PoolTimedOut,
+            Some(LeaseFence::Unconfirmed { since }),
+        );
+        assert!(
+            matches!(&fenced, DbError::LeaseUnconfirmed(unconfirmed) if unconfirmed.as_secs() >= 12),
+            "{fenced:?}"
+        );
+        let said = fenced.to_string();
+        assert!(
+            said.starts_with(
+                "this process's serving lease is unconfirmed: no renewal has reached the \
+                 database for 12s"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("held by"), "{said}");
+    }
+
+    /// One holder's fence is its own: clearing one server's (a test process
+    /// runs several) leaves another's, and a resumed holder's is gone.
+    #[test]
+    fn a_lease_fence_is_its_holder_s_and_is_cleared_on_resumption() {
+        let resumed = crate::serving_lease::HolderId::generate();
+        let taken = crate::serving_lease::HolderId::generate();
+        set_lease_fence(&taken, Some(LeaseFence::Lost("held by another".to_owned())));
+        set_lease_fence(
+            &resumed,
+            Some(LeaseFence::Unconfirmed {
+                since: tokio::time::Instant::now(),
+            }),
+        );
+        assert!(matches!(
+            current_lease_fence(),
+            Some(LeaseFence::Unconfirmed { .. })
+        ));
+        set_lease_fence(&resumed, None);
+        assert_eq!(
+            current_lease_fence(),
+            Some(LeaseFence::Lost("held by another".to_owned()))
+        );
+        set_lease_fence(&taken, None);
+        assert_eq!(current_lease_fence(), None);
     }
 }
 

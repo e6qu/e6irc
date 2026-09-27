@@ -8,40 +8,15 @@ use super::*;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
+use e6irc_edge::websocket::{
+    MAX_IRC_WS_MESSAGE, WsFrameMode, send_close, send_frame, send_irc_line, write_failure_reason,
+};
+
 use crate::bouncer::SessionAuthority;
 
-/// The largest WebSocket message `/ws/irc` reads. IRCv3 WebSocket carries one
-/// IRC line per message; one over the line limit is refused with 417 and the
-/// connection kept, as an over-long TCP line is. But a message is read whole
-/// before it can be judged, so one past this is not read at all: the
-/// connection is closed with 1009 (message too big).
-const MAX_IRC_WS_MESSAGE: usize = 64 * 1024;
 /// JSON can escape one input byte as six ASCII bytes. Bound the UI envelope
 /// before deserialization while admitting every wire-sized composer command.
 const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
-
-use crate::peer_write::{PEER_WRITE_DEADLINE, SendFailure, within_send_deadline};
-
-/// Write one frame, giving up on a peer that has stopped reading
-/// ([`crate::peer_write`]).
-async fn send_frame(socket: &mut WebSocket, frame: WsMessage) -> Result<(), SendFailure> {
-    within_send_deadline(PEER_WRITE_DEADLINE, socket.send(frame)).await
-}
-
-/// Outbound WebSocket frame discipline, fixed for the connection by ircv3
-/// subprotocol negotiation (<https://ircv3.net/specs/extensions/websocket>).
-#[derive(Clone, Copy)]
-pub(super) enum WsFrameMode {
-    /// `binary.ircv3.net`: every line is a binary frame (raw bytes verbatim).
-    Binary,
-    /// `text.ircv3.net`: every line is a text frame; non-UTF-8 bytes are lossily
-    /// replaced with U+FFFD, since a WebSocket text frame must be valid UTF-8.
-    Text,
-    /// No subprotocol negotiated: text when the line is valid UTF-8, otherwise
-    /// binary — so arbitrary IRC bytes survive. The historical behavior the
-    /// existing `/ws/irc` clients rely on.
-    Auto,
-}
 
 /// A WebSocket upgrade request, rejected as a problem document rather than
 /// axum's plain-text default: a plain `GET /ws/irc` is a `400` (or `426` for a
@@ -162,12 +137,12 @@ pub(super) async fn ws_irc(
 /// lives — its per-IP slot and its place among the tasks shutdown waits for.
 pub(super) struct WsIrcConnection {
     conn: crate::core::ConnId,
-    ip: crate::net::ClientIp,
+    ip: ClientIp,
     mode: WsFrameMode,
     transport: crate::core::ConnectionTransport,
     stream: crate::net::HttpStreamReclaim,
-    _guard: crate::net::ConnGuard,
-    _task: crate::net::ConnectionTask,
+    _guard: ConnGuard,
+    _task: e6irc_edge::connection::ConnectionTask,
 }
 
 /// How a `/ws/irc` connection's loop ended.
@@ -189,9 +164,9 @@ enum WsIrcEnd {
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
 /// IRC line; each core Output line is one outbound text frame. Mirrors
-/// the TCP connection path (net::serve_conn) over the WS transport. A
-/// single task owns the socket and selects between inbound frames and
-/// the drained SendQ — no split, so no extra dependency.
+/// the TCP connection path (`e6irc_edge::connection::serve_conn`) over the
+/// WS transport. A single task owns the socket and selects between inbound
+/// frames and the drained SendQ — no split, so no extra dependency.
 pub(super) async fn ws_irc_conn(
     state: Arc<AppState>,
     mut socket: WebSocket,
@@ -285,7 +260,7 @@ pub(super) async fn ws_irc_conn(
         WsIrcEnd::SessionOver => {
             // Everything still queued, then a normal close, within the bound a
             // finished session's output has on every transport.
-            let delivered = tokio::time::timeout(crate::net::CLOSING_DRAIN, async {
+            let delivered = tokio::time::timeout(e6irc_edge::connection::CLOSING_DRAIN, async {
                 while let Some(env) = out_rx.pop().await {
                     send_irc_line(&mut socket, mode, &env.payload.0).await?;
                 }
@@ -309,7 +284,7 @@ pub(super) async fn ws_irc_conn(
             drop(core_tx.push(Input::Closed { conn, reason }).await);
             if let Some((code, text)) = close {
                 let closed = tokio::time::timeout(
-                    crate::net::CLOSING_DRAIN,
+                    e6irc_edge::connection::CLOSING_DRAIN,
                     send_close(&mut socket, code, text),
                 )
                 .await;
@@ -335,15 +310,7 @@ pub(super) async fn ws_irc_conn(
     // is closed without letting unread input reset away the last frames.
     drop(socket);
     if let Ok(mut stream) = stream.await {
-        crate::lingering_close::close_within_bound(&mut stream).await;
-    }
-}
-
-/// The session's `Input::Closed` reason for a frame the client did not take.
-fn write_failure_reason(failure: &SendFailure) -> &'static str {
-    match failure {
-        SendFailure::Stalled => "Write timeout",
-        SendFailure::Transport => "Write error",
+        e6irc_edge::lingering_close::close_within_bound(&mut stream).await;
     }
 }
 
@@ -364,39 +331,6 @@ fn read_failure(state: &AppState, error: axum::Error) -> WsIrcEnd {
     WsIrcEnd::ClientEnded {
         reason: format!("Read error: {error}"),
         close: None,
-    }
-}
-
-/// Send one core Output line as one frame. The core's Output is a full wire
-/// line terminated with exactly "\r\n" (state.rs `send_bytes`). Strip only
-/// that terminator: `trim_end()` would eat significant trailing spaces in a
-/// `:`-prefixed trailing parameter, silently dropping content.
-async fn send_irc_line(
-    socket: &mut WebSocket,
-    mode: WsFrameMode,
-    bytes: &[u8],
-) -> Result<(), SendFailure> {
-    let line = bytes
-        .strip_suffix(b"\r\n")
-        .or_else(|| bytes.strip_suffix(b"\n"))
-        .unwrap_or(bytes);
-    // Frame type follows the negotiated subprotocol. Under Auto (no
-    // subprotocol) a non-UTF-8 body goes out as a binary frame rather than
-    // being corrupted by lossy U+FFFD replacement; under the text subprotocol
-    // the client asked for text, so it is replaced.
-    match mode {
-        WsFrameMode::Binary => send_frame(socket, WsMessage::binary(line.to_vec())).await,
-        WsFrameMode::Text => {
-            send_frame(
-                socket,
-                WsMessage::text(String::from_utf8_lossy(line).into_owned()),
-            )
-            .await
-        }
-        WsFrameMode::Auto => match std::str::from_utf8(line) {
-            Ok(text) => send_frame(socket, WsMessage::text(text)).await,
-            Err(_) => send_frame(socket, WsMessage::binary(line.to_vec())).await,
-        },
     }
 }
 
@@ -1029,15 +963,6 @@ pub(super) async fn ws_ui_conn(
             },
         }
     }
-}
-
-/// Close the socket with `code` and a reason the client can show.
-async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str) {
-    let close = axum::extract::ws::CloseFrame {
-        code,
-        reason: reason.into(),
-    };
-    drop(send_frame(socket, WsMessage::Close(Some(close))).await);
 }
 
 /// Tell the client its network cannot be attached to, and close the socket.

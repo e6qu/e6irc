@@ -2088,10 +2088,10 @@ pub(crate) enum BridgeRead {
 pub(crate) async fn bridge_ws_send(
     write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
     frame: tokio_tungstenite::tungstenite::Message,
-) -> Result<(), crate::peer_write::SendFailure> {
+) -> Result<(), e6irc_edge::peer_write::SendFailure> {
     use futures_util::SinkExt;
-    crate::peer_write::within_send_deadline(
-        crate::peer_write::PEER_WRITE_DEADLINE,
+    e6irc_edge::peer_write::within_send_deadline(
+        e6irc_edge::peer_write::PEER_WRITE_DEADLINE,
         write.send(frame),
     )
     .await
@@ -6580,10 +6580,12 @@ pub async fn attach<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let stream =
-        crate::peer_write::DeadlineWriter::new(stream, crate::peer_write::PEER_WRITE_DEADLINE);
+    let stream = e6irc_edge::peer_write::DeadlineWriter::new(
+        stream,
+        e6irc_edge::peer_write::PEER_WRITE_DEADLINE,
+    );
     match relay_attached(stream, input, handle, caps, authority, greeting, liveness).await {
-        Err(error) if crate::peer_write::is_stalled(&error) => Ok(AttachEnd::ClientTooSlow),
+        Err(error) if e6irc_edge::peer_write::is_stalled(&error) => Ok(AttachEnd::ClientTooSlow),
         ended => ended,
     }
 }
@@ -6618,7 +6620,7 @@ fn attach_status_notice(runtime: &NetworkRuntimeSnapshot) -> String {
 
 /// [`attach`]'s relay, over a stream whose writes are already bounded.
 async fn relay_attached<S>(
-    stream: crate::peer_write::DeadlineWriter<S>,
+    stream: e6irc_edge::peer_write::DeadlineWriter<S>,
     input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,

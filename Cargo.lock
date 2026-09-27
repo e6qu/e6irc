@@ -867,6 +867,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "e6irc-edge"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "bytes",
+ "e6irc-proto",
+ "e6irc-queue",
+ "ipnet",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "e6irc-load"
 version = "0.1.0"
 dependencies = [
@@ -927,6 +946,7 @@ dependencies = [
  "axum",
  "bytes",
  "e6irc-client",
+ "e6irc-edge",
  "e6irc-proto",
  "e6irc-queue",
  "futures-util",

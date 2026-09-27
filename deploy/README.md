@@ -381,12 +381,24 @@ servers linked — is not supported: the lease makes it impossible.
 - **Lease.** The serving process holds the one row of `serving_lease` and
   renews it every 3 seconds; the lease stands for 15 seconds after the last
   renewal, measured on PostgreSQL's clock (the hosts' clocks do not matter). A
-  process that cannot confirm a renewal for 10 seconds stops serving by itself
-  — the same bounded drain as SIGTERM, and a non-zero exit, so its service
-  manager restarts it as a standby — before anyone else can take the lease.
-  When a standby takes the lease it ends every PostgreSQL connection the
-  previous holder opened, and a process without the lease cannot open a new
-  one: nothing a stalled holder had in flight lands after the takeover. Every
+  process that cannot confirm a renewal for 10 seconds — PostgreSQL is down,
+  restarting or unreachable — is **fenced**: `/readyz` answers 503 with
+  `"lease":"unconfirmed"`, it keeps every IRC connection and serves them from
+  memory, and it keeps trying to renew. When PostgreSQL answers again and
+  the lease is still its own (nobody took it, however long ago it expired),
+  it resumes: `/readyz` answers 200 and it writes again. If another process
+  took the lease meanwhile, it stops serving — the same bounded drain as
+  SIGTERM, and a non-zero exit, so its service manager restarts it as a
+  standby. So a PostgreSQL restart or outage on a single server no longer
+  disconnects anyone. The cost, in a network split between two hosts: the
+  clients still connected to the old holder stay on it, served from memory
+  and without the database, until it reaches PostgreSQL again and sees the
+  takeover; only then are they disconnected and reconnect to the new holder.
+  Its bouncer networks stay connected meanwhile too, so the upstream may see
+  a session from each holder until then. When a standby takes the lease it
+  ends every PostgreSQL connection the previous holder opened, and a process
+  without the lease cannot open a new one: nothing a stalled holder had in
+  flight lands after the takeover. Every
   process must connect as the same database role, so the new holder can see
   and end the old one's connections. Each takeover is an audit entry
   (`SERVING_LEASE_ACQUIRE`); `e6irc_serving_lease_held` and
@@ -404,7 +416,7 @@ servers linked — is not supported: the lease makes it impossible.
   that same HTTP check as their health check — a standby does not bind them.
 - **Service manager.** Run the same unit (`e6ircd.service`) with the same
   configuration on two hosts; whichever starts first serves. `Restart=` brings
-  a fenced or crashed process back as the standby.
+  a crashed process, or one that found its lease taken, back as the standby.
 - **Rolling upgrade.** Restart the standby with the new release (a standby may
   be newer than the schema); send SIGTERM to the serving process — the
   upgraded standby takes over and migrates; then start the old serving host

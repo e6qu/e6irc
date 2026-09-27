@@ -1510,6 +1510,10 @@ Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
 - **Fencing is enforced by PostgreSQL too**: every pool connection passes
   `serving_lease_register_backend`, and a takeover ends the previous holder's
   recorded connections, so its queued writes fail and none lands.
+- **A fenced holder holds on through an outage unless actually taken over**:
+  past the fence it keeps its clients and hot state, answers `/readyz` 503
+  (`lease: unconfirmed`) and keeps renewing; a renewal that finds the lease
+  still its own resumes it, one that finds another holder drains and exits.
 - **Only the holder migrates**; a standby older than the schema refuses at
   boot; `rotate-secrets` and `recover-administrator` never migrate under a
   serving process and refuse an older schema with "upgrade the serving process
@@ -1530,20 +1534,28 @@ configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
 fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
-Status: phase 0 done; phase 1 is the next to build; every other phase is
-scheduled in the order below.
+Status: phases 0 and 1 done; phase 2 is the next to build; every other phase
+is scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
   tier's invariants), §19 (the design and its settled decisions), a §18
   cross-reference, and the glossary's "Edge tier" terms. *Green because*
   documentation only; the terminology, no-deferral and journey guards pass.
-- **Phase 1 — extract `e6irc-edge`.** Move accept, the TLS acceptor and
+- **Phase 1 — extract `e6irc-edge` (done).** Move accept, the TLS acceptor and
   certificate reload, client-address resolution (`ClientIp`, `PeerLimitKey`,
   `ConnLimiter`), `peer_write`, `lingering_close`, the framing read and write
   loops and the WebSocket framing helpers into an `e6irc-edge` crate with no
   sqlx; a `tools/gate.sh` guard over `cargo tree` holds "no sqlx in
   `e6irc-edge`". DESIGN §4 and §7.2. *Green because* a pure move: the single
   process is unchanged and every existing test passes as is.
+  As built (DESIGN §19.1, "Phase 1 as built"): the moved code reaches the core
+  only through `CorePort`, which e6ircd implements over `CoreIngress` with the
+  same `Input` events, and counts through `TransportTelemetry`; the session
+  identity the accept assigns (`ConnId`, `ConnectionIdAllocator`,
+  `ConnectionTransport`, `Output`) moved with it. The guard is
+  `tools/check-edge-isolation.sh`: no sqlx or other PostgreSQL client, no
+  `e6ircd` and no `reqwest` in any dependency kind, feature or target, with
+  its contract test run against a scratch workspace.
 - **Phase 2 — in-process link.** The core reaches connections only through
   link frames: the remote send queue with `Drained` accounting, credits,
   `Kill` and `End`, pacing woken by `Drained`; bouncer attach and `/ws/ui`

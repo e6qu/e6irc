@@ -123,6 +123,20 @@ impl ErrorKind {
     }
 }
 
+/// The transport's failures are counted as the error kinds of the same name.
+impl From<e6irc_edge::connection::TransportError> for ErrorKind {
+    fn from(kind: e6irc_edge::connection::TransportError) -> Self {
+        use e6irc_edge::connection::TransportError;
+        match kind {
+            TransportError::Accept => Self::Accept,
+            TransportError::ConnectionSetup => Self::ConnectionSetup,
+            TransportError::TlsHandshake => Self::TlsHandshake,
+            TransportError::Read => Self::Read,
+            TransportError::Write => Self::Write,
+        }
+    }
+}
+
 /// One safe, bounded event from a server component. The event carries no
 /// external error text, so an operator view cannot disclose a secret by
 /// replaying a diagnostic.
@@ -432,6 +446,11 @@ impl Telemetry {
         if self.serving_lease.set(status).is_err() {
             eprintln!("observability: the serving lease was already being observed");
         }
+    }
+
+    /// Where the serving lease stands, once one is observed (`/readyz`).
+    pub(crate) fn serving_lease_standing(&self) -> Option<crate::serving_lease::LeaseStanding> {
+        self.serving_lease.get().map(|lease| lease.standing())
     }
 
     fn database_pool_snapshot(&self) -> Option<DatabasePoolSnapshot> {
@@ -840,7 +859,8 @@ impl Telemetry {
             one_metric(
                 &mut out,
                 "e6irc_serving_lease_held",
-                "Whether this process holds the database's serving lease (1) or has lost it (0).",
+                "Whether this process holds the database's serving lease with a renewal confirmed \
+                 within the fence (1), or not: unconfirmed, or lost (0).",
                 "gauge",
                 u64::from(lease.held()),
             );
@@ -1140,6 +1160,17 @@ fn render_histogram(out: &mut String, kind: LatencyKind, latency: &LatencySnapsh
         latency.sum_us as f64 / 1_000_000.0,
         latency.count
     ));
+}
+
+/// The edge's connections count into the same telemetry as everything else.
+impl e6irc_edge::connection::TransportTelemetry for Telemetry {
+    fn record_error(&self, kind: e6irc_edge::connection::TransportError) {
+        Telemetry::record_error(self, kind.into());
+    }
+
+    fn record_connection_rejected(&self) {
+        Telemetry::record_connection_rejected(self);
+    }
 }
 
 #[cfg(test)]

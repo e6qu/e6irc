@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::config::OidcProviderConfig;
+use e6irc_edge::address::{
+    ClientIp, ConnGuard, ConnLimiter, PeerLimitKey, PeerRefusal, PeerRefusalLog,
+};
 
 mod channels;
 mod credentials;
@@ -148,7 +151,7 @@ pub struct AppState {
     /// turned it `"off"`. The bucket refills to full over 60 seconds.
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
-    pub(crate) auth_buckets: Mutex<HashMap<crate::net::PeerLimitKey, (f64, std::time::Instant)>>,
+    pub(crate) auth_buckets: Mutex<HashMap<PeerLimitKey, (f64, std::time::Instant)>>,
     /// Per-account ordinary/administrator API token buckets. The boolean key
     /// distinguishes the smaller administrator budget.
     pub api_rate_burst: usize,
@@ -166,10 +169,10 @@ pub struct AppState {
     pub(crate) account_exports: AccountExportSlots,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
-    pub(crate) conn_limiter: crate::net::ConnLimiter,
+    pub(crate) conn_limiter: ConnLimiter,
     /// Every client connection's task, which an `/ws/irc` session's joins, so
     /// shutdown waits for its closing `ERROR` as for a raw socket's.
-    pub(crate) connections: crate::net::ConnectionTasks,
+    pub(crate) connections: e6irc_edge::connection::ConnectionTasks,
     /// The per-address in-flight request bound ([`RequestAdmission`]).
     pub(crate) request_admission: Arc<RequestAdmission>,
     /// `/readyz`'s shared database probe ([`DatabaseReadiness`]).
@@ -1350,13 +1353,17 @@ async fn observe_http(
 
 /// `/readyz` of the serving process. A standby answers its own
 /// (`net::StandbyHealth`): `role` tells a load balancer's operator which one
-/// answered.
+/// answered. `lease` is where the serving lease stands: `held`, or
+/// `unconfirmed` while the process is fenced for want of a confirmed renewal
+/// (it keeps its clients and does not use the database), `ended` once it is
+/// given up or taken, `not_configured` without a database.
 #[derive(Serialize)]
 struct Readiness {
     ready: bool,
     role: &'static str,
     core: &'static str,
     database: &'static str,
+    lease: &'static str,
 }
 
 const READINESS_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1451,7 +1458,10 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         }
         None => true,
     };
-    let ready = core_ready && database_ready;
+    let lease = state.telemetry.serving_lease_standing();
+    let lease_ready =
+        lease.is_none_or(|standing| standing == crate::serving_lease::LeaseStanding::Held);
+    let ready = core_ready && database_ready && lease_ready;
     (
         if ready {
             StatusCode::OK
@@ -1469,6 +1479,10 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             } else {
                 "unavailable"
             },
+            lease: lease.map_or(
+                "not_configured",
+                crate::serving_lease::LeaseStanding::as_str,
+            ),
         }),
     )
         .into_response()
@@ -2028,21 +2042,19 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 /// The per-address in-flight request count, keyed by the [`PeerLimitKey`] of
 /// the client address the request resolves to ([`client_ip`]: the socket peer,
 /// or the forwarded client behind a trusted proxy).
-///
-/// [`PeerLimitKey`]: crate::net::PeerLimitKey
 pub(crate) struct RequestAdmission {
     trusted_proxies: Vec<ipnet::IpNet>,
     limit: usize,
-    in_flight: Mutex<HashMap<crate::net::PeerLimitKey, usize>>,
+    in_flight: Mutex<HashMap<PeerLimitKey, usize>>,
     /// Where a request refused for an unusable forwarded address is logged.
-    refusals: Arc<crate::net::PeerRefusalLog>,
+    refusals: Arc<PeerRefusalLog>,
 }
 
 impl RequestAdmission {
     pub(crate) fn new(
         trusted_proxies: Vec<ipnet::IpNet>,
         limit: usize,
-        refusals: Arc<crate::net::PeerRefusalLog>,
+        refusals: Arc<PeerRefusalLog>,
     ) -> Self {
         Self {
             trusted_proxies,
@@ -2052,7 +2064,7 @@ impl RequestAdmission {
         }
     }
 
-    fn admit(self: &Arc<Self>, client: crate::net::ClientIp) -> Option<InFlightRequest> {
+    fn admit(self: &Arc<Self>, client: ClientIp) -> Option<InFlightRequest> {
         let client = client.limit_key();
         let mut in_flight = self.in_flight.lock().expect("request admission lock");
         let count = in_flight.entry(client).or_insert(0);
@@ -2070,7 +2082,7 @@ impl RequestAdmission {
 /// One admitted request; its slot is released when the response is returned.
 struct InFlightRequest {
     admission: Arc<RequestAdmission>,
-    client: crate::net::PeerLimitKey,
+    client: PeerLimitKey,
 }
 
 impl Drop for InFlightRequest {
@@ -4452,7 +4464,7 @@ mod invitation_url_tests {
 
 #[cfg(test)]
 mod client_ip_tests {
-    use crate::net::ClientIp;
+    use e6irc_edge::address::ClientIp;
 
     /// The client a request resolves to, when it resolves to one.
     fn client_ip(
@@ -4469,7 +4481,7 @@ mod client_ip_tests {
         let admission = std::sync::Arc::new(super::RequestAdmission::new(
             Vec::new(),
             1,
-            std::sync::Arc::new(crate::net::PeerRefusalLog::new(
+            std::sync::Arc::new(e6irc_edge::address::PeerRefusalLog::new(
                 std::time::Duration::from_secs(60),
             )),
         ));
@@ -5060,7 +5072,9 @@ mod request_bound_tests {
                     Arc::new(RequestAdmission::new(
                         Vec::new(),
                         8,
-                        Arc::new(crate::net::PeerRefusalLog::new(Duration::from_secs(60))),
+                        Arc::new(e6irc_edge::address::PeerRefusalLog::new(
+                            Duration::from_secs(60),
+                        )),
                     )),
                     1,
                 ),
@@ -5149,7 +5163,9 @@ mod request_bound_tests {
                 Arc::new(RequestAdmission::new(
                     Vec::new(),
                     8,
-                    Arc::new(crate::net::PeerRefusalLog::new(Duration::from_secs(60))),
+                    Arc::new(e6irc_edge::address::PeerRefusalLog::new(
+                        Duration::from_secs(60),
+                    )),
                 )),
                 1,
             ),

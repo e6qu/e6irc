@@ -27,18 +27,18 @@ pub(crate) const LINGER_BYTES: usize = 8 * 1024 * 1024;
 /// The longest [`close_within_bound`] takes: the drain's [`LINGER_TIME`], and a
 /// second before it for the shutdown's own write (a TLS `close_notify`) to a
 /// peer that is not reading.
-pub(crate) const LINGER_CLOSE_BOUND: Duration = Duration::from_secs(3);
+pub const LINGER_CLOSE_BOUND: Duration = Duration::from_secs(3);
 
 /// Shut `stream` down — lingering, when it is a [`LingeringClose`] — within
 /// [`LINGER_CLOSE_BOUND`]. The connection is over either way: a close that
 /// fails or runs out of time has no one left to report to.
-pub(crate) async fn close_within_bound<S: AsyncWrite + Unpin>(stream: &mut S) {
+pub async fn close_within_bound<S: AsyncWrite + Unpin>(stream: &mut S) {
     use tokio::io::AsyncWriteExt;
     drop(tokio::time::timeout(LINGER_CLOSE_BOUND, stream.shutdown()).await);
 }
 
 /// A stream whose shutdown lingers: see the module documentation.
-pub(crate) struct LingeringClose<S> {
+pub struct LingeringClose<S> {
     inner: S,
     state: Linger,
 }
@@ -54,7 +54,7 @@ enum Linger {
 }
 
 impl<S> LingeringClose<S> {
-    pub(crate) fn new(inner: S) -> Self {
+    pub fn new(inner: S) -> Self {
         Self {
             inner,
             state: Linger::Open,
@@ -138,14 +138,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
 /// A stream lent out that comes back when the borrower drops it, so its owner
 /// can still close it properly: hyper drops an upgraded connection's stream
 /// without shutting it down.
-pub(crate) struct Reclaimable<S> {
+pub struct Reclaimable<S> {
     inner: Option<S>,
     back: Option<tokio::sync::oneshot::Sender<S>>,
 }
 
 impl<S> Reclaimable<S> {
     /// The stream to lend, and where it comes back.
-    pub(crate) fn new(inner: S) -> (Self, tokio::sync::oneshot::Receiver<S>) {
+    pub fn new(inner: S) -> (Self, tokio::sync::oneshot::Receiver<S>) {
         let (back, reclaim) = tokio::sync::oneshot::channel();
         (
             Self {
