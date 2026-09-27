@@ -84,7 +84,9 @@ jobs:
             runner: ubuntu-24.04-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    # The build, then booting the candidate against PostgreSQL (about two
+    # minutes, most of it the database's start and the stop budget).
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -123,6 +125,16 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
       - name: Verify the direct architecture image
         run: tools/verify-container-shape.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}" "${{ matrix.arch }}"
+      # Run the candidate before anything vouches for it, on its own
+      # architecture's runner: its entrypoint, its unprivileged user, its shared
+      # libraries and a PostgreSQL across a network, up to /healthz, /readyz and
+      # a clean exit on SIGTERM (the boot CI gives its own build of the
+      # Dockerfile), and its binary must name the commit this job built. A
+      # candidate that fails is never attested nor assembled into the manifest.
+      - name: Boot the candidate image against PostgreSQL
+        run: tools/test-production-container.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}"
+      - name: Require the candidate to report the built revision
+        run: tools/check-image-version.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}" "${{ needs.metadata.outputs.revision }}"
       # The action downloads syft from GitHub releases on every run; one HTTP
       # 500 there failed the release of b532432c5894. One retry; the Rust-crate
       # check below still fails the job if neither attempt wrote an SBOM.
@@ -300,6 +312,11 @@ jobs:
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # The daemon reports the commit it was built from (`e6ircd --version` and
+    # the e6irc_build_info metric), as the image's does; without this a native
+    # release would say `unknown`.
+    env:
+      E6IRC_BUILD_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # A release is built from a clean slate with the compiler the image uses:
@@ -324,6 +341,11 @@ jobs:
         run: cargo auditable build --locked -p e6ircd --release --all-features --target ${{ matrix.target }}
       - name: Build native clients
         run: cargo auditable build --locked -p e6irc-cli -p e6irc-tui --profile release-client --target ${{ matrix.target }}
+      # Compiling for a target proves nothing about whether its binary starts:
+      # execute each one here, on the target's own runner (Windows ARM and
+      # macOS included), and require it to name the version and commit built.
+      - name: Execute every binary on this target's runner
+        run: python tools/smoke-native-release.py --target ${{ matrix.target }} --revision ${{ github.sha }}
       - name: Package deterministic archive
         run: python tools/package-native-release.py --target ${{ matrix.target }}
       - name: Attest archive provenance

@@ -416,6 +416,8 @@ jobs:
       # a ready /readyz, and a clean exit on SIGTERM inside the stop budget.
       - name: Boot the built image against PostgreSQL
         run: tools/test-production-container.sh e6irc:ci
+      - name: Require the image to report the built revision
+        run: tools/check-image-version.sh e6irc:ci "${{ github.sha }}"
       # The same SBOM generator release.yml attests with; the binary is built
       # with cargo auditable, so its Rust crates must appear in it.
       # One retry for the action's syft download (see release.yml); the check

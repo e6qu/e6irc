@@ -5146,7 +5146,14 @@ Layers, bottom to top:
   shipped build passes `--locked`
   (`tools/check-locked-builds.sh`); native releases build with
   `rust-toolchain.toml`'s Rust, the one the image carries
-  (`tools/check-release-toolchain.sh`), and no restored cache. The
+  (`tools/check-release-toolchain.sh`), and no restored cache. Nothing is
+  released unexecuted: each architecture's candidate image is booted against
+  PostgreSQL on its own runner (`tools/test-production-container.sh`) and must
+  report the commit it was built from (`e6ircd --version`,
+  `tools/check-image-version.sh`) before it is attested or assembled, and
+  every native binary runs `--version` on its target's own runner — Windows
+  ARM and macOS included — and must name the version and commit built before
+  it is packaged (`tools/smoke-native-release.py`). The
   assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.

@@ -45,26 +45,26 @@ def release_target(value: str) -> str:
     return value
 
 
-def source_files(
-    target: str, target_directory: pathlib.Path
-) -> tuple[tuple[str, pathlib.Path, int], ...]:
+def executables(target: str, target_directory: pathlib.Path) -> tuple[tuple[str, pathlib.Path], ...]:
+    """Each shipped binary's archive name and built path. The packager and
+    tools/smoke-native-release.py both read this one list, so a binary cannot
+    be packaged without being the one the release job executed."""
     suffix = ".exe" if "windows" in target else ""
     return (
-        (
-            f"e6ircd{suffix}",
-            target_directory / target / "release" / f"e6ircd{suffix}",
-            0o755,
-        ),
-        (
-            f"e6irc{suffix}",
-            target_directory / target / "release-client" / f"e6irc{suffix}",
-            0o755,
-        ),
+        (f"e6ircd{suffix}", target_directory / target / "release" / f"e6ircd{suffix}"),
+        (f"e6irc{suffix}", target_directory / target / "release-client" / f"e6irc{suffix}"),
         (
             f"e6irc-tui{suffix}",
             target_directory / target / "release-client" / f"e6irc-tui{suffix}",
-            0o755,
         ),
+    )
+
+
+def source_files(
+    target: str, target_directory: pathlib.Path
+) -> tuple[tuple[str, pathlib.Path, int], ...]:
+    return (
+        *((name, path, 0o755) for name, path in executables(target, target_directory)),
         *((name, path, 0o644) for name, path in DOCUMENTS),
     )
 
