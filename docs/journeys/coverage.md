@@ -110,12 +110,12 @@ budget, phase, and closed-outcome evidence for stricter tuned-host campaigns.
 
 ### Redeploy without dropping connections
 
-A design target, not current behavior: DESIGN §1 and §21 set the goal that a
+A design target, not current behavior: DESIGN §1 and §19 set the goal that a
 core redeploy, handover or crash takeover keeps every client connection open,
 through the edge tier `PLAN.md` builds in phases. Today every restart and
 takeover closes each client connection with its `ERROR`, as "Restart without
 losing durable state" describes. No journey claims the outcome yet, because
-no evidence exists; the zero-drop suite (DESIGN §21.11) grows with each phase,
+no evidence exists; the zero-drop suite (DESIGN §19.11) grows with each phase,
 and the journey that states the outcome with that suite as its evidence
 arrives with the deployment phase.
 

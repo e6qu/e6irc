@@ -670,7 +670,7 @@ one task receives from, as `e6irc-queue` is.
 ## Edge tier
 
 The connection-holding tier that lets the serving process be replaced without
-closing a client connection (DESIGN §21).
+closing a client connection (DESIGN §19).
 
 **Edge** — a process (`e6ircd edge`, or the same code in process) that holds
 client sockets and speaks the core link. It interprets nothing past framing,
@@ -782,7 +782,15 @@ edge can hand it over.
 
 **Warm standby** — a standby core holding read-only **observer links** to the
 edges, receiving every record and replica as it is written, so a takeover
-uploads only what changed.
+uploads only what changed. Edges find standbys through the **standby
+registry**: a row per standby beside the serving lease, naming its
+observer-link address, heartbeated and expiring as the lease is; the holder
+pushes the current list to its edges.
+
+**Directory key** — the monotonic number the core allocates each session at
+`Open`, which the connection directory pages by, so a walk never misses a
+connection opened on another edge. The slot-prefixed connection identifier
+stays the session's wire identity and carries no order across edges.
 
 **PROXY protocol / PROXY** — the header a TCP load balancer prepends to a
 connection to pass on the client's address (version 2 is binary). An edge

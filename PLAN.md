@@ -1518,20 +1518,20 @@ Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
 ## Edge tier
 
 Goal: e6irc deploys and redeploys without dropping a client connection
-(DESIGN §1, §21). A connection-holding edge (`e6ircd edge`) holds client
+(DESIGN §1, §19). A connection-holding edge (`e6ircd edge`) holds client
 sockets and the core's records of them; the core, the serving-lease holder,
 can then be replaced gracefully or after a crash while every socket stays
 open. The phases run in order, each on the one open pull request of its
 time, and each lands green on its own: it builds in every feature
 configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
-fuzz type-check all pass, and DESIGN §21.9's rewrites for that phase land
+fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
 Status: phase 0 done; phase 1 is the next to build; every other phase is
 scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
-  tier's invariants), §21 (the design and its settled decisions), a §18
+  tier's invariants), §19 (the design and its settled decisions), a §18
   cross-reference, and the glossary's "Edge tier" terms. *Green because*
   documentation only; the terminology, no-deferral and journey guards pass.
 - **Phase 1 — extract `e6irc-edge`.** Move accept, the TLS acceptor and
@@ -1553,9 +1553,13 @@ scheduled in the order below.
   `e6ircd edge-credentials`; the epoch fence; `/readyz`-based discovery; HTTP
   proxying and upgrade authorization; edge configuration from `Welcome`; the
   `core_edges` roster; the PROXY protocol version 2 on edge listeners; the
-  `Hello` role field, with the observer role refused loudly by name. A core
+  `Hello` role field, with the observer role refused loudly by name; the
+  connection directory paged by a monotonic directory key the core allocates
+  at `Open` (re-allocated in the records' original order at a rebuild), with
+  `ConnectionIdAllocator` and `LiveConnectionQuery` documented as promising a
+  unique, never reused, unpredictable wire identity and no order. A core
   restart still closes sessions, loudly (`ERROR … (server restarting)`), and
-  so does a link reset. DESIGN §4, §8, §17. *Green because* behaviour is
+  so does a link reset. DESIGN §4, §8, §9.4, §17. *Green because* behaviour is
   identical except for the process boundary, and the first process-level
   tests run on Linux, macOS and Windows.
 - **Phase 4 — graceful rebuild.** Session records, channel replicas,
@@ -1572,9 +1576,14 @@ scheduled in the order below.
   database-outage hold. *Green because* a crash becomes drop-free, with the
   zero-drop suite's crash scenarios asserting losses equal the reported
   counts.
-- **Phase 5b — warm standby.** Standbys hold observer links and receive every
+- **Phase 5b — warm standby.** A standby registry beside the lease: each
+  standby records its observer-link address in a row heartbeated and expiring
+  as the lease is, announced on change. The holder pushes the current standby
+  list to its edges over the core link (`Welcome` and on each change), and
+  edges dial observers from it, with no operator configuration naming a
+  standby under systemd, containers or Kubernetes. Standbys receive every
   record and replica as written; at `Hello{cut}` the new core fetches only
-  the revisions that differ, so the upload leaves the gap. *Green because*
+  the revisions that differ, so the upload leaves the gap. DESIGN §8, §18. *Green because*
   the observer role is additive (a standby without it still takes over by
   full upload, the phase 5 path), and the zero-drop suite runs its graceful
   and crash scenarios both with and without a warm standby, recording the
@@ -1604,7 +1613,7 @@ scheduled in the order below.
   outcome (`docs/journeys/`). *Green because* documentation, guards and
   measurement.
 
-Maintainer decisions for the edge tier (DESIGN §21.10), every recommendation
+Maintainer decisions for the edge tier (DESIGN §19.10), every recommendation
 of the design adopted:
 
 - **D1** `e6ircd edge` subcommand over a database-free `e6irc-edge` crate.
@@ -1635,7 +1644,22 @@ of the design adopted:
   clients.
 - **D17** The edge proxies all HTTP.
 - **D18** The warm standby is phase 5b, right after crash takeover, with the
-  observer role reserved in `Hello` in phase 3.
+  observer role reserved in `Hello` in phase 3; standbys are found through a
+  standby registry beside the lease that the holder pushes to its edges.
+
+Maintainer answers to the phase 0 review:
+
+- **Replay marking.** The core marks accumulating lines *retained for replay*
+  in the acknowledgement; the edge replays exactly those and never reads a
+  payload (DESIGN §2, §19.2).
+- **Standby discovery** is the standby registry, not operator configuration
+  (DESIGN §19.8, phase 5b).
+- **Connection-directory order.** A directory walk that can miss a live
+  connection is a bug: the directory pages by a core-allocated monotonic
+  directory key, and the slot-prefixed identifier is only the wire identity
+  (DESIGN §2, §19.2, phase 3).
+- **PROXY protocol version 2** lands in phase 3; **`e6ircd stop
+  --handover|--final`** lands in phase 4.
 
 ## Remaining qualification
 
