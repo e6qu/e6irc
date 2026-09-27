@@ -6097,9 +6097,12 @@ preference:
 ### 19.7 Serving lease, followers and the database-outage hold
 
 - **The lease keeps its role** (§18): it decides which core serves. The edge
-  adds the epoch fence (§19.2). A core whose lease ended (`LeaseEnd::Taken` or
-  `Fenced`) stops talking to edges — it never closes clients — and its links
-  are superseded by the new epoch. The critical-failure path becomes a stop
+  adds the epoch fence (§19.2). A core whose lease ended (`LeaseEnd::Taken`:
+  a renewal found another holder) stops talking to edges — it never closes
+  clients — and its links are superseded by the new epoch. A core fenced for
+  want of a confirmed renewal (`LeaseStanding::Unconfirmed`, §18) has not
+  lost the lease: it keeps its links and serves from hot state until a
+  renewal says which. The critical-failure path becomes a stop
   without a cut; the next holder rebuilds as after a crash.
 - **Announcement followers** (`follow_announcements`: settings, credentials,
   lease) run per core and restart with it; each re-reads its table at its
@@ -6108,8 +6111,11 @@ preference:
   they take their configuration from `Welcome` and its updates.
 - **The database-outage hold** (§18: the holder keeps its connections through
   a database outage unless it is taken over) composes with the edges. While
-  the database is down no standby can take the lease, and edges are
-  unaffected. A takeover after the database returns no longer drops clients:
+  the database is down for every process no standby can take the lease, and
+  edges are unaffected; in a split where only the holder is cut off, a
+  standby takes the expired lease and the edges' epoch fence moves them to it
+  at once, instead of the old holder's clients waiting until it reaches the
+  database again (§18's cost of the hold without edges). A takeover after the database returns no longer drops clients:
   B rebuilds from the edges, which hold the state as the old holder evolved it
   during the outage, including channel changes that lived only in memory.
   What the old holder could not persist follows the hold's own rules, and a
