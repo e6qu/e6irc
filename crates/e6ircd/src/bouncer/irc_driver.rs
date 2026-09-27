@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use e6irc_client::{Connection, NetworkNames, OwnedMessage, RelayEvent};
 
+use super::nick_regain::{NickRegain, NickRegainTiming, alternative_nick};
 use super::replies::{Correlation, ReplyRouter, Upstream};
 use super::upstream_identity::{
     AutojoinChannel, ChannelKey, ConfirmedChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
@@ -49,6 +50,9 @@ pub struct NetworkConfig {
     pub internal_upstreams: crate::egress::InternalUpstreams,
     /// Whether the first dial is held back as one of a boot's many.
     pub first_dial: FirstDial,
+    /// How a session registered under the alternative nickname takes the
+    /// configured one back (see [`super::nick_regain`]).
+    pub nick_regain: NickRegainTiming,
 }
 
 /// When a started driver first dials. A daemon restart starts every stored
@@ -81,6 +85,7 @@ impl Default for NetworkConfig {
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: FirstDial::Immediate,
+            nick_regain: NickRegainTiming::default(),
         }
     }
 }
@@ -435,7 +440,7 @@ pub async fn preflight_irc(
     let registration = register(config, &mut connection);
     let outcome = match tokio::time::timeout_at(deadline, registration).await {
         Ok(Ok(welcomed)) => {
-            configured_nick_was_granted(connection.names(), config.nick.as_str(), welcomed)
+            requested_nick_was_granted(connection.names(), config.nick.as_str(), welcomed)
                 .map_err(|rejection| preflight_refusal(Some(rejection)))
         }
         Ok(Err(error)) => Err(match RegistrationError::classify(error) {
@@ -595,30 +600,31 @@ async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::i
     }
 }
 
-/// The welcomed nickname, when it is the configured one. A server that
-/// truncates to its NICKLEN, or renames on registration, welcomes the
+/// The welcomed nickname, when it is the one requested: the configured one,
+/// or the alternative registration fell back to while it is held. A server
+/// that truncates to its NICKLEN, or renames on registration, welcomes the
 /// connection under a name the owner never chose; running under it would be an
 /// identity invented on their behalf, with whatever channel access and services
 /// relationship that name has. Case is the server's to normalise.
-pub(super) fn configured_nick_was_granted(
+pub(super) fn requested_nick_was_granted(
     names: &NetworkNames,
-    configured: &str,
+    requested: &str,
     welcomed: String,
 ) -> Result<String, e6irc_client::RegistrationRejection> {
-    if names.eq(configured, &welcomed) {
+    if names.eq(requested, &welcomed) {
         Ok(welcomed)
     } else {
         Err(e6irc_client::RegistrationRejection::welcomed_as(
-            configured, &welcomed,
+            requested, &welcomed,
         ))
     }
 }
 
-/// What one bounded registration attempt means to the session loop. A refusal
-/// of the configured nickname is a refusal like any other: the driver never
-/// substitutes a nickname the owner did not choose. It reports the upstream's
-/// reason, retries on the slow refusal schedule in case a ghost of its own
-/// previous session times out, and parks if the nickname stays taken.
+/// What one bounded registration attempt means to the session loop. A taken
+/// nickname reaches this as a refusal only when the alternative was taken too
+/// (the driver offers exactly one, see [`connect_once`]); it is then a refusal
+/// like any other, reported with the upstream's reason, retried on the slow
+/// refusal schedule, and parked on if it persists.
 fn registration_outcome(
     result: Result<Result<String, std::io::Error>, tokio::time::error::Elapsed>,
 ) -> Result<String, super::SessionOutcome> {
@@ -655,7 +661,8 @@ fn preflight_refusal(
         e6irc_client::RegistrationRefusal::InvalidUsername => {
             IrcPreflightFailure::InvalidUsername(Some(rejection))
         }
-        e6irc_client::RegistrationRefusal::NicknameInUse => {
+        e6irc_client::RegistrationRefusal::NicknameInUse
+        | e6irc_client::RegistrationRefusal::NicknameRegainRefused => {
             IrcPreflightFailure::NicknameInUse(Some(rejection))
         }
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
@@ -703,6 +710,11 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         }
         Err(_) => return dropped(super::NetworkFailure::ConnectionTimedOut),
     };
+    // A ghost of this network's own last session — one the upstream never saw
+    // end — holds the configured nickname until the upstream reaps it. The
+    // session registers under the one alternative instead and takes the
+    // configured nickname back before it counts as connected (§10.3).
+    conn.offer_alternative_nick(&alternative_nick(&config.nick));
     let register_fut = register(config, &mut conn);
     let registration = tokio::select! {
         _ = ends.shutdown_signalled() => None,
@@ -717,21 +729,22 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         Ok(welcomed) => welcomed,
         Err(outcome) => return outcome,
     };
-    let current_nick =
-        match configured_nick_was_granted(conn.names(), config.nick.as_str(), welcomed) {
-            Ok(nick) => nick,
-            Err(rejection) => {
-                // Registered, under a name nobody chose: leave as a client would,
-                // or the upstream keeps that session until its ping timeout.
-                say_goodbye(
-                    &mut conn,
-                    "registered under an unconfigured nickname",
-                    "irc driver",
-                )
-                .await;
-                return super::SessionOutcome::RegistrationRejected(rejection);
-            }
-        };
+    let registered_as = conn.alternative_nick_taken().map(str::to_owned);
+    let requested = registered_as.as_deref().unwrap_or(config.nick.as_str());
+    let current_nick = match requested_nick_was_granted(conn.names(), requested, welcomed) {
+        Ok(nick) => nick,
+        Err(rejection) => {
+            // Registered, under a name nobody chose: leave as a client would,
+            // or the upstream keeps that session until its ping timeout.
+            say_goodbye(
+                &mut conn,
+                "registered under an unconfigured nickname",
+                "irc driver",
+            )
+            .await;
+            return super::SessionOutcome::RegistrationRejected(rejection);
+        }
+    };
     let mut identity = SelfIdentity {
         nick: current_nick,
         // `~` because no identd answered; replaced by whatever the upstream
@@ -741,36 +754,35 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             .expect("IRC driver starts only from a validated upstream address")
             .to_string(),
     };
-    // Join the configured autojoin plus every channel the upstream confirmed
-    // us in before the drop (runtime joins are tracked in `shared.joined`),
-    // keyed channels with their keys.
-    let rejoin = shared.joined.rejoin(&config.autojoin);
     // Every line from here on is paced to the upstream's flood allowance.
     let mut pacer = UpstreamPacer::new();
-    // As few lines as the wire allows, each bounded; the whole burst is still
-    // raced against the stop signal so a removal or replacement is not held
-    // behind a slow upstream's worth of them.
-    let rejoined = tokio::select! {
-        _ = ends.shutdown_signalled() => None,
-        result = async {
-            for line in join_lines(&rejoin) {
-                pacer.write(&mut conn, &line).await?;
-            }
-            Ok::<(), std::io::Error>(())
-        } => Some(result),
-    };
-    match rejoined {
-        None => {
-            say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
-            return super::SessionOutcome::Stopped;
-        }
-        Some(Err(_)) => return dropped(super::NetworkFailure::AutojoinFailed),
-        Some(Ok(())) => {}
-    }
     let mut upstream = UpstreamCapabilities::of(&conn);
     ends.set_client_tags(upstream.client_tags());
     ends.begin_irc_session(identity.nick.clone());
-    ends.emit(ConnectionEvent::Connected);
+    let mut requested_nicks = RequestedNicks::default();
+    let mut regain = match registered_as {
+        Some(alternative) => {
+            ends.emit(ConnectionEvent::RegainingNickname(
+                super::NicknameRegain::new(&alternative, config.nick.as_str()),
+            ));
+            // The rename back is asked for, whether the driver's own `NICK`
+            // or NickServ's `REGAIN` makes it: not one forced on the owner.
+            requested_nicks.observe(&format!("NICK {}", config.nick));
+            Some(NickRegain::new(
+                config.nick.as_str(),
+                &alternative,
+                conn.sasl_mechanism().is_some(),
+                config.nick_regain,
+                tokio::time::Instant::now(),
+            ))
+        }
+        None => {
+            if let Some(outcome) = come_online(shared, ends, &mut conn, &mut pacer).await {
+                return outcome;
+            }
+            None
+        }
+    };
     // The mechanism is the client's choice among what the network offered, so
     // the owner is told which one carried the password — and which ones the
     // network refused before any credential was sent, so a weaker one that is
@@ -785,8 +797,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         ));
     }
     let mut echoes = UpstreamEchoes::default();
-    let mut requested_nicks = RequestedNicks::default();
     let mut router = ReplyRouter::default();
+    // While the nickname is being regained no command is read, so the stop
+    // that `next_command` would carry is watched on its own.
+    let mut stop = std::pin::pin!(ends.stop_signal());
 
     // Keepalive: `connect_once` bounds connect + registration, but the
     // steady-state read below would otherwise block forever on a half-open
@@ -807,8 +821,23 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         // in the shared queue until a token is back; the upstream's lines keep
         // flowing.
         let blocked = pacer.blocked_until(tokio::time::Instant::now());
+        let regain_wake = regain.as_ref().map(NickRegain::wake);
         tokio::select! {
             () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
+            () = tokio::time::sleep_until(regain_wake.unwrap_or_else(tokio::time::Instant::now)), if regain_wake.is_some() => {
+                let regaining = regain.as_mut().expect("a wake is set only while regaining");
+                let step = regaining.on_tick(
+                    tokio::time::Instant::now(),
+                    &ends.upstream_features().isupport,
+                );
+                if let Some(outcome) = follow_regain(step, &mut conn, &mut pacer).await {
+                    return outcome;
+                }
+            }
+            () = &mut stop, if regain.is_some() => {
+                say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
+                return super::SessionOutcome::Stopped;
+            }
             // Upstream -> buffer + event.
             msg = silence.bound(conn.next_line_relayable()) => match msg {
                 Some(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
@@ -860,6 +889,21 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         }
                         None => {}
                     }
+                    if let Some(regaining) = regain.as_mut() {
+                        let step = regaining.on_line(
+                            &message,
+                            conn.names(),
+                            &ends.upstream_features().isupport,
+                            tokio::time::Instant::now(),
+                        );
+                        let consumed = step.consumed;
+                        if let Some(outcome) = follow_regain(step, &mut conn, &mut pacer).await {
+                            return outcome;
+                        }
+                        if consumed {
+                            continue;
+                        }
+                    }
                     follow_membership(ends, &shared.joined, &message, conn.names());
                     match router.classify(&message, raw, conn.names(), &identity.nick, std::time::Instant::now()) {
                         // A correlation PING's answer closes what came before
@@ -881,6 +925,21 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                             if track(ends, &shared.joined, &mut identity, &mut requested_nicks, emitted).is_err() {
                                 return dropped(super::NetworkFailure::ChannelLimitExceeded);
                             }
+                        }
+                    }
+                    // The configured nickname is back: the session is what
+                    // the owner configured, and connects as any other does.
+                    if let Some(regaining) = regain.as_ref()
+                        && conn.names().eq(&identity.nick, regaining.configured())
+                    {
+                        for line in regaining.finished() {
+                            if pacer.write(&mut conn, &line).await.is_err() {
+                                return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                            }
+                        }
+                        regain = None;
+                        if let Some(outcome) = come_online(shared, ends, &mut conn, &mut pacer).await {
+                            return outcome;
                         }
                     }
                 }
@@ -913,7 +972,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                 }
             },
             // Downstream command -> upstream.
-            cmd = ends.next_command(), if blocked.is_none() => match cmd {
+            // Nothing an attached client sends goes out under the
+            // alternative nickname: it waits for the configured one.
+            cmd = ends.next_command(), if blocked.is_none() && regain.is_none() => match cmd {
                 Some(cmd) => {
                     let Some(line) = outgoing(&cmd, upstream.client_tags(), ends, &shared.joined) else {
                         continue;
@@ -961,6 +1022,66 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             },
         }
     }
+}
+
+/// Join the configured autojoin plus every channel the upstream confirmed us
+/// in before the drop (runtime joins are tracked in `shared.joined`), keyed
+/// channels with their keys, and say the network is connected. `Some` is how
+/// the session ended instead: stopped during the burst, or a write failed.
+async fn come_online(
+    shared: &SharedDriver,
+    ends: &mut DriverEnds,
+    conn: &mut Connection,
+    pacer: &mut UpstreamPacer,
+) -> Option<super::SessionOutcome> {
+    let rejoin = shared.joined.rejoin(&shared.config.autojoin);
+    // As few lines as the wire allows, each bounded; the whole burst is still
+    // raced against the stop signal so a removal or replacement is not held
+    // behind a slow upstream's worth of them.
+    let rejoined = tokio::select! {
+        _ = ends.shutdown_signalled() => None,
+        result = async {
+            for line in join_lines(&rejoin) {
+                pacer.write(conn, &line).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        } => Some(result),
+    };
+    match rejoined {
+        None => {
+            say_goodbye(conn, STOPPED_GOODBYE, "irc driver").await;
+            Some(super::SessionOutcome::Stopped)
+        }
+        Some(Err(_)) => Some(dropped(super::NetworkFailure::AutojoinFailed)),
+        Some(Ok(())) => {
+            ends.emit(ConnectionEvent::Connected);
+            None
+        }
+    }
+}
+
+/// Write what a step of the nickname's regain asks for; `Some` is how the
+/// session ends: the nickname is not coming back (said with `QUIT`, so the
+/// alternative leaves no ghost of its own), or a write failed.
+async fn follow_regain(
+    step: super::nick_regain::Step,
+    conn: &mut Connection,
+    pacer: &mut UpstreamPacer,
+) -> Option<super::SessionOutcome> {
+    for line in &step.send {
+        if pacer.write(conn, line).await.is_err() {
+            return Some(dropped(super::NetworkFailure::UpstreamWriteFailed));
+        }
+    }
+    let rejection = step.refused?;
+    eprintln!("irc driver: nickname not regained: {rejection:?}");
+    say_goodbye(
+        conn,
+        "the configured nickname could not be regained",
+        "irc driver",
+    )
+    .await;
+    Some(super::SessionOutcome::RegistrationRejected(rejection))
 }
 
 /// Most lines the driver writes to an upstream back to back. An upstream

@@ -103,11 +103,17 @@ account never worked from the chat client, and what a rejected account then did:
   credentials kept reading "connected". There is one list, re-read every ten
   seconds, that quotes the upstream's own reason beside the settings control.
 
-The driver no longer answers a taken nickname by silently registering as
-`nick_` (and only when SASL was off). It offers the configured nickname only,
-reports the refusal with the upstream's text, retries on the refusal schedule
-so a ghost of its own session can time out, and parks if the nickname stays
-taken.
+The driver no longer answers a taken nickname by silently running as `nick_`
+(and only when SASL was off). A taken nickname is treated as a possible ghost
+of the network's own session (a crash, a standby's takeover, a link that died
+without `QUIT`): the driver registers under one alternative, is
+`regaining_nickname` ("connected as bncbot_, regaining bncbot") rather than
+connected, joins and sends nothing, and takes the configured nickname back —
+NickServ `REGAIN` with SASL, and `MONITOR` or `ISON` otherwise. A definite
+services refusal parks it at once; a holder that outlasts five minutes, or an
+alternative that is taken too, is the `nickname_in_use` refusal on its
+schedule. The CSRF token's key is derived from the master secret key, so open
+pages keep posting across a restart and a standby's takeover.
 
 The chat client's network dialog does not gate saving on a connection test:
 **Test connection** is an optional diagnostic that says `QUIT` when it is done.

@@ -331,6 +331,7 @@ fn configured_driver(
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
             internal_upstreams,
             first_dial: super::FirstDial::Immediate,
+            nick_regain: super::NickRegainTiming::default(),
         };
         return Ok(Box::new(super::LocalDriver::new(core.clone(), config)));
     }
@@ -993,6 +994,7 @@ impl MutationLane {
             Some(
                 super::NetworkLifecycle::Connecting
                 | super::NetworkLifecycle::Connected
+                | super::NetworkLifecycle::RegainingNickname
                 | super::NetworkLifecycle::Reconnecting,
             ) => Ok(false),
             Some(

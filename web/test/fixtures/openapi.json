@@ -4273,10 +4273,11 @@
                                         "type": "array"
                                       },
                                       "state": {
-                                        "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
+                                        "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                                         "enum": [
                                           "connecting",
                                           "connected",
+                                          "regaining_nickname",
                                           "reconnecting",
                                           "authentication_failed",
                                           "registration_failed",
@@ -4530,10 +4531,11 @@
                                         "type": "array"
                                       },
                                       "state": {
-                                        "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
+                                        "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                                         "enum": [
                                           "connecting",
                                           "connected",
+                                          "regaining_nickname",
                                           "reconnecting",
                                           "authentication_failed",
                                           "registration_failed",
@@ -8422,10 +8424,11 @@
                                     "type": "array"
                                   },
                                   "state": {
-                                    "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
+                                    "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                                     "enum": [
                                       "connecting",
                                       "connected",
+                                      "regaining_nickname",
                                       "reconnecting",
                                       "authentication_failed",
                                       "registration_failed",
@@ -9156,10 +9159,11 @@
                               "type": "array"
                             },
                             "state": {
-                              "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
+                              "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                               "enum": [
                                 "connecting",
                                 "connected",
+                                "regaining_nickname",
                                 "reconnecting",
                                 "authentication_failed",
                                 "registration_failed",
@@ -10032,10 +10036,11 @@
                               "type": "array"
                             },
                             "state": {
-                              "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
+                              "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                               "enum": [
                                 "connecting",
                                 "connected",
+                                "regaining_nickname",
                                 "reconnecting",
                                 "authentication_failed",
                                 "registration_failed",

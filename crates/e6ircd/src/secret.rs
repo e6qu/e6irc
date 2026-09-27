@@ -133,6 +133,86 @@ impl SecretKeyring {
     }
 }
 
+impl SecretKeyring {
+    /// The keys for `purpose` derived from every configured key, the
+    /// primary's first: what the primary derives is what is issued, and what
+    /// a previous key derives is still accepted, exactly as sealing reads
+    /// either generation during a rotation.
+    pub fn derive(&self, purpose: DerivedKeyPurpose) -> DerivedKeys {
+        DerivedKeys {
+            primary: self.primary.derive(purpose),
+            previous: self
+                .previous
+                .iter()
+                .map(|key| key.derive(purpose))
+                .collect(),
+        }
+    }
+}
+
+/// What a key derived from the master key is used for. Each purpose is its own
+/// HKDF `info`, so no derived key equals another purpose's or the master key
+/// itself, and learning one reveals nothing about the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedKeyPurpose {
+    /// The HMAC key of the session-bound token every server-rendered form
+    /// carries.
+    FormCsrf,
+}
+
+impl DerivedKeyPurpose {
+    const fn info(self) -> &'static [u8] {
+        match self {
+            Self::FormCsrf => b"e6irc v1 form csrf token",
+        }
+    }
+}
+
+/// Keys derived for one [`DerivedKeyPurpose`]: `primary` issues, and `primary`
+/// or any `previous` one is accepted. Every process configured with the same
+/// master keys holds the same set, so what one issued another accepts — across
+/// a restart, and across a standby's takeover. Wiped when dropped, like the
+/// keys they come from.
+pub struct DerivedKeys {
+    primary: [u8; KEY_LEN],
+    previous: Vec<[u8; KEY_LEN]>,
+}
+
+impl Drop for DerivedKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.primary.zeroize();
+        for key in &mut self.previous {
+            key.zeroize();
+        }
+    }
+}
+
+impl DerivedKeys {
+    /// A key of this process's own, for a deployment with no master key:
+    /// nothing it issues outlives the process.
+    pub fn random() -> Self {
+        let mut primary = [0u8; KEY_LEN];
+        SystemRandom::new()
+            .fill(&mut primary)
+            .expect("system RNG must produce key bytes");
+        Self {
+            primary,
+            previous: Vec::new(),
+        }
+    }
+
+    /// The key new values are issued under.
+    pub fn primary(&self) -> &[u8; KEY_LEN] {
+        &self.primary
+    }
+
+    /// Every key a value may have been issued under, the primary first.
+    pub fn accepted(&self) -> impl Iterator<Item = &[u8; KEY_LEN]> {
+        std::iter::once(&self.primary).chain(&self.previous)
+    }
+}
+
 impl std::error::Error for SecretError {}
 
 /// True when `value` is a sealed blob (and so needs a key to open), of either
@@ -202,6 +282,19 @@ impl SecretKey {
     /// The key as base64, for writing to a key file.
     pub fn to_base64(&self) -> String {
         e6irc_proto::base64::encode(&self.0)
+    }
+
+    /// HKDF-SHA256 (RFC 5869) of this key, with no salt and `purpose`'s info.
+    fn derive(&self, purpose: DerivedKeyPurpose) -> [u8; KEY_LEN] {
+        use aws_lc_rs::hkdf::{HKDF_SHA256, Salt};
+        let mut derived = [0u8; KEY_LEN];
+        Salt::new(HKDF_SHA256, &[])
+            .extract(&self.0)
+            .expand(&[purpose.info()], HKDF_SHA256)
+            .expect("32 bytes is a valid HKDF-SHA256 output length")
+            .fill(&mut derived)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        derived
     }
 
     fn aead(&self) -> LessSafeKey {
@@ -410,6 +503,51 @@ mod tests {
         assert_eq!(ring.open(&old_blob, CTX).unwrap(), "before");
         let new_blob = ring.seal("after", CTX);
         assert_eq!(primary_copy.open(&new_blob, CTX).unwrap(), "after");
+    }
+
+    /// The derivation is HKDF-SHA256 with no salt, as RFC 5869 defines it:
+    /// computed here by hand from HMAC, so a change of algorithm, salt or
+    /// info string (which would invalidate every form open in a browser at
+    /// the next deploy) cannot pass unnoticed.
+    #[test]
+    fn a_derived_key_is_hkdf_sha256_of_the_master_key() {
+        use aws_lc_rs::hmac;
+        let key = SecretKey::generate();
+        let prk = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &[0u8; 32]), &key.0);
+        let mut block = DerivedKeyPurpose::FormCsrf.info().to_vec();
+        block.push(1);
+        let okm = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, prk.as_ref()), &block);
+        assert_eq!(key.derive(DerivedKeyPurpose::FormCsrf), okm.as_ref());
+        assert_ne!(key.derive(DerivedKeyPurpose::FormCsrf), key.0);
+    }
+
+    /// Two processes given the same keys derive the same set; a rotated ring
+    /// issues under the new key and still accepts what the old one derived.
+    #[test]
+    fn derived_keys_follow_the_keyring_across_processes_and_rotation() {
+        let old = SecretKey::generate();
+        let copy = |key: &SecretKey| SecretKey::from_base64(&key.to_base64()).unwrap();
+        let first = SecretKeyring::single(copy(&old)).derive(DerivedKeyPurpose::FormCsrf);
+        let second = SecretKeyring::single(copy(&old)).derive(DerivedKeyPurpose::FormCsrf);
+        assert_eq!(first.primary(), second.primary());
+
+        let new = SecretKey::generate();
+        let rotated = SecretKeyring::new(copy(&new), vec![copy(&old)])
+            .unwrap()
+            .derive(DerivedKeyPurpose::FormCsrf);
+        assert_eq!(
+            rotated.primary(),
+            SecretKeyring::single(new)
+                .derive(DerivedKeyPurpose::FormCsrf)
+                .primary()
+        );
+        let accepted: Vec<_> = rotated.accepted().collect();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[1], first.primary());
+
+        let random = DerivedKeys::random();
+        assert_ne!(random.primary(), DerivedKeys::random().primary());
+        assert_eq!(random.accepted().count(), 1);
     }
 
     #[test]

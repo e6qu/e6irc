@@ -920,6 +920,7 @@ pub(super) async fn preflight_network_core(
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
         internal_upstreams,
         first_dial: crate::bouncer::FirstDial::Immediate,
+        nick_regain: crate::bouncer::NickRegainTiming::default(),
     };
     // Below the request deadline, so the test's own typed timeout is what the
     // caller reads rather than a generic "request timed out".

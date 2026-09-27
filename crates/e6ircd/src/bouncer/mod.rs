@@ -37,6 +37,7 @@ mod irc_driver;
 mod local_driver;
 #[cfg(feature = "matrix")]
 mod matrix;
+mod nick_regain;
 mod replies;
 mod serve;
 #[cfg(feature = "slack")]
@@ -53,6 +54,7 @@ pub use irc_driver::{
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
+pub use nick_regain::NickRegainTiming;
 pub use serve::{ConfiguredNetwork, DriverStops, NetworkStatus, Registry};
 pub(crate) use serve::{
     ConfiguredNetworkHeld, MutationLane, RegistryRefusal, UnwrittenLines, bnc_serve,
@@ -402,6 +404,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
                 internal_upstreams,
                 first_dial,
+                nick_regain: NickRegainTiming::default(),
             })))
         }
         NetworkKind::Local => {
@@ -3275,6 +3278,8 @@ impl IrcSessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverConnectionStatus {
     Connected,
+    /// Registered under an alternative nickname; not connected.
+    RegainingNickname,
     Reconnecting(NetworkFailure),
     AuthenticationFailed,
     RegistrationFailed(NetworkFailure),
@@ -3284,6 +3289,7 @@ impl DriverConnectionStatus {
     pub const fn lifecycle(self) -> NetworkLifecycle {
         match self {
             Self::Connected => NetworkLifecycle::Connected,
+            Self::RegainingNickname => NetworkLifecycle::RegainingNickname,
             Self::Reconnecting(_) => NetworkLifecycle::Reconnecting,
             Self::AuthenticationFailed => NetworkLifecycle::AuthenticationFailed,
             Self::RegistrationFailed(_) => NetworkLifecycle::RegistrationFailed,
@@ -3293,6 +3299,7 @@ impl DriverConnectionStatus {
     pub const fn failure(self) -> Option<NetworkFailure> {
         match self {
             Self::Connected => None,
+            Self::RegainingNickname => Some(NetworkFailure::NicknameInUse),
             Self::Reconnecting(failure) | Self::RegistrationFailed(failure) => Some(failure),
             Self::AuthenticationFailed => Some(NetworkFailure::AuthenticationRejected),
         }
@@ -3302,6 +3309,11 @@ impl DriverConnectionStatus {
 fn status_notice(status: DriverConnectionStatus) -> String {
     match status {
         DriverConnectionStatus::Connected => ":*bnc* NOTICE * :upstream connected".to_string(),
+        DriverConnectionStatus::RegainingNickname => format!(
+            ":*bnc* NOTICE * :upstream regaining the configured nickname: {} ({})",
+            NetworkFailure::NicknameInUse.summary(),
+            NetworkFailure::NicknameInUse.code()
+        ),
         DriverConnectionStatus::Reconnecting(failure) => format!(
             ":*bnc* NOTICE * :upstream reconnecting: {} ({})",
             failure.summary(),
@@ -3348,6 +3360,10 @@ pub struct ClientCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connected,
+    /// The configured nickname was in use, so the session registered under
+    /// an alternative and is taking the configured one back (§10.3). It is
+    /// not connected: nothing is joined or sent under the alternative.
+    RegainingNickname(NicknameRegain),
     /// A classified transient failure ended the current attempt; another
     /// attempt follows. Carrying the reason makes an unclassified disconnect
     /// impossible for every driver using the public SPI.
@@ -3368,6 +3384,28 @@ pub enum ConnectionEvent {
     /// shares the registration-failed lifecycle: both mean "this network's
     /// settings do not work against this upstream".
     ConfigurationFailed(ConfigurationRefusal),
+}
+
+/// A session registered under an alternative nickname while it takes the
+/// configured one back: who it is and who it is waiting to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NicknameRegain {
+    diagnostic: String,
+}
+
+impl NicknameRegain {
+    pub fn new(registered_as: &str, configured: &str) -> Self {
+        Self {
+            diagnostic: e6irc_client::bounded_diagnostic(&format!(
+                "connected as {registered_as}, regaining {configured}"
+            )),
+        }
+    }
+
+    /// "connected as <alternative>, regaining <configured>".
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -3422,6 +3460,9 @@ pub struct NetworkHistory {
 pub enum NetworkLifecycle {
     Connecting,
     Connected,
+    /// Registered under an alternative nickname, taking the configured one
+    /// back ([`ConnectionEvent::RegainingNickname`]).
+    RegainingNickname,
     Reconnecting,
     AuthenticationFailed,
     RegistrationFailed,
@@ -3438,6 +3479,7 @@ impl NetworkLifecycle {
         match self {
             Self::Connecting => "connecting",
             Self::Connected => "connected",
+            Self::RegainingNickname => "regaining_nickname",
             Self::Reconnecting => "reconnecting",
             Self::AuthenticationFailed => "authentication_failed",
             Self::RegistrationFailed => "registration_failed",
@@ -3478,6 +3520,9 @@ pub enum NetworkFailure {
     InvalidNickname,
     InvalidUsername,
     NicknameInUse,
+    /// Services refused to hand the configured nickname back: it is
+    /// registered to another account.
+    NicknameRegainRefused,
     /// 464 after the configured server password was sent.
     ServerPasswordRejected,
     /// 464 with no server password configured.
@@ -3528,6 +3573,7 @@ impl NetworkFailure {
             Self::InvalidNickname => "invalid_nickname",
             Self::InvalidUsername => "invalid_username",
             Self::NicknameInUse => "nickname_in_use",
+            Self::NicknameRegainRefused => "nickname_regain_refused",
             Self::ServerPasswordRejected => "server_password_rejected",
             Self::ServerPasswordRequired => "server_password_required",
             Self::NetworkBanned => "network_banned",
@@ -3568,6 +3614,9 @@ impl NetworkFailure {
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
             Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
+            Self::NicknameRegainRefused => {
+                "The configured nickname belongs to another account; the network will not hand it back."
+            }
             Self::ServerPasswordRejected => "The network rejected the configured server password.",
             Self::ServerPasswordRequired => {
                 "The network requires a server password, which this network configuration does not supply."
@@ -3735,6 +3784,8 @@ enum FailureDisposition {
     Retry {
         next_attempt_in: Option<std::time::Duration>,
     },
+    /// Registered, but under an alternative nickname: not a connection yet.
+    RegainingNickname,
     Terminal(TerminalNetworkLifecycle),
 }
 
@@ -3762,6 +3813,9 @@ enum NetworkRuntimePhase {
     Connected {
         connected_at: e6irc_proto::time::Millis,
     },
+    /// Registered under an alternative nickname, taking the configured one
+    /// back; not connected.
+    RegainingNickname,
     Terminal(TerminalNetworkLifecycle),
     /// Stopped by its owner's account lifecycle; the driver is gone.
     Held(OwnerHold),
@@ -3773,6 +3827,7 @@ impl NetworkRuntimePhase {
             Self::Connecting => NetworkLifecycle::Connecting,
             Self::Reconnecting { .. } => NetworkLifecycle::Reconnecting,
             Self::Connected { .. } => NetworkLifecycle::Connected,
+            Self::RegainingNickname => NetworkLifecycle::RegainingNickname,
             Self::Terminal(lifecycle) => lifecycle.lifecycle(),
             Self::Held(hold) => hold.lifecycle(),
         }
@@ -3781,16 +3836,22 @@ impl NetworkRuntimePhase {
     const fn next_retry_at(self) -> Option<e6irc_proto::time::Millis> {
         match self {
             Self::Reconnecting { next_retry_at } => next_retry_at,
-            Self::Connecting | Self::Connected { .. } | Self::Terminal(_) | Self::Held(_) => None,
+            Self::Connecting
+            | Self::Connected { .. }
+            | Self::RegainingNickname
+            | Self::Terminal(_)
+            | Self::Held(_) => None,
         }
     }
 
     const fn connected_at(self) -> Option<e6irc_proto::time::Millis> {
         match self {
             Self::Connected { connected_at } => Some(connected_at),
-            Self::Connecting | Self::Reconnecting { .. } | Self::Terminal(_) | Self::Held(_) => {
-                None
-            }
+            Self::Connecting
+            | Self::Reconnecting { .. }
+            | Self::RegainingNickname
+            | Self::Terminal(_)
+            | Self::Held(_) => None,
         }
     }
 }
@@ -3918,6 +3979,7 @@ impl NetworkRuntime {
                     )
                 }),
             },
+            FailureDisposition::RegainingNickname => NetworkRuntimePhase::RegainingNickname,
             FailureDisposition::Terminal(lifecycle) => NetworkRuntimePhase::Terminal(lifecycle),
         };
         state.state_changed_at = now;
@@ -6030,6 +6092,12 @@ impl DriverEnds {
             }
             failure_event => {
                 let (status, disposition, failure, diagnostic) = match failure_event {
+                    ConnectionEvent::RegainingNickname(ref regain) => (
+                        DriverConnectionStatus::RegainingNickname,
+                        FailureDisposition::RegainingNickname,
+                        NetworkFailure::NicknameInUse,
+                        Some(regain.diagnostic()),
+                    ),
                     ConnectionEvent::Reconnecting(failure) => (
                         DriverConnectionStatus::Reconnecting(failure),
                         FailureDisposition::Retry { next_attempt_in },
@@ -6098,6 +6166,11 @@ impl DriverEnds {
                     ),
                     FailureDisposition::Retry { .. } => eprintln!(
                         "bnc: {} disconnected ({}); reconnecting",
+                        self.runtime.label(),
+                        failure.code(),
+                    ),
+                    FailureDisposition::RegainingNickname => eprintln!(
+                        "bnc: {} registered under an alternative nickname ({}); regaining",
                         self.runtime.label(),
                         failure.code(),
                     ),
@@ -6293,6 +6366,9 @@ const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> Net
         }
         e6irc_client::RegistrationRefusal::InvalidUsername => NetworkFailure::InvalidUsername,
         e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
+        e6irc_client::RegistrationRefusal::NicknameRegainRefused => {
+            NetworkFailure::NicknameRegainRefused
+        }
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             NetworkFailure::ServerPasswordRejected
         }

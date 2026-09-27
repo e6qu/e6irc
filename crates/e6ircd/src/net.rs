@@ -1201,6 +1201,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 critical_tx.clone(),
             ));
         }
+        let (csrf_keys, csrf_warning) = crate::http::CsrfKeys::for_keyring(secret_key.as_deref());
+        if let Some(warning) = csrf_warning {
+            eprintln!("{warning}");
+        }
         Some(Arc::new(crate::http::AppState {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -1227,14 +1231,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
             configured_admin_accounts: configured_administrators.clone(),
-            csrf_key: {
-                use aws_lc_rs::rand::SecureRandom;
-                let mut k = [0u8; 32];
-                aws_lc_rs::rand::SystemRandom::new()
-                    .fill(&mut k)
-                    .expect("system RNG for CSRF key");
-                k
-            },
+            csrf_keys,
             trusted_proxies: trusted_proxies.clone(),
             auth_rate_burst: config.limits.auth_rate_burst.burst(),
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
