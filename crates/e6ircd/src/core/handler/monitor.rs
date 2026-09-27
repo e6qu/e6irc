@@ -54,8 +54,8 @@ pub(super) fn monitor_status(
     let mut online = Vec::new();
     let mut offline = Vec::new();
     for (key, shown) in targets {
-        match state.registered_user(key) {
-            Some(user) => online.push(user.prefix()),
+        match presence(state, key) {
+            Some(present) => online.push(present.prefix()),
             None => offline.push(shown.clone()),
         }
     }
@@ -80,7 +80,15 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             };
             let mut added = Vec::new();
             let mut rejected = Vec::new();
-            for nick in list.split(',').filter(|n| !n.is_empty()) {
+            let nicklen = state.config.nicklen;
+            // Only a name that could be a nick is watched — the grammar NICK
+            // enforces. Solanum's `add_monitor` skips any other (`clean_nick`):
+            // `#chan` or `a!b` would take a slot no one can ever fill, and a
+            // spaced one would break the 731/732 lists it is echoed in.
+            let nicks = list
+                .split(',')
+                .filter(|nick| crate::sanitize::valid_nick(nick, nicklen));
+            for nick in nicks {
                 let key = state.nick_key(nick);
                 if state.sessions[&conn].monitoring.contains_key(&key) {
                     continue;

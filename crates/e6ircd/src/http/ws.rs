@@ -864,6 +864,17 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
+                // The registration burst that followed the session's start has
+                // ended: the network's own ISUPPORT, which the session event
+                // sent at the start could not carry yet.
+                Ok(DriverEvent::Features(features)) => {
+                    if let Some(session) = handle.irc_session_snapshot()
+                        && send_frame(&mut socket, WsMessage::text(session_event(&session, &features))).await
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
                 // Browser chat does not negotiate the raw IRC read-marker
                 // capability; account-scoped marker fanout belongs only to
                 // authenticated raw attaches that opted into it.

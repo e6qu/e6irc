@@ -25,9 +25,9 @@ fn parse_whox(arg: &str) -> Option<WhoxRequest> {
     }
     // The token is echoed as a middle parameter of every 354 row, so a value
     // that cannot stand as one (empty, `:`-leading, or spaced: `WHO #c
-    // :%nt,a b`) is treated as absent and echoed as the conventional "0",
-    // Solanum's empty-querytype default.
-    let token = token.filter(|t| MiddleParam::stands_alone(t));
+    // :%nt,a b`) is treated as absent and echoed as the conventional "0", as
+    // Solanum answers an empty token or one longer than three characters.
+    let token = token.filter(|t| t.len() <= 3 && MiddleParam::stands_alone(t));
     Some(WhoxRequest {
         fields: fields_part.chars().collect(),
         token,
@@ -140,6 +140,15 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     deliver_who_reply(state, conn, WhoRequester::Local, reply);
 }
 
+/// Who a WHO mask names when it is a nick written out in full — no `*` or `?`
+/// — and someone holds it.
+fn named_presence(state: &ServerState, mask: &str) -> Option<Presence> {
+    if mask.contains(['*', '?']) || mask == "0" {
+        return None;
+    }
+    presence(state, &state.nick_key(mask))
+}
+
 fn wire_line(line: &str) -> bytes::Bytes {
     bytes::Bytes::from(format!("{line}\r\n"))
 }
@@ -151,17 +160,14 @@ fn who_reply(
     mask: &str,
     arg: &str,
 ) -> crate::core::paced::WhoReply<String> {
-    // The RFC 2812 `o` flag restricts matches to operators; Solanum also
-    // accepts it combined with a WHOX spec (`WHO * o%nf`). Anything else in
-    // the flags position is ignored, as before.
-    let (opers_only, whox_part) = match arg.strip_prefix('o') {
-        Some(rest) if rest.is_empty() || rest.starts_with('%') => (true, rest),
-        _ => (false, arg),
-    };
-    let whox = parse_whox(whox_part);
+    // The second parameter as Solanum's `m_who` reads it: an `o` in front
+    // restricts the matches to operators, and whatever follows a `%` is the
+    // WHOX field selector (`WHO * o%nf`, `WHO #c %nt,42`).
+    let opers_only = arg.starts_with('o');
+    let whox = arg.find('%').and_then(|at| parse_whox(&arg[at..]));
     let requester_multi_prefix = state.reply_caps(conn).is_some_and(|caps| caps.multi_prefix);
     let server = state.config.server_name.clone();
-    // Monotonic: idle is elapsed time since `last_active` (also monotonic).
+    // Monotonic: idle is elapsed time since `idle_since` (also monotonic).
     let now = (state.config.mono_clock)();
     let row_line = |channel: &str, row: WhoRowData| match &whox {
         Some(req) => whox_row_line(
@@ -222,24 +228,56 @@ fn who_reply(
                             flags: who_flags_profile(profile, sigil),
                             realname: profile.realname.clone(),
                             account: profile.account.clone(),
-                            idle_secs: now.saturating_sub(profile.last_active.get()).as_secs(),
+                            idle_secs: now.saturating_sub(profile.idle_since.get()).as_secs(),
                         }
                     });
                 rows.extend(members.map(|row| row_line(&chan.name, row)));
             }
         }
+    } else if let Some(present) = named_presence(state, mask) {
+        // A nick, named exactly: that user alone (Solanum's `m_who`), shown
+        // even when invisible, beside a channel the requester may see them in.
+        match present {
+            Presence::User(user) if !opers_only || user.oper => {
+                let (channel, sigil) = state
+                    .who_channel(user.conn(), conn, user.invisible, requester_multi_prefix)
+                    .unwrap_or_else(|| ("*".to_string(), ""));
+                let row = WhoRowData {
+                    user: user.user.clone(),
+                    host: user.host.clone(),
+                    nick: user.nick.clone(),
+                    realname: user.realname.clone(),
+                    account: user.account.clone(),
+                    flags: who_flags(user.away.is_some(), user.oper, user.bot, sigil),
+                    idle_secs: now.saturating_sub(user.idle_since.get()).as_secs(),
+                };
+                rows.push(row_line(&channel, row));
+            }
+            Presence::Service(service) if !opers_only => {
+                let row = WhoRowData {
+                    user: service.nick.to_string(),
+                    host: service.host.clone(),
+                    nick: service.nick.to_string(),
+                    realname: service.realname().to_string(),
+                    account: None,
+                    flags: who_flags(false, false, false, ""),
+                    idle_secs: 0,
+                };
+                rows.push(row_line("*", row));
+            }
+            Presence::User(_) | Presence::Service(_) => {}
+        }
     } else {
-        // Nick, mask, or "*"/"0" (everyone). Match against nick and host
-        // under the server casemapping.
+        // A mask, or "*"/"0" (everyone). Solanum's `who_global` matches it
+        // against the nick, username, host, server and realname under the
+        // server casemapping.
         let match_all = mask == "*" || mask == "0";
         let casemap = state.casemap;
-        // Invisible users are hidden unless the requester is themselves, shares
-        // a channel, or named them *by their exact nick*. "Named exactly" means
-        // a wildcard-free mask that matches the nick specifically: the mask is
-        // also matched against the host, so a literal host like `WHO 10.0.0.5`
-        // (no wildcards) would otherwise reveal every `+i` user on that host,
-        // and a nick wildcard like `bo*` must still hide them.
-        let is_wildcard = match_all || mask.contains('*') || mask.contains('?');
+        // Invisible users are hidden unless the requester is themselves or
+        // shares a channel with them — a literal host like `WHO 10.0.0.5` must
+        // not reveal every `+i` user on it; naming one by nick is the branch
+        // above.
+        let server = &state.config.server_name;
         // Every registered user, on whichever shard: the published records.
         let users = state
             .registered_users()
@@ -247,16 +285,18 @@ fn who_reply(
             .filter(|user| !opers_only || user.oper)
             .filter(|user| {
                 match_all
-                    || e6irc_proto::mask::matches(casemap, mask, &user.nick)
-                    || e6irc_proto::mask::matches(casemap, mask, &user.host)
+                    || [
+                        user.nick.as_str(),
+                        &user.user,
+                        &user.host,
+                        server,
+                        &user.realname,
+                    ]
+                    .into_iter()
+                    .any(|field| e6irc_proto::mask::matches(casemap, mask, field))
             })
             .filter(|user| {
-                let named_by_nick =
-                    !is_wildcard && e6irc_proto::mask::matches(casemap, mask, &user.nick);
-                user.conn() == conn
-                    || !user.invisible
-                    || state.share_channel(conn, user.conn())
-                    || named_by_nick
+                user.conn() == conn || !user.invisible || state.share_channel(conn, user.conn())
             })
             .map(|user| WhoRowData {
                 user: user.user.clone(),
@@ -265,7 +305,7 @@ fn who_reply(
                 realname: user.realname.clone(),
                 account: user.account.clone(),
                 flags: who_flags(user.away.is_some(), user.oper, user.bot, ""),
-                idle_secs: now.saturating_sub(user.last_active.get()).as_secs(),
+                idle_secs: now.saturating_sub(user.idle_since.get()).as_secs(),
             });
         rows.extend(users.map(|row| row_line("*", row)));
     }
@@ -423,24 +463,38 @@ pub(super) fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
 }
 
 pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    // WHOIS [<server>] <nick>: when two params are given the first is a
-    // server target we resolve locally, so the nick is always the last.
-    let Some(&target) = p.last().filter(|_| !p.is_empty()) else {
+    // WHOIS [<server>] <nick>[,<nick>…], as Solanum's `m_whois` reads it: with
+    // two parameters the first names the server to ask (a server mask, or a
+    // nick standing for its server — `WHOIS nick nick`), and only the first
+    // nick of a list is looked up.
+    let (server, nicks) = match p {
+        [] => (None, ""),
+        [nicks] => (None, *nicks),
+        [server, nicks, ..] => (Some(*server), *nicks),
+    };
+    let target = nicks.split(',').next().unwrap_or_default();
+    if target.is_empty() {
         state.numeric(conn, ERR_NONICKNAMEGIVEN, &[], Some("No nickname given"));
         return;
-    };
+    }
+    if let Some(server) = server
+        && !names_this_server(state, server)
+    {
+        return err_nosuchserver(state, conn, server);
+    }
     let key = state.nick_key(target);
     // Answered from the user's published record and the channel owners'
     // published facts, never from this shard's own sessions and channels: the
     // user and their channels may live on any shard, and the answer must not
     // depend on which.
-    match state.registered_user(&key) {
-        Some(user) => {
+    match presence(state, &key) {
+        Some(Presence::Service(service)) => whois_service(state, conn, &service),
+        Some(Presence::User(user)) => {
             let (nick, user_name, host, realname) =
                 (&user.nick, &user.user, &user.host, &user.realname);
             let chans = state.whois_channels(user.conn(), conn);
             let server = state.config.server_name.clone();
-            let network = state.config.network_name.clone();
+            let description = state.config.description.clone();
             state.numeric(
                 conn,
                 RPL_WHOISUSER,
@@ -474,17 +528,19 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     Some("is using a secure connection"),
                 );
             }
+            // Solanum's 312 carries the server's description (`servptr->info`),
+            // the same text LINKS shows for it.
             state.numeric(
                 conn,
                 RPL_WHOISSERVER,
                 &[Middle::own(nick), Middle::own(&server)],
-                Some(&network),
+                Some(&description),
             );
             // RPL_WHOISIDLE reports seconds idle (elapsed monotonic time since
             // last activity) and a Unix-*second* signon *timestamp* (wall
             // clock) — the two clocks the type split keeps separate.
             let idle = (state.config.mono_clock)()
-                .saturating_sub(user.last_active.get())
+                .saturating_sub(user.idle_since.get())
                 .as_secs();
             state.numeric(
                 conn,
@@ -523,6 +579,79 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 Some("End of /WHOIS list"),
             );
         }
+    }
+}
+
+/// WHOIS of a services pseudo-client, as Solanum answers one (`m_whois`): its
+/// identity, its server, 313 with the `servicestring` ("is a Network
+/// Service"), and the end — no channels and no idle time (it is not a local
+/// client).
+fn whois_service(state: &mut ServerState, conn: ConnId, service: &ServiceUser) {
+    let nick = service.nick;
+    state.numeric(
+        conn,
+        RPL_WHOISUSER,
+        &[
+            Middle::own(nick),
+            Middle::own(nick),
+            Middle::own(&service.host),
+            Middle::own("*"),
+        ],
+        Some(service.realname()),
+    );
+    let (server, description) = (
+        state.config.server_name.clone(),
+        state.config.description.clone(),
+    );
+    state.numeric(
+        conn,
+        RPL_WHOISSERVER,
+        &[Middle::own(nick), Middle::own(&server)],
+        Some(&description),
+    );
+    state.numeric(
+        conn,
+        RPL_WHOISOPERATOR,
+        &[Middle::own(nick)],
+        Some("is a Network Service"),
+    );
+    state.numeric(
+        conn,
+        RPL_ENDOFWHOIS,
+        &[Middle::own(nick)],
+        Some("End of /WHOIS list"),
+    );
+}
+
+/// Whether a command's server argument names this server, as Solanum's
+/// `hunt_server` resolves one: a mask matching the server's name, or the nick
+/// of anyone on it (every user and service is on this server). Anything else
+/// is `ERR_NOSUCHSERVER` — never silently answered as though it named us.
+pub(super) fn names_this_server(state: &ServerState, target: &str) -> bool {
+    e6irc_proto::mask::matches(state.casemap, target, &state.config.server_name)
+        || presence(state, &state.nick_key(target)).is_some()
+}
+
+/// `ERR_NOSUCHSERVER (<server>) :No such server`.
+pub(super) fn err_nosuchserver(state: &mut ServerState, conn: ConnId, server: &str) {
+    state.numeric(
+        conn,
+        ERR_NOSUCHSERVER,
+        &[Middle::echo(server)],
+        Some("No such server"),
+    );
+}
+
+/// The optional `[<server>]` of VERSION, TIME, MOTD and ADMIN: absent or
+/// empty, or naming this server, the command is answered here; `false` — with
+/// 402 sent — when it names a server that is not this one.
+pub(super) fn answered_here(state: &mut ServerState, conn: ConnId, p: &[&str]) -> bool {
+    match p.first().copied().filter(|server| !server.is_empty()) {
+        Some(server) if !names_this_server(state, server) => {
+            err_nosuchserver(state, conn, server);
+            false
+        }
+        _ => true,
     }
 }
 
@@ -592,7 +721,12 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 // ---- WHOWAS -------------------------------------------------------------
 
 pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let Some(&target) = p.first() else {
+    // Only the first nick of a list is looked up (Solanum's `m_whowas`).
+    let Some(target) = p
+        .first()
+        .and_then(|nicks| nicks.split(',').next())
+        .filter(|nick| !nick.is_empty())
+    else {
         state.numeric(conn, ERR_NONICKNAMEGIVEN, &[], Some("No nickname given"));
         return;
     };
@@ -604,7 +738,7 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let key = state.nick_key(target);
     let server = state.config.server_name.clone();
-    let matches = state.whowas.of(state.casemap, &key, limit);
+    let matches = state.whowas.of(&key, limit);
     if matches.is_empty() {
         // Raw client input; keep an empty/':'-leading target from breaking the
         // echo's framing.
@@ -649,7 +783,10 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 // ---- TIME / INFO --------------------------------------------------------
 
-pub(super) fn cmd_time(state: &mut ServerState, conn: ConnId) {
+pub(super) fn cmd_time(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !answered_here(state, conn, p) {
+        return;
+    }
     let server = state.config.server_name.clone();
     let now = e6irc_proto::time::server_time((state.config.clock)());
     state.numeric(conn, RPL_TIME, &[Middle::own(&server)], Some(&now));
@@ -748,7 +885,10 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
     );
 }
 
-pub(super) fn cmd_version(state: &mut ServerState, conn: ConnId) {
+pub(super) fn cmd_version(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !answered_here(state, conn, p) {
+        return;
+    }
     let server = state.config.server_name.clone();
     let version = concat!("e6ircd-", env!("CARGO_PKG_VERSION"));
     state.numeric(
@@ -761,7 +901,10 @@ pub(super) fn cmd_version(state: &mut ServerState, conn: ConnId) {
     send_isupport(state, conn);
 }
 
-pub(super) fn cmd_admin(state: &mut ServerState, conn: ConnId) {
+pub(super) fn cmd_admin(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !answered_here(state, conn, p) {
+        return;
+    }
     let server = state.config.server_name.clone();
     let network = state.config.network_name.clone();
     state.numeric(
@@ -799,7 +942,7 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let online: Vec<String> = p
         .iter()
         .flat_map(|arg| arg.split_whitespace())
-        .filter_map(|nick| Some(state.registered_user(&state.nick_key(nick))?.nick.clone()))
+        .filter_map(|nick| Some(presence(state, &state.nick_key(nick))?.nick().to_string()))
         .collect();
     // RPL_ISON is a single reply by RFC 2812 (splitting it would be
     // non-conformant), yet the echoed list is bounded only by the input frame
@@ -946,8 +1089,8 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         name: "NAMES",
         oper: false,
         lines: &[
-            "NAMES [<channel>{,<channel>}]",
-            "List the visible members of channels.",
+            "NAMES [<channel>]",
+            "List the visible members of a channel, or of every channel you can see and then the users in none.",
         ],
     },
     HelpTopic {
@@ -955,23 +1098,23 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "MODE <target> [<modes> [<parameters>]]",
-            "Query or change channel modes (bqeI lists, k/l parameters, gimnstC flags, o/v prefixes) or your user modes (iwB).",
+            "Query or change channel modes (bqeI lists, k/l parameters, gimnstC flags, o/v prefixes) or your user modes (iwBR).",
         ],
     },
     HelpTopic {
         name: "WHO",
         oper: false,
         lines: &[
-            "WHO <mask> [%<fields>[,<token>]] [o]",
-            "List users matching a channel or mask; the % form is the WHOX field selector.",
+            "WHO <#channel|nick|mask> [o][%<fields>[,<token>]]",
+            "List users in a channel, or matching a nick, username, host, server or realname mask; o shows only operators, and the % form is the WHOX field selector.",
         ],
     },
     HelpTopic {
         name: "WHOIS",
         oper: false,
         lines: &[
-            "WHOIS <nick>",
-            "Show a user's identity, account, channels, idle time, and server.",
+            "WHOIS [<server>] <nick>",
+            "Show a user's identity, account, channels, idle time (since their last message), and server.",
         ],
     },
     HelpTopic {
@@ -1065,7 +1208,7 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic {
         name: "MOTD",
         oper: false,
-        lines: &["MOTD", "Show the server's message of the day."],
+        lines: &["MOTD [<server>]", "Show the server's message of the day."],
     },
     HelpTopic {
         name: "LUSERS",
@@ -1075,7 +1218,7 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic {
         name: "TIME",
         oper: false,
-        lines: &["TIME", "Show the server's local time."],
+        lines: &["TIME [<server>]", "Show the server's local time."],
     },
     HelpTopic {
         name: "INFO",
@@ -1085,12 +1228,15 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic {
         name: "VERSION",
         oper: false,
-        lines: &["VERSION", "Show the server software version."],
+        lines: &["VERSION [<server>]", "Show the server software version."],
     },
     HelpTopic {
         name: "ADMIN",
         oper: false,
-        lines: &["ADMIN", "Show administrative contact information."],
+        lines: &[
+            "ADMIN [<server>]",
+            "Show administrative contact information.",
+        ],
     },
     HelpTopic {
         name: "ISON",
@@ -1104,8 +1250,8 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         name: "LINKS",
         oper: false,
         lines: &[
-            "LINKS",
-            "List the servers in the network (this is a single-server network).",
+            "LINKS [[<server>] <mask>]",
+            "List the servers in the network matching a mask (this is a single-server network).",
         ],
     },
     HelpTopic {

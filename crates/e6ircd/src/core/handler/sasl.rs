@@ -115,12 +115,7 @@ pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bo
         .credential_attempts
         .consume()
     {
-        let server = state.config.server_name.clone();
-        state.send(
-            conn,
-            &format!(":{server} ERROR :Closing Link: too many authentication attempts"),
-        );
-        state.close(conn, "Too many authentication attempts");
+        state.close_with_error(conn, "Too many authentication attempts");
         return false;
     }
     true

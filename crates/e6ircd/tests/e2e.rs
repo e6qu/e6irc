@@ -212,7 +212,7 @@ fn shutdown_delivers_every_closing_error_before_it_returns() {
     let text = String::from_utf8_lossy(&received);
     assert!(text.contains(" 376 late "), "the whole MOTD arrives");
     assert!(
-        text.ends_with("ERROR :Closing Link: irc.e2e.example (Server shutting down)\r\n"),
+        text.ends_with("ERROR :Closing Link: 127.0.0.1 (Server shutting down)\r\n"),
         "the closing ERROR is the last line delivered: {:?}",
         &text[text.len().saturating_sub(200)..]
     );

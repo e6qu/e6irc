@@ -296,6 +296,29 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `MemberModes::sigils` — the one renderer of a member's rank sigils,
     honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
     copy that ignored the capability.
+  - `ChannelName` — a channel name the server will create is parsed once, by
+    one rule (`sanitize::ChannelName::parse`: `#`, at most `CHANNELLEN` bytes,
+    no space, `,`, `:`, C0 control, DEL or U+00A0), where a name enters: JOIN
+    (on the sender's shard, before the channel's owner is asked, which takes
+    only a `ChannelName`), a bridged channel, a read marker's target. A
+    boolean validator was re-checked at each and let the formatting controls
+    through, so `#lib\x0fera` could be created and shown as `#libera`.
+  - `closing_link` — every disconnection's `ERROR :Closing Link: <host>
+    (<reason>)` is built by one function that fits the reason to the wire, and
+    the core closes a session with it through `ServerState::close_with_error`.
+    A dozen hand-built copies had four shapes, and one did not fit its reason:
+    a long ban reason stored by an older build made an over-long line at
+    registration, a panic of the shared worker in a debug build.
+  - `IdleSince` and `Session::last_received` — idle time and liveness are two
+    clocks. Idle (WHOIS 317, WHOX `l`) moves only with a PRIVMSG, as Solanum's
+    `localClient->last`; liveness moves with every line and drives the
+    reaper's PING. One clock moved by every command made a bot that polled
+    `ISON` look present forever.
+  - `Presence` — a presence query (WHOIS, WHO, ISON, USERHOST, MONITOR,
+    INVITE) finds a nick in the user directory or as a services pseudo-client
+    from one function (`handler::services::presence`), so NickServ and
+    ChanServ answer every such query alike from one record each; before, each
+    command asked only the user directory and called them absent.
   - `render_multiline` — one renderer for a multiline message's delivered
     forms, used by local delivery, the channel owner and CHATHISTORY replay,
     so the three cannot frame, tag or fit it differently.
@@ -889,7 +912,12 @@ strip = "symbols"
   worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
   Other traffic keeps flowing beside the rows, and a labeled one stays one
   labeled batch across its turns. A second `LIST` aborts the first (`/LIST
-  aborted`), so a connection paces at most one.
+  aborted`), so a connection paces at most one. A bare `NAMES` — every
+  channel the asker may see, with the members it may see, then the users in
+  no channel, as Solanum's `names_global` — is the same sweep with a
+  `353` row per channel (`ChannelSweep::Names`), paced beside a LIST in its
+  own slot (`Session::channel_names`) and ending `366 * :End of /NAMES list`;
+  a second one while it is answering gets `263 RPL_TRYAGAIN` and its `366`.
 - A `LIST` keeps a cursor, not a copy of the channel list (`core/list.rs`,
   as Solanum's SAFELIST keeps its place in the channel hash). Its reply opens
   at once; each channel shard is then asked, turn by turn, for the next page
@@ -915,7 +943,8 @@ strip = "symbols"
   that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
   channel's `WHO` is paced on the asker's shard, from the rows its owner sent
   back. What is being paced lives on the session (`Session::channel_list`,
-  `Session::paced_who`), so it cannot outlive the connection: a remote
+  `Session::channel_names`, `Session::paced_who`), so it cannot outlive the
+  connection: a remote
   channel's WHO rows or LIST rows that arrive after the asker closed find no
   session and are dropped with it, where a paced reply once queued for a
   closed connection aborted the worker.
@@ -996,7 +1025,25 @@ strip = "symbols"
   to clone its member list a hundred times). A list mode named more than once
   in one MODE is dumped once. `TOPIC <channel>` with one parameter is a query
   however it is framed (`TOPIC :#c` used to clear the topic). Every echo of
-  client text, PONG included, is fitted to the 512-byte wire limit.
+  client text, PONG included, is fitted to the 512-byte wire limit. A JOIN of
+  a name no channel may have (`ChannelName`, §2: over `CHANNELLEN`, only the
+  `#`, or a space, `,`, `:`, control character or U+00A0 in it) is
+  `479 ERR_BADCHANNAME`, checked before the `#` as Solanum's `m_join` does
+  (Solanum refuses its fake-channel characters so under
+  `disable_fake_channels`, which Libera sets); a name without the `#` is 403.
+  A channel registered under such a name by an older build is named at
+  startup, since no one can join it (drop it from the administrators' channel
+  directory or its owner's console).
+- Every disconnection ends with one line, Solanum's `ERROR :Closing Link:
+  <host> (<reason>)`, its reason fitted to the wire (`sanitize::closing_link`).
+- Nick changes are throttled as Solanum's `anti_nick_flood` does at the
+  values its reference configuration and Libera run (`max_nick_changes = 5`,
+  `max_nick_time = 20 seconds`): a sixth change within twenty seconds of the
+  last is `438 ERR_NICKTOOFAST` (`<nick> <new> :Nick change too fast. Please
+  wait 20 seconds.`) until twenty seconds pass without an attempt; a refused
+  attempt counts, a nick someone else holds does not, and operators are
+  exempt. Named constants (`MAX_NICK_CHANGES`, `MAX_NICK_TIME_MS`), as the
+  knock delays are.
 - Registration pipeline: `CAP LS 302` → (SASL) → NICK/USER → welcome burst
   (001–005 with ISUPPORT, LUSERS, MOTD).
 - SASL-required mode, globally (`limits.require_sasl = true`) or for clients
@@ -1371,7 +1418,11 @@ subset's exact behavior.
   Solanum's `knock_delay` / `knock_delay_channel`). RPL_KNOCK goes to every
   member of a `+g` channel, to the operators otherwise, in Solanum's shape:
   `710 <channel> <channel> <nick!user@host> :has asked for an invite.` `QUIT` with no comment
-  leaves as `Quit: <nick>`, `QUIT :` with an empty reason. PART of a channel
+  leaves as `Quit: <nick>`, `QUIT :` with an empty reason; a connection younger
+  than Solanum's `anti_spam_exit_message_time` — five minutes, as Solanum's
+  reference configuration and Libera run it (`ANTI_SPAM_EXIT_MESSAGE_TIME_MS`,
+  a named constant like the knock delays) — leaves as `Client Quit` whatever
+  it said, unless it is an operator. PART of a channel
   that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
   cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
@@ -1452,7 +1503,14 @@ subset's exact behavior.
   A pseudo-client speaks as `<Service>!<Service>@services.<server>` — its
   notices and every channel mode ChanServ sets (a mode lock's correction,
   `OP`/`VOICE` and their inverses, an access holder's op or voice on join)
-  alike, from one helper (`ServerState::service_prefix`).
+  alike, from one helper (`ServerState::service_prefix`). It is present, as
+  that record with Atheme's real name for it ("Nickname Services", "Channel
+  Services"), to every presence query, as Libera's services are to Solanum:
+  WHOIS answers 311, 312, `313 :is a Network Service` and 318 (no channels, no
+  idle time — Solanum's `m_whois` for a service), WHO of its nick shows its
+  row, and ISON, USERHOST and MONITOR find it online. An INVITE for one is
+  answered 341 once the channel checks pass, as Solanum answers the INVITE it
+  relays to services, and goes no further (a service joins no channel).
   - NickServ: `REGISTER`, `IDENTIFY`, `LOGOUT`; `GROUP`/`UNGROUP` add the
     current nick to the identified account or remove a grouped one (an account
     holds at most five nicks, its name included — Atheme's `maxnicks`; a nick
@@ -1562,6 +1620,35 @@ Concretely:
   no `displayed_usercount` floor hides small channels from a bare `LIST`, and
   no global `pace_wait` answers a busy moment with `RPL_LOAD2HI`.
 - NickServ/ChanServ surface per §7.6.
+- Presence and query surfaces answer as Solanum's do:
+  - WHOIS idle time (317) and WHOX `l` count from the user's last PRIVMSG —
+    to a channel or a user, itself included — as Solanum's `m_message` sets
+    `localClient->last`; a NOTICE, a TAGMSG or any other command leaves it
+    running (`IdleSince`, §2). WHOIS 312 carries the server's description,
+    the text LINKS shows, not the network name.
+  - WHOIS looks up the first nick of a list (`WHOIS a,b` is `a`); `WHOIS :`
+    and `WHOWAS :` are 431 and `PING :` is 409. A server argument — WHOIS's
+    first of two, VERSION's, TIME's, MOTD's, ADMIN's, or the first of LINKS's
+    two — is resolved as `hunt_server` resolves one: this server's name, a
+    mask matching it, or anyone's nick is answered here, and anything else is
+    `402 ERR_NOSUCHSERVER`. `LINKS <mask>` lists the servers matching the mask.
+  - A WHO mask is matched against the nick, username, host, server and
+    realname (`who_global`); a mask that is a nick written out in full shows
+    that user alone, even when invisible, beside the first channel (in name
+    order) the asker shares with them or, unless they are invisible, that is
+    not secret, with their rank there (`m_who`), `*` when there is none. The
+    second parameter reads as Solanum reads it: `o` in front for operators
+    only, and the WHOX selector after a `%` anywhere; a WHOX token longer than
+    three characters is answered as `0`.
+  - MONITOR skips a target that is not a nick (Solanum's `clean_nick`), so a
+    `#chan` or a spaced name takes no slot and never reaches 731/732.
+  - INVITE names the invitee by their own nick, carried from the sender's
+    shard (`ChannelInvitee`), and follows 341 with 301 when they are away.
+  - WHOWAS keeps at most `WHOWAS_PER_NICK` (20) records of one nick within its
+    `WHOWAS_CAP` (1,000), so a user reconnecting under one nick replaces its
+    own oldest rather than pushing out everyone else's. Solanum bounds only
+    the whole history; twenty is what its `m_whowas` answers a remote WHOWAS
+    with.
 - **Relayed messages name their target canonically**, as Solanum's do: a
   PRIVMSG, NOTICE, TAGMSG or multiline batch to `#FOO` reaches members (and the
   sender's echo) addressed to the channel's own name, `#foo`, with any
@@ -2570,7 +2657,24 @@ driver said last (its goodbye among them) unless the network's rows are about
 to be deleted. A process shutdown keeps the rows, so it writes them too: the
 driver's release and that final write share the one driver-stop deadline, and
 only a write still in progress when it passes (a wedged database) is abandoned
-and reported.
+and reported. That shutdown takes the mutation lane before it empties the
+registry, so a transition in flight — a replace waiting out its old driver's
+goodbye — finishes first and its new driver is stopped with the rest; the
+registry is then closed, and every later start is refused
+(`RegistryClosed`, a 503 to the request that asked). It used to drain the
+registry beside the lane, and the replace then started its driver into the
+emptied registry: a session dialled during shutdown that never said `QUIT`,
+met by the restarted daemon as a ghost `433`. Past construction the lane is
+the only registry writer at all — the stored networks started at boot go
+through it too. A driver is built without running (`NetworkDriver::prepare`)
+and its task starts only once the network's persistence task has subscribed,
+so no line the driver says before the subscription can be kept in the ring
+and never stored.
+An account's own network with no running driver is described by why: disabled
+when its row says so; being reconfigured while a replace waits out the old
+driver (the key is marked as it is taken out); failed to start, with the
+reason, when an enabled row's driver could not be built at boot. Every one of
+them used to be called disabled.
 The registry refuses to register over a live driver *before* the second driver
 starts, so two upstream sessions can never race for one network, and each
 caller states what it means: create and edit **supersede** (stop the
@@ -2588,7 +2692,8 @@ session.
 
 ```rust
 trait NetworkDriver {          // one impl per kind: local, irc, matrix, discord, slack
-    async fn start(...) -> DriverHandle;   // connect / open session
+    fn prepare(self) -> PreparedDriver;    // the handle, and the task not yet run
+    fn start(self) -> NetworkHandle;       // prepare, then run the task
     // DriverHandle: send events up (messages, joins, state),
     // accept commands down (send message, join, set away, ...)
 }
@@ -2619,7 +2724,14 @@ above the trait, provides for every network kind:
   waiting after 60 s is forgotten. What answers no pending command is the
   session's, as before: conversation, membership, a numeric the upstream sent
   unasked, and the topic and member list after our own `JOIN`, which are the
-  channel's state for every client. Each attachment's route holds 1,024
+  channel's state for every client — and which the session follows from then
+  on through every `JOIN`, `PART`, `KICK`, `QUIT`, `NICK`, membership `MODE`
+  and `TOPIC` (at most 20,000 memberships per session; a channel past that
+  has its list unknown). A client's `NAMES` of one channel whose list the
+  session follows is answered from it, to that client, as soju answers one:
+  the browser asks for every joined channel's list on each connect, and each
+  question would otherwise be a line of the upstream's flood allowance
+  (§10.3). Each attachment's route holds 1,024
   lines; a reply read more slowly than the network sends it loses the rest,
   for that client alone, and it is told how many. The `/ws/ui` socket has a
   route like a raw attach. A sender's own messages reach the
@@ -2635,7 +2747,15 @@ above the trait, provides for every network kind:
   its line with our prefix still matches the line it came from. An upstream
   without `echo-message` gets the echo synthesized, per target, when the line
   is written; the driver follows the upstream's `CAP DEL echo-message` (and
-  asks for what a `CAP NEW` offers) mid-session. Either way the originator
+  asks for what a `CAP NEW` offers) mid-session, and a change of it never
+  echoes a line twice or not at all: a line written while the driver's
+  request for `echo-message` awaits its verdict waits for the upstream's echo
+  and is echoed by the driver only if the answer is `NAK`, and a line still
+  awaiting its echo when a `CAP DEL` withdraws it is echoed by the driver
+  then. A capability the upstream refused is asked for again only when a
+  `CAP NEW` offers it anew (it used to be re-requested on every `CAP` line, so
+  a refusal was answered with the same request for as long as the connection
+  lasted). Either way the originator
   receives its echo only when it negotiated `echo-message` on attach, the same
   contract a real server has, and a NickServ command that can carry a secret
   is redacted in the upstream's echo exactly as in a synthesized one. A bridge
@@ -2667,9 +2787,20 @@ above the trait, provides for every network kind:
   on exit, and forwarding it would end the always-on session the bouncer
   exists to keep. The browser composer refuses the same commands, judged on the
   final line after slash translation so `/raw` cannot smuggle them. The
-  reverse holds too: the upstream's own `CAP` lines end at the driver, because
-  an attached client negotiated its capabilities with the bouncer and would act
-  on the upstream's against the wrong hop.
+  reverse holds too: what is the session's own business ends at the driver —
+  the upstream's `CAP` lines (an attached client negotiated its capabilities
+  with the bouncer and would act on the upstream's against the wrong hop), its
+  `PING`s, the answer to the driver's keepalive, and its `ERROR` (§10.3). The
+  `irc` and `local` drivers read every line through the one function that
+  decides this (`irc_driver::upstream_control`); the `local` driver used to
+  relay the core's `ERROR :Closing Link` on a KILL, a GHOST or a ban into the
+  backlog and to every attached client. The bouncer's own numerics to an
+  attached client (`409`, `907`, `421`, a `CAP` reply) are addressed to the
+  nick that client has now, not the one it was welcomed under.
+- **Attach status**: an attaching client is told the network's state up
+  front, after its welcome: connected, or the lifecycle it is in with the
+  failure and the upstream's own words (the lifecycle notice of that
+  transition, from the runtime snapshot) — not merely "disconnected".
 - **Attachment liveness**: a quiet or parked network writes nothing to its
   clients, so a half-open one (a laptop that slept, a NAT that forgot the
   flow) would never be written to, never error, and hold its task, socket and
@@ -2744,21 +2875,36 @@ above the trait, provides for every network kind:
   about the network's own lifecycle belongs in the ring, so a client attaching
   later learns the state it is joining; a transient failure — backlog storage
   refusing a write — does not, because replaying it announces a fault that is
-  over. Transient notices go to the live broadcast only, and the per-network
-  status dedup keys on the lifecycle rather than on the message text, so a
-  reworded diagnostic is not a new transition.
-- **Authoritative attach state**: replay is followed by an
-  `IrcSessionSnapshot` containing the current upstream nick and confirmed
-  memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
-  reach it. A synthesized JOIN (the real one aged out of the ring) is followed,
-  on an IRC network, by the channel's real topic and member list: the bouncer
-  sends `TOPIC` and `NAMES` for the channel on the attaching client's behalf,
-  and the answers reach that client alone (§10.1's reply routing), as a
-  server's own answer to a JOIN would; the account's MARKREAD position follows
-  the JOIN, before the end of that list, when negotiated. A bridge, whose
-  provider has no member list to ask, and an upstream that cannot be asked
-  right now (its queue full, or parked — said in a notice) get a minimal
-  NAMES reply naming the session alone. Every line
+  over. Transient notices — backlog storage failing or lagging, the command
+  queue full — go to the live broadcast only, and the per-network status
+  dedup keys on the lifecycle and failure code rather than on the message
+  text, so a reworded diagnostic is not a new transition, while a new reason
+  within one outage (a `433`, a K-line, a throttle, after a string of
+  connection failures) is retained the first time it is given.
+- **Authoritative attach state, and a replay read as it was said**: the ring
+  keeps, beside its lines, the session's state as of its oldest entry — nick,
+  channels, and each channel's topic and members as the session followed them
+  — advanced by every entry it evicts (to the state a session boundary
+  records, when one goes). An attaching raw client is brought to that state
+  before the replay (the `NICK` and `JOIN`s, each channel's topic and member
+  list with its JOIN), shown the replay, and then brought to the session's
+  state now (`IrcSessionSnapshot`: the current nick and confirmed
+  memberships), as soju and ZNC do. So a line said under an old nick is read
+  as the client's own and the rename as its own rename, a channel's lines
+  follow its JOIN, and a conversation is matched to its read marker under the
+  nick it was said to; the replay used to start at the current nick, which
+  made each of them look like someone else's. A channel joined without its
+  member list (the session never had it, or it was past the bound) is told,
+  once the replay is over, what the session knows now; the upstream is asked
+  for it (`TOPIC`, `NAMES`, on the attaching client's behalf, the answers
+  reaching that client alone) for at most two channels an attach, since every
+  question is a line of the flood allowance and waits in the queue every
+  attached client shares, and the rest are told how to ask. The account's
+  MARKREAD position follows each JOIN, before its member list, when
+  negotiated. A bridge, whose provider has no member list to ask, gets a
+  minimal NAMES reply naming the session alone. A backlog restored from
+  storage carries no state of its own, so a replay beginning in it starts at
+  the current nick. Every line
   the bouncer makes from the upstream's names fits one IRC line: a prefix
   drops its user and host, or a PART its reason, when the names need the room,
   and a line no shortening fits is replaced by a bounded notice saying what
@@ -2797,6 +2943,16 @@ backlog did not hold) and `account-tag` (offered to attached clients, as the
 the core answers in, so `batch` and `labeled-response` are not asked for. The
 core is this binary: a refusal, or a welcome without the answer, is an
 `upstream_protocol_failed` drop, never a session that silently lacks them.
+The core ends the in-process session with `ERROR` when an operator KILLs it,
+NickServ GHOSTs or REGAINs its nick, or a K- or D-line matches; the driver
+reads that as the `irc` driver reads an upstream's `ERROR` (§10.3: a `*bnc*`
+notice, the drop's diagnostic, never a relayed line) and reconnects. Like the
+`irc` driver it shares `JoinedChannels`: the next session rejoins the
+configured autojoin plus every channel the core had confirmed, with the keys
+learned for them, so a KILL no longer drops the channels joined at runtime; a
+channel the core refuses to rejoin is dropped from the intent with a notice,
+and a rename no attached client asked for (services enforcing a nick) is
+announced as `renamed_by_upstream`, as the `irc` driver announces one.
 
 ### 10.3 `irc` driver — external networks (ZNC/soju-style)
 
@@ -2934,7 +3090,19 @@ core is this binary: a refusal, or a welcome without the answer, is an
   before the drop — comma-joined within the 510-byte line, so a heavy user's
   hundred channels are a handful of lines rather than a burst Solanum's flood
   limit answers with "Excess Flood" (runtime JOIN/PART/KICK are tracked as they
-  are acknowledged upstream). A keyed channel is rejoined with its key, keyed
+  are acknowledged upstream). Every line the driver writes to an upstream —
+  an attached client's, a reply-correlation `PING`, a rejoin, a `PONG`, a
+  keepalive, a `CAP REQ` — is paced, as ZNC and soju pace theirs, by a token
+  bucket of the local driver's line-meter shape
+  (`core::line_meter::TokenBucket`) sized to the flood allowance of Solanum
+  and its ircd-ratbox ancestors: `UPSTREAM_LINE_BURST` = 5 lines at once
+  (`client_flood_burst_max`), then `UPSTREAM_LINES_PER_SECOND` = 2 a second
+  (the `client_flood_message_num` Solanum drains a registered client's queue
+  by each second); a faster writer fills the server's unparsed queue until it
+  closes the link with "Excess Flood". Past the allowance the attachments'
+  commands wait in the shared queue while the upstream's lines keep flowing.
+  The goodbye `QUIT` of a stopping driver is its last line and is not held
+  back. A keyed channel is rejoined with its key, keyed
   channels first on each line so every key lands on its channel: the key a
   client's `JOIN` offered once the upstream confirms that channel, then any
   `+k`/`-k` the channel sees (read with the network's `CHANMODES` and
@@ -3099,7 +3267,16 @@ is `*` while the network cannot carry client-only tags (§10.1) and the
 network's own value otherwise. Because the network's registration burst is
 never relayed or replayed (§10.1), no later line can put the network's own
 values of these back; a 005 the network sends later in the session reaches
-attached clients live with them removed.
+attached clients live with them removed. The welcome is written by the attach
+itself, from the same instant as the replay (`AttachSnapshot`), so an
+ISUPPORT or `CLIENTTAGDENY` change is either in it or reaches the client live —
+it used to be built before that instant, and a change between the two was
+lost to the client. Each attachment remembers the tokens it was told; a
+client that attached before a session's registration burst ended (welcomed
+with a bridge's defaults, or the last session's) is sent, when it ends, one
+`005` with the tokens that changed and a `-TOKEN` for each withdrawn, and its
+case mapping follows. `/ws/ui` is sent the session event again with the
+network's own ISUPPORT.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 

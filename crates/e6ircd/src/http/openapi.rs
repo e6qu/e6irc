@@ -2875,7 +2875,10 @@ mod tests {
         assert_eq!(pattern, "^#");
         assert_eq!(name["maxLength"], crate::sanitize::CHANNELLEN);
         for refused in ["&local", "+modeless", "!safe"] {
-            assert!(!crate::sanitize::valid_channel_name(refused), "{refused}");
+            assert!(
+                crate::sanitize::ChannelName::parse(refused).is_err(),
+                "{refused}"
+            );
         }
     }
 
