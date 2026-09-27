@@ -96,3 +96,9 @@ name = "mask_matching"
 path = "fuzz_targets/mask_matching.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "chathistory_window"
+path = "fuzz_targets/chathistory_window.rs"
+test = false
+doc = false

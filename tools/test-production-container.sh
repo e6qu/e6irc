@@ -120,8 +120,13 @@ case "$refusal" in
   *) echo "the refusal does not name the missing variable: $refusal" >&2; exit 1 ;;
 esac
 
-# SIGTERM with the documented stop budget must end in a clean exit, not a kill.
-docker stop --time 55 "$server" >/dev/null
+# SIGTERM with the systemd unit's stop budget must end in a clean exit, not a
+# kill. The budget is read from the unit, so the two cannot drift
+# (tools/check-systemd-unit.sh holds this read to the unit too).
+unit="$(dirname "$0")/../deploy/e6ircd.service"
+stop_seconds="$(sed -n 's/^TimeoutStopSec=\([0-9][0-9]*\)s$/\1/p' "$unit")"
+[ -n "$stop_seconds" ] || { echo "could not read TimeoutStopSec from $unit" >&2; exit 1; }
+docker stop --time "$stop_seconds" "$server" >/dev/null
 exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$server")"
 [ "$exit_code" = 0 ] || { echo "graceful stop exited $exit_code" >&2; exit 1; }
 echo "production container contract ok"

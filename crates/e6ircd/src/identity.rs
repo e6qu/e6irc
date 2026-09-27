@@ -3,44 +3,101 @@
 use std::fmt;
 
 /// Longest password any surface accepts, in bytes.
-const MAX_PASSWORD_LEN: usize = 512;
+pub const MAX_PASSWORD_LEN: usize = 512;
 
-/// Why a password cannot be set on an account.
+/// The shortest a new password may be, in characters, unless
+/// `registration.minimum_password_length` says otherwise: NIST SP 800-63B
+/// §5.1.1.2's floor for a memorized secret the subscriber chooses.
+pub const DEFAULT_MINIMUM_PASSWORD_CHARS: usize = 8;
+
+/// The highest `registration.minimum_password_length` may be: a character is
+/// at most four UTF-8 bytes, so a password of this many characters fits in
+/// [`MAX_PASSWORD_LEN`] in every script. A higher minimum would refuse, in
+/// some scripts, every password long enough to meet it.
+pub const MAX_MINIMUM_PASSWORD_CHARS: usize = MAX_PASSWORD_LEN / 4;
+
+/// Why a password cannot be set on an account. Each carries the minimum in
+/// force, which the explanation states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordRefusal {
-    /// Nothing to log in with: SASL PLAIN, the web login and the REST API all
-    /// refuse an empty password, so an account created with one could never be
-    /// logged in to — or dropped — again.
-    Empty,
+    /// Fewer characters than the minimum — the empty password among them,
+    /// which SASL PLAIN, the web login and the REST API all refuse.
+    TooShort { minimum: usize },
     /// Longer than [`MAX_PASSWORD_LEN`].
-    TooLong,
+    TooLong { minimum: usize },
 }
 
 impl PasswordRefusal {
     /// The one wording every surface uses for the rule.
-    pub fn explanation(self) -> &'static str {
-        "Passwords must contain 1–512 bytes."
+    pub fn explanation(self) -> String {
+        let (Self::TooShort { minimum } | Self::TooLong { minimum }) = self;
+        let characters = if minimum == 1 {
+            "character"
+        } else {
+            "characters"
+        };
+        format!(
+            "Passwords must be at least {minimum} {characters} and at most {MAX_PASSWORD_LEN} \
+             bytes."
+        )
     }
 }
 
-/// A password an account may be given: 1–[`MAX_PASSWORD_LEN`] bytes. Every
-/// surface that sets one — IRC `REGISTER`, NickServ `REGISTER`, the web and
-/// the REST API — parses it here, and account creation takes only this type,
-/// so no path can store a password the others would refuse to verify.
-#[derive(Clone, PartialEq, Eq)]
-pub struct NewPassword(String);
+/// The rule for a password being set: at least
+/// `registration.minimum_password_length` characters and at most
+/// [`MAX_PASSWORD_LEN`] bytes. One cell, shared by the IRC core, NickServ, the
+/// web and the REST API, and set live when the setting changes, so every
+/// surface applies the same minimum at the same moment. Until it is set it
+/// holds [`DEFAULT_MINIMUM_PASSWORD_CHARS`].
+#[derive(Debug, Clone)]
+pub struct PasswordPolicy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-impl NewPassword {
-    pub fn parse(raw: &str) -> Result<Self, PasswordRefusal> {
-        if raw.is_empty() {
-            Err(PasswordRefusal::Empty)
+impl Default for PasswordPolicy {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            DEFAULT_MINIMUM_PASSWORD_CHARS,
+        )))
+    }
+}
+
+impl PasswordPolicy {
+    /// Require at least `characters` of every password set from now on. The
+    /// configuration has held it to 1 through [`MAX_MINIMUM_PASSWORD_CHARS`].
+    pub fn set_minimum_chars(&self, characters: usize) {
+        assert!(
+            (1..=MAX_MINIMUM_PASSWORD_CHARS).contains(&characters),
+            "the configuration bounds the password minimum, and {characters} is outside it"
+        );
+        self.0
+            .store(characters, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The minimum in force, in characters.
+    pub fn minimum_chars(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `raw` as a password an account may be given, or why not.
+    pub fn new_password(&self, raw: &str) -> Result<NewPassword, PasswordRefusal> {
+        let minimum = self.minimum_chars();
+        if raw.chars().count() < minimum {
+            Err(PasswordRefusal::TooShort { minimum })
         } else if raw.len() > MAX_PASSWORD_LEN {
-            Err(PasswordRefusal::TooLong)
+            Err(PasswordRefusal::TooLong { minimum })
         } else {
-            Ok(Self(raw.to_owned()))
+            Ok(NewPassword(raw.to_owned()))
         }
     }
 }
+
+/// A password an account may be given, as the [`PasswordPolicy`] in force
+/// admitted it. Every surface that sets one — IRC `REGISTER`, NickServ
+/// `REGISTER`, the web and the REST API — parses it there, and account
+/// creation takes only this type, so no path can store a password another
+/// surface refuses. The minimum governs passwords being set; an existing
+/// password is verified as it was stored.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewPassword(String);
 
 impl std::ops::Deref for NewPassword {
     type Target = str;
@@ -77,6 +134,58 @@ impl CredentialAttemptBudget {
         }
         self.used += 1;
         true
+    }
+}
+
+/// The credential a sign-in presented, which an IRC session and a bouncer
+/// attachment keep for as long as they live, so revoking that one credential
+/// ends exactly what it opened. SASL PLAIN, NickServ `IDENTIFY` and the attach
+/// listener accept the account password or an app password; SASL OAUTHBEARER
+/// accepts a personal access token; IRC and NickServ `REGISTER` sign in with
+/// the password they just set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CredentialId {
+    /// The account's primary password. It is never revoked on its own:
+    /// changing or removing it changes the account's authority, which ends
+    /// every session the account has, however it signed in.
+    AccountPassword,
+    /// A credential issued alongside the password, revocable by itself.
+    Issued(IssuedCredential),
+}
+
+/// A credential issued to an account besides its password, named by its row:
+/// revoking it deletes that row, and the table announces the deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IssuedCredential {
+    /// An app password, by its `account_credentials` id.
+    AppPassword(i64),
+    /// A personal access token, by its `api_tokens` id.
+    ApiToken(i64),
+}
+
+impl IssuedCredential {
+    /// What kind of credential this is, in words.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::AppPassword(_) => "app password",
+            Self::ApiToken(_) => "personal access token",
+        }
+    }
+
+    /// Why a session or attachment this credential opened is closed when it is
+    /// revoked.
+    pub fn revocation_reason(self) -> &'static str {
+        match self {
+            Self::AppPassword(_) => "App password revoked",
+            Self::ApiToken(_) => "Personal access token revoked",
+        }
+    }
+}
+
+impl fmt::Display for IssuedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::AppPassword(id) | Self::ApiToken(id)) = self;
+        write!(f, "{} {id}", self.kind())
     }
 }
 
@@ -428,21 +537,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_new_password_holds_one_to_512_bytes() {
-        assert_eq!(NewPassword::parse("").err(), Some(PasswordRefusal::Empty));
+    fn a_new_password_holds_eight_characters_to_512_bytes_by_default() {
+        let policy = PasswordPolicy::default();
+        const EIGHT: usize = DEFAULT_MINIMUM_PASSWORD_CHARS;
         assert_eq!(
-            NewPassword::parse(&"p".repeat(513)).err(),
-            Some(PasswordRefusal::TooLong)
+            policy.new_password("").err(),
+            Some(PasswordRefusal::TooShort { minimum: EIGHT })
         );
         assert_eq!(
-            &*NewPassword::parse(&"p".repeat(512)).expect("fits"),
+            policy.new_password("hunter2").err(),
+            Some(PasswordRefusal::TooShort { minimum: EIGHT }),
+            "seven characters are one too few"
+        );
+        assert!(policy.new_password("hunter22").is_ok(), "eight is enough");
+        assert!(
+            policy.new_password("pässwörd").is_ok(),
+            "characters are counted, not bytes"
+        );
+        assert_eq!(
+            policy.new_password("äöüäöüä").err(),
+            Some(PasswordRefusal::TooShort { minimum: EIGHT }),
+            "fourteen bytes are still seven characters"
+        );
+        assert_eq!(
+            policy.new_password(&"p".repeat(513)).err(),
+            Some(PasswordRefusal::TooLong { minimum: EIGHT })
+        );
+        assert_eq!(
+            &*policy.new_password(&"p".repeat(512)).expect("fits"),
             "p".repeat(512)
         );
         assert_eq!(
-            format!("{:?}", NewPassword::parse("hunter2").expect("fits")),
+            format!("{:?}", policy.new_password("hunter22").expect("fits")),
             "NewPassword(..)",
             "never printed"
         );
+        assert_eq!(
+            PasswordRefusal::TooShort { minimum: EIGHT }.explanation(),
+            "Passwords must be at least 8 characters and at most 512 bytes."
+        );
+    }
+
+    /// The minimum is one cell every surface reads: a change of it applies
+    /// to the next password set, through every clone.
+    #[test]
+    fn the_password_minimum_is_followed_live() {
+        let policy = PasswordPolicy::default();
+        let surface = policy.clone();
+        policy.set_minimum_chars(1);
+        assert!(surface.new_password("sesame").is_ok());
+        assert!(surface.new_password("x").is_ok());
+        assert_eq!(
+            surface.new_password("").err(),
+            Some(PasswordRefusal::TooShort { minimum: 1 })
+        );
+        assert_eq!(
+            PasswordRefusal::TooShort { minimum: 1 }.explanation(),
+            "Passwords must be at least 1 character and at most 512 bytes."
+        );
+        policy.set_minimum_chars(MAX_MINIMUM_PASSWORD_CHARS);
+        let longest_script = "\u{10348}".repeat(MAX_MINIMUM_PASSWORD_CHARS);
+        assert_eq!(longest_script.len(), MAX_PASSWORD_LEN);
+        assert!(
+            surface.new_password(&longest_script).is_ok(),
+            "the highest minimum is met in four-byte characters"
+        );
+        assert!(surface.new_password(&"p".repeat(127)).is_err());
     }
 
     #[test]

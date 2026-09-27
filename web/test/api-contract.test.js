@@ -8,6 +8,7 @@ import {
   ApiError,
   ApiSchemaError,
   apiContractLoader,
+  directoryPage,
   directoryQuery,
   getOperationJson,
   operationRequestSchema,
@@ -609,5 +610,44 @@ test("the console builds every directory query through the allow-list", async ()
     const allowed = /directoryQuery\(\s*$/.test(before)
       || /^window\.location\.search\)\.get\("[a-z_]+"\)/.test(after);
     assert.ok(allowed, `console.js reads the page query outside directoryQuery: ${before}${after}`);
+  }
+});
+
+test("a directory page's status comes from its own query, not from a next cursor", () => {
+  // The first page of a long directory has a next cursor; the accounts pager
+  // read that as "an older page". Only the page's own cursor says where it is.
+  const first = directoryPage(new URLSearchParams("limit=50"), "before_id", 41);
+  assert.equal(first.first, true);
+  assert.equal(first.next.toString(), "limit=50&before_id=41");
+  const last = directoryPage(new URLSearchParams("limit=50&before_id=41"), "before_id", null);
+  assert.equal(last.first, false);
+  assert.equal(last.next, null);
+  const middle = directoryPage(new URLSearchParams("after=%2Flibera%2Fconfigured"), "after", "alice/libera/stored");
+  assert.equal(middle.first, false);
+  assert.equal(middle.next.get("after"), "alice/libera/stored");
+  assert.equal(directoryPage(new URLSearchParams(), "before_id", undefined).next, null);
+});
+
+test("every console pager takes its status from the page's own position", async () => {
+  const source = await readFile(new URL("../../crates/e6ircd/assets/console.js", import.meta.url), "utf8");
+  // One renderer decides the status, from `page.first`; no pager computes a
+  // status of its own from a cursor.
+  assert.equal([...source.matchAll(/page\.first \?/g)].length, 1);
+  assert.doesNotMatch(source, /\?\s*"Showing an older page\."/);
+  assert.doesNotMatch(source, /"Showing an older page\."\s*:/);
+  const pagers = [...source.matchAll(/fillPager\([^()]*(?:\([^()]*\))?[^()]*, directoryPage\(/g)].length;
+  assert.ok(pagers >= 7, `expected every directory pager to use fillPager, found ${pagers}`);
+});
+
+test("the network create contract refuses the names the server refuses", () => {
+  const create = (name) => serializeOperationRequest(servedContract, "POST", "/api/v1/me/networks", {
+    kind: "irc", name, addr: "irc.example.net:6697", tls: true, nick: "alice",
+    username: "alice", realname: "Alice", autojoin: [],
+  });
+  for (const name of ["libera", "a", "a.b", ".a", "..a", "...", "a-b_c.d", "x".repeat(64)]) {
+    assert.doesNotThrow(() => create(name), name);
+  }
+  for (const name of ["", ".", "..", "a b", "a/b", "é", "x".repeat(65)]) {
+    assert.throws(() => create(name), ApiSchemaError, name);
   }
 });

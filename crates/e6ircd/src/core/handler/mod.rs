@@ -88,14 +88,14 @@ fn input_too_long(state: &mut ServerState, conn: ConnId) {
 pub(crate) fn channel_join(
     state: &mut ServerState,
     actor: ChannelActor,
-    name: &str,
+    name: &crate::sanitize::ChannelName,
     join_key: Option<&str>,
     label: Option<String>,
 ) {
     let session = actor.session_owner();
     // The same string under the same casemapping keys the same channel here
     // as on the session's shard, where it was counted against the limit.
-    let requested = state.chan_key(name);
+    let requested = state.chan_key(name.as_str());
     let result = channel::join_on_owner(state, actor, name, join_key);
     state.route_join_result(session, requested, result, label);
 }
@@ -768,15 +768,10 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
     // is alive, so it answers an outstanding liveness PING: the reaper must not
     // close an actively-sending client merely because its traffic happened to
     // be its own PINGs and never a literal PONG (a real class of minimal bots).
+    // Idle time is the other clock: only a PRIVMSG moves it (`IdleSince`).
     if let Some(session) = state.sessions.get_mut(&conn) {
         session.awaiting_pong = false;
-        // WHOIS idle / WHOX `l`, on the other hand, measures time since real
-        // activity, so a keepalive must not reset it — only a non-keepalive
-        // command bumps `last_active`. Every channel's record of this member
-        // reads that same value (see `LastActive`), so nothing is sent to them.
-        if command != "PING" && command != "PONG" {
-            session.last_active.set((state.config.mono_clock)());
-        }
+        session.last_received = (state.config.mono_clock)();
     }
 
     // Commands legal before registration.
@@ -833,15 +828,19 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "MONITOR" => cmd_monitor(state, conn, p),
         "MARKREAD" => cmd_markread(state, conn, p),
         "SETNAME" => cmd_setname(state, conn, p),
-        "MOTD" => send_motd(state, conn),
+        "MOTD" => {
+            if answered_here(state, conn, p) {
+                send_motd(state, conn);
+            }
+        }
         "LUSERS" => send_lusers(state, conn),
-        "TIME" => cmd_time(state, conn),
+        "TIME" => cmd_time(state, conn, p),
         "INFO" => cmd_info(state, conn),
-        "VERSION" => cmd_version(state, conn),
-        "ADMIN" => cmd_admin(state, conn),
+        "VERSION" => cmd_version(state, conn, p),
+        "ADMIN" => cmd_admin(state, conn, p),
         "ISON" => cmd_ison(state, conn, p),
         "USERIP" => cmd_userip(state, conn, p),
-        "LINKS" => cmd_links(state, conn),
+        "LINKS" => cmd_links(state, conn, p),
         "STATS" => cmd_stats(state, conn, p),
         "KNOCK" => cmd_knock(state, conn, p),
         "OPER" => cmd_oper(state, conn, p),
@@ -868,7 +867,8 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
 // ---- connection-level ---------------------------------------------------
 
 fn cmd_ping(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let Some(&token) = p.first() else {
+    // An empty origin (`PING :`) is no origin either (Solanum's `m_ping`).
+    let Some(&token) = p.first().filter(|token| !token.is_empty()) else {
         state.numeric(conn, ERR_NOORIGIN, &[], Some("No origin specified"));
         return;
     };
@@ -907,15 +907,13 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::MonoMil
                 expired.push((conn, "Ping timeout"));
             }
         } else if now
-            .saturating_sub(s.last_active.get().max(s.last_ping_sent))
+            .saturating_sub(s.last_received.max(s.last_ping_sent))
             .as_millis()
             >= IDLE_PING_INTERVAL_MS
         {
-            // Idle since the later of the last real activity and the last
+            // Silent since the later of the last line received and the last
             // liveness PING — so a client that just answered a PING isn't
-            // re-pinged every tick. `last_active` stays the pure WHOIS-idle
-            // clock (a keepalive PONG must not reset a user's idle time); the
-            // ping cadence is driven by `last_ping_sent` here.
+            // re-pinged every tick.
             to_ping.push(conn);
         }
     }
@@ -928,8 +926,7 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::MonoMil
         state.send(conn, &format!("PING :{server}"));
     }
     for (conn, reason) in expired {
-        state.send(conn, &format!(":{server} ERROR :Closing Link: {reason}"));
-        state.close(conn, reason);
+        state.close_with_error(conn, reason);
     }
 }
 
@@ -944,27 +941,22 @@ fn quit_reason(comment: Option<&str>, nick: &str) -> String {
     }
 }
 
+/// A connection younger than `limits.anti_spam_exit_message_time_seconds`
+/// (Solanum's `anti_spam_exit_message_time`) leaves as `Client Quit`
+/// (`m_quit`), so connecting only to quit with a message cannot spam every
+/// channel it joined; an operator's comment always shows.
 fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let nick = state
-        .sessions
-        .get(&conn)
-        .and_then(|session| session.nick())
-        .unwrap_or("*")
-        .to_string();
-    let reason = quit_reason(p.first().copied(), &nick);
-    let host = state
-        .sessions
-        .get(&conn)
-        .map(|s| s.host.clone())
-        .unwrap_or_default();
-    // The reason is echoed inside this ERROR wrapper, whose overhead can push a
-    // maximal QUIT reason past the wire limit — fit it like every other relay
-    // of client text. The trailing `)` is part of the head's cost, so budget
-    // for it by including it before fitting and re-appending after.
-    let head = format!("ERROR :Closing Link: {host} (");
-    let fitted = fit_trailing(&format!("{head})"), &reason);
-    state.send(conn, &format!("{head}{fitted})"));
-    state.close(conn, &reason);
+    let session = &state.sessions[&conn];
+    let nick = session.nick().unwrap_or("*").to_string();
+    let age = (state.config.mono_clock)().saturating_sub(session.opened_at);
+    let age = std::time::Duration::from_millis(age.as_millis());
+    let reason =
+        if session.oper.is_none() && state.anti_spam_exit_message_time.hides_comment_at(age) {
+            "Client Quit".to_string()
+        } else {
+            quit_reason(p.first().copied(), &nick)
+        };
+    state.close_with_error(conn, &reason);
 }
 
 #[cfg(test)]

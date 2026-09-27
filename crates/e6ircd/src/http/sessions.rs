@@ -119,7 +119,7 @@ pub(super) async fn reauthenticate_with_password(
     SessionMutation(account, session): SessionMutation,
     JsonBody(request): JsonBody<ReauthenticateRequest>,
 ) -> Response {
-    if let Some(detail) = password_input_error(&request.password) {
+    if let Some(detail) = presented_password_error(&request.password) {
         return problem_at_field(
             StatusCode::BAD_REQUEST,
             "Invalid password",
@@ -272,6 +272,10 @@ impl ValidatedLiveConnectionQuery {
     }
 }
 
+/// Longest live-connection `nick` filter, in characters: an IRC nickname's
+/// length bound.
+pub(super) const LIVE_NICK_FILTER_CHARS: usize = 64;
+
 pub(super) fn validate_live_connection_query(
     params: LiveConnectionQueryParams,
     default_limit: usize,
@@ -289,20 +293,20 @@ pub(super) fn validate_live_connection_query(
         "The before_id cursor must be a positive live-connection id.",
     )?
     .map(|id| id as u64);
-    let nick = super::device::printable_exact_filter(
+    let nick = super::device::exact_filter(
         params.nick,
-        64,
+        "nick",
+        LIVE_NICK_FILTER_CHARS,
         "Invalid live-connection filter",
-        "The exact nick must contain 1–64 printable bytes.",
     )?;
-    let account = super::device::printable_exact_filter(
+    let account = super::device::exact_filter(
         params.account,
+        "account",
         MAX_ACCOUNT_LEN,
         "Invalid live-connection filter",
-        "The exact account must contain 1–64 printable bytes.",
     )?;
-    let transport = match params.transport.as_deref().map(str::trim) {
-        None | Some("") => None,
+    let transport = match params.transport.as_deref() {
+        None => None,
         Some("tcp") => Some(crate::core::ConnectionTransport::Tcp),
         Some("tls") => Some(crate::core::ConnectionTransport::Tls),
         Some("websocket") => Some(crate::core::ConnectionTransport::WebSocket),
@@ -317,8 +321,8 @@ pub(super) fn validate_live_connection_query(
             .into());
         }
     };
-    let oper = match params.oper.as_deref().map(str::trim) {
-        None | Some("") => None,
+    let oper = match params.oper.as_deref() {
+        None => None,
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(_) => {
@@ -570,8 +574,8 @@ mod tests {
             LiveConnectionQueryParams {
                 limit: Some(37),
                 before_id: Some(91),
-                nick: Some(" Alice ".into()),
-                account: Some(" Account ".into()),
+                nick: Some("Alice".into()),
+                account: Some("Account".into()),
                 transport: Some("websocket".into()),
                 oper: Some("false".into()),
             },
@@ -603,19 +607,25 @@ mod tests {
                 ..Default::default()
             });
         }
-        for transport in ["udp", "TCP"] {
+        for transport in ["udp", "TCP", "", " tcp"] {
             assert_bad_query(LiveConnectionQueryParams {
                 transport: Some(transport.into()),
                 ..Default::default()
             });
         }
-        for oper in ["1", "yes"] {
+        for oper in ["1", "yes", "", " true"] {
             assert_bad_query(LiveConnectionQueryParams {
                 oper: Some(oper.into()),
                 ..Default::default()
             });
         }
-        for nick in ["line\nbreak".to_string(), "x".repeat(65)] {
+        for nick in [
+            "line\nbreak".to_string(),
+            "x".repeat(LIVE_NICK_FILTER_CHARS + 1),
+            String::new(),
+            "   ".to_string(),
+            " Alice".to_string(),
+        ] {
             assert_bad_query(LiveConnectionQueryParams {
                 nick: Some(nick),
                 ..Default::default()

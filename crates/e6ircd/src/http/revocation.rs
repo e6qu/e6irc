@@ -3,7 +3,7 @@
 //! A request is authorized once, when it arrives. A socket outlives that
 //! moment by hours, so "is this credential still good?" has to be asked again
 //! whenever the answer can change: when it is revoked (by any path — the
-//! tables announce it themselves, see `crate::db::CredentialChangeListener`)
+//! tables announce it themselves, see `crate::db::CredentialChange`)
 //! and when it expires. A socket takes a [`CredentialLease`] for the
 //! credential it authenticated with and ends when [`CredentialLease::ended`]
 //! returns.
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
-use crate::db::{CredentialChange, CredentialChangeListener, DbError, RevocableCredential};
+use crate::db::{CredentialChange, DbError, RevocableCredential};
 
 /// Whether a watched credential still authorizes its socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,41 +161,42 @@ impl CredentialWatch {
     }
 
     /// Follow the store's credential announcements for the life of the
-    /// process. A lost connection is re-established with a bounded backoff,
-    /// and every watched credential is read again once it is, because what
-    /// was announced in between was not heard.
-    pub(crate) async fn run(self: Arc<Self>, url: String, pool: sqlx::PgPool) {
-        const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
-        const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-        let mut retry = RETRY_MIN;
-        loop {
-            let mut listener = match CredentialChangeListener::connect(&url).await {
-                Ok(listener) => listener,
-                Err(error) => {
-                    eprintln!(
-                        "http: credential-change listener unavailable, retrying in {}s: {error}",
-                        retry.as_secs()
-                    );
-                    tokio::time::sleep(retry).await;
-                    retry = (retry * 2).min(RETRY_MAX);
-                    continue;
-                }
-            };
-            retry = RETRY_MIN;
-            self.refresh_all(&pool).await;
-            loop {
-                match listener.next().await {
-                    Ok(CredentialChange::Changed(credential)) => {
-                        self.refresh(&pool, &credential).await;
-                    }
-                    Ok(CredentialChange::Resynchronize) => self.refresh_all(&pool).await,
-                    Err(error) => {
-                        eprintln!("http: credential-change listener lost: {error}");
-                        break;
-                    }
-                }
+    /// process; a re-established connection, which may have missed any number
+    /// of them, reads every watched credential again.
+    pub(crate) async fn run(self: Arc<Self>, url: crate::db::DatabaseUrl, pool: sqlx::PgPool) {
+        crate::db::follow_announcements(
+            url,
+            crate::db::CREDENTIAL_CHANGED_CHANNEL,
+            "http: credential-change listener",
+            None,
+            CredentialFollower { watch: self, pool },
+        )
+        .await;
+    }
+}
+
+struct CredentialFollower {
+    watch: Arc<CredentialWatch>,
+    pool: sqlx::PgPool,
+}
+
+impl crate::db::Follower for CredentialFollower {
+    async fn on_change(&mut self, announcement: crate::db::Announcement) -> Result<(), String> {
+        match CredentialChange::of(announcement) {
+            CredentialChange::Changed(credential) => {
+                self.watch.refresh(&self.pool, &credential).await;
             }
+            CredentialChange::Resynchronize => self.watch.refresh_all(&self.pool).await,
+            // An account's authority: the account-authority watcher's. A
+            // suspension or deletion also ends the account's browser
+            // credentials, which are announced themselves.
+            CredentialChange::Account(_) => {}
+            // An app password or token's IRC sessions and attachments: the
+            // account-authority watcher's. A token's chat sockets hear its
+            // `Changed` announcement.
+            CredentialChange::IssuedRevoked(_) => {}
         }
+        Ok(())
     }
 }
 
@@ -217,6 +218,22 @@ impl CredentialLease {
                 *current = answer;
                 true
             });
+        }
+    }
+
+    /// Read the credential again now, and say whether the store says it has
+    /// ended; if so every socket holding it is told. A socket asks when its
+    /// network stops: a suspension or deletion ends the account's credentials
+    /// and stops its networks in one change, and the network's stop can reach
+    /// the socket before the credential's announcement does. A store that
+    /// cannot be asked says nothing either way.
+    pub(crate) async fn has_ended_now(&self, pool: &sqlx::PgPool) -> bool {
+        match crate::db::credential_remaining(pool, &self.credential).await {
+            Ok(None) => {
+                self.watch.announce(&self.credential, Ok(None));
+                true
+            }
+            Ok(Some(_)) | Err(_) => false,
         }
     }
 

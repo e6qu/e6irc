@@ -225,12 +225,35 @@ pub struct Connection {
     /// Capabilities requested after registration whose verdict has not
     /// arrived, so a repeated `CAP NEW` does not ask twice.
     awaiting_verdict: Vec<&'static str>,
+    /// Capabilities the server refused (`CAP NAK`), during registration or
+    /// since, which are not asked for again until a `CAP NEW` offers them
+    /// anew: asked for on every later `CAP` line, a refusal was answered by
+    /// the same request — the driver re-read `CAP` lines after each, so the
+    /// two sides traded `REQ` and `NAK` for as long as the connection lasted.
+    refused: Vec<&'static str>,
     /// The network's `CASEMAPPING` and `CHANTYPES`, from every 005 read on
     /// this connection (whichever read path read it).
     names: NetworkNames,
     /// The most lines one `CHATHISTORY` request may ask for, from the 005
     /// `CHATHISTORY=<max>` token; `None` when the server named no limit.
     chathistory_limit: Option<usize>,
+    /// The one other nickname registration may fall back to when the
+    /// requested one is in use ([`Connection::offer_alternative_nick`]).
+    alternative_nick: AlternativeNick,
+}
+
+/// Whether registration may register under a nickname other than the one
+/// requested, and whether it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AlternativeNick {
+    /// A nickname in use refuses registration.
+    None,
+    /// Offered once, in place of the requested nickname, on its first 433,
+    /// 436 or 437.
+    Offered(String),
+    /// Offered: registration now waits on this nickname, and a refusal of it
+    /// refuses registration.
+    Taken(String),
 }
 
 /// Whether what is written to a connection can be read on the path — decided
@@ -1087,8 +1110,10 @@ impl Connection {
             requested_when_offered: Vec::new(),
             enabled: std::collections::BTreeSet::new(),
             awaiting_verdict: Vec::new(),
+            refused: Vec::new(),
             names: NetworkNames::default(),
             chathistory_limit: None,
+            alternative_nick: AlternativeNick::None,
             reader,
             writer,
             framing: LineBuffer::new(e6irc_proto::message::MAX_SERVER_FRAME_LEN),
@@ -1311,7 +1336,7 @@ impl Connection {
                     Err(_) => return Ok(CapabilityNegotiation::Unanswered),
                 }
             };
-            if let Some(err) = self.registration_refused(&msg) {
+            if let Some(err) = self.refused_while_registering(&msg).await? {
                 return Err(err);
             }
             // A 451 that names `PASS` answers the server password, not `CAP LS`:
@@ -1446,6 +1471,9 @@ impl Connection {
                 // Past the bound the server is only not listened to further;
                 // what the connection already has is unaffected.
                 drop(self.advertised.record(list));
+                // Offered anew: a refusal of it before is not this offer's.
+                self.refused
+                    .retain(|refused| !list.split_whitespace().any(|name| name == *refused));
             }
             Some("DEL") => {
                 self.advertised.withdraw(list);
@@ -1468,6 +1496,8 @@ impl Connection {
                     let capability = self.awaiting_verdict.swap_remove(position);
                     if verdict == "ACK" {
                         self.enabled.insert(capability);
+                    } else {
+                        self.refused.push(capability);
                     }
                 }
             }
@@ -1530,6 +1560,7 @@ impl Connection {
                 self.advertised.offers(capability)
                     && !self.enabled(capability)
                     && !self.awaiting_verdict.contains(capability)
+                    && !self.refused.contains(capability)
                     && self.prerequisite_enabled(capability)
             })
             .collect();
@@ -1552,6 +1583,13 @@ impl Connection {
         self.enabled.contains(capability)
     }
 
+    /// Whether a `CAP REQ` for `capability` (from
+    /// [`Connection::capabilities_to_request`]) has been handed out and its
+    /// `ACK` or `NAK` has not arrived: the server may already be acting on it.
+    pub fn awaiting_verdict(&self, capability: &str) -> bool {
+        self.awaiting_verdict.contains(&capability)
+    }
+
     /// Read `message` as the verdict on the one outstanding `CAP REQ` for
     /// `capabilities`, and enable them when it acknowledges them. `Ok(None)`:
     /// not the verdict.
@@ -1561,8 +1599,14 @@ impl Connection {
         capabilities: &[&'static str],
     ) -> io::Result<Option<CapabilityVerdict>> {
         let verdict = capability_verdict(message, capabilities)?;
-        if verdict == Some(CapabilityVerdict::Acknowledged) {
-            self.enabled.extend(capabilities.iter().copied());
+        match verdict {
+            Some(CapabilityVerdict::Acknowledged) => {
+                self.enabled.extend(capabilities.iter().copied());
+            }
+            Some(CapabilityVerdict::Refused(_)) => {
+                self.refused.extend(capabilities.iter().copied())
+            }
+            None => {}
         }
         Ok(verdict)
     }
@@ -1577,7 +1621,7 @@ impl Connection {
             .await?;
         loop {
             let msg = self.recv("closed during capability negotiation").await?;
-            if let Some(err) = self.registration_refused(&msg) {
+            if let Some(err) = self.refused_while_registering(&msg).await? {
                 return Err(err);
             }
             if let Some(verdict) = self.settle_capability_request(&msg, capabilities)? {
@@ -1658,7 +1702,7 @@ impl Connection {
         msg: &OwnedMessage,
         mechanism: &str,
     ) -> io::Result<Option<io::Error>> {
-        if let Some(err) = self.registration_refused(msg) {
+        if let Some(err) = self.refused_while_registering(msg).await? {
             return Ok(Some(err));
         }
         let failure = match msg.command.as_str() {
@@ -1715,7 +1759,7 @@ impl Connection {
     async fn await_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
             let msg = self.recv("closed before welcome").await?;
-            if let Some(err) = self.registration_refused(&msg) {
+            if let Some(err) = self.refused_while_registering(&msg).await? {
                 return Err(err);
             }
             match msg.command.as_str() {
@@ -1846,7 +1890,7 @@ impl Connection {
                         ));
                     }
                 };
-            if let Some(err) = self.registration_refused(&msg) {
+            if let Some(err) = self.refused_while_registering(&msg).await? {
                 return Err(err);
             }
             match msg.command.as_str() {
@@ -2088,6 +2132,46 @@ impl Connection {
     fn registration_refused(&self, message: &OwnedMessage) -> Option<io::Error> {
         RegistrationRejection::from_reply(message, self.server_password_sent)
             .map(RegistrationRejection::into_error)
+    }
+
+    /// [`Connection::registration_refused`] for a wait loop that may still
+    /// write: the first refusal of the requested nickname as in use, when an
+    /// alternative is offered, is answered with `NICK <alternative>` and
+    /// registration goes on; any other refusal, including one of the
+    /// alternative, ends it. At most one `NICK` is ever added.
+    async fn refused_while_registering(
+        &mut self,
+        message: &OwnedMessage,
+    ) -> io::Result<Option<io::Error>> {
+        let Some(rejection) = RegistrationRejection::from_reply(message, self.server_password_sent)
+        else {
+            return Ok(None);
+        };
+        if rejection.refusal() == RegistrationRefusal::NicknameInUse
+            && let AlternativeNick::Offered(alternative) = &self.alternative_nick
+        {
+            let alternative = alternative.clone();
+            self.send_line(&format!("NICK {alternative}")).await?;
+            self.alternative_nick = AlternativeNick::Taken(alternative);
+            return Ok(None);
+        }
+        Ok(Some(rejection.into_error()))
+    }
+
+    /// Let registration fall back to `alternative`, once, when the requested
+    /// nickname is in use (433, 436 or 437). Whoever offers it must still act
+    /// on a welcome under it ([`Connection::alternative_nick_taken`]): the
+    /// server has registered a name nobody configured.
+    pub fn offer_alternative_nick(&mut self, alternative: &str) {
+        self.alternative_nick = AlternativeNick::Offered(alternative.to_owned());
+    }
+
+    /// The alternative registration fell back to, once it has.
+    pub fn alternative_nick_taken(&self) -> Option<&str> {
+        match &self.alternative_nick {
+            AlternativeNick::Taken(alternative) => Some(alternative),
+            AlternativeNick::None | AlternativeNick::Offered(_) => None,
+        }
     }
 
     async fn send_registration_identity(&mut self, identity: &Identity<'_>) -> io::Result<()> {
@@ -2760,6 +2844,11 @@ pub enum RegistrationRefusal {
     /// The server welcomed the connection under a nickname other than the one
     /// requested. Built only by [`RegistrationRejection::welcomed_as`].
     WelcomedAsAnotherNickname,
+    /// A connection registered under an alternative asked for the requested
+    /// nickname back, and the network said it never will: the nickname is
+    /// registered to an account other than the one this connection
+    /// authenticated as. Built only by [`RegistrationRejection::regain_refused`].
+    NicknameRegainRefused,
     /// The server does not offer the SASL capability or mechanism this
     /// connection was asked to authenticate with. Built only from a
     /// [`SaslRejection`].
@@ -2812,6 +2901,27 @@ impl RegistrationRejection {
             refusal: RegistrationRefusal::WelcomedAsAnotherNickname,
             diagnostic: bounded_diagnostic(&format!(
                 "requested {requested}, but the server welcomed {welcomed}"
+            )),
+        }
+    }
+
+    /// The network refused to hand `requested` back to a connection that
+    /// registered under an alternative, in the words `said` (a services
+    /// answer such as "Invalid password for alice").
+    pub fn regain_refused(requested: &str, said: &str) -> Self {
+        Self {
+            refusal: RegistrationRefusal::NicknameRegainRefused,
+            diagnostic: bounded_diagnostic(&format!("{requested} cannot be regained: {said}")),
+        }
+    }
+
+    /// `requested` was still in use `waited` after the connection registered
+    /// as `alternative` to wait for it: whoever holds it is not going away.
+    pub fn not_regained(requested: &str, alternative: &str, waited: std::time::Duration) -> Self {
+        Self {
+            refusal: RegistrationRefusal::NicknameInUse,
+            diagnostic: bounded_diagnostic(&format!(
+                "{requested} was still in use {waited:?} after registering as {alternative}"
             )),
         }
     }
@@ -2910,7 +3020,8 @@ impl RegistrationRefusal {
     /// not take, and a server password it wants or rejects, take the same
     /// schedule. A
     /// welcome under another nickname parks at once: it cannot end without a
-    /// shorter, or different, configured nickname.
+    /// shorter, or different, configured nickname; so does a nickname the
+    /// network says belongs to another account.
     pub const fn retry_policy(self) -> RefusalRetry {
         match self {
             Self::NotRegistered
@@ -2923,7 +3034,7 @@ impl RegistrationRefusal {
             | Self::ServerPasswordRejected
             | Self::ServerPasswordRequired
             | Self::SaslFailed => RefusalRetry::ScheduleThenPark,
-            Self::WelcomedAsAnotherNickname => RefusalRetry::ParkNow,
+            Self::WelcomedAsAnotherNickname | Self::NicknameRegainRefused => RefusalRetry::ParkNow,
         }
     }
 
@@ -2935,6 +3046,7 @@ impl RegistrationRefusal {
         match self {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
             Self::InvalidNickname | Self::WelcomedAsAnotherNickname => io::ErrorKind::InvalidInput,
+            Self::NicknameRegainRefused => io::ErrorKind::PermissionDenied,
             Self::InvalidUsername => io::ErrorKind::InvalidInput,
             Self::ServerPasswordRejected | Self::ServerPasswordRequired => {
                 io::ErrorKind::PermissionDenied
@@ -3477,6 +3589,50 @@ mod tests {
         assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
+    /// A capability the server refused is not asked for again on the next
+    /// `CAP` line: a relay that re-reads what to request after every `CAP`
+    /// line used to answer each `NAK` with the same `REQ`, for as long as the
+    /// connection lasted. Offered anew by a `CAP NEW`, it is asked for again.
+    #[tokio::test]
+    async fn a_refused_capability_is_asked_for_again_only_when_offered_anew() {
+        let mut steps = after_discovery(
+            ":srv CAP * LS :server-time batch",
+            vec![
+                Expect("CAP REQ :server-time"),
+                Send(":srv CAP * ACK :server-time"),
+            ],
+        );
+        steps.extend(IDENTITY_THEN_WELCOME);
+        steps.extend([
+            Send(":srv CAP nick NEW :echo-message"),
+            Send(":srv CAP nick NAK :echo-message"),
+            Send(":srv CAP nick NEW :echo-message"),
+        ]);
+        let (mut connection, server) = scripted(steps);
+        connection.request_when_offered("echo-message");
+        connection
+            .register(&TEST_IDENTITY)
+            .await
+            .expect("registered");
+        connection.next_line_relayable().await.unwrap();
+        assert_eq!(connection.capabilities_to_request(), vec!["echo-message"]);
+        assert!(connection.awaiting_verdict("echo-message"));
+        connection.next_line_relayable().await.unwrap();
+        assert!(!connection.awaiting_verdict("echo-message"));
+        assert!(
+            connection.capabilities_to_request().is_empty(),
+            "a refusal is not answered with the same request"
+        );
+        connection.next_line_relayable().await.unwrap();
+        assert_eq!(
+            connection.capabilities_to_request(),
+            vec!["echo-message"],
+            "offered anew, it is asked for anew"
+        );
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
     #[tokio::test]
     async fn sasl_stops_before_authenticate_when_the_mechanism_is_not_advertised() {
         let rejection = assert_registration(
@@ -3790,7 +3946,8 @@ mod tests {
         assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
-    /// Libera offers ECDSA, EXTERNAL, PLAIN and SCRAM-SHA-512: a password
+    /// Libera offers `ECDSA-NIST256P-CHALLENGE`, `EXTERNAL`, `PLAIN` and
+    /// `SCRAM-SHA-512`: a password
     /// logs in with SCRAM-SHA-512, and the connection says so.
     #[tokio::test]
     async fn the_strongest_offered_password_mechanism_is_chosen_and_stated() {
@@ -4362,6 +4519,71 @@ mod tests {
         assert_eq!(
             RegistrationRefusal::ServerPasswordRequired.retry_policy(),
             RegistrationRefusal::ServerPasswordRejected.retry_policy()
+        );
+    }
+
+    /// An offered alternative answers the first refusal of the requested
+    /// nickname as in use, once: a refusal of the alternative ends
+    /// registration, and a connection that offers none is refused at once.
+    #[tokio::test]
+    async fn an_offered_alternative_is_taken_once_when_the_nickname_is_in_use() {
+        let registration = |tail: [Step; 3]| {
+            let mut steps = vec![
+                Expect("CAP LS 302"),
+                Send(":srv CAP * LS :"),
+                Expect("NICK nick"),
+                Expect("USER ident 0 * :real"),
+                Expect("CAP END"),
+            ];
+            steps.extend(tail);
+            scripted(steps)
+        };
+        let (mut connection, server) = registration([
+            Send(":srv 433 * nick :Nickname is already in use"),
+            Expect("NICK nick_"),
+            Send(":srv 001 nick_ :Welcome"),
+        ]);
+        connection.offer_alternative_nick("nick_");
+        assert_eq!(connection.alternative_nick_taken(), None);
+        assert_eq!(
+            connection.register(&TEST_IDENTITY).await.expect("welcomed"),
+            "nick_"
+        );
+        assert_eq!(connection.alternative_nick_taken(), Some("nick_"));
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+
+        let (mut connection, server) = registration([
+            Send(":srv 436 * nick :Nickname collision"),
+            Expect("NICK nick_"),
+            Send(":srv 433 * nick_ :Nickname is already in use"),
+        ]);
+        connection.offer_alternative_nick("nick_");
+        let error = connection.register(&TEST_IDENTITY).await.unwrap_err();
+        let rejection = RegistrationRejection::from_error(&error).expect("a typed refusal");
+        assert_eq!(rejection.refusal(), RegistrationRefusal::NicknameInUse);
+        drop(connection);
+        assert_eq!(
+            server.await.unwrap(),
+            Vec::<String>::new(),
+            "one NICK added"
+        );
+
+        let (mut connection, server) = registration([
+            Send(":srv 437 * nick :Nick/channel is temporarily unavailable"),
+            Pause(std::time::Duration::ZERO),
+            Pause(std::time::Duration::ZERO),
+        ]);
+        let error = connection.register(&TEST_IDENTITY).await.unwrap_err();
+        assert_eq!(
+            RegistrationRefusal::from_error(&error),
+            Some(RegistrationRefusal::NicknameInUse)
+        );
+        drop(connection);
+        assert_eq!(
+            server.await.unwrap(),
+            Vec::<String>::new(),
+            "nothing offered"
         );
     }
 

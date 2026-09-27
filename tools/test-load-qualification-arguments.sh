@@ -37,3 +37,17 @@ refuses validate_qualification_arguments 100001 1 1
 refuses validate_qualification_arguments 100000 100000 1
 refuses validate_qualification_arguments 2 1 10000001
 refuses validate_qualification_arguments 100000 1 102
+
+burst_within_command_burst 1
+burst_within_command_burst 39
+refuses burst_within_command_burst 40
+refuses burst_within_command_burst 600
+refuses burst_within_command_burst 0
+
+monitoring_url http://127.0.0.1:8080
+monitoring_url http://127.0.0.1:8080/
+monitoring_url 'http://[::1]:8080'
+refuses monitoring_url https://127.0.0.1:8080
+refuses monitoring_url http://127.0.0.1
+refuses monitoring_url http://127.0.0.1:8080/api
+refuses monitoring_url 127.0.0.1:8080

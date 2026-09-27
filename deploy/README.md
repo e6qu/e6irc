@@ -88,10 +88,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now e6ircd
 ```
 
-The unit uses SIGTERM and a 55-second stop budget, exceeding the daemon’s
+The unit uses SIGTERM and a 65-second stop budget, exceeding the daemon’s
 bounded shutdown — up to 15 seconds telling every bouncer network's upstream
-goodbye, then up to 5 seconds draining the core shards, then up to 30 seconds
-flushing PostgreSQL — so systemd cannot kill a still-clean shutdown first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
+goodbye, then up to 5 seconds draining the core shards, then up to 8 seconds
+letting client connections deliver their closing `ERROR`, then up to 30
+seconds flushing PostgreSQL ([Stop timeout](#stop-timeout)) — so systemd cannot
+kill a still-clean shutdown first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
 daemon in milliseconds, and systemd's default limit of five starts in ten
 seconds would otherwise leave the unit permanently failed after a reboot where
 PostgreSQL comes up later than e6irc; restarts stay two seconds apart and each
@@ -111,8 +113,10 @@ neither a core file nor a same-user debugger may read them.
 A `[[listeners]]` entry with `tls` and the BNC attach listener's certificate
 (`[bnc].tls`, or the console's BNC TLS paths) are read from their PEM files at
 start and again whenever they change: every 60 seconds the daemon compares
-the files' identities (modification and status-change times, length, inode)
-with those it read, and it reloads at once on `SIGHUP`
+each file's modification time and a SHA-256 digest of its contents with those
+it read — the digest decides, so a rewrite that keeps the modification time
+(`cp -p`, `rsync -t`, an unpacked archive) is still a change — and it reloads
+at once on `SIGHUP`
 (`systemctl kill -s HUP e6ircd`). A renewal hook therefore needs no restart.
 The `SIGHUP` handler is installed before the database wait, so a renewal hook
 that fires while the daemon is still starting cannot kill it.
@@ -129,7 +133,9 @@ Clients attaching to their always-on networks authenticate with their account
 password (SASL PLAIN). The listener therefore refuses to be configured on any
 address but loopback without a certificate — in the configuration file
 (`[bnc] addr = …` needs `tls = { cert_path = …, key_path = … }` unless the
-address is `127.0.0.1`/`::1`) and in the console alike, each refusal naming the
+address is a loopback one — anywhere in `127.0.0.0/8`, `::1`, or an
+IPv4-mapped loopback address such as `::ffff:127.0.0.1`) and in the console
+alike, each refusal naming the
 setting. A loopback listener without TLS is for clients on the same machine
 (or behind a TLS-terminating proxy that runs there). The TLS handshake has the
 same 30-second bound as the IRC listeners'.
@@ -181,7 +187,8 @@ them. A variable that still states a console-owned setting must agree with the
 stored value: if it differs, the container fails to start and names each such
 setting (`http.admin_accounts`, `oidc[0].client_secret`) without printing
 either value. Resolve it by unsetting the variable (the stored value applies;
-`E6IRC_SERVER_NAME` and `E6IRC_PUBLIC_URL` are required, so align those),
+an unset `E6IRC_SERVER_NAME` or `E6IRC_PUBLIC_URL` takes the stored value, and
+only a first start, with nothing stored, needs it),
 setting it to the stored value, or changing the setting in the console first.
 So removing a name from `E6IRC_ADMIN_ACCOUNTS` or rotating
 `E6IRC_OIDC_CLIENT_SECRET` is done in the console (then the variable is
@@ -194,7 +201,9 @@ exists; remove the environment secret after successful initialization.
 The same page owns live history and audit retention (30 and 365 days by
 default). History retention bounds both the server's own channel history
 (`messages`) and every network's bouncer history (`bnc_buffer`, direct
-messages included). A supervised worker applies those limits in bounded
+messages included), and what either serves from memory — the core's history
+rings and each network's in-memory backlog — from the moment it is saved. A
+supervised worker applies those limits to the database in bounded
 batches every five minutes — up to 21 batches in one tick when a backlog has
 built up — and also removes expired browser sessions, personal access tokens,
 device grants, consumed logout tokens, and monitoring samples past their
@@ -208,9 +217,9 @@ configured, the next start seals and imports them atomically.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `E6IRC_SERVER_NAME` | yes | IRC server name, e.g. `e6irc.dev.e6qu.dev` |
-| `E6IRC_PUBLIC_URL` | yes | External base URL; OIDC redirect + post-logout base |
-| `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant) |
+| `E6IRC_SERVER_NAME` | on the first start | IRC server name, e.g. `e6irc.dev.e6qu.dev`; unset afterwards, the name the console stores applies |
+| `E6IRC_PUBLIC_URL` | on the first start | External base URL; OIDC redirect + post-logout base; unset afterwards, the URL the console stores applies |
+| `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant). Its query keys are a closed set — `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey` (or their hyphenated spellings), `application_name`, `options` (`-c name=value` settings), `statement-cache-capacity` — and any other key, a misspelt `sslmode` value or a field stated twice is refused at start; the container must not set libpq variables (`PGHOST`, `PGSSLMODE`, `PGPASSWORD`, ...), which are refused by name: the URL alone describes the connection |
 | `APPLICATION_RELEASE_REVISION` | yes | The deployed revision, shown on the console's configuration page and on the authenticated identity page Shauth's browser validator reads. With the `shauth` provider configured it must be 12–64 lowercase hexadecimal digits or `sha256:` plus 64 of them; the image tag's short SHA qualifies |
 | `E6IRC_SECRET_KEY` | for credential storage (secret) | Base64 32-byte primary key; new managed and account-network credentials are sealed with it |
 | `E6IRC_PREVIOUS_SECRET_KEYS` | only during rotation (secret) | Comma-separated old keys accepted for reads until `e6ircd rotate-secrets` commits |
@@ -222,7 +231,7 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_MONITORING_TOKEN` | no (secret; at least 32 non-whitespace characters) | Bearer for the read-only `/api/v1/monitoring/observation` endpoint; unset, the endpoint is closed |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated administrator account names, imported on the first start and console-owned afterwards (see above); empty fields name no account |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
-| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
+| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for the serving process's pool, a few connections per standby (see High availability), and your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
@@ -252,6 +261,12 @@ The command re-seals managed configuration and every account-network
 credential in one PostgreSQL transaction and writes a redacted audit record.
 It exits nonzero and rolls the whole transaction back if any value cannot be
 proven readable. After success, remove `E6IRC_PREVIOUS_SECRET_KEYS` and restart.
+The re-seal writes a new settings revision; the serving process hears it and
+adopts it at once, so the console keeps saving without a restart. Run
+`rotate-secrets` and `recover-administrator` with the binary the serving
+process runs: against a schema older than its binary, a command refuses while a
+process serves (`upgrade the serving process first`) rather than migrate under
+it.
 
 ### Recover a lost administrator login
 
@@ -273,23 +288,147 @@ is refused and nothing is changed. A running e6ircd honours the authority at
 once — it reads an account's authority on every request — so sign in and change
 the password.
 
+## Upgrade notes
+
+Read these before deploying a release that includes the change named.
+
+- **One process serves a database (migration 0098).** The first upgrade to a
+  release with the serving lease needs every e6ircd process on the database
+  stopped: an older release knows no lease, so one left running would serve
+  beside the new one. Stop them all, start one with the new release (it
+  migrates), then start any standbys. Every later upgrade is the rolling
+  procedure under High availability. A second process on the same database no
+  longer serves beside the first: it stands by (below).
+- **The HTTP authentication throttle is on (migration 0088).** A stored
+  `limits.auth_rate_burst` of `null` used to mean off; it now takes the
+  default, twenty requests a minute per client address, on the routes that
+  sign people in. Behind a reverse proxy every request comes from the proxy's
+  address, so unless `limits.trusted_proxies` (a console-owned limit, at
+  `/console/configuration`) names the proxy, every user shares one budget of
+  twenty a minute.
+  Set `trusted_proxies` to the proxy's address or range so each client is
+  counted by the address the proxy forwards, or set `auth_rate_burst` to
+  `"off"` if the proxy throttles those routes itself. When the HTTP listener
+  binds only a loopback address and no trusted proxy is set, start logs a
+  warning saying so; a listener bound wider (`0.0.0.0:8080` in the container)
+  cannot tell, so check the setting.
+- **The database URL is read strictly.** A query key outside the closed set
+  in the table above (`ssl_mode`, `connect_timeout`, `hostaddr`, ...), a
+  misspelt `sslmode` value, or a field stated twice now refuses start by name;
+  such a key used to be dropped, and a dropped `sslmode` meant no certificate
+  verification. libpq variables (`PGSSLMODE`, `PGHOST`, `PGPASSWORD`, ...) in
+  the daemon's environment are refused too — state everything in the URL.
+- **A server network's `buffer_cap` is at most 5,000 (migration 0091).** That
+  is what the stored backlog keeps, and a start now restores a network's whole
+  buffer. A stored value above it is brought to 5,000 (more never survived a
+  restart), as a new settings revision whose `CONFIG` audit entry records each
+  network's previous value; a configuration file stating more is refused at
+  start.
+- **A configuration file may leave out `server_name`, `network_name` and
+  `[[listeners]]`** once the console stores them, and `E6IRC_SERVER_NAME` may be
+  unset; the stored values apply. A first start with nothing stored refuses,
+  naming each.
+- **`E6IRC_PUBLIC_URL` may be unset** once the console stores the public URL,
+  as a database-backed file's `[http]` may omit `public_url`; the stored value
+  applies. A first start with nothing stored refuses, naming
+  `http.public_url` — so a database-backed file with `[http]` states it on the
+  first start too.
+- **`motd` lines and `description` are bounded** (372 and 242 bytes: what their
+  replies carry whole). A longer one is refused at start and at a console
+  save instead of being cut short on the wire.
+- **The whole MOTD is bounded in bytes (migration 0094).** A new client is
+  sent all of it at registration, so it may take at most 8,703 bytes as sent —
+  half the smallest SendQ: its lines together at most 8,318 bytes, each line
+  counting 140 more for its reply. A stored MOTD above it keeps the longest run
+  of its first lines that fits, as a new settings revision whose `CONFIG`
+  audit entry records the previous MOTD in full; a configuration file stating
+  more is refused at start.
+- **History pages in `(time, msgid)` order (migrations 0093 and 0094).** 0093
+  builds its index concurrently, outside a transaction, so writers to
+  `messages` are not blocked; on a large table it takes a while. A start
+  interrupted during the build drops the invalid index it left and builds it
+  again. Read markers kept under a correspondent's nick are moved to the
+  identity key conversations use.
+
 ## Stop timeout
 
 On SIGTERM the daemon stops accepting work, tells every bouncer network's
-upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so a
-restart never meets its own ghost), drains its core shards for at most 5
-seconds, then flushes buffered writes to PostgreSQL for at most 30 seconds.
-Give the container at least 55 seconds before it is killed, as
-`e6ircd.service` does: `stopTimeout: 55` (or more) in the ECS container
-definition, `docker stop --time 55`, or `stop_grace_period: 55s` in Compose.
+upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so the
+next process to serve does not meet its session there still logged in),
+drains its core shards for at most 5 seconds, lets every client connection
+deliver its closing `ERROR` and close for at most 8 seconds, flushes buffered
+writes to PostgreSQL for at most 30 seconds, and then gives the serving lease
+back for at most 5 seconds, so a standby takes over at once. A process that is
+killed instead says no goodbye: its upstream sessions end when the upstream
+notices the dropped connection, and until then the next process to serve
+finds its nick held there — it registers under the alternative nickname and
+takes the configured one back once the ghost is gone or NickServ regains it. Give the container at least 65 seconds
+before it is killed, as
+`e6ircd.service` does: `stopTimeout: 65` (or more) in the ECS container
+definition, `docker stop --time 65`, or `stop_grace_period: 65s` in Compose.
 The Docker default of 10 seconds and the ECS default of 30 can both kill a
 shutdown that was still flushing cleanly.
+
+## High availability
+
+One e6ircd process serves a database: it runs the IRC core, the bouncer
+drivers (one upstream session per network), the database writer, storage
+maintenance and sampling, and binds the IRC, attach and HTTP listeners. Any
+other process started with the same configuration and database is a
+**standby**. Two processes serving one database — the IRC equivalent of two
+servers linked — is not supported: the lease makes it impossible.
+
+- **Lease.** The serving process holds the one row of `serving_lease` and
+  renews it every 3 seconds; the lease stands for 15 seconds after the last
+  renewal, measured on PostgreSQL's clock (the hosts' clocks do not matter). A
+  process that cannot confirm a renewal for 10 seconds stops serving by itself
+  — the same bounded drain as SIGTERM, and a non-zero exit, so its service
+  manager restarts it as a standby — before anyone else can take the lease.
+  When a standby takes the lease it ends every PostgreSQL connection the
+  previous holder opened, and a process without the lease cannot open a new
+  one: nothing a stalled holder had in flight lands after the takeover. Every
+  process must connect as the same database role, so the new holder can see
+  and end the old one's connections. Each takeover is an audit entry
+  (`SERVING_LEASE_ACQUIRE`); `e6irc_serving_lease_held` and
+  `e6irc_serving_lease_epoch` are on the metrics.
+- **Standby.** A standby says so on stderr (`standing by: the serving lease is
+  held by ADDRESS pid PID, e6ircd VERSION ...`), binds only the HTTP address,
+  and answers there `/healthz` 200 and `/readyz` 503 with
+  `{"role":"standby","holder":...}`; everything else is 503. It takes over the
+  moment the holder releases the lease (a graceful stop announces it) or 15
+  seconds after the holder's last renewal (a crash), then closes that listener,
+  migrates, and binds everything as a serving process does. A standby whose
+  binary is older than the schema refuses to start: it could never serve.
+- **Load balancer.** Route to the process whose `/readyz` answers 200: HTTP
+  and WebSockets on the HTTP port, and TCP 6697 (IRC) and the attach port with
+  that same HTTP check as their health check — a standby does not bind them.
+- **Service manager.** Run the same unit (`e6ircd.service`) with the same
+  configuration on two hosts; whichever starts first serves. `Restart=` brings
+  a fenced or crashed process back as the standby.
+- **Rolling upgrade.** Restart the standby with the new release (a standby may
+  be newer than the schema); send SIGTERM to the serving process — the
+  upgraded standby takes over and migrates; then start the old serving host
+  with the new release, as the standby. The first upgrade to a release with the
+  lease is the exception above: stop every process.
+- **Recovery point.** A graceful handoff loses nothing: the serving process
+  flushes to PostgreSQL before it releases. After a crash the new process
+  serves what PostgreSQL committed; lines the dead process had buffered and not
+  yet written (at most one batch of the history writer, and a bouncer
+  network's last backlog lines) are lost. Clients reconnect; bouncer networks
+  are dialled again by the new holder.
+- **PostgreSQL itself must fail over with synchronous replication**
+  (`synchronous_commit = on` with a synchronous standby, or a managed service
+  that promises no committed transaction is lost at failover). An asynchronous
+  replica promoted after a crash can roll the lease row back to an earlier
+  holder — and with it every write after that point — so two processes could
+  each believe the lease theirs until the next renewal.
 
 ## Running on any container host
 
 Any host that runs an OCI image can run e6irc. It has to provide:
 
-- **The environment** in the table above. Four variables are required; secrets
+- **The environment** in the table above. Three variables are required, and
+  `E6IRC_SERVER_NAME` for the first start; secrets
   (`E6IRC_DATABASE_URL`, `E6IRC_SECRET_KEY`, `E6IRC_PREVIOUS_SECRET_KEYS`,
   `E6IRC_OIDC_CLIENT_SECRET`, `E6IRC_BOOTSTRAP_TOKEN`, `E6IRC_MONITORING_TOKEN`)
   belong in the host's secret store, not in the image
@@ -306,8 +445,9 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   exits non-zero. Migrations run on a connection of their own with no
   statement timeout, so a long one (an index on a table that has grown for
   months) completes; one that waits more than 10 s for a lock — another
-  replica migrating, a long transaction — is abandoned and retried, up to six
-  attempts, one stderr line each. Back it up with `tools/backup-postgres.sh`.
+  process migrating, a long transaction — is abandoned and retried, up to six
+  attempts, one stderr line each. Only the process holding the serving lease
+  migrates (see High availability). Back it up with `tools/backup-postgres.sh`.
 - **The master key**, `E6IRC_SECRET_KEY`, kept outside the database and backed
   up separately. Without it the daemon cannot store upstream or managed
   credentials, and a database restored without it holds ciphertext nothing can
@@ -342,7 +482,7 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   optional BNC listener an administrator can enable in the console is a TCP
   port of its own, needs a host that can publish one, and off loopback needs a
   certificate the container can read ([BNC attach listener](#bnc-attach-listener)).
-- **A stop timeout of at least 55 seconds** ([Stop timeout](#stop-timeout)).
+- **A stop timeout of at least 65 seconds** ([Stop timeout](#stop-timeout)).
 - **Outbound network access** to PostgreSQL, to the OpenID Connect issuer, and
   — for always-on networks and bridges — to the IRC networks (TCP 6697 for the
   curated ones), Matrix homeservers, Discord, and Slack. On an account's

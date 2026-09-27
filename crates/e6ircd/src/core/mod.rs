@@ -10,6 +10,7 @@
 
 mod banmask;
 mod handler;
+pub(crate) mod history_request;
 mod hot_history;
 pub(crate) mod line_meter;
 mod list;
@@ -43,6 +44,7 @@ use bytes::Bytes;
 #[cfg(test)]
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
+pub(crate) use state::HistoryRetention;
 use state::{
     ChanKey, ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
     ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
@@ -271,6 +273,57 @@ impl CoreIngress {
         self.broadcast(|| Input::Shutdown).await
     }
 
+    /// Apply history retention (`storage.history_retention_days`) to what the
+    /// core and the bouncer serve from memory, from now on: every shard and
+    /// every network reads the one cell this sets.
+    pub(crate) fn set_history_retention_days(&self, days: u64) {
+        self.directories.history_retention.set_days(days);
+    }
+
+    /// Apply `limits.anti_spam_exit_message_time_seconds` to every `QUIT`
+    /// from now on: every shard reads the one cell this sets.
+    pub(crate) fn set_anti_spam_exit_message_time_seconds(&self, seconds: u64) {
+        self.directories
+            .anti_spam_exit_message_time
+            .set_seconds(seconds);
+    }
+
+    /// Apply what of a stored settings revision the core follows live: the
+    /// history retention, the QUIT-comment delay and the password minimum. The
+    /// one way a revision reaches the running core, whether a console save
+    /// here or another writer's revision adopted here, so no path can apply one
+    /// without the others
+    /// ([`crate::config::ManagedConfig::requires_restart_to_reach`] names the
+    /// same settings).
+    pub(crate) fn adopt_live_settings(&self, settings: &crate::config::ManagedConfig) {
+        self.set_history_retention_days(settings.storage.history_retention_days);
+        self.set_anti_spam_exit_message_time_seconds(
+            settings.limits.anti_spam_exit_message_time_seconds,
+        );
+        self.directories
+            .password_policy
+            .set_minimum_chars(settings.registration.minimum_password_length);
+    }
+
+    /// The rule for a password being set, which the core holds `REGISTER`
+    /// and NickServ `REGISTER` to and the web and the REST API read too: one
+    /// cell, so a change of `registration.minimum_password_length` reaches
+    /// every surface at once.
+    pub(crate) fn password_policy(&self) -> crate::identity::PasswordPolicy {
+        self.directories.password_policy.clone()
+    }
+
+    /// Every app password and personal access token a live IRC session, on
+    /// any shard, signed in with.
+    pub(crate) fn signed_in_credentials(&self) -> Vec<crate::identity::IssuedCredential> {
+        self.directories.signed_in_credentials.held()
+    }
+
+    /// The history retention cell, for the bouncer's backlogs.
+    pub(crate) fn history_retention(&self) -> HistoryRetention {
+        self.directories.history_retention.clone()
+    }
+
     pub(crate) async fn broadcast_read_markers_expired(
         &self,
         markers: Arc<[ExpiredReadMarker]>,
@@ -296,6 +349,37 @@ impl CoreIngress {
             successions: successions.to_vec(),
         })
         .await
+    }
+
+    /// Tell every shard that the revocation listener was re-connected, and
+    /// wait until each has refused the verdicts of the credential checks
+    /// queued before: only then may the listener re-read what live sessions
+    /// hold, since a verdict that lands before the refusal is among them and
+    /// one that lands after is refused. Bounded like [`Self::admin_reply`].
+    pub(crate) async fn refuse_verdicts_in_flight(&self) -> Result<(), String> {
+        const SHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut answers = Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            let (done, answered) = tokio::sync::oneshot::channel();
+            if shard
+                .push(Input::RefuseVerdictsInFlight { done })
+                .await
+                .is_err()
+            {
+                return Err("core worker unavailable".into());
+            }
+            answers.push(answered);
+        }
+        for answered in answers {
+            match tokio::time::timeout(SHARD_REPLY_TIMEOUT, answered).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_closed)) => return Err("core worker dropped the request".into()),
+                Err(_elapsed) => {
+                    return Err("core worker did not answer within 5 seconds".into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Put one administrative request to the core and wait for its answer,
@@ -405,7 +489,8 @@ impl Input {
             Input::Tick { .. }
             | Input::Shutdown
             | Input::ReadMarkersExpired { .. }
-            | Input::AccountDeleted { .. } => {
+            | Input::AccountDeleted { .. }
+            | Input::RefuseVerdictsInFlight { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
             }
             Input::ServerBanResult { requester, .. } => match requester {
@@ -417,6 +502,9 @@ impl Input {
             }
             Input::AccountSuspensionApplied { .. } => {
                 panic!("account-suspension event must be broadcast by a core worker")
+            }
+            Input::AccountSessionsEnded { .. } | Input::CredentialSessionsEnded { .. } => {
+                panic!("sessions-ended event must be broadcast by a core worker")
             }
             Input::ReadMarkerApplied { .. } => {
                 panic!("read-marker event must be broadcast by a core worker")
@@ -602,7 +690,8 @@ impl std::fmt::Display for ConnectionIdExhausted {
 impl std::error::Error for ConnectionIdExhausted {}
 
 /// One stored read marker that storage maintenance deleted: the account's
-/// display name as stored, the folded target, and the value deleted.
+/// display name as stored, the target as kept (a `MarkerTarget`), and the
+/// value deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredReadMarker {
     pub account: String,
@@ -646,7 +735,7 @@ pub enum Input {
     ChannelJoin {
         owner: ChannelOwner,
         actor: ChannelActor,
-        name: String,
+        name: crate::sanitize::ChannelName,
         join_key: Option<String>,
         label: Option<String>,
     },
@@ -844,6 +933,12 @@ pub enum Input {
         account: String,
         successions: Vec<crate::db::ChannelSuccession>,
     },
+    /// The revocation listener was re-connected: refuse the verdict of every
+    /// credential check queued before now, then say so on `done`
+    /// ([`state::ServerState::refuse_verdicts_in_flight`]).
+    RefuseVerdictsInFlight {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply {
         conn: ConnId,
@@ -924,6 +1019,17 @@ pub enum Input {
         suspended: bool,
         reason: String,
         actor: String,
+    },
+    /// An account's credentials changed: every core shard ends its sessions.
+    AccountSessionsEnded {
+        account: String,
+        reason: String,
+        actor: String,
+    },
+    /// An issued credential was revoked: every core shard ends the sessions
+    /// it opened.
+    CredentialSessionsEnded {
+        credential: crate::identity::IssuedCredential,
     },
     /// A stored account read marker applied on every non-origin core shard.
     ReadMarkerApplied {
@@ -1041,6 +1147,23 @@ pub enum AdminRequest {
         suspended: bool,
         reason: String,
         actor: String,
+    },
+    /// End every live session of an account whose credentials changed (a
+    /// password change): a verdict for a credential check queued before it is
+    /// refused when it lands, then every authenticated session is closed.
+    /// Unlike a suspension, no gate stays.
+    EndAccountSessions {
+        account: String,
+        reason: String,
+        actor: String,
+    },
+    /// End every live session the app password or personal access token
+    /// `credential` opened, because it was revoked: a verdict for a check of
+    /// it queued before now is refused when it lands, then each such session
+    /// is closed with an `ERROR` naming the revocation. The account's other
+    /// sessions stay.
+    EndCredentialSessions {
+        credential: crate::identity::IssuedCredential,
     },
     /// Mutate one registered channel owned by `actor`. This is the shared
     /// control-plane entry used by the owner API and console.
@@ -1593,7 +1716,14 @@ pub enum DbRequest {
     /// Verify a bearer token (SASL OAUTHBEARER); answered with the same
     /// `PasswordVerified`/`PasswordRejected` replies as a password. A token is
     /// only ever presented by SASL, so its reply origin is always `Sasl`.
-    VerifyToken { conn: ConnId, token: String },
+    /// `authzid` is the GS2 authorization identity the client asked to act
+    /// as; a token is refused unless it is absent or names the token's own
+    /// account (RFC 7628 §3.1).
+    VerifyToken {
+        conn: ConnId,
+        token: String,
+        authzid: Option<String>,
+    },
     CreateAccount {
         conn: ConnId,
         name: String,
@@ -1697,7 +1827,8 @@ pub enum DbRequest {
     SetReadMarker {
         conn: ConnId,
         account: String,
-        /// Casefolded target.
+        /// What the marker is kept under: a `MarkerTarget` (a channel's folded
+        /// name, or a correspondent's identity).
         target: String,
         /// Validated target spelling from the command, for the reply.
         display: String,
@@ -1936,6 +2067,11 @@ impl HistoryFloor {
             Self::Whole => true,
             Self::Since(since) => ts >= since,
         }
+    }
+
+    /// This floor, or `cutoff` where that is later.
+    pub(crate) fn at_least(self, cutoff: e6irc_proto::time::Millis) -> Self {
+        Self::Since(self.millis().max(cutoff))
     }
 
     /// The bound as the millisecond value the history queries compare `ts`
@@ -2216,6 +2352,32 @@ impl HistoryRow {
             None => std::borrow::Cow::Borrowed(&self.body),
         }
     }
+
+    /// Where this entry sits in its buffer's history: its millisecond, then its
+    /// msgid compared byte by byte. The one total order of a buffer, which
+    /// every shard computes identically from the message alone — the hot ring
+    /// keeps its entries in it and the database pages by it
+    /// (`ORDER BY ts, msgid COLLATE "C"`, migration 0093), so two lines
+    /// stamped in one millisecond on different shards sit in the same order in
+    /// both, whichever shard persisted each. A byte comparison is what the
+    /// `"C"` collation is; any other collation would order the same ids
+    /// differently in the database than here.
+    pub(crate) fn place(&self) -> HistoryPlace<'_> {
+        HistoryPlace {
+            ts: self.ts,
+            msgid: Some(&self.msgid),
+        }
+    }
+}
+
+/// A position in a buffer's `(ts, msgid)` order ([`HistoryRow::place`]). A
+/// `timestamp=` bound has no msgid and sits before every message stamped in
+/// its millisecond: `None` orders before any id, as a SQL row comparison
+/// against a NULL id reduces to one on the time alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HistoryPlace<'a> {
+    pub(crate) ts: e6irc_proto::time::Millis,
+    pub(crate) msgid: Option<&'a str>,
 }
 
 /// Capability state that determines the wire shape of a CHATHISTORY reply.
@@ -2267,6 +2429,13 @@ impl From<state::Caps> for HistoryResponseCaps {
 pub enum DbReply {
     PasswordVerified {
         account: String,
+        /// The credential that verified, which the session keeps: revoking it
+        /// ends the session.
+        credential: crate::identity::CredentialId,
+        /// How much longer the credential authorizes, by the store's clock:
+        /// exactly a personal access token's expiry, at which the session
+        /// ends. `None` for a password, which does not expire.
+        expires_in: Option<std::time::Duration>,
         origin: CredentialOrigin,
     },
     PasswordRejected {
@@ -2488,6 +2657,14 @@ pub(crate) enum CoreEffect {
         reason: String,
         actor: String,
     },
+    BroadcastAccountSessionsEnded {
+        account: String,
+        reason: String,
+        actor: String,
+    },
+    BroadcastCredentialSessionsEnded {
+        credential: crate::identity::IssuedCredential,
+    },
     BroadcastReadMarker {
         account: String,
         target: String,
@@ -2553,6 +2730,24 @@ impl CoreEffect {
                 },
                 false,
             ),
+            CoreEffect::BroadcastAccountSessionsEnded {
+                account,
+                reason,
+                actor,
+            } => (
+                Input::AccountSessionsEnded {
+                    account: account.clone(),
+                    reason: reason.clone(),
+                    actor: actor.clone(),
+                },
+                false,
+            ),
+            CoreEffect::BroadcastCredentialSessionsEnded { credential } => (
+                Input::CredentialSessionsEnded {
+                    credential: *credential,
+                },
+                false,
+            ),
             CoreEffect::BroadcastReadMarker {
                 account,
                 target,
@@ -2608,8 +2803,9 @@ pub(crate) enum CoreWorkerExit {
 pub(crate) const CROSS_SHARD_BACKLOG_LIMIT: usize = 65_536;
 
 /// How long a worker with a LIST or WHO reply being paced out waits, idle,
-/// before giving it another turn: at the default send queue, half of it — 512
-/// rows — per turn.
+/// before giving it another turn. Each turn fills the client's send queue up
+/// to half its `sendq_bytes` ([`SessionOutput::paced_room`]), however many rows
+/// that is.
 pub(crate) const PACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -2626,6 +2822,11 @@ pub(crate) struct CoreWorker {
 
 impl CoreWorker {
     pub(crate) fn new(core: Core, receiver: Receiver<Input>, ingress: CoreIngress) -> Self {
+        // Heard from the moment it is built to run, not from its first
+        // finished event: a probe answered in the milliseconds before an idle
+        // core's first tick is not a stalled core, and a worker that never
+        // gets to run still shows as stalled once the heartbeat bound passes.
+        core.state.telemetry.record_core_heartbeat(core.shard.0);
         let backlog = (0..ingress.shards.len()).map(|_| VecDeque::new()).collect();
         Self {
             core,
@@ -3273,10 +3474,17 @@ impl Core {
             Input::PaceReplies => {}
             Input::Tick { now } => {
                 handler::reap_idle(&mut self.state, now);
+                self.state.expire_logins(now);
                 handler::services::enforce_nick_protection(&mut self.state, now);
                 handler::oper::expire_server_bans(&mut self.state);
             }
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
+            Input::RefuseVerdictsInFlight { done } => {
+                self.state.refuse_verdicts_in_flight();
+                // The listener waits for every shard; one that stopped
+                // waiting has given up on all of them.
+                let _ = done.send(());
+            }
             Input::AccountDeleted {
                 account,
                 successions,
@@ -3383,6 +3591,21 @@ impl Core {
             Input::ServerBanApplied { mutation } => {
                 handler::oper::apply_committed_server_ban(&mut self.state, mutation);
             }
+            Input::AccountSessionsEnded {
+                account,
+                reason,
+                actor,
+            } => {
+                handler::admin::apply_account_sessions_ended(
+                    &mut self.state,
+                    &account,
+                    &reason,
+                    &actor,
+                );
+            }
+            Input::CredentialSessionsEnded { credential } => {
+                handler::admin::apply_credential_sessions_ended(&mut self.state, credential);
+            }
             Input::AccountSuspensionApplied {
                 account,
                 suspended,
@@ -3454,14 +3677,14 @@ impl Core {
         handler::pace_replies(&mut self.state);
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
-        // overflows someone else's queue — hence the loop). Dropping the
-        // session drops its queue Sender, which is what closes the
-        // socket: write_loop drains, flushes, and shuts down on None.
+        // overflows someone else's queue — hence the loop). Its backlog is
+        // replaced by its closing ERROR, and dropping the session drops its
+        // queue Sender, which is what closes the socket.
         while let Some(conn) = self.state.doomed.pop() {
             if self.state.sessions.contains_key(&conn) {
                 self.state.telemetry.record_sendq_kill();
             }
-            self.state.close(conn, "SendQ exceeded");
+            self.state.close_for_sendq(conn);
         }
         self.state.publish_changed_channels();
         self.state.publish_census();
@@ -3555,9 +3778,164 @@ impl SessionOutput {
         drop(self.write(line));
         self.said_goodbye = true;
     }
+
+    /// Discard everything still queued, then queue the closing line — which
+    /// the emptied queue always has room for. For a connection killed because
+    /// it could not take what it was sent.
+    pub(crate) fn discard_backlog_for_goodbye(&mut self, line: WireLine) {
+        drop(self.tx.0.take_queued());
+        self.write_goodbye(line);
+    }
 }
 
 pub(crate) struct SendqExceeded;
+
+/// Fuzzing-only access to the hot history ring and the CHATHISTORY window
+/// arithmetic over it, for the `chathistory_window` target.
+///
+/// Compiled *only* under cargo-fuzz's `--cfg fuzzing` (never in a normal build,
+/// `cargo test`, or the shipped binary), so it does not widen the crate's real
+/// public surface.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    use e6irc_proto::time::Millis;
+
+    use super::hot_history::{HotHistory, HotHistoryBounds};
+    use super::state::HistoryKey;
+
+    /// One message entering a ring: when it was stamped, on which shard,
+    /// whether it is a TAGMSG, and how many bytes of client-only tags it
+    /// carries.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Arrival {
+        pub ts: u64,
+        pub shard: u8,
+        pub tagmsg: bool,
+        pub tag_bytes: u16,
+    }
+
+    /// A ring after its arrivals: `(msgid, ts)` oldest first, whether it is
+    /// the whole record, and its newest timestamp in the text scope and in the
+    /// text-and-tags scope. `msgids[i]` is the msgid the `i`th arrival was
+    /// stamped with by its shard's real msgid source, so a millisecond's
+    /// entries from several shards order as they do in production.
+    #[derive(Debug, Clone)]
+    pub struct Ring {
+        pub msgids: Vec<String>,
+        pub entries: Vec<(String, u64)>,
+        pub complete: bool,
+        pub latest_text: Option<u64>,
+        pub latest_all: Option<u64>,
+        held: Vec<super::HistoryRow>,
+    }
+
+    /// The bytes one entry of `arrival` holds in a ring, with a msgid of
+    /// the length every stamped one has at that time.
+    pub fn footprint(arrival: Arrival) -> usize {
+        let msgid = super::state::MsgidSource::with_boot(super::CoreShardId(0), 0)
+            .next(Millis::from_millis(arrival.ts));
+        super::hot_history::footprint(&entry(msgid, arrival))
+    }
+
+    fn entry(msgid: String, arrival: Arrival) -> super::HistoryRow {
+        super::HistoryRow {
+            msgid,
+            ts: Millis::from_millis(arrival.ts),
+            sender_prefix: "n!u@h".into(),
+            sender_account: None,
+            kind: if arrival.tagmsg {
+                super::HistoryKind::Tagmsg
+            } else {
+                super::HistoryKind::Privmsg
+            },
+            body: String::new(),
+            sender_is_bot: false,
+            multiline: None,
+            client_tags: "t".repeat(usize::from(arrival.tag_bytes)),
+        }
+    }
+
+    /// Push `arrivals` in order into one ring bounded to `ring_bytes`.
+    pub fn ring_after(arrivals: &[Arrival], ring_bytes: usize) -> Ring {
+        let mut history = HotHistory::default();
+        let key = HistoryKey::channel_for_test("#fuzz");
+        let bounds = HotHistoryBounds {
+            rings: 1,
+            ring_bytes,
+            bytes: usize::MAX,
+        };
+        // One source per shard, as each core shard has; the boot value is
+        // fixed so that a shard's ids have one length.
+        let mut sources = std::collections::HashMap::new();
+        let msgids: Vec<String> = arrivals
+            .iter()
+            .map(|arrival| {
+                sources
+                    .entry(arrival.shard)
+                    .or_insert_with(|| {
+                        super::state::MsgidSource::with_boot(
+                            super::CoreShardId(usize::from(arrival.shard)),
+                            0x0123_4567_89ab_cdef,
+                        )
+                    })
+                    .next(Millis::from_millis(arrival.ts))
+            })
+            .collect();
+        for (msgid, arrival) in msgids.iter().zip(arrivals) {
+            history.push(&key, entry(msgid.clone(), *arrival), true, bounds);
+        }
+        let Some(ring) = history.get(&key) else {
+            return Ring {
+                msgids,
+                entries: Vec::new(),
+                complete: true,
+                latest_text: None,
+                latest_all: None,
+                held: Vec::new(),
+            };
+        };
+        let latest = ring.latest();
+        Ring {
+            msgids,
+            entries: ring
+                .entries()
+                .iter()
+                .map(|entry| (entry.msgid.clone(), entry.ts.as_millis()))
+                .collect(),
+            complete: ring.complete(),
+            latest_text: latest
+                .in_scope(super::HistoryScope::Text)
+                .map(Millis::as_millis),
+            latest_all: latest
+                .in_scope(super::HistoryScope::TextAndTags)
+                .map(Millis::as_millis),
+            held: ring.entries().iter().cloned().collect(),
+        }
+    }
+
+    /// Resolve `CHATHISTORY <sub> <target> <first> [<second>] <limit>` against
+    /// `ring` as the core does: the msgids of the page and whether the ring
+    /// covered it. `None` when the request is malformed.
+    pub fn window(
+        ring: &Ring,
+        sub: &str,
+        first: &str,
+        second: &str,
+        limit: usize,
+    ) -> Option<(Vec<String>, bool)> {
+        let sub = super::history_request::ChathistorySub::parse(sub)?;
+        let (first, second) = super::history_request::parse_selectors(sub, first, second).ok()?;
+        let (page, covered) = super::handler::resolve_ring_window(
+            &ring.held,
+            ring.complete,
+            sub,
+            &first,
+            &second,
+            limit,
+        );
+        Some((page.into_iter().map(|entry| entry.msgid).collect(), covered))
+    }
+}
 
 #[cfg(test)]
 mod wire_line_tests {
@@ -3849,8 +4227,18 @@ mod ingress_tests {
             }
         };
         check(&first, &second);
-        first.state.set_account(session.conn(), "Alice".into());
-        second.state.set_account(ConnId(9), "alice".into());
+        first.state.set_account(
+            session.conn(),
+            "Alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
+        second.state.set_account(
+            ConnId(9),
+            "alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         check(&first, &second);
         assert_eq!(indexed(&first, "alice"), vec![session.conn()]);
         assert_eq!(indexed(&second, "alice"), vec![ConnId(9)]);
@@ -4276,7 +4664,12 @@ mod ingress_tests {
         let (alice, mut alice_rx) = register_on_first(&mut first, "alice");
         // alice is the founder: arriving first in a registered channel opens
         // no ops, so only the founder can set its (+t) topic.
-        first.state.set_account(alice, "founder".into());
+        first.state.set_account(
+            alice,
+            "founder".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         first.handle(Input::Line {
             conn: alice,
             line: format!("JOIN {channel}").into_bytes(),
@@ -4511,6 +4904,8 @@ mod ingress_tests {
         outputs: std::collections::HashMap<u64, Receiver<Output>>,
         /// Each shard's requests to the database worker (there is none).
         database: Vec<Receiver<super::DbRequest>>,
+        /// What the server outside the core hands it live: history retention.
+        ingress: CoreIngress,
     }
 
     impl Shards {
@@ -4580,6 +4975,7 @@ mod ingress_tests {
                 cores,
                 outputs: std::collections::HashMap::new(),
                 database: requests,
+                ingress,
             }
         }
 
@@ -4686,7 +5082,7 @@ mod ingress_tests {
     }
 
     /// Idle time is the session's own clock, read where it is asked about. A
-    /// line must not cost one member update per channel the sender is in.
+    /// message must not cost one member update per channel the sender is in.
     #[test]
     fn activity_is_not_fanned_out_to_every_channel_and_a_remote_who_still_sees_idle() {
         let mut shards = Shards::new();
@@ -4698,7 +5094,7 @@ mod ingress_tests {
         Shards::advance_clock(60);
         shards.cores[0].handle(Input::Line {
             conn: ConnId(2),
-            line: b"VERSION".to_vec(),
+            line: b"PRIVMSG alice :a note to self".to_vec(),
         });
         assert!(
             shards.cores[0].take_effects().is_empty(),
@@ -4710,7 +5106,7 @@ mod ingress_tests {
         let out = shards.drain(1);
         assert!(
             out.iter().any(|line| line.ends_with(" alice 30")),
-            "the channel's owner must report alice idle since her last line: {out:#?}"
+            "the channel's owner must report alice idle since her last message: {out:#?}"
         );
     }
 
@@ -4795,6 +5191,59 @@ mod ingress_tests {
         }
     }
 
+    /// A bare NAMES lists the channels every shard owns — the answer does not
+    /// depend on which shard owns a channel or holds the requester — and then
+    /// the users in no channel, wherever their sessions live.
+    #[test]
+    fn a_bare_names_lists_the_channels_of_every_shard() {
+        let mut shards = alice_and_bob("");
+        shards.client(4, "carol", "");
+        let [here, there] = shards.owned;
+        shards.line(1, &format!("JOIN {here},{there}"));
+        shards.drain(2);
+        shards.line(2, "NAMES");
+        let out = shards.drain(2);
+        let mut expected = vec![
+            format!(":irc.test 353 alice = {here} :@bob"),
+            format!(":irc.test 353 alice = {there} :@bob"),
+        ];
+        expected.sort();
+        expected.push(":irc.test 353 alice * * :alice carol".to_string());
+        expected.push(":irc.test 366 alice * :End of /NAMES list".to_string());
+        assert_eq!(out, expected);
+    }
+
+    /// An INVITE to a channel another shard owns names the invitee by the nick
+    /// the sender's shard found them under, not as the inviter typed it, and
+    /// WHO of a nick shows the channel it shares with them there.
+    #[test]
+    fn invite_and_who_name_a_user_canonically_across_shards() {
+        let mut shards = alice_and_bob("");
+        let there = shards.owned[1];
+        assert_ne!(shards.shard_of(2), 1, "alice is not on the owner's shard");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.drain(2);
+        shards.line(2, &format!("INVITE BOB {there}"));
+        assert_eq!(
+            shards.drain(2),
+            [format!(":irc.test 341 alice bob {there}")]
+        );
+        assert_eq!(
+            shards.drain(1),
+            [format!(":alice!alice@host.test INVITE bob :{there}")]
+        );
+        shards.line(1, &format!("JOIN {there}"));
+        shards.drain(2);
+        shards.line(2, "WHO bob %cn");
+        assert_eq!(
+            shards.drain(2),
+            [
+                format!(":irc.test 354 alice {there} bob"),
+                ":irc.test 315 alice bob :End of /WHO list".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn whois_ison_and_userhost_answer_for_a_nick_on_another_shard() {
         let mut shards = alice_and_bob("");
@@ -4872,7 +5321,12 @@ mod ingress_tests {
         // carol's account owns the nick a stale connection still holds.
         shards.client(3, "carol", "");
         shards.client(4, "visitor", "");
-        shards.cores[0].state.set_account(ConnId(4), "carol".into());
+        shards.cores[0].state.set_account(
+            ConnId(4),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         shards.settle();
         shards.line(4, "PRIVMSG NickServ :GHOST carol");
         assert!(
@@ -5064,6 +5518,301 @@ mod ingress_tests {
         );
     }
 
+    /// Set the shards' clock to `ms` past its origin — backwards too, as a
+    /// stepped wall clock does.
+    fn set_clock_ms(ms: u64) {
+        MONO_NOW.with(|now| now.set(ms));
+    }
+
+    /// `timestamp=` of the shards' wall clock at `ms` past its origin.
+    fn at(ms: u64) -> String {
+        let wall = e6irc_proto::time::Millis::from_millis(1_000_000 + ms);
+        format!("timestamp={}", e6irc_proto::time::server_time(wall))
+    }
+
+    /// The texts of the messages a CHATHISTORY answer replayed, in order.
+    fn replayed(out: &[String]) -> Vec<String> {
+        out.iter()
+            .filter(|line| line.contains(" PRIVMSG "))
+            .map(|line| line.rsplit_once(" :").expect("a text").1.to_string())
+            .collect()
+    }
+
+    /// A batch of only blank lines to a channel another shard owns is refused
+    /// on the sender's shard, as it is to one this shard owns: it is never
+    /// routed, delivered, or stored.
+    #[test]
+    fn an_all_blank_multiline_batch_to_another_shards_channel_has_no_text_to_send() {
+        let caps = "batch draft/multiline message-tags echo-message labeled-response \
+                    draft/chathistory";
+        let mut shards = alice_and_bob(caps);
+        let there = shards.owned[1];
+        assert_ne!(shards.shard_of(2), 1, "alice's session is not the owner's");
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(2);
+        shards.drain(1);
+        shards.line(2, &format!("@label=blank BATCH +7 draft/multiline {there}"));
+        shards.line(2, &format!("@batch=7 PRIVMSG {there} :"));
+        shards.line(2, &format!("@batch=7 PRIVMSG {there} :"));
+        shards.line(2, "BATCH -7");
+        let sender = shards.drain(2);
+        assert_eq!(lines_with(&sender, " 412 ").len(), 1, "{sender:#?}");
+        assert!(
+            sender.iter().any(|line| line.contains("@label=blank")),
+            "the opening BATCH's label went unanswered: {sender:#?}"
+        );
+        assert!(lines_with(&sender, " PRIVMSG ").is_empty(), "{sender:#?}");
+        let recipient = shards.drain(1);
+        assert!(recipient.is_empty(), "{recipient:#?}");
+        shards.line(1, &format!("CHATHISTORY LATEST {there} * 10"));
+        let history = shards.drain(1);
+        assert!(replayed(&history).is_empty(), "stored: {history:#?}");
+    }
+
+    /// A wall clock stepped back leaves a message stamped earlier arriving
+    /// after one stamped later. The ring keeps them in time order, so every
+    /// window is cut where the database would cut it.
+    #[test]
+    fn a_ring_pages_by_time_when_a_stepped_clock_delivers_out_of_order() {
+        let mut shards = alice_and_bob("batch draft/chathistory server-time message-tags");
+        let there = shards.owned[1];
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        set_clock_ms(1_001);
+        shards.line(2, &format!("PRIVMSG {there} :x"));
+        set_clock_ms(1_000);
+        shards.line(2, &format!("PRIVMSG {there} :a"));
+        shards.drain(1);
+        let mut page = |request: String| {
+            shards.line(1, &format!("CHATHISTORY {request}"));
+            replayed(&shards.drain(1))
+        };
+        assert_eq!(page(format!("LATEST {there} * 10")), ["a", "x"]);
+        assert_eq!(page(format!("BEFORE {there} {} 10", at(1_001))), ["a"]);
+        assert!(page(format!("AFTER {there} {} 10", at(1_000))) == ["x"]);
+        assert_eq!(
+            page(format!("BETWEEN {there} {} {} 10", at(999), at(1_002))),
+            ["a", "x"]
+        );
+        assert_eq!(
+            page(format!("BETWEEN {there} {} {} 1", at(1_002), at(999))),
+            ["x"],
+            "newest first from the newer bound"
+        );
+        assert_eq!(page(format!("AROUND {there} {} 2", at(1_001))), ["a", "x"]);
+    }
+
+    /// A direct message stamped on the sender's shard reaches the peer's
+    /// shard after a later one the peer sent there. The peer's copy of the
+    /// conversation keeps them in time order all the same.
+    #[test]
+    fn a_conversation_entry_from_another_shard_takes_its_place_in_time() {
+        let mut shards = alice_and_bob("batch draft/chathistory server-time");
+        set_clock_ms(2_000);
+        shards.push_line(2, "PRIVMSG bob :early");
+        set_clock_ms(2_001);
+        shards.push_line(1, "PRIVMSG alice :late");
+        shards.settle();
+        shards.drain(1);
+        shards.line(1, "CHATHISTORY LATEST alice * 10");
+        assert_eq!(replayed(&shards.drain(1)), ["early", "late"]);
+        shards.line(1, &format!("CHATHISTORY BEFORE alice {} 10", at(2_001)));
+        assert_eq!(replayed(&shards.drain(1)), ["early"]);
+        shards.line(1, &format!("CHATHISTORY AFTER alice {} 10", at(2_000)));
+        assert_eq!(replayed(&shards.drain(1)), ["late"]);
+    }
+
+    /// `limits.anti_spam_exit_message_time_seconds` is Libera's five minutes
+    /// until it is set, `0` shows every QUIT comment, and a change of it
+    /// applies to the next QUIT on every shard, without a restart.
+    #[test]
+    fn the_quit_comment_delay_is_followed_live_on_every_shard() {
+        set_clock_ms(0);
+        let mut shards = Shards::new();
+        let there = shards.owned[0];
+        for (conn, nick) in [(2, "alice"), (1, "bob"), (3, "carol"), (4, "dave")] {
+            shards.client(conn, nick, "");
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(2);
+        let quit = |shards: &mut Shards, conn: u64| {
+            shards.line(conn, "QUIT :bye");
+            shards
+                .drain(2)
+                .into_iter()
+                .filter(|line| line.contains(" QUIT "))
+                .collect::<Vec<_>>()
+        };
+        set_clock_ms(300_000 - 1);
+        assert_eq!(
+            quit(&mut shards, 1),
+            [":bob!bob@host.test QUIT :Client Quit"],
+            "younger than the default five minutes"
+        );
+        let mut settings =
+            crate::config::ManagedConfig::from_config(&crate::config::Config::default(), None)
+                .expect("managed");
+        settings.limits.anti_spam_exit_message_time_seconds = 0;
+        shards.ingress.adopt_live_settings(&settings);
+        assert_eq!(
+            quit(&mut shards, 3),
+            [":carol!carol@host.test QUIT :Quit: bye"],
+            "0 shows every comment"
+        );
+        set_clock_ms(300_000);
+        shards.ingress.set_anti_spam_exit_message_time_seconds(600);
+        assert_eq!(
+            quit(&mut shards, 4),
+            [":dave!dave@host.test QUIT :Client Quit"],
+            "older than five minutes, younger than the ten now set"
+        );
+    }
+
+    /// History retention bounds what the rings serve as it bounds what the
+    /// database keeps, and a change of it applies at once, without a restart:
+    /// a message older than it is in no page and dates no TARGETS buffer.
+    #[test]
+    fn rings_do_not_serve_history_older_than_retention() {
+        let caps = "batch draft/chathistory server-time";
+        let mut shards = alice_and_bob(caps);
+        let there = shards.owned[1];
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        set_clock_ms(0);
+        shards.line(2, &format!("PRIVMSG {there} :stale"));
+        shards.line(2, "PRIVMSG bob :stale secret");
+        let day = 24 * 60 * 60 * 1000;
+        set_clock_ms(3 * day);
+        shards.line(2, &format!("PRIVMSG {there} :fresh"));
+        shards.drain(1);
+        let page = |shards: &mut Shards, request: String| {
+            shards.line(1, &format!("CHATHISTORY {request}"));
+            replayed(&shards.drain(1))
+        };
+        let latest = format!("LATEST {there} * 10");
+        assert_eq!(page(&mut shards, latest.clone()), ["stale", "fresh"]);
+
+        shards.ingress.set_history_retention_days(1);
+        assert_eq!(page(&mut shards, latest), ["fresh"]);
+        assert_eq!(
+            page(
+                &mut shards,
+                format!("BEFORE {there} {} 10", at(3 * day + 1))
+            ),
+            ["fresh"]
+        );
+        assert_eq!(
+            page(&mut shards, format!("AROUND {there} {} 10", at(0))),
+            ["fresh"]
+        );
+        assert!(page(&mut shards, "LATEST alice * 10".into()).is_empty());
+        shards.line(
+            1,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        let targets = shards.drain(1);
+        assert_eq!(
+            lines_with(&targets, "CHATHISTORY TARGETS ").len(),
+            1,
+            "only the channel has history left: {targets:#?}"
+        );
+    }
+
+    /// TARGETS names a channel another shard owns as the channel is named,
+    /// not by the folded key the database answers with.
+    #[test]
+    fn targets_names_another_shards_channel_by_its_display_name() {
+        let mut shards = Shards::with_database();
+        shards.client(2, "alice", "batch draft/chathistory server-time");
+        let channel = ["#Foo[x]", "#Bar[x]", "#Baz[x]", "#Qux[x]", "#Quux[x]"]
+            .into_iter()
+            .find(|name| shards.cores[0].state.channel_owner(name).shard() != CoreShardId(0))
+            .expect("a channel shard 1 owns");
+        assert_eq!(shards.shard_of(2), 0);
+        shards.line(2, &format!("JOIN {channel}"));
+        shards.drain(2);
+        shards.line(
+            2,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        let (batch_ref, caps, folded) = shards.database_request(0, |request| match request {
+            super::DbRequest::QueryTargets {
+                batch_ref,
+                caps,
+                channels,
+                ..
+            } => Some((batch_ref, caps, channels[0].0.clone())),
+            _ => None,
+        });
+        assert_ne!(folded, channel, "the database is asked by the folded key");
+        shards.cores[0].handle(Input::TargetsPage {
+            conn: ConnId(2),
+            batch_ref,
+            caps,
+            targets: Ok(vec![(
+                folded,
+                e6irc_proto::time::Millis::from_millis(1_000_000),
+            )]),
+            label: None,
+        });
+        shards.settle();
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, &format!("CHATHISTORY TARGETS {channel} ")).len(),
+            1,
+            "{out:#?}"
+        );
+    }
+
+    /// A message relayed by the channel's owner names the channel as the
+    /// channel is named, as the sender's own shard does (Solanum parity), and
+    /// its replay is the same line.
+    #[test]
+    fn a_message_to_another_shards_channel_names_it_canonically() {
+        let caps = "batch draft/chathistory server-time message-tags echo-message";
+        let mut shards = alice_and_bob(caps);
+        let there = shards.owned[1];
+        for conn in [1, 2] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(1);
+        shards.drain(2);
+        let shouted = there.to_ascii_uppercase();
+        shards.line(2, &format!("PRIVMSG {shouted} :hi"));
+        let live = shards.drain(1);
+        let echo = shards.drain(2);
+        let wanted = format!(" PRIVMSG {there} :hi");
+        let [live_line] = lines_with(&live, &wanted)[..] else {
+            panic!("the recipient's copy names the channel canonically: {live:#?}");
+        };
+        assert_eq!(lines_with(&echo, &wanted).len(), 1, "{echo:#?}");
+        shards.line(1, &format!("CHATHISTORY LATEST {there} * 1"));
+        let history = shards.drain(1);
+        let [replay] = lines_with(&history, &wanted)[..] else {
+            panic!("one replayed message: {history:#?}");
+        };
+        let without_batch = replay
+            .strip_prefix("@batch=")
+            .and_then(|rest| rest.split_once(';'))
+            .map(|(_, rest)| format!("@{rest}"))
+            .expect("a batch tag");
+        assert_eq!(
+            without_batch, live_line,
+            "replay is the line delivered live"
+        );
+        shards.line(2, &format!("TAGMSG {shouted}"));
+        assert_eq!(
+            lines_with(&shards.drain(1), &format!(" TAGMSG {there}")).len(),
+            1
+        );
+    }
+
     /// alice joins a channel owned by each shard, speaks in both, and asks
     /// which of her buffers have history. Returns the TARGETS lines.
     fn targets_after_speaking_in(mut shards: Shards, channels: [&str; 2]) -> Vec<String> {
@@ -5117,6 +5866,21 @@ mod ingress_tests {
 
     /// Identify `conn` to `account` through NickServ, answering the verify.
     fn identify_on(shards: &mut Shards, conn: u64, account: &str) {
+        identify_with_on(
+            shards,
+            conn,
+            account,
+            crate::identity::CredentialId::AccountPassword,
+        );
+    }
+
+    /// [`identify_on`], the store answering that `credential` verified.
+    fn identify_with_on(
+        shards: &mut Shards,
+        conn: u64,
+        account: &str,
+        credential: crate::identity::CredentialId,
+    ) {
         shards.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
         let shard = shards.shard_of(conn);
         shards.database_request(shard, |request| {
@@ -5126,11 +5890,246 @@ mod ingress_tests {
             conn: ConnId(conn),
             reply: super::DbReply::PasswordVerified {
                 account: account.into(),
+                credential,
+                expires_in: None,
                 origin: super::CredentialOrigin::NickServIdentify,
             },
         });
         shards.settle();
         shards.drain(conn);
+    }
+
+    /// `registration.minimum_password_length` is eight until it is set, and a
+    /// change of it applies to the next `REGISTER` and NickServ `REGISTER` on
+    /// every shard, without a restart: at one, irctest's "sesame" is a
+    /// password an account may be given.
+    #[test]
+    fn the_password_minimum_is_followed_live_on_every_shard() {
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+            shards.client(conn, nick, "draft/account-registration");
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        shards.line(1, "REGISTER * * sesame");
+        assert!(
+            shards
+                .drain(1)
+                .iter()
+                .any(|line| line.contains("FAIL REGISTER WEAK_PASSWORD")
+                    && line.contains("at least 8 characters")),
+            "eight characters unless configured"
+        );
+
+        let mut settings =
+            crate::config::ManagedConfig::from_config(&crate::config::Config::default(), None)
+                .expect("managed");
+        settings.registration.minimum_password_length = 1;
+        shards.ingress.adopt_live_settings(&settings);
+        for (conn, command) in [
+            (2, "REGISTER * * sesame"),
+            (3, "PRIVMSG NickServ :REGISTER sesame"),
+        ] {
+            shards.line(conn, command);
+            let shard = shards.shard_of(conn);
+            let password = shards.database_request(shard, |request| match request {
+                super::DbRequest::CreateAccount { password, .. } => Some(password),
+                _ => None,
+            });
+            assert_eq!(&*password, "sesame", "{command}");
+        }
+        assert_eq!(
+            shards.ingress.password_policy().minimum_chars(),
+            1,
+            "the web and the REST API read the same cell"
+        );
+    }
+
+    /// Answer `conn`'s queued NickServ IDENTIFY with `reply`.
+    fn verdict_on(shards: &mut Shards, conn: u64, reply: super::DbReply) {
+        let shard = shards.shard_of(conn);
+        shards.cores[shard].handle(Input::DbReply {
+            conn: ConnId(conn),
+            reply,
+        });
+        shards.settle();
+    }
+
+    /// Queue a NickServ IDENTIFY for `conn`, its verdict still to come.
+    fn identify_queued(shards: &mut Shards, conn: u64) {
+        shards.line(conn, "PRIVMSG NickServ :IDENTIFY alice secret");
+        let shard = shards.shard_of(conn);
+        shards.database_request(shard, |request| {
+            matches!(request, super::DbRequest::VerifyPassword { .. }).then_some(())
+        });
+    }
+
+    /// A session a personal access token signed in ends when the token
+    /// expires, by the store's reckoning of how long it had left, and says
+    /// why; one the account password signed in stays.
+    #[test]
+    fn a_session_a_token_signed_in_ends_when_the_token_expires() {
+        use crate::identity::{CredentialId, IssuedCredential};
+        set_clock_ms(0);
+        let mut shards = Shards::with_database();
+        shards.client(1, "alice1", "");
+        shards.client(2, "alice2", "");
+        identify_queued(&mut shards, 1);
+        verdict_on(
+            &mut shards,
+            1,
+            super::DbReply::PasswordVerified {
+                account: "alice".into(),
+                credential: CredentialId::Issued(IssuedCredential::ApiToken(5)),
+                expires_in: Some(std::time::Duration::from_secs(30)),
+                origin: super::CredentialOrigin::NickServIdentify,
+            },
+        );
+        identify_on(&mut shards, 2, "alice");
+        shards.drain(1);
+        let tick = |shards: &mut Shards| {
+            let now = thread_mono_clock();
+            for core in &mut shards.cores {
+                core.handle(Input::Tick { now });
+            }
+            shards.settle();
+        };
+        Shards::advance_clock(29);
+        tick(&mut shards);
+        assert!(
+            !shards.drain(1).iter().any(|line| line.starts_with("ERROR")),
+            "the token has a second left"
+        );
+        Shards::advance_clock(1);
+        tick(&mut shards);
+        assert!(
+            shards.drain(1).iter().any(|line| {
+                line.starts_with("ERROR :Closing Link")
+                    && line.contains("Personal access token expired")
+            }),
+            "the session ends with its token"
+        );
+        shards.line(2, "PING :here");
+        assert!(shards.drain(2).iter().any(|line| line.contains(" PONG ")));
+    }
+
+    /// The window a lost revocation listener leaves: a credential check read
+    /// the store before the credential was revoked, the revocation was
+    /// announced while nothing listened, and the verdict lands after the
+    /// listener's re-connection re-checked what the live sessions hold —
+    /// which did not include this one yet. The re-connection refuses every
+    /// verdict queued before it on every shard first, so this one is refused
+    /// (and its client told to try again), while a verdict that landed before
+    /// the refusal is held by a live session, among what the listener
+    /// re-checks. A check queued after it logs in.
+    #[test]
+    fn a_verdict_read_before_a_listener_re_check_is_refused() {
+        use crate::identity::{CredentialId, IssuedCredential};
+        const REVOKED: IssuedCredential = IssuedCredential::AppPassword(3);
+        const LANDED_FIRST: IssuedCredential = IssuedCredential::AppPassword(4);
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "raced"), (2, "early")] {
+            shards.client(conn, nick, "");
+            identify_queued(&mut shards, conn);
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        let verified = |credential| super::DbReply::PasswordVerified {
+            account: "alice".into(),
+            credential: CredentialId::Issued(credential),
+            expires_in: None,
+            origin: super::CredentialOrigin::NickServIdentify,
+        };
+        // This verdict lands before the re-connection: its session is live
+        // when the listener reads what live sessions hold.
+        verdict_on(&mut shards, 2, verified(LANDED_FIRST));
+        assert_eq!(shards.ingress.signed_in_credentials(), vec![LANDED_FIRST]);
+
+        let mut refused = Vec::new();
+        for core in &mut shards.cores {
+            let (done, answered) = tokio::sync::oneshot::channel();
+            core.handle(Input::RefuseVerdictsInFlight { done });
+            refused.push(answered);
+        }
+        for mut answered in refused {
+            assert_eq!(answered.try_recv(), Ok(()), "every shard answers");
+        }
+
+        verdict_on(&mut shards, 1, verified(REVOKED));
+        let told = shards.drain(1);
+        assert!(
+            told.iter()
+                .any(|line| line.contains("re-checked") && line.contains("try again")),
+            "{told:#?}"
+        );
+        assert_eq!(
+            shards.ingress.signed_in_credentials(),
+            vec![LANDED_FIRST],
+            "the stale verdict signed nothing in"
+        );
+        // A check queued now read the store after the re-connection.
+        identify_queued(&mut shards, 1);
+        verdict_on(&mut shards, 1, verified(IssuedCredential::AppPassword(9)));
+        assert!(
+            shards
+                .drain(1)
+                .iter()
+                .any(|line| line.contains("You are now identified")),
+            "a check queued after the re-check logs in"
+        );
+    }
+
+    /// A revoked app password's sessions end on every shard, whichever shard
+    /// the request reached, and the count of what live sessions signed in
+    /// with, which a listener that missed announcements reads, follows every
+    /// login and departure.
+    #[test]
+    fn a_revoked_credential_ends_its_sessions_on_every_shard() {
+        use crate::identity::{CredentialId, IssuedCredential};
+        const APP_A: IssuedCredential = IssuedCredential::AppPassword(1);
+        const APP_B: IssuedCredential = IssuedCredential::AppPassword(2);
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "alice1"), (2, "alice2"), (3, "alice3"), (4, "alice4")] {
+            shards.client(conn, nick, "");
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        identify_with_on(&mut shards, 1, "alice", CredentialId::Issued(APP_A));
+        identify_with_on(&mut shards, 2, "alice", CredentialId::Issued(APP_A));
+        identify_with_on(&mut shards, 3, "alice", CredentialId::Issued(APP_B));
+        identify_on(&mut shards, 4, "alice");
+        let mut held = shards.ingress.signed_in_credentials();
+        held.sort_unstable();
+        assert_eq!(held, vec![APP_A, APP_B]);
+
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        shards.cores[0].handle(Input::Admin {
+            req: super::AdminRequest::EndCredentialSessions { credential: APP_A },
+            reply,
+        });
+        shards.settle();
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(super::AdminReply::Ok(message)) if message.contains("Disconnected 1")
+        ));
+        for revoked in [1, 2] {
+            assert!(
+                shards.drain(revoked).iter().any(|line| {
+                    line.starts_with("ERROR :Closing Link") && line.contains("App password revoked")
+                }),
+                "connection {revoked}, on shard {}",
+                shards.shard_of(revoked)
+            );
+        }
+        for kept in [3, 4] {
+            shards.line(kept, "PING :here");
+            assert!(
+                shards
+                    .drain(kept)
+                    .iter()
+                    .any(|line| line.contains(" PONG "))
+            );
+        }
+        assert_eq!(shards.ingress.signed_in_credentials(), vec![APP_B]);
+        shards.close(3);
+        assert!(shards.ingress.signed_in_credentials().is_empty());
     }
 
     /// REGAIN reaches a holder on another shard: its shard renames it to a
@@ -5220,6 +6219,8 @@ mod ingress_tests {
             conn: ConnId(2),
             reply: super::DbReply::PasswordVerified {
                 account: "alice".into(),
+                credential: crate::identity::CredentialId::AccountPassword,
+                expires_in: None,
                 origin: super::CredentialOrigin::NickServIdentify,
             },
         });
@@ -5544,7 +6545,7 @@ mod ingress_tests {
         let out = shards.drain(1);
         assert_eq!(
             out,
-            ["ERROR :Closing Link: irc.test (Server shutting down)"],
+            ["ERROR :Closing Link: host.test (Server shutting down)"],
             "the closing ERROR must be the last thing the connection is sent"
         );
     }
@@ -6271,7 +7272,7 @@ mod ingress_tests {
                     away: false,
                     oper: false,
                     bot: false,
-                    last_active: crate::core::state::LastActive::new(mono_clock()),
+                    idle_since: crate::core::state::IdleSince::new(mono_clock()),
                 },
             },
             target.into(),

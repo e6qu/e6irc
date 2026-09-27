@@ -376,13 +376,54 @@ fn operations() -> serde_json::Value {
         "maxLength": e6irc_client::ServerPassword::MAX_LEN, "writeOnly": true,
         "description": "The network's connection password, sent as PASS before registration; only for a private server that requires one. Stored sealed; never returned."
     });
+    // Each network connection field once, bounded by the constants its handler
+    // enforces (`check_upstream_bounds`, the identity grammar, the credential
+    // checks): create, replace, and the connection test share these, and
+    // `network_field_schemas_carry_the_handlers_bounds` holds them to it.
     let irc_autojoin_schema = serde_json::json!({
-        "type": "array", "maxItems": 64, "items": { "type": "string" },
+        "type": "array", "maxItems": crate::bouncer::AutojoinEntry::MAX_CONFIGURED,
+        "items": { "type": "string", "minLength": 1,
+            "maxLength": crate::bouncer::AutojoinEntry::MAX_SUBMITTED_BYTES },
         "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none."
     });
+    let bridge_autojoin_schema = serde_json::json!({
+        "type": "array", "maxItems": crate::bouncer::AutojoinEntry::MAX_CONFIGURED,
+        "items": { "type": "string", "minLength": 1, "maxLength": crate::bouncer::UpstreamChannel::MAX_BYTES },
+        "description": "The rooms or channel ids to bridge, one per entry; a bridge's entries take no key."
+    });
+    let network_name_schema = serde_json::json!({
+        "type": "string", "minLength": 1, "maxLength": crate::sanitize::MAX_NETWORK_NAME_LEN,
+        "pattern": crate::sanitize::NETWORK_NAME_PATTERN,
+        "description": "The network's selector in URLs and in the raw attach address: letters, digits, '.', '_' and '-', never '.' or '..'."
+    });
+    let upstream_addr_schema = |min_length: usize| {
+        serde_json::json!({ "type": "string", "minLength": min_length,
+            "maxLength": super::networks::MAX_UPSTREAM_ADDR_LEN })
+    };
+    let upstream_nick_schema = |min_length: usize| {
+        serde_json::json!({ "type": "string", "minLength": min_length,
+            "maxLength": crate::bouncer::UpstreamNick::MAX_BYTES })
+    };
+    let upstream_username_schema = |description: &str| {
+        serde_json::json!({ "type": "string",
+            "pattern": format!("^[A-Za-z0-9][A-Za-z0-9_-]{{0,{}}}$", crate::bouncer::UpstreamUsername::MAX_BYTES - 1),
+            "description": description })
+    };
+    let upstream_realname_schema = |description: &str| {
+        serde_json::json!({ "type": "string", "minLength": 1,
+            "maxLength": crate::bouncer::UpstreamRealname::MAX_BYTES, "description": description })
+    };
+    let irc_sasl_account_schema = serde_json::json!({
+        "type": ["string", "null"], "minLength": 1, "maxLength": super::networks::MAX_UPSTREAM_ACCOUNT_LEN,
+        "description": "The SASL login, sent exactly as given: surrounding whitespace is refused, never trimmed."
+    });
+    let irc_sasl_password_schema = serde_json::json!({
+        "type": ["string", "null"], "minLength": 1, "maxLength": super::networks::MAX_UPSTREAM_PASSWORD_LEN, "writeOnly": true
+    });
+    let bridge_secret_schema = |max_length: usize| serde_json::json!({ "type": "string", "minLength": 1, "maxLength": max_length, "writeOnly": true });
     let network_response_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "autojoin_keyed", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime"],
+        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "autojoin_keyed", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime", "configured"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
             "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
@@ -394,12 +435,13 @@ fn operations() -> serde_json::Value {
             "sasl_account": { "type": ["string", "null"] },
             "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" }, "has_server_password": { "type": "boolean" },
             "enabled": { "type": "boolean" }, "connected": { "type": ["boolean", "null"] },
+            "configured": { "type": "boolean", "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409)." },
             "runtime": { "oneOf": [
                 { "type": "null" },
                 { "type": "object", "additionalProperties": false,
                     "required": ["state", "state_changed_at", "next_retry_at", "recent_failures", "connected_at", "last_input_at", "last_output_at", "last_error_at", "last_error", "connect_latency_ms", "connection_attempts", "errors", "attached_clients", "traffic", "buffer"],
                     "properties": {
-                        "state": { "type": "string", "enum": ["connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"] },
+                        "state": { "type": "string", "enum": ["connecting", "connected", "regaining_nickname", "reconnecting", "authentication_failed", "registration_failed", "owner_suspended", "owner_deleted"], "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped)." },
                         "state_changed_at": { "type": "string" }, "next_retry_at": { "type": ["string", "null"] },
                         "recent_failures": { "type": "array", "maxItems": crate::bouncer::NETWORK_FAILURE_HISTORY_LIMIT, "items": {
                             "type": "object", "additionalProperties": false, "required": ["at", "code", "summary"],
@@ -446,8 +488,10 @@ fn operations() -> serde_json::Value {
     let admin_networks_response = json_response(
         "networks with runtime snapshots",
         serde_json::json!({
-            "type": "object", "additionalProperties": false, "required": ["networks"],
-            "properties": { "networks": { "type": "array", "items": { "oneOf": [
+            "type": "object", "additionalProperties": false, "required": ["networks", "next_after"],
+            "properties": {
+                "next_after": { "type": ["string", "null"], "minLength": 1, "description": "The `after` cursor of the next page; null on the last." },
+                "networks": { "type": "array", "maxItems": crate::db::BncNetworkInventoryPageSize::MAX, "items": { "oneOf": [
                 owned_admin_network_schema,
                 { "type": "object", "additionalProperties": false, "required": ["owner", "name", "kind", "enabled", "connected", "runtime", "shared"],
                     "properties": { "owner": { "const": "shared" }, "name": { "type": "string", "minLength": 1 }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "enabled": { "const": true }, "connected": { "type": "boolean" }, "runtime": network_response_schema["properties"]["runtime"].clone(), "shared": { "const": true } } }
@@ -471,7 +515,7 @@ fn operations() -> serde_json::Value {
                 "required": ["at_ms", "component", "severity", "message"],
                 "properties": {
                     "at_ms": { "type": "integer", "minimum": 0 },
-                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http"] },
+                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http", "configuration"] },
                     "severity": { "const": "error" },
                     "message": { "const": "An operational error was recorded." }
                 }
@@ -732,33 +776,51 @@ fn operations() -> serde_json::Value {
                 "schema": { "type": "integer", "format": "int64", "minimum": 1 } }),
         ]
     };
+    // One exact-match filter parameter, as `device::exact_filter` parses it:
+    // absent is no filter; present is 1–`maximum` printable characters with
+    // no surrounding whitespace, a blank value being a 400 rather than "no
+    // filter".
+    let exact_filter_parameter = |name: &str, maximum: usize, matching: &str| {
+        serde_json::json!({ "name": name, "in": "query",
+            "description": format!("Exact {name} filter{matching}. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter."),
+            "schema": { "type": "string", "minLength": 1, "maxLength": maximum,
+                "pattern": super::device::EXACT_FILTER_PATTERN } })
+    };
     let mut account_directory_parameters = admin_cursor_parameters();
-    account_directory_parameters.push(serde_json::json!({
-        "name": "name", "in": "query",
-        "schema": { "type": "string", "maxLength": 64 }
-    }));
+    account_directory_parameters.push(exact_filter_parameter(
+        "name",
+        MAX_ACCOUNT_LEN,
+        ", under RFC1459 case-folding",
+    ));
     let mut registered_channel_parameters = admin_cursor_parameters();
     registered_channel_parameters.extend([
-        serde_json::json!({ "name": "name", "in": "query",
-            "schema": { "type": "string", "maxLength": 50 } }),
-        serde_json::json!({ "name": "founder", "in": "query",
-            "schema": { "type": "string", "maxLength": 64 } }),
+        exact_filter_parameter(
+            "name",
+            crate::sanitize::CHANNELLEN,
+            ", under RFC1459 case-folding",
+        ),
+        exact_filter_parameter("founder", MAX_ACCOUNT_LEN, ", under RFC1459 case-folding"),
     ]);
     let mut server_ban_parameters = admin_cursor_parameters();
     server_ban_parameters.extend([
         serde_json::json!({ "name": "kind", "in": "query",
             "schema": { "type": "string", "enum": ["kline", "dline", "xline"] } }),
-        serde_json::json!({ "name": "mask", "in": "query",
-            "schema": { "type": "string", "maxLength": 512 } }),
+        exact_filter_parameter(
+            "mask",
+            e6irc_proto::message::MAX_LINE_LEN,
+            ", under RFC1459 case-folding",
+        ),
     ]);
     let mut audit_parameters = admin_cursor_parameters();
+    let principal = ", an account under RFC1459 case-folding (as account principals are recorded) and any other principal as spelled";
     audit_parameters.extend([
-        serde_json::json!({ "name": "actor", "in": "query",
-            "schema": { "type": "string", "maxLength": 128 } }),
-        serde_json::json!({ "name": "action", "in": "query",
-            "schema": { "type": "string", "maxLength": 64 } }),
-        serde_json::json!({ "name": "target", "in": "query",
-            "schema": { "type": "string", "maxLength": 512 } }),
+        exact_filter_parameter("actor", super::device::AUDIT_ACTOR_FILTER_CHARS, principal),
+        exact_filter_parameter("action", super::device::AUDIT_ACTION_FILTER_CHARS, ""),
+        exact_filter_parameter(
+            "target",
+            super::device::AUDIT_TARGET_FILTER_CHARS,
+            principal,
+        ),
     ]);
     let connection_cursor_parameters = || {
         vec![
@@ -769,8 +831,7 @@ fn operations() -> serde_json::Value {
     };
     let mut own_connection_parameters = connection_cursor_parameters();
     own_connection_parameters.extend([
-        serde_json::json!({ "name": "nick", "in": "query",
-            "schema": { "type": "string", "maxLength": 64 } }),
+        exact_filter_parameter("nick", super::sessions::LIVE_NICK_FILTER_CHARS, ""),
         serde_json::json!({ "name": "transport", "in": "query",
             "schema": { "type": "string",
                 "enum": ["tcp", "tls", "websocket", "wss", "local"] } }),
@@ -778,10 +839,7 @@ fn operations() -> serde_json::Value {
             "schema": { "type": "boolean" } }),
     ]);
     let mut admin_connection_parameters = own_connection_parameters.clone();
-    admin_connection_parameters.push(serde_json::json!({
-        "name": "account", "in": "query",
-        "schema": { "type": "string", "maxLength": 64 }
-    }));
+    admin_connection_parameters.push(exact_filter_parameter("account", MAX_ACCOUNT_LEN, ""));
     let connection_mutation_parameters = || {
         vec![
             serde_json::json!({ "name": "id", "in": "path", "required": true,
@@ -825,7 +883,13 @@ fn operations() -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "before_connect": { "type": "boolean" },
-            "require_email": { "type": "boolean" }
+            "require_email": { "type": "boolean" },
+            "minimum_password_length": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::identity::MAX_MINIMUM_PASSWORD_CHARS,
+                "description": "The fewest characters a password being set may have, on IRC and NickServ REGISTER, the web and this API; 8 (NIST SP 800-63B) unless configured. Existing passwords still verify. Applied without a restart."
+            }
         }
     });
     let limits_schema = serde_json::json!({
@@ -835,6 +899,12 @@ fn operations() -> serde_json::Value {
             "max_connections_per_ip": { "type": ["integer", "null"], "minimum": 1 },
             "command_burst": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "command_rate": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "anti_spam_exit_message_time_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": crate::config::MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS,
+                "description": "How long a connection must have been open before its QUIT comment is shown (Solanum's anti_spam_exit_message_time); a younger non-operator connection leaves as \"Client Quit\". 0 shows every comment. Applied without a restart."
+            },
             "trusted_proxies": { "type": "array", "items": { "type": "string" } },
             "auth_rate_burst": {
                 "oneOf": [{ "type": "integer", "minimum": 1 }, { "const": "off" }],
@@ -879,7 +949,7 @@ fn operations() -> serde_json::Value {
     let networks_schema = serde_json::json!({
         "type": "array", "items": { "type": "object", "additionalProperties": false,
             "required": ["name", "owner", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password", "server_password"],
-            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": { "type": "null", "description": "Always null on read: a stored server password is never returned." } } }
+            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_NETWORK_BUFFER_CAP }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": { "type": "null", "description": "Always null on read: a stored server password is never returned." } } }
     });
     let scalar_settings_schema = serde_json::json!({
         "type": "object",
@@ -892,11 +962,11 @@ fn operations() -> serde_json::Value {
             "admin_accounts"
         ],
         "properties": {
-            "server_name": { "type": "string" },
-            "network_name": { "type": "string" },
-            "description": { "type": "string" },
-            "motd": { "type": "array", "items": { "type": "string" } },
-            "nicklen": { "type": "integer", "minimum": 10, "maximum": 64 },
+            "server_name": { "type": "string", "maxLength": crate::config::MAX_SERVER_NAME_LEN, "description": "A hostname of at most this many bytes." },
+            "network_name": { "type": "string", "maxLength": crate::config::MAX_NETWORK_NAME_LEN, "description": "One token of at most this many bytes." },
+            "description": { "type": "string", "maxLength": crate::config::MAX_DESCRIPTION_LEN, "description": "The RPL_LINKS server information, at most this many bytes: what the reply has room for at the longest server name and nickname." },
+            "motd": { "type": "array", "items": { "type": "string", "maxLength": crate::config::MAX_MOTD_LINE_LEN }, "description": format!("Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname. The lines together take at most {} bytes, each counting {} more for its reply ({} bytes for the whole MOTD as sent at registration: half the smallest SendQ). JSON Schema cannot state a bound on the lines' total bytes; the server refuses a save past it.", crate::config::MAX_MOTD_LINES_BYTES, crate::config::MOTD_LINE_REPLY_OVERHEAD, crate::config::MAX_MOTD_BYTES) },
+            "nicklen": { "type": "integer", "minimum": crate::config::MIN_NICKLEN, "maximum": crate::config::MAX_NICKLEN },
             "sendq_bytes": { "type": "integer", "minimum": crate::config::MIN_SENDQ_BYTES, "maximum": crate::config::MAX_SENDQ_BYTES, "description": "Bytes queued for one connection, output held behind a deferred reply included, before it is closed for SendQ." },
             "core_queue": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_QUEUE },
             "core_workers": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_WORKERS },
@@ -950,11 +1020,11 @@ fn operations() -> serde_json::Value {
         schema
     };
     let managed_network_request_schema = serde_json::json!({ "oneOf": [
-        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true }, "server_password": server_password_schema.clone() } })),
-        managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 } } })),
-        managed_network_variant("matrix", &["revision", "name", "addr", "tls", "nick", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
-        managed_network_variant("discord", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
-        managed_network_variant("slack", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }))
+        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_NETWORK_BUFFER_CAP }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true }, "server_password": server_password_schema.clone() } })),
+        managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_NETWORK_BUFFER_CAP } } })),
+        managed_network_variant("matrix", &["revision", "name", "addr", "tls", "nick", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_NETWORK_BUFFER_CAP }, "sasl_password": { "type": "string", "writeOnly": true } } })),
+        managed_network_variant("discord", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_NETWORK_BUFFER_CAP }, "sasl_password": { "type": "string", "writeOnly": true } } })),
+        managed_network_variant("slack", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_NETWORK_BUFFER_CAP }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }))
     ] });
     let configuration_response = json_response(
         "redacted settings, revision, and runtime/bootstrap status",
@@ -1099,8 +1169,8 @@ fn operations() -> serde_json::Value {
             },
             "/readyz": {
                 "get": { "summary": "Core and PostgreSQL readiness probe", "responses": {
-                    "200": { "description": "all configured dependencies are ready" },
-                    "503": { "description": "the core heartbeat is stale or PostgreSQL is unavailable" } } }
+                    "200": { "description": "this process serves (role \"serving\") and all configured dependencies are ready" },
+                    "503": { "description": "the core heartbeat is stale or PostgreSQL is unavailable, or this process is a standby (role \"standby\", naming the serving lease's holder)" } } }
             },
             "/api/v1/monitoring/observation": {
                 "get": {
@@ -1449,21 +1519,38 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/auth/device/start": {
                 "post": { "summary": "Begin an RFC 8628 device authorization grant",
-                    "responses": { "200": { "description": "device_code, user_code, verification_uri" },
+                    "description": "RFC 8628 §3.1: a form body naming the client. Parameters the endpoint does not define are ignored (RFC 6749 §3.1); one sent twice is refused. Every device grant issues the scope `read write irc`; a request may name exactly that scope.",
+                    "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["client_id"],
+                            "properties": {
+                                "client_id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[\\x20-\\x7E]+$", "description": "The client starting the grant; the grant is bound to it and its token is labelled with it." },
+                                "scope": { "type": "string", "description": "Optional; if sent, exactly `read write irc` in any order." }
+                            }
+                        }
+                    } } },
+                    "responses": { "200": { "description": "RFC 8628 §3.2: device_code, user_code, verification_uri, expires_in, and interval (the seconds a device waits between polls)" },
+                        "400": { "description": "RFC 6749 §5.2 error: invalid_request (not a form, a repeated parameter, or a missing or malformed client_id) or invalid_scope" },
                         "503": { "description": "database or absolute public URL unavailable" } } }
             },
             "/api/v1/auth/device/token": {
                 "post": { "summary": "Poll for the device grant's token",
-                    "requestBody": { "required": true, "content": { "application/json": {
+                    "description": "RFC 8628 §3.4: a form body. Parameters the endpoint does not define are ignored (RFC 6749 §3.1); one sent twice is refused. Each device code's polls are paced: one sooner than the grant's interval after the previous poll is answered `slow_down` and lengthens the interval by 5 seconds (§3.5).",
+                    "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": {
                         "schema": {
-                            "type": "object", "additionalProperties": false,
-                            "required": ["device_code"],
-                            "properties": { "device_code": { "type": "string", "minLength": 1 } }
+                            "type": "object",
+                            "required": ["grant_type", "device_code", "client_id"],
+                            "properties": {
+                                "grant_type": { "type": "string", "enum": ["urn:ietf:params:oauth:grant-type:device_code"] },
+                                "device_code": { "type": "string", "minLength": 1 },
+                                "client_id": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The client that started the grant; another client's device code is `invalid_grant`." }
+                            }
                         }
                     } } },
-                    "responses": { "200": { "description": "access_token once approved" },
+                    "responses": { "200": { "description": "RFC 6749 §5.1 once approved: access_token, token_type Bearer, expires_in, and scope" },
                         "503": { "description": "no database configured, or the database is unavailable" },
-                        "400": { "description": "RFC 8628 error: authorization_pending, expired_token, invalid_grant, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
+                        "400": { "description": "RFC 8628 §3.5 error: authorization_pending (poll again after the interval), slow_down (the interval grew by 5 seconds), expired_token, invalid_grant (unknown, consumed, or another client's device code), invalid_request, unsupported_grant_type, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
             },
             "/api/v1/auth/device/approve": {
                 "post": {
@@ -1546,12 +1633,12 @@ fn operations() -> serde_json::Value {
                             "required": ["new_password"],
                             "properties": {
                                 "current_password": { "type": "string", "minLength": 1, "maxLength": 512 },
-                                "new_password": { "type": "string", "minLength": 1, "maxLength": 512 }
+                                "new_password": { "type": "string", "minLength": 1, "maxLength": 512, "description": "At least registration.minimum_password_length characters (8 unless configured, NIST SP 800-63B) and at most 512 bytes." }
                             }
                         }
                     } } },
                     "responses": {
-                        "200": json_response("primary password changed; other browser sessions signed out", serde_json::json!({
+                        "200": json_response("primary password changed; other browser sessions, IRC connections and bouncer attachments signed out", serde_json::json!({
                             "type": "object", "additionalProperties": false, "required": ["detail"],
                             "properties": { "detail": { "type": "string", "const": super::credentials::PASSWORD_CHANGE_DETAIL } }
                         }))["200"],
@@ -1739,7 +1826,7 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/me/networks": {
                 "get": { "summary": "List the account's BNC networks with live upstream status",
-                    "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
+                    "description": "The account's stored networks, then the networks the server configuration defines for it (`configured: true`: the operator's, always enabled, and refused with 409 by PUT, PATCH, and DELETE). Each network includes its configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin (each entry `#channel`, or `#channel key` for a keyed channel, whose key is stored sealed and never returned), with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
@@ -1748,21 +1835,20 @@ fn operations() -> serde_json::Value {
                         "schema": { "oneOf": [
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
-                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": irc_autojoin_schema.clone(), "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": server_password_schema.clone() } },
+                                "properties": { "kind": { "const": "irc" }, "name": network_name_schema.clone(), "addr": upstream_addr_schema(1), "tls": { "type": "boolean" }, "nick": upstream_nick_schema(1), "username": upstream_username_schema("IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick."), "realname": upstream_realname_schema("IRC real name sent in USER."), "autojoin": irc_autojoin_schema.clone(), "sasl_account": irc_sasl_account_schema.clone(), "sasl_password": irc_sasl_password_schema.clone(), "server_password": server_password_schema.clone() } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "autojoin", "sasl_password"],
-                                "properties": { "kind": { "const": "matrix" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
+                                "properties": { "kind": { "const": "matrix" }, "name": network_name_schema.clone(), "addr": upstream_addr_schema(1), "tls": { "const": true }, "nick": upstream_nick_schema(1), "autojoin": bridge_autojoin_schema.clone(), "sasl_password": bridge_secret_schema(super::networks::MAX_UPSTREAM_PASSWORD_LEN) } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "autojoin", "sasl_password"],
-                                "properties": { "kind": { "const": "discord" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
+                                "properties": { "kind": { "const": "discord" }, "name": network_name_schema.clone(), "addr": upstream_addr_schema(0), "tls": { "const": true }, "autojoin": bridge_autojoin_schema.clone(), "sasl_password": bridge_secret_schema(super::networks::MAX_UPSTREAM_PASSWORD_LEN) } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "autojoin", "sasl_account", "sasl_password"],
-                                "properties": { "kind": { "const": "slack" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }
+                                "properties": { "kind": { "const": "slack" }, "name": network_name_schema.clone(), "addr": upstream_addr_schema(0), "tls": { "const": true }, "autojoin": bridge_autojoin_schema.clone(), "sasl_account": bridge_secret_schema(super::networks::MAX_UPSTREAM_ACCOUNT_LEN), "sasl_password": bridge_secret_schema(super::networks::MAX_UPSTREAM_PASSWORD_LEN) } }
                         ] } } } },
                     "responses": { "201": network_created_response["201"],
                         "400": { "description": "invalid name, address, identity, or kind-specific configuration; an upstream inside the server's own network is refused" },
-                        "404": { "description": "the bouncer is not enabled on this server" },
-                        "409": { "description": "duplicate name, or upstream secret with no master key" },
+                        "409": { "description": "duplicate name, a name the server configuration defines for this account, or upstream secret with no master key" },
                         "503": { "description": "database or network registry unavailable" } } }
             },
             "/api/v1/me/network-preflight": {
@@ -1774,14 +1860,14 @@ fn operations() -> serde_json::Value {
                         "schema": { "type": "object", "additionalProperties": false,
                             "required": ["addr", "tls", "nick", "username", "realname"],
                             "properties": {
-                                "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
+                                "addr": upstream_addr_schema(1),
                                 "tls": { "type": "boolean" },
-                                "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
-                                "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER; never derived from the nick." },
-                                "realname": { "type": "string", "minLength": 1, "maxLength": 128 },
+                                "nick": upstream_nick_schema(1),
+                                "username": upstream_username_schema("IRC user name (ident) sent in USER; never derived from the nick."),
+                                "realname": upstream_realname_schema("IRC real name sent in USER."),
                                 "autojoin": irc_autojoin_schema.clone(),
-                                "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
-                                "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true },
+                                "sasl_account": irc_sasl_account_schema.clone(),
+                                "sasl_password": irc_sasl_password_schema.clone(),
                                 "server_password": server_password_schema.clone()
                             } } } } },
                     "responses": {
@@ -1870,15 +1956,20 @@ fn operations() -> serde_json::Value {
                         "schema": { "type": "object", "additionalProperties": false,
                             "required": ["addr", "tls", "nick", "autojoin", "autojoin_keys", "credentials", "server_password"],
                             "properties": {
-                                "addr": { "type": "string" },
+                                "addr": upstream_addr_schema(0),
                                 "tls": { "type": "boolean" },
-                                "nick": { "type": "string" },
-                                "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required when the stored network is kind=irc (400 with field=username when absent or invalid); refused for a bridge." },
-                                "realname": { "type": "string", "description": "IRC real name sent in USER. Required when the stored network is kind=irc (400 with field=realname when absent); refused for a bridge." },
-                                "autojoin": { "type": "array", "maxItems": 64, "items": { "type": "string" }, "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing. An IRC entry `#channel key` sets that channel's key." },
+                                "nick": upstream_nick_schema(0),
+                                "username": upstream_username_schema("IRC user name (ident) sent in USER. Required when the stored network is kind=irc (400 with field=username when absent or invalid); refused for a bridge."),
+                                "realname": upstream_realname_schema("IRC real name sent in USER. Required when the stored network is kind=irc (400 with field=realname when absent); refused for a bridge."),
+                                "autojoin": {
+                                    "type": "array", "maxItems": crate::bouncer::AutojoinEntry::MAX_CONFIGURED,
+                                    "items": irc_autojoin_schema["items"].clone(),
+                                    "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing. An IRC entry `#channel key` sets that channel's key." },
                                 "autojoin_keys": { "type": "object", "additionalProperties": false, "required": ["keep"],
                                     "description": "Which stored channel keys carry over. Required: a key is write-only, so an entry listed without one could otherwise mean either keep or remove it.",
-                                    "properties": { "keep": { "type": "array", "items": { "type": "string" }, "description": "Channels, listed in autojoin without a new key, that keep their stored key. Every other channel's stored key is removed." } } },
+                                    "properties": { "keep": { "type": "array", "maxItems": crate::bouncer::AutojoinEntry::MAX_CONFIGURED,
+                                        "items": { "type": "string", "minLength": 1, "maxLength": crate::bouncer::UpstreamChannel::MAX_BYTES },
+                                        "description": "Channels, listed in autojoin without a new key, that keep their stored key. Every other channel's stored key is removed." } } },
                                 "credentials": {
                                     "oneOf": [
                                         { "type": "object", "additionalProperties": false,
@@ -1891,8 +1982,9 @@ fn operations() -> serde_json::Value {
                                             "required": ["action"],
                                             "properties": {
                                                 "action": { "const": "set" },
-                                                "account": { "type": "string" },
-                                                "password": { "type": "string" }
+                                                "account": { "type": "string", "minLength": 1, "maxLength": super::networks::MAX_UPSTREAM_ACCOUNT_LEN,
+                                                    "description": "An IRC SASL login, sent exactly as given (surrounding whitespace is refused, never trimmed), or a Slack bot token." },
+                                                "password": bridge_secret_schema(super::networks::MAX_UPSTREAM_PASSWORD_LEN)
                                             } }
                                     ]
                                 },
@@ -1916,7 +2008,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "204": { "description": "updated and live driver replaced" },
                         "400": { "description": "invalid kind-specific configuration or credential action" },
                         "404": { "description": "no such network" },
-                        "409": { "description": "cannot seal credentials or start replacement driver, or a stored secret would be sent to a new destination (field names it)" } } },
+                        "409": { "description": "cannot seal credentials or start replacement driver, a stored secret would be sent to a new destination (field names it), or the server configuration defines this network (only the operator changes it)" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
                     "security": authenticated,
                     "parameters": network_name_parameter,
@@ -1926,12 +2018,13 @@ fn operations() -> serde_json::Value {
                     "responses": { "200": network_enabled_response["200"],
                         "400": { "description": "invalid JSON body" },
                         "404": { "description": "no such network" },
-                        "409": { "description": "cannot start (stored secret, no master key)" } } },
+                        "409": { "description": "cannot start (stored secret, no master key), or the server configuration defines this network (only the operator starts or stops it)" } } },
                 "delete": { "summary": "Delete a BNC network and stop its driver",
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "responses": { "204": { "description": "deleted" },
-                        "404": { "description": "no such network" } } }
+                        "404": { "description": "no such network" },
+                        "409": { "description": "the server configuration defines this network (only the operator removes it)" } } }
             },
             "/api/v1/me/networks/{name}/buffer": {
                 "get": { "summary": "Read the bounded owner-scoped component log (oldest-first)",
@@ -1966,7 +2059,7 @@ fn operations() -> serde_json::Value {
                         "101": { "description": "Switching Protocols: the live chat socket (see the description for its events and close codes)" },
                         "400": { "description": "not a valid WebSocket upgrade, or an invalid query (a problem document)" },
                         "403": { "description": "the Origin is not this application's, or the credential is refused as for any authenticated read" },
-                        "404": { "description": "no such network of yours, or the bouncer is not enabled" },
+                        "404": { "description": "no such network of yours" },
                         "426": { "description": "the WebSocket version is not supported (a problem document)" }
                     } }
             },
@@ -2005,7 +2098,7 @@ fn operations() -> serde_json::Value {
                             "additionalProperties": false,
                             "properties": {
                                 "account": { "type": "string", "maxLength": 64 },
-                                "password": { "type": "string", "maxLength": 512 },
+                                "password": { "type": "string", "minLength": 1, "maxLength": 512, "description": "At least registration.minimum_password_length characters (8 unless configured, NIST SP 800-63B) and at most 512 bytes." },
                                 "contact_email": { "type": ["string", "null"], "maxLength": 254 },
                                 "administrator": { "type": "boolean", "default": false }
                             }
@@ -2281,9 +2374,17 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/admin/networks": {
                 "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
-                    "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
+                    "description": "Every network with its configuration (credentials as presence booleans only) and live driver runtime state: the shared networks, then each owner's, by RFC1459-folded owner and network name, a network the server configuration defines for an owner (`configured: true`) before a stored one of the same name. Pages are stable: `after` selects strictly the networks after the one whose `next_after` it repeats, so networks created or removed meanwhile cannot duplicate or skip another.",
                     "security": authenticated,
+                    "parameters": [
+                        { "name": "limit", "in": "query", "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": crate::db::BncNetworkInventoryPageSize::MAX, "default": 100 } },
+                        { "name": "after", "in": "query", "required": false,
+                            "description": "A `next_after` value from the previous page.",
+                            "schema": { "type": "string", "minLength": 1 } }
+                    ],
                     "responses": { "200": admin_networks_response["200"],
+                        "400": { "description": "invalid limit or cursor" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/networks/{owner}/{name}": {
@@ -2292,7 +2393,7 @@ fn operations() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
-                    "responses": { "200": admin_network_enabled_response["200"], "400": { "description": "invalid JSON body" }, "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "409": { "description": "the owner is suspended, or the stored network cannot start" }, "503": { "description": "database unavailable" } } }
+                    "responses": { "200": admin_network_enabled_response["200"], "400": { "description": "invalid JSON body" }, "403": { "description": "not an admin account" }, "404": { "description": "no such stored network for that owner" }, "409": { "description": "the owner is suspended, the stored network cannot start, or the server configuration defines this network (change it in the configuration)" }, "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
@@ -2803,7 +2904,10 @@ mod tests {
         assert_eq!(pattern, "^#");
         assert_eq!(name["maxLength"], crate::sanitize::CHANNELLEN);
         for refused in ["&local", "+modeless", "!safe"] {
-            assert!(!crate::sanitize::valid_channel_name(refused), "{refused}");
+            assert!(
+                crate::sanitize::ChannelName::parse(refused).is_err(),
+                "{refused}"
+            );
         }
     }
 
@@ -2947,6 +3051,78 @@ mod tests {
         assert!(refused.to_string().contains("autojoin_keys"), "{refused}");
         with["autojoin_keys"] = serde_json::json!({ "keep": [] });
         assert!(serde_json::from_value::<super::UpdateNetwork>(with).is_ok());
+    }
+
+    /// Create, replace, and the connection test document the bounds the
+    /// handlers enforce, read from the same constants, so a client validating
+    /// against the contract cannot send what the server refuses for length (the
+    /// create schema once had no bound at all on a name, address, nick, real
+    /// name, or SASL field).
+    #[test]
+    fn network_field_schemas_carry_the_handlers_bounds() {
+        use super::super::networks::{
+            MAX_UPSTREAM_ACCOUNT_LEN, MAX_UPSTREAM_ADDR_LEN, MAX_UPSTREAM_PASSWORD_LEN,
+        };
+        use crate::bouncer::{AutojoinEntry, UpstreamChannel, UpstreamNick, UpstreamRealname};
+        let spec = super::document();
+        let body = |path: &str, method: &str| {
+            spec["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
+                .clone()
+        };
+        let create = body("/api/v1/me/networks", "post");
+        let replace = body("/api/v1/me/networks/{name}", "put");
+        let preflight = body("/api/v1/me/network-preflight", "post");
+        let irc = [&create["oneOf"][0], &preflight, &replace];
+        for (field, maximum) in [
+            ("addr", MAX_UPSTREAM_ADDR_LEN),
+            ("nick", UpstreamNick::MAX_BYTES),
+            ("realname", UpstreamRealname::MAX_BYTES),
+        ] {
+            for schema in irc {
+                assert_eq!(schema["properties"][field]["maxLength"], maximum, "{field}");
+            }
+        }
+        for schema in [&create["oneOf"][0], &preflight] {
+            assert_eq!(
+                schema["properties"]["sasl_account"]["maxLength"],
+                MAX_UPSTREAM_ACCOUNT_LEN
+            );
+            assert_eq!(
+                schema["properties"]["sasl_password"]["maxLength"],
+                MAX_UPSTREAM_PASSWORD_LEN
+            );
+        }
+        for variant in create["oneOf"].as_array().expect("one branch per kind") {
+            let name = &variant["properties"]["name"];
+            assert_eq!(name["minLength"], 1);
+            assert_eq!(name["maxLength"], crate::sanitize::MAX_NETWORK_NAME_LEN);
+            assert_eq!(name["pattern"], crate::sanitize::NETWORK_NAME_PATTERN);
+            assert_eq!(
+                variant["properties"]["autojoin"]["maxItems"],
+                AutojoinEntry::MAX_CONFIGURED
+            );
+            assert_eq!(
+                variant["properties"]["sasl_password"]["maxLength"],
+                MAX_UPSTREAM_PASSWORD_LEN
+            );
+        }
+        for variant in 1..=3 {
+            assert_eq!(
+                create["oneOf"][variant]["properties"]["autojoin"]["items"]["maxLength"],
+                UpstreamChannel::MAX_BYTES
+            );
+        }
+        assert_eq!(
+            create["oneOf"][3]["properties"]["sasl_account"]["maxLength"],
+            MAX_UPSTREAM_ACCOUNT_LEN
+        );
+        assert_eq!(
+            replace["properties"]["autojoin_keys"]["properties"]["keep"]["maxItems"],
+            AutojoinEntry::MAX_CONFIGURED
+        );
+        let set = &replace["properties"]["credentials"]["oneOf"][2]["properties"];
+        assert_eq!(set["account"]["maxLength"], MAX_UPSTREAM_ACCOUNT_LEN);
+        assert_eq!(set["password"]["maxLength"], MAX_UPSTREAM_PASSWORD_LEN);
     }
 
     #[test]

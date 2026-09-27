@@ -160,6 +160,66 @@ async fn runtime_shards_deliver_and_stop_together() {
     }
 }
 
+/// Shutdown returns only once each client has been *sent* its closing ERROR,
+/// not merely had it queued: the process exits right after, and ending the
+/// runtime cancels whatever a connection still had to write. Here a client
+/// that has not yet read a large MOTD has its ERROR queued behind it; it
+/// starts reading only after the shutdown has begun, and must still get
+/// everything, the ERROR, and an orderly end of stream.
+#[test]
+fn shutdown_delivers_every_closing_error_before_it_returns() {
+    use std::io::{Read, Write};
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut config = test_config();
+    // More than the kernel buffers between the two ends hold, so most of it
+    // is still in the server's send queue when the shutdown starts.
+    config.sendq_bytes = 16 * 1024 * 1024;
+    config.motd = (0..30_000)
+        .map(|i| format!("{i:05} {}", "m".repeat(300)))
+        .collect();
+    let (running, client) = runtime.block_on(async {
+        let running = net::start(config).await.expect("start");
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(4096).expect("small window");
+        let client = socket.connect(running.addrs[0]).await.expect("connect");
+        (running, client.into_std().expect("std stream"))
+    });
+    client.set_nonblocking(false).expect("blocking");
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("read timeout");
+    let mut writer = client.try_clone().expect("clone");
+    writer
+        .write_all(b"NICK late\r\nUSER late 0 * :Late\r\n")
+        .expect("register");
+    // The welcome and the MOTD are queued; the client reads none of it yet.
+    std::thread::sleep(Duration::from_millis(300));
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut client = client;
+        let mut received = Vec::new();
+        let ended = client.read_to_end(&mut received);
+        (received, ended)
+    });
+    let outcome = runtime.block_on(running.shutdown.run());
+    // What `main` does next: the runtime, and every task still in it, ends.
+    drop(runtime);
+    assert_eq!(outcome, net::ShutdownOutcome::Flushed);
+    let (received, ended) = reader.join().expect("reader thread");
+    let text = String::from_utf8_lossy(&received);
+    assert!(text.contains(" 376 late "), "the whole MOTD arrives");
+    assert!(
+        text.ends_with("ERROR :Closing Link: 127.0.0.1 (Server shutting down)\r\n"),
+        "the closing ERROR is the last line delivered: {:?}",
+        &text[text.len().saturating_sub(200)..]
+    );
+    ended.expect("an orderly end of stream");
+    drop(writer);
+}
+
 #[tokio::test]
 async fn whois_reports_idle_and_signon() {
     let running = net::start(test_config()).await.expect("start");

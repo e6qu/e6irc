@@ -13,7 +13,10 @@ fn cli_sasl_database_name() -> String {
 /// the environment is an administrative connection, not shared test storage:
 /// other integration binaries deliberately leave real managed configuration
 /// in it while proving restart and secret-sealing behavior.
-async fn prepare_cli_sasl_database(admin_url: &str, database_name: &str) -> String {
+async fn prepare_cli_sasl_database(
+    admin_url: &str,
+    database_name: &str,
+) -> e6ircd::db::DatabaseUrl {
     let pool = sqlx::PgPool::connect(admin_url)
         .await
         .expect("connect to the administrative database");
@@ -31,7 +34,9 @@ async fn prepare_cli_sasl_database(admin_url: &str, database_name: &str) -> Stri
 
     let mut url = reqwest::Url::parse(admin_url).expect("database URL");
     url.set_path(database_name);
-    url.to_string()
+    url.as_str()
+        .parse()
+        .expect("E6IRC_TEST_DATABASE_URL is a URL e6ircd accepts")
 }
 
 async fn drop_cli_sasl_database(admin_url: &str, database_name: &str) {
@@ -722,19 +727,32 @@ async fn cli_api_hits_rest_endpoints() {
     let base = format!("http://{http}");
     let bin = env!("CARGO_BIN_EXE_e6irc");
 
-    // /healthz -> "ok", exit 0
-    let out = tokio::task::spawn_blocking({
+    // Calls without a token read no login cache of the host's: the default
+    // cache path is pointed at a file this test owns and never writes.
+    let cache = std::env::temp_dir().join(format!(
+        "e6irc-cli-api-{}-{}.json",
+        std::process::id(),
+        http.port()
+    ));
+    let api = |path: &'static str| {
         let base = base.clone();
-        move || {
+        let cache = cache.clone();
+        tokio::task::spawn_blocking(move || {
             Command::new(bin)
-                .args(["api", "GET", "/healthz", "--base", &base])
+                .env("E6IRC_TOKEN_FILE", &cache)
+                .args(["api", "GET", path, "--base", &base])
                 .output()
                 .expect("run")
-        }
-    })
-    .await
-    .unwrap();
-    assert!(out.status.success(), "healthz should exit 0");
+        })
+    };
+
+    // /healthz -> "ok", exit 0
+    let out = api("/healthz").await.unwrap();
+    assert!(
+        out.status.success(),
+        "healthz should exit 0: {}",
+        outcome(&out)
+    );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("ok"),
         "{:?}",
@@ -761,25 +779,11 @@ async fn cli_api_hits_rest_endpoints() {
     .await
     .unwrap();
     #[cfg(unix)]
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", outcome(&out));
 
     // /api/v1/server -> JSON with server_name
-    let out = tokio::task::spawn_blocking({
-        let base = base.clone();
-        move || {
-            Command::new(bin)
-                .args(["api", "GET", "/api/v1/server", "--base", &base])
-                .output()
-                .expect("run")
-        }
-    })
-    .await
-    .unwrap();
-    assert!(out.status.success());
+    let out = api("/api/v1/server").await.unwrap();
+    assert!(out.status.success(), "{}", outcome(&out));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("irc.cliapi.example"),
         "{:?}",
@@ -787,18 +791,23 @@ async fn cli_api_hits_rest_endpoints() {
     );
 
     // A non-2xx path (unknown route -> 404) makes the CLI exit nonzero.
-    let out = tokio::task::spawn_blocking({
-        let base = base.clone();
-        move || {
-            Command::new(bin)
-                .args(["api", "GET", "/api/v1/nope", "--base", &base])
-                .output()
-                .expect("run")
-        }
-    })
-    .await
-    .unwrap();
-    assert!(!out.status.success(), "404 must be a nonzero exit");
+    let out = api("/api/v1/nope").await.unwrap();
+    assert!(
+        !out.status.success(),
+        "404 must be a nonzero exit: {}",
+        outcome(&out)
+    );
+}
+
+/// A finished CLI run as a failure message shows it: the exit status and
+/// everything it wrote, so a failure names its own cause.
+fn outcome(out: &std::process::Output) -> String {
+    format!(
+        "{}; stdout {:?}; stderr {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// A server that welcomes the CLI, confirms whatever it joins, and then drops

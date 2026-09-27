@@ -22,6 +22,9 @@ function networkSummary(value) {
     nick: value.nick,
     enabled: value.enabled,
     connected: value.connected,
+    // The server configuration defines it: the operator's, never switched
+    // or edited from the account.
+    configured: value.configured,
     state: value.runtime?.state ?? null,
     failureCode: value.runtime?.last_error?.code ?? null,
     failureDetail: value.runtime?.last_error?.diagnostic ?? null,
@@ -61,6 +64,13 @@ export function networkStateLabel(network) {
 export function networkStateHelp(network) {
   if (network.enabled === false) return "This network is disabled.";
   if (network.connected === true) return null;
+  // Not a refusal: the bouncer met a session of its own the network never saw
+  // end, and says which name it holds meanwhile. Nothing is joined or sent
+  // under that name, and there is nothing to repair yet.
+  if (network.state === "regaining_nickname") {
+    const holding = network.failureDetail ? ` (${network.failureDetail})` : "";
+    return `The nickname is held by an earlier session of this network that did not end cleanly; the bouncer is registered under a temporary one and takes the configured nickname back as soon as it is free${holding}.`;
+  }
   // The network's own words are the most useful thing on the row: "SASL access
   // only" or "Trying to reconnect too fast" says what no classification can.
   // Without them the advice points at the console, where they would be.
@@ -78,6 +88,8 @@ function stateRepair(network, whereToLook) {
       return "The network rejected the NickServ account or password. Open settings to correct them.";
     case "nickname_in_use":
       return "The nickname is in use on this network. Choose another in settings, or wait for the old session to time out.";
+    case "nickname_regain_refused":
+      return "The nickname belongs to another account on this network. Choose another in settings, or enter that account's NickServ credentials.";
     case "server_password_required":
       return "The network requires a server password. Enter it in settings, as Server password under Advanced.";
     case "server_password_rejected":

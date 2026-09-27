@@ -321,6 +321,22 @@ export function directoryQuery(search, keys, defaults = {}) {
   return query;
 }
 
+/**
+ * One page's place in a cursor-paged directory. `first` says whether the page
+ * shown is the first, which only the page's own query can say: it carries the
+ * cursor parameter or it does not. A next cursor says only that another page
+ * follows — a status read from it called the first page of a long directory
+ * an older one. `next` is the next page's query, or null on the last page.
+ */
+export function directoryPage(query, parameter, nextCursor) {
+  let next = null;
+  if (nextCursor !== null && nextCursor !== undefined) {
+    next = new URLSearchParams(query);
+    next.set(parameter, String(nextCursor));
+  }
+  return Object.freeze({ first: !query.has(parameter), next });
+}
+
 export function parseOperationQuery(document, method, url, label = "API query") {
   const { operation } = declaredOperation(document, method, url);
   const parameters = operationParameters(operation, label);

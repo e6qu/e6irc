@@ -43,18 +43,70 @@ impl FloodExemptions {
     }
 }
 
+/// A token bucket of one [`CommandFlood`] shape: `burst` tokens at most,
+/// `rate` regained per second. A connection's [`LineMeter`] spends one per
+/// line it hands the core; the bouncer's `irc` driver spends one per line it
+/// writes to an upstream, whose own flood limit is the same shape.
+pub(crate) struct TokenBucket {
+    flood: CommandFlood,
+    tokens: u32,
+    /// The instant through which regained tokens have been credited. It
+    /// advances by whole tokens' worth only, so a remainder shorter than one
+    /// token carries forward instead of being lost to a steady stream.
+    refilled_to: Instant,
+}
+
+impl TokenBucket {
+    /// A full bucket at `now`.
+    pub(crate) fn new(flood: CommandFlood, now: Instant) -> Self {
+        Self {
+            flood,
+            tokens: flood.burst(),
+            refilled_to: now,
+        }
+    }
+
+    /// When the next token is there: `None` now, or the instant it is
+    /// regained.
+    pub(crate) fn blocked_until(&mut self, now: Instant) -> Option<Instant> {
+        let rate = u64::from(self.flood.rate());
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.refilled_to).as_millis())
+            .unwrap_or(u64::MAX);
+        // `credited * 1000 / rate <= elapsed_ms`: the watermark never passes
+        // `now`.
+        let credited = elapsed_ms.saturating_mul(rate) / 1000;
+        self.refilled_to += Duration::from_millis(credited.saturating_mul(1000) / rate);
+        let tokens =
+            (u64::from(self.tokens).saturating_add(credited)).min(u64::from(self.flood.burst()));
+        self.tokens = u32::try_from(tokens).expect("at most the burst, which is a u32");
+        if self.tokens > 0 {
+            return None;
+        }
+        // The next whole token is credited once `elapsed * rate >= 1000`.
+        Some(self.refilled_to + Duration::from_millis(1000u64.div_ceil(rate)))
+    }
+
+    /// Take a token, or nothing from an empty bucket (an exempt spender's).
+    fn take(&mut self) {
+        self.tokens = self.tokens.saturating_sub(1);
+    }
+
+    /// Spend a token, waiting until one is regained when the bucket is empty.
+    pub(crate) async fn spend(&mut self) {
+        while let Some(until) = self.blocked_until(Instant::now()) {
+            tokio::time::sleep_until(until).await;
+        }
+        self.take();
+    }
+}
+
 /// One connection's allowance, held by the task that hands its lines to the
 /// core.
 pub(crate) struct LineMeter {
     conn: ConnId,
     /// `None` only for an ingress built without a bucket: the test harnesses',
     /// which pipeline whole scripted sessions at once.
-    flood: Option<CommandFlood>,
-    tokens: u32,
-    /// The instant through which regained tokens have been credited. It
-    /// advances by whole tokens' worth only, so a remainder shorter than one
-    /// token carries forward instead of being lost to a steady stream.
-    refilled_to: Instant,
+    bucket: Option<TokenBucket>,
     exemptions: FloodExemptions,
 }
 
@@ -69,9 +121,7 @@ impl LineMeter {
     ) -> Self {
         Self {
             conn,
-            flood,
-            tokens: flood.map_or(0, CommandFlood::burst),
-            refilled_to: now,
+            bucket: flood.map(|flood| TokenBucket::new(flood, now)),
             exemptions,
         }
     }
@@ -79,22 +129,14 @@ impl LineMeter {
     /// When the next line may go: `None` now, or the instant the next token
     /// is regained.
     pub(crate) fn blocked_until(&mut self, now: Instant) -> Option<Instant> {
-        let flood = self.flood?;
-        let rate = u64::from(flood.rate());
-        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.refilled_to).as_millis())
-            .unwrap_or(u64::MAX);
-        // `credited * 1000 / rate <= elapsed_ms`: the watermark never passes
-        // `now`.
-        let credited = elapsed_ms.saturating_mul(rate) / 1000;
-        self.refilled_to += Duration::from_millis(credited.saturating_mul(1000) / rate);
-        let tokens =
-            (u64::from(self.tokens).saturating_add(credited)).min(u64::from(flood.burst()));
-        self.tokens = u32::try_from(tokens).expect("at most the burst, which is a u32");
-        if self.tokens > 0 || self.exemptions.contains(self.conn) {
-            return None;
+        let until = self.bucket.as_mut()?.blocked_until(now)?;
+        (!self.exemptions.contains(self.conn)).then_some(until)
+    }
+
+    fn take(&mut self) {
+        if let Some(bucket) = &mut self.bucket {
+            bucket.take();
         }
-        // The next whole token is credited once `elapsed * rate >= 1000`.
-        Some(self.refilled_to + Duration::from_millis(1000u64.div_ceil(rate)))
     }
 
     /// Spend a token for one line, waiting until one is regained when the
@@ -103,7 +145,7 @@ impl LineMeter {
         while let Some(until) = self.blocked_until(Instant::now()) {
             tokio::time::sleep_until(until).await;
         }
-        self.tokens = self.tokens.saturating_sub(1);
+        self.take();
     }
 }
 
@@ -124,7 +166,7 @@ mod tests {
     fn spend_at(meter: &mut LineMeter, now: Instant) -> bool {
         let free = meter.blocked_until(now).is_none();
         if free {
-            meter.tokens = meter.tokens.saturating_sub(1);
+            meter.take();
         }
         free
     }

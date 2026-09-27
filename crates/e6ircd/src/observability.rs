@@ -72,10 +72,13 @@ pub(crate) enum ErrorKind {
     Database,
     Bouncer,
     Http,
+    /// A listener could not be set up from its configuration: an unreadable
+    /// or mismatched certificate, say. Not a peer's failure.
+    Configuration,
 }
 
 impl ErrorKind {
-    pub(crate) const COUNT: usize = 9;
+    pub(crate) const COUNT: usize = 10;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Accept,
         Self::ConnectionSetup,
@@ -86,6 +89,7 @@ impl ErrorKind {
         Self::Database,
         Self::Bouncer,
         Self::Http,
+        Self::Configuration,
     ];
 
     const fn index(self) -> usize {
@@ -99,6 +103,7 @@ impl ErrorKind {
             Self::Database => 6,
             Self::Bouncer => 7,
             Self::Http => 8,
+            Self::Configuration => 9,
         }
     }
 
@@ -113,6 +118,7 @@ impl ErrorKind {
             Self::Database => "database",
             Self::Bouncer => "bouncer",
             Self::Http => "http",
+            Self::Configuration => "configuration",
         }
     }
 }
@@ -354,6 +360,7 @@ pub(crate) struct Telemetry {
     latency: [LatencyHistogram; LatencyKind::COUNT],
     operational_log: OperationalLog,
     database_pool: std::sync::OnceLock<(sqlx::PgPool, crate::db::DatabasePoolSize)>,
+    serving_lease: std::sync::OnceLock<std::sync::Arc<crate::serving_lease::LeaseStatus>>,
 }
 
 pub(crate) struct BncClientConnection {
@@ -400,6 +407,7 @@ impl Telemetry {
             latency: std::array::from_fn(|_| LatencyHistogram::new()),
             operational_log: OperationalLog::new(),
             database_pool: std::sync::OnceLock::new(),
+            serving_lease: std::sync::OnceLock::new(),
         }
     }
 
@@ -412,6 +420,17 @@ impl Telemetry {
     ) {
         if self.database_pool.set((pool, size)).is_err() {
             eprintln!("observability: the database pool was already being observed");
+        }
+    }
+
+    /// Report the serving lease in every Prometheus rendering from now on.
+    /// Called once, when the lease is held.
+    pub(crate) fn observe_serving_lease(
+        &self,
+        status: std::sync::Arc<crate::serving_lease::LeaseStatus>,
+    ) {
+        if self.serving_lease.set(status).is_err() {
+            eprintln!("observability: the serving lease was already being observed");
         }
     }
 
@@ -533,6 +552,16 @@ impl Telemetry {
         );
     }
 
+    /// How many core shards declared themselves ([`Self::expect_core_shards`]):
+    /// the shards this process is running, whatever the configuration said
+    /// before the console's stored revision was applied. `0` before the first
+    /// is built.
+    pub(crate) fn core_shards(&self) -> u64 {
+        self.core_heartbeats
+            .get()
+            .map_or(0, |heartbeats| heartbeats.len() as u64)
+    }
+
     fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
@@ -567,10 +596,16 @@ impl Telemetry {
             previous_unregistered,
             current_unregistered,
         );
+        self.record_core_heartbeat(shard);
+    }
+
+    /// Core shard `shard` is alive now: when its worker is built to run
+    /// ([`crate::core::CoreWorker::new`]), and each time it finishes an event.
+    pub(crate) fn record_core_heartbeat(&self, shard: usize) {
         let heartbeats = self
             .core_heartbeats
             .get()
-            .expect("a core declares its shard count before handling events");
+            .expect("a core declares its shard count before it runs");
         heartbeats[shard].store(self.elapsed_ms().saturating_add(1), Ordering::Relaxed);
     }
 
@@ -672,7 +707,7 @@ impl Telemetry {
         out.push_str(&format!(
             "e6irc_build_info{{version=\"{}\",revision=\"{}\"}} 1\n",
             env!("CARGO_PKG_VERSION"),
-            option_env!("E6IRC_BUILD_REVISION").unwrap_or("unknown"),
+            crate::BUILD_REVISION,
         ));
         one_metric(
             &mut out,
@@ -800,6 +835,22 @@ impl Telemetry {
         render_queues(&mut out, &snapshot.queues);
         if let Some(pool) = snapshot.database_pool {
             render_database_pool(&mut out, pool);
+        }
+        if let Some(lease) = self.serving_lease.get() {
+            one_metric(
+                &mut out,
+                "e6irc_serving_lease_held",
+                "Whether this process holds the database's serving lease (1) or has lost it (0).",
+                "gauge",
+                u64::from(lease.held()),
+            );
+            one_metric(
+                &mut out,
+                "e6irc_serving_lease_epoch",
+                "Acquisitions of the serving lease so far, as of this process's.",
+                "gauge",
+                u64::try_from(lease.epoch()).unwrap_or(0),
+            );
         }
         out.push_str("# HELP e6irc_errors_total Operational errors by fixed subsystem.\n");
         out.push_str("# TYPE e6irc_errors_total counter\n");
@@ -936,12 +987,16 @@ const MAINTENANCE_DRAIN_PAUSE: Duration = Duration::from_millis(250);
 /// expired credentials and durable history/audit data from growing forever; a
 /// tick whose batch fills keeps draining, bounded, before the next tick.
 /// Every read marker it deletes is handed to the core, whose mirror counts it.
+/// The history retention it applies here is the one the core and the bouncer
+/// apply to what they serve from memory: it is handed to them before the
+/// first sweep (the console hands them every later change as it saves one).
 pub(crate) async fn run_storage_maintenance(
     pool: sqlx::PgPool,
     telemetry: std::sync::Arc<Telemetry>,
     settings: std::sync::Arc<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>,
     core: crate::core::CoreIngress,
 ) {
+    core.adopt_live_settings(&settings.read().await.settings);
     let mut ticker = tokio::time::interval(Duration::from_secs(300));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval`'s first tick is immediate. Consume it so startup never races
@@ -970,6 +1025,7 @@ pub(crate) async fn run_storage_maintenance(
         telemetry.record_database_request(started.elapsed());
         let retention = {
             let snapshot = settings.read().await;
+            core.adopt_live_settings(&snapshot.settings);
             crate::db::StorageRetention {
                 history_days: snapshot.settings.storage.history_retention_days,
                 audit_days: snapshot.settings.storage.audit_retention_days,
@@ -1128,6 +1184,20 @@ mod tests {
         assert_eq!(entries[0].message, "An operational error was recorded.");
     }
 
+    #[test]
+    fn the_serving_lease_is_reported_once_held_and_when_lost() {
+        let telemetry = Telemetry::new();
+        assert!(!telemetry.prometheus(0, 0).contains("e6irc_serving_lease"));
+        let lease = crate::serving_lease::LeaseStatus::held_at(7);
+        telemetry.observe_serving_lease(lease.clone());
+        let text = telemetry.prometheus(0, 0);
+        assert!(text.contains("e6irc_serving_lease_held 1\n"), "{text}");
+        assert!(text.contains("e6irc_serving_lease_epoch 7\n"), "{text}");
+        lease.lose();
+        let text = telemetry.prometheus(0, 0);
+        assert!(text.contains("e6irc_serving_lease_held 0\n"), "{text}");
+    }
+
     #[tokio::test]
     async fn the_database_pool_is_reported_when_there_is_one() {
         let telemetry = Telemetry::new();
@@ -1247,6 +1317,18 @@ mod tests {
         assert!(!telemetry.core_is_fresh(Duration::from_secs(45)));
         telemetry.adjust_core_gauges(0, (0, 0, 0), (0, 0, 0));
         assert!(telemetry.core_is_fresh(Duration::from_secs(45)));
+    }
+
+    /// The monitoring observation's `core.shards` is what the shards declared
+    /// when they were built — the count a load qualification checks its claim
+    /// against — and nothing before they are.
+    #[test]
+    fn the_core_shard_count_is_what_the_shards_declared() {
+        let telemetry = Telemetry::new();
+        assert_eq!(telemetry.core_shards(), 0);
+        telemetry.expect_core_shards(3);
+        telemetry.expect_core_shards(3);
+        assert_eq!(telemetry.core_shards(), 3);
     }
 
     #[test]

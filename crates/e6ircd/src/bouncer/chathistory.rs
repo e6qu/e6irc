@@ -10,11 +10,16 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{AttachCaps, NetworkHandle, NetworkHistory};
 use crate::core::HistoryFail;
+use crate::core::history_request::{
+    ChathistorySub, MarkreadRequest, Refusal, Selector, parse_limit, parse_markread,
+    parse_selectors, parse_targets,
+};
 use crate::db::{BncHistoryPaging as Paging, BncHistorySelector as HistorySelector};
 
-/// The largest page a client may ask for in one CHATHISTORY reply. Bounded so
-/// a hostile client cannot demand the whole 5000-line backlog in one write.
-pub(super) const CHATHISTORY_LIMIT_MAX: i64 = 500;
+/// The largest page a client may ask for in one CHATHISTORY reply — the
+/// core's own bound, so a hostile client cannot demand the whole 5000-line
+/// backlog in one write.
+pub(super) const CHATHISTORY_LIMIT_MAX: usize = crate::core::history_request::CHATHISTORY_MAX;
 
 /// Serve a `CHATHISTORY` command from an attached client. `params` are the
 /// words after the command verb, case-preserved.
@@ -35,20 +40,14 @@ pub(crate) async fn handle_chathistory(
         )
         .await;
     };
-    let upper = sub.to_ascii_uppercase();
-    let paging = match upper.as_str() {
-        "LATEST" => Paging::Latest,
-        "BEFORE" => Paging::Before,
-        "AFTER" => Paging::After,
-        "AROUND" => Paging::Around,
-        "BETWEEN" => Paging::Between,
-        "TARGETS" => return targets(handle, write, caps, params).await,
-        _ => {
-            let detail = "Unknown subcommand";
-            return fail(write, HistoryFail::UnknownCommand, &[sub], detail).await;
-        }
+    if sub.eq_ignore_ascii_case("TARGETS") {
+        return targets(handle, write, caps, params).await;
+    }
+    let Some(sub) = ChathistorySub::parse(sub) else {
+        let detail = "Unknown subcommand";
+        return fail(write, HistoryFail::UnknownCommand, &[sub], detail).await;
     };
-    paged(handle, write, caps, paging, &upper, params).await
+    paged(handle, write, caps, sub, params).await
 }
 
 /// `CHATHISTORY` refused because the client did not negotiate the cap.
@@ -74,29 +73,16 @@ pub(crate) async fn handle_markread(
     origin: u64,
     params: &[&str],
 ) -> std::io::Result<()> {
-    // The core's MARKREAD codes and context: the target (or `*` when none
-    // was given) always rides the FAIL.
-    let Some(&target) = params.first() else {
-        return fail_markread(
-            write,
-            HistoryFail::NeedMoreParams,
-            "*",
-            "Not enough parameters",
-        )
-        .await;
+    // Parsed by the parser the core's MARKREAD shares, so both refuse a
+    // malformed request with the same FAIL; the target (or `*` when none was
+    // given) always rides it.
+    let (target, marker) = match parse_markread(params, valid_target) {
+        Ok(MarkreadRequest::Query { target }) => (target, None),
+        Ok(MarkreadRequest::Set { target, marker }) => (target, Some(marker)),
+        Err((target, refusal)) => {
+            return fail_markread(write, refusal.code, target, refusal.detail).await;
+        }
     };
-    if params.len() > 2 {
-        return fail_markread(
-            write,
-            HistoryFail::InvalidParams,
-            target,
-            "expected <target> [timestamp]",
-        )
-        .await;
-    }
-    if !valid_target(target) {
-        return fail_markread(write, HistoryFail::InvalidParams, target, "Invalid target").await;
-    }
     let Some(history) = handle.history() else {
         return fail_markread(
             write,
@@ -108,23 +94,12 @@ pub(crate) async fn handle_markread(
     };
     let (network, pool) = (&history.network, &history.pool);
     let casemapping = handle.names().casemapping();
-    match params.get(1) {
+    match marker {
         // `MARKREAD <target>` queries one marker.
         None => send_read_marker(write, &history, casemapping, account, target).await?,
         // `MARKREAD <target> <timestamp>` sets the position and acknowledges.
-        Some(raw) => {
-            let timestamp = match normalize_timestamp(raw) {
-                Some(ts) => ts,
-                None => {
-                    return fail_markread(
-                        write,
-                        HistoryFail::InvalidParams,
-                        target,
-                        "malformed timestamp",
-                    )
-                    .await;
-                }
-            };
+        Some(marker) => {
+            let timestamp = e6irc_proto::time::server_time(marker);
             let stored = match crate::db::set_bnc_read_marker(
                 pool,
                 account,
@@ -227,40 +202,32 @@ async fn require_history(
     }
 }
 
-/// `CHATHISTORY (LATEST|BEFORE|AFTER) <target> <selector> <limit>`.
+/// `CHATHISTORY <LATEST|BEFORE|AFTER|AROUND> <target> <selector> <limit>` and
+/// `CHATHISTORY BETWEEN <target> <selector> <selector> <limit>`.
 async fn paged(
     handle: &NetworkHandle,
     write: &mut (impl AsyncWrite + Unpin),
     caps: AttachCaps,
-    paging: Paging,
-    sub: &str,
+    sub: ChathistorySub,
     params: &[&str],
 ) -> std::io::Result<()> {
-    let between = matches!(paging, Paging::Between);
-    let expected = if between { 5 } else { 4 };
+    let expected = sub.parameter_count();
+    let name = sub.name();
     if params.len() < expected {
         return fail(
             write,
             HistoryFail::NeedMoreParams,
-            &[sub],
+            &[name],
             "Missing parameters",
         )
         .await;
     }
     let target = params[1];
-    let context = [sub, target];
+    let context = [name, target];
+    let refuse = |refusal: Refusal| (refusal.code, refusal.detail);
     if params.len() > expected {
-        return fail(
-            write,
-            HistoryFail::InvalidParams,
-            &context,
-            if between {
-                "expected exactly <target> <selector> <selector> <limit>"
-            } else {
-                "expected exactly <target> <selector> <limit>"
-            },
-        )
-        .await;
+        let (code, detail) = refuse(sub.too_many_parameters());
+        return fail(write, code, &context, detail).await;
     }
     if !valid_target(target) {
         return fail(
@@ -271,39 +238,31 @@ async fn paged(
         )
         .await;
     }
-    let selector = match HistorySelector::parse(params[2]) {
-        Ok(selector) => selector,
-        Err((code, reason)) => return fail(write, code, &context, reason).await,
-    };
-    let selector2 = if between {
-        match HistorySelector::parse(params[3]) {
-            Ok(selector) => selector,
-            Err((code, reason)) => return fail(write, code, &context, reason).await,
-        }
+    let second = if sub.takes_two_selectors() {
+        params[3]
     } else {
-        HistorySelector::Star
+        "*"
     };
-    if !matches!(paging, Paging::Latest)
-        && (matches!(selector, HistorySelector::Star)
-            || matches!(selector2, HistorySelector::Star) && between)
-    {
-        return fail(
-            write,
-            HistoryFail::InvalidParams,
-            &context,
-            "* is only a valid selector for LATEST",
-        )
-        .await;
-    }
-    let limit_raw = params[if between { 4 } else { 3 }];
-    let Some(limit) = parse_limit(limit_raw) else {
-        return fail(
-            write,
-            HistoryFail::InvalidParams,
-            &context,
-            "limit must be between 1 and 500",
-        )
-        .await;
+    let (selector, selector2) = match parse_selectors(sub, params[2], second) {
+        Ok((first, second)) => (stored_selector(first), stored_selector(second)),
+        Err(refusal) => {
+            let (code, detail) = refuse(refusal);
+            return fail(write, code, &context, detail).await;
+        }
+    };
+    let limit = match parse_limit(params[expected - 1]) {
+        Ok(limit) => i64::try_from(limit).expect("a page limit fits a database integer"),
+        Err(refusal) => {
+            let (code, detail) = refuse(refusal);
+            return fail(write, code, &context, detail).await;
+        }
+    };
+    let paging = match sub {
+        ChathistorySub::Latest => Paging::Latest,
+        ChathistorySub::Before => Paging::Before,
+        ChathistorySub::After => Paging::After,
+        ChathistorySub::Around => Paging::Around,
+        ChathistorySub::Between => Paging::Between,
     };
     let Some(history) = require_history(handle, write, &context).await? else {
         return Ok(());
@@ -335,30 +294,13 @@ async fn paged(
     }
 }
 
-impl HistorySelector {
-    /// Parse a client's selector into a validated position: a well-formed
-    /// message id, or a timestamp canonicalized to the stored representation.
-    /// A reference type other than `msgid`/`timestamp` is INVALID_MSGREFTYPE,
-    /// a malformed value of a known one INVALID_PARAMS — as in the core.
-    fn parse(raw: &str) -> Result<Self, (HistoryFail, &'static str)> {
-        if raw == "*" {
-            return Ok(Self::Star);
-        }
-        if let Some(msgid) = raw.strip_prefix("msgid=") {
-            return e6irc_proto::message::valid_message_id(msgid)
-                .then(|| Self::Msgid(msgid.to_string()))
-                .ok_or((HistoryFail::InvalidParams, "invalid msgid selector"));
-        }
-        if let Some(timestamp) = raw.strip_prefix("timestamp=") {
-            return e6irc_proto::time::parse_server_time_millis(timestamp)
-                .map(e6irc_proto::time::server_time)
-                .map(Self::Timestamp)
-                .ok_or((HistoryFail::InvalidParams, "invalid timestamp selector"));
-        }
-        Err((
-            HistoryFail::InvalidMsgRefType,
-            "selector must be *, msgid=..., or timestamp=...",
-        ))
+/// A parsed selector as the store compares it: a message id, or a timestamp in
+/// the stored representation.
+fn stored_selector(selector: Selector) -> HistorySelector {
+    match selector {
+        Selector::Star => HistorySelector::Star,
+        Selector::Msgid(msgid) => HistorySelector::Msgid(msgid),
+        Selector::Timestamp(ms) => HistorySelector::Timestamp(e6irc_proto::time::server_time(ms)),
     }
 }
 
@@ -371,53 +313,13 @@ async fn targets(
     params: &[&str],
 ) -> std::io::Result<()> {
     const CONTEXT: &[&str] = &["TARGETS"];
-    if params.len() != 4 {
-        let code = if params.len() < 4 {
-            HistoryFail::NeedMoreParams
-        } else {
-            HistoryFail::InvalidParams
-        };
-        return fail(
-            write,
-            code,
-            CONTEXT,
-            "expected exactly <timestamp> <timestamp> <target-count>",
-        )
-        .await;
-    }
-    let parse_timestamp = |raw: &str| {
-        raw.strip_prefix("timestamp=")
-            .and_then(e6irc_proto::time::parse_server_time_millis)
-            .map(e6irc_proto::time::server_time)
+    let window = match parse_targets(params) {
+        Ok(window) => window,
+        Err(refusal) => return fail(write, refusal.code, CONTEXT, refusal.detail).await,
     };
-    let (Some(first), Some(second)) = (parse_timestamp(params[1]), parse_timestamp(params[2]))
-    else {
-        return fail(
-            write,
-            HistoryFail::InvalidParams,
-            CONTEXT,
-            "expected two timestamp= bounds",
-        )
-        .await;
-    };
-    let (minimum, maximum) = if first <= second {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    let count_raw = params[3];
-    let count = match parse_limit(count_raw) {
-        Some(n) => n,
-        None => {
-            return fail(
-                write,
-                HistoryFail::InvalidParams,
-                CONTEXT,
-                "target count must be between 1 and 500",
-            )
-            .await;
-        }
-    };
+    let minimum = e6irc_proto::time::server_time(window.after);
+    let maximum = e6irc_proto::time::server_time(window.before);
+    let count = i64::try_from(window.limit).expect("a page limit fits a database integer");
     let Some(history) = require_history(handle, write, CONTEXT).await? else {
         return Ok(());
     };
@@ -612,12 +514,6 @@ async fn db_error(
     .await
 }
 
-/// Parse a positive page limit.
-fn parse_limit(raw: &str) -> Option<i64> {
-    let n = raw.parse::<i64>().ok()?;
-    (n > 0 && n <= CHATHISTORY_LIMIT_MAX).then_some(n)
-}
-
 /// Whether `target` can name one conversation of an external network. Its
 /// channel types, nick grammar and lengths are the network's (Ergo's Unicode
 /// nicks, IRCnet's `!` channels, a `NICKLEN` of 32), and the conversations
@@ -632,12 +528,6 @@ fn valid_target(target: &str) -> bool {
         && !target
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || c == ',')
-}
-
-/// Normalize a required `timestamp=` MARKREAD position before storage.
-fn normalize_timestamp(raw: &str) -> Option<String> {
-    let ts = raw.strip_prefix("timestamp=")?;
-    e6irc_proto::time::parse_server_time_millis(ts).map(e6irc_proto::time::server_time)
 }
 
 /// A process-wide counter minting distinct BATCH tags (the tag just has to be
@@ -656,12 +546,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn limits_and_targets_are_closed_bounded_values() {
-        assert_eq!(parse_limit("1"), Some(1));
-        assert_eq!(parse_limit("500"), Some(500));
-        for invalid in ["0", "501", "-1", "not-a-number"] {
-            assert_eq!(parse_limit(invalid), None, "{invalid}");
-        }
+    fn targets_are_closed_bounded_values() {
         // Whatever the network names: Unicode and long nicks, `!` channels.
         for valid in [
             "#room",
@@ -678,18 +563,6 @@ mod tests {
             assert!(!valid_target(invalid), "{invalid:?}");
         }
         assert!(!valid_target(&"x".repeat(201)));
-        assert!(matches!(
-            HistorySelector::parse("msgid=opaque"),
-            Ok(HistorySelector::Msgid(_))
-        ));
-        for invalid in [
-            "msgid=",
-            "msgid=:invalid",
-            "2026-01-01T00:00:00.000Z",
-            "timestamp=invalid",
-        ] {
-            assert!(HistorySelector::parse(invalid).is_err(), "{invalid}");
-        }
     }
 
     #[tokio::test]
@@ -741,6 +614,7 @@ mod tests {
             vec!["TARGETS", "timestamp=2026-01-01T00:00:00.000Z"],
             vec!["LATEST", "#room", "*", "501"],
             vec!["LATEST", "#room", "*", "10", "extra"],
+            vec!["BETWEEN", "#room", "timestamp=bad", "foo=1", "10"],
         ] {
             handle_chathistory(&handle, &mut server, caps, &params)
                 .await
@@ -749,6 +623,9 @@ mod tests {
         for params in [
             vec![],
             vec!["#room", "timestamp=2026-01-01T00:00:00.000Z", "extra"],
+            vec!["#room", "2026-01-01T00:00:00.000Z"],
+            vec!["#room", "timestamp=not-a-time"],
+            vec!["*"],
             vec!["#room"],
         ] {
             handle_markread(&handle, &mut server, "alice", 0, &params)
@@ -769,12 +646,16 @@ mod tests {
                 ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS * :Missing parameters",
                 ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS LATEST :Missing parameters",
                 ":*bnc* FAIL CHATHISTORY INVALID_TARGET BEFORE bad,target :invalid target",
-                ":*bnc* FAIL CHATHISTORY INVALID_MSGREFTYPE BEFORE #room :selector must be *, msgid=..., or timestamp=...",
-                ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS TARGETS :expected exactly <timestamp> <timestamp> <target-count>",
+                ":*bnc* FAIL CHATHISTORY INVALID_MSGREFTYPE BEFORE #room :Unknown message reference type",
+                ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS TARGETS :Expected exactly two timestamp= bounds and a limit",
                 ":*bnc* FAIL CHATHISTORY INVALID_PARAMS LATEST #room :limit must be between 1 and 500",
-                ":*bnc* FAIL CHATHISTORY INVALID_PARAMS LATEST #room :expected exactly <target> <selector> <limit>",
+                ":*bnc* FAIL CHATHISTORY INVALID_PARAMS LATEST #room :Expected exactly <target> <selector> <limit>",
+                ":*bnc* FAIL CHATHISTORY INVALID_MSGREFTYPE BETWEEN #room :Unknown message reference type",
                 ":*bnc* FAIL MARKREAD NEED_MORE_PARAMS * :Not enough parameters",
-                ":*bnc* FAIL MARKREAD INVALID_PARAMS #room :expected <target> [timestamp]",
+                ":*bnc* FAIL MARKREAD INVALID_PARAMS #room :Expected <target> [timestamp=<time>]",
+                ":*bnc* FAIL MARKREAD INVALID_PARAMS #room :Expected timestamp=",
+                ":*bnc* FAIL MARKREAD INVALID_PARAMS #room :Malformed timestamp",
+                ":*bnc* FAIL MARKREAD INVALID_PARAMS * :Invalid target",
                 ":*bnc* FAIL MARKREAD TEMPORARILY_UNAVAILABLE #room :read markers are not configured",
             ]
         );
@@ -859,17 +740,6 @@ mod tests {
             line.matches("time=").count(),
             1,
             "history must never emit duplicate time tags"
-        );
-    }
-
-    #[test]
-    fn markread_requires_a_real_target_and_timestamp_selector() {
-        assert!(!valid_target("*"));
-        assert_eq!(normalize_timestamp("2026-01-01T00:00:00.000Z"), None);
-        assert_eq!(normalize_timestamp("timestamp=not-a-time"), None);
-        assert_eq!(
-            normalize_timestamp("timestamp=2026-01-01T00:00:00.1Z"),
-            Some("2026-01-01T00:00:00.100Z".into())
         );
     }
 }

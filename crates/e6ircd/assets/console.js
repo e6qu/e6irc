@@ -1,4 +1,4 @@
-import { REAUTHENTICATION_REQUIRED, apiContractLoader, directoryQuery, getOperationJson } from "/console-contract.js";
+import { REAUTHENTICATION_REQUIRED, apiContractLoader, directoryPage, directoryQuery, getOperationJson } from "/console-contract.js";
 import { loadSettings, saveSetting } from "/console-settings.js";
 
 (() => {
@@ -407,6 +407,19 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   const append = (parent, ...children) => {
     for (const child of children) parent.append(child);
     return parent;
+  };
+
+  // Every directory's pager: the status says which page is shown — the page's
+  // own query decides (`directoryPage`), never whether another page follows —
+  // and a link opens the next page when there is one.
+  const fillPager = (pager, page, firstStatus, laterStatus, linkText, path) => {
+    pager.replaceChildren(element("span", "meta", page.first ? firstStatus : laterStatus));
+    if (page.next) {
+      const link = element("a", "", linkText);
+      link.href = `${path}?${page.next}`;
+      pager.append(link);
+    }
+    return pager;
   };
 
   // The generated markup's accessibility contract lives in these builders:
@@ -1097,6 +1110,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return value;
   };
 
+  // A count or duration for which zero is meaningful (it switches something
+  // off), so an empty field is refused rather than read as zero.
+  const wholeNumber = (fields, name, label) => {
+    const value = fieldValue(fields, name);
+    const number = Number(value);
+    if (!value || !Number.isSafeInteger(number) || number < 0) {
+      throw new Error(`${label} must be a whole number, 0 or more.`);
+    }
+    return number;
+  };
+
   const optionalPositiveInteger = (fields, name, label) => {
     const value = fieldValue(fields, name);
     return value ? positiveInteger({ get: () => value }, name, label) : null;
@@ -1164,11 +1188,13 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         registration: {
           before_connect: fields.has("registration_before_connect"),
           require_email: fields.has("registration_require_email"),
+          minimum_password_length: positiveInteger(fields, "registration_minimum_password_length", "Minimum password length"),
         },
         limits: {
           max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
           command_burst: positiveInteger(fields, "command_burst", "Command burst"),
           command_rate: positiveInteger(fields, "command_rate", "Command rate"),
+          anti_spam_exit_message_time_seconds: wholeNumber(fields, "anti_spam_exit_message_time_seconds", "Quit message delay"),
           trusted_proxies: splitValues(String(fields.get("trusted_proxies") || ""), "\n"),
           require_sasl: fields.has("require_sasl"),
           require_sasl_from: splitValues(String(fields.get("require_sasl_from") || ""), "\n"),
@@ -1532,7 +1558,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
     for (const name of ["nicklen", "sendq_bytes", "core_queue", "core_workers", "max_hot_channels", "max_history_ring_bytes", "max_hot_history_bytes"]) configurationValue(form, name, settings[name]);
-    for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
+    for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "anti_spam_exit_message_time_seconds", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "require_sasl", settings.limits.require_sasl);
     configurationValue(form, "require_sasl_from", apiCollection(settings.limits, "require_sasl_from", "configuration").join("\n"));
@@ -1541,6 +1567,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "observability_retention_hours", settings.observability.retention_hours);
     configurationChecked(form, "registration_before_connect", settings.registration.before_connect);
     configurationChecked(form, "registration_require_email", settings.registration.require_email);
+    configurationValue(form, "registration_minimum_password_length", settings.registration.minimum_password_length);
     const bncStatus = root.querySelector("[data-configuration-bnc-status]");
     bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
     if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
@@ -1608,17 +1635,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const count = document.getElementById("admin-ban-count");
         if (count) count.textContent = String(bans.length);
         const pager = document.getElementById("admin-ban-pager");
-        if (pager) {
-          pager.replaceChildren();
-          if (result.next_before_id) {
-            const link = document.createElement("a");
-            const older = new URLSearchParams(query);
-            older.set("before_id", String(result.next_before_id));
-            link.href = `/console/bans?${older}`;
-            link.textContent = "Older rules";
-            pager.append(link);
-          }
-        }
+        if (pager) fillPager(pager, directoryPage(query, "before_id", result.next_before_id), "Showing the newest matching rules.", "Showing an older page.", "Older rules", "/console/bans");
         if (!bans.length) {
           const row = document.createElement("tr");
           const cell = document.createElement("td");
@@ -1853,17 +1870,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const table = append(captionedTable(own ? "Your live IRC connections" : "Live IRC connections"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Connection type"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
         connections.append(scrollRegion("Live connections", table));
       }
-      const pager = element("div", "pager");
-      pager.append(element("span", "meta", query.has("before_id") ? "Showing an older page." : "Showing the newest matching connections."));
-      if (typeof data.next_before_id === "string") {
-        const next = new URLSearchParams(query);
-        next.set("before_id", data.next_before_id);
-        const older = document.createElement("a");
-        older.href = `${pagePath}?${next}`;
-        older.textContent = "Older connections";
-        pager.append(older);
-      }
-      connections.append(pager);
+      connections.append(fillPager(element("div", "pager"), directoryPage(query, "before_id", data.next_before_id), "Showing the newest matching connections.", "Showing an older page.", "Older connections", pagePath));
     };
     if (filters instanceof HTMLFormElement) {
       const query = connectionQuery();
@@ -1931,6 +1938,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const identityList = accountRoot.querySelector("[data-api-account-identity-list]");
     const linkProviders = accountRoot.querySelector("[data-api-account-link-providers]");
     const csrf = accountRoot.dataset.csrf || "";
+    const minimumPasswordLength = Number(accountRoot.dataset.minimumPasswordLength);
     const renderPassword = (hasLocalPassword) => {
       if (!(passwordPanel instanceof HTMLElement)) return;
       const title = hasLocalPassword ? "Primary password" : "Add a local password";
@@ -1945,6 +1953,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const passwordField = (label, name, autocomplete) => {
         const { label: field, control: input } = labelledControl("input", name, label);
         input.type = "password"; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
+        if (autocomplete === "new-password") input.minLength = minimumPasswordLength;
         addRevealControl(input);
         return field;
       };
@@ -1970,7 +1979,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         void mutateAccount(form, "PUT", body, "Password update failed.")
           .then((result) => {
             if (!result) return;
-            setAccountResult(`${current ? "Local password changed." : "Local password added."} Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.`, true);
+            setAccountResult(`${current ? "Local password changed." : "Local password added."} Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.`, true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
               const credentials = apiCollection(updated, "credentials", "credential directory");
               renderPassword(credentials.some((credential) => credential.kind === "local_password"));
@@ -2368,7 +2377,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const button = (text, className) => { const node = element("button", className, text); node.type = "submit"; return node; };
     // The page carries both directories' cursors; each API query takes only its own.
     const pageQuery = () => directoryQuery(window.location.search, ["name", "limit", "before_id", "invitation_before_id"], { limit: "50" });
-    const pager = (text, cursor, parameter) => { const wrapper = element("div", "pager"); wrapper.append(element("span", "meta", cursor ? "Showing an older page." : "Showing the newest page.")); if (cursor) { const link = element("a", "", text); const params = pageQuery(); params.set(parameter, String(cursor)); link.href = `/console/accounts?${params}`; wrapper.append(link); } return wrapper; };
+    const pager = (text, cursor, parameter) => fillPager(element("div", "pager"), directoryPage(pageQuery(), parameter, cursor), "Showing the newest page.", "Showing an older page.", text, "/console/accounts");
     const renderInvitations = (data) => {
       if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = apiCollection(data, "invitations", "invitation directory");
       if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = captionedTable("Pending account invitations"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
@@ -2408,7 +2417,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } row.append(cell); });
       const actions = document.createElement("td");
       actions.className = "row-actions";
-      if (network.shared === true) actions.textContent = "Managed configuration";
+      // A shared network, or one the server configuration defines for an
+      // account, is the operator's: its lifecycle follows the configuration.
+      if (network.shared === true || network.configured === true) actions.textContent = "Managed configuration";
       else {
         const form = document.createElement("form");
         form.method = "post";
@@ -2425,8 +2436,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (adminNetworkRows instanceof HTMLElement) {
     refreshAdminNetworks = async () => {
       try {
-        const result = await apiRead("/api/v1/admin/networks");
+        const query = directoryQuery(window.location.search, ["limit", "after"], { limit: "100" });
+        const result = await apiRead(`/api/v1/admin/networks?${query}`);
         renderAdminNetworks(apiCollection(result, "networks", "network directory"));
+        const pager = document.getElementById("admin-network-pager");
+        if (pager) fillPager(pager, directoryPage(query, "after", result.next_after), "Showing the first networks.", "Showing a later page.", "More networks", "/console/admin/networks");
       } catch (error) {
         tableLoadFailure(adminNetworkRows, 9, error, () => void refreshAdminNetworks());
         return false;
@@ -2485,7 +2499,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (ownerNetworkCount) ownerNetworkCount.textContent = String(networks.length);
     if (!networks.length) {
       const row = document.createElement("tr");
-      const cell = networkCell("No networks yet. Add one above.");
+      const cell = networkCell("No networks yet. Add one in the IRC client.");
       cell.colSpan = 7;
       cell.className = "empty";
       row.append(cell);
@@ -2528,21 +2542,26 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       inspect.className = "rowlink";
       inspect.href = name.href;
       inspect.textContent = "Inspect";
-      const toggle = document.createElement("form");
-      toggle.method = "post";
-      toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
-      toggle.dataset.apiOwnerNetworkToggle = "";
-      const csrf = hiddenInput("csrf", ownerNetworkRows.dataset.csrf || "");
-      const nextEnabled = hiddenInput("enabled", !enabled);
-      const toggleButton = document.createElement("button");
-      toggleButton.type = "submit";
-      toggleButton.textContent = enabled ? "Disable" : "Enable";
-      toggle.append(csrf, nextEnabled, toggleButton);
       // No Remove on a row: a destructive button repeated down a list is the
       // easiest one to hit by mistake, and removing a network is offered where
       // the network is -- in its own page here, and in the settings dialog
-      // that edits it.
-      actions.append(inspect, toggle);
+      // that edits it. A network the server configuration defines is the
+      // operator's, so it has no lifecycle control here at all.
+      if (network.configured === true) {
+        actions.append(inspect, element("span", "meta", "Server configuration"));
+      } else {
+        const toggle = document.createElement("form");
+        toggle.method = "post";
+        toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
+        toggle.dataset.apiOwnerNetworkToggle = "";
+        const csrf = hiddenInput("csrf", ownerNetworkRows.dataset.csrf || "");
+        const nextEnabled = hiddenInput("enabled", !enabled);
+        const toggleButton = document.createElement("button");
+        toggleButton.type = "submit";
+        toggleButton.textContent = enabled ? "Disable" : "Enable";
+        toggle.append(csrf, nextEnabled, toggleButton);
+        actions.append(inspect, toggle);
+      }
       row.append(status, nameCell, kind, upstream, clients, errors, actions);
       body.append(row);
     }
@@ -2721,11 +2740,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
           const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
           const actions = document.createElement("td"); actions.className = "row-actions";
-          if (network.owner === account && network.shared !== true) {
+          if (network.owner === account && network.shared !== true && network.configured !== true) {
             for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
             const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = hiddenInput("csrf", csrf); const enabled = hiddenInput("enabled", !network.enabled); const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
             const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = hiddenInput("csrf", csrf); const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
-          } else actions.textContent = `Managed by ${network.owner}`;
+          } else actions.textContent = network.shared === true || network.configured === true ? "Managed configuration" : `Managed by ${network.owner}`;
           row.append(status, name, owner, actions); body.append(row);
         }
         table.append(body); target.append(scrollRegion(`${kind} bridges`, table));
@@ -2733,8 +2752,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     };
     refreshIntegrations = async () => {
       try {
-        const result = await apiRead("/api/v1/admin/networks");
+        const query = directoryQuery(window.location.search, ["limit", "after"], { limit: "100" });
+        const result = await apiRead(`/api/v1/admin/networks?${query}`);
         render(apiCollection(result, "networks", "integration directory"));
+        const pager = integrations.querySelector("[data-integration-pager]");
+        if (pager instanceof HTMLElement) fillPager(pager, directoryPage(query, "after", result.next_after), "Showing the first networks.", "Showing a later page.", "More networks", "/console/integrations");
       } catch (error) {
         integrations.querySelectorAll("[data-integration-list]").forEach((target) => {
           if (target instanceof HTMLElement) listLoadFailure(target, error, () => void refreshIntegrations());
@@ -2817,16 +2839,19 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const bridgeLabels = { nick: "Identity", autojoin: "Rooms / channel IDs", "account-credential": "Account credential", "secret-credential": "Secret credential" };
       if (network.kind !== "irc") for (const [field, label] of Object.entries(bridgeLabels)) { const node = ownerNetworkDetail.querySelector(`[data-network-label="${field}"]`); if (node) node.textContent = label; }
       const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) summary.hidden = false;
+      // A network the server configuration defines is the operator's: shown here, but
+      // never switched, edited, or removed from here.
+      const operatorOwned = network.configured === true;
       const actions = ownerNetworkDetail.querySelector("[data-network-actions]"); if (actions instanceof HTMLElement) actions.hidden = false;
       const destructive = ownerNetworkDetail.querySelector("[data-network-destructive]"); if (destructive instanceof HTMLElement) destructive.hidden = false;
       const toggle = ownerNetworkDetail.querySelector("[data-network-toggle]"); if (toggle) toggle.textContent = network.enabled ? "Disable" : "Enable";
       const enabled = ownerNetworkDetail.querySelector("[data-network-enabled]"); if (enabled instanceof HTMLInputElement) enabled.value = String(!network.enabled);
-      const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
-      const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
-      const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/?network=${encodeURIComponent(network.name)}&settings=1`; edit.textContent = "Edit settings"; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
+      const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) { toggleForm.hidden = operatorOwned; toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; }
+      const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.hidden = operatorOwned; deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
+      const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (operatorOwned) edit.hidden = true; else if (network.kind === "irc") { edit.href = `/?network=${encodeURIComponent(network.name)}&settings=1`; edit.textContent = "Edit settings"; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
       const accountSetup = ownerNetworkDetail.querySelector("[data-network-account-setup]");
       if (accountSetup instanceof HTMLElement) {
-        accountSetup.hidden = network.kind !== "irc";
+        accountSetup.hidden = network.kind !== "irc" || operatorOwned;
         const chat = accountSetup.querySelector("[data-network-chat]");
         if (chat instanceof HTMLAnchorElement) chat.href = `/?network=${encodeURIComponent(network.name)}`;
         // The credentials live in one editor; this page points at it rather
@@ -2891,7 +2916,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const result = await apiRead(`/api/v1/admin/channels?${query}`);
         const channels = apiCollection(result, "channels", "channel directory");
         const pager = document.getElementById("admin-channel-pager");
-        if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const older = new URLSearchParams(query); older.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${older}`; link.textContent = "Older registrations"; pager.append(link); } }
+        if (pager) fillPager(pager, directoryPage(query, "before_id", result.next_before_id), "Showing the newest matching registrations.", "Showing an older page.", "Older registrations", "/console/admin/channels");
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
@@ -2916,23 +2941,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const count = document.getElementById("admin-audit-count");
         if (count) count.textContent = String(entries.length);
         const pager = document.getElementById("admin-audit-pager");
-        if (pager) {
-          pager.replaceChildren();
-          const status = document.createElement("span");
-          status.className = "meta";
-          status.textContent = query.has("before_id")
-            ? "Showing an older page."
-            : "Showing the newest matching actions.";
-          pager.append(status);
-          if (result.next_before_id) {
-            const link = document.createElement("a");
-            const older = new URLSearchParams(query);
-            older.set("before_id", String(result.next_before_id));
-            link.href = `/console/audit?${older}`;
-            link.textContent = "Older actions";
-            pager.append(link);
-          }
-        }
+        if (pager) fillPager(pager, directoryPage(query, "before_id", result.next_before_id), "Showing the newest matching actions.", "Showing an older page.", "Older actions", "/console/audit");
         if (!entries.length) {
           const row = document.createElement("tr");
           const cell = document.createElement("td");

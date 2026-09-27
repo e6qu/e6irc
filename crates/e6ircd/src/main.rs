@@ -9,6 +9,7 @@ use e6ircd::secret::SecretKey;
 
 const USAGE: &str = "usage:\n  \
     e6ircd [<configuration>]        run the server\n  \
+    e6ircd --version                print the version and build revision\n  \
     e6ircd check-config [<configuration>]\n  \
                                      validate configuration and exit\n  \
     e6ircd genkey                   print a new base64 master key\n  \
@@ -48,8 +49,25 @@ fn main() -> ExitCode {
         Some("recover-administrator") => recover_administrator(&args[1..]),
         Some("check-config") => check_config(&args[1..]),
         Some("healthcheck") => healthcheck(&args[1..]),
+        Some("--version") => version(&args[1..]),
         _ => run(&args),
     }
+}
+
+/// `e6ircd --version`: `e6ircd <version> (revision <commit>)` on stdout. The
+/// release jobs run it on every target's own runner before packaging, so an
+/// archive never ships a binary that was not executed there.
+fn version(args: &[String]) -> ExitCode {
+    if !args.is_empty() {
+        eprintln!("e6ircd --version takes no arguments\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    println!(
+        "e6ircd {} (revision {})",
+        env!("CARGO_PKG_VERSION"),
+        e6ircd::BUILD_REVISION
+    );
+    ExitCode::SUCCESS
 }
 
 /// The whole probe -- connect, write, read -- must finish inside this, so a
@@ -189,6 +207,18 @@ fn check_config(args: &[String]) -> ExitCode {
                      agrees with the revision stored there. Start refuses, by name, any that \
                      differs."
                 );
+                if !config.left_to_stored_settings.is_empty() {
+                    eprintln!(
+                        "{CONTEXT}: it leaves {} to the settings the console stores; a first \
+                         start, with none stored yet, refuses naming {}.",
+                        config.left_to_stored_settings.join(", "),
+                        if config.left_to_stored_settings.len() == 1 {
+                            "it"
+                        } else {
+                            "them"
+                        }
+                    );
+                }
             }
             ExitCode::SUCCESS
         }
@@ -340,6 +370,7 @@ fn rotate_secrets(args: &[String]) -> ExitCode {
         .build()
         .expect("tokio runtime");
     match runtime.block_on(async {
+        e6ircd::db::refuse_libpq_process_environment()?;
         let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
         e6ircd::db::rotate_database_secrets(&pool, &keys, "rotate-secrets").await
     }) {
@@ -387,6 +418,7 @@ fn recover_administrator(args: &[String]) -> ExitCode {
         .build()
         .expect("tokio runtime");
     match runtime.block_on(async {
+        e6ircd::db::refuse_libpq_process_environment()?;
         let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
         e6ircd::db::recover_administrator(&pool, account).await
     }) {
@@ -470,19 +502,34 @@ fn run(args: &[String]) -> ExitCode {
         .build()
         .expect("tokio runtime");
     runtime.block_on(async {
-        match net::start(config).await {
-            Ok(running) => {
-                let mut running = running;
+        // Installed once, before the start: a signal that arrives while the
+        // process waits for the database or stands by ends the wait, and one
+        // that arrives while a boot holding the lease completes is kept for
+        // the shutdown below rather than lost.
+        let mut signals = match ShutdownSignals::install() {
+            Ok(signals) => signals,
+            Err(error) => {
+                eprintln!("e6ircd: cannot install the shutdown signal handlers: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match net::start_unless(config, signals.received()).await {
+            Ok(net::Started::StoppedWhileWaiting) => {
+                eprintln!("e6ircd: shutting down; this process was not serving yet");
+                ExitCode::SUCCESS
+            }
+            Ok(net::Started::Serving(running)) => {
+                let mut running = *running;
                 for addr in &running.addrs {
                     println!("listening on {addr}");
                 }
                 // Run until a termination signal arrives, then shut down
                 // gracefully: stop accepting, notify clients, flush the PG write
-                // queue (DESIGN §18). The flush is the correctness point — the
-                // DB worker's buffered history must reach PostgreSQL, never be
-                // dropped by an abrupt process exit.
+                // queue, give the serving lease back (DESIGN §18). The flush is
+                // the correctness point — the DB worker's buffered history must
+                // reach PostgreSQL, never be dropped by an abrupt process exit.
                 let critical_failure = tokio::select! {
-                    () = wait_for_shutdown_signal() => None,
+                    () = signals.received() => None,
                     failure = running.shutdown.wait_for_critical_failure() => Some(failure),
                 };
                 if let Some(failure) = &critical_failure {
@@ -524,31 +571,51 @@ fn run(args: &[String]) -> ExitCode {
     })
 }
 
-/// Resolve once a shutdown signal is received. On Unix that is SIGTERM (what a
-/// service manager or `docker stop` sends) or SIGINT (Ctrl-C). Elsewhere only
-/// Ctrl-C is portable — Windows has no SIGTERM — and `ctrl_c` also covers the
-/// Windows console close events, so the daemon still shuts down cleanly there
-/// and, crucially, the workspace still compiles on the non-Unix CI targets.
-async fn wait_for_shutdown_signal() {
+/// The signals that ask for a graceful shutdown. On Unix that is SIGTERM (what
+/// a service manager or `docker stop` sends) or SIGINT (Ctrl-C); on Windows,
+/// which has no SIGTERM, the console's Ctrl-C. Each stream is created once and
+/// kept, so a signal delivered while nobody is waiting on it is still seen by
+/// the next wait.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        // A failure to install a handler is a startup-class fault, not something
-        // to swallow: without it we could never shut down cleanly.
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("install SIGTERM handler for graceful shutdown");
-        tokio::select! {
-            res = tokio::signal::ctrl_c() => {
-                res.expect("install Ctrl-C handler for graceful shutdown");
-            }
-            _ = sigterm.recv() => {}
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                terminate: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
         }
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install Ctrl-C handler for graceful shutdown");
+
+    /// Resolve once a shutdown signal is received.
+    async fn received(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.terminate.recv() => {}
+                _ = self.interrupt.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.ctrl_c.recv().await;
+        }
     }
 }
 
@@ -659,7 +726,7 @@ mod tests {
         assert!(failure.contains("line 2, column 16"), "{failure}");
         assert!(failure.contains("expected a string"), "{failure}");
 
-        let error = toml::from_str::<Config>("server_name = \"irc.example.test\"\n")
+        let error = toml::from_str::<Config>("[database]\nstartup_wait_seconds = 1\n")
             .expect_err("a required field is missing");
         let failure = describe_parse_error(error, None);
         assert!(failure.contains("missing field"), "{failure}");

@@ -68,6 +68,46 @@ fn the_environment_alone_states_a_valid_configuration() {
     assert!(output.status.success(), "{}", report(&output));
 }
 
+/// The database URL is the whole description of the connection. sqlx reads
+/// libpq's variables into every field a URL leaves out, so a `PGSSLMODE` left
+/// in the service's environment used to turn TLS verification off unseen; the
+/// binary now refuses it by name, and a URL key sqlx would have dropped is
+/// refused rather than ignored.
+#[test]
+fn the_database_connection_is_what_the_url_states_and_nothing_else() {
+    let mut stray = minimal();
+    stray.push(("PGSSLMODE", "disable".to_owned()));
+    let output = e6ircd(&["check-config", "--config-from-environment"], &stray);
+    assert!(!output.status.success(), "{}", report(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("PGSSLMODE set in the environment"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("disable"), "{stderr}");
+
+    for query in [
+        "ssl_mode=verify-full",
+        "sslmode=verify_full",
+        "connect_timeout=5",
+    ] {
+        let mut environment = minimal();
+        environment.retain(|(name, _)| *name != "E6IRC_DATABASE_URL");
+        environment.push((
+            "E6IRC_DATABASE_URL",
+            format!("postgres://e6irc:{SECRET}@db.example.invalid/e6irc?{query}"),
+        ));
+        let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
+        assert!(!output.status.success(), "{query}: {}", report(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("database.url cannot be used"),
+            "{query}: {stderr}"
+        );
+        assert!(!stderr.contains(SECRET), "{stderr}");
+    }
+}
+
 /// `[secrets].key_file` and `E6IRC_SECRET_KEY` are alternatives; stated
 /// together, the refusal names both so the operator knows which to remove.
 #[test]
@@ -343,4 +383,23 @@ fn check_config_judges_the_sasl_requirement_as_start_does() {
         assert!(said.contains(named), "{limits}: {said}");
     }
     std::fs::remove_file(&path).expect("remove the configuration");
+}
+
+/// The release jobs execute `e6ircd --version` on every target before they
+/// package it, and compare the line with the version and revision they built.
+#[test]
+fn version_states_the_package_version_and_the_build_revision() {
+    let output = e6ircd(&["--version"], &[]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "e6ircd {} (revision {})\n",
+            env!("CARGO_PKG_VERSION"),
+            e6ircd::BUILD_REVISION
+        )
+    );
+    let extra = e6ircd(&["--version", "--config", "e6irc.toml"], &[]);
+    assert_eq!(extra.status.code(), Some(2), "{}", report(&extra));
+    assert!(extra.stdout.is_empty(), "{}", report(&extra));
 }

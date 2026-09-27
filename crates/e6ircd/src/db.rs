@@ -17,12 +17,23 @@ use crate::core::{DbReply, DbRequest, Input};
 use crate::observability::Telemetry;
 use e6irc_queue::Receiver;
 
+mod announcements;
 mod credential_change;
 mod secret_rotation;
-pub use credential_change::{
-    CredentialChange, CredentialChangeListener, RevocableCredential, credential_remaining,
+mod url;
+pub(crate) use announcements::{
+    Announcement, Announcements, CREDENTIAL_CHANGED_CHANNEL, Follower, SERVING_LEASE_CHANNEL,
+    SETTINGS_CHANGED_CHANNEL, follow_announcements,
 };
+pub(crate) use credential_change::CredentialChange;
+pub use credential_change::{
+    AccountAnnouncement, AccountAuthority, RevocableCredential, credential_remaining,
+    issued_credentials_stored,
+};
+pub(crate) use credential_change::{account_authority, every_account_authority};
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
+pub use url::{DatabaseUrl, DatabaseUrlError};
+pub use url::{LIBPQ_ENVIRONMENT, refuse_libpq_process_environment};
 
 /// Migrations are compiled into the binary; startup refuses to run on
 /// checksum drift (sqlx's default) rather than guessing.
@@ -40,6 +51,10 @@ const MAX_DATABASE_MILLIS: u64 = 1 << 53;
 #[derive(Debug)]
 pub enum DbError {
     Connect(sqlx::Error),
+    /// A libpq environment variable is set; see
+    /// [`url::refuse_libpq_process_environment`]. Only the operator can clear
+    /// it.
+    LibpqEnvironment(String),
     /// Startup kept retrying the initial connection for its whole wait and
     /// PostgreSQL never accepted one; `last` is the final attempt's error.
     StartupWaitExhausted {
@@ -114,12 +129,30 @@ pub enum DbError {
         completed: Box<StorageMaintenanceReport>,
         failures: Vec<MaintenanceFailure>,
     },
+    /// The database holds migrations this binary does not know: a later
+    /// release migrated it. Nothing is served or changed.
+    SchemaNewerThanBinary {
+        applied: i64,
+        known: i64,
+    },
+    /// The database schema is older than this binary, and a serving process
+    /// holds the lease: only the serving process migrates, so a command-line
+    /// process refuses instead.
+    ServedSchemaOlder(crate::serving_lease::LeaseHeld),
+    /// Taking the serving lease could not end this many connections of the
+    /// previous holder; the lease was not taken.
+    PreviousHolderLingers(i64),
+    /// This process has lost the serving lease (fenced, or taken over), so
+    /// the database refuses it connections: what a pool timeout or a refused
+    /// connection means once [`mark_fenced`] has recorded why.
+    NotServing(String),
 }
 
 impl std::fmt::Display for DbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connect(e) => write!(f, "database connect failed: {e}"),
+            Self::LibpqEnvironment(refusal) => f.write_str(refusal),
             Self::StartupWaitExhausted {
                 attempts,
                 waited,
@@ -216,6 +249,26 @@ impl std::fmt::Display for DbError {
                 }
                 write!(f, "; every other collection committed its batch")
             }
+            Self::SchemaNewerThanBinary { applied, known } => write!(
+                f,
+                "the database schema is at migration {applied}, newer than this binary knows \
+                 (its newest is {known}); run the release that migrated it"
+            ),
+            Self::ServedSchemaOlder(held) => write!(
+                f,
+                "the database schema is older than this binary and {held} serves it; upgrade \
+                 the serving process first, which migrates it"
+            ),
+            Self::NotServing(why) => write!(
+                f,
+                "this process no longer holds the serving lease ({why}); it cannot use the \
+                 database"
+            ),
+            Self::PreviousHolderLingers(count) => write!(
+                f,
+                "{count} connection(s) of the previous serving-lease holder did not end when \
+                 terminated; the lease was not taken"
+            ),
         }
     }
 }
@@ -227,13 +280,42 @@ impl std::error::Error for DbError {}
 /// telemetry as `e6irc_database_pool_acquire_timeouts_total`.
 static POOL_ACQUIRE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Why this process lost the serving lease, once it has: set once, by the
+/// lease's renewal task when the lease ends ([`mark_fenced`]).
+static FENCED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record that this process no longer holds the serving lease, and why (who
+/// holds it now, or that it fenced itself). From then on a pool that cannot
+/// hand out a connection — the database refuses every new one this process
+/// opens — reports that, not a bare timeout. The first reason stands.
+pub(crate) fn mark_fenced(why: String) {
+    FENCED.get_or_init(|| why);
+}
+
+/// SQLSTATE `serving_lease_register_backend` (migration 0098) raises for a
+/// process that does not hold the lease.
+const NOT_THE_LEASE_HOLDER: &str = "E6L01";
+
 /// Every query failure in this module passes through here on its way into a
-/// [`DbError`], so an exhausted pool is counted wherever it is met.
-fn query_error(error: sqlx::Error) -> DbError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+/// [`DbError`], so an exhausted pool is counted wherever it is met, and a
+/// process that has lost the serving lease says so.
+pub(crate) fn query_error(error: sqlx::Error) -> DbError {
+    classify_query_error(error, FENCED.get().map(String::as_str))
+}
+
+fn classify_query_error(error: sqlx::Error, fenced: Option<&str>) -> DbError {
+    let timed_out = matches!(error, sqlx::Error::PoolTimedOut);
+    if timed_out {
         POOL_ACQUIRE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    DbError::Query(error)
+    let refused = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == NOT_THE_LEASE_HOLDER);
+    match fenced {
+        Some(why) if timed_out || refused => DbError::NotServing(why.to_owned()),
+        _ => DbError::Query(error),
+    }
 }
 
 pub(crate) fn pool_acquire_timeouts() -> u64 {
@@ -280,8 +362,9 @@ fn seconds_for_database(value: u64, column: &str) -> Result<f64, DbError> {
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: i64 = 60_000;
 
 /// How long one migration statement may wait for a lock (the migrator's own
-/// advisory lock included — another replica migrating — or a table lock held
-/// by a live server) before the attempt is abandoned and retried.
+/// advisory lock included — another process migrating a database that has no
+/// serving lease yet — or a table lock held by a long transaction) before the
+/// attempt is abandoned and retried.
 const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Attempts [`run_migrations`] makes when a migration keeps timing out on a
 /// lock; the pause between two of them doubles from one second.
@@ -352,10 +435,10 @@ impl TryFrom<u32> for DatabasePoolSize {
 /// must see. This fails at once with that reason, and the bound keeps an
 /// unroutable address from hanging startup on the operating system's connect
 /// timeout.
-async fn connect_directly(url: &str) -> Result<sqlx::PgConnection, DbError> {
+pub(crate) async fn connect_directly(url: &DatabaseUrl) -> Result<sqlx::PgConnection, DbError> {
     tokio::time::timeout(
         DATABASE_ACQUIRE_TIMEOUT,
-        <sqlx::PgConnection as sqlx::Connection>::connect(url),
+        <sqlx::PgConnection as sqlx::Connection>::connect_with(&url.connect_options()),
     )
     .await
     .map_err(|_| {
@@ -365,6 +448,28 @@ async fn connect_directly(url: &str) -> Result<sqlx::PgConnection, DbError> {
         )))
     })?
     .map_err(DbError::Connect)
+}
+
+/// A listener for `NOTIFY` on a connection of its own, not one of the shared
+/// pool's, which it would hold for the process lifetime. It is what
+/// `PgListener::connect` builds — a one-connection pool that only
+/// re-establishes the connection — made from the parsed URL's options.
+pub(crate) async fn notification_listener(
+    url: &DatabaseUrl,
+) -> Result<sqlx::postgres::PgListener, DbError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .max_lifetime(None)
+        .idle_timeout(None)
+        .connect_with(url.connect_options())
+        .await
+        .map_err(DbError::Connect)?;
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .map_err(DbError::Connect)?;
+    // The pool is this listener's alone; nothing closes it but the listener.
+    listener.ignore_pool_close_event(true);
+    Ok(listener)
 }
 
 /// Whether a migration failed because a statement waited out
@@ -387,13 +492,17 @@ fn migration_waited_on_a_lock(error: &sqlx::migrate::MigrateError) -> bool {
 /// a request and wrong for a migration, which may rewrite or index a table
 /// that has grown for months — a deployment that large would crash-loop on
 /// every upgrade. Here there is no statement timeout, and a bounded lock
-/// timeout instead: a migration stuck behind a lock (another replica
-/// migrating, a long transaction on a live server) gives up after
+/// timeout instead: a migration stuck behind a lock (another process
+/// migrating a database that has no serving lease yet, a long transaction)
+/// gives up after
 /// [`MIGRATION_LOCK_TIMEOUT`], says so on stderr, and is retried on a fresh
 /// connection with a doubling pause, [`MIGRATION_LOCK_ATTEMPTS`] times in all.
 /// Every other migration failure is a fact about the schema and is returned at
 /// once.
-pub async fn run_migrations(url: &str, migrator: &sqlx::migrate::Migrator) -> Result<(), DbError> {
+pub async fn run_migrations(
+    url: &DatabaseUrl,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), DbError> {
     let mut pause = Duration::from_secs(1);
     for attempt in 1..=MIGRATION_LOCK_ATTEMPTS {
         let mut connection = connect_directly(url).await?;
@@ -406,7 +515,7 @@ pub async fn run_migrations(url: &str, migrator: &sqlx::migrate::Migrator) -> Re
             .execute(&mut connection)
             .await
             .map_err(DbError::Connect)?;
-        let outcome = migrator.run(&mut connection).await;
+        let outcome = migrate_holding_the_lock(&mut connection, migrator).await;
         // Closing ends the session, which releases the migrator's advisory
         // lock whatever state a failed attempt left it in.
         <sqlx::PgConnection as sqlx::Connection>::close(connection)
@@ -432,16 +541,245 @@ pub async fn run_migrations(url: &str, migrator: &sqlx::migrate::Migrator) -> Re
     unreachable!("the final attempt returns its outcome")
 }
 
-/// Migrate, then open a pool of the default size — for a one-shot command
-/// (`recover-administrator`, secret rotation), which opens connections only as
-/// it uses them. The daemon opens its pool through
-/// [`connect_and_migrate_with_retry`], at its configured size.
-pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
-    connect_and_migrate_sized(url, DatabasePoolSize::for_this_host()).await
+/// The index a `-- no-transaction` migration builds, or `None` when it is not
+/// the one shape such a migration may take: a comment header, then exactly one
+/// `CREATE [UNIQUE] INDEX CONCURRENTLY <name> ...;` statement.
+///
+/// That is the only reason a migration runs outside a transaction here — an
+/// index built on a live table without blocking its writers — and holding it
+/// to one statement is what makes an interruption recoverable: a concurrent
+/// build that fails (a lock wait past [`MIGRATION_LOCK_TIMEOUT`], a lost
+/// connection) leaves its index behind *invalid*, and nothing else, so dropping
+/// that index restores the state before the migration.
+fn concurrent_index_name(sql: &str) -> Option<String> {
+    let statement: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let statement = statement.trim();
+    let body = statement.strip_suffix(';')?;
+    if body.contains(';') {
+        return None;
+    }
+    let mut words = body.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    let mut word = words.next()?;
+    if word.eq_ignore_ascii_case("UNIQUE") {
+        word = words.next()?;
+    }
+    if !word.eq_ignore_ascii_case("INDEX") || !words.next()?.eq_ignore_ascii_case("CONCURRENTLY") {
+        return None;
+    }
+    let name = words.next()?;
+    // The name is interpolated into a DROP below: a plain identifier only.
+    let plain = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    (plain && words.next()?.eq_ignore_ascii_case("ON")).then(|| name.to_owned())
 }
 
-async fn connect_and_migrate_sized(url: &str, size: DatabasePoolSize) -> Result<PgPool, DbError> {
-    run_migrations(url, &MIGRATOR).await?;
+/// Take the migrator's advisory lock, drop what an interrupted concurrent
+/// index build left ([`drop_interrupted_index_builds`]), and migrate. The
+/// lock is taken first because a build in progress is invalid too: another
+/// process migrating holds it for the build's whole length. It is a
+/// session-level lock and re-entrant — the migrator takes it again and
+/// releases its own hold — and closing the connection releases this one.
+async fn migrate_holding_the_lock(
+    connection: &mut sqlx::PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    use sqlx::migrate::Migrate;
+    connection.lock().await?;
+    drop_interrupted_index_builds(connection, migrator).await?;
+    migrator.run(connection).await
+}
+
+/// Drop what an interrupted concurrent index build left: for each
+/// `-- no-transaction` migration ([`concurrent_index_name`]), its index when
+/// PostgreSQL holds it invalid. sqlx records such a migration only after its
+/// statement succeeds, so the next attempt runs it again — and without this it
+/// would fail on the leftover name for good, where a retry after a lock
+/// timeout is exactly what [`run_migrations`] promises. An invalid index serves
+/// no query, so nothing is lost; a valid one (the build finished) is kept.
+async fn drop_interrupted_index_builds(
+    connection: &mut sqlx::PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    for migration in migrator.iter().filter(|migration| migration.no_tx) {
+        let Some(index) = concurrent_index_name(migration.sql.as_str()) else {
+            return Err(sqlx::migrate::MigrateError::Source(
+                format!(
+                    "migration {} runs outside a transaction but is not one CREATE INDEX \
+                     CONCURRENTLY statement",
+                    migration.version
+                )
+                .into(),
+            ));
+        };
+        let invalid: Option<bool> = sqlx::query_scalar(
+            "SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        )
+        .bind(&index)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if invalid == Some(true) {
+            eprintln!(
+                "db: dropping index {index}, left invalid by an interrupted build of migration {}",
+                migration.version
+            );
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP INDEX {index}")))
+                .execute(&mut *connection)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The migrations a database has and this binary's, compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaState {
+    /// Whether migration 0098's `serving_lease` exists: until it does, no
+    /// process holds a lease, and the schema is brought up to it under the
+    /// migrator's advisory lock alone.
+    lease_table: bool,
+    /// Applied migrations this binary does not know (a later release's).
+    unknown: Vec<i64>,
+    /// This binary's migrations the database has not applied.
+    pending: Vec<i64>,
+}
+
+impl SchemaState {
+    async fn read(url: &DatabaseUrl) -> Result<Self, DbError> {
+        let mut connection = connect_directly(url).await?;
+        let (lease_table, ledger): (bool, bool) = sqlx::query_as(
+            "SELECT to_regclass('serving_lease') IS NOT NULL,
+                    to_regclass('_sqlx_migrations') IS NOT NULL",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(DbError::Connect)?;
+        let applied: Vec<i64> = if ledger {
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+                .fetch_all(&mut connection)
+                .await
+                .map_err(DbError::Connect)?
+        } else {
+            Vec::new()
+        };
+        <sqlx::PgConnection as sqlx::Connection>::close(connection)
+            .await
+            .map_err(DbError::Connect)?;
+        let known: Vec<i64> = MIGRATOR.iter().map(|migration| migration.version).collect();
+        Ok(Self {
+            lease_table,
+            unknown: applied
+                .iter()
+                .copied()
+                .filter(|version| !known.contains(version))
+                .collect(),
+            pending: known
+                .into_iter()
+                .filter(|version| !applied.contains(version))
+                .collect(),
+        })
+    }
+
+    /// Refuse a schema a later release migrated: this binary cannot serve it,
+    /// and must not take the lease from a process that can.
+    fn refuse_newer(&self) -> Result<(), DbError> {
+        match self.unknown.iter().max() {
+            Some(&applied) => Err(DbError::SchemaNewerThanBinary {
+                applied,
+                known: MIGRATOR
+                    .iter()
+                    .map(|migration| migration.version)
+                    .max()
+                    .unwrap_or(0),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Before any lease can exist: a database without migration 0098's lease
+/// table is migrated as every release before it migrated, under the
+/// migrator's advisory lock, since no process can hold a lease on it yet.
+/// Then a schema a later release migrated is refused.
+async fn bootstrap_and_check_schema(url: &DatabaseUrl) -> Result<SchemaState, DbError> {
+    let mut schema = SchemaState::read(url).await?;
+    if !schema.lease_table {
+        run_migrations(url, &MIGRATOR).await?;
+        schema = SchemaState::read(url).await?;
+    }
+    schema.refuse_newer()?;
+    Ok(schema)
+}
+
+/// Refuse a schema a later release migrated, as boot does: a standby checks
+/// before each attempt at the lease, so one that could not serve never takes
+/// it from one that can.
+pub(crate) async fn refuse_newer_schema(url: &DatabaseUrl) -> Result<(), DbError> {
+    SchemaState::read(url).await?.refuse_newer()
+}
+
+/// Bring the schema up to this binary. Only the lease holder calls this (the
+/// serving process after taking the lease, a command-line process holding it
+/// for the migration), so no process migrates under a serving one.
+pub(crate) async fn migrate(url: &DatabaseUrl) -> Result<(), DbError> {
+    run_migrations(url, &MIGRATOR).await
+}
+
+/// A pool for a one-shot command (`recover-administrator`, secret rotation),
+/// of the default size; it opens connections only as it uses them. The daemon
+/// opens its pool through [`connect_pool`], at its configured size.
+///
+/// A command is not the serving process, and does not migrate under one: a
+/// schema older than this binary is migrated only while no process serves the
+/// database, holding the serving lease for the migration; with a serving
+/// holder it is refused ([`DbError::ServedSchemaOlder`]) — upgrade the serving
+/// process, which migrates it. A schema a later release migrated is refused
+/// too. A database without the lease table yet is migrated as before it.
+pub async fn connect_and_migrate(url: &DatabaseUrl) -> Result<PgPool, DbError> {
+    let schema = bootstrap_and_check_schema(url).await?;
+    if !schema.pending.is_empty() {
+        let purpose = format!(
+            "{} running a command-line migration",
+            crate::serving_lease::serving_purpose()
+        );
+        let holder = crate::serving_lease::HolderId::generate();
+        match crate::serving_lease::acquire(url, &holder, &purpose).await {
+            Ok(lease) => {
+                let migrated = migrate(url).await;
+                let released = lease.release(COMMAND_LEASE_RELEASE_TIMEOUT).await;
+                migrated?;
+                released?;
+            }
+            Err(crate::serving_lease::AcquireRefusal::Held(held)) => {
+                return Err(DbError::ServedSchemaOlder(held));
+            }
+            Err(crate::serving_lease::AcquireRefusal::Database(error)) => return Err(error),
+        }
+    }
+    connect_pool(url, DatabasePoolSize::for_this_host(), None).await
+}
+
+/// How long a command-line migration waits to hand the serving lease back.
+const COMMAND_LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open the shared pool. With `fence`, the serving process's own: every
+/// connection is checked, as it is made, to belong to the serving lease's
+/// holder and recorded as the holder's (`serving_lease_register_backend`,
+/// migration 0098), so a process that has lost the lease cannot open one, and
+/// the next holder can end every one it has open.
+pub async fn connect_pool(
+    url: &DatabaseUrl,
+    size: DatabasePoolSize,
+    fence: Option<&crate::serving_lease::HolderId>,
+) -> Result<PgPool, DbError> {
+    let fence = fence.map(|holder| holder.as_str().to_owned());
     // Every caller shares this pool, including HTTP handlers and the database
     // worker. A dependency interruption must therefore produce a bounded,
     // typed query failure instead of parking unrelated requests on SQLx's
@@ -449,7 +787,8 @@ async fn connect_and_migrate_sized(url: &str, size: DatabasePoolSize) -> Result<
     PgPoolOptions::new()
         .max_connections(size.get())
         .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
-        .after_connect(|connection, _metadata| {
+        .after_connect(move |connection, _metadata| {
+            let fence = fence.clone();
             Box::pin(async move {
                 for (setting, value) in [
                     ("statement_timeout", DATABASE_STATEMENT_TIMEOUT_MS),
@@ -465,10 +804,16 @@ async fn connect_and_migrate_sized(url: &str, size: DatabasePoolSize) -> Result<
                         .execute(&mut *connection)
                         .await?;
                 }
+                if let Some(holder) = fence {
+                    sqlx::query("SELECT serving_lease_register_backend($1::uuid)")
+                        .bind(holder)
+                        .execute(&mut *connection)
+                        .await?;
+                }
                 Ok(())
             })
         })
-        .connect(url)
+        .connect_with(url.connect_options())
         .await
         .map_err(DbError::Connect)
 }
@@ -516,25 +861,28 @@ pub struct StartupDatabaseAttempt<'a> {
     pub retry_in: Option<std::time::Duration>,
 }
 
-/// [`connect_and_migrate`] for process startup: a refused or not-yet-listening
+/// Wait for the database at process startup: a refused or not-yet-listening
 /// PostgreSQL (a container that starts a few seconds after this one, a
 /// restarting server) is retried with a doubling, capped backoff until `wait`
-/// is spent, and every failed attempt is reported. Only connection failures
-/// are retried: a migration failure is a fact about the schema that waiting
-/// cannot change, and is returned at once.
-pub async fn connect_and_migrate_with_retry(
-    url: &str,
+/// is spent, and every failed attempt is reported. An attempt connects, brings
+/// a database without the serving-lease table up to it
+/// ([`bootstrap_and_check_schema`]), and refuses a schema a later release
+/// migrated. Only connection failures are retried: a migration failure or a
+/// newer schema is a fact that waiting cannot change, and is returned at once.
+/// No lease is taken and nothing else is migrated here; the caller takes the
+/// lease ([`crate::serving_lease::acquire`]) and then [`migrate`]s.
+pub async fn wait_for_database(
+    url: &DatabaseUrl,
     wait: StartupDatabaseWait,
-    size: DatabasePoolSize,
     mut report: impl FnMut(StartupDatabaseAttempt<'_>),
-) -> Result<PgPool, DbError> {
+) -> Result<(), DbError> {
     let started = std::time::Instant::now();
     let mut backoff = StartupDatabaseWait::FIRST_BACKOFF;
     let mut attempts: u32 = 0;
     loop {
         attempts = attempts.saturating_add(1);
-        let error = match connect_and_migrate_sized(url, size).await {
-            Ok(pool) => return Ok(pool),
+        let error = match bootstrap_and_check_schema(url).await {
+            Ok(_) => return Ok(()),
             Err(error @ DbError::Connect(_)) => error,
             Err(error) => return Err(error),
         };
@@ -1157,8 +1505,18 @@ pub async fn load_or_initialize_managed_config(
 }
 
 pub async fn load_managed_config(pool: &PgPool) -> Result<ManagedConfigSnapshot, DbError> {
+    stored_managed_config(pool)
+        .await?
+        .ok_or_else(|| DbError::InvalidServerSettings("settings row is missing".into()))
+}
+
+/// The stored settings revision, or `None` before the first start has
+/// imported one.
+pub async fn stored_managed_config(
+    pool: &PgPool,
+) -> Result<Option<ManagedConfigSnapshot>, DbError> {
     use sqlx::Row;
-    let row = sqlx::query(
+    let Some(row) = sqlx::query(
         "SELECT revision, settings, updated_by,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS \"UTC\"') AS updated_at
          FROM server_settings WHERE singleton",
@@ -1166,13 +1524,15 @@ pub async fn load_managed_config(pool: &PgPool) -> Result<ManagedConfigSnapshot,
     .fetch_optional(pool)
     .await
     .map_err(query_error)?
-    .ok_or_else(|| DbError::InvalidServerSettings("settings row is missing".into()))?;
-    Ok(ManagedConfigSnapshot {
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ManagedConfigSnapshot {
         revision: row.get("revision"),
         settings: decode_managed_settings(row.get("settings"))?,
         updated_by: row.get("updated_by"),
         updated_at: row.get("updated_at"),
-    })
+    }))
 }
 
 /// Store a complete typed settings revision and its redacted audit description
@@ -1220,6 +1580,43 @@ pub async fn save_managed_config(
         updated_by: actor.name().to_string(),
         updated_at,
     })
+}
+
+/// [`save_managed_config`] over the revision `current` holds, keeping `current`
+/// what is stored: the new revision when the save commits, and the stored row
+/// when another writer (`e6ircd rotate-secrets`, from a process of its own) got
+/// there first. Without the reload a stale snapshot stayed stale, and every later
+/// save from it failed the same way until the process restarted; with it, the
+/// [`DbError::StaleServerSettings`] this returns is true of a revision the
+/// administrator can now read, and a retry from it works. What the stored
+/// revision changes live (the BNC attach listener) is applied by
+/// `crate::settings_watch`, which hears the other writer's commit.
+pub async fn save_managed_config_over(
+    pool: &PgPool,
+    current: &mut ManagedConfigSnapshot,
+    settings: &crate::config::ManagedConfig,
+    actor: &AuditPrincipal,
+    audit_detail: &str,
+) -> Result<ManagedConfigSnapshot, DbError> {
+    match save_managed_config(pool, current.revision, settings, actor, audit_detail).await {
+        Ok(saved) => {
+            *current = saved.clone();
+            Ok(saved)
+        }
+        Err(DbError::StaleServerSettings) => {
+            match load_managed_config(pool).await {
+                Ok(stored) if stored.revision > current.revision => *current = stored,
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "managed configuration: a save found revision {} stale and the stored \
+                     revision could not be read: {error}",
+                    current.revision
+                ),
+            }
+            Err(DbError::StaleServerSettings)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn insert_primary_password(
@@ -2290,6 +2687,46 @@ pub async fn list_suspended_accounts(pool: &PgPool) -> Result<Vec<String>, DbErr
         .map_err(query_error)
 }
 
+/// Why an account can no longer own a running network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerStanding {
+    Suspended,
+    /// Deleted: its name is retired.
+    Deleted,
+}
+
+/// Of the folded account names in `owners`, those whose account is suspended
+/// or was deleted — the owners whose configured networks start held.
+pub async fn inactive_network_owners(
+    pool: &PgPool,
+    owners: &[String],
+) -> Result<Vec<(String, OwnerStanding)>, DbError> {
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT o.folded, a.id IS NULL
+         FROM unnest($1::text[]) AS o(folded)
+         LEFT JOIN accounts a ON a.name_folded = o.folded
+         WHERE (a.id IS NOT NULL AND (a.flags & $2) <> 0)
+            OR (a.id IS NULL
+                AND EXISTS (SELECT 1 FROM retired_account_names r WHERE r.name_folded = o.folded))",
+    )
+    .bind(owners)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(owner, deleted)| {
+            let standing = if deleted {
+                OwnerStanding::Deleted
+            } else {
+                OwnerStanding::Suspended
+            };
+            (owner, standing)
+        })
+        .collect())
+}
+
 pub async fn account_name_by_id(pool: &PgPool, account_id: i64) -> Result<Option<String>, DbError> {
     sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1")
         .bind(account_id)
@@ -2303,6 +2740,8 @@ pub struct AccountStateChange {
     pub name: String,
     pub folded: String,
     pub suspended: bool,
+    /// The account's authority as this change left it.
+    pub authority: AccountAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2572,11 +3011,13 @@ pub async fn set_account_suspended(
         "",
     )
     .await?;
+    let authority = committed_authority(&mut transaction, account_id).await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountStateChange {
         name,
         folded,
         suspended,
+        authority,
     }))
 }
 
@@ -2717,6 +3158,9 @@ struct CredentialVerificationPlan {
     /// Verifications against the dummy hash, spent so the attempt costs the
     /// same whatever the account holds.
     dummies: usize,
+    /// The primary password's credential id, if it is a candidate: a match on
+    /// any other candidate is an app password.
+    primary: Option<i64>,
 }
 
 /// Decide what to verify `presented` against.
@@ -2742,6 +3186,7 @@ fn plan_credential_verification(
         }
     }
     let dummies = usize::from(primary.is_none()) + usize::from(named.is_none());
+    let primary_id = primary.as_ref().map(|credential| credential.credential_id);
     let candidates = primary
         .into_iter()
         .chain(named)
@@ -2753,6 +3198,7 @@ fn plan_credential_verification(
     CredentialVerificationPlan {
         candidates,
         dummies,
+        primary: primary_id,
     }
 }
 
@@ -2834,13 +3280,10 @@ pub async fn issue_app_password(
     password: &str,
     label: &str,
 ) -> Result<String, DbError> {
-    if verify_local_password(pool, account, password)
-        .await?
-        .is_none()
-    {
+    let Some(verified) = verify_local_password(pool, account, password).await? else {
         return Err(DbError::BadCredentials);
-    }
-    issue_app_password_for_account(pool, account, label).await
+    };
+    issue_app_password_for_account(pool, &verified, label).await
 }
 
 /// Mint an app password for an account whose browser session has already been
@@ -2850,10 +3293,10 @@ pub async fn issue_app_password(
 /// the same cap, lock, hashing, and storage transaction.
 pub async fn issue_app_password_for_account(
     pool: &PgPool,
-    account: &str,
+    account: &VerifiedAccount,
     label: &str,
 ) -> Result<String, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
+    let folded = CaseMapping::Rfc1459.casefold(account.name());
     let mut secret_bytes = [0u8; 32];
     use argon2::password_hash::rand_core::RngCore;
     OsRng.fill_bytes(&mut secret_bytes);
@@ -3272,11 +3715,24 @@ async fn handle_request(
         // bound lives at the `ARGON2_PERMITS` choke point regardless), so make the
         // invariant load-bearing rather than shipping a second copy of the logic.
         DbRequest::VerifyPassword { .. } => unreachable!("offloaded by run_worker"),
-        DbRequest::VerifyToken { conn, token } => {
+        DbRequest::VerifyToken {
+            conn,
+            token,
+            authzid,
+        } => {
             // A bearer token is only ever presented by SASL OAUTHBEARER.
             let origin = crate::core::CredentialOrigin::Sasl;
             let outcome = match api_token_account(pool, &token).await {
-                Ok(Some(account)) => VerifyOutcome::Verified(account),
+                // e6irc never lets one account act as another: a GS2
+                // authorization identity must name the token's own account.
+                Ok(Some(signed_in))
+                    if authzid.as_deref().is_some_and(|authzid| {
+                        !CaseMapping::Rfc1459.eq(authzid, signed_in.account.name())
+                    }) =>
+                {
+                    VerifyOutcome::Rejected
+                }
+                Ok(Some(signed_in)) => VerifyOutcome::Verified(signed_in),
                 Ok(None) => VerifyOutcome::Rejected,
                 Err(e) => {
                     record_database_error(telemetry);
@@ -4025,6 +4481,12 @@ pub enum LinkOutcome {
     AlreadyYours,
     /// The identity belongs to a different account — refused.
     Conflict,
+    /// The browser session that started the link has ended (signed out,
+    /// revoked, expired) or is not the account's — refused.
+    SessionEnded,
+    /// The browser session has not proved its person within
+    /// [`STEP_UP_WINDOW`] — refused.
+    SessionNotRecent,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -4148,13 +4610,19 @@ pub async fn unlink_oidc_identity(
     Ok(UnlinkIdentityOutcome::Unlinked)
 }
 
-/// Attach an OIDC `(issuer, subject)` to `account`. Because the pair is
-/// globally unique, an identity already owned by another account is a hard
-/// [`LinkOutcome::Conflict`], never a silent move. A suspended account cannot
-/// gain a login identity: the account is resolved through the same active-only
-/// lock every other credential mutation uses.
+/// Attach an OIDC `(issuer, subject)` to `account`, for the browser session
+/// `session` that asked. Because the pair is globally unique, an identity
+/// already owned by another account is a hard [`LinkOutcome::Conflict`], never
+/// a silent move. A suspended account cannot gain a login identity: the account
+/// is resolved through the same active-only lock every other credential
+/// mutation uses. The session is checked in the same transaction as the insert
+/// — live, the account's, and within [`STEP_UP_WINDOW`] of proving its person
+/// — and held (`FOR SHARE`) until it commits, so a sign-out or password change
+/// that ends it cannot interleave: the link lands before the session ends, or
+/// not at all.
 pub async fn link_oidc_identity(
     pool: &PgPool,
+    session: &str,
     account: &str,
     issuer: &str,
     subject: &str,
@@ -4162,6 +4630,23 @@ pub async fn link_oidc_identity(
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let account_id = lock_active_account_id(&mut transaction, &folded).await?;
+    let recent: Option<bool> = sqlx::query_scalar(
+        "SELECT authenticated_at > now() - make_interval(secs => $3)
+         FROM web_sessions
+         WHERE token_hash = $1 AND account_id = $2 AND expires_at > now()
+         FOR SHARE",
+    )
+    .bind(token_hash(session))
+    .bind(account_id)
+    .bind(STEP_UP_WINDOW.as_secs_f64())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    match recent {
+        None => return Ok(LinkOutcome::SessionEnded),
+        Some(false) => return Ok(LinkOutcome::SessionNotRecent),
+        Some(true) => {}
+    }
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
          ON CONFLICT (issuer, subject) DO NOTHING RETURNING id",
@@ -4317,7 +4802,7 @@ macro_rules! history_where {
 
 /// The windowed form: two bounded halves unioned, then ordered as one. The
 /// inner select aliases the timestamp so the outer query can order by it, and
-/// carries `ts`/`id` for that ordering.
+/// carries `ts` for that ordering beside the `msgid` it selects anyway.
 macro_rules! history_window {
     ($scope:expr, $older:literal, $newer:literal) => {
         by_history_scope!($scope, history_window!($older, $newer))
@@ -4327,15 +4812,15 @@ macro_rules! history_window {
             "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
              client_tags FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
-             body, sender_is_bot, multiline, client_tags, ts, id FROM messages ",
+             body, sender_is_bot, multiline, client_tags, ts FROM messages ",
             history_where!($kind),
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
-             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts, id \
+             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts \
              FROM messages ",
             history_where!($kind),
             $newer,
-            ") ) w ORDER BY ts ASC, id ASC"
+            ") ) w ORDER BY ts ASC, msgid COLLATE \"C\" ASC"
         )
     };
 }
@@ -4408,7 +4893,14 @@ pub(crate) async fn query_history_in_scope(
     // and reads only rows at or above it — pivots included, so a msgid from
     // before the floor is as unknown here as one from another buffer.
     let floor = millis_for_database(floor.millis(), "history floor")?;
-    // BETWEEN resolves each pivot's `(ts, id)` in the DB and derives its own
+    // Every page is ordered by `(ts, msgid COLLATE "C")`: the one total order
+    // the hot ring keeps too (`HistoryRow::place`), computed from the message
+    // alone, so a millisecond's lines persisted by different shards are paged
+    // in the order the ring holds them. `"C"` is a byte comparison, as the
+    // ring's; the database's default collation would order the same ids
+    // differently. Index: `messages_target_ts_msgid_idx` (migration 0093).
+    //
+    // BETWEEN resolves each pivot's `(ts, msgid)` in the DB and derives its own
     // direction, so it produces its final oldest-first order itself rather than
     // going through the shared newest-first reversal below.
     if let HistoryQuery::BetweenSelectors {
@@ -4445,7 +4937,7 @@ pub(crate) async fn query_history_in_scope(
         Option<usize>,
     ) = match query {
         HistoryQuery::Latest { limit } => (
-            history_select!(scope, "ORDER BY ts DESC, id DESC LIMIT $3"),
+            history_select!(scope, "ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $3"),
             None,
             limit,
             None,
@@ -4453,7 +4945,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::Before { before_ts, limit } => (
             history_select!(
                 scope,
-                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 before_ts,
@@ -4468,7 +4960,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::LatestAfter { after_ts, limit } => (
             history_select!(
                 scope,
-                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4480,7 +4972,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::LatestAfterMsgid { msgid, limit } => (
             history_select!(
                 scope,
-                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND (ts, msgid COLLATE \"C\") > (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4489,7 +4981,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::After { after_ts, limit } => (
             history_select!(
                 scope,
-                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4502,8 +4994,8 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::Around { around_ts, limit } => (
             history_window!(
                 scope,
-                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
-                "AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4",
+                "AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $5"
             ),
             Some(Position::Millis(millis_for_database(
                 around_ts,
@@ -4512,7 +5004,7 @@ pub(crate) async fn query_history_in_scope(
             limit / 2,
             Some(limit - limit / 2),
         ),
-        // Msgid pivots: page on the composite (ts, id) relative to the
+        // Msgid pivots: page on the composite (ts, msgid) relative to the
         // pivot row so messages sharing the pivot's timestamp are not
         // skipped.
         //
@@ -4528,7 +5020,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::BeforeMsgid { msgid, limit } => (
             history_select!(
                 scope,
-                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND (ts, msgid COLLATE \"C\") < (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4537,7 +5029,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::AfterMsgid { msgid, limit } => (
             history_select!(
                 scope,
-                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
+                "AND (ts, msgid COLLATE \"C\") > (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4546,8 +5038,8 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::AroundMsgid { msgid, limit } => (
             history_window!(
                 scope,
-                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
-                "AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
+                "AND (ts, msgid COLLATE \"C\") < (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4",
+                "AND (ts, msgid COLLATE \"C\") >= (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $5"
             ),
             Some(Position::Msgid(msgid)),
             limit / 2,
@@ -4599,12 +5091,15 @@ fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbE
     })
 }
 
-/// The BETWEEN query with each endpoint resolved to a `(ts, id)` position *in the
-/// database*, so the span and the paging direction are correct even when a
-/// `msgid=` pivot has scrolled out of the in-memory ring. A `msgid=` pivot is
-/// looked up within this target (an unknown-here msgid yields an empty result,
-/// like the other msgid pivots); a `timestamp=` bound has no id, so it uses id
-/// sentinels that make its comparison ts-only. Returns rows oldest-first.
+/// The BETWEEN query with each endpoint resolved to a `(ts, msgid)` position
+/// *in the database*, so the span and the paging direction are correct even
+/// when a `msgid=` pivot has scrolled out of the in-memory ring. A `msgid=`
+/// pivot is looked up within this target (an unknown-here msgid yields an
+/// empty result, like the other msgid pivots); a `timestamp=` bound has no
+/// msgid and binds a NULL one, which reduces the row comparison to the time
+/// alone (`(ts, m) > (T, NULL)` is `ts > T`) — the place before every message
+/// stamped in its millisecond, as [`crate::core::HistoryPlace`] orders it.
+/// Returns rows oldest-first.
 async fn query_between_selectors(
     pool: &PgPool,
     target: &str,
@@ -4615,16 +5110,11 @@ async fn query_between_selectors(
     scope: crate::core::HistoryScope,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::SelectorBound;
+    /// A pivot's `(ts, msgid)` place; `msgid` is `None` for a timestamp.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
     struct HistoryMarker {
         ts_millis: i64,
-        id: i64,
-        is_timestamp: bool,
-    }
-
-    #[derive(sqlx::FromRow)]
-    struct HistoryMarkerRow {
-        ts_millis: i64,
-        id: i64,
+        msgid: Option<String>,
     }
 
     async fn marker(
@@ -4636,12 +5126,11 @@ async fn query_between_selectors(
         match b {
             SelectorBound::Timestamp(t) => Ok(Some(HistoryMarker {
                 ts_millis: millis_for_database(*t, "history selector")?,
-                id: 0,
-                is_timestamp: true,
+                msgid: None,
             })),
             SelectorBound::Msgid(m) => {
-                let row: Option<HistoryMarkerRow> = sqlx::query_as(
-                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, id \
+                let ts_millis: Option<i64> = sqlx::query_scalar(
+                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint \
                      FROM messages WHERE msgid = $1 AND target = $2 \
                      AND ts >= to_timestamp($3::double precision / 1000)",
                 )
@@ -4651,10 +5140,9 @@ async fn query_between_selectors(
                 .fetch_optional(pool)
                 .await
                 .map_err(query_error)?;
-                Ok(row.map(|row| HistoryMarker {
-                    ts_millis: row.ts_millis,
-                    id: row.id,
-                    is_timestamp: false,
+                Ok(ts_millis.map(|ts_millis| HistoryMarker {
+                    ts_millis,
+                    msgid: Some(m.clone()),
                 }))
             }
         }
@@ -4673,51 +5161,34 @@ async fn query_between_selectors(
     };
     // Order the two pivots; the first selector being the newer bound means the
     // `limit` cuts from the newest end (CHATHISTORY walks first → second).
-    let newest_first = (m1.ts_millis, m1.id) > (m2.ts_millis, m2.id);
+    // `None < Some` and a byte comparison of the ids: `HistoryPlace`'s order.
+    let newest_first = m1 > m2;
     let (older, newer) = if newest_first { (m2, m1) } else { (m1, m2) };
-    // Lower bound (strictly after the older pivot): a timestamp uses id = MAX so
-    // `(ts,id) > (T, MAX)` is `ts > T`. Upper bound (strictly before the newer
-    // pivot): a timestamp uses id = MIN so `(ts,id) < (T, MIN)` is `ts < T`.
-    let (lo_ts, lo_id) = (
-        older.ts_millis,
-        if older.is_timestamp {
-            i64::MAX
-        } else {
-            older.id
-        },
-    );
-    let (hi_ts, hi_id) = (
-        newer.ts_millis,
-        if newer.is_timestamp {
-            i64::MIN
-        } else {
-            newer.id
-        },
-    );
+    // Strictly after the older pivot, strictly before the newer.
     let sql = if newest_first {
         history_select!(
             scope,
             "\
-             AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
-             AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
-             ORDER BY ts DESC, id DESC LIMIT $7"
+             AND (ts, msgid COLLATE \"C\") > (to_timestamp($3::double precision / 1000), $4::text) \
+             AND (ts, msgid COLLATE \"C\") < (to_timestamp($5::double precision / 1000), $6::text) \
+             ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $7"
         )
     } else {
         history_select!(
             scope,
             "\
-             AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
-             AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
-             ORDER BY ts ASC, id ASC LIMIT $7"
+             AND (ts, msgid COLLATE \"C\") > (to_timestamp($3::double precision / 1000), $4::text) \
+             AND (ts, msgid COLLATE \"C\") < (to_timestamp($5::double precision / 1000), $6::text) \
+             ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $7"
         )
     };
     let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = sqlx::query_as(sql)
         .bind(target)
         .bind(floor)
-        .bind(lo_ts)
-        .bind(lo_id)
-        .bind(hi_ts)
-        .bind(hi_id)
+        .bind(older.ts_millis)
+        .bind(older.msgid)
+        .bind(newer.ts_millis)
+        .bind(newer.msgid)
         .bind(limit as i64)
         .fetch_all(pool)
         .await;
@@ -4737,7 +5208,7 @@ struct HistoryTargetRow {
 /// The CHATHISTORY TARGETS statement, in a scope's fragments.
 ///
 /// A channel's newest entry in scope is one backward scan of
-/// `messages_target_ts_id_idx` per requested channel (a LATERAL `max(ts)`
+/// `messages_target_ts_msgid_idx` per requested channel (a LATERAL `max(ts)`
 /// becomes `Index Scan Backward ... Limit 1`, stepping over the TAGMSG rows a
 /// text-scope reader cannot be sent); grouping
 /// `WHERE target = ANY(..)` instead read every row of every joined channel to
@@ -5901,7 +6372,7 @@ impl AuditPrincipal {
     }
 }
 
-async fn insert_audit_log_with<'executor>(
+pub(crate) async fn insert_audit_log_with<'executor>(
     executor: impl sqlx::Executor<'executor, Database = sqlx::Postgres>,
     actor: &AuditPrincipal,
     action: &str,
@@ -6024,14 +6495,22 @@ pub async fn query_audit_log(
     if let Some(before_id) = filter.before_id {
         query.push(" AND id < ").push_bind(before_id);
     }
-    if let Some(actor) = filter.actor {
-        query.push(" AND actor = ").push_bind(actor);
+    // An account principal is stored folded ([`AuditPrincipal::account`]), so
+    // the filter is folded to meet it, as the account directory's name filter
+    // is; every other principal (an operator, a nick, a channel, a mask) is
+    // stored as spelled and matched as spelled.
+    for (column, value) in [("actor", filter.actor), ("target", filter.target)] {
+        if let Some(value) = value {
+            query
+                .push(format!(" AND (({column}_kind = 'account' AND {column} = "))
+                .push_bind(CaseMapping::Rfc1459.casefold(value))
+                .push(format!(") OR ({column}_kind <> 'account' AND {column} = "))
+                .push_bind(value.to_owned())
+                .push("))");
+        }
     }
     if let Some(action) = filter.action {
         query.push(" AND action = ").push_bind(action);
-    }
-    if let Some(target) = filter.target {
-        query.push(" AND target = ").push_bind(target);
     }
     query
         .push(" ORDER BY id DESC LIMIT ")
@@ -6593,7 +7072,7 @@ async fn founder_capacity(
 /// inventing a bogus [`CredentialOrigin`]; the worker maps it to the
 /// origin-carrying reply at the one place that knows which command asked.
 enum VerifyOutcome {
-    Verified(String),
+    Verified(VerifiedSignIn),
     Rejected,
     Throttled(LoginRetryAfter),
     Unavailable,
@@ -6602,7 +7081,12 @@ enum VerifyOutcome {
 impl VerifyOutcome {
     fn into_reply(self, origin: crate::core::CredentialOrigin) -> DbReply {
         match self {
-            Self::Verified(account) => DbReply::PasswordVerified { account, origin },
+            Self::Verified(signed_in) => DbReply::PasswordVerified {
+                account: signed_in.account.into_name(),
+                credential: signed_in.credential,
+                expires_in: signed_in.expires_in,
+                origin,
+            },
             Self::Rejected => DbReply::PasswordRejected { origin },
             Self::Throttled(retry_after) => DbReply::PasswordThrottled {
                 origin,
@@ -6645,7 +7129,7 @@ async fn handle_create_account(
 
 async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOutcome {
     match verify_credentials(pool, account, password).await {
-        Ok(Some(account)) => VerifyOutcome::Verified(account),
+        Ok(Some(signed_in)) => VerifyOutcome::Verified(signed_in),
         Ok(None) => VerifyOutcome::Rejected,
         Err(DbError::LoginThrottled(retry_after)) => VerifyOutcome::Throttled(retry_after),
         Err(e) => {
@@ -6657,11 +7141,35 @@ async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOu
 
 // ---- device authorization grant (RFC 8628) ------------------------------
 
+/// The client a device grant was started for (RFC 8628 §3.1 `client_id`):
+/// 1–64 visible ASCII characters, RFC 6749's `VSCHAR`. There is no client
+/// registry — every device client is public — so the identifier binds a grant
+/// to whoever started it (a poll naming another is refused, RFC 6749 §4.1.3)
+/// and labels the personal access token it mints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceClientId(String);
+
+impl DeviceClientId {
+    pub fn parse(raw: &str) -> Option<Self> {
+        (!raw.is_empty()
+            && raw.len() <= 64
+            && raw.bytes().all(|byte| (0x20..=0x7e).contains(&byte)))
+        .then(|| Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// State of a device grant when polled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceStatus {
     /// Not yet approved by a user.
     Pending,
+    /// Polled sooner than the grant's interval since its last poll. The
+    /// interval has grown by [`DEVICE_POLL_SLOW_DOWN_SECONDS`] (RFC 8628 §3.5).
+    SlowDown,
     /// Approved; the grant is consumed and a freshly-minted API token returned.
     /// Consuming the grant and minting the token happen in one transaction, so
     /// an approved grant is never destroyed by a token-mint failure.
@@ -6673,9 +7181,18 @@ pub enum DeviceStatus {
     Denied,
     /// The grant window elapsed.
     Expired,
-    /// No such grant (bad or already-consumed device code).
+    /// No such grant (bad or already-consumed device code), or one another
+    /// client started.
     Unknown,
 }
+
+/// How long a device waits between polls when a grant starts: RFC 8628 §3.2
+/// `interval`, advertised by `/device/start` from this same value.
+pub const DEVICE_POLL_INTERVAL_SECONDS: u16 = 5;
+
+/// How much a poll sooner than its grant's interval lengthens the interval
+/// (RFC 8628 §3.5 `slow_down`).
+pub const DEVICE_POLL_SLOW_DOWN_SECONDS: i32 = 5;
 
 /// How long a device grant may be approved and polled: RFC 8628 `expires_in`,
 /// advertised by `/device/start` from this same value.
@@ -6690,7 +7207,10 @@ const DEVICE_GRANT_EXPIRED_RETENTION_SECONDS: i32 = 600;
 /// Start a device grant: a secret `device_code` the client polls with and
 /// a short `user_code` the user enters to approve. Valid for
 /// [`DEVICE_GRANT_LIFETIME_SECONDS`].
-pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbError> {
+pub async fn create_device_grant(
+    pool: &PgPool,
+    client: &DeviceClientId,
+) -> Result<(String, String), DbError> {
     use argon2::password_hash::rand_core::RngCore;
     // URL-safe: a device code in a form body spelled with `+` would arrive as
     // a space from any client that does not percent-encode it.
@@ -6721,12 +7241,17 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
         .execute(pool)
         .await
         .map_err(query_error)?;
+    // Only the code's digest is kept, as for every other bearer: a read of
+    // this table cannot collect an approved grant's token.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ($1, $2, now() + make_interval(secs => $3))",
+        "INSERT INTO device_grants
+             (device_code_hash, user_code, client_id, poll_interval_seconds, expires_at)
+         VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
     )
-    .bind(&device_code)
+    .bind(token_hash(&device_code))
     .bind(&user_code)
+    .bind(client.as_str())
+    .bind(i32::from(DEVICE_POLL_INTERVAL_SECONDS))
     .bind(i32::from(DEVICE_GRANT_LIFETIME_SECONDS))
     .execute(pool)
     .await
@@ -6779,9 +7304,15 @@ pub async fn approve_device_grant(
     })
 }
 
-/// Poll a grant; if approved and valid, atomically consume it and mint the
-/// caller's API token (labelled `token_label`) in the same transaction,
-/// returning the token in [`DeviceStatus::Approved`].
+/// Poll a grant for `client`; if approved and valid, atomically consume it and
+/// mint the caller's API token (labelled with the client's identifier) in the
+/// same transaction, returning the token in [`DeviceStatus::Approved`].
+///
+/// A grant is `client`'s only if that client started it; another's code is
+/// [`DeviceStatus::Unknown`]. Each poll is paced (RFC 8628 §3.5): one that
+/// arrives sooner than the grant's interval after the previous poll is
+/// answered [`DeviceStatus::SlowDown`], whatever the grant's state, and
+/// lengthens the interval by [`DEVICE_POLL_SLOW_DOWN_SECONDS`].
 ///
 /// Consume-and-mint is one transaction on purpose: if the mint fails for a
 /// transient reason (a database error), the transaction rolls back and the
@@ -6795,15 +7326,59 @@ pub async fn approve_device_grant(
 pub async fn poll_device_grant(
     pool: &PgPool,
     device_code: &str,
-    token_label: &str,
+    client: &DeviceClientId,
 ) -> Result<DeviceStatus, DbError> {
+    let code_hash = token_hash(device_code);
     let mut tx = pool.begin().await.map_err(query_error)?;
+    // Record the poll, and lengthen the interval of one that came too soon.
+    // The row lock this takes also orders concurrent polls of one code.
+    let paced: Option<(bool, bool)> = sqlx::query_as(
+        "WITH polled AS (
+             SELECT id,
+                    last_polled_at IS NOT NULL
+                        AND now() < last_polled_at
+                                    + make_interval(secs => poll_interval_seconds)
+                        AS too_soon
+             FROM device_grants
+             WHERE device_code_hash = $1 AND client_id = $2
+             FOR UPDATE
+         )
+         UPDATE device_grants g
+         SET last_polled_at = now(),
+             poll_interval_seconds = CASE
+                 WHEN polled.too_soon
+                 THEN LEAST(g.poll_interval_seconds + $3, $4)
+                 ELSE g.poll_interval_seconds
+             END
+         FROM polled
+         WHERE g.id = polled.id
+         RETURNING polled.too_soon, g.expires_at > now()",
+    )
+    .bind(&code_hash)
+    .bind(client.as_str())
+    .bind(DEVICE_POLL_SLOW_DOWN_SECONDS)
+    .bind(i32::from(DEVICE_GRANT_LIFETIME_SECONDS))
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(query_error)?;
+    match paced {
+        None => return Ok(DeviceStatus::Unknown),
+        Some((true, _)) => {
+            tx.commit().await.map_err(query_error)?;
+            return Ok(DeviceStatus::SlowDown);
+        }
+        Some((false, false)) => {
+            tx.commit().await.map_err(query_error)?;
+            return Ok(DeviceStatus::Expired);
+        }
+        Some((false, true)) => {}
+    }
     let approved: Option<String> = sqlx::query_scalar(
         "DELETE FROM device_grants g USING accounts a
-         WHERE g.device_code = $1 AND g.account_id = a.id AND g.expires_at > now()
+         WHERE g.device_code_hash = $1 AND g.account_id = a.id
          RETURNING a.name",
     )
-    .bind(device_code)
+    .bind(&code_hash)
     .fetch_optional(&mut *tx)
     .await
     .map_err(query_error)?;
@@ -6814,7 +7389,7 @@ pub async fn poll_device_grant(
         let token = match mint_api_token_under_cap(
             &mut tx,
             &account,
-            token_label,
+            client.as_str(),
             crate::identity::ApiTokenScopes::device_access(),
             crate::identity::ApiTokenLifetimeDays::DEFAULT,
         )
@@ -6851,18 +7426,9 @@ pub async fn poll_device_grant(
         tx.commit().await.map_err(query_error)?;
         return Ok(DeviceStatus::Approved(token));
     }
-    let row: Option<(bool,)> =
-        sqlx::query_as("SELECT expires_at > now() FROM device_grants WHERE device_code = $1")
-            .bind(device_code)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
+    // The recorded poll commits with the answer.
     tx.commit().await.map_err(query_error)?;
-    Ok(match row {
-        Some((true,)) => DeviceStatus::Pending,
-        Some((false,)) => DeviceStatus::Expired,
-        None => DeviceStatus::Unknown,
-    })
+    Ok(DeviceStatus::Pending)
 }
 
 /// Aggregate server counts for the admin API: `(accounts, registered
@@ -7278,6 +7844,55 @@ struct CredentialVerificationRow {
     credential_id: i64,
 }
 
+/// The account a credential was verified as: the account's stored name, as the
+/// store answered it — never the login text that was presented, which may be a
+/// grouped nick or another casing of it. What grants lasting authority (an app
+/// password, a browser session) takes only this, so a verification and the
+/// grant that follows cannot name two different things: minting with the
+/// presented text once answered a verified grouped nick with a 401, after the
+/// verification had already cleared the name's attempt window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAccount(String);
+
+impl VerifiedAccount {
+    /// An account whose identity another authority established — one just
+    /// created from the caller's own password, an OpenID Connect identity, a
+    /// live browser session. `name` is the account's stored name, as that
+    /// authority resolved it.
+    pub fn established(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_name(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedAccount {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A sign-in the store verified: the account, and the credential that opened
+/// it, which whatever the sign-in opens keeps so that revoking the credential
+/// ends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSignIn {
+    pub account: VerifiedAccount,
+    pub credential: crate::identity::CredentialId,
+    /// How much longer the credential authorizes, by PostgreSQL's clock — the
+    /// one its expiry was written against: a personal access token's
+    /// remaining lifetime, `None` for a password, which does not expire.
+    pub expires_in: Option<std::time::Duration>,
+}
+
 /// Verify an account password or app password.
 ///
 /// Every attempt costs two Argon2 computations under one permit, whether or
@@ -7288,7 +7903,7 @@ pub async fn verify_credentials(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedSignIn>, DbError> {
     let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
@@ -7302,7 +7917,7 @@ async fn verify_any_credential(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedSignIn>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let display_name: Option<String> =
         sqlx::query_scalar("SELECT name FROM accounts WHERE name_folded = $1 AND (flags & $2) = 0")
@@ -7325,13 +7940,23 @@ async fn verify_any_credential(
     .await
     .map_err(query_error)?;
     let plan = plan_credential_verification(stored, password);
+    let primary = plan.primary;
     let matched_id =
         matching_credential_id(plan.candidates, plan.dummies, password.to_string()).await?;
     let (Some(display_name), Some(id)) = (display_name, matched_id) else {
         return Ok(None);
     };
     record_credential_use(pool, id).await?;
-    Ok(Some(display_name))
+    let credential = if primary == Some(id) {
+        crate::identity::CredentialId::AccountPassword
+    } else {
+        crate::identity::CredentialId::Issued(crate::identity::IssuedCredential::AppPassword(id))
+    };
+    Ok(Some(VerifiedSignIn {
+        account: VerifiedAccount(display_name),
+        credential,
+        expires_in: None,
+    }))
 }
 
 /// Record that credential `credential_id` just verified, for the credential
@@ -7353,7 +7978,7 @@ pub async fn verify_local_password(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedAccount>, DbError> {
     let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
@@ -7367,7 +7992,7 @@ async fn verify_primary_password(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedAccount>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let row: Option<CredentialVerificationRow> = sqlx::query_as(
         "SELECT a.name AS display_name, c.argon2_hash, c.id AS credential_id FROM accounts a
@@ -7401,7 +8026,7 @@ async fn verify_primary_password(
     .await?;
     if matched.is_some() {
         record_credential_use(pool, credential_id).await?;
-        Ok(Some(display_name))
+        Ok(Some(VerifiedAccount(display_name)))
     } else {
         Ok(None)
     }
@@ -7473,7 +8098,7 @@ pub async fn change_local_password(
     current_password: &str,
     new_password: &str,
     current_session: &str,
-) -> Result<(), DbError> {
+) -> Result<AccountAuthority, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let row: Option<LocalCredentialRow> = sqlx::query_as(
         "SELECT c.id AS credential_id, c.argon2_hash
@@ -7533,8 +8158,9 @@ pub async fn change_local_password(
         "primary password changed; other browser sessions ended",
     )
     .await?;
+    let authority = committed_password_authority(&mut transaction, credential_id).await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(())
+    Ok(authority)
 }
 
 /// Add the first primary password to an authenticated account provisioned by
@@ -7548,7 +8174,7 @@ pub async fn set_local_password(
     account: &str,
     new_password: &str,
     current_session: &str,
-) -> Result<(), DbError> {
+) -> Result<AccountAuthority, DbError> {
     let PasswordMutation {
         mut transaction,
         folded,
@@ -7581,8 +8207,37 @@ pub async fn set_local_password(
         "primary password added; other browser sessions ended",
     )
     .await?;
+    let authority = committed_authority(&mut transaction, account_id).await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(())
+    Ok(authority)
+}
+
+/// The authority `account_id` will have once `transaction` commits, as
+/// migration 0095's triggers counted this transaction's change: what the
+/// server that made the change records as applied, so it does not apply its
+/// own change a second time when the announcement reaches it.
+async fn committed_authority(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<AccountAuthority, DbError> {
+    account_authority(&mut **transaction, account_id)
+        .await?
+        .ok_or_else(|| DbError::UnknownAccount(account_id.to_string()))
+}
+
+/// [`committed_authority`] of the account a primary password credential
+/// belongs to.
+async fn committed_password_authority(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    credential_id: i64,
+) -> Result<AccountAuthority, DbError> {
+    let account_id: i64 =
+        sqlx::query_scalar("SELECT account_id FROM account_credentials WHERE id = $1")
+            .bind(credential_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(query_error)?;
+    committed_authority(transaction, account_id).await
 }
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------
@@ -7823,27 +8478,105 @@ pub async fn list_bnc_networks(
 /// One stored BNC network paired with its display owner for admin inventory.
 pub struct OwnedBncNetworkRow {
     pub owner: String,
+    /// Where the row sorts in the inventory, and the cursor that follows it.
+    pub key: BncInventoryKey,
     pub network: BncNetworkRow,
 }
 
-/// Every account-owned network, ordered by owner and name. This is consumed
-/// only behind the HTTP administrator gate.
-pub async fn list_bnc_network_inventory(pool: &PgPool) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
+bounded_page_size!(
+    BncNetworkInventoryPageSize,
+    "A non-zero administrator network-inventory page size capped at the public API maximum."
+);
+
+/// Where one network sorts in the administrator inventory, which is also the
+/// cursor that selects the networks after it: by folded owner (a shared
+/// network's is empty, so shared networks come first), then folded name, and
+/// a configuration-defined network before a stored one of the same key. The
+/// order is bytewise in PostgreSQL (`COLLATE "C"`) as in Rust, so a page ends
+/// where the next begins whatever the database's collation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BncInventoryKey {
+    owner: String,
+    name: String,
+    stored: bool,
+}
+
+impl BncInventoryKey {
+    /// The key of a network whose owner (`None` when shared) and name are
+    /// spelled any way: both are folded here, as the registry folds them.
+    pub fn new(owner: Option<&str>, name: &str, stored: bool) -> Self {
+        let fold = |value: &str| CaseMapping::Rfc1459.casefold(value);
+        Self {
+            owner: owner.map(fold).unwrap_or_default(),
+            name: fold(name),
+            stored,
+        }
+    }
+
+    /// The cursor text: `owner/name/stored` or `owner/name/configured`, the
+    /// owner empty for a shared network.
+    pub fn cursor(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.owner,
+            self.name,
+            if self.stored { "stored" } else { "configured" }
+        )
+    }
+
+    /// Parse a cursor [`BncInventoryKey::cursor`] wrote; anything else is
+    /// `None`. A folded key is its own fold, so a spelling that is not one is
+    /// refused rather than read as a different position.
+    pub fn parse_cursor(value: &str) -> Option<Self> {
+        let mut parts = value.rsplitn(3, '/');
+        let stored = match parts.next()? {
+            "stored" => true,
+            "configured" => false,
+            _ => return None,
+        };
+        let name = parts.next()?;
+        let owner = parts.next()?;
+        let key = Self::new((!owner.is_empty()).then_some(owner), name, stored);
+        (crate::sanitize::valid_network_name(name) && key.owner == owner && key.name == name)
+            .then_some(key)
+    }
+}
+
+/// One page of account-owned networks after `after`, in [`BncInventoryKey`]
+/// order: at most `page_size + 1` rows, the extra one telling the caller a
+/// next page exists. Consumed only behind the HTTP administrator gate.
+pub async fn bnc_network_inventory_page(
+    pool: &PgPool,
+    after: Option<&BncInventoryKey>,
+    page_size: BncNetworkInventoryPageSize,
+) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
     use sqlx::Row;
     let rows = sqlx::query(concat!(
-        "SELECT a.name AS owner, ",
+        "SELECT a.name AS owner, a.name_folded AS owner_key, ",
         bnc_network_columns!(),
         " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         ORDER BY a.name_folded, lower(n.name)"
+         WHERE $1::text IS NULL
+            OR (a.name_folded COLLATE \"C\", lower(n.name) COLLATE \"C\")
+                 > ($1 COLLATE \"C\", $2 COLLATE \"C\")
+            OR (a.name_folded = $1 AND lower(n.name) = $2 AND NOT $3)
+         ORDER BY a.name_folded COLLATE \"C\", lower(n.name) COLLATE \"C\"
+         LIMIT $4"
     ))
+    .bind(after.map(|key| key.owner.as_str()))
+    .bind(after.map(|key| key.name.as_str()))
+    .bind(after.is_some_and(|key| key.stored))
+    .bind((page_size.value() + 1) as i64)
     .fetch_all(pool)
     .await
     .map_err(query_error)?;
     rows.iter()
         .map(|row| {
+            let network = bnc_row(row)?;
+            let owner_key: String = row.get("owner_key");
             Ok(OwnedBncNetworkRow {
                 owner: row.get("owner"),
-                network: bnc_row(row)?,
+                key: BncInventoryKey::new(Some(&owner_key), &network.name, true),
+                network,
             })
         })
         .collect()
@@ -8281,9 +9014,11 @@ pub async fn delete_bnc_network(
     Ok(true)
 }
 
-/// Rows to retain per (owner, network) in `bnc_buffer`. Only the newest are
-/// ever replayed (see `PRELOAD_LIMIT`); the rest are dead weight.
-const BNC_BUFFER_CAP: i64 = 5000;
+/// Rows to retain per (owner, network) in `bnc_buffer`: the largest
+/// `buffer_cap` a network may have ([`crate::config::MAX_NETWORK_BUFFER_CAP`]),
+/// so a start can restore any network's whole replay buffer, and CHATHISTORY
+/// reaches that far back for every network whatever its buffer holds.
+const BNC_BUFFER_CAP: i64 = crate::config::MAX_NETWORK_BUFFER_CAP as i64;
 
 /// Bytes of lines to retain per (owner, network) in `bnc_buffer`: the row cap
 /// at [`crate::bouncer::BACKLOG_BYTES_PER_LINE`] a line, the rate the
@@ -8394,7 +9129,9 @@ pub async fn open_bnc_buffer(
 /// Append one upstream line to a network's persisted buffer, extracting the
 /// conversation target for CHATHISTORY queries: classified and keyed by the
 /// network's own naming rules (`names`), with its name kept as the network
-/// spelled it.
+/// spelled it. `own_nick` is the session's own nick when the line was said
+/// (`None` before the session had one), recorded with the line so a restore
+/// can start its replay under it (migration 0096).
 pub async fn persist_bnc_line(
     pool: &PgPool,
     buffer: &BncBuffer,
@@ -8408,8 +9145,9 @@ pub async fn persist_bnc_line(
     let sent_at = bnc_line_sent_at(line);
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at,
-                                 target_display, target_casemapping)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                 target_display, target_casemapping, own_nick,
+                                 own_nick_recorded)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)",
     )
     .bind(&buffer.key.owner)
     .bind(&buffer.key.network)
@@ -8420,6 +9158,7 @@ pub async fn persist_bnc_line(
     .bind(sent_at)
     .bind(display)
     .bind(names.casemapping().isupport_token())
+    .bind(own_nick)
     .execute(pool)
     .await
     .map_err(query_error)?;
@@ -8630,29 +9369,75 @@ pub async fn recent_bnc_lines(
     Ok(recent_bnc_backlog(pool, owner, network, limit)
         .await?
         .into_iter()
-        .map(|(line, _)| line)
+        .map(|stored| stored.line)
         .collect())
 }
 
-/// [`recent_bnc_lines`], each with the time it was stored under (its `time`
-/// tag, or its arrival), for a ring restored from storage.
+/// The session's own nick as a stored backlog line recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredOwnNick {
+    /// Stored before migration 0096, which recorded none.
+    NotRecorded,
+    /// Said before the session had a nick: the bouncer's own notices before
+    /// the upstream welcomed it.
+    NoNick,
+    /// Said while the session's own nick was this.
+    Nick(String),
+}
+
+/// One stored backlog line, for a ring restored from storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBacklogLine {
+    pub line: String,
+    /// The time it was stored under: its `time` tag, or its arrival.
+    pub stored_at: String,
+    pub own_nick: StoredOwnNick,
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredBacklogRow {
+    line: String,
+    stored_at: String,
+    own_nick: Option<String>,
+    own_nick_recorded: bool,
+}
+
+impl From<StoredBacklogRow> for StoredBacklogLine {
+    fn from(row: StoredBacklogRow) -> Self {
+        // The table's constraint holds a nick only on a row that recorded one.
+        let own_nick = match (row.own_nick_recorded, row.own_nick) {
+            (false, _) => StoredOwnNick::NotRecorded,
+            (true, None) => StoredOwnNick::NoNick,
+            (true, Some(nick)) => StoredOwnNick::Nick(nick),
+        };
+        Self {
+            line: row.line,
+            stored_at: row.stored_at,
+            own_nick,
+        }
+    }
+}
+
+/// [`recent_bnc_lines`], each with the time it was stored under and the
+/// session's own nick when it was said, for a ring restored from storage.
 pub async fn recent_bnc_backlog(
     pool: &PgPool,
     owner: &str,
     network: &str,
     limit: i64,
-) -> Result<Vec<(String, String)>, DbError> {
+) -> Result<Vec<StoredBacklogLine>, DbError> {
     let key = BncBufferKey::new(owner, network);
     // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
     // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
     // backward and filters out every other buffer's newer lines, so a quiet
     // buffer's replay cost grew with everyone else's traffic. A row from
     // before `sent_at` existed has its arrival.
-    sqlx::query_as(
+    let rows: Vec<StoredBacklogRow> = sqlx::query_as(
         "SELECT line,
                 coalesce(sent_at,
                          to_char(created_at AT TIME ZONE 'UTC',
-                                 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))
+                                 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) AS stored_at,
+                own_nick, own_nick_recorded
          FROM bnc_buffer
          WHERE id = ANY(ARRAY(
              SELECT id FROM bnc_buffer
@@ -8665,7 +9450,8 @@ pub async fn recent_bnc_backlog(
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    Ok(rows.into_iter().map(StoredBacklogLine::from).collect())
 }
 
 // ---- BNC CHATHISTORY queries ---------------------------------------------
@@ -9430,7 +10216,7 @@ pub const MAX_BROWSER_SESSIONS_PER_ACCOUNT: usize = 32;
 /// caller; only its SHA-256 is stored. The session expires after 14 days.
 pub async fn create_web_session(
     pool: &PgPool,
-    account: &str,
+    account: &VerifiedAccount,
     user_agent: Option<&SessionUserAgent>,
 ) -> Result<String, DbError> {
     create_web_session_with_identity(pool, account, OidcSessionIdentity::default(), user_agent)
@@ -9442,10 +10228,11 @@ pub async fn create_web_session(
 /// in.
 pub async fn create_web_session_with_identity(
     pool: &PgPool,
-    account: &str,
+    account: &VerifiedAccount,
     identity: OidcSessionIdentity<'_>,
     user_agent: Option<&SessionUserAgent>,
 ) -> Result<String, DbError> {
+    let account = account.name();
     let OidcSessionIdentity {
         id_token,
         provider,
@@ -10034,10 +10821,16 @@ async fn mint_api_token_under_cap(
     Ok(token)
 }
 
-/// Resolve a PAT to its account, if valid and unexpired.
-pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<String>, DbError> {
-    sqlx::query_scalar(
-        "SELECT a.name FROM api_tokens t
+/// Resolve a PAT that may sign in to IRC to its account and itself, if valid
+/// and unexpired.
+pub async fn api_token_account(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<VerifiedSignIn>, DbError> {
+    let row: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT a.name, t.id,
+                (EXTRACT(EPOCH FROM (t.expires_at - now())) * 1000)::BIGINT
+         FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
            AND t.expires_at > now()
@@ -10048,7 +10841,16 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    Ok(row.map(|(name, id, remaining_ms)| VerifiedSignIn {
+        account: VerifiedAccount(name),
+        credential: crate::identity::CredentialId::Issued(
+            crate::identity::IssuedCredential::ApiToken(id),
+        ),
+        expires_in: Some(std::time::Duration::from_millis(
+            remaining_ms.max(0).unsigned_abs(),
+        )),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10261,6 +11063,42 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
 }
 
 #[cfg(test)]
+mod inventory_cursor_tests {
+    use super::BncInventoryKey;
+
+    /// The administrator inventory's cursor is the sort key, written and read
+    /// back exactly: shared networks first, a configured network before a
+    /// stored one of the same key, and a spelling that is not a folded key —
+    /// or not a key at all — refused rather than read as another position.
+    #[test]
+    fn inventory_cursor_round_trips_orders_and_refuses_other_text() {
+        let shared = BncInventoryKey::new(None, "Libera", false);
+        let configured = BncInventoryKey::new(Some("Alice"), "Libera", false);
+        let stored = BncInventoryKey::new(Some("alice"), "libera", true);
+        assert!(shared < configured && configured < stored);
+        for key in [&shared, &configured, &stored] {
+            assert_eq!(
+                BncInventoryKey::parse_cursor(&key.cursor()).as_ref(),
+                Some(key)
+            );
+        }
+        assert_eq!(stored.cursor(), "alice/libera/stored");
+        assert_eq!(shared.cursor(), "/libera/configured");
+        for refused in [
+            "",
+            "alice/libera",
+            "alice/libera/running",
+            "Alice/libera/stored",
+            "alice/Libera/stored",
+            "alice/../stored",
+            "alice//stored",
+        ] {
+            assert_eq!(BncInventoryKey::parse_cursor(refused), None, "{refused}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod pool_size_tests {
     use super::{DatabasePoolSize, MAX_CONCURRENT_ARGON2};
 
@@ -10282,6 +11120,34 @@ mod pool_size_tests {
         let parsed: DatabasePoolSize = serde_json::from_str("48").expect("in bounds");
         assert_eq!(parsed.get(), 48);
         assert!(serde_json::from_str::<DatabasePoolSize>("0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod fence_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_fenced_process_s_refused_or_timed_out_pool_names_the_lease() {
+        let why = "held by 10.0.0.2 pid 7, e6ircd 0.1.0";
+        let fenced = classify_query_error(sqlx::Error::PoolTimedOut, Some(why));
+        assert!(matches!(&fenced, DbError::NotServing(reason) if reason == why));
+        assert!(
+            fenced
+                .to_string()
+                .starts_with("this process no longer holds the serving lease (held by 10.0.0.2"),
+            "{fenced}"
+        );
+        // Serving still: a timeout is a timeout.
+        assert!(matches!(
+            classify_query_error(sqlx::Error::PoolTimedOut, None),
+            DbError::Query(sqlx::Error::PoolTimedOut)
+        ));
+        // Fenced, but an unrelated failure is itself.
+        assert!(matches!(
+            classify_query_error(sqlx::Error::RowNotFound, Some(why)),
+            DbError::Query(sqlx::Error::RowNotFound)
+        ));
     }
 }
 
@@ -10537,6 +11403,38 @@ mod history_sql_tests {
     /// `ts_millis` alias is load-bearing — the computed column needs a name to
     /// bind to. A silent change here would be a runtime bind failure on every
     /// history read, so it is pinned rather than trusted.
+    /// Every migration that runs outside a transaction is one concurrent index
+    /// build whose index can be named, so an interrupted build can be undone;
+    /// anything else in such a file is refused.
+    #[test]
+    fn a_migration_outside_a_transaction_is_one_concurrent_index_build() {
+        let outside: Vec<_> = super::MIGRATOR.iter().filter(|m| m.no_tx).collect();
+        assert!(!outside.is_empty());
+        for migration in outside {
+            assert!(
+                super::concurrent_index_name(migration.sql.as_str()).is_some(),
+                "migration {}",
+                migration.version
+            );
+        }
+        assert_eq!(
+            super::concurrent_index_name(
+                "-- no-transaction\n-- why\nCREATE UNIQUE INDEX CONCURRENTLY a_idx\n    ON t (c);\n"
+            )
+            .as_deref(),
+            Some("a_idx")
+        );
+        for refused in [
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY a_idx ON t (c); DROP INDEX b_idx;",
+            "-- no-transaction\nCREATE INDEX a_idx ON t (c);",
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY IF NOT EXISTS a_idx ON t (c);",
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY \"A\" ON t (c);",
+            "-- no-transaction\nVACUUM messages;",
+        ] {
+            assert_eq!(super::concurrent_index_name(refused), None, "{refused}");
+        }
+    }
+
     #[test]
     fn history_select_expands_to_the_expected_statement() {
         let prefix = "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
@@ -10574,13 +11472,16 @@ mod history_sql_tests {
                 "the millis column is aliased so FromRow can bind it by name: {sql}"
             );
             assert_eq!(
-                sql.matches("ts, id").count(),
+                sql.matches("client_tags, ts ").count(),
                 2,
-                "both halves carry ordering columns"
+                "both halves carry the ordering column"
             );
             assert_eq!(sql.matches("kind <> 'tagmsg'").count(), cuts, "{sql}");
             assert_eq!(sql.matches("client_tags").count(), 3, "{sql}");
-            assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
+            assert!(
+                sql.trim_end()
+                    .ends_with(r#"ORDER BY ts ASC, msgid COLLATE "C" ASC"#)
+            );
             assert!(sql.contains("UNION ALL"));
         }
     }

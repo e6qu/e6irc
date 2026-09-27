@@ -279,6 +279,21 @@ impl TestServer {
         conn
     }
 
+    /// All queued output lines for a connection exactly as sent, CRLF
+    /// included — for a test that counts bytes, which [`Self::drain`]'s
+    /// trimming would change.
+    fn drain_wire(&mut self, conn: ConnId) -> Vec<String> {
+        let rx = &mut self
+            .conns
+            .iter_mut()
+            .find(|(c, _)| *c == conn)
+            .expect("conn")
+            .1;
+        std::iter::from_fn(|| rx.try_pop())
+            .map(|env| String::from_utf8(env.payload.0.to_vec()).expect("utf8"))
+            .collect()
+    }
+
     /// All queued output lines for a connection, CRLF stripped.
     fn drain(&mut self, conn: ConnId) -> Vec<String> {
         let rx = &mut self
@@ -299,12 +314,30 @@ impl TestServer {
 
 /// Identify a connection to an account via the NickServ flow.
 fn identify(s: &mut TestServer, conn: ConnId, account: &str) {
+    identify_with(
+        s,
+        conn,
+        account,
+        e6ircd::identity::CredentialId::AccountPassword,
+    );
+}
+
+/// Identify a connection to an account via the NickServ flow, with the store
+/// answering that `credential` verified.
+fn identify_with(
+    s: &mut TestServer,
+    conn: ConnId,
+    account: &str,
+    credential: e6ircd::identity::CredentialId,
+) {
     s.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
+            credential,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -648,11 +681,11 @@ fn privmsg_to_nick_and_errors() {
         s.drain(bob),
         vec![":alice!alice@host1.example PRIVMSG bob :psst"]
     );
-    // case-insensitive target
+    // case-insensitive target, relayed as the recipient's own nick (Solanum)
     s.line(alice, "PRIVMSG BOB :again");
     assert_eq!(
         s.drain(bob),
-        vec![":alice!alice@host1.example PRIVMSG BOB :again"]
+        vec![":alice!alice@host1.example PRIVMSG bob :again"]
     );
 
     s.line(alice, "PRIVMSG ghost :anyone?");
@@ -682,7 +715,7 @@ fn notice_never_generates_errors() {
 
 #[test]
 fn part_and_quit_broadcast() {
-    let mut s = TestServer::new();
+    let mut s = server_with_moving_clock();
     let alice = s.register(1, "alice");
     let bob = s.register(2, "bob");
     for c in [alice, bob] {
@@ -708,6 +741,8 @@ fn part_and_quit_broadcast() {
     s.line(bob, "JOIN #room");
     s.drain(bob);
     s.drain(alice);
+    // Old enough that its QUIT comment is shown (`anti_spam_exit_message_time`).
+    advance_mono(ANTI_SPAM_EXIT_MESSAGE_MS);
     s.line(bob, "QUIT :bye");
     let bob_out = s.drain(bob);
     assert!(
@@ -1487,6 +1522,121 @@ fn motd_and_lusers_commands() {
     assert!(has_numeric(&out, "251") && has_numeric(&out, "255"));
 }
 
+/// The longest description and motd line the configuration admits arrive
+/// whole at the longest server name and nickname, and one byte more would not:
+/// the bounds are the replies' own room, so neither text is ever clipped by
+/// the numeric's wire fit.
+#[test]
+fn the_longest_admitted_description_and_motd_line_arrive_whole() {
+    use e6ircd::config::{
+        MAX_DESCRIPTION_LEN, MAX_MOTD_LINE_LEN, MAX_NICKLEN, MAX_SERVER_NAME_LEN,
+    };
+    let server_name = format!(
+        "{}.example",
+        "s".repeat(MAX_SERVER_NAME_LEN - ".example".len())
+    );
+    let description = "d".repeat(MAX_DESCRIPTION_LEN);
+    let motd = "m".repeat(MAX_MOTD_LINE_LEN);
+    let mut s = TestServer::configured(
+        false,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.server_name = server_name.clone();
+            config.nicklen = MAX_NICKLEN;
+            config.description = description.clone();
+            config.motd = vec![motd.clone()];
+        },
+    );
+    let nick = format!("n{}", "x".repeat(MAX_NICKLEN - 1));
+    let c = s.register(1, &nick);
+    s.drain(c);
+    for (command, numeric, text) in [("LINKS", "364", &description), ("MOTD", "372", &motd)] {
+        s.line(c, command);
+        let reply = s
+            .drain(c)
+            .into_iter()
+            .find(|line| line.split(' ').nth(1) == Some(numeric))
+            .unwrap_or_else(|| panic!("{command} answers {numeric}"));
+        assert!(
+            reply.ends_with(text.as_str()),
+            "{command} was clipped: {reply}"
+        );
+        assert_eq!(
+            reply.len(),
+            e6irc_proto::message::MAX_LINE_LEN - 2,
+            "{command}'s reply fills the line exactly, so one byte more would be clipped"
+        );
+    }
+}
+
+/// The largest MOTD the configuration admits — long lines or many short ones,
+/// at the longest server name and nickname — takes exactly the bytes the
+/// bound counts (`motd_reply_bytes`, half the smallest SendQ), and reaches a
+/// client that has not read a byte whole, with the rest of its registration
+/// burst, within the smallest SendQ a connection can have.
+#[test]
+fn the_largest_admitted_motd_fits_the_smallest_sendq_at_registration() {
+    use e6ircd::config::{
+        MAX_MOTD_BYTES, MAX_MOTD_LINE_LEN, MAX_MOTD_LINES_BYTES, MAX_NICKLEN, MAX_SERVER_NAME_LEN,
+        MIN_SENDQ_BYTES, MOTD_LINE_REPLY_OVERHEAD, motd_reply_bytes,
+    };
+    let server_name = format!(
+        "{}.example",
+        "s".repeat(MAX_SERVER_NAME_LEN - ".example".len())
+    );
+    let long = MAX_MOTD_LINE_LEN + MOTD_LINE_REPLY_OVERHEAD;
+    let mut long_lines = vec!["m".repeat(MAX_MOTD_LINE_LEN); 15];
+    long_lines.push("m".repeat(MAX_MOTD_LINES_BYTES - 15 * long - 2 * MOTD_LINE_REPLY_OVERHEAD));
+    long_lines.push(String::new());
+    let short = 1 + MOTD_LINE_REPLY_OVERHEAD;
+    let mut short_lines = vec!["m".to_string(); MAX_MOTD_LINES_BYTES / short];
+    short_lines.push("m".repeat(MAX_MOTD_LINES_BYTES % short - MOTD_LINE_REPLY_OVERHEAD));
+    for motd in [long_lines, short_lines] {
+        assert_eq!(motd_reply_bytes(&motd), MAX_MOTD_BYTES);
+        let lines = motd.len();
+        let mut s = TestServer::configured(
+            false,
+            || Millis::from_millis(1_000_000_000),
+            |config| {
+                config.server_name = server_name.clone();
+                config.nicklen = MAX_NICKLEN;
+                config.sendq_bytes = MIN_SENDQ_BYTES;
+                config.motd = motd;
+            },
+        );
+        let nick = format!("n{}", "x".repeat(MAX_NICKLEN - 1));
+        let c = s.connect_from(
+            1,
+            &format!("{}.example", "h".repeat(60)),
+            e6ircd::core::ConnectionTransport::Tcp,
+        );
+        s.line(c, &format!("NICK {nick}"));
+        s.line(c, &format!("USER {nick} 0 * :{}", "r".repeat(200)));
+        let burst = s.drain_wire(c);
+        let numeric = |line: &String| line.split(' ').nth(1).map(str::to_owned);
+        let motd_bytes: usize = burst
+            .iter()
+            .filter(|line| matches!(numeric(line).as_deref(), Some("375" | "372" | "376")))
+            .map(String::len)
+            .sum();
+        assert_eq!(
+            burst
+                .iter()
+                .filter(|line| numeric(line).as_deref() == Some("372"))
+                .count(),
+            lines,
+            "{burst:#?}"
+        );
+        assert_eq!(motd_bytes, MAX_MOTD_BYTES, "the bound counts what is sent");
+        let bytes: usize = burst.iter().map(String::len).sum();
+        assert!(
+            bytes - motd_bytes <= MIN_SENDQ_BYTES / 2,
+            "the rest of the burst is {} bytes",
+            bytes - motd_bytes
+        );
+    }
+}
+
 // ---- IRCv3 capability negotiation ---------------------------------------
 
 #[test]
@@ -1612,6 +1762,8 @@ fn sasl_abort_then_reauth_does_not_cross_wire_the_stale_verify() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2001,6 +2153,8 @@ fn sasl_plain_success_flow() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2047,6 +2201,8 @@ fn sasl_login(s: &mut TestServer, conn: ConnId, account: &str) {
         conn,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2236,7 +2392,7 @@ fn sasl_verification_attempts_are_capped_per_connection() {
     assert!(
         s.drain(c)
             .iter()
-            .any(|l| l.contains("too many authentication attempts")),
+            .any(|l| l.contains("Too many authentication attempts")),
         "connection must be closed after too many attempts"
     );
 }
@@ -2260,7 +2416,7 @@ fn malformed_sasl_attempts_spend_the_same_connection_budget() {
     let out = s.drain(c);
     assert!(
         out.iter().any(|line| line.contains("ERROR")
-            && line.contains("too many authentication attempts")),
+            && line.contains("Too many authentication attempts")),
         "the malformed path must not bypass the connection budget: {out:?}"
     );
     assert!(s.db_requests().is_empty());
@@ -3034,7 +3190,7 @@ fn sasl_unknown_mechanism_gets_908() {
 fn nickserv_register_creates_account() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
-    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter22");
     let req = s.db_requests();
     assert_eq!(
         req,
@@ -3042,7 +3198,9 @@ fn nickserv_register_creates_account() {
             conn: alice,
             name: "alice".into(),
             contact_email: None,
-            password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("hunter22")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -3083,7 +3241,8 @@ fn account_registration_persists_only_valid_normalized_contact_email() {
                 e6ircd::identity::ContactEmail::parse("Alice+IRC@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("correct-horse-battery")
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("correct-horse-battery")
                 .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::RegisterCommand,
         }]
@@ -3118,7 +3277,7 @@ fn register_fail_clips_the_echoed_account_name() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.drain(alice);
-    s.line(alice, &format!("REGISTER {} * hunter2", "a".repeat(480)));
+    s.line(alice, &format!("REGISTER {} * hunter22", "a".repeat(480)));
     let out = s.drain(alice);
     let fail = out
         .iter()
@@ -3135,7 +3294,7 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
     let alice = s.register(1, "alice");
     s.line(
         alice,
-        "PRIVMSG NickServ :REGISTER hunter2 Alice@Example.COM",
+        "PRIVMSG NickServ :REGISTER hunter22 Alice@Example.COM",
     );
     assert_eq!(
         s.db_requests(),
@@ -3146,14 +3305,16 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
                 e6ircd::identity::ContactEmail::parse("Alice@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("hunter22")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
 
     s.line(
         alice,
-        "PRIVMSG NickServ :REGISTER hunter2 alice@example.com ignored",
+        "PRIVMSG NickServ :REGISTER hunter22 alice@example.com ignored",
     );
     assert!(s.db_requests().is_empty());
     assert!(
@@ -3173,7 +3334,7 @@ fn nickserv_register_duplicate_and_syntax() {
     assert!(out[0].contains("Syntax"), "{out:#?}");
     assert!(s.db_requests().is_empty());
 
-    s.line(alice, "PRIVMSG NickServ :REGISTER pw");
+    s.line(alice, "PRIVMSG NickServ :REGISTER password");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
@@ -3217,6 +3378,8 @@ fn overlapping_identify_is_refused_not_silently_dropped() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3246,6 +3409,8 @@ fn nickserv_identify_flow() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3285,6 +3450,8 @@ fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "eve".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3299,6 +3466,8 @@ fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3353,6 +3522,8 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3451,7 +3622,7 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     let req = s.db_requests();
     assert!(
         matches!(
@@ -3495,11 +3666,11 @@ fn second_register_while_first_pending_is_refused() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     let first = s.db_requests();
     assert_eq!(first.len(), 1, "first REGISTER enqueues one CreateAccount");
     // Second REGISTER before the first resolves.
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     assert!(
         s.db_requests().is_empty(),
         "a duplicate in-flight REGISTER must not enqueue a second CreateAccount"
@@ -3539,7 +3710,7 @@ fn labeled_register_reply_carries_the_label() {
 
     // A labeled REGISTER must not be ACKed synchronously as empty — the answer
     // is still in flight. Nothing should come back until the DB replies.
-    s.line(alice, "@label=reg1 REGISTER * * hunter2");
+    s.line(alice, "@label=reg1 REGISTER * * hunter22");
     let out = s.drain(alice);
     assert!(
         out.is_empty(),
@@ -3575,7 +3746,7 @@ fn labeled_register_reply_carries_the_label() {
         "batch labeled-response draft/account-registration",
     );
     s.drain(bob);
-    s.line(bob, "@label=reg2 REGISTER * * hunter2");
+    s.line(bob, "@label=reg2 REGISTER * * hunter22");
     assert!(
         s.drain(bob).is_empty(),
         "labeled REGISTER is held for its async reply"
@@ -3617,6 +3788,8 @@ fn labeled_identify_verdict_carries_the_label() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3683,7 +3856,7 @@ fn nickserv_identify_spends_the_shared_credential_budget() {
     let out = s.drain(alice);
     assert!(
         out.iter()
-            .any(|l| l.contains("ERROR") && l.contains("too many authentication attempts")),
+            .any(|l| l.contains("ERROR") && l.contains("Too many authentication attempts")),
         "the ninth credential attempt must close the connection: {out:#?}"
     );
 }
@@ -3786,6 +3959,8 @@ fn chanserv_register_flow() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4011,6 +4186,8 @@ fn chanserv_flags_rejects_an_unknown_flag() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4094,6 +4271,8 @@ fn chanserv_register_requires_op() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4257,6 +4436,8 @@ fn whox_full_fields_with_account() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5396,7 +5577,7 @@ fn away_noop_is_not_rebroadcast() {
 
 #[test]
 fn account_notify_and_tag() {
-    let mut s = TestServer::new();
+    let mut s = server_with_moving_clock();
     let alice = register_with_caps(&mut s, 1, "alice", "account-notify account-tag");
     let bob = s.register(2, "bob");
     for c in [alice, bob] {
@@ -5411,6 +5592,8 @@ fn account_notify_and_tag() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5436,6 +5619,9 @@ fn account_notify_and_tag() {
         ("NICK bobby", ":bob!bob@host2.example NICK bobby"),
         ("QUIT :done", ":bobby!bob@host2.example QUIT :Quit: done"),
     ] {
+        if command.starts_with("QUIT") {
+            advance_mono(ANTI_SPAM_EXIT_MESSAGE_MS);
+        }
         s.line(bob, command);
         let got = s.drain(alice);
         // AWAY reaches alice only with away-notify, which she lacks.
@@ -5462,6 +5648,8 @@ fn account_tag_on_mode_and_kick_but_not_server_lines() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5508,6 +5696,8 @@ fn account_notify_fires_on_post_registration_sasl() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -7156,7 +7346,7 @@ fn kill_requires_oper() {
         s.drain(bob),
         [
             ":alice!alice@host1.example KILL bob :bye",
-            "ERROR :Closing Link: irc.test.example (Killed (alice (bye)))",
+            "ERROR :Closing Link: host2.example (Killed (alice (bye)))",
         ]
     );
     assert!(
@@ -7325,7 +7515,7 @@ fn account_creation_is_rate_limited_per_ip() {
         host: "shared-ip".into(),
         transport: e6ircd::core::ConnectionTransport::Tcp,
     });
-    for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * pw"] {
+    for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * password"] {
         core.handle(Input::Line {
             conn,
             line: line.as_bytes().to_vec(),
@@ -7347,7 +7537,7 @@ fn account_creation_is_rate_limited_per_ip() {
     // the worker.
     core.handle(Input::Line {
         conn,
-        line: b"REGISTER * * pw".to_vec(),
+        line: b"REGISTER * * password".to_vec(),
     });
     let creates = std::iter::from_fn(|| db_rx.try_pop())
         .filter(|env| matches!(env.payload, e6ircd::core::DbRequest::CreateAccount { .. }))
@@ -7632,7 +7822,7 @@ fn nickserv_register_db_unavailable_notifies() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
-    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter22");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
@@ -9374,7 +9564,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.drain(alice);
-    s.line(alice, "REGISTER bob * hunter2");
+    s.line(alice, "REGISTER bob * hunter22");
     let out = s.drain(alice);
     assert!(
         out.iter()
@@ -9388,7 +9578,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
 
     // `*` and the caller's own nick both name the caller's account.
     for arg in ["*", "alice"] {
-        s.line(alice, &format!("REGISTER {arg} * hunter2"));
+        s.line(alice, &format!("REGISTER {arg} * hunter22"));
         s.drain(alice);
         assert_eq!(
             s.db_requests(),
@@ -9396,7 +9586,9 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
                 conn: alice,
                 name: "alice".into(),
                 contact_email: None,
-                password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
+                password: e6ircd::identity::PasswordPolicy::default()
+                    .new_password("hunter22")
+                    .expect("valid password"),
                 origin: e6ircd::core::AccountOrigin::RegisterCommand,
             }],
             "REGISTER {arg} must register the caller's own nick"
@@ -9423,7 +9615,7 @@ fn register_before_connect_is_refused_unless_enabled() {
     let conn = s.connect(1);
     s.line(conn, "NICK earlybird");
     s.drain(conn);
-    s.line(conn, "REGISTER * * hunter2");
+    s.line(conn, "REGISTER * * hunter22");
     let out = s.drain(conn);
     assert!(
         out.iter()
@@ -9441,7 +9633,7 @@ fn register_reply_waits_behind_nothing_but_arrives_in_order() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.drain(alice);
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     s.line(alice, "PING :sync");
     let before = s.drain(alice);
     assert!(
@@ -9503,6 +9695,40 @@ fn a_few_huge_lines_overrun_the_sendq_by_bytes() {
     // A queue of TEST_SENDQ_BYTES holds about thirty such lines; counting
     // lines, it took 256 of them.
     assert!(sent <= TEST_SENDQ_BYTES / 4_000 + 1, "{sent} lines");
+}
+
+/// A client killed for SendQ exceeded is sent its closing ERROR and nothing
+/// else: the backlog it could not take is discarded, as Solanum does, rather
+/// than drained to it for as long as it trickles.
+#[test]
+fn a_sendq_kill_discards_the_backlog_and_sends_only_the_closing_error() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    s.drain(alice);
+    s.drain(bob);
+    let text = "x".repeat(400);
+    let mut sent = 0;
+    loop {
+        s.line(alice, &format!("PRIVMSG #c :{text}"));
+        sent += 1;
+        let killed = s
+            .drain(alice)
+            .iter()
+            .any(|line| line.starts_with(":bob!") && line.contains(" QUIT "));
+        if killed {
+            break;
+        }
+        assert!(sent < 10_000, "bob was never killed for SendQ");
+    }
+    assert_eq!(
+        s.drain(bob),
+        ["ERROR :Closing Link: host2.example (SendQ exceeded)"],
+        "only the closing line is left in the killed client's queue"
+    );
 }
 
 #[test]
@@ -9976,6 +10202,8 @@ fn an_identify_in_flight_at_the_deadline_defers_the_rename() {
         conn: late,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -12991,7 +13219,7 @@ fn registering_an_account_frees_the_conversations_of_the_unauthenticated_nick() 
     let bob = s.register(2, "bob");
     s.line(alice, "PRIVMSG bob :the secret");
     s.drain(bob);
-    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter22");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
@@ -13180,10 +13408,11 @@ fn channels_per_session_is_capped() {
     );
     // The refused target is the client's own text, echoed as one parameter:
     // a trailing-form target with a space is the `*` placeholder, not two.
+    // A name no channel may have is refused as that before the limit.
     s.line(a, "JOIN :#one more");
     assert_eq!(
         s.drain(a),
-        [":irc.test.example 405 alice * :You have joined too many channels"],
+        [":irc.test.example 479 alice * :Illegal channel name"],
     );
 }
 
@@ -14139,6 +14368,8 @@ fn account_tag_value_is_escaped() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "a\\b".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14503,6 +14734,8 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
         conn: late,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14552,6 +14785,214 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
     assert_eq!(page.entries.len(), 1, "reactivation removes the live gate");
 }
 
+/// A connection that authenticated with SASL but has not ended CAP
+/// negotiation, so it holds the account without being registered.
+fn sasl_authenticated_unregistered(s: &mut TestServer, id: u64, account: &str) -> ConnId {
+    let c = s.connect(id);
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(
+        c,
+        &format!("AUTHENTICATE {}", b64(&format!("\0{account}\0pw"))),
+    );
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: account.into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert!(has_numeric(&s.drain(c), "903"));
+    c
+}
+
+/// The suspension sweep closes a connection that authenticated but had not
+/// registered yet: it used to be skipped for want of a nick to KILL, and then
+/// registered as the suspended account.
+#[test]
+fn account_suspension_closes_an_authenticated_session_still_registering() {
+    let mut server = TestServer::new();
+    let registering = sasl_authenticated_unregistered(&mut server, 10, "alice");
+    let suspended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::SetAccountSuspended {
+            account: "alice".into(),
+            suspended: true,
+            reason: "Account suspended".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(
+        matches!(suspended, e6ircd::core::AdminReply::Ok(message) if message.contains("Disconnected 1"))
+    );
+    let out = server.drain(registering);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with("ERROR") && line.contains("Account suspended")),
+        "{out:#?}"
+    );
+    server.line(registering, "NICK alice");
+    server.line(registering, "USER a 0 * :A");
+    server.line(registering, "CAP END");
+    assert!(
+        !has_numeric(&server.drain(registering), "001"),
+        "the closed session does not go on to register"
+    );
+}
+
+/// A password change ends every live session of the account — registered or
+/// still registering — and refuses a verdict for a check queued before it,
+/// without the lasting gate a suspension installs: a check queued afterwards
+/// read the new credentials and logs in.
+#[test]
+fn a_password_change_ends_the_accounts_sessions_and_its_in_flight_verdicts() {
+    use e6ircd::core::AdminReply;
+    let mut server = TestServer::new();
+    let registered = server.register(10, "AliceOne");
+    identify(&mut server, registered, "Alice");
+    let registering = sasl_authenticated_unregistered(&mut server, 20, "ALICE");
+    let bob = server.register(30, "Bob");
+    identify(&mut server, bob, "Bob");
+    // A password checked before the change, whose verdict lands after it.
+    let raced = server.register(40, "Raced");
+    server.line(raced, "PRIVMSG NickServ :IDENTIFY Alice old-password");
+    server.db_requests();
+
+    let ended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::EndAccountSessions {
+            account: "alice".into(),
+            reason: "Password changed".into(),
+            actor: "alice".into(),
+        },
+    );
+    assert!(
+        matches!(&ended, AdminReply::Ok(message) if message.contains("Disconnected 2")),
+        "{ended:?}"
+    );
+    for connection in [registered, registering] {
+        assert!(
+            server
+                .drain(connection)
+                .iter()
+                .any(|line| line.contains("ERROR") && line.contains("Password changed")),
+            "every session of the account ends"
+        );
+    }
+    server.line(bob, "PING :still-here");
+    assert!(server.drain(bob).iter().any(|line| line.contains(" PONG ")));
+
+    server.core.handle(Input::DbReply {
+        conn: raced,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    assert!(
+        server
+            .drain(raced)
+            .iter()
+            .any(|line| line.contains("Invalid password")),
+        "a verdict for the old password is refused"
+    );
+    identify(&mut server, raced, "Alice");
+    server.line(raced, "WHOIS Raced");
+    assert!(
+        server
+            .drain(raced)
+            .iter()
+            .any(|line| line.contains(" 330 ") && line.contains("Alice")),
+        "a check queued after the change logs in: no gate stays"
+    );
+}
+
+/// Revoking app password A ends exactly the sessions A signed in — not the
+/// account's session signed in with its password, nor one signed in with app
+/// password B — and refuses a verdict for a check of A queued before the
+/// revocation, while a check of B queued alongside it still logs in.
+#[test]
+fn revoking_an_app_password_ends_exactly_the_sessions_it_signed_in() {
+    use e6ircd::core::AdminReply;
+    use e6ircd::identity::{CredentialId, IssuedCredential};
+    const APP_A: IssuedCredential = IssuedCredential::AppPassword(11);
+    const APP_B: IssuedCredential = IssuedCredential::AppPassword(12);
+    let mut server = TestServer::new();
+    let with_password = server.register(10, "AlicePw");
+    identify(&mut server, with_password, "Alice");
+    let with_a = server.register(20, "AliceA");
+    identify_with(&mut server, with_a, "Alice", CredentialId::Issued(APP_A));
+    let with_b = server.register(30, "AliceB");
+    identify_with(&mut server, with_b, "Alice", CredentialId::Issued(APP_B));
+    // Checks of A and of B queued before the revocation, landing after it.
+    let raced_a = server.register(40, "RacedA");
+    server.line(raced_a, "PRIVMSG NickServ :IDENTIFY Alice app-password-a");
+    server.db_requests();
+    let raced_b = server.register(50, "RacedB");
+    server.line(raced_b, "PRIVMSG NickServ :IDENTIFY Alice app-password-b");
+    server.db_requests();
+
+    let ended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::EndCredentialSessions { credential: APP_A },
+    );
+    assert!(
+        matches!(&ended, AdminReply::Ok(message) if message.contains("Disconnected 1")),
+        "{ended:?}"
+    );
+    let out = server.drain(with_a);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with("ERROR :Closing Link")
+                && line.contains("App password revoked")),
+        "{out:#?}"
+    );
+    for kept in [with_password, with_b] {
+        server.line(kept, "PING :still-here");
+        let out = server.drain(kept);
+        assert!(
+            out.iter().any(|line| line.contains(" PONG "))
+                && !out.iter().any(|l| l.starts_with("ERROR")),
+            "{out:#?}"
+        );
+    }
+
+    let verdict = |credential| e6ircd::core::DbReply::PasswordVerified {
+        account: "Alice".into(),
+        credential: CredentialId::Issued(credential),
+        expires_in: None,
+        origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+    };
+    server.core.handle(Input::DbReply {
+        conn: raced_a,
+        reply: verdict(APP_A),
+    });
+    assert!(
+        server
+            .drain(raced_a)
+            .iter()
+            .any(|line| line.contains("Invalid password")),
+        "a verdict for the revoked app password is refused"
+    );
+    server.core.handle(Input::DbReply {
+        conn: raced_b,
+        reply: verdict(APP_B),
+    });
+    server.line(raced_b, "WHOIS RacedB");
+    assert!(
+        server
+            .drain(raced_b)
+            .iter()
+            .any(|line| line.contains(" 330 ") && line.contains("Alice")),
+        "another app password's verdict still logs in"
+    );
+}
+
 #[test]
 fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
     let mut server = TestServer::new();
@@ -14563,6 +15004,8 @@ fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14811,7 +15254,7 @@ fn oper_guesses_spend_the_connection_credential_budget() {
     let out = s.drain(mallory);
     assert!(
         out.iter().any(|line| line.contains("ERROR")
-            && line.contains("too many authentication attempts")),
+            && line.contains("Too many authentication attempts")),
         "OPER must not be a password oracle without a budget: {out:?}"
     );
     // The link is gone: even the right password no longer reaches OPER.
@@ -16085,7 +16528,7 @@ fn account_creation_limit_counts_an_ipv6_slash_64_as_one_address() {
     s.line(op, "SETHOST alice cloaked.example");
     s.db_requests();
     for conn in [first, neighbour, elsewhere] {
-        s.line(conn, "PRIVMSG NickServ :REGISTER pw");
+        s.line(conn, "PRIVMSG NickServ :REGISTER password");
     }
     assert_eq!(created_accounts(&mut s), ["alice", "carol"]);
     assert!(
@@ -16108,14 +16551,14 @@ fn configured_administrator_names_cannot_be_registered_over_irc() {
         },
     );
     let root = s.register(1, "rOOt");
-    s.line(root, "PRIVMSG NickServ :REGISTER pw");
+    s.line(root, "PRIVMSG NickServ :REGISTER password");
     let out = s.drain(root);
     assert!(
         out.iter()
             .any(|line| line.starts_with(":NickServ!") && line.contains("reserved")),
         "{out:#?}"
     );
-    s.line(root, "REGISTER * * pw");
+    s.line(root, "REGISTER * * password");
     let out = s.drain(root);
     assert!(
         out.iter()
@@ -16125,7 +16568,7 @@ fn configured_administrator_names_cannot_be_registered_over_irc() {
     assert!(created_accounts(&mut s).is_empty());
     // Any other name registers as before.
     let alice = s.register(2, "alice");
-    s.line(alice, "PRIVMSG NickServ :REGISTER pw");
+    s.line(alice, "PRIVMSG NickServ :REGISTER password");
     assert_eq!(created_accounts(&mut s), ["alice"]);
 }
 
@@ -16548,7 +16991,7 @@ fn a_dline_matches_the_real_address_by_cidr_and_refuses_a_host_name() {
     let out = s.drain(bob);
     assert!(
         out.iter()
-            .any(|l| l == "ERROR :Closing Link: (D-Lined: bad netblock)"),
+            .any(|l| l == "ERROR :Closing Link: cloaked.example (D-Lined: bad netblock)"),
         "the cloaked user is D-lined, told only the public reason: {out:#?}"
     );
     // A new connection from the range is refused; one outside it is not.
@@ -16853,10 +17296,11 @@ fn knock_follows_solanum() {
 }
 
 /// QUIT's reason is Solanum's: `Quit: <comment>`, the nick when none was
-/// given, and nothing at all for an empty comment.
+/// given, and nothing at all for an empty comment — from a connection old
+/// enough for its comment to be shown.
 #[test]
 fn quit_reason_follows_solanum() {
-    let mut s = TestServer::new();
+    let mut s = server_with_moving_clock();
     let op = s.register(1, "op");
     s.line(op, "JOIN #c");
     for (id, nick, quit, seen) in [
@@ -16869,9 +17313,11 @@ fn quit_reason_follows_solanum() {
             ":dave!dave@host4.example QUIT :Quit: later",
         ),
     ] {
+        advance_mono(0);
         let who = s.register(id, nick);
         s.line(who, "JOIN #c");
         s.drain(op);
+        advance_mono(ANTI_SPAM_EXIT_MESSAGE_MS);
         s.line(who, quit);
         assert_eq!(s.drain(op), [seen], "{quit}");
     }
@@ -16893,6 +17339,8 @@ fn labeled_identify_with_echo_keeps_the_echo_in_its_response() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -16919,6 +17367,8 @@ fn every_login_path_sends_900_and_logout_sends_901() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -16937,7 +17387,7 @@ fn every_login_path_sends_900_and_logout_sends_901() {
     );
 
     let bob = s.register(2, "bob");
-    s.line(bob, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(bob, "PRIVMSG NickServ :REGISTER hunter22");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: bob,
@@ -16966,6 +17416,8 @@ fn sasl_success_sends_900_exactly_once() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -16990,6 +17442,8 @@ fn labeled_authenticate_is_answered_by_its_verdict() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -17041,6 +17495,8 @@ fn authenticate_during_verification_ends_the_attempt_once() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -17051,19 +17507,30 @@ fn authenticate_during_verification_ends_the_attempt_once() {
     );
 }
 
-/// `REGISTER` refuses a password no login surface would accept, with the
-/// spec's code, and enqueues nothing.
+/// `REGISTER` refuses a password shorter than eight characters — the empty one
+/// no login surface would accept among them — with the spec's code, and
+/// enqueues nothing. NickServ `REGISTER` applies the same rule.
 #[test]
-fn register_refuses_an_empty_password() {
+fn register_refuses_a_password_under_eight_characters() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.db_requests();
-    s.line(alice, "REGISTER * * :");
-    assert_eq!(
-        s.drain(alice),
-        [
-            ":irc.test.example FAIL REGISTER WEAK_PASSWORD alice :Passwords must contain 1–512 bytes."
-        ]
+    for short in ["REGISTER * * :", "REGISTER * * hunter2"] {
+        s.line(alice, short);
+        assert_eq!(
+            s.drain(alice),
+            [
+                ":irc.test.example FAIL REGISTER WEAK_PASSWORD alice :Passwords must be at least 8 characters and at most 512 bytes."
+            ],
+            "{short}"
+        );
+    }
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains("Passwords must be at least 8 characters")),
+        "NickServ REGISTER refuses it too"
     );
     assert!(s.db_requests().is_empty(), "no account is created");
 }
@@ -17083,7 +17550,7 @@ fn register_without_a_nick_needs_one() {
     s.line(c, "CAP LS 302");
     s.line(c, "CAP REQ :draft/account-registration");
     s.drain(c);
-    s.line(c, "REGISTER * * hunter2");
+    s.line(c, "REGISTER * * hunter22");
     let out = s.drain(c);
     assert_eq!(
         out,
@@ -17112,7 +17579,7 @@ fn register_after_a_refused_nick_says_the_name_is_taken() {
     s.line(c, "CAP REQ :draft/account-registration");
     s.line(c, "NICK root");
     s.drain(c);
-    s.line(c, "REGISTER * * hunter2");
+    s.line(c, "REGISTER * * hunter22");
     let out = s.drain(c);
     assert_eq!(
         out,
@@ -17121,7 +17588,7 @@ fn register_after_a_refused_nick_says_the_name_is_taken() {
     // Taking a nick settles it: the refusal no longer names the old one.
     s.line(c, "NICK other");
     s.drain(c);
-    s.line(c, "REGISTER * * hunter2");
+    s.line(c, "REGISTER * * hunter22");
     assert!(
         !s.drain(c)
             .iter()
@@ -17354,5 +17821,697 @@ fn chathistory_replays_client_only_tags_and_reactions() {
                 .expect("batched");
             expected.replace("1000000000-0-X", reference)
         }),
+    );
+}
+
+// ---- canonical targets, shared request parsing, conversation read markers --
+
+/// `line` without its leading `batch=` tag: a replayed line as it would have
+/// been delivered live.
+fn unbatched(line: &str) -> String {
+    let rest = line.strip_prefix("@batch=").expect("a batch tag");
+    match rest.split_once(';') {
+        Some((_, tags)) => format!("@{tags}"),
+        None => rest.split_once(' ').expect("a message").1.to_string(),
+    }
+}
+
+/// A message relayed to a channel or a user names the target as the server
+/// does — the channel's own name, the recipient's current nick — not as the
+/// sender spelled it (Solanum parity), and CHATHISTORY replays exactly the
+/// line that was delivered.
+#[test]
+fn live_and_replayed_messages_name_their_target_canonically() {
+    let mut s = TestServer::new_no_persistence();
+    let caps = "echo-message batch draft/chathistory server-time message-tags";
+    let bob = register_with_caps(&mut s, 2, "Bob", caps);
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    for conn in [bob, alice] {
+        s.line(conn, "JOIN #foo");
+    }
+    s.drain(bob);
+    s.drain(alice);
+
+    for (sent, canonical, replay_target) in [
+        ("PRIVMSG #FOO :hi", " PRIVMSG #foo :hi", "#FOO"),
+        ("PRIVMSG BOB :yo", " PRIVMSG Bob :yo", "bOB"),
+    ] {
+        s.line(alice, sent);
+        let recipient = s.drain(bob);
+        assert!(
+            recipient.iter().any(|line| line.ends_with(canonical)),
+            "{sent}: {recipient:#?}"
+        );
+        let echo = s.drain(alice);
+        let [live] = echo.as_slice() else {
+            panic!("{sent}: one echo: {echo:#?}");
+        };
+        assert!(live.ends_with(canonical), "{sent}: {live}");
+        s.line(alice, &format!("CHATHISTORY LATEST {replay_target} * 1"));
+        let page = s.drain(alice);
+        let replayed: Vec<String> = page
+            .iter()
+            .filter(|line| line.contains(" PRIVMSG "))
+            .map(|line| unbatched(line))
+            .collect();
+        assert_eq!(replayed, std::slice::from_ref(live), "{sent}: {page:#?}");
+    }
+
+    // A STATUSMSG keeps its sigil, before the channel's own name.
+    s.line(bob, "PRIVMSG @#FOO :ops");
+    let echo = s.drain(bob);
+    assert!(
+        echo.iter()
+            .any(|line| line.ends_with(" PRIVMSG @#foo :ops")),
+        "{echo:#?}"
+    );
+    // TAGMSG too.
+    s.line(alice, "@+draft/react=x TAGMSG #FOO");
+    assert!(
+        s.drain(bob)
+            .iter()
+            .any(|line| line.ends_with(" TAGMSG #foo")),
+        "a TAGMSG names the channel canonically"
+    );
+}
+
+/// The core and the bouncer parse CHATHISTORY selectors and MARKREAD
+/// parameters with one parser: an unknown reference type in either selector
+/// outranks a malformed value in the other, and a MARKREAD with a stray third
+/// parameter is refused rather than silently accepted.
+#[test]
+fn chathistory_and_markread_parameters_are_refused_as_the_bouncer_refuses_them() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/chathistory draft/read-marker");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(alice, "CHATHISTORY BETWEEN #c timestamp=bad foo=1 10");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example FAIL CHATHISTORY INVALID_MSGREFTYPE BETWEEN #c \
+          :Unknown message reference type"
+        ]
+    );
+    s.line(alice, "MARKREAD #c timestamp=2026-07-18T12:00:00.000Z junk");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example FAIL MARKREAD INVALID_PARAMS #c \
+          :Expected <target> [timestamp=<time>]"]
+    );
+    s.line(alice, "MARKREAD #c");
+    assert_eq!(s.drain(alice), [":irc.test.example MARKREAD #c *"]);
+}
+
+/// A logged-in reader's marker on a conversation is kept under the peer's
+/// identity — their account — as the conversation is, so it survives the
+/// peer's nick change.
+#[test]
+fn a_conversation_read_marker_follows_the_peer_across_a_nick_change() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    let bob = s.register(2, "bob");
+    identify(&mut s, bob, "robert");
+
+    s.line(alice, "MARKREAD bob timestamp=2026-07-18T12:00:00.000Z");
+    let request = confirm_read_marker(&mut s);
+    assert_eq!(request.target, "robert", "kept under the peer's account");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example MARKREAD bob timestamp=2026-07-18T12:00:00.000Z"]
+    );
+
+    s.line(bob, "NICK bobby");
+    s.drain(bob);
+    s.line(alice, "MARKREAD bobby");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example MARKREAD bobby timestamp=2026-07-18T12:00:00.000Z"]
+    );
+}
+
+/// A peer who has not authenticated is keyed as their conversation is, by
+/// `~nick`: whoever holds the nick next is someone else, and does not inherit
+/// the marker.
+#[test]
+fn an_unauthenticated_peers_read_marker_is_keyed_as_their_conversation_is() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    let carol = s.register(2, "carol");
+
+    s.line(alice, "MARKREAD carol timestamp=2026-07-18T12:00:00.000Z");
+    let request = confirm_read_marker(&mut s);
+    assert_eq!(request.target, "~carol");
+    s.drain(alice);
+
+    s.line(carol, "NICK carla");
+    s.drain(carol);
+    s.line(alice, "MARKREAD carla");
+    assert_eq!(s.drain(alice), [":irc.test.example MARKREAD carla *"]);
+}
+
+// ---- Solanum parity: names, idle, presence, throttles ---------------------
+
+/// Solanum's `anti_spam_exit_message_time` as Libera runs it, in milliseconds:
+/// a younger connection's QUIT comment is not shown.
+const ANTI_SPAM_EXIT_MESSAGE_MS: u64 = 5 * 60 * 1000;
+
+/// A channel name that would render as another's — a formatting control in it
+/// (`#lib\x0fera` shows as `#libera`), any other C0 control, DEL or U+00A0 —
+/// is refused with 479 ERR_BADCHANNAME, as Solanum refuses its fake-channel
+/// characters under `disable_fake_channels`, which Libera sets
+/// (`check_channel_name_loc` in `modules/core/m_join.c`). An over-long name is
+/// 479 as well; a name without `#` stays 403. Nothing is created.
+#[test]
+fn join_refuses_look_alike_and_over_long_channel_names() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let long = format!("#{}", "a".repeat(50));
+    for name in [
+        "#lib\x0fera",
+        "#lib\x02era",
+        "#lib\u{a0}era",
+        "#lib\x7fera",
+        &long,
+    ] {
+        s.line(alice, &format!("JOIN {name}"));
+        assert_eq!(
+            s.drain(alice),
+            [format!(
+                ":irc.test.example 479 alice {name} :Illegal channel name"
+            )],
+            "{name:?}"
+        );
+    }
+    s.line(alice, "JOIN libera");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 403 alice libera :No such channel"]
+    );
+    s.line(alice, "LIST");
+    let out = s.drain(alice);
+    assert!(
+        !out.iter().any(|line| line.contains(" 322 ")),
+        "no channel was created: {out:#?}"
+    );
+}
+
+/// The idle seconds `asker`'s WHOIS reports for `nick`.
+fn whois_idle(s: &mut TestServer, asker: ConnId, nick: &str) -> u64 {
+    s.line(asker, &format!("WHOIS {nick}"));
+    let out = s.drain(asker);
+    let line = out
+        .iter()
+        .find(|line| line.contains(" 317 "))
+        .unwrap_or_else(|| panic!("no 317: {out:#?}"));
+    line.split(' ')
+        .nth(4)
+        .expect("idle field")
+        .parse()
+        .expect("seconds")
+}
+
+/// WHOIS idle time counts from the user's last PRIVMSG, as in Solanum, whose
+/// `msg_channel` / `msg_client` (`modules/core/m_message.c`) alone set
+/// `localClient->last` — "idle time shouldn't be reset by notices or tagmsg",
+/// nor by any other command. Liveness is the other clock: any line, a PING
+/// included, keeps the reaper from pinging.
+#[test]
+fn idle_time_counts_from_the_last_privmsg_only() {
+    let mut s = server_with_moving_clock();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    advance_mono(10_000);
+    assert_eq!(whois_idle(&mut s, bob, "alice"), 10);
+    for line in [
+        "NOTICE bob :psst",
+        "JOIN #c",
+        "MODE alice +i",
+        "AWAY :brb",
+        "AWAY",
+        "PING :still here",
+    ] {
+        s.line(alice, line);
+    }
+    s.drain(alice);
+    advance_mono(15_000);
+    assert_eq!(
+        whois_idle(&mut s, bob, "alice"),
+        15,
+        "only a PRIVMSG counts"
+    );
+    s.line(alice, "PRIVMSG bob :hi");
+    advance_mono(18_000);
+    assert_eq!(whois_idle(&mut s, bob, "alice"), 3);
+    s.line(alice, "PRIVMSG #c :anyone?");
+    advance_mono(20_000);
+    assert_eq!(
+        whois_idle(&mut s, bob, "alice"),
+        2,
+        "a channel PRIVMSG counts"
+    );
+    s.drain(alice);
+    // A client whose only traffic is its own keepalive is alive: no liveness
+    // PING, although it has not spoken for minutes.
+    advance_mono(200_000);
+    s.line(alice, "PING :keepalive");
+    s.drain(alice);
+    tick_after(&mut s, 260_000);
+    let out = s.drain(alice);
+    assert!(!out.iter().any(|line| line.starts_with("PING")), "{out:#?}");
+}
+
+/// NickServ and ChanServ are present to every presence query, from one record
+/// per service — `NickServ!NickServ@services.<server>` (DESIGN §7.6) — as the
+/// services Libera links are to Solanum: WHOIS answers as `m_whois` does for a
+/// service (311, 312, 313 with "is a Network Service", 318; no channels, no
+/// idle), and WHO, ISON, USERHOST, MONITOR and INVITE all find them.
+#[test]
+fn services_are_present_to_presence_queries() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "WHOIS nickserv");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 311 alice NickServ NickServ services.irc.test.example * :Nickname Services",
+            ":irc.test.example 312 alice NickServ irc.test.example :test server",
+            ":irc.test.example 313 alice NickServ :is a Network Service",
+            ":irc.test.example 318 alice NickServ :End of /WHOIS list",
+        ]
+    );
+    s.line(alice, "WHO chanserv");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 352 alice * ChanServ services.irc.test.example irc.test.example ChanServ H :0 Channel Services",
+            ":irc.test.example 315 alice chanserv :End of /WHO list",
+        ]
+    );
+    s.line(alice, "ISON nickserv nobody ChanServ");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 303 alice :NickServ ChanServ"]
+    );
+    s.line(alice, "USERHOST NICKSERV");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 302 alice :NickServ=+NickServ@services.irc.test.example"]
+    );
+    s.line(alice, "MONITOR + nickserv");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 730 alice :NickServ!NickServ@services.irc.test.example"]
+    );
+    // Solanum relays an INVITE for a service to the services server and tells
+    // the inviter it was sent; the service joins nothing.
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(alice, "INVITE chanserv #c");
+    assert_eq!(s.drain(alice), [":irc.test.example 341 alice ChanServ #c"]);
+}
+
+/// Solanum's `anti_nick_flood` as its reference configuration and Libera run
+/// it (`max_nick_changes = 5`, `max_nick_time = 20 seconds`;
+/// `change_local_nick` in `modules/core/m_nick.c`): a sixth change within
+/// twenty seconds of the last is 438 ERR_NICKTOOFAST and changes nothing;
+/// twenty quiet seconds start the count again; an operator is never refused.
+#[test]
+fn nick_changes_are_throttled_as_solanum_does() {
+    let mut s = server_with_moving_clock();
+    let alice = s.register(1, "alice");
+    for i in 1..=5 {
+        s.line(alice, &format!("NICK a{i}"));
+        let out = s.drain(alice);
+        assert!(
+            out.iter()
+                .any(|line| line.ends_with(&format!(" NICK a{i}"))),
+            "{out:#?}"
+        );
+    }
+    s.line(alice, "NICK a6");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 438 a5 a5 a6 :Nick change too fast. Please wait 20 seconds."]
+    );
+    advance_mono(20_001);
+    s.line(alice, "NICK a6");
+    assert!(s.drain(alice).iter().any(|line| line.ends_with(" NICK a6")));
+
+    let op = s.register(2, "op");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    for i in 1..=8 {
+        s.line(op, &format!("NICK o{i}"));
+        let out = s.drain(op);
+        assert!(
+            out.iter()
+                .any(|line| line.ends_with(&format!(" NICK o{i}"))),
+            "an operator is exempt: {out:#?}"
+        );
+    }
+}
+
+/// One nick keeps at most twenty WHOWAS records (twenty is what Solanum's
+/// `m_whowas` answers a remote WHOWAS with; Solanum itself bounds only the
+/// whole history): a user reconnecting under one nick over and over replaces
+/// its own oldest records rather than pushing everyone else's out.
+#[test]
+fn whowas_keeps_at_most_twenty_records_per_nick() {
+    let mut s = TestServer::new();
+    let asker = s.register(1, "asker");
+    let carol = s.register(2, "carol");
+    s.line(carol, "QUIT");
+    for i in 0..30 {
+        let again = s.register(10 + i, "mallory");
+        s.line(again, "QUIT");
+    }
+    s.line(asker, "WHOWAS mallory");
+    let out = s.drain(asker);
+    assert_eq!(
+        out.iter().filter(|line| line.contains(" 314 ")).count(),
+        20,
+        "{out:#?}"
+    );
+    s.line(asker, "WHOWAS carol");
+    assert!(has_numeric(&s.drain(asker), "314"));
+}
+
+/// INVITE names the invitee by their own nick — in 341, in the INVITE they
+/// receive — however the inviter spelled it, and follows 341 with 301 when
+/// they are away, as Solanum's `m_invite` does (`target_p->name`, then
+/// `RPL_AWAY` for an away target).
+#[test]
+fn invite_names_the_invitee_canonically_and_reports_away() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let bob = s.register(2, "Bob");
+    s.line(op, "JOIN #c");
+    s.drain(op);
+    s.line(bob, "AWAY :lunch");
+    s.drain(bob);
+    s.line(op, "INVITE BOB #c");
+    assert_eq!(
+        s.drain(op),
+        [
+            ":irc.test.example 341 op Bob #c",
+            ":irc.test.example 301 op Bob :lunch",
+        ]
+    );
+    assert_eq!(s.drain(bob), [":op!op@host1.example INVITE Bob :#c"]);
+}
+
+/// An empty, listed or server target is answered as Solanum answers it:
+/// `WHOIS :` and `WHOWAS :` are 431 and `PING :` is 409 (`m_whois`,
+/// `m_whowas`, `m_ping`); `WHOIS a,b` looks up `a` alone; and a server
+/// argument — WHOIS's first, or that of VERSION, TIME, MOTD, ADMIN or a
+/// two-parameter LINKS — is resolved as `hunt_server` resolves it: this
+/// server's name, a mask of it or anyone's nick is answered here, and
+/// anything else is 402 ERR_NOSUCHSERVER, never silently answered.
+#[test]
+fn empty_listed_and_server_targets_follow_solanum() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let _bob = s.register(2, "bob");
+    for (line, numeric) in [("WHOIS :", "431"), ("WHOWAS :", "431"), ("PING :", "409")] {
+        s.line(alice, line);
+        let out = s.drain(alice);
+        assert!(
+            has_numeric(&out, numeric) && out.len() == 1,
+            "{line}: {out:#?}"
+        );
+    }
+    s.line(alice, "WHOIS bob,alice");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|line| line.contains(" 311 alice bob "))
+            && !out.iter().any(|line| line.contains(" 311 alice alice ")),
+        "{out:#?}"
+    );
+    for command in [
+        "WHOIS other.server bob",
+        "VERSION other.server",
+        "TIME other.server",
+        "MOTD other.server",
+        "ADMIN other.server",
+        "LINKS other.server *",
+    ] {
+        s.line(alice, command);
+        assert_eq!(
+            s.drain(alice),
+            [":irc.test.example 402 alice other.server :No such server"],
+            "{command}"
+        );
+    }
+    for command in [
+        "WHOIS irc.test.example bob",
+        "WHOIS bob bob",
+        "VERSION irc.test.*",
+        "TIME irc.test.example",
+        "MOTD bob",
+        "ADMIN irc.test.example",
+        "LINKS irc.test.example *",
+    ] {
+        s.line(alice, command);
+        let out = s.drain(alice);
+        assert!(
+            !out.is_empty() && !has_numeric(&out, "402"),
+            "{command}: {out:#?}"
+        );
+    }
+    s.line(alice, "LINKS nomatch.*");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 365 alice nomatch.* :End of /LINKS list"]
+    );
+}
+
+/// A WHO mask matches as Solanum's `who_global` matches it — nick, username,
+/// host, server or realname (`modules/m_who.c`) — and a WHO of a nick shows a
+/// channel the requester may see them in, with their rank there, as `m_who`
+/// does, rather than `*`: never a secret one the requester is not in.
+#[test]
+fn who_matches_every_field_and_shows_a_visible_channel() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #aaa");
+    s.line(bob, "MODE #aaa +s");
+    s.line(bob, "JOIN #pub");
+    s.drain(bob);
+    let row = ":irc.test.example 352 alice * bob host2.example irc.test.example bob H :0 Real bob";
+    for mask in ["Real b*", "irc.test.*", "host2.*"] {
+        s.line(alice, &format!("WHO :{mask}"));
+        let out = s.drain(alice);
+        assert!(out.iter().any(|line| line == row), "{mask}: {out:#?}");
+    }
+    s.line(alice, "WHO bob");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 352 alice #pub bob host2.example irc.test.example bob H@ :0 Real bob",
+            ":irc.test.example 315 alice bob :End of /WHO list",
+        ]
+    );
+    // Sharing the secret channel shows it (it sorts first).
+    s.line(bob, "INVITE alice #aaa");
+    s.line(alice, "JOIN #aaa");
+    s.drain(alice);
+    s.line(alice, "WHO bob %cnf");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 354 alice #aaa bob H@",
+            ":irc.test.example 315 alice bob :End of /WHO list",
+        ]
+    );
+}
+
+/// The second WHO parameter as Solanum's `m_who` reads it: an `o` in front
+/// restricts the reply to operators, a `%` anywhere opens the WHOX selector,
+/// and a WHOX token longer than three characters is answered as `0`.
+#[test]
+fn who_flags_parse_as_solanum_reads_them() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let op = s.register(2, "op");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(alice, "WHO * o%n");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 354 alice op",
+            ":irc.test.example 315 alice * :End of /WHO list",
+        ]
+    );
+    s.line(alice, "WHO op x%tn,1234");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 354 alice 0 op",
+            ":irc.test.example 315 alice op :End of /WHO list",
+        ]
+    );
+    s.line(alice, "HELP WHO");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|line| line.ends_with(":WHO <#channel|nick|mask> [o][%<fields>[,<token>]]")),
+        "{out:#?}"
+    );
+    s.line(alice, "HELP MODE");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|line| line.contains("your user modes (iwBR)")),
+        "+R is a mode a user sets: {out:#?}"
+    );
+}
+
+/// MONITOR watches only what could be a nick — Solanum's `add_monitor` skips
+/// any target `clean_nick` refuses — so `#chan`, `a!b` or a spaced name takes
+/// no slot and never reaches the 731/732 lists.
+#[test]
+fn monitor_skips_targets_that_are_not_nicks() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "MONITOR + #chan,a!b,carol");
+    assert_eq!(s.drain(alice), [":irc.test.example 731 alice :carol"]);
+    s.line(alice, "MONITOR + :dave,a b");
+    assert_eq!(s.drain(alice), [":irc.test.example 731 alice :dave"]);
+    s.line(alice, "MONITOR L");
+    let out = s.drain(alice);
+    let listed: Vec<&str> = out
+        .iter()
+        .filter(|line| line.contains(" 732 "))
+        .flat_map(|line| line.rsplit_once(':').expect("trailing").1.split(','))
+        .collect();
+    assert_eq!(listed.len(), 2, "{out:#?}");
+    assert!(
+        listed.contains(&"carol") && listed.contains(&"dave"),
+        "{out:#?}"
+    );
+}
+
+/// Every disconnection says why in one shape, Solanum's
+/// `ERROR :Closing Link: <host> (<reason>)` (`exit_local_client` in
+/// `ircd/client.c`), fitted to the wire — a ban reason stored before today's
+/// bounds, met at registration, once made an over-long line.
+#[test]
+fn every_closing_link_has_one_shape_and_fits_the_wire() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_server_bans(vec![e6ircd::db::PersistedServerBan {
+            mask: "*@banned.example".into(),
+            reason: "x".repeat(600),
+            set_by: "oper".into(),
+            kind: "kline".into(),
+            expires_at: None,
+        }])
+        .expect("a K-line row");
+    let banned = s.connect_from(1, "banned.example", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(banned, "NICK banned");
+    s.line(banned, "USER banned 0 * :Banned");
+    let out = s.drain(banned);
+    let error = out
+        .iter()
+        .find(|line| line.starts_with("ERROR "))
+        .unwrap_or_else(|| panic!("{out:#?}"));
+    assert!(
+        error.starts_with("ERROR :Closing Link: banned.example (K-Lined: xxx")
+            && error.ends_with("x)")
+            && error.len() + 2 <= 512,
+        "{error}"
+    );
+    let ghostly = s.register(2, "ghostly");
+    s.line(ghostly, "QUIT :gone");
+    assert_eq!(
+        s.drain(ghostly).last().map(String::as_str),
+        Some("ERROR :Closing Link: host2.example (Client Quit)")
+    );
+}
+
+/// A bare NAMES lists every channel the requester may see — each with the
+/// members it may see — then the users in no channel, and ends
+/// `366 * :End of /NAMES list`, as Solanum's `names_global` does
+/// (`modules/m_names.c`): a secret channel the requester is not in, and an
+/// invisible user, stay hidden.
+#[test]
+fn bare_names_lists_every_visible_channel_then_the_unchanneled() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let _carol = s.register(3, "carol");
+    let dave = s.register(4, "dave");
+    s.line(dave, "MODE dave +i");
+    s.line(bob, "JOIN #pub");
+    s.line(bob, "JOIN #hidden");
+    s.line(bob, "MODE #hidden +s");
+    s.drain(bob);
+    s.line(alice, "NAMES");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example 353 alice = #pub :@bob",
+            ":irc.test.example 353 alice * * :alice carol",
+            ":irc.test.example 366 alice * :End of /NAMES list",
+        ]
+    );
+}
+
+/// A bare NAMES of a large network is paced through the send queue as a LIST
+/// is, never overflowing it.
+#[test]
+fn a_large_bare_names_is_paced_to_half_the_send_queue() {
+    let mut s = TestServer::with_paced_sendq(true);
+    let lister = many_channels(&mut s, 300);
+    s.line(lister, "NAMES");
+    let mut out = s.drain(lister);
+    assert!(fills_half_the_paced_queue(&out), "{out:#?}");
+    assert!(!has_numeric(&out, "366"), "{out:#?}");
+    while !has_numeric(&out, "366") {
+        s.core.handle(Input::PaceReplies);
+        let more = s.drain(lister);
+        assert!(
+            !more.is_empty() && wire_bytes(&more) < PACED_SENDQ_BYTES / 2 + 512,
+            "{more:#?}"
+        );
+        out.extend(more);
+    }
+    let channels = out
+        .iter()
+        .filter(|line| line.contains(" 353 lister = #room"))
+        .count();
+    assert_eq!(channels, 300);
+    assert_answers_ping(&mut s, lister, "after a paced NAMES");
+}
+
+/// A QUIT comment from a connection younger than Solanum's
+/// `anti_spam_exit_message_time` — five minutes, as its reference
+/// configuration and Libera run it — leaves as `Client Quit` (`m_quit` in
+/// `modules/core/m_quit.c`); an operator's comment is always shown.
+#[test]
+fn a_young_connections_quit_comment_is_client_quit() {
+    let mut s = server_with_moving_clock();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #c");
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #c");
+    s.drain(op);
+    advance_mono(ANTI_SPAM_EXIT_MESSAGE_MS - 1);
+    s.line(bob, "QUIT :visit my site");
+    assert_eq!(s.drain(op), [":bob!bob@host2.example QUIT :Client Quit"]);
+    advance_mono(0);
+    let carol = s.register(3, "carol");
+    s.line(carol, "OPER god letmein");
+    s.line(carol, "JOIN #c");
+    s.drain(op);
+    s.line(carol, "QUIT :duty calls");
+    assert_eq!(
+        s.drain(op),
+        [":carol!carol@host3.example QUIT :Quit: duty calls"]
     );
 }

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use e6irc_client::{Connection, NetworkNames, OwnedMessage, RelayEvent};
 
+use super::nick_regain::{NickRegain, NickRegainTiming, alternative_nick};
 use super::replies::{Correlation, ReplyRouter, Upstream};
 use super::upstream_identity::{
     AutojoinChannel, ChannelKey, ConfirmedChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
@@ -49,6 +50,9 @@ pub struct NetworkConfig {
     pub internal_upstreams: crate::egress::InternalUpstreams,
     /// Whether the first dial is held back as one of a boot's many.
     pub first_dial: FirstDial,
+    /// How a session registered under the alternative nickname takes the
+    /// configured one back (see [`super::nick_regain`]).
+    pub nick_regain: NickRegainTiming,
 }
 
 /// When a started driver first dials. A daemon restart starts every stored
@@ -81,6 +85,7 @@ impl Default for NetworkConfig {
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: FirstDial::Immediate,
+            nick_regain: NickRegainTiming::default(),
         }
     }
 }
@@ -213,7 +218,7 @@ impl JoinedChannels {
     /// a fold-collision: its casing is the owner's. A configured channel is
     /// joined with the key it was last seen with (a `+k` since, or the key a
     /// client joined it with), and otherwise with its configured key.
-    fn rejoin(&self, autojoin: &[AutojoinChannel]) -> Vec<(String, Option<ChannelKey>)> {
+    pub(super) fn rejoin(&self, autojoin: &[AutojoinChannel]) -> Vec<(String, Option<ChannelKey>)> {
         let intent = self.0.lock().expect("joined set poisoned");
         let names = &intent.names;
         let mut list: Vec<(String, Option<ChannelKey>)> = autojoin
@@ -246,9 +251,13 @@ impl JoinedChannels {
 impl IrcNetwork {
     /// Start the driver task and return a handle to it.
     pub fn start(config: NetworkConfig) -> NetworkHandle {
+        Self::prepare(config).launch()
+    }
+
+    /// The driver's handle and its task, not yet running.
+    pub(super) fn prepare(config: NetworkConfig) -> super::PreparedDriver {
         let (handle, ends) = NetworkHandle::channels(config.buffer_cap);
-        tokio::spawn(run(config, ends));
-        handle
+        super::PreparedDriver::new(handle, run(config, ends))
     }
 }
 
@@ -431,7 +440,7 @@ pub async fn preflight_irc(
     let registration = register(config, &mut connection);
     let outcome = match tokio::time::timeout_at(deadline, registration).await {
         Ok(Ok(welcomed)) => {
-            configured_nick_was_granted(connection.names(), config.nick.as_str(), welcomed)
+            requested_nick_was_granted(connection.names(), config.nick.as_str(), welcomed)
                 .map_err(|rejection| preflight_refusal(Some(rejection)))
         }
         Ok(Err(error)) => Err(match RegistrationError::classify(error) {
@@ -591,30 +600,31 @@ async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::i
     }
 }
 
-/// The welcomed nickname, when it is the configured one. A server that
-/// truncates to its NICKLEN, or renames on registration, welcomes the
+/// The welcomed nickname, when it is the one requested: the configured one,
+/// or the alternative registration fell back to while it is held. A server
+/// that truncates to its NICKLEN, or renames on registration, welcomes the
 /// connection under a name the owner never chose; running under it would be an
 /// identity invented on their behalf, with whatever channel access and services
 /// relationship that name has. Case is the server's to normalise.
-pub(super) fn configured_nick_was_granted(
+pub(super) fn requested_nick_was_granted(
     names: &NetworkNames,
-    configured: &str,
+    requested: &str,
     welcomed: String,
 ) -> Result<String, e6irc_client::RegistrationRejection> {
-    if names.eq(configured, &welcomed) {
+    if names.eq(requested, &welcomed) {
         Ok(welcomed)
     } else {
         Err(e6irc_client::RegistrationRejection::welcomed_as(
-            configured, &welcomed,
+            requested, &welcomed,
         ))
     }
 }
 
-/// What one bounded registration attempt means to the session loop. A refusal
-/// of the configured nickname is a refusal like any other: the driver never
-/// substitutes a nickname the owner did not choose. It reports the upstream's
-/// reason, retries on the slow refusal schedule in case a ghost of its own
-/// previous session times out, and parks if the nickname stays taken.
+/// What one bounded registration attempt means to the session loop. A taken
+/// nickname reaches this as a refusal only when the alternative was taken too
+/// (the driver offers exactly one, see [`connect_once`]); it is then a refusal
+/// like any other, reported with the upstream's reason, retried on the slow
+/// refusal schedule, and parked on if it persists.
 fn registration_outcome(
     result: Result<Result<String, std::io::Error>, tokio::time::error::Elapsed>,
 ) -> Result<String, super::SessionOutcome> {
@@ -651,7 +661,8 @@ fn preflight_refusal(
         e6irc_client::RegistrationRefusal::InvalidUsername => {
             IrcPreflightFailure::InvalidUsername(Some(rejection))
         }
-        e6irc_client::RegistrationRefusal::NicknameInUse => {
+        e6irc_client::RegistrationRefusal::NicknameInUse
+        | e6irc_client::RegistrationRefusal::NicknameRegainRefused => {
             IrcPreflightFailure::NicknameInUse(Some(rejection))
         }
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
@@ -699,6 +710,11 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         }
         Err(_) => return dropped(super::NetworkFailure::ConnectionTimedOut),
     };
+    // A ghost of this network's own last session — one the upstream never saw
+    // end — holds the configured nickname until the upstream reaps it. The
+    // session registers under the one alternative instead and takes the
+    // configured nickname back before it counts as connected (§10.3).
+    conn.offer_alternative_nick(&alternative_nick(&config.nick));
     let register_fut = register(config, &mut conn);
     let registration = tokio::select! {
         _ = ends.shutdown_signalled() => None,
@@ -713,21 +729,22 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         Ok(welcomed) => welcomed,
         Err(outcome) => return outcome,
     };
-    let current_nick =
-        match configured_nick_was_granted(conn.names(), config.nick.as_str(), welcomed) {
-            Ok(nick) => nick,
-            Err(rejection) => {
-                // Registered, under a name nobody chose: leave as a client would,
-                // or the upstream keeps that session until its ping timeout.
-                say_goodbye(
-                    &mut conn,
-                    "registered under an unconfigured nickname",
-                    "irc driver",
-                )
-                .await;
-                return super::SessionOutcome::RegistrationRejected(rejection);
-            }
-        };
+    let registered_as = conn.alternative_nick_taken().map(str::to_owned);
+    let requested = registered_as.as_deref().unwrap_or(config.nick.as_str());
+    let current_nick = match requested_nick_was_granted(conn.names(), requested, welcomed) {
+        Ok(nick) => nick,
+        Err(rejection) => {
+            // Registered, under a name nobody chose: leave as a client would,
+            // or the upstream keeps that session until its ping timeout.
+            say_goodbye(
+                &mut conn,
+                "registered under an unconfigured nickname",
+                "irc driver",
+            )
+            .await;
+            return super::SessionOutcome::RegistrationRejected(rejection);
+        }
+    };
     let mut identity = SelfIdentity {
         nick: current_nick,
         // `~` because no identd answered; replaced by whatever the upstream
@@ -737,34 +754,35 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             .expect("IRC driver starts only from a validated upstream address")
             .to_string(),
     };
-    // Join the configured autojoin plus every channel the upstream confirmed
-    // us in before the drop (runtime joins are tracked in `shared.joined`),
-    // keyed channels with their keys.
-    let rejoin = shared.joined.rejoin(&config.autojoin);
-    // As few lines as the wire allows, each bounded; the whole burst is still
-    // raced against the stop signal so a removal or replacement is not held
-    // behind a slow upstream's worth of them.
-    let rejoined = tokio::select! {
-        _ = ends.shutdown_signalled() => None,
-        result = async {
-            for line in join_lines(&rejoin) {
-                write_bounded(&mut conn, &line, super::UPSTREAM_WRITE_DEADLINE).await?;
-            }
-            Ok::<(), std::io::Error>(())
-        } => Some(result),
-    };
-    match rejoined {
-        None => {
-            say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
-            return super::SessionOutcome::Stopped;
-        }
-        Some(Err(_)) => return dropped(super::NetworkFailure::AutojoinFailed),
-        Some(Ok(())) => {}
-    }
+    // Every line from here on is paced to the upstream's flood allowance.
+    let mut pacer = UpstreamPacer::new();
     let mut upstream = UpstreamCapabilities::of(&conn);
     ends.set_client_tags(upstream.client_tags());
     ends.begin_irc_session(identity.nick.clone());
-    ends.emit(ConnectionEvent::Connected);
+    let mut requested_nicks = RequestedNicks::default();
+    let mut regain = match registered_as {
+        Some(alternative) => {
+            ends.emit(ConnectionEvent::RegainingNickname(
+                super::NicknameRegain::new(&alternative, config.nick.as_str()),
+            ));
+            // The rename back is asked for, whether the driver's own `NICK`
+            // or NickServ's `REGAIN` makes it: not one forced on the owner.
+            requested_nicks.observe(&format!("NICK {}", config.nick));
+            Some(NickRegain::new(
+                config.nick.as_str(),
+                &alternative,
+                conn.sasl_mechanism().is_some(),
+                config.nick_regain,
+                tokio::time::Instant::now(),
+            ))
+        }
+        None => {
+            if let Some(outcome) = come_online(shared, ends, &mut conn, &mut pacer).await {
+                return outcome;
+            }
+            None
+        }
+    };
     // The mechanism is the client's choice among what the network offered, so
     // the owner is told which one carried the password — and which ones the
     // network refused before any credential was sent, so a weaker one that is
@@ -779,8 +797,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         ));
     }
     let mut echoes = UpstreamEchoes::default();
-    let mut requested_nicks = RequestedNicks::default();
     let mut router = ReplyRouter::default();
+    // While the nickname is being regained no command is read, so the stop
+    // that `next_command` would carry is watched on its own.
+    let mut stop = std::pin::pin!(ends.stop_signal());
 
     // Keepalive: `connect_once` bounds connect + registration, but the
     // steady-state read below would otherwise block forever on a half-open
@@ -797,7 +817,27 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     let mut awaiting_keepalive = false;
     let mut silence = super::SilenceDeadline::new(config.keepalive_idle);
     loop {
+        // Past the upstream's flood allowance, the attachments' commands wait
+        // in the shared queue until a token is back; the upstream's lines keep
+        // flowing.
+        let blocked = pacer.blocked_until(tokio::time::Instant::now());
+        let regain_wake = regain.as_ref().map(NickRegain::wake);
         tokio::select! {
+            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
+            () = tokio::time::sleep_until(regain_wake.unwrap_or_else(tokio::time::Instant::now)), if regain_wake.is_some() => {
+                let regaining = regain.as_mut().expect("a wake is set only while regaining");
+                let step = regaining.on_tick(
+                    tokio::time::Instant::now(),
+                    &ends.upstream_features().isupport,
+                );
+                if let Some(outcome) = follow_regain(step, &mut conn, &mut pacer).await {
+                    return outcome;
+                }
+            }
+            () = &mut stop, if regain.is_some() => {
+                say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
+                return super::SessionOutcome::Stopped;
+            }
             // Upstream -> buffer + event.
             msg = silence.bound(conn.next_line_relayable()) => match msg {
                 Some(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
@@ -807,110 +847,99 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // a PING, a reply or framing, and is simply relayed. A bad
                     // line must not drop the link — it is delivered, not fatal.
                     let Some(message) = parsed else {
-                        if track(ends, shared, &mut identity, &mut requested_nicks, ends.emit_session_line(raw)).is_err() {
+                        if track(ends, &shared.joined, &mut identity, &mut requested_nicks, ends.emit_session_line(raw)).is_err() {
                             return dropped(super::NetworkFailure::ChannelLimitExceeded);
                         }
                         continue;
                     };
-                    // Answer PINGs transparently (keepalive is the driver's
-                    // job, not the attached client's).
-                    if message.command == "PING" {
-                        let token = message.params.first().cloned().unwrap_or_default();
-                        if write_bounded(&mut conn, &pong_line(&token), super::UPSTREAM_WRITE_DEADLINE)
-                            .await
-                            .is_err()
-                        {
-                            return dropped(super::NetworkFailure::UpstreamWriteFailed);
-                        }
-                        continue;
-                    }
-                    // The reply to our *own* keepalive PING is internal
-                    // bookkeeping, not conversation — drop it so it doesn't
-                    // fill the backlog (one junk line per idle interval,
-                    // evicting real messages) and reach attached clients.
-                    // Mirrors the local driver's keepalive discipline.
-                    if message.command == "PONG"
-                        && message.params.last().map(String::as_str) == Some("e6bnc-keepalive")
-                    {
-                        continue;
-                    }
-                    // Capabilities are negotiated hop by hop. `CAP NEW` and
-                    // `CAP DEL` describe this driver's negotiation with the
-                    // upstream, which the connection has already followed;
-                    // an attached client negotiated with the bouncer and would
-                    // act on them against the wrong hop. What changed changes
-                    // how the driver writes from here on.
-                    if message.command == "CAP" {
-                        for capability in conn.capabilities_to_request() {
-                            if write_bounded(&mut conn, &format!("CAP REQ :{capability}"), super::UPSTREAM_WRITE_DEADLINE)
-                                .await
-                                .is_err()
-                            {
+                    match upstream_control(&message, ends) {
+                        Some(UpstreamControl::Answer(line)) => {
+                            if pacer.write(&mut conn, &line).await.is_err() {
                                 return dropped(super::NetworkFailure::UpstreamWriteFailed);
                             }
+                            continue;
                         }
-                        upstream = UpstreamCapabilities::of(&conn);
-                        ends.set_client_tags(upstream.client_tags());
-                        continue;
+                        Some(UpstreamControl::Consumed) => continue,
+                        // What changed changes how the driver writes from here
+                        // on, and a wanted capability the upstream now offers
+                        // is asked for.
+                        Some(UpstreamControl::Capabilities) => {
+                            for capability in conn.capabilities_to_request() {
+                                if pacer.write(&mut conn, &format!("CAP REQ :{capability}")).await.is_err() {
+                                    return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                                }
+                            }
+                            let before = upstream.echoes;
+                            upstream = UpstreamCapabilities::of(&conn);
+                            ends.set_client_tags(upstream.client_tags());
+                            // The upstream will not echo what is still waiting
+                            // (a `CAP DEL`, or a `NAK` of the request): each
+                            // is echoed here instead, once.
+                            if before != EchoSource::Synthesized
+                                && upstream.echoes == EchoSource::Synthesized
+                            {
+                                for (echo, origin) in echoes.synthesize_waiting(&identity) {
+                                    ends.emit_echo(echo, origin);
+                                }
+                            }
+                            continue;
+                        }
+                        Some(UpstreamControl::Closed(closed)) => {
+                            return super::SessionOutcome::ClosedByUpstream(closed);
+                        }
+                        None => {}
                     }
-                    // The upstream is closing the link and says why. To an
-                    // attached client `ERROR` means *its* connection is
-                    // over, and replayed from the backlog days later it
-                    // would mean it again; the reason is kept as this
-                    // drop's diagnostic and said as a notice instead.
-                    if message.command == "ERROR" {
-                        let closed = super::LinkClosed::new(
-                            message.params.last().map(String::as_str).unwrap_or("no reason given"),
+                    if let Some(regaining) = regain.as_mut() {
+                        let step = regaining.on_line(
+                            &message,
+                            conn.names(),
+                            &ends.upstream_features().isupport,
+                            tokio::time::Instant::now(),
                         );
-                        ends.emit_line(super::bnc_notice(
-                            "*",
-                            &format!("upstream closed the link: {}", closed.diagnostic()),
-                        ));
-                        return super::SessionOutcome::ClosedByUpstream(closed);
+                        let consumed = step.consumed;
+                        if let Some(outcome) = follow_regain(step, &mut conn, &mut pacer).await {
+                            return outcome;
+                        }
+                        if consumed {
+                            continue;
+                        }
                     }
-                    // A refused join of a channel the driver meant to be in: the
-                    // channel cannot be joined as it is, so it is not rejoined
-                    // again and again after every reconnect (soju does the same).
-                    if let Some(channel) = refused_join(&message)
-                        && ends.irc_session_snapshot().is_some_and(|session| {
-                            !session.channels.iter().any(|joined| conn.names().eq(joined, channel))
-                        })
-                        && shared.joined.forget(channel)
-                    {
-                        ends.emit_line(super::bnc_notice(
-                            "*",
-                            &format!(
-                                "{channel} will not be rejoined after a reconnect: \
-                                 the upstream refused to join it ({})",
-                                message.command
-                            ),
-                        ));
-                    }
+                    follow_membership(ends, &shared.joined, &message, conn.names());
                     match router.classify(&message, raw, conn.names(), &identity.nick, std::time::Instant::now()) {
                         // A correlation PING's answer closes what came before
                         // it; the commands forwarded since want one of their own.
                         Upstream::Consumed => {
                             if let Some(barrier) = router.barrier_due()
-                                && write_bounded(&mut conn, &barrier, super::UPSTREAM_WRITE_DEADLINE)
-                                    .await
-                                    .is_err()
+                                && pacer.write(&mut conn, &barrier).await.is_err()
                             {
                                 return dropped(super::NetworkFailure::UpstreamWriteFailed);
                             }
                         }
                         Upstream::Reply { line, origin } => ends.emit_reply(origin, line),
                         Upstream::Session { line, origin } => {
-                            if let Some((channel, key)) = key_change(&message, ends) {
-                                shared.joined.set_key(&channel, key);
-                            }
-                            let emitted = if upstream.echoes {
-                                echoes.publish(ends, &message, line, origin, &identity.nick, conn.names())
-                            } else {
+                            let emitted = if upstream.echoes == EchoSource::Synthesized {
                                 ends.emit_session_line(line)
+                            } else {
+                                echoes.publish(ends, &message, line, origin, &identity.nick, conn.names())
                             };
-                            if track(ends, shared, &mut identity, &mut requested_nicks, emitted).is_err() {
+                            if track(ends, &shared.joined, &mut identity, &mut requested_nicks, emitted).is_err() {
                                 return dropped(super::NetworkFailure::ChannelLimitExceeded);
                             }
+                        }
+                    }
+                    // The configured nickname is back: the session is what
+                    // the owner configured, and connects as any other does.
+                    if let Some(regaining) = regain.as_ref()
+                        && conn.names().eq(&identity.nick, regaining.configured())
+                    {
+                        for line in regaining.finished() {
+                            if pacer.write(&mut conn, &line).await.is_err() {
+                                return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                            }
+                        }
+                        regain = None;
+                        if let Some(outcome) = come_online(shared, ends, &mut conn, &mut pacer).await {
+                            return outcome;
                         }
                     }
                 }
@@ -937,18 +966,17 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     }
                     awaiting_keepalive = true;
                     silence.restart();
-                    if write_bounded(&mut conn, "PING :e6bnc-keepalive", super::UPSTREAM_WRITE_DEADLINE)
-                        .await
-                        .is_err()
-                    {
+                    if pacer.write(&mut conn, &format!("PING :{KEEPALIVE_TOKEN}")).await.is_err() {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
                 }
             },
             // Downstream command -> upstream.
-            cmd = ends.next_command() => match cmd {
+            // Nothing an attached client sends goes out under the
+            // alternative nickname: it waits for the configured one.
+            cmd = ends.next_command(), if blocked.is_none() && regain.is_none() => match cmd {
                 Some(cmd) => {
-                    let Some(line) = outgoing(&cmd, &upstream, ends, shared) else {
+                    let Some(line) = outgoing(&cmd, upstream.client_tags(), ends, &shared.joined) else {
                         continue;
                     };
                     let written = router.forward(
@@ -958,35 +986,29 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         conn.names(),
                         std::time::Instant::now(),
                     );
-                    if write_bounded(&mut conn, &written, super::UPSTREAM_WRITE_DEADLINE)
-                        .await
-                        .is_err()
-                    {
-                        return dropped(super::NetworkFailure::UpstreamWriteFailed);
-                    }
-                    if let Some(barrier) = router.barrier_due()
-                        && write_bounded(&mut conn, &barrier, super::UPSTREAM_WRITE_DEADLINE)
-                            .await
-                            .is_err()
-                    {
-                        return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                    for line in std::iter::once(written).chain(router.barrier_due()) {
+                        if pacer.write(&mut conn, &line).await.is_err() {
+                            return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                        }
                     }
                     // The detached buffer and the account's other sessions
                     // must see both sides of the conversation, and the
                     // originator sees its echo exactly when it negotiated
-                    // echo-message on attach. An upstream that echoes is
-                    // waited for — a refused line then has no echo, and the
-                    // refusal is the verdict; one that does not echo gets
+                    // echo-message on attach. An upstream that echoes — or
+                    // may, its verdict on `echo-message` still to come — is
+                    // waited for: a refused line then has no echo, and the
+                    // refusal is the verdict. One that does not echo gets
                     // the echo manufactured here, one per target, from the
                     // line as the upstream was sent it.
                     requested_nicks.observe(&line);
-                    if upstream.echoes {
-                        if upstream.correlation == Correlation::Order {
+                    match upstream.echoes {
+                        EchoSource::Upstream | EchoSource::AwaitingVerdict => {
                             echoes.sent(&line, cmd.origin, conn.names());
                         }
-                    } else {
-                        for echo in self_echoes(&line, &identity) {
-                            ends.emit_echo(echo, cmd.origin);
+                        EchoSource::Synthesized => {
+                            for echo in self_echoes(&line, &identity) {
+                                ends.emit_echo(echo, cmd.origin);
+                            }
                         }
                     }
                     // A barrier's answer may already be due; the loop reads it.
@@ -1002,14 +1024,225 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     }
 }
 
+/// Join the configured autojoin plus every channel the upstream confirmed us
+/// in before the drop (runtime joins are tracked in `shared.joined`), keyed
+/// channels with their keys, and say the network is connected. `Some` is how
+/// the session ended instead: stopped during the burst, or a write failed.
+async fn come_online(
+    shared: &SharedDriver,
+    ends: &mut DriverEnds,
+    conn: &mut Connection,
+    pacer: &mut UpstreamPacer,
+) -> Option<super::SessionOutcome> {
+    let rejoin = shared.joined.rejoin(&shared.config.autojoin);
+    // As few lines as the wire allows, each bounded; the whole burst is still
+    // raced against the stop signal so a removal or replacement is not held
+    // behind a slow upstream's worth of them.
+    let rejoined = tokio::select! {
+        _ = ends.shutdown_signalled() => None,
+        result = async {
+            for line in join_lines(&rejoin) {
+                pacer.write(conn, &line).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        } => Some(result),
+    };
+    match rejoined {
+        None => {
+            say_goodbye(conn, STOPPED_GOODBYE, "irc driver").await;
+            Some(super::SessionOutcome::Stopped)
+        }
+        Some(Err(_)) => Some(dropped(super::NetworkFailure::AutojoinFailed)),
+        Some(Ok(())) => {
+            ends.emit(ConnectionEvent::Connected);
+            None
+        }
+    }
+}
+
+/// Write what a step of the nickname's regain asks for; `Some` is how the
+/// session ends: the nickname is not coming back (said with `QUIT`, so the
+/// alternative leaves no ghost of its own), or a write failed.
+async fn follow_regain(
+    step: super::nick_regain::Step,
+    conn: &mut Connection,
+    pacer: &mut UpstreamPacer,
+) -> Option<super::SessionOutcome> {
+    for line in &step.send {
+        if pacer.write(conn, line).await.is_err() {
+            return Some(dropped(super::NetworkFailure::UpstreamWriteFailed));
+        }
+    }
+    let rejection = step.refused?;
+    eprintln!("irc driver: nickname not regained: {rejection:?}");
+    say_goodbye(
+        conn,
+        "the configured nickname could not be regained",
+        "irc driver",
+    )
+    .await;
+    Some(super::SessionOutcome::RegistrationRejected(rejection))
+}
+
+/// Most lines the driver writes to an upstream back to back. An upstream
+/// parses a client's lines only as fast as its flood allowance and closes the
+/// link ("Excess Flood") once too many wait unparsed, so every line of a
+/// session — an attached client's, a reply-correlation `PING`, a rejoin, a
+/// `PONG`, a keepalive — spends a token of one bucket shaped like the
+/// allowance of Solanum (Libera.Chat) and its ircd-ratbox ancestors: five
+/// lines at once (`client_flood_burst_max`), then two a second
+/// ([`UPSTREAM_LINES_PER_SECOND`]). ZNC and soju pace their upstreams the same
+/// way, for the same reason.
+pub(crate) const UPSTREAM_LINE_BURST: usize = 5;
+
+/// Lines a second the driver writes to an upstream once its
+/// [`UPSTREAM_LINE_BURST`] is spent: what Solanum drains a registered
+/// client's queue at (`client_flood_message_num` per
+/// `client_flood_message_time`).
+pub(crate) const UPSTREAM_LINES_PER_SECOND: usize = 2;
+
+/// The token `PING` the driver sends when the upstream has been silent, whose
+/// answer is its own business.
+const KEEPALIVE_TOKEN: &str = "e6bnc-keepalive";
+
+/// Every line one session writes upstream, paced to the upstream's flood
+/// allowance ([`UPSTREAM_LINE_BURST`], [`UPSTREAM_LINES_PER_SECOND`]) and each
+/// bounded by [`super::UPSTREAM_WRITE_DEADLINE`].
+struct UpstreamPacer(crate::core::line_meter::TokenBucket);
+
+impl UpstreamPacer {
+    fn new() -> Self {
+        let allowance =
+            crate::core::CommandFlood::new(UPSTREAM_LINE_BURST, UPSTREAM_LINES_PER_SECOND)
+                .expect("the upstream allowance is a valid bucket");
+        Self(crate::core::line_meter::TokenBucket::new(
+            allowance,
+            tokio::time::Instant::now(),
+        ))
+    }
+
+    fn blocked_until(&mut self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.0.blocked_until(now)
+    }
+
+    /// Write `line` once a token is there.
+    async fn write(&mut self, connection: &mut Connection, line: &str) -> std::io::Result<()> {
+        self.0.spend().await;
+        write_bounded(connection, line, super::UPSTREAM_WRITE_DEADLINE).await
+    }
+}
+
+/// An upstream line that is the session's own business rather than an
+/// attached client's, and what it asks of the driver. The `irc` and `local`
+/// drivers read every line through [`upstream_control`] first, so neither can
+/// relay one of these into the backlog.
+pub(super) enum UpstreamControl {
+    /// Answer with this line: a `PING`'s `PONG`, fitted to the wire.
+    Answer(String),
+    /// A `CAP` line: capabilities are negotiated hop by hop, and an attached
+    /// client negotiated its own with the bouncer — it would act on these
+    /// against the wrong hop. The connection has followed the change.
+    Capabilities,
+    /// The answer to the driver's own keepalive `PING`: bookkeeping, not
+    /// conversation, which would otherwise fill the backlog one line per idle
+    /// interval.
+    Consumed,
+    /// The upstream is closing the link and says why. To an attached client
+    /// `ERROR` means *its* connection is over — several reconnect on it — and
+    /// replayed from the backlog days later it would mean it again; the
+    /// reason is said as a `*bnc*` notice instead (already emitted), and kept
+    /// as the drop's diagnostic.
+    Closed(super::LinkClosed),
+}
+
+/// What `message` asks of the driver when it is the session's own business;
+/// `None` for anything an attached client or the backlog may see.
+pub(super) fn upstream_control(
+    message: &OwnedMessage,
+    ends: &DriverEnds,
+) -> Option<UpstreamControl> {
+    match message.command.to_ascii_uppercase().as_str() {
+        "PING" => Some(UpstreamControl::Answer(pong_line(
+            message.params.first().map_or("", String::as_str),
+        ))),
+        "PONG" if message.params.last().map(String::as_str) == Some(KEEPALIVE_TOKEN) => {
+            Some(UpstreamControl::Consumed)
+        }
+        "CAP" => Some(UpstreamControl::Capabilities),
+        "ERROR" => {
+            let closed = super::LinkClosed::new(
+                message
+                    .params
+                    .last()
+                    .map_or("no reason given", String::as_str),
+            );
+            ends.emit_line(super::bnc_notice(
+                "*",
+                &format!("upstream closed the link: {}", closed.diagnostic()),
+            ));
+            Some(UpstreamControl::Closed(closed))
+        }
+        _ => None,
+    }
+}
+
+/// Follow what `message` says about the channels the session means to be in:
+/// a refused join of a channel the driver meant to be in is dropped from the
+/// reconnect intent, with a notice — it cannot be joined as it is, so it is not
+/// rejoined again and again after every reconnect (soju does the same) — and a
+/// `+k`/`-k` updates the key it is rejoined with.
+pub(super) fn follow_membership(
+    ends: &DriverEnds,
+    joined: &JoinedChannels,
+    message: &OwnedMessage,
+    names: &NetworkNames,
+) {
+    if let Some(channel) = refused_join(message)
+        && ends.irc_session_snapshot().is_some_and(|session| {
+            !session
+                .channels
+                .iter()
+                .any(|member| names.eq(member, channel))
+        })
+        && joined.forget(channel)
+    {
+        ends.emit_line(super::bnc_notice(
+            "*",
+            &format!(
+                "{channel} will not be rejoined after a reconnect: \
+                 the upstream refused to join it ({})",
+                message.command
+            ),
+        ));
+    }
+    if let Some((channel, key)) = key_change(message, ends) {
+        joined.set_key(&channel, key);
+    }
+}
+
+/// Whether the upstream echoes this session's messages, and so who makes the
+/// one echo of a message an attached client sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoSource {
+    /// `echo-message` is enabled: the upstream echoes each message it
+    /// accepts, and only those; its echo is relayed as the one echo of the
+    /// line.
+    Upstream,
+    /// The driver has asked for `echo-message` (a `CAP NEW` offered it) and
+    /// the verdict has not arrived. The upstream may already echo what is
+    /// written now, so nothing is synthesized: each line waits for the
+    /// upstream's echo, and is echoed here only if the answer is `NAK`.
+    AwaitingVerdict,
+    /// No `echo-message`: the driver synthesizes the echo when it writes the
+    /// line.
+    Synthesized,
+}
+
 /// What the upstream has enabled that decides how the driver writes: whether
 /// it echoes, whether it carries client-only tags, and how its replies are
 /// told apart. Re-read whenever a `CAP` line changes what is enabled.
 struct UpstreamCapabilities {
-    /// With `echo-message` the upstream echoes each message it accepts, and
-    /// only those: its echo is relayed as the one echo of the line. Without it
-    /// the driver synthesizes the echo when it writes the line.
-    echoes: bool,
+    echoes: EchoSource,
     message_tags: bool,
     correlation: Correlation,
 }
@@ -1019,7 +1252,13 @@ impl UpstreamCapabilities {
         let message_tags = conn.enabled("message-tags");
         let labels = message_tags && conn.enabled("batch") && conn.enabled("labeled-response");
         Self {
-            echoes: conn.enabled("echo-message"),
+            echoes: if conn.enabled("echo-message") {
+                EchoSource::Upstream
+            } else if conn.awaiting_verdict("echo-message") {
+                EchoSource::AwaitingVerdict
+            } else {
+                EchoSource::Synthesized
+            },
             message_tags,
             correlation: if labels {
                 Correlation::Labels
@@ -1040,10 +1279,11 @@ impl UpstreamCapabilities {
 
 /// Fold what one published session line changed into the driver's own state:
 /// the identity the upstream shows, a rename (announced when nobody asked for
-/// it), and the reconnect intent.
-fn track(
+/// it), and the reconnect intent. The `irc` and `local` drivers both follow
+/// their session through it.
+pub(super) fn track(
     ends: &DriverEnds,
-    shared: &SharedDriver,
+    joined: &JoinedChannels,
     identity: &mut SelfIdentity,
     requested_nicks: &mut RequestedNicks,
     emitted: Result<super::SessionChange, super::ChannelLimitExceeded>,
@@ -1076,7 +1316,7 @@ fn track(
     // intent survives a transport drop: only a confirmed JOIN/PART/KICK changes
     // it, so an unrelated numeric cannot erase channels still awaiting
     // confirmation on this new session.
-    shared.joined.apply(change, &ends.names())
+    joined.apply(change, &ends.names())
 }
 
 /// A client's line as the upstream is to be sent it (see
@@ -1084,18 +1324,18 @@ fn track(
 /// `PART` of a channel the reconnect intent holds but this session is not in
 /// (its rejoin failed) removes it from the intent — the one way a client can
 /// — and says so, before the upstream's own answer.
-fn outgoing(
+pub(super) fn outgoing(
     cmd: &super::ClientCommand,
-    upstream: &UpstreamCapabilities,
+    client_tags: ClientTags,
     ends: &DriverEnds,
-    shared: &SharedDriver,
+    joined: &JoinedChannels,
 ) -> Option<String> {
-    let line = super::carriable(cmd, upstream.client_tags(), ends)?;
+    let line = super::carriable(cmd, client_tags, ends)?;
     let Ok(message) = e6irc_proto::message::Message::parse(&line) else {
         return Some(line);
     };
     match message.command.to_ascii_uppercase().as_str() {
-        "JOIN" => shared.joined.offer_keys(&message),
+        "JOIN" => joined.offer_keys(&message),
         "PART" => {
             let live = ends
                 .irc_session_snapshot()
@@ -1108,9 +1348,7 @@ fn outgoing(
                 .map(|channels| channels.split(',').collect::<Vec<_>>())
                 .unwrap_or_default()
             {
-                if !live.iter().any(|joined| names.eq(joined, channel))
-                    && shared.joined.forget(channel)
-                {
+                if !live.iter().any(|member| names.eq(member, channel)) && joined.forget(channel) {
                     ends.answer(
                         cmd.origin,
                         super::bnc_notice(
@@ -1155,49 +1393,17 @@ fn key_change(message: &OwnedMessage, ends: &DriverEnds) -> Option<(String, Opti
         return None;
     }
     let features = ends.upstream_features();
-    let token = |name: &str| {
-        features.isupport.iter().find_map(|token| {
-            token
-                .strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('='))
-                .map(str::to_string)
-        })
-    };
-    let chanmodes = token("CHANMODES").unwrap_or_else(|| "beI,k,l,imnpst".to_string());
-    let prefix = token("PREFIX").unwrap_or_else(|| "(ov)@+".to_string());
-    let membership = prefix
-        .strip_prefix('(')
-        .and_then(|rest| rest.split_once(')'))
-        .map_or("", |(modes, _)| modes);
-    let mut kinds = chanmodes.split(',');
-    let (always, parameter, when_set) = (
-        kinds.next().unwrap_or(""),
-        kinds.next().unwrap_or(""),
-        kinds.next().unwrap_or(""),
-    );
-    let mut arguments = arguments.iter();
-    let mut adding = true;
-    let mut change = None;
-    for mode in modes.chars() {
-        match mode {
-            '+' => adding = true,
-            '-' => adding = false,
-            mode => {
-                let takes = always.contains(mode)
-                    || parameter.contains(mode)
-                    || membership.contains(mode)
-                    || (adding && when_set.contains(mode));
-                let argument = if takes { arguments.next() } else { None };
-                if mode == 'k' {
-                    change = Some(if adding {
-                        argument.and_then(|key| ChannelKey::parse(key))
-                    } else {
-                        None
-                    });
-                }
+    let change = super::channel_views::channel_mode_changes(&features, modes, arguments)
+        .into_iter()
+        .filter(|(_, mode, _)| *mode == 'k')
+        .map(|(adding, _, argument)| {
+            if adding {
+                argument.and_then(ChannelKey::parse)
+            } else {
+                None
             }
-        }
-    }
+        })
+        .next_back();
     Some((channel.clone(), change?))
 }
 
@@ -1375,9 +1581,9 @@ impl EchoKey {
         })
     }
 
-    /// The keys of a message an attached client sent, one per target, when
-    /// the upstream will echo it.
-    fn of_client_line(line: &str, names: &NetworkNames) -> Vec<Self> {
+    /// The keys of a message an attached client sent, one per target (with
+    /// that target as the client named it), when the upstream will echo it.
+    fn of_client_line<'line>(line: &'line str, names: &NetworkNames) -> Vec<(Self, &'line str)> {
         let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
             return Vec::new();
         };
@@ -1389,7 +1595,7 @@ impl EchoKey {
         };
         targets
             .split(',')
-            .filter_map(|target| Self::new(&command, target, text, names))
+            .filter_map(|target| Self::new(&command, target, text, names).map(|key| (key, target)))
             .collect()
     }
 
@@ -1436,19 +1642,29 @@ impl EchoKey {
 /// this bound, costing at most the routing of one late echo.
 const MAX_PENDING_ECHOES: usize = 256;
 
+/// One target's delivery of a message written upstream, awaiting its echo.
+struct PendingEcho {
+    key: EchoKey,
+    /// The attachment that sent it.
+    origin: u64,
+    /// The line as the upstream was sent it, and the one target this entry
+    /// is for, so the echo can be made here if the upstream stops echoing.
+    line: std::sync::Arc<str>,
+    target: String,
+}
+
 /// The messages written upstream whose echo has not arrived yet, oldest
-/// first, each with the attachment that sent it. An echo is matched to the
-/// oldest entry with its key, so identical lines from two attachments are
-/// echoed to each in the order they were sent.
+/// first. An echo is matched to the oldest entry with its key, so identical
+/// lines from two attachments are echoed to each in the order they were sent.
 #[derive(Default)]
-struct PendingEchoes(std::collections::VecDeque<(EchoKey, u64)>);
+struct PendingEchoes(std::collections::VecDeque<PendingEcho>);
 
 impl PendingEchoes {
-    fn push(&mut self, key: EchoKey, origin: u64) {
+    fn push(&mut self, pending: PendingEcho) {
         if self.0.len() == MAX_PENDING_ECHOES {
             self.0.pop_front();
         }
-        self.0.push_back((key, origin));
+        self.0.push_back(pending);
     }
 
     /// The attachment that sent the line `echo` echoes, when one is waiting:
@@ -1457,13 +1673,13 @@ impl PendingEchoes {
         let position = self
             .0
             .iter()
-            .position(|(pending, _)| pending == echo)
+            .position(|pending| pending.key == *echo)
             .or_else(|| {
                 self.0
                     .iter()
-                    .position(|(pending, _)| echo.is_truncation_of(pending, head))
+                    .position(|pending| echo.is_truncation_of(&pending.key, head))
             })?;
-        self.0.remove(position).map(|(_, origin)| origin)
+        self.0.remove(position).map(|pending| pending.origin)
     }
 }
 
@@ -1479,14 +1695,36 @@ impl UpstreamEchoes {
     /// Await the echo of `line`, which attachment `origin` sent, once per
     /// target it names.
     pub(super) fn sent(&mut self, line: &str, origin: u64, names: &NetworkNames) {
-        for key in EchoKey::of_client_line(line, names) {
-            self.0.push(key, origin);
+        let shared: std::sync::Arc<str> = line.into();
+        for (key, target) in EchoKey::of_client_line(line, names) {
+            self.0.push(PendingEcho {
+                key,
+                origin,
+                line: shared.clone(),
+                target: target.to_string(),
+            });
         }
+    }
+
+    /// The upstream will not echo what is still waiting — it withdrew
+    /// `echo-message`, or refused the request for it — so each waiting
+    /// delivery is echoed here, as `identity`, once, with the attachment that
+    /// sent it.
+    pub(super) fn synthesize_waiting(&mut self, identity: &SelfIdentity) -> Vec<(String, u64)> {
+        self.0
+            .0
+            .drain(..)
+            .filter_map(|pending| {
+                echo_of(&pending.line, Some(&pending.target), identity)
+                    .map(|echo| (echo, pending.origin))
+            })
+            .collect()
     }
 
     /// Publish a session line of the upstream, as the echo of an attachment's
     /// line when it is one (`origin` is its label's attachment, when it had
-    /// one), with a services command that can carry a secret redacted.
+    /// one), with a services command that can carry a secret redacted. The
+    /// delivery it echoes stops waiting either way.
     pub(super) fn publish(
         &mut self,
         ends: &DriverEnds,
@@ -1499,9 +1737,9 @@ impl UpstreamEchoes {
         let Some((key, head)) = EchoKey::of_upstream_echo(message, own_nick, names) else {
             return ends.emit_session_line(line);
         };
-        let origin = origin.or_else(|| self.0.take(&key, head));
+        let waiting = self.0.take(&key, head);
         let line = redact_sensitive_echo(line, message);
-        match origin {
+        match origin.or(waiting) {
             Some(origin) => ends.emit_session_echo(line, origin),
             None => ends.emit_session_line(line),
         }
@@ -1517,11 +1755,11 @@ const MAX_REQUESTED_NICKS: usize = 8;
 /// first. The upstream's confirmation of one is the owner's own choice taking
 /// effect; a rename to any other name was not asked for.
 #[derive(Default)]
-struct RequestedNicks(std::collections::VecDeque<String>);
+pub(super) struct RequestedNicks(std::collections::VecDeque<String>);
 
 impl RequestedNicks {
     /// Remember the nickname `line` asks for, when it is a `NICK`.
-    fn observe(&mut self, line: &str) {
+    pub(super) fn observe(&mut self, line: &str) {
         let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
             return;
         };
@@ -1846,10 +2084,9 @@ pub(super) mod tests {
     #[test]
     fn a_message_to_several_targets_is_echoed_per_target() {
         let names = NetworkNames::default();
-        let mut pending = PendingEchoes::default();
-        for key in EchoKey::of_client_line("PRIVMSG #a,#B :hi", &names) {
-            pending.push(key, 7);
-        }
+        let mut echoes = UpstreamEchoes::default();
+        echoes.sent("PRIVMSG #a,#B :hi", 7, &names);
+        let pending = &mut echoes.0;
         for echo in [":alice!u@h PRIVMSG #a :hi", ":alice!u@h PRIVMSG #b :hi"] {
             let (key, head) =
                 EchoKey::of_upstream_echo(&owned(echo), "alice", &names).expect("our echo");
@@ -1868,13 +2105,10 @@ pub(super) mod tests {
     fn an_echo_the_upstream_truncated_is_still_the_lines_echo() {
         let names = NetworkNames::default();
         let text = "x".repeat(480);
-        let mut pending = PendingEchoes::default();
-        for key in EchoKey::of_client_line(&format!("PRIVMSG #room :{text}"), &names) {
-            pending.push(key, 7);
-        }
-        for key in EchoKey::of_client_line("PRIVMSG #room :hello world", &names) {
-            pending.push(key, 8);
-        }
+        let mut echoes = UpstreamEchoes::default();
+        echoes.sent(&format!("PRIVMSG #room :{text}"), 7, &names);
+        echoes.sent("PRIVMSG #room :hello world", 8, &names);
+        let pending = &mut echoes.0;
         let short = ":alice!~alice@host.example PRIVMSG #room :hello";
         let (key, head) =
             EchoKey::of_upstream_echo(&owned(short), "alice", &names).expect("our echo");

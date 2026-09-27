@@ -1,6 +1,6 @@
 {% extends "console_base.html" %}
 {% block main %}
-  <div data-api-account-read data-csrf="{{ shell.csrf }}">
+  <div data-api-account-read data-csrf="{{ shell.csrf }}" data-minimum-password-length="{{ minimum_password_length }}">
     <div class="page-head">
       <div>
         <p class="eyebrow">Self-service security</p>

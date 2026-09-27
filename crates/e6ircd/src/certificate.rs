@@ -1,6 +1,6 @@
 //! TLS server certificates that follow their files.
 //!
-//! A certificate is renewed on disk (by an ACME client, by hand) long before
+//! A certificate is renewed on disk (by an automated certificate client, by hand) long before
 //! the process that serves it restarts. Every TLS listener — the IRC listeners
 //! and the bouncer attach listener — serves its certificate through a
 //! [`ReloadingCertificate`], which reads the files again when the process gets
@@ -95,6 +95,20 @@ struct ReadState {
     /// files' settled state, because a fix need not change anything a stamp
     /// can see.
     failing: Option<Failure>,
+}
+
+/// Read every certificate/key pair `config` names — each TLS IRC listener's
+/// and the attach listener's — and match each key to its certificate, as start
+/// does before it serves any of them. The one judgement `check-config` and
+/// every console save make of the files, so neither can accept a certificate
+/// the next start refuses.
+pub(crate) fn load_configured(config: &crate::config::Config) -> io::Result<()> {
+    let listener_files = config.listeners.iter().filter_map(|l| l.tls.as_ref());
+    let bnc_files = config.bnc.iter().filter_map(|bnc| bnc.tls.as_ref());
+    for files in listener_files.chain(bnc_files) {
+        ReloadingCertificate::load(files)?;
+    }
+    Ok(())
 }
 
 /// A server certificate read from `cert_path`/`key_path`, replaced in place

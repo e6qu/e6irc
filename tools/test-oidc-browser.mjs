@@ -497,9 +497,13 @@ try {
     page.getByRole("button", { name: "Add password", exact: true }).click(),
   ]);
   // 200, not 204: the answer says what else the change did (other browser
-  // sessions ended; app passwords and tokens untouched).
+  // sessions, IRC connections and bouncer attachments ended; app passwords and
+  // tokens untouched).
   assert.equal(passwordResponse.status(), 200, await passwordResponse.text());
-  assert.match((await passwordResponse.json()).detail, /Other browser sessions were signed out/);
+  assert.match(
+    (await passwordResponse.json()).detail,
+    /Other browser sessions, IRC connections and bouncer attachments were signed out/,
+  );
   await expectStatus(page, /Local password added/);
   await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/login`);
@@ -749,7 +753,10 @@ try {
   // durable policy mutation through the rendered controls.
   let administratorNetworkReads = 0;
   const administratorNetworkFailureErrorStart = applicationErrors.length;
-  await page.route(`${applicationOrigin}/api/v1/admin/networks`, async (route) => {
+  // The console reads the inventory's first page (`?limit=100`).
+  const administratorNetworkRead = `${applicationOrigin}/api/v1/admin/networks?limit=100`;
+  const administratorNetworkReadMatches = (url) => url.href === administratorNetworkRead;
+  await page.route(administratorNetworkReadMatches, async (route) => {
     administratorNetworkReads += 1;
     if (administratorNetworkReads === 1) {
       await route.fulfill({
@@ -773,7 +780,7 @@ try {
     [`503 GET ${applicationOrigin}/api/v1/admin/networks`],
     "the deliberate fleet failure was the only browser diagnostic during recovery",
   );
-  await page.unroute(`${applicationOrigin}/api/v1/admin/networks`);
+  await page.unroute(administratorNetworkReadMatches);
 
   let overviewStatsReads = 0;
   const overviewFailureErrorStart = applicationErrors.length;
@@ -1106,7 +1113,7 @@ try {
   await ownerNetworkFailure.waitFor();
   assert.match(await ownerNetworkFailure.innerText(), /invalid API response/i);
   await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
-  await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
+  await page.getByText("No networks yet. Add one in the IRC client.", { exact: true }).waitFor();
   assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
   assert.deepEqual(
     applicationErrors.splice(ownerNetworkFailureErrorStart),
@@ -1624,6 +1631,7 @@ try {
             has_sasl_account: false,
             has_sasl_password: false,
             has_server_password: false,
+            configured: false,
             enabled: true,
             connected: false,
             runtime: {
@@ -2516,8 +2524,11 @@ async function startIrcUpstream() {
     async sendPeerMessage(target, text) {
       assert.ok(activeConnection, "select an upstream connection before sending a peer message");
       outboundSequence += 1;
+      // Stamped now: the journey sets a history retention, and the server
+      // rightly keeps nothing older, so a fixed date would age out of it.
+      const time = new Date().toISOString();
       activeConnection.socket.write(
-        `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
+        `@time=${time};msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
       );
     },
     async waitForLine(predicate) {

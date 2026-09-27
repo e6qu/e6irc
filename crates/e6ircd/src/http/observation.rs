@@ -97,7 +97,7 @@ pub(super) async fn application_observation(
     }
 
     let core_ready = state.telemetry.core_is_fresh(Duration::from_secs(45));
-    let database_ready = match &state.pool {
+    let database_ready = match state.pool() {
         Some(pool) => {
             let started = Instant::now();
             let ready = database_is_ready(pool).await;
@@ -171,6 +171,14 @@ pub(super) async fn application_observation(
                     "Connected BNC networks",
                     snapshot.bnc_connected,
                     "networks",
+                ),
+                // What a load qualification checks its recorded `core_workers`
+                // against: the shards running, not the ones a file named.
+                metric(
+                    "core.shards",
+                    "Core shards",
+                    state.telemetry.core_shards(),
+                    "shards",
                 ),
                 metric(
                     "queues.depth",

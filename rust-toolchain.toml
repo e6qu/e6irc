@@ -1,0 +1,22 @@
+# The one Rust toolchain this repository is built, linted, tested and released
+# with. rustup reads this file for every `cargo`/`rustc` run in the checkout,
+# so a developer's machine, every CI job, the native release jobs and the
+# container image all compile with the same compiler. The Dockerfile's build
+# image carries this release, every workflow's `toolchain:` input names it, and
+# tools/check-release-toolchain.sh fails when any of them names another.
+#
+# The one exception is CI's `fuzz-smoke` job: cargo-fuzz instruments with
+# `-Zsanitizer`, which only a nightly compiler accepts, so that job names its
+# pinned nightly explicitly (its RUSTUP_TOOLCHAIN and `cargo +nightly-…`),
+# which overrides this file.
+#
+# To move to a new Rust release, change `channel` here, the `toolchain:` inputs
+# in .github/workflows, and the Dockerfile's `rust:<version>-bookworm` base (tag
+# and digest) in the same change.
+#
+# No `targets`: every native build and test runs on a runner whose host triple
+# is its target, so the host standard library is the one it needs.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -1,6 +1,5 @@
-# Pinned Solanum (+ Atheme, once services scenarios land) for the
-# differential harness. Solanum has no official image; built from the
-# pinned source ref below.
+# Pinned Solanum for the differential harness. Solanum has no official
+# image; it is built from the pinned source ref in the Dockerfile.
 services:
   solanum:
     build:

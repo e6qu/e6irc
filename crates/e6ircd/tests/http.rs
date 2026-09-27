@@ -10,6 +10,11 @@ use tokio::net::TcpStream;
 
 mod support;
 
+/// A plain pool on `url` for the test's own queries, beside the daemon's.
+async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
+    sqlx::PgPool::connect_with(url.connect_options()).await
+}
+
 #[path = "support/deadline.rs"]
 mod deadline;
 
@@ -75,6 +80,30 @@ fn test_config() -> Config {
         }),
         ..Config::default()
     }
+}
+
+/// Link an OpenID Connect identity as a recently signed-in browser session of
+/// the account does; the session is removed afterwards, so it counts in
+/// nothing the test goes on to check.
+async fn link_identity(
+    pool: &sqlx::PgPool,
+    account: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<e6ircd::db::LinkOutcome, e6ircd::db::DbError> {
+    let session = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established(account),
+        None,
+    )
+    .await?;
+    let linked = e6ircd::db::link_oidc_identity(pool, &session, account, issuer, subject).await;
+    sqlx::query("DELETE FROM web_sessions WHERE token_hash = sha256(convert_to($1, 'UTF8'))")
+        .bind(&session)
+        .execute(pool)
+        .await
+        .expect("remove the linking session");
+    linked
 }
 
 async fn request(addr: std::net::SocketAddr, req: &str) -> (u16, String, String) {
@@ -261,28 +290,25 @@ fn temporary_path(label: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn healthz_is_public_and_ok() {
-    // Liveness is the process plus every core shard's heartbeat, so it turns
-    // 200 once each shard has finished its first event (its first tick).
+    // Liveness is the process plus every core shard's heartbeat, and a shard
+    // is heard from the moment its worker is built — before startup returns —
+    // so the very first probe answers 200. It used to wait for each shard's
+    // first finished event, and a probe in the milliseconds before an idle
+    // core's first tick was told "core stalled".
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    let mut last = (0, String::new());
-    for _ in 0..200 {
-        let (status, _, body) = request(http, &get("/healthz")).await;
-        last = (status, body);
-        if last.0 == 200 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert_eq!(last.0, 200, "{}", last.1);
-    assert_eq!(last.1, "ok");
+    let (status, _, body) = request(http, &get("/healthz")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "ok");
 }
 
 #[tokio::test]
 async fn device_authorization_requires_an_absolute_public_url() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    let start_request = "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let start_request = "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 20\r\n\
+         Connection: close\r\n\r\nclient_id=e6irc-test";
 
     let (status, headers, body) = request(http, start_request).await;
     assert_eq!(status, 503);
@@ -573,9 +599,13 @@ async fn every_route_class_carries_the_header_baseline() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("account");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
     let mut config = test_config();
     config.database = Some(DatabaseConfig {
@@ -1003,6 +1033,32 @@ async fn a_plain_get_of_the_websocket_endpoint_is_a_problem_document() {
     assert_eq!(v["title"], "Invalid WebSocket upgrade", "{body}");
 }
 
+/// Behind a trusted proxy, a forwarded chain broken by an entry that is not an
+/// address (nginx's `unix:`) names no client: walking past it would read the
+/// client's own entries. Every request — an IRC WebSocket included — is
+/// refused rather than keyed by an address the client chose.
+#[tokio::test]
+async fn an_unusable_forwarded_entry_from_a_trusted_proxy_is_refused() {
+    let mut config = test_config();
+    config.limits.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let forwarded = |path: &str, extra: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             X-Forwarded-For: 198.51.100.66, unix:\r\n{extra}\r\n"
+        )
+    };
+    let (status, head, body) = request(http, &forwarded("/no-such-page", "")).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Unusable X-Forwarded-For", "{body}");
+    let upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    let (status, head, body) = request(http, &forwarded("/ws/irc", upgrade)).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Unusable X-Forwarded-For", "{body}");
+}
+
 #[tokio::test]
 async fn the_per_address_authentication_budget_says_when_to_retry() {
     let mut config = test_config();
@@ -1079,7 +1135,7 @@ async fn a_body_over_the_limit_is_a_problem_json_413() {
     // A body that declares no length is refused once it passes the limit.
     let mut streamed = String::from(
         "POST /api/v1/auth/device/token HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+         Content-Type: application/x-www-form-urlencoded\r\nTransfer-Encoding: chunked\r\n\r\n",
     );
     for _ in 0..20 {
         streamed.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
@@ -1647,7 +1703,7 @@ async fn bnc_network_management_lifecycle() {
     assert_eq!(status, 204, "update: {body}");
     // The audit row names the fields the edit changed (by name only) and the
     // kind; `addr` and `tls` were resubmitted unchanged and are not listed.
-    let audit_pool = sqlx::PgPool::connect(&url).await.expect("audit pool");
+    let audit_pool = plain_pool(&url).await.expect("audit pool");
     let (target, detail): (String, String) = sqlx::query_as(
         "SELECT target, detail FROM audit_log WHERE action = 'NETWORK_UPDATE' ORDER BY id DESC LIMIT 1",
     )
@@ -2688,6 +2744,7 @@ async fn openapi_spec_is_served() {
             "enabled",
             "connected",
             "runtime",
+            "configured",
         ])
     );
     assert_eq!(
@@ -2700,9 +2757,12 @@ async fn openapi_spec_is_served() {
         serde_json::json!([
             "connecting",
             "connected",
+            "regaining_nickname",
             "reconnecting",
             "authentication_failed",
             "registration_failed",
+            "owner_suspended",
+            "owner_deleted",
         ])
     );
     let create_network_schema = &v["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]
@@ -2738,7 +2798,6 @@ async fn openapi_spec_is_served() {
         ("/api/v1/me/profile", "patch"),
         ("/api/v1/me/password", "put"),
         ("/api/v1/me/tokens", "post"),
-        ("/api/v1/auth/device/token", "post"),
         ("/api/v1/auth/device/approve", "post"),
         ("/api/v1/admin/bans", "post"),
         ("/api/v1/admin/configuration", "patch"),
@@ -2763,6 +2822,23 @@ async fn openapi_spec_is_served() {
                         .all(|variant| variant["additionalProperties"] == false)
             });
         assert!(closed, "{method} {path}");
+    }
+    // The RFC 8628 endpoints take forms, and ignore parameters they do not
+    // define (RFC 6749 §3.1).
+    for (path, required) in [
+        (
+            "/api/v1/auth/device/start",
+            serde_json::json!(["client_id"]),
+        ),
+        (
+            "/api/v1/auth/device/token",
+            serde_json::json!(["grant_type", "device_code", "client_id"]),
+        ),
+    ] {
+        let schema = &v["paths"][path]["post"]["requestBody"]["content"]["application/x-www-form-urlencoded"]
+            ["schema"];
+        assert_eq!(schema["required"], required, "{path}");
+        assert!(schema["additionalProperties"].is_null(), "{path}");
     }
     let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"];
@@ -2831,6 +2907,15 @@ async fn openapi_spec_is_served() {
     ] {
         assert_eq!(limits_schema[field]["minimum"], 1, "{field}");
     }
+    // Zero switches it off; the bound is the one the configuration holds.
+    assert_eq!(
+        limits_schema["anti_spam_exit_message_time_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(
+        limits_schema["anti_spam_exit_message_time_seconds"]["maximum"],
+        e6ircd::config::MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS
+    );
     // On by default, so off has a spelling of its own.
     assert_eq!(
         limits_schema["auth_rate_burst"]["oneOf"],
@@ -3075,7 +3160,7 @@ async fn openapi_spec_is_served() {
     assert_eq!(
         v["paths"]["/api/v1/me/password"]["put"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["properties"]["detail"]["const"],
-        "Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them."
+        "Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them."
     );
     assert!(v["paths"]["/api/v1/me/password"]["put"]["responses"]["204"].is_null());
     let callback_parameters =
@@ -3337,9 +3422,13 @@ async fn account_url_redirects_to_the_complete_account_console() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -3487,9 +3576,13 @@ async fn console_networks_page_lists_the_callers_networks() {
     )
     .await
     .expect("seed hostile backlog line");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -3637,9 +3730,13 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("account");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -3795,9 +3892,7 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         .expect("sample timestamp")
         .saturating_sub(2 * 60 * 60 * 1_000);
     old_snapshot["sampled_at_ms"] = old_sampled_at.into();
-    let verification_pool = sqlx::PgPool::connect(&url)
-        .await
-        .expect("verification pool");
+    let verification_pool = plain_pool(&url).await.expect("verification pool");
     sqlx::query("INSERT INTO observability_samples (sampled_at_ms, snapshot) VALUES ($1, $2)")
         .bind(i64::try_from(old_sampled_at).unwrap())
         .bind(old_snapshot)
@@ -4050,9 +4145,13 @@ async fn console_configuration_manages_every_credential_collection() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("account");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -4730,12 +4829,20 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
             .await
             .expect("account");
     }
-    let boss_session = e6ircd::db::create_web_session(&pool, "boss", None)
-        .await
-        .expect("boss session");
-    let mallory_session = e6ircd::db::create_web_session(&pool, "mallory", None)
-        .await
-        .expect("mallory session");
+    let boss_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("boss"),
+        None,
+    )
+    .await
+    .expect("boss session");
+    let mallory_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("mallory"),
+        None,
+    )
+    .await
+    .expect("mallory session");
     sqlx::query(
         "INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#Control', '#control', id FROM accounts WHERE name_folded = 'boss'",
@@ -5048,7 +5155,7 @@ async fn admin_accounts_endpoint_is_gated() {
     assert_eq!(status, 403);
     // Authority is read from the account row on every request: a grant
     // written to the database behind the running server's back — as
-    // `e6ircd recover-administrator` or another replica writes it — is
+    // `e6ircd recover-administrator` or an operator's hand writes it — is
     // honoured by the very next request, and its revocation likewise.
     let bob_id = e6ircd::db::account_id_by_name(&pool, "bob")
         .await
@@ -5174,12 +5281,20 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
     e6ircd::db::create_account_with_contact(&pool, "bob", "pw", None)
         .await
         .expect("bob");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("alice session");
-    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
     add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
@@ -5280,20 +5395,32 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     .execute(&pool)
     .await
     .expect("hostile display account");
-    let alice_session = e6ircd::db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("alice session");
-    let bob_session = e6ircd::db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("bob session");
-    e6ircd::db::issue_app_password_for_account(&pool, "Alice", "desktop")
-        .await
-        .expect("app password");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
+    e6ircd::db::issue_app_password_for_account(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        "desktop",
+    )
+    .await
+    .expect("app password");
     let api_secret = issue_api_token(&pool, "Alice", "automation")
         .await
         .expect("API token");
     assert_eq!(
-        e6ircd::db::link_oidc_identity(
+        link_identity(
             &pool,
             "Alice",
             "https://issuer.example",
@@ -5495,9 +5622,13 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
     let bob_token = issue_api_token(&pool, "Bob", "Bob API")
         .await
         .expect("Bob token");
-    let bob_session = e6ircd::db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("Bob browser session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("Bob browser session");
     drop(pool);
 
     let config = Config {
@@ -5598,13 +5729,15 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
     assert_eq!(
         e6ircd::db::verify_credentials(&verification, "Bob", "bob password")
             .await
-            .expect("verify"),
-        Some("Bob".into())
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(e6ircd::db::VerifiedAccount::established("Bob"))
     );
     assert_eq!(
         e6ircd::db::api_token_account(&verification, &bob_token)
             .await
-            .expect("old token lookup"),
+            .expect("old token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         None,
         "reactivation never resurrects a revoked bearer"
     );
@@ -5693,9 +5826,13 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     let alice_token = issue_api_token(&pool, "Alice", "administrator API")
         .await
         .expect("Alice token");
-    let alice_session = e6ircd::db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("Alice session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("Alice session");
 
     let config = Config {
         server_name: "irc.onboarding.example".into(),
@@ -5859,7 +5996,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         e6ircd::db::verify_local_password(&pool, "Bob", "bob-password")
             .await
             .expect("Bob password"),
-        Some("Bob".into())
+        Some(e6ircd::db::VerifiedAccount::established("Bob"))
     );
     let (status, _, body) = request(http, &get(invitation_path)).await;
     assert_eq!(status, 404, "{body}");
@@ -5982,12 +6119,20 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
             .await
             .unwrap_or_else(|error| panic!("create {name}: {error}"));
     }
-    let alice_session = e6ircd::db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("alice session");
-    let bob_session = e6ircd::db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("bob session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
     for (channel, founder) in [
         ("#Alpha", "alice"),
         ("#Bravo", "bob"),
@@ -6244,12 +6389,20 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     e6ircd::db::create_account_with_contact(&pool, "bob", "pw", None)
         .await
         .expect("bob");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("alice session");
-    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
     for (actor, action, target, detail) in [
         ("alice", "OPER", "alice", ""),
         ("bob", "KLINE", "first@host", "<script>alert(1)</script>"),
@@ -6351,6 +6504,50 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     );
     assert_eq!(filtered["audit"][0]["detail"], "abuse");
 
+    // An account principal is recorded folded, so the actor filter folds as
+    // the account directory's name filter does; an operator principal (the
+    // concurrent row above) is matched as spelled, and never by a folded
+    // spelling of an account's name.
+    let folded = "/api/v1/admin/audit?actor=ALICE&action=KLINE&target=second%40host";
+    let (status, _, folded_body) = request(http, &cookie_get(folded, &alice_session)).await;
+    assert_eq!(status, 200, "{folded_body}");
+    let folded: serde_json::Value = serde_json::from_str(&folded_body).expect("folded JSON");
+    assert_eq!(
+        folded["audit"].as_array().map(Vec::len),
+        Some(1),
+        "{folded_body}"
+    );
+    let operator = "/api/v1/admin/audit?actor=ALICE&action=OPER";
+    let (status, _, operator_body) = request(http, &cookie_get(operator, &alice_session)).await;
+    assert_eq!(status, 200, "{operator_body}");
+    let operator: serde_json::Value = serde_json::from_str(&operator_body).expect("operator JSON");
+    assert!(
+        operator["audit"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .all(|entry| entry["detail"] != "concurrent"),
+        "an operator principal matched a folded account spelling: {operator_body}"
+    );
+    // A blank filter is a 400, not "no filter" (which returned every row).
+    for blank in ["actor=", "target=%20%20", "action=%20KLINE"] {
+        let path = format!("/api/v1/admin/audit?{blank}");
+        let (status, _, body) = request(http, &cookie_get(&path, &alice_session)).await;
+        assert_eq!(status, 400, "{blank}: {body}");
+        assert!(body.contains("Invalid audit filter"), "{body}");
+    }
+    // The console's filter form submits its unfilled fields empty; the page
+    // reads those as not given.
+    let (status, _, form_page) = request(
+        http,
+        &cookie_get(
+            "/console/audit?actor=&action=CONFIG&target=",
+            &alice_session,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{form_page}");
+
     let (status, _, page) = request(http, &cookie_get("/console/audit", &alice_session)).await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("<h1>Audit log</h1>"), "{page}");
@@ -6408,9 +6605,13 @@ async fn admin_console_ban_and_channel_actions() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     sqlx::query(
         "INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#dropme', '#dropme', id FROM accounts WHERE name_folded = 'alice'",
@@ -6634,12 +6835,20 @@ async fn admin_connection_directory_and_disconnect_controls() {
     e6ircd::db::create_account_with_contact(&pool, "bob", "pw", None)
         .await
         .expect("bob");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
-    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
     drop(pool);
 
     let config = Config {
@@ -6877,9 +7086,13 @@ async fn my_sessions_are_scoped_to_the_caller() {
     e6ircd::db::create_account_with_contact(&pool, "bob", "s3cr3t", None)
         .await
         .expect("bob");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -7075,15 +7288,27 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     let current_agent =
         e6ircd::db::SessionUserAgent::from_header("Current Browser").expect("agent");
     let other_agent = e6ircd::db::SessionUserAgent::from_header("Browser <other>").expect("agent");
-    let current = e6ircd::db::create_web_session(&pool, "alice", Some(&current_agent))
-        .await
-        .expect("current session");
-    let other = e6ircd::db::create_web_session(&pool, "alice", Some(&other_agent))
-        .await
-        .expect("other session");
-    let bob = e6ircd::db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let current = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        Some(&current_agent),
+    )
+    .await
+    .expect("current session");
+    let other = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        Some(&other_agent),
+    )
+    .await
+    .expect("other session");
+    let bob = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
 
     let config = Config {
         server_name: "irc.browser-sessions.example".into(),
@@ -7188,9 +7413,13 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
         None
     );
 
-    let third = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("third session");
+    let third = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("third session");
     let revoke_others = format!(
         "DELETE /api/v1/me/sessions?except=current HTTP/1.1\r\nHost: t\r\n\
          Cookie: e6irc_session={current}\r\nX-E6IRC-CSRF: {csrf}\r\n\
@@ -7249,12 +7478,20 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         .await
         .expect("bob");
     let alice_token = issue_api_token(&pool, "alice", "t").await.expect("tok");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("alice session");
-    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
     e6ircd::db::create_bnc_network(
         &pool,
         "alice",
@@ -7373,9 +7610,13 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     e6ircd::db::create_bnc_network(
         &pool,
         "alice",
@@ -7528,9 +7769,13 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     let api_token = issue_api_token(&pool, "alice", "bridge-edit")
         .await
         .expect("API token");
@@ -7882,15 +8127,19 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
-    e6ircd::db::link_oidc_identity(&pool, "alice", "https://idp.example", "alice-primary")
+    link_identity(&pool, "alice", "https://idp.example", "alice-primary")
         .await
         .expect("primary identity");
-    e6ircd::db::link_oidc_identity(&pool, "alice", "https://idp.example", "alice-secondary")
+    link_identity(&pool, "alice", "https://idp.example", "alice-secondary")
         .await
         .expect("secondary identity");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
 
     let config = Config {
         server_name: "irc.form.example".into(),
@@ -8018,7 +8267,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         Some("Second@new.example".into())
     );
 
-    let api_password = r#"{"current_password":"pw","new_password":"api-pw"}"#;
+    let api_password = r#"{"current_password":"pw","new_password":"api-password"}"#;
     let api_change_without_csrf = format!(
         "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\
@@ -8038,15 +8287,15 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert_eq!(status, 200, "{body}");
     assert!(
         body.contains(
-            "Other browser sessions were signed out; app passwords and access tokens are unchanged"
+            "Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged"
         ),
         "{body}"
     );
     assert_eq!(
-        e6ircd::db::verify_local_password(&pool, "alice", "api-pw")
+        e6ircd::db::verify_local_password(&pool, "alice", "api-password")
             .await
             .expect("API password verify"),
-        Some("alice".into())
+        Some(e6ircd::db::VerifiedAccount::established("alice"))
     );
 
     let app_body = r#"{"label":"Laptop"}"#;
@@ -8212,9 +8461,13 @@ async fn device_authorization_grant_flow() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     let bearer = issue_api_token(&pool, "alice", "device approval")
         .await
         .expect("bearer");
@@ -8254,9 +8507,80 @@ async fn device_authorization_grant_flow() {
             body.len()
         )
     };
+    // The two RFC 8628 endpoints take form bodies (§3.1, §3.4).
+    let form_post = |path: &str, body: &str| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    const START: &str = "client_id=e6irc-test";
+    let poll_body = |device_code: &str| {
+        format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code\
+             &device_code={device_code}&client_id=e6irc-test"
+        )
+    };
+    let oauth_error = |body: &str| {
+        serde_json::from_str::<serde_json::Value>(body).expect("an OAuth error is JSON")["error"]
+            .as_str()
+            .expect("error code")
+            .to_string()
+    };
+    // Each device code's polls are paced (§3.5); the test moves the last
+    // poll back instead of waiting out the interval.
+    let poll_pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let pace = || async {
+        sqlx::query("UPDATE device_grants SET last_polled_at = now() - interval '1 hour'")
+            .execute(&poll_pool)
+            .await
+            .expect("pace polls");
+    };
+
+    // The device authorization request names its client (§3.1).
+    let (status, _, body) =
+        request(http, &form_post("/api/v1/auth/device/start", "scope=read")).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        oauth_error(&body),
+        "invalid_request",
+        "client_id is required"
+    );
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/start",
+            "client_id=e6irc-test&scope=read+write+irc+administrator",
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(oauth_error(&body), "invalid_scope");
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "{}")).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        oauth_error(&body),
+        "invalid_request",
+        "a JSON body is not a form"
+    );
 
     // start
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    let (status, headers, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/start",
+            "client_id=e6irc-test&scope=irc+read+write&unknown=ignored",
+        ),
+    )
+    .await;
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let device_code = v["device_code"].as_str().unwrap().to_string();
@@ -8265,23 +8589,78 @@ async fn device_authorization_grant_flow() {
         v["verification_uri"].as_str(),
         Some("http://e6.example/device")
     );
+    assert_eq!(v["interval"], 5);
+    assert_eq!(v["expires_in"], 600);
 
-    let (status, _, _) = request(
+    // The token request is RFC 8628 §3.4's: a JSON body, another grant type,
+    // or another client's device code does not reach the grant.
+    let (status, _, body) = request(
         http,
         &post(
             "/api/v1/auth/device/token",
             "",
-            &format!(r#"{{"device_code":"{device_code}","extra":true}}"#),
+            &format!(r#"{{"device_code":"{device_code}"}}"#),
         ),
     )
     .await;
-    assert_eq!(status, 400, "unknown device-token fields must be rejected");
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(oauth_error(&body), "invalid_request");
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/token",
+            &format!(
+                "grant_type=authorization_code&device_code={device_code}&client_id=e6irc-test"
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(oauth_error(&body), "unsupported_grant_type");
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/token",
+            &poll_body(&device_code).replace("e6irc-test", "someone-else"),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        oauth_error(&body),
+        "invalid_grant",
+        "a device code is its own client's"
+    );
 
     // poll before approval -> authorization_pending
-    let tok_body = format!(r#"{{"device_code":"{device_code}"}}"#);
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body)).await;
+    let tok_body = poll_body(&device_code);
+    let (status, headers, body) =
+        request(http, &form_post("/api/v1/auth/device/token", &tok_body)).await;
     assert_eq!(status, 400);
-    assert!(body.contains("authorization_pending"), "{body}");
+    assert_eq!(oauth_error(&body), "authorization_pending");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
+    // Polled again at once -> slow_down, and the grant's interval grew by 5 s.
+    let (status, _, body) = request(http, &form_post("/api/v1/auth/device/token", &tok_body)).await;
+    assert_eq!(status, 400);
+    assert_eq!(oauth_error(&body), "slow_down");
+    let interval: i32 = sqlx::query_scalar(
+        "SELECT poll_interval_seconds FROM device_grants
+         WHERE device_code_hash = sha256(convert_to($1, 'UTF8'))",
+    )
+    .bind(&device_code)
+    .fetch_one(&poll_pool)
+    .await
+    .expect("interval");
+    assert_eq!(
+        interval, 10,
+        "slow_down lengthens the interval by 5 seconds"
+    );
+    pace().await;
 
     // approve as alice (cookie), lowercased to prove normalization
     let ap_body = format!(r#"{{"user_code":"{}"}}"#, user_code.to_lowercase());
@@ -8333,10 +8712,13 @@ async fn device_authorization_grant_flow() {
     assert_eq!(status, 204);
 
     // poll after approval -> access_token
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body)).await;
+    let (status, _, body) = request(http, &form_post("/api/v1/auth/device/token", &tok_body)).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let token = v["access_token"].as_str().unwrap().to_string();
+    assert_eq!(v["token_type"], "Bearer");
+    assert_eq!(v["scope"], "read write irc");
+    assert_eq!(v["expires_in"], 30 * 86_400);
 
     // the minted token works as a PAT
     let me = format!(
@@ -8347,13 +8729,14 @@ async fn device_authorization_grant_flow() {
     assert!(body.contains("alice"), "{body}");
 
     // grant consumed: polling again is invalid_grant
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body)).await;
+    pace().await;
+    let (status, _, body) = request(http, &form_post("/api/v1/auth/device/token", &tok_body)).await;
     assert_eq!(status, 400);
     assert!(body.contains("invalid_grant"), "{body}");
 
     // A device polling past expiry is told `expired_token` (RFC 8628 §3.5),
     // even after another start has run the expired-grant pruning.
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    let (status, _, body) = request(http, &form_post("/api/v1/auth/device/start", START)).await;
     assert_eq!(status, 200, "{body}");
     let lapsed: serde_json::Value = serde_json::from_str(&body).expect("json");
     let lapsed_code = lapsed["device_code"].as_str().unwrap().to_string();
@@ -8362,31 +8745,28 @@ async fn device_authorization_grant_flow() {
         .expect("connect");
     sqlx::query(
         "UPDATE device_grants SET expires_at = now() - interval '1 second'
-         WHERE device_code = $1",
+         WHERE device_code_hash = sha256(convert_to($1, 'UTF8'))",
     )
     .bind(&lapsed_code)
     .execute(&pool)
     .await
     .expect("expire grant");
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    let (status, _, body) = request(http, &form_post("/api/v1/auth/device/start", START)).await;
     assert_eq!(status, 200, "{body}");
-    let lapsed_poll = format!(r#"{{"device_code":"{lapsed_code}"}}"#);
+    let lapsed_poll = poll_body(&lapsed_code);
     let (status, _, body) =
-        request(http, &post("/api/v1/auth/device/token", "", &lapsed_poll)).await;
+        request(http, &form_post("/api/v1/auth/device/token", &lapsed_poll)).await;
     assert_eq!(status, 400);
     assert!(body.contains("expired_token"), "{body}");
 
     // A device token counts toward the per-account cap like any other. A grant
     // approved while a slot was free, then beaten to it, is denied once.
     let start_grant = || async {
-        let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+        let (status, _, body) = request(http, &form_post("/api/v1/auth/device/start", START)).await;
         assert_eq!(status, 200, "{body}");
         let started: serde_json::Value = serde_json::from_str(&body).expect("json");
         (
-            format!(
-                r#"{{"device_code":"{}"}}"#,
-                started["device_code"].as_str().unwrap()
-            ),
+            poll_body(started["device_code"].as_str().unwrap()),
             format!(
                 r#"{{"user_code":"{}"}}"#,
                 started["user_code"].as_str().unwrap()
@@ -8421,11 +8801,11 @@ async fn device_authorization_grant_flow() {
         .expect("under the cap");
     }
     let (status, _, body) =
-        request(http, &post("/api/v1/auth/device/token", "", &raced_poll)).await;
+        request(http, &form_post("/api/v1/auth/device/token", &raced_poll)).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("access_denied"), "{body}");
     let (status, _, body) =
-        request(http, &post("/api/v1/auth/device/token", "", &raced_poll)).await;
+        request(http, &form_post("/api/v1/auth/device/token", &raced_poll)).await;
     assert_eq!(status, 400, "{body}");
     assert!(
         body.contains("invalid_grant"),
@@ -8502,7 +8882,7 @@ async fn device_authorization_grant_flow() {
 
     // A second grant, approved end-to-end through the page's form (lowercase
     // to prove the same normalization as the JSON path).
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    let (status, _, body) = request(http, &form_post("/api/v1/auth/device/start", START)).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let device_code2 = v["device_code"].as_str().unwrap().to_string();
@@ -8529,8 +8909,9 @@ async fn device_authorization_grant_flow() {
     )
     .await;
     assert_eq!(status, 403);
-    let tok_body2 = format!(r#"{{"device_code":"{device_code2}"}}"#);
-    let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body2)).await;
+    let tok_body2 = poll_body(&device_code2);
+    let (status, _, body) =
+        request(http, &form_post("/api/v1/auth/device/token", &tok_body2)).await;
     assert_eq!(status, 200, "form-approved grant must mint: {body}");
 }
 
@@ -8664,14 +9045,16 @@ async fn personal_access_token_scopes_gate_reads_writes_admin_and_irc() {
     assert_eq!(
         e6ircd::db::api_token_account(&pool, &read)
             .await
-            .expect("read token lookup"),
+            .expect("read token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         None,
         "a read-only API grant must not silently gain IRC authentication"
     );
     assert_eq!(
         e6ircd::db::api_token_account(&pool, &irc)
             .await
-            .expect("IRC token lookup"),
+            .expect("IRC token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         Some("alice".into())
     );
     drop(pool);
@@ -8762,9 +9145,13 @@ async fn authenticated_api_limit_is_per_account_shared_across_bearers_and_bounde
     let alice_token = issue_api_token(&pool, "alice", "automation")
         .await
         .expect("Alice token");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("Alice session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("Alice session");
     let bob_token = issue_api_token(&pool, "bob", "automation")
         .await
         .expect("Bob token");
@@ -9097,7 +9484,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         .expect("acct");
     let session = e6ircd::db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         e6ircd::db::OidcSessionIdentity {
             id_token: Some("the.id.token"),
             provider: Some("shauth"),
@@ -9111,9 +9498,13 @@ async fn rp_initiated_logout_redirects_to_provider() {
     )
     .await
     .expect("sso session");
-    let local_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("local session");
+    let local_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("local session");
     drop(pool);
 
     let config = Config {
@@ -9343,9 +9734,13 @@ async fn application_entry_starts_shauth_when_configured() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -9433,7 +9828,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         .expect("acct");
     let session = e6ircd::db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         e6ircd::db::OidcSessionIdentity {
             id_token: Some("the.id.token"),
             provider: Some("corp"),
@@ -9525,9 +9920,13 @@ async fn admin_networks_fleet_view_and_toggle() {
         .expect("bob");
     let alice_token = issue_api_token(&pool, "alice", "t").await.expect("tok");
     let bob_token = issue_api_token(&pool, "bob", "t").await.expect("tok");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     // Bob owns an enabled network; its driver cannot dial 127.0.0.1:1, which
     // is exactly the "misbehaving upstream" the admin lever exists for.
     e6ircd::db::create_bnc_network(
@@ -9647,10 +10046,13 @@ async fn admin_networks_fleet_view_and_toggle() {
 }
 
 /// A database-backed server with the HTTP listener and nothing else.
-async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running {
+async fn start_with_database(
+    url: &e6ircd::db::DatabaseUrl,
+    administrators: &[&str],
+) -> net::Running {
     let config = Config {
         database: Some(DatabaseConfig {
-            url: url.into(),
+            url: url.clone(),
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         }),
@@ -9671,6 +10073,409 @@ async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running
     net::start(config).await.expect("start")
 }
 
+/// The configuration as `http` serves it, and the console's CSRF value.
+async fn configuration_of(http: std::net::SocketAddr, session: &str) -> serde_json::Value {
+    let (status, _, body) = request(
+        http,
+        &format!(
+            "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).expect("configuration JSON")
+}
+
+/// PATCH the scalar settings `settings` over `revision` on `http`.
+async fn patch_configuration(
+    http: std::net::SocketAddr,
+    session: &str,
+    csrf: &str,
+    revision: &serde_json::Value,
+    settings: &serde_json::Value,
+) -> (u16, String) {
+    let body = serde_json::json!({ "revision": revision, "settings": settings }).to_string();
+    let (status, _, body) = request(
+        http,
+        &format!(
+            "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    (status, body)
+}
+
+/// Poll `http`'s configuration until `done` holds of it.
+async fn configuration_when(
+    http: std::net::SocketAddr,
+    session: &str,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        let current = configuration_of(http, session).await;
+        if done(&current) {
+            return current;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the configuration never reached the expected state");
+}
+
+/// One process serves the database, but it is not the only writer of the
+/// stored settings: `e6ircd rotate-secrets` bumps the revision as it re-seals,
+/// from a process of its own. The serving process used to hold the revision
+/// it loaded or saved last, so after any other write its console refused
+/// every save as stale until it was restarted. Now a committed revision
+/// reaches it (the table announces it), and what the other writer changed
+/// live — here, turning the attach listener off — is applied as a console
+/// save in the serving process applies it; the console then saves over it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_settings_revision_written_by_another_process_reaches_the_serving_one() {
+    let url = support::test_db("a_settings_revision_written_by_another_process").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("root"),
+        None,
+    )
+    .await
+    .expect("session");
+    let running = start_with_database(&url, &["root"]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+    let loaded = configuration_of(http, &session).await["revision"]
+        .as_i64()
+        .expect("revision");
+
+    // An out-of-band write, as `rotate-secrets` makes one.
+    sqlx::query("UPDATE server_settings SET revision = revision + 1")
+        .execute(&pool)
+        .await
+        .expect("bump the stored revision");
+    let bumped = loaded + 1;
+    configuration_when(http, &session, |current| current["revision"] == bumped).await;
+
+    // Another process saves a revision that turns the attach listener off:
+    // the serving process adopts it and its listener follows.
+    let current = configuration_of(http, &session).await;
+    assert!(
+        current["runtime"]["bound_bnc_addr"].is_string(),
+        "{current}"
+    );
+    let stored = e6ircd::db::load_managed_config(&pool)
+        .await
+        .expect("the stored revision");
+    let mut elsewhere = stored.settings.clone();
+    elsewhere.description = "saved by another process".into();
+    elsewhere.bnc_addr = None;
+    e6ircd::db::save_managed_config(
+        &pool,
+        stored.revision,
+        &elsewhere,
+        &e6ircd::db::AuditPrincipal::host("rotate-secrets"),
+        "written by another process",
+    )
+    .await
+    .expect("another process's revision");
+    let seen = configuration_when(http, &session, |current| {
+        current["revision"] == bumped + 1 && current["runtime"]["bound_bnc_addr"].is_null()
+    })
+    .await;
+    assert_eq!(seen["settings"]["description"], "saved by another process");
+
+    // The console saves over the adopted revision without a conflict.
+    let mut settings = seen["settings"].clone();
+    settings["description"] = "saved in the console".into();
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &seen["revision"], &settings).await;
+    assert_eq!(status, 200, "{body}");
+    let stored = e6ircd::db::load_managed_config(&pool)
+        .await
+        .expect("the stored revision");
+    assert_eq!(stored.settings.description, "saved in the console");
+}
+
+/// `registration.minimum_password_length` is eight until the console changes
+/// it, and a change applies at once to the web and the REST API — the account
+/// forms render it, and an administrator's account creation is held to it —
+/// without a restart.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_password_minimum_is_a_live_console_setting() {
+    let url = support::test_db("the_password_minimum_is_a_live_console_setting").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "root password", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("root"),
+        None,
+    )
+    .await
+    .expect("session");
+    let running = start_with_database(&url, &["root"]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    let page = async |path: &str| {
+        let (status, _, page) = request(
+            http,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: t\r\n\
+                 Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        page
+    };
+    let csrf = csrf_from_html(&page("/console/configuration").await).to_string();
+    let create = async |account: &str| {
+        let body = serde_json::json!({
+            "account": account,
+            "password": "sesame",
+            "contact_email": null,
+            "administrator": false,
+        })
+        .to_string();
+        let (status, _, body) = request(
+            http,
+            &format!(
+                "POST /api/v1/admin/accounts HTTP/1.1\r\nHost: t\r\n\
+                 Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        (status, body)
+    };
+
+    let (status, body) = create("carol").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("at least 8 characters"), "{body}");
+    assert!(page("/console/accounts").await.contains("minlength=\"8\""));
+    assert!(
+        page("/console/account")
+            .await
+            .contains("data-minimum-password-length=\"8\"")
+    );
+
+    let current = configuration_of(http, &session).await;
+    let mut settings = current["settings"].clone();
+    settings["registration"]["minimum_password_length"] = serde_json::json!(1);
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"restart_required\":false"), "{body}");
+    let (status, body) = create("carol").await;
+    assert_eq!(status, 201, "{body}");
+    assert!(page("/console/accounts").await.contains("minlength=\"1\""));
+    assert_eq!(
+        e6ircd::db::verify_credentials(&pool, "carol", "sesame")
+            .await
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(e6ircd::db::VerifiedAccount::established("carol"))
+    );
+
+    settings["registration"]["minimum_password_length"] = serde_json::json!(0);
+    let current = configuration_of(http, &session).await;
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("minimum_password_length"), "{body}");
+}
+
+/// A save that moves the attach listener and then finds its revision stale
+/// leaves the listener where the stored revision it reloaded says, at once. It
+/// used to put the listener back where the stale revision had it, and only the
+/// settings watcher's next announcement brought it to the stored one — here,
+/// with the announcement never heard, never.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stale_listener_save_leaves_the_listener_where_the_stored_revision_says() {
+    let url = support::test_db("a_stale_listener_save_leaves_the_listener_where").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("root"),
+        None,
+    )
+    .await
+    .expect("session");
+    let running = start_with_database(&url, &["root"]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+    let current = configuration_of(http, &session).await;
+    assert!(
+        current["runtime"]["bound_bnc_addr"].is_string(),
+        "{current}"
+    );
+
+    // Another writer turns the listener off, and this server does not hear
+    // of it.
+    sqlx::query("ALTER TABLE server_settings DISABLE TRIGGER server_settings_changed")
+        .execute(&pool)
+        .await
+        .expect("silence the announcements");
+    sqlx::query(
+        "UPDATE server_settings
+         SET revision = revision + 1, settings = jsonb_set(settings, '{bnc_addr}', 'null')",
+    )
+    .execute(&pool)
+    .await
+    .expect("an out-of-band revision");
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let mut settings = current["settings"].clone();
+    settings["bnc_addr"] = serde_json::Value::String(format!("127.0.0.1:{port}"));
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 409, "{body}");
+    let after = configuration_of(http, &session).await;
+    assert_eq!(
+        after["revision"].as_i64(),
+        current["revision"].as_i64().map(|revision| revision + 1),
+        "{after}"
+    );
+    assert!(
+        after["runtime"]["bound_bnc_addr"].is_null(),
+        "the listener follows the reloaded revision: {after}"
+    );
+}
+
+/// Removing a console-owned setting from the bootstrap hands it to the console
+/// (DESIGN §18), and that includes the three every server needs and the public
+/// URL: a file may leave out `server_name`, `network_name`, `[[listeners]]`
+/// and `[http].public_url` once the database stores them, and the stored
+/// values run. A first start with none stored refuses, naming each; it used to
+/// be impossible to leave the names out at all, so a name changed in the
+/// console had to be copied into the file (and `E6IRC_PUBLIC_URL` was
+/// required outright).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
+    let text = support::test_db_text("a_bootstrap_may_leave_the_server_s_names").await;
+    let document = |names: bool| {
+        let mut document = toml::Table::new();
+        let mut database = toml::Table::new();
+        database.insert("url".into(), toml::Value::String(text.clone()));
+        document.insert("database".into(), toml::Value::Table(database));
+        let mut http = toml::Table::new();
+        http.insert("addr".into(), toml::Value::String("127.0.0.1:0".into()));
+        if names {
+            http.insert(
+                "public_url".into(),
+                toml::Value::String("https://irc.stored.example".into()),
+            );
+        }
+        document.insert("http".into(), toml::Value::Table(http));
+        if names {
+            document.insert("server_name".into(), "irc.stored.example".into());
+            document.insert("network_name".into(), "StoredNet".into());
+            let mut listener = toml::Table::new();
+            listener.insert("addr".into(), toml::Value::String("127.0.0.1:0".into()));
+            document.insert(
+                "listeners".into(),
+                toml::Value::Array(vec![toml::Value::Table(listener)]),
+            );
+        }
+        Config::from_table(document, &[]).expect("the document is valid")
+    };
+    let omitting = document(false);
+    assert_eq!(
+        omitting.left_to_stored_settings,
+        [
+            "server_name",
+            "network_name",
+            "listeners",
+            "http.public_url"
+        ]
+    );
+    let refusal = match net::start(omitting).await {
+        Ok(_) => panic!("a first start cannot take the names from nothing"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refusal.contains("does not state server_name, network_name, listeners, http.public_url"),
+        "{refusal}"
+    );
+    // A restart: the first process stops, giving the serving lease back.
+    net::start(document(true))
+        .await
+        .expect("the first start")
+        .shutdown
+        .run()
+        .await;
+    let running = net::start(document(false))
+        .await
+        .expect("a later start takes the names from the stored settings");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    let (status, _, body) = request(http, &get("/api/v1/server")).await;
+    assert_eq!(status, 200, "{body}");
+    let server: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(server["server_name"], "irc.stored.example");
+    assert_eq!(server["network_name"], "StoredNet");
+    assert_eq!(running.addrs.len(), 1, "the stored listener is bound");
+    let (status, _, body) = request(
+        http,
+        "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 19\r\n\
+         Connection: close\r\n\r\nclient_id=e6irc-cli",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let device: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        device["verification_uri"], "https://irc.stored.example/device",
+        "the stored public URL runs"
+    );
+}
+
 /// Administrator console pages spend the separate administrator budget that
 /// `/api/v1/admin/*` spends (DESIGN §9.4), not the ordinary one: with a budget
 /// of one, the second administrator page is refused while an ordinary page
@@ -9685,9 +10490,13 @@ async fn administrator_pages_spend_the_administrator_budget() {
     e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
         .await
         .expect("root");
-    let session = e6ircd::db::create_web_session(&pool, "root", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("root"),
+        None,
+    )
+    .await
+    .expect("session");
     let mut config = test_config();
     config.limits.administrator_api_rate_burst = 1;
     let http = net::start(Config {
@@ -9772,9 +10581,13 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
     let token = issue_api_token(&pool, &account, "leaked")
         .await
         .expect("token");
-    let session = e6ircd::db::create_web_session(&pool, &account, None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established(account.as_str()),
+        None,
+    )
+    .await
+    .expect("session");
     let identity = e6ircd::db::list_oidc_identities(&pool, &account)
         .await
         .expect("identities")[0]
@@ -9903,12 +10716,20 @@ async fn console_pages_are_cookie_only_and_report_their_refusals() {
     )
     .await
     .expect("read token");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("alice session");
-    let mallory_session = e6ircd::db::create_web_session(&pool, "mallory", None)
-        .await
-        .expect("mallory session");
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("alice session");
+    let mallory_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("mallory"),
+        None,
+    )
+    .await
+    .expect("mallory session");
     let http = start_with_database(&url, &["alice"])
         .await
         .http_addr
@@ -9988,8 +10809,10 @@ async fn console_pages_are_cookie_only_and_report_their_refusals() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn recover_administrator_subcommand_is_honoured_by_a_running_daemon() {
-    let url =
-        support::test_db("recover_administrator_subcommand_is_honoured_by_a_running_daemon").await;
+    let url_text =
+        support::test_db_text("recover_administrator_subcommand_is_honoured_by_a_running_daemon")
+            .await;
+    let url: e6ircd::db::DatabaseUrl = url_text.parse().expect("the test database URL");
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -10015,7 +10838,7 @@ async fn recover_administrator_subcommand_is_honoured_by_a_running_daemon() {
         &config_path,
         format!(
             "server_name = \"irc.recover.example\"\nnetwork_name = \"RecoverNet\"\n\
-             [[listeners]]\naddr = \"127.0.0.1:0\"\n[database]\nurl = \"{url}\"\n"
+             [[listeners]]\naddr = \"127.0.0.1:0\"\n[database]\nurl = \"{url_text}\"\n"
         ),
     )
     .expect("write config");
@@ -10092,9 +10915,13 @@ async fn bearer_with_an_unverified_cookie_cannot_revoke_browser_sessions() {
     let token = issue_api_token(&pool, "alice", "automation")
         .await
         .expect("token");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     let http = start_with_database(&url, &[])
         .await
         .http_addr
@@ -10430,9 +11257,13 @@ async fn logout_post_requires_the_session_csrf_value() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     let http = start_with_database(&url, &[])
         .await
         .http_addr
@@ -10472,9 +11303,13 @@ async fn logout_post_requires_the_session_csrf_value() {
     // A sign-out form (the value in its body) is a navigation: it ends the
     // session and sends the browser on — here, a local session, to the
     // signed-out page.
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("second session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("second session");
     let owner = session_headers(http, &session).await;
     let csrf = owner
         .split("X-E6IRC-CSRF: ")
@@ -10529,9 +11364,13 @@ async fn changes_that_mint_lasting_access_need_a_recent_sign_in() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "correct-horse", None)
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '1 hour'")
         .execute(&pool)
         .await
@@ -11282,7 +12121,7 @@ async fn frontchannel_logout_clears_only_a_revoked_sessions_cookie() {
         sessions.push(
             e6ircd::db::create_web_session_with_identity(
                 &pool,
-                account,
+                &e6ircd::db::VerifiedAccount::established(account),
                 e6ircd::db::OidcSessionIdentity {
                     id_token: Some("the.id.token"),
                     provider: Some("shauth"),
@@ -11379,4 +12218,331 @@ fn seeded_target(action: &str, target: &str) -> e6ircd::db::AuditPrincipal {
         "OPER" => e6ircd::db::AuditPrincipal::operator(target),
         _ => e6ircd::db::AuditPrincipal::account(target),
     }
+}
+
+/// `GET` an API path with a bearer token; the status and the JSON body.
+async fn get_json(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+) -> (u16, serde_json::Value, String) {
+    let (status, _, body) = request(
+        addr,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    (status, value, body)
+}
+
+/// A bearer-authenticated JSON request of any method.
+async fn send_json(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> (u16, String) {
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _head, body) = request(addr, &req).await;
+    (status, body)
+}
+
+/// A network the server configuration defines for an account is the
+/// operator's: the account sees it (marked `configured`) in its own list and
+/// can read it, but every account-level create, edit, enable/disable and
+/// delete under its key is a 409 that leaves it running — a create used to
+/// supersede it, and an edit or delete of a same-named stored row stopped it.
+/// The administrator inventory lists it too, and pages the whole fleet by a
+/// stable cursor. The managed-network API refuses what the next start could
+/// not build, naming the field, and a configured name an account already
+/// stores.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn configured_networks_are_the_operators_and_the_inventory_pages_them() {
+    use e6ircd::config::{NetworkEntry, NetworkKind};
+    let url = support::test_db("configured_networks_are_the_operators").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("configured-networks-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    for account in ["alice", "bob"] {
+        e6ircd::db::create_account_with_contact(&pool, account, "pw", None)
+            .await
+            .expect("account");
+    }
+    let alice = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("alice token");
+    let bob = issue_api_token(&pool, "bob", "test")
+        .await
+        .expect("bob token");
+    drop(pool);
+
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
+    let configured = |owner: Option<&str>, name: &str, nick: &str| NetworkEntry {
+        kind: NetworkKind::Irc,
+        name: name.into(),
+        owner: owner.map(str::to_string),
+        addr: up.to_string(),
+        tls: false,
+        nick: nick.into(),
+        username: Some(nick.into()),
+        realname: Some("Configured".into()),
+        autojoin: vec![],
+        buffer_cap: 16,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    };
+    let config = Config {
+        server_name: "irc.configured.example".into(),
+        network_name: "ConfiguredNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path,
+            previous_key_files: Vec::new(),
+        }),
+        networks: vec![
+            configured(Some("alice"), "OpsNet", "opsbot"),
+            configured(None, "lobby", "lobbybot"),
+        ],
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+
+    // Bob stores two networks of his own.
+    for name in ["bnet", "anet"] {
+        let (status, body) = post_json(
+            http,
+            "/api/v1/me/networks",
+            &bob,
+            &format!(
+                r#"{{"kind":"irc","name":"{name}","addr":"{up}","tls":false,"nick":"bob{name}","username":"bob","realname":"Bob","autojoin":[]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    // Alice's configured network is hers to see, and not hers to change.
+    let (status, list, body) = get_json(http, "/api/v1/me/networks", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    let networks = list["networks"].as_array().expect("networks");
+    assert_eq!(networks.len(), 1, "{body}");
+    assert_eq!(networks[0]["name"], "OpsNet");
+    assert_eq!(networks[0]["configured"], true);
+    assert_eq!(networks[0]["enabled"], true);
+    assert!(networks[0]["runtime"].is_object(), "{body}");
+    let (status, one, body) = get_json(http, "/api/v1/me/networks/opsnet", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(one["configured"], true, "{body}");
+    let (status, _, body) = get_json(http, "/api/v1/me/networks/opsnet/buffer", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _, body) = get_json(http, "/api/v1/me/networks/opsnet/operations", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, bobs, _) = get_json(http, "/api/v1/me/networks", &bob).await;
+    assert!(
+        bobs["networks"]
+            .as_array()
+            .expect("networks")
+            .iter()
+            .all(|network| network["configured"] == false),
+        "{bobs}"
+    );
+
+    let refused = |status: u16, body: &str| {
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("server configuration"), "{body}");
+    };
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &alice,
+        &format!(
+            r#"{{"kind":"irc","name":"opsnet","addr":"{up}","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}}"#
+        ),
+    )
+    .await;
+    refused(status, &body);
+    let replacement = format!(
+        r#"{{"addr":"{up}","tls":false,"nick":"hijack","username":"alice","realname":"Alice","autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"#
+    );
+    let (status, body) = send_json(
+        http,
+        "PUT",
+        "/api/v1/me/networks/OpsNet",
+        &alice,
+        &replacement,
+    )
+    .await;
+    refused(status, &body);
+    let (status, body) = patch_json(
+        http,
+        "/api/v1/me/networks/opsnet",
+        &alice,
+        r#"{"enabled":false}"#,
+    )
+    .await;
+    refused(status, &body);
+    let (status, body) = send_json(http, "DELETE", "/api/v1/me/networks/opsnet", &alice, "").await;
+    refused(status, &body);
+    let (status, body) = patch_json(
+        http,
+        "/api/v1/admin/networks/alice/opsnet",
+        &alice,
+        r#"{"enabled":false}"#,
+    )
+    .await;
+    refused(status, &body);
+    let (_, still, body) = get_json(http, "/api/v1/me/networks/opsnet", &alice).await;
+    assert_eq!(still["nick"], "opsbot", "{body}");
+    assert_eq!(still["enabled"], true, "{body}");
+    assert_ne!(still["runtime"]["state"], serde_json::Value::Null, "{body}");
+
+    // The fleet inventory: shared first, then by owner and name, one page of
+    // two at a time, every network once.
+    let mut seen = Vec::new();
+    let mut path = "/api/v1/admin/networks?limit=2".to_string();
+    loop {
+        let (status, page, body) = get_json(http, &path, &alice).await;
+        assert_eq!(status, 200, "{body}");
+        let networks = page["networks"].as_array().expect("networks");
+        assert!(networks.len() <= 2, "{body}");
+        for network in networks {
+            seen.push((
+                network["owner"].as_str().expect("owner").to_string(),
+                network["name"].as_str().expect("name").to_string(),
+                network["configured"] == true || network["shared"] == true,
+            ));
+        }
+        match page["next_after"].as_str() {
+            Some(cursor) => {
+                path = format!(
+                    "/api/v1/admin/networks?limit=2&after={}",
+                    cursor.replace('/', "%2F")
+                );
+            }
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            ("shared".to_string(), "lobby".to_string(), true),
+            ("alice".to_string(), "OpsNet".to_string(), true),
+            ("bob".to_string(), "anet".to_string(), false),
+            ("bob".to_string(), "bnet".to_string(), false),
+        ]
+    );
+    let (status, _, body) = get_json(http, "/api/v1/admin/networks?after=bob%2Fanet", &alice).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("after"), "{body}");
+
+    // The managed-network API: what the next start could not build is refused
+    // naming the field, and a configured network cannot take a stored name.
+    let (_, configuration, _) = get_json(http, "/api/v1/admin/configuration", &alice).await;
+    let revision = configuration["revision"].as_i64().expect("revision");
+    for (field, value) in [
+        ("nick", r#""alice smith""#),
+        ("autojoin", r##"["#ops key"]"##),
+        ("autojoin", r#"["ops"]"#),
+        ("realname", r#""Al\rice""#),
+    ] {
+        let mut network = serde_json::json!({
+            "revision": revision, "kind": "irc", "name": "managed", "owner": null,
+            "addr": up.to_string(), "tls": false, "nick": "managed", "username": "managed",
+            "realname": "Managed", "autojoin": [], "buffer_cap": 16
+        });
+        network[field] = serde_json::from_str(value).expect("value");
+        let (status, body) = post_json(
+            http,
+            "/api/v1/admin/configuration/networks",
+            &alice,
+            &network.to_string(),
+        )
+        .await;
+        assert_eq!(status, 400, "{field}={value}: {body}");
+        assert!(body.contains(field), "{field}={value}: {body}");
+    }
+    let (status, body) = post_json(
+        http,
+        "/api/v1/admin/configuration/networks",
+        &alice,
+        &serde_json::json!({
+            "revision": revision, "kind": "irc", "name": "BNET", "owner": "Bob",
+            "addr": up.to_string(), "tls": false, "nick": "managed", "username": "managed",
+            "realname": "Managed", "autojoin": [], "buffer_cap": 16
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("already has a network named"), "{body}");
+
+    // The SASL login is sent as given everywhere: surrounding whitespace is
+    // refused by create, the connection test, and an edit alike.
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &bob,
+        &format!(
+            r#"{{"kind":"irc","name":"sasl","addr":"{up}","tls":true,"nick":"bobsasl","username":"bob","realname":"Bob","autojoin":[],"sasl_account":" bob","sasl_password":"pw"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sasl_account"), "{body}");
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/network-preflight",
+        &bob,
+        &format!(
+            r#"{{"addr":"{up}","tls":true,"nick":"bobprobe","username":"bob","realname":"Bob","sasl_account":"bob ","sasl_password":"pw"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sasl_account"), "{body}");
+    let (status, body) = send_json(
+        http,
+        "PUT",
+        "/api/v1/me/networks/anet",
+        &bob,
+        &format!(
+            r#"{{"addr":"{up}","tls":true,"nick":"bobanet","username":"bob","realname":"Bob","autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"set","account":" bob","password":"pw"}},"server_password":{{"action":"keep"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sasl_account"), "{body}");
 }

@@ -11,6 +11,9 @@ cargo build --locked --release -p e6irc-load -p e6ircd
 target/release/e6irc-load --addr 127.0.0.1:6667 --clients 1000 --burst 20
 ```
 
+`e6irc-load --help` (or `-h`) prints every flag with its meaning; the flags
+are described below as well.
+
 Flags: `--addr host:port` (required), `--clients N`
 (default 100), `--channels C` (default 1 — spread clients across C
 channels), `--channel PREFIX` (default `#load`; actual channel is
@@ -23,6 +26,27 @@ channels), `--channel PREFIX` (default `#load`; actual channel is
 acceptance threshold. The optional thresholds turn the measurement into an
 acceptance gate: missing exact deliveries or violating any supplied threshold
 exits nonzero.
+
+**A burst the flood limiter would meter is refused.** Every line a connection
+sends spends one token of the server's command bucket (`limits.command_burst`,
+40 by default, refilled at `limits.command_rate`, 20 a second). A sender whose
+burst and fence line exceed the bucket is metered to the refill rate, so the
+run would time the limiter rather than fan-out — and a burst of a few hundred
+outlasts the receivers' 30-second timeout. The harness therefore refuses
+`--burst` past `--server-command-burst N` (default 40, e6ircd's default; state
+the server's own value when it differs) unless the senders oper up:
+`--oper-name NAME` with the password in `E6IRC_LOAD_OPER_PASSWORD` (never an
+argument, which the process list shows) makes each sender `OPER` before it
+joins, and an IRC operator is exempt from the limiter. A refused `OPER` fails
+the sender. Each sender leaves with `QUIT` and reads until the server closes:
+dropping a socket with unread input makes the kernel reset it, and the reset
+discarded the part of the burst the server had not yet read.
+
+**The server's core shards are read from the server.** `--monitoring-url
+http://HOST:PORT` reads the server's monitoring observation (`core.shards`)
+before the run, with the bearer in `E6IRC_MONITORING_TOKEN` (the server's
+monitoring token); `--core-workers N` states the count the run claims, and a
+server running another number rejects the run. The report records both.
 
 **Use `--channels` for realistic numbers.** One giant channel makes the
 join phase O(N²) — each join sends a NAMES list of every current member
@@ -63,7 +87,10 @@ has a closed `passed` or `rejected` outcome; an execution failure has a closed
 error. The file is created once and synced before success is reported.
 `--host-provenance-sha256 DIGEST` records a controlled runner's host-file
 digest in that contract. It requires a report, server resident-memory sampling,
-and every throughput, latency, and memory acceptance threshold.
+`--core-workers` with `--monitoring-url`, and every throughput, latency, and
+memory acceptance threshold. The contract is `format_version` 3: version 3
+added the request's `core_workers`, `senders_are_operators` and
+`server_command_burst`, and the report's `server_core_shards`.
 The harness rejects workloads above 100,000 clients or 10 million tracked
 messages before it allocates tasks or measurement buffers.
 
@@ -117,12 +144,22 @@ harness run still writes `result.json`; preflight failures create no evidence.
 
 ```
 E6IRC_QUALIFICATION_HOST=scale-host-01 \
+E6IRC_QUALIFICATION_MONITORING_URL=http://127.0.0.1:8080 \
+E6IRC_MONITORING_TOKEN="$SERVER_MONITORING_TOKEN" \
   tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 2 20000 200 20 results/20000 \
   100 1000 500 262144
 ```
 
-The third value is the configured core-worker count. The final four values are
-minimum connect rate, minimum fan-out rate, maximum P99 milliseconds, and
+The third value is the core-worker count the evidence claims; the harness
+reads the count the server runs from its monitoring observation
+(`E6IRC_QUALIFICATION_MONITORING_URL`, the server's `http://HOST:PORT`, with
+the server's `E6IRC_MONITORING_TOKEN`), a mismatch rejects the run, and
+verification refuses evidence whose result does not show the claimed count. A
+burst past the server's default command burst (39 lines and the fence) is
+refused before it starts unless `E6IRC_QUALIFICATION_OPER_NAME` and
+`E6IRC_LOAD_OPER_PASSWORD` name an `[[oper]]` for the senders to oper up as. The
+final four values are
+minimum connect rate, minimum fan-out rate, maximum 99th-percentile latency in milliseconds, and
 maximum incremental server resident bytes per requested connection. The result
 records the SHA-256 digest of `host.txt`; `qualification.json` records digests
 for both raw files. Verify `qualification.json` with its sibling `result.json`
@@ -131,7 +168,7 @@ publishing a claim.
 
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,
-at least 100 deliveries/second, P99 below five seconds, and graceful shutdown.
+at least 100 deliveries/second, 99th-percentile latency below five seconds, and graceful shutdown.
 On Linux it also samples the daemon and rejects more than 1 MiB of incremental
 peak RSS per requested connection. Those deliberately generous shared-runner
 limits catch catastrophic regressions without pretending to be a

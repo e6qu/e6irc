@@ -12,10 +12,18 @@ client is executed with them. The password reaches it only through its
 environment.
 
 The URL is the one e6ircd itself connects with, so its query parameters are
-read the way the daemon reads them (hyphenated spellings included). Every
-parameter is either forwarded, or named below as meaningless to a client, or
-refused: dropping one silently could dial a different server, or the right one
-without the TLS verification the operator asked for.
+read the way the daemon reads them (hyphenated spellings included): the keys
+below are exactly the daemon's closed set (`crates/e6ircd/src/db/url.rs`,
+whose test compares the two lists). Every parameter is either forwarded, or
+named below as meaningless to a client, or refused: dropping one silently
+could dial a different server, or the right one without the TLS verification
+the operator asked for. A field stated twice is refused too, as the daemon
+refuses it, rather than letting the last spelling win.
+
+The URL is the whole description of the connection, for the client as for the
+daemon: every libpq variable inherited from the caller's environment is
+removed before the URL's are set (a stray `PGSSLMODE=disable` would otherwise
+turn off the verification the URL asks for), and no password file is read.
 
 No message names any part of the URL's content; a malformed URL can put a
 fragment of the password anywhere a parser looks.
@@ -29,9 +37,10 @@ import urllib.parse
 
 URL_VARIABLE = "E6IRC_DATABASE_URL"
 
+# libpq's `hostaddr` and `connect_timeout` are not here: the daemon cannot
+# honour them as libpq does, so a URL stating one is refused by both.
 QUERY_PARAMETERS = {
     "host": "PGHOST",
-    "hostaddr": "PGHOSTADDR",
     "port": "PGPORT",
     "dbname": "PGDATABASE",
     "user": "PGUSER",
@@ -47,7 +56,6 @@ QUERY_PARAMETERS = {
     "ssl-key": "PGSSLKEY",
     "application_name": "PGAPPNAME",
     "options": "PGOPTIONS",
-    "connect_timeout": "PGCONNECT_TIMEOUT",
 }
 
 # Sizes the daemon's prepared-statement cache; it selects nothing about the
@@ -92,24 +100,38 @@ def libpq_environment(url: str) -> dict[str, str]:
         raise UnusableUrl("it contains a bare '#'; write one inside a value as %23")
 
     environment: dict[str, str] = {}
+
+    def state(variable: str, value: str) -> None:
+        if variable in environment:
+            field = next(key for key, name in QUERY_PARAMETERS.items() if name == variable)
+            raise UnusableUrl(f"it states its {field} more than once")
+        environment[variable] = value
+
     credentials, _, authority = parts.netloc.rpartition("@")
     user, has_password, password = credentials.partition(":")
     if user:
-        environment["PGUSER"] = decoded("user name", user)
+        state("PGUSER", decoded("user name", user))
     if has_password:
-        environment["PGPASSWORD"] = decoded("password", password)
+        state("PGPASSWORD", decoded("password", password))
     host, port = host_and_port(authority)
     if host:
-        environment["PGHOST"] = decoded("host", host)
+        state("PGHOST", decoded("host", host))
     if port:
-        environment["PGPORT"] = port
-    if parts.path.strip("/"):
-        environment["PGDATABASE"] = decoded("database name", parts.path[1:])
+        state("PGPORT", port)
+    database = parts.path[1:]
+    if database:
+        if "/" in database:
+            raise UnusableUrl("its path names more than a database")
+        state("PGDATABASE", decoded("database name", database))
 
+    daemon_only_stated: set[str] = set()
     for pair in filter(None, parts.query.split("&")):
         key, _, value = pair.partition("=")
         key = decoded("query string", key)
         if key in DAEMON_ONLY_PARAMETERS:
+            if key in daemon_only_stated:
+                raise UnusableUrl(f"it states its {key} more than once")
+            daemon_only_stated.add(key)
             continue
         variable = QUERY_PARAMETERS.get(key)
         if variable is None:
@@ -122,7 +144,7 @@ def libpq_environment(url: str) -> dict[str, str]:
                 f"its query parameter {key!r} has a bare '+', which e6ircd reads "
                 "as a space and libpq as a plus sign; write %20 or %2B"
             )
-        environment[variable] = decoded(f"query parameter {key!r}", value)
+        state(variable, decoded(f"query parameter {key!r}", value))
 
     port = environment.get("PGPORT")
     if port is not None and not (port.isascii() and port.isdigit() and 0 < int(port) < 65536):
@@ -135,7 +157,12 @@ def main() -> int:
     if not command:
         print(f"usage: {URL_VARIABLE}=... {sys.argv[0]} COMMAND [ARGUMENT...]", file=sys.stderr)
         return 2
-    environment = dict(os.environ)
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("PG")
+    }
+    # No password file either: the daemon reads none, and a client that found
+    # one would connect with a password the URL does not state.
+    environment["PGPASSFILE"] = os.devnull
     url = environment.pop(URL_VARIABLE, "")
     if not url:
         print(f"{URL_VARIABLE} is required", file=sys.stderr)

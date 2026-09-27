@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::numerics::{
-    ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL, ERR_USERNOTINCHANNEL,
-    RPL_LOGGEDIN, RPL_LOGGEDOUT,
+    ERR_BADCHANNAME, ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL,
+    ERR_USERNOTINCHANNEL, RPL_LOGGEDIN, RPL_LOGGEDOUT,
 };
 use e6irc_queue::Sender;
 
@@ -42,6 +42,37 @@ impl ChanKey {
         ChanKey(folded.to_string())
     }
 }
+
+/// What a read marker is kept under: a channel's casefolded name, or the
+/// *identity* of a direct-message correspondent — the one a conversation with
+/// them is keyed by (DESIGN §11.1.1): their account when they have one, so the
+/// marker follows them across a nick change the way the conversation does, and
+/// `~nick` when they have not authenticated, as the conversation is. Built by
+/// [`ServerState::marker_target`] from a name a client gave, from a channel's
+/// key, or from what the store already holds (`MarkerTarget::stored`), so a
+/// correspondent's nick can never key one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkerTarget(String);
+
+impl MarkerTarget {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A key the store holds, written from [`MarkerTarget::as_str`].
+    pub(crate) fn stored(key: String) -> Self {
+        Self(key)
+    }
+}
+
+impl From<&ChanKey> for MarkerTarget {
+    fn from(key: &ChanKey) -> Self {
+        Self(key.0.clone())
+    }
+}
+
+/// An account's read marker: whose, and on what.
+pub(crate) type MarkerKey = (AccountKey, MarkerTarget);
 
 /// Casefolded nick key; same rationale as [`ChanKey`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,10 +236,55 @@ impl MembershipDirectory {
         ))
     }
 
+    /// A channel's display name, when it exists.
+    fn channel_name(&self, key: &ChanKey) -> Option<String> {
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        channels.get(key).map(|channel| channel.name.clone())
+    }
+
     /// When a channel's current incarnation was created.
     fn channel_created_at(&self, key: &ChanKey) -> Option<e6irc_proto::time::Millis> {
         let channels = self.channels.lock().expect("membership directory poisoned");
         channels.get(key).map(|channel| channel.created_at)
+    }
+
+    /// The channel a WHO of `target` by nick shows `requester`, with
+    /// `target`'s rank sigils there — Solanum's `m_who`: the first of
+    /// `target`'s channels (here, in key order) that `requester` is in too,
+    /// or, unless `target` is invisible, that is not secret. `None` when there
+    /// is none, and WHO shows `*`.
+    pub(crate) fn who_channel(
+        &self,
+        target: ConnId,
+        requester: ConnId,
+        target_invisible: bool,
+        multi_prefix: bool,
+    ) -> Option<(String, &'static str)> {
+        let by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        let shared = by_conn.get(&requester);
+        let mut keys: Vec<&ChanKey> = by_conn.get(&target).into_iter().flatten().collect();
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        keys.into_iter().find_map(|key| {
+            let channel = channels.get(key)?;
+            let member = shared.is_some_and(|shared| shared.contains(key));
+            (member || (!target_invisible && !channel.secret)).then(|| {
+                let sigil = channel
+                    .ranks
+                    .get(&target)
+                    .map_or("", |modes| modes.sigils(multi_prefix));
+                (channel.name.clone(), sigil)
+            })
+        })
+    }
+
+    /// Whether `conn` is in any channel, on any shard.
+    fn in_any_channel(&self, conn: ConnId) -> bool {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .get(&conn)
+            .is_some_and(|channels| !channels.is_empty())
     }
 
     /// `target`'s channels as WHOIS shows them to `requester`: rank sigils (all
@@ -922,7 +998,7 @@ pub(crate) struct PublicUser {
     /// Umode +Z: the connection is TLS end to end ([`Session::secure`]).
     pub(crate) secure: bool,
     pub(crate) signon: e6irc_proto::time::Millis,
-    pub(crate) last_active: LastActive,
+    pub(crate) idle_since: IdleSince,
 }
 
 impl PublicUser {
@@ -934,7 +1010,7 @@ impl PublicUser {
             host: session.host.clone(),
             real_ip: session.real_ip,
             realname: session.realname().expect("registered").to_string(),
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             away: session.away.clone(),
             oper: session.oper.is_some(),
             bot: session.bot,
@@ -943,7 +1019,7 @@ impl PublicUser {
             registered_only: session.registered_only,
             secure: session.secure(),
             signon: session.signon,
-            last_active: session.last_active.clone(),
+            idle_since: session.idle_since.clone(),
         }
     }
 
@@ -954,7 +1030,7 @@ impl PublicUser {
             && Some(self.user.as_str()) == session.user()
             && self.host == session.host
             && Some(self.realname.as_str()) == session.realname()
-            && self.account == session.account
+            && self.account.as_deref() == session.account()
             && self.away == session.away
             && self.oper == session.oper.is_some()
             && self.bot == session.bot
@@ -1006,7 +1082,7 @@ impl PublicUser {
             away: self.away.is_some(),
             oper: self.oper,
             bot: self.bot,
-            last_active: self.last_active.clone(),
+            idle_since: self.idle_since.clone(),
         }
     }
 }
@@ -1191,27 +1267,43 @@ pub(crate) struct Census {
 }
 
 /// The server-wide WHOWAS ring: a nick may be asked about from any shard.
+/// It holds at most [`WHOWAS_CAP`] records, and at most [`WHOWAS_PER_NICK`] of
+/// any one nick, so a user reconnecting under one nick over and over keeps
+/// only its newest few rather than pushing every other nick's out.
 #[derive(Clone, Default)]
 pub(crate) struct WhowasDirectory {
-    newest_first: Arc<Mutex<std::collections::VecDeque<WhowasEntry>>>,
+    newest_first: Arc<Mutex<std::collections::VecDeque<(NickKey, WhowasEntry)>>>,
 }
 
 impl WhowasDirectory {
-    fn record(&self, entry: WhowasEntry) {
+    fn record(&self, key: NickKey, entry: WhowasEntry) {
         let mut ring = self.newest_first.lock().expect("whowas directory poisoned");
-        if ring.len() == WHOWAS_CAP {
-            ring.pop_back();
+        let oldest_kept = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (held, _))| *held == key)
+            .map(|(index, _)| index)
+            .nth(WHOWAS_PER_NICK - 1);
+        match oldest_kept {
+            Some(index) => {
+                ring.remove(index);
+            }
+            None if ring.len() == WHOWAS_CAP => {
+                ring.pop_back();
+            }
+            None => {}
         }
-        ring.push_front(entry);
+        ring.push_front((key, entry));
     }
 
     /// Up to `limit` records of `key`, newest first.
-    pub(crate) fn of(&self, casemap: CaseMapping, key: &NickKey, limit: usize) -> Vec<WhowasEntry> {
+    pub(crate) fn of(&self, key: &NickKey, limit: usize) -> Vec<WhowasEntry> {
         self.newest_first
             .lock()
             .expect("whowas directory poisoned")
             .iter()
-            .filter(|entry| casemap.casefold(&entry.nick) == key.as_str())
+            .filter(|(held, _)| held == key)
+            .map(|(_, entry)| entry)
             .take(limit)
             .cloned()
             .collect()
@@ -1233,6 +1325,158 @@ pub(crate) struct CoreDirectories {
     pub(crate) nick_registrations: NickRegistrationDirectory,
     /// Which connections their readers let past the line meter.
     pub(crate) flood_exemptions: crate::core::line_meter::FloodExemptions,
+    /// How long history is kept.
+    pub(crate) history_retention: HistoryRetention,
+    /// How old a connection must be before its QUIT comment is shown.
+    pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
+    /// The issued credentials live sessions signed in with.
+    pub(crate) signed_in_credentials: SignedInCredentials,
+    /// The rule for a password being set, shared with the web and the REST
+    /// API.
+    pub(crate) password_policy: crate::identity::PasswordPolicy,
+}
+
+/// A session's login: the account, the credential that signed it in, and,
+/// for a personal access token, the instant the token expires and the login
+/// with it.
+#[derive(Debug, Clone)]
+struct Login {
+    account: String,
+    credential: crate::identity::CredentialId,
+    expires_at: Option<e6irc_proto::time::MonoMillis>,
+}
+
+/// What a credential verdict is refused for, once it no longer stands
+/// ([`ServerState::end_credentials`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum EndedSignIns {
+    /// Every credential of the account: its password changed.
+    Account(AccountKey),
+    /// One app password or personal access token: it was revoked.
+    Credential(crate::identity::IssuedCredential),
+    /// Every credential: the revocation listener was re-connected and
+    /// re-checks what it may have missed, which a verdict read before it
+    /// cannot have seen ([`ServerState::refuse_verdicts_in_flight`]).
+    Every,
+}
+
+/// Why a verdict that landed is refused although the store verified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleVerdict {
+    /// Its account's credentials changed, or the credential was revoked,
+    /// after the check was queued.
+    CredentialEnded,
+    /// The revocation listener was re-connected after the check was queued:
+    /// what was revoked meanwhile is re-checked, and a verdict read before
+    /// that cannot be told apart from one for a revoked credential. The client
+    /// may simply try again.
+    Rechecked,
+}
+
+/// The app passwords and personal access tokens live sessions on every shard
+/// signed in with, each counted once per session. A listener that missed
+/// revocations while its connection was down reads which of these are still
+/// stored ([`crate::account_authority`]); nothing else is held long enough to
+/// need asking about.
+#[derive(Clone, Default)]
+pub(crate) struct SignedInCredentials(
+    Arc<std::sync::Mutex<HashMap<crate::identity::IssuedCredential, usize>>>,
+);
+
+impl SignedInCredentials {
+    fn hold(&self, credential: crate::identity::CredentialId) {
+        if let crate::identity::CredentialId::Issued(issued) = credential {
+            *self
+                .0
+                .lock()
+                .expect("signed-in credentials poisoned")
+                .entry(issued)
+                .or_default() += 1;
+        }
+    }
+
+    fn release(&self, credential: crate::identity::CredentialId) {
+        let crate::identity::CredentialId::Issued(issued) = credential else {
+            return;
+        };
+        let mut held = self.0.lock().expect("signed-in credentials poisoned");
+        let std::collections::hash_map::Entry::Occupied(mut entry) = held.entry(issued) else {
+            unreachable!("a session's issued credential is held while it is signed in");
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
+
+    /// Every issued credential a live session signed in with.
+    pub(crate) fn held(&self) -> Vec<crate::identity::IssuedCredential> {
+        self.0
+            .lock()
+            .expect("signed-in credentials poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+}
+
+/// How old a connection must be before the comment of its `QUIT` is shown
+/// (`limits.anti_spam_exit_message_time_seconds`, Solanum's
+/// `anti_spam_exit_message_time`). One cell, shared by every shard and set
+/// live when the setting changes, so each `QUIT` reads the value in force.
+/// Until it is set it holds the setting's own default, Libera's five minutes.
+#[derive(Clone)]
+pub(crate) struct AntiSpamExitMessageTime(Arc<std::sync::atomic::AtomicU64>);
+
+impl Default for AntiSpamExitMessageTime {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::config::DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS,
+        )))
+    }
+}
+
+impl AntiSpamExitMessageTime {
+    pub(crate) fn set_seconds(&self, seconds: u64) {
+        self.0.store(seconds, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a connection `age` old leaves with its comment hidden. Zero
+    /// seconds hides none.
+    pub(crate) fn hides_comment_at(&self, age: std::time::Duration) -> bool {
+        age.as_secs() < self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// How long history is kept (`storage.history_retention_days`), for what is
+/// served from memory: the core's rings and the bouncer's backlogs. Storage
+/// maintenance deletes what is older from the database; a ring or a backlog
+/// holding it would otherwise go on serving it. One cell, shared by every
+/// shard and every bouncer network and set live when the setting changes, so
+/// no reader can hold a stale copy of it. Zero days — the value before any is
+/// set, and with no database, which is then the whole record — is no cutoff.
+#[derive(Clone, Default)]
+pub(crate) struct HistoryRetention(Arc<std::sync::atomic::AtomicU64>);
+
+impl HistoryRetention {
+    pub(crate) fn set_days(&self, days: u64) {
+        self.0.store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The oldest time still kept at `now`, or `None` when history does not
+    /// age out.
+    pub(crate) fn cutoff(
+        &self,
+        now: e6irc_proto::time::Millis,
+    ) -> Option<e6irc_proto::time::Millis> {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            days => Some(now.saturating_sub(e6irc_proto::time::Millis::from_millis(
+                days.saturating_mul(DAY_MS),
+            ))),
+        }
+    }
 }
 
 /// A validated command-flood bucket shape: `burst` tokens at most, refilling
@@ -1363,7 +1607,7 @@ pub struct CoreConfig {
     /// clock above and used for every *timer* decision — the ping/registration
     /// reaper deadlines and the flood-bucket refill. Kept distinct (in source
     /// and in type, [`e6irc_proto::time::MonoMillis`]) so a timer can never be
-    /// compared against wall-clock time, which an NTP step or VM resume can
+    /// compared against wall-clock time, which an NTP step or virtual-machine resume can
     /// jump forward (mass-reaping every connection) or backward (freezing the
     /// reaper). The wall clock stays the source only for real timestamps
     /// (`server-time`, msgids, signon).
@@ -1563,10 +1807,13 @@ impl EventLine {
 /// shared by two messages — two shards counting from zero in the same
 /// millisecond, or a restart whose clock stepped back — silently loses the
 /// second from history. The id is opaque to every reader (CHATHISTORY pivots,
-/// the bouncer, clients all compare it whole); the leading millisecond only
-/// keeps ids roughly time-ordered for a human reading them.
+/// the bouncer, clients all compare it whole) — except for order: history is
+/// ordered by `(ts, msgid)` compared byte by byte
+/// ([`crate::core::HistoryRow::place`]), and the counter is written at a fixed
+/// width so that within one millisecond one shard's ids ascend in the order it
+/// stamped them, which is the order it delivered them live.
 #[derive(Debug)]
-struct MsgidSource {
+pub(crate) struct MsgidSource {
     /// `{shard}-{boot}-`, fixed for the process.
     stem: String,
     counter: u64,
@@ -1582,16 +1829,16 @@ impl MsgidSource {
         Self::with_boot(shard, u64::from_le_bytes(boot))
     }
 
-    fn with_boot(shard: CoreShardId, boot: u64) -> Self {
+    pub(crate) fn with_boot(shard: CoreShardId, boot: u64) -> Self {
         Self {
             stem: format!("{}-{boot:016x}-", shard.0),
             counter: 0,
         }
     }
 
-    fn next(&mut self, now: e6irc_proto::time::Millis) -> String {
+    pub(crate) fn next(&mut self, now: e6irc_proto::time::Millis) -> String {
         self.counter += 1;
-        format!("{}-{}{}", now.as_millis(), self.stem, self.counter)
+        format!("{}-{}{:016x}", now.as_millis(), self.stem, self.counter)
     }
 }
 
@@ -1684,12 +1931,13 @@ pub(crate) struct Session {
     /// multi-line CAP replies, and `cap-notify` it cannot turn off.
     pub cap_302: bool,
     pub caps: Caps,
-    /// Services account this connection is authenticated to. Written only by
+    /// Services account this connection is authenticated to, with the
+    /// credential that signed it in. Written only by
     /// [`ServerState::set_account`] and [`ServerState::clear_account`]: a
     /// login changes the connection's identity (see
     /// [`ServerState::conn_identity`]), and what the old identity owned must
     /// be dealt with in the same step.
-    account: Option<String>,
+    login: Option<Login>,
     pub sasl: SaslState,
     /// A SASL credential verify is genuinely outstanding (dispatched, reply not
     /// yet seen). Unlike `sasl == Verifying`, this survives an `AUTHENTICATE *`
@@ -1709,6 +1957,10 @@ pub(crate) struct Session {
     pub credential_attempts: crate::identity::CredentialAttemptBudget,
     /// Deferred NickServ IDENTIFY reply.
     pub pending_identify: Option<PendingServiceReply>,
+    /// The shard's credential epoch when this session's outstanding
+    /// credential check (SASL or IDENTIFY; one at a time) was queued: its
+    /// verdict is refused if the account's credentials changed since.
+    pub(crate) verify_epoch: u64,
     /// Deferred NickServ REGISTER reply.
     pub pending_register: Option<PendingServiceReply>,
     /// The protected nick this session holds without having identified to
@@ -1754,6 +2006,8 @@ pub(crate) struct Session {
     /// When this session's last KNOCK was delivered, on the monotonic clock: a
     /// user may knock once per `KNOCK_DELAY` (Solanum's `knock_delay`).
     pub last_knock: Option<e6irc_proto::time::MonoMillis>,
+    /// This session's recent nick changes, for Solanum's `anti_nick_flood`.
+    pub nick_changes: NickChangeThrottle,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
@@ -1762,6 +2016,8 @@ pub(crate) struct Session {
     /// channels and the rows of the pages not yet sent. On the session, so a
     /// LIST cannot be paced to a connection that is gone.
     pub(crate) channel_list: Option<crate::core::list::ChannelListCursor>,
+    /// This connection's bare NAMES still answering, paced like a LIST.
+    pub(crate) channel_names: Option<crate::core::list::ChannelListCursor>,
     /// This connection's WHO replies too long to queue at once, still going
     /// out as its send queue drains. On the session for the same reason.
     pub(crate) paced_who: Option<crate::core::paced::PacedReplies>,
@@ -1775,15 +2031,19 @@ pub(crate) struct Session {
     /// map on IDENTIFY/SASL: it was unattributable when set, and carrying it over
     /// would write a persisted marker the client never asked to associate with the
     /// account (same reason the DM-history identity key is not back-filled).
-    pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
+    pub anon_read_markers: HashMap<MarkerTarget, e6irc_proto::time::Millis>,
     /// Whether this connection's reader is told it is exempt from the line
     /// meter ([`crate::core::line_meter`]): what `oper` was when it was last
     /// published there.
     flood_exempt: bool,
-    /// Monotonic millisecond of the last non-keepalive command — the elapsed
-    /// idle duration since it (WHOIS idle / WHOX `l`) and the reaper's idle-ping
-    /// cadence both read it. (WHOIS *signon*, a real timestamp, is `signon`.)
-    pub last_active: LastActive,
+    /// When the user last spoke, for "seconds idle" (see [`IdleSince`]).
+    /// (WHOIS *signon*, a real timestamp, is `signon`.)
+    pub idle_since: IdleSince,
+    /// Monotonic millisecond the last line of any kind arrived — a PING or
+    /// PONG included: the reaper's liveness clock, which pings a connection
+    /// that has sent nothing for a while. Separate from [`Self::idle_since`],
+    /// which only speaking moves.
+    pub last_received: e6irc_proto::time::MonoMillis,
     pub signon: e6irc_proto::time::Millis,
     /// Monotonic millisecond the connection opened, for the registration
     /// deadline (an unregistered connection that never completes is reaped).
@@ -2103,7 +2363,12 @@ impl Session {
 
     /// The services account this connection is logged in to.
     pub fn account(&self) -> Option<&str> {
-        self.account.as_deref()
+        self.login.as_ref().map(|login| login.account.as_str())
+    }
+
+    /// The credential that signed this connection in to its account.
+    pub fn signed_in_with(&self) -> Option<crate::identity::CredentialId> {
+        self.login.as_ref().map(|login| login.credential)
     }
 
     /// The current nick, in either registration state (`None` before NICK).
@@ -2228,7 +2493,7 @@ impl Session {
     /// Who this session is to a channel's masks, given its `prefix()` (taken
     /// by the caller so the subject can borrow it).
     pub(crate) fn mask_subject<'a>(&'a self, prefix: &'a str) -> MaskSubject<'a> {
-        MaskSubject::new(prefix, self.real_ip, self.account.as_deref())
+        MaskSubject::new(prefix, self.real_ip, self.account())
     }
 
     /// `nick!user@host` — total on a registered session (its nick/user exist by
@@ -2314,18 +2579,53 @@ pub(crate) struct MemberIdentity {
     pub(crate) invisible: bool,
 }
 
-/// When a session last did something, on the monotonic clock: the one value
-/// behind every "seconds idle" answer.
-///
-/// It is a shared handle, not a copied timestamp, because it changes with
-/// every line a client sends. The session writes it; whoever answers about the
-/// user — this shard's WHOIS, another shard's WHO for a channel it owns — reads
-/// the same value. Copying it into each channel's member record instead meant
-/// one update per channel per line.
-#[derive(Debug, Clone)]
-pub(crate) struct LastActive(Arc<std::sync::atomic::AtomicU64>);
+/// Solanum's `anti_nick_flood`, with the `max_nick_changes` and
+/// `max_nick_time` its reference configuration (and Libera) runs: a user who
+/// has changed nick [`MAX_NICK_CHANGES`] times, each within
+/// [`MAX_NICK_TIME_MS`] of the one before, is refused the next with
+/// `ERR_NICKTOOFAST` (438) until that long passes without an attempt — a
+/// refused attempt counts too, as in `change_local_nick`. Operators are
+/// exempt. Every nick change is announced to each of the user's channel peers
+/// and its watchers, so without it one client could flood them all.
+#[derive(Debug, Default)]
+pub struct NickChangeThrottle {
+    count: u32,
+    last: Option<e6irc_proto::time::MonoMillis>,
+}
 
-impl LastActive {
+pub(crate) const MAX_NICK_CHANGES: u32 = 5;
+pub(crate) const MAX_NICK_TIME_MS: u64 = 20_000;
+
+impl NickChangeThrottle {
+    /// Count a nick change attempted at `now`; whether it is one too many.
+    pub(crate) fn too_fast(&mut self, now: e6irc_proto::time::MonoMillis) -> bool {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_sub(last).as_millis() > MAX_NICK_TIME_MS)
+        {
+            self.count = 0;
+        }
+        self.last = Some(now);
+        self.count = self.count.saturating_add(1);
+        self.count > MAX_NICK_CHANGES
+    }
+}
+
+/// When a user last spoke, on the monotonic clock: the one value behind every
+/// "seconds idle" answer (WHOIS 317, WHOX `l`, the administrators' connection
+/// list). Solanum's `localClient->last`: set at registration and by a PRIVMSG
+/// (`m_message.c` — never a NOTICE or TAGMSG, nor any other command), so idle
+/// time is time since the user last said something, not since its client last
+/// sent a line. Liveness is the other clock, [`Session::last_received`].
+///
+/// It is a shared handle, not a copied timestamp: the session writes it;
+/// whoever answers about the user — this shard's WHOIS, another shard's WHO
+/// for a channel it owns — reads the same value. Copying it into each
+/// channel's member record instead meant one update per channel per message.
+#[derive(Debug, Clone)]
+pub(crate) struct IdleSince(Arc<std::sync::atomic::AtomicU64>);
+
+impl IdleSince {
     pub(crate) fn new(at: e6irc_proto::time::MonoMillis) -> Self {
         Self(Arc::new(std::sync::atomic::AtomicU64::new(at.as_millis())))
     }
@@ -2353,12 +2653,12 @@ pub(crate) struct ChannelMemberProfile {
     pub(crate) away: bool,
     pub(crate) oper: bool,
     pub(crate) bot: bool,
-    pub(crate) last_active: LastActive,
+    pub(crate) idle_since: IdleSince,
 }
 
 impl ChannelMemberProfile {
     #[cfg(test)]
-    fn derived(identity: &MemberIdentity, last_active: e6irc_proto::time::MonoMillis) -> Self {
+    fn derived(identity: &MemberIdentity, idle_since: e6irc_proto::time::MonoMillis) -> Self {
         let (_, user_host) = identity
             .prefix
             .split_once('!')
@@ -2373,7 +2673,7 @@ impl ChannelMemberProfile {
             away: false,
             oper: false,
             bot: false,
-            last_active: LastActive::new(last_active),
+            idle_since: IdleSince::new(idle_since),
         }
     }
 }
@@ -2468,7 +2768,6 @@ pub struct ChannelJoinSuccess {
 
 #[derive(Debug, Clone)]
 pub enum ChannelJoinFailure {
-    NoSuchChannel { name: String },
     InviteOnly { name: String },
     Banned { name: String },
     BadKey { name: String },
@@ -2777,7 +3076,7 @@ pub struct ChannelListRequest {
     id: ChannelListRequestId,
     session: SessionOwner,
     shard: CoreShardId,
-    filter: Arc<crate::core::list::ListFilter>,
+    sweep: crate::core::list::ChannelSweep,
     after: Option<ChanKey>,
     limit: NonZeroUsize,
 }
@@ -2798,8 +3097,8 @@ impl ChannelListRequest {
         self.shard
     }
 
-    pub(crate) fn filter(&self) -> &crate::core::list::ListFilter {
-        &self.filter
+    pub(crate) fn sweep(&self) -> &crate::core::list::ChannelSweep {
+        &self.sweep
     }
 
     pub(crate) fn after(&self) -> Option<&ChanKey> {
@@ -2816,8 +3115,17 @@ impl ChannelListRequest {
 pub struct ChannelListRow {
     pub(crate) key: ChanKey,
     pub(crate) name: String,
-    pub(crate) members: usize,
-    pub(crate) topic: String,
+    pub(crate) body: ChannelRowBody,
+}
+
+/// What a sweep shows of one channel.
+#[derive(Debug, Clone)]
+pub enum ChannelRowBody {
+    /// A LIST row: the member count and the topic.
+    List { members: usize, topic: String },
+    /// A NAMES row: whether the channel is secret (its 353 symbol), and the
+    /// members the requester may see, each as it reads a name.
+    Names { secret: bool, names: Vec<String> },
 }
 
 /// One page of a LIST, from the shard it was asked of.
@@ -2839,26 +3147,43 @@ pub struct ChannelModeChange {
     pub(crate) arguments: Vec<String>,
 }
 
+/// Who an INVITE names, as the sender's shard found them: where they are, and
+/// the nick and away message they had there — so the channel's owner names
+/// the invitee by their own nick, not the spelling the inviter typed (Solanum's
+/// `target_p->name`), and the inviter hears the away message after 341.
 #[derive(Debug, Clone)]
 pub struct ChannelInvitee {
-    owner: SessionOwner,
-    requested_nick: String,
+    target: InviteeTarget,
+    nick: String,
+    away: Option<String>,
+}
+
+/// Where an invitee is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InviteeTarget {
+    /// A user's session, on whichever shard it lives.
+    Session(SessionOwner),
+    /// A services pseudo-client, which joins no channel: the invitation is
+    /// answered as Solanum answers one to a service, and goes no further.
+    Service,
 }
 
 impl ChannelInvitee {
-    pub(crate) fn new(owner: SessionOwner, requested_nick: String) -> Self {
-        Self {
-            owner,
-            requested_nick,
-        }
+    pub(crate) fn new(target: InviteeTarget, nick: String, away: Option<String>) -> Self {
+        Self { target, nick, away }
     }
 
-    pub(crate) fn owner(&self) -> SessionOwner {
-        self.owner
+    pub(crate) fn target(&self) -> InviteeTarget {
+        self.target
     }
 
-    pub(crate) fn requested_nick(&self) -> &str {
-        &self.requested_nick
+    /// The invitee's own nick, however the inviter spelled it.
+    pub(crate) fn nick(&self) -> &str {
+        &self.nick
+    }
+
+    pub(crate) fn away(&self) -> Option<&str> {
+        self.away.as_deref()
     }
 }
 
@@ -2970,12 +3295,28 @@ pub enum ChannelKnockResult {
 
 #[derive(Debug)]
 pub enum ChannelInviteResult {
-    Invited { invitee: String, channel: String },
-    NoSuchChannel { target: String },
-    Hidden { target: String, proof: Hidden },
-    NotOnChannel { target: String },
-    NotOperator { target: String },
-    UserOnChannel { invitee: String, channel: String },
+    Invited {
+        invitee: String,
+        away: Option<String>,
+        channel: String,
+    },
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+        proof: Hidden,
+    },
+    NotOnChannel {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    UserOnChannel {
+        invitee: String,
+        channel: String,
+    },
 }
 
 /// The member status a ChanServ OP, DEOP, VOICE or DEVOICE changes.
@@ -3374,11 +3715,11 @@ pub enum SpeakRefusal {
 pub struct ChannelMultiline {
     owner: ChannelOwner,
     actor: ChannelActor,
-    batch: MultilineBatch,
+    batch: CompletedMultiline,
 }
 
 impl ChannelMultiline {
-    pub(crate) fn new(owner: ChannelOwner, actor: ChannelActor, batch: MultilineBatch) -> Self {
+    pub(crate) fn new(owner: ChannelOwner, actor: ChannelActor, batch: CompletedMultiline) -> Self {
         Self {
             owner,
             actor,
@@ -3392,7 +3733,7 @@ impl ChannelMultiline {
     pub(crate) fn actor(&self) -> &ChannelActor {
         &self.actor
     }
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, MultilineBatch) {
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, CompletedMultiline) {
         (self.owner, self.actor, self.batch)
     }
 }
@@ -3651,7 +3992,7 @@ impl HistoryKey {
         self.0.starts_with('#').then(|| ChanKey(self.0.clone()))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn channel_for_test(name: &str) -> Self {
         HistoryKey(name.to_string())
     }
@@ -3693,6 +4034,84 @@ pub(crate) struct MultilineBatch {
     /// PRIVMSG or NOTICE, taken from the first line; the batch is one message,
     /// so it cannot change kind partway through.
     pub kind: Option<crate::core::MessageKind>,
+}
+
+/// Why a closed [`MultilineBatch`] is no message at all.
+#[derive(Debug)]
+pub(crate) enum MultilineRefusal {
+    /// No line was sent in it: a malformed batch (`FAIL BATCH MULTILINE_INVALID`).
+    Empty,
+    /// Only blank lines: a blank line is a line break, not text, so the batch
+    /// has no text to send — what ERR_NOTEXTTOSEND refuses for a PRIVMSG.
+    /// `loud` is false for a NOTICE, which is refused silently.
+    NoText { loud: bool },
+}
+
+impl MultilineBatch {
+    /// Close the batch into the one message it carries, or say why it carries
+    /// none. The refusal travels with the label of the BATCH that opened it,
+    /// which is still owed an answer.
+    pub(crate) fn complete(self) -> Result<CompletedMultiline, (MultilineRefusal, Option<String>)> {
+        let Some(kind) = self.kind.filter(|_| !self.lines.is_empty()) else {
+            return Err((MultilineRefusal::Empty, self.label));
+        };
+        if self.lines.iter().all(|(text, _)| text.is_empty()) {
+            let loud = kind.is_loud();
+            return Err((MultilineRefusal::NoText { loud }, self.label));
+        }
+        Ok(CompletedMultiline {
+            target: self.target,
+            client_tags: self.client_tags,
+            label: self.label,
+            lines: self.lines,
+            kind,
+        })
+    }
+}
+
+/// A closed multiline batch that is a message: at least one line, at least one
+/// of them with text, and one kind. Only [`MultilineBatch::complete`] builds
+/// one, and delivery — on the sender's shard or on the channel's owner — takes
+/// nothing else, so a batch with nothing to send cannot be delivered or stored
+/// on either.
+#[derive(Debug)]
+pub(crate) struct CompletedMultiline {
+    target: String,
+    client_tags: String,
+    label: Option<String>,
+    lines: Vec<(String, bool)>,
+    kind: crate::core::MessageKind,
+}
+
+impl CompletedMultiline {
+    /// The target, as the client spelled it.
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Client-only tags from the opening BATCH.
+    pub(crate) fn client_tags(&self) -> &str {
+        &self.client_tags
+    }
+
+    /// The opening BATCH's labeled-response label.
+    pub(crate) fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// The lines, `(text, concatenate-with-previous)`, in the order sent.
+    pub(crate) fn lines(&self) -> &[(String, bool)] {
+        &self.lines
+    }
+
+    pub(crate) fn kind(&self) -> crate::core::MessageKind {
+        self.kind
+    }
+
+    /// The target and the label, for a refusal that answers the batch.
+    pub(crate) fn into_target_and_label(self) -> (String, Option<String>) {
+        (self.target, self.label)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3995,11 +4414,11 @@ impl Channel {
         recipient: Recipient,
         identity: MemberIdentity,
         modes: MemberModes,
-        last_active: e6irc_proto::time::MonoMillis,
+        idle_since: e6irc_proto::time::MonoMillis,
     ) {
         self.add_member_with_profile(
             recipient,
-            ChannelMemberProfile::derived(&identity, last_active),
+            ChannelMemberProfile::derived(&identity, idle_since),
             identity,
             modes,
         );
@@ -4337,12 +4756,32 @@ pub(crate) struct ServerState {
     /// The line meter's exemptions, which this shard publishes for its own
     /// sessions ([`Self::sync_flood_exemption`]).
     flood_exemptions: crate::core::line_meter::FloodExemptions,
+    /// How long history is kept, shared with every shard and the bouncer.
+    history_retention: HistoryRetention,
+    /// How old a connection must be before its QUIT comment is shown, shared
+    /// with every shard.
+    pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
+    /// The rule `REGISTER` and NickServ `REGISTER` hold a new password to,
+    /// shared with every shard, the web and the REST API.
+    pub(crate) password_policy: crate::identity::PasswordPolicy,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
     /// verification already in flight cannot re-authenticate after the
     /// suspension event has run.
     pub suspended_accounts: HashSet<AccountKey>,
+    /// Advances each time an account's sessions, or an issued credential's,
+    /// end for a credential change ([`Self::end_credentials`]); a queued
+    /// credential check records it ([`Session::verify_epoch`]).
+    credential_epoch: u64,
+    /// The epoch each account's credentials, or each issued credential, last
+    /// ended at, kept while a credential check queued before it may still
+    /// land — which is all a verdict compares
+    /// ([`Self::credentials_ended_since`]).
+    credentials_ended: HashMap<EndedSignIns, u64>,
+    /// The issued credentials this shard's sessions signed in with, in the
+    /// count every shard shares.
+    signed_in_credentials: SignedInCredentials,
     /// Accounts permanently deleted while this process runs. A write already
     /// in flight when one was deleted (MARKREAD, NickServ GROUP or SET
     /// ENFORCE) can answer after its mirror was emptied; the confirmation adds
@@ -4370,11 +4809,11 @@ pub(crate) struct ServerState {
     /// methods (`store_read_marker`, `reserve_read_marker`,
     /// `release_read_marker`, `preload_read_markers`) so
     /// `read_marker_slots` can never drift from the maps.
-    read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
+    read_markers: HashMap<MarkerKey, e6irc_proto::time::Millis>,
     /// Number of database writes in flight for each account/target. A target
     /// is reserved here before its first durable write completes, so pipelined
     /// MARKREAD commands cannot evade the per-account distinct-target cap.
-    pending_read_markers: HashMap<(AccountKey, ChanKey), usize>,
+    pending_read_markers: HashMap<MarkerKey, usize>,
     /// Distinct targets each account holds a marker for, confirmed or
     /// pending — the operand of the per-account MARKREAD cap. Kept at every
     /// write so a MARKREAD costs a lookup, not a scan of every account's
@@ -4458,7 +4897,8 @@ pub(crate) struct ServerState {
     channel_list_id: u64,
     /// The connections with a LIST or WHO reply being paced out: which
     /// sessions the pacing turn visits. The paced output itself lives on the
-    /// session ([`Session::channel_list`], [`Session::paced_who`]), so it
+    /// session ([`Session::channel_list`], [`Session::channel_names`],
+    /// [`Session::paced_who`]), so it
     /// cannot outlive the connection it answers.
     pub(crate) pacing: HashSet<ConnId>,
 }
@@ -4552,6 +4992,11 @@ pub(crate) struct WhowasEntry {
 
 pub(crate) const WHOWAS_CAP: usize = 1000;
 
+/// The most WHOWAS records one nick keeps. Solanum bounds only the whole
+/// history (`whowas_length`), so one nick's reconnects could fill it; twenty
+/// is as many as Solanum answers a remote WHOWAS with (`m_whowas`).
+pub(crate) const WHOWAS_PER_NICK: usize = 20;
+
 impl ServerState {
     pub fn local_recipient(&self, conn: ConnId) -> Recipient {
         Recipient::new(
@@ -4576,11 +5021,11 @@ impl ServerState {
             host: session.host.clone(),
             real_ip: session.real_ip,
             realname: session.realname().expect("registered member").to_string(),
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             away: session.away.is_some(),
             oper: session.oper.is_some(),
             bot: session.bot,
-            last_active: session.last_active.clone(),
+            idle_since: session.idle_since.clone(),
         }
     }
 
@@ -4589,7 +5034,7 @@ impl ServerState {
         ChannelActor {
             recipient: self.local_recipient(conn),
             identity: self.local_member_identity(conn),
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
             bot: session.bot,
@@ -4623,7 +5068,7 @@ impl ServerState {
         &mut self,
         owner: ChannelOwner,
         actor: ChannelActor,
-        name: String,
+        name: crate::sanitize::ChannelName,
         join_key: Option<String>,
         label: Option<String>,
     ) {
@@ -4740,11 +5185,11 @@ impl ServerState {
     /// Begin `conn`'s LIST, whose reply is already open (inside `batch` when
     /// labeled): a cursor at the start of every channel shard. The connection
     /// has no LIST in progress.
-    pub fn start_channel_list(
+    pub(crate) fn start_channel_list(
         &mut self,
         conn: ConnId,
         batch: Option<String>,
-        filter: crate::core::list::ListFilter,
+        sweep: crate::core::list::ChannelSweep,
     ) {
         let id = ChannelListRequestId(self.channel_list_id);
         self.channel_list_id = self
@@ -4756,12 +5201,17 @@ impl ServerState {
             .sessions
             .output_mut(&conn)
             .expect("a LIST is started by the session sending it");
-        let previous = session
-            .channel_list
-            .replace(crate::core::list::ChannelListCursor::new(
-                id, filter, batch, shards,
-            ));
-        assert!(previous.is_none(), "a connection has one LIST in progress");
+        let slot = match sweep {
+            crate::core::list::ChannelSweep::List(_) => &mut session.channel_list,
+            crate::core::list::ChannelSweep::Names { .. } => &mut session.channel_names,
+        };
+        let previous = slot.replace(crate::core::list::ChannelListCursor::new(
+            id, sweep, batch, shards,
+        ));
+        assert!(
+            previous.is_none(),
+            "a connection has one LIST and one NAMES in progress"
+        );
     }
 
     /// Ask channel shard `shard` for the next page of `conn`'s LIST: at most
@@ -4778,7 +5228,7 @@ impl ServerState {
             id: cursor.id,
             session: SessionOwner::new(conn, self.shard),
             shard: CoreShardId::new(shard),
-            filter: Arc::clone(&cursor.filter),
+            sweep: cursor.sweep.clone(),
             after,
             limit,
         };
@@ -4807,10 +5257,9 @@ impl ServerState {
         let Some(session) = self.sessions.output_mut(&result.session.conn()) else {
             return false;
         };
-        let Some(cursor) = session
-            .channel_list
-            .as_mut()
-            .filter(|cursor| cursor.id == result.id)
+        let Some(cursor) = [&mut session.channel_list, &mut session.channel_names]
+            .into_iter()
+            .find_map(|slot| slot.as_mut().filter(|cursor| cursor.id == result.id))
         else {
             return false;
         };
@@ -5330,6 +5779,28 @@ impl ServerState {
         });
     }
 
+    pub(crate) fn broadcast_credential_sessions_ended(
+        &mut self,
+        credential: crate::identity::IssuedCredential,
+    ) {
+        self.effects
+            .push(CoreEffect::BroadcastCredentialSessionsEnded { credential });
+    }
+
+    pub(crate) fn broadcast_account_sessions_ended(
+        &mut self,
+        account: String,
+        reason: String,
+        actor: String,
+    ) {
+        self.effects
+            .push(CoreEffect::BroadcastAccountSessionsEnded {
+                account,
+                reason,
+                actor,
+            });
+    }
+
     pub(crate) fn broadcast_read_marker(
         &mut self,
         account: String,
@@ -5381,6 +5852,9 @@ impl ServerState {
             doomed: Vec::new(),
             effects: Vec::new(),
             suspended_accounts: HashSet::new(),
+            credential_epoch: 0,
+            credentials_ended: HashMap::new(),
+            signed_in_credentials: directories.signed_in_credentials,
             deleted_accounts: HashSet::new(),
             db_tx,
             started_at,
@@ -5404,6 +5878,9 @@ impl ServerState {
             whowas: directories.whowas,
             census: directories.census,
             flood_exemptions: directories.flood_exemptions,
+            history_retention: directories.history_retention,
+            anti_spam_exit_message_time: directories.anti_spam_exit_message_time,
+            password_policy: directories.password_policy,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,
@@ -5476,7 +5953,7 @@ impl ServerState {
 
     /// Append to a target's hot ring, creating it if absent, and keep the
     /// global LRU within `max_hot_channels` and `max_hot_history_bytes`: this
-    /// target is touched to MRU and the least-recently-active rings are
+    /// target is marked most recently used and the least-recently-active rings are
     /// evicted once either is exceeded, as its own oldest entries are past
     /// `max_history_ring_bytes`. An
     /// evicted or overflowed ring is marked incomplete, so CHATHISTORY pages
@@ -5550,7 +6027,7 @@ impl ServerState {
             realname: realname.to_string(),
             signoff: (self.config.clock)(),
         };
-        self.whowas.record(entry);
+        self.whowas.record(self.nick_key(nick), entry);
     }
 
     /// Add this event's change in this shard's connections and channels to
@@ -5619,10 +6096,12 @@ impl ServerState {
             .unwrap_or_default()
     }
 
-    /// `conn` is no longer logged in to `account`: drop it from the index,
-    /// and the account's entry once it is empty.
-    fn forget_account_session(&mut self, account: &str, conn: ConnId) {
-        let key = self.account_key(account);
+    /// `conn` is no longer logged in with `login`: drop it from the account
+    /// index, and the account's entry once it is empty, and let go of the
+    /// credential it signed in with.
+    fn forget_login(&mut self, login: &Login, conn: ConnId) {
+        self.signed_in_credentials.release(login.credential);
+        let key = self.account_key(&login.account);
         let std::collections::hash_map::Entry::Occupied(mut entry) =
             self.account_sessions.entry(key)
         else {
@@ -5636,21 +6115,18 @@ impl ServerState {
     }
 
     /// The confirmed read marker for `key`, if any.
-    pub(crate) fn read_marker(
-        &self,
-        key: &(AccountKey, ChanKey),
-    ) -> Option<e6irc_proto::time::Millis> {
+    pub(crate) fn read_marker(&self, key: &MarkerKey) -> Option<e6irc_proto::time::Millis> {
         self.read_markers.get(key).copied()
     }
 
     /// Whether a database write for `key` is in flight.
-    pub(crate) fn read_marker_pending(&self, key: &(AccountKey, ChanKey)) -> bool {
+    pub(crate) fn read_marker_pending(&self, key: &MarkerKey) -> bool {
         self.pending_read_markers.contains_key(key)
     }
 
     /// Whether `key` holds one of its account's marker slots: confirmed, or
     /// reserved by a write in flight.
-    pub(crate) fn read_marker_slot_held(&self, key: &(AccountKey, ChanKey)) -> bool {
+    pub(crate) fn read_marker_slot_held(&self, key: &MarkerKey) -> bool {
         self.read_markers.contains_key(key) || self.pending_read_markers.contains_key(key)
     }
 
@@ -5680,7 +6156,7 @@ impl ServerState {
     /// reported as already current so no caller fans it out.
     pub(crate) fn store_read_marker(
         &mut self,
-        key: (AccountKey, ChanKey),
+        key: MarkerKey,
         marker_ms: e6irc_proto::time::Millis,
     ) -> Option<e6irc_proto::time::Millis> {
         if self.account_deleted(&key.0) {
@@ -5695,7 +6171,7 @@ impl ServerState {
     }
 
     /// Reserve `key` for a database write now in flight.
-    pub(crate) fn reserve_read_marker(&mut self, key: (AccountKey, ChanKey)) {
+    pub(crate) fn reserve_read_marker(&mut self, key: MarkerKey) {
         let held = self.read_marker_slot_held(&key);
         *self.pending_read_markers.entry(key.clone()).or_default() += 1;
         if !held {
@@ -5707,7 +6183,7 @@ impl ServerState {
     /// reserved — a reply without a request, which the caller reports.
     pub(crate) fn release_read_marker(
         &mut self,
-        key: &(AccountKey, ChanKey),
+        key: &MarkerKey,
     ) -> Result<(), ReadMarkerNotReserved> {
         match self.pending_read_markers.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
@@ -5746,6 +6222,98 @@ impl ServerState {
 
     pub fn is_account_suspended(&self, account: &str) -> bool {
         self.suspended_accounts.contains(&self.account_key(account))
+    }
+
+    /// Record that `conn` has just queued a credential check.
+    pub(crate) fn credential_check_queued(&mut self, conn: ConnId) {
+        let epoch = self.credential_epoch;
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.verify_epoch = epoch;
+        }
+    }
+
+    /// Whether the verdict landing for `conn` is stale: `account`'s
+    /// credentials changed, or the issued `credential` was revoked, after the
+    /// check was queued — the verdict speaks for a credential that no longer
+    /// stands — or the revocation listener was re-connected since, and the
+    /// verdict was read before what it missed was re-checked. Either is
+    /// refused.
+    pub(crate) fn stale_verdict(
+        &self,
+        conn: ConnId,
+        account: &str,
+        credential: crate::identity::CredentialId,
+    ) -> Option<StaleVerdict> {
+        let session = self.sessions.get(&conn)?;
+        let ended_since = |key: &EndedSignIns| {
+            self.credentials_ended
+                .get(key)
+                .is_some_and(|ended| *ended > session.verify_epoch)
+        };
+        if ended_since(&EndedSignIns::Account(self.account_key(account)))
+            || matches!(
+                credential,
+                crate::identity::CredentialId::Issued(issued)
+                    if ended_since(&EndedSignIns::Credential(issued))
+            )
+        {
+            Some(StaleVerdict::CredentialEnded)
+        } else if ended_since(&EndedSignIns::Every) {
+            Some(StaleVerdict::Rechecked)
+        } else {
+            None
+        }
+    }
+
+    /// The revocation listener was re-connected: a verdict for any check
+    /// queued before now is refused when it lands, as it may speak for a
+    /// credential revoked while nothing listened. Run on every shard before
+    /// the listener re-reads what the live sessions hold, so a verdict either
+    /// lands first — and its session is among those re-read — or is refused.
+    pub(crate) fn refuse_verdicts_in_flight(&mut self) {
+        self.end_credentials(EndedSignIns::Every);
+    }
+
+    /// Close every session whose login has expired by `now`: one a personal
+    /// access token signed in ends when the token does. Driven by the periodic
+    /// tick.
+    pub(crate) fn expire_logins(&mut self, now: e6irc_proto::time::MonoMillis) {
+        let expired: Vec<ConnId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session
+                    .login
+                    .as_ref()
+                    .and_then(|login| login.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at)
+            })
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in expired {
+            self.close_with_error(conn, "Personal access token expired");
+        }
+    }
+
+    /// `ended` — an account's credentials, or one issued credential — no
+    /// longer stands: a verdict for any check queued before now is refused
+    /// when it lands. Changes no check still outstanding predates are
+    /// forgotten.
+    pub(crate) fn end_credentials(&mut self, ended: EndedSignIns) {
+        self.credential_epoch += 1;
+        let oldest_outstanding = self
+            .sessions
+            .values()
+            .filter(|session| session.sasl_verify.is_some() || session.pending_identify.is_some())
+            .map(|session| session.verify_epoch)
+            .min();
+        match oldest_outstanding {
+            None => self.credentials_ended.clear(),
+            Some(oldest) => {
+                self.credentials_ended.retain(|_, at| *at > oldest);
+                self.credentials_ended.insert(ended, self.credential_epoch);
+            }
+        }
     }
 
     /// The channel key for `target`, or `None` when it does not name a
@@ -5885,8 +6453,8 @@ impl ServerState {
     /// Seed the read-marker mirror from persisted `(account, target, millis)`
     /// rows at boot. The dump returns the display-cased account name, so it is
     /// folded here into an `AccountKey` — matching the key MARKREAD builds at
-    /// runtime. The stored target is already the casefolded `ChanKey` string (it
-    /// was written from `ChanKey::as_str`), so it is wrapped directly.
+    /// runtime. The stored target is already a [`MarkerTarget`] (it was written
+    /// from `MarkerTarget::as_str`), so it is wrapped directly.
     pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.read_markers.clear();
         // The slot count is rebuilt from what remains (writes still in flight)
@@ -5902,7 +6470,7 @@ impl ServerState {
         }
         for (account, target, ms) in rows {
             let account = self.account_key(&account);
-            self.store_read_marker((account, ChanKey(target)), ms);
+            self.store_read_marker((account, MarkerTarget(target)), ms);
         }
     }
 
@@ -5914,7 +6482,7 @@ impl ServerState {
         for marker in markers {
             let key = (
                 self.account_key(&marker.account),
-                ChanKey(marker.target.clone()),
+                MarkerTarget(marker.target.clone()),
             );
             let std::collections::hash_map::Entry::Occupied(entry) = self.read_markers.entry(key)
             else {
@@ -5967,7 +6535,7 @@ impl ServerState {
     fn forget_account_read_markers(&mut self, account: &str) {
         let account = self.account_key(account);
         self.deleted_accounts.insert(account.clone());
-        let forgotten: Vec<(AccountKey, ChanKey)> = self
+        let forgotten: Vec<MarkerKey> = self
             .read_markers
             .keys()
             .filter(|(holder, _)| *holder == account)
@@ -6127,12 +6695,23 @@ impl ServerState {
         self.memberships.channel_activity(key, scope)
     }
 
+    /// Channel `key`'s display name, wherever it lives: this shard's own
+    /// channel, or the record its owner published. `None` when no such
+    /// channel exists.
+    pub(crate) fn channel_display_name(&self, key: &ChanKey) -> Option<String> {
+        match self.channels.get(key) {
+            Some(channel) => Some(channel.name.clone()),
+            None => self.memberships.channel_name(key),
+        }
+    }
+
     /// The oldest history of channel `key` that `account` may read, or `None`
     /// when no such channel exists: the founder and access list of a
     /// registered channel keep its whole record (the rule REST applies), and
     /// everyone else sees only the current incarnation, created when the
     /// channel last came into being. The owner's live channel answers when
-    /// this shard owns it, the published record when another shard does.
+    /// this shard owns it, the published record when another shard does. Nor
+    /// does anyone read past history retention ([`Self::retained`]).
     pub(crate) fn channel_history_floor(
         &self,
         key: &ChanKey,
@@ -6149,11 +6728,28 @@ impl ServerState {
                     .access_flags(key, &self.account_key(account))
                     .is_some()
         });
-        Some(if keeps_whole_record {
+        Some(self.retained(if keeps_whole_record {
             crate::core::HistoryFloor::Whole
         } else {
             crate::core::HistoryFloor::Since(created_at)
-        })
+        }))
+    }
+
+    /// The oldest history of a conversation its participant may read: the
+    /// whole of it, up to history retention.
+    pub(crate) fn conversation_history_floor(&self) -> crate::core::HistoryFloor {
+        self.retained(crate::core::HistoryFloor::Whole)
+    }
+
+    /// `floor`, raised to what history retention still keeps: storage
+    /// maintenance deletes older rows, and a ring still holding them must not
+    /// serve them either. The one place a history floor meets retention, so
+    /// every read the core answers — ring, database, TARGETS — stops at it.
+    fn retained(&self, floor: crate::core::HistoryFloor) -> crate::core::HistoryFloor {
+        match self.history_retention.cutoff((self.config.clock)()) {
+            Some(cutoff) => floor.at_least(cutoff),
+            None => floor,
+        }
     }
 
     /// The ring under `key` gained or lost entries. When it is a channel's,
@@ -6165,6 +6761,23 @@ impl ServerState {
     }
 
     /// `target`'s channels as WHOIS shows them to `requester`.
+    /// See [`MembershipDirectory::who_channel`].
+    pub(crate) fn who_channel(
+        &self,
+        target: ConnId,
+        requester: ConnId,
+        target_invisible: bool,
+        multi_prefix: bool,
+    ) -> Option<(String, &'static str)> {
+        self.memberships
+            .who_channel(target, requester, target_invisible, multi_prefix)
+    }
+
+    /// Whether `conn` is in any channel, whichever shard owns it.
+    pub(crate) fn in_any_channel(&self, conn: ConnId) -> bool {
+        self.memberships.in_any_channel(conn)
+    }
+
     pub(crate) fn whois_channels(&self, target: ConnId, requester: ConnId) -> Vec<String> {
         let multi_prefix = self
             .sessions
@@ -6251,7 +6864,7 @@ impl ServerState {
     /// it lasts exactly as long as the party it was with.
     pub fn conn_identity(&self, conn: ConnId) -> String {
         match self.sessions.get(&conn) {
-            Some(s) => match &s.account {
+            Some(s) => match s.account() {
                 Some(account) => self.casemap.casefold(account),
                 None => format!("~{}", self.casemap.casefold(s.nick().unwrap_or(""))),
             },
@@ -6261,12 +6874,22 @@ impl ServerState {
 
     /// The identity behind a nick. An online nick resolves through its session
     /// (so an unauthenticated user resolves to their unclaimable `~` identity);
-    /// an offline one is taken to be an account name, which is what lets a
-    /// conversation with a registered user be read while they are away.
+    /// an offline one is taken to be an account's — the account it is grouped
+    /// to, or the account of that name — which is what lets a conversation with
+    /// a registered user be read while they are away, by any of their nicks.
     pub fn nick_identity(&self, nick: &str) -> String {
         match self.registered_user(&self.nick_key(nick)) {
             Some(user) => user.identity(self.casemap),
-            None => self.casemap.casefold(nick),
+            None => self.resolve_account_key(nick).as_str().to_string(),
+        }
+    }
+
+    /// What `target`'s read marker is kept under (see [`MarkerTarget`]): a
+    /// channel by its folded name, anyone else by their identity.
+    pub(crate) fn marker_target(&self, target: &str) -> MarkerTarget {
+        match self.chan_key_if_channel(target) {
+            Some(key) => MarkerTarget::from(&key),
+            None => MarkerTarget(self.nick_identity(target)),
         }
     }
 
@@ -6318,12 +6941,13 @@ impl ServerState {
                 cap_negotiating: false,
                 cap_302: false,
                 caps: Caps::default(),
-                account: None,
+                login: None,
                 sasl: SaslState::default(),
                 sasl_verify: None,
                 sasl_buf: String::new(),
                 credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
+                verify_epoch: 0,
                 pending_register: None,
                 nick_enforcement: NickEnforcement::default(),
                 drop_confirmation: None,
@@ -6337,9 +6961,11 @@ impl ServerState {
                 pending_joins: HashMap::new(),
                 part_on_join: HashMap::new(),
                 last_knock: None,
+                nick_changes: NickChangeThrottle::default(),
                 monitoring: HashMap::new(),
                 multiline: None,
                 channel_list: None,
+                channel_names: None,
                 paced_who: None,
                 label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
@@ -6349,10 +6975,12 @@ impl ServerState {
                 // from a real early reading (the mono epoch IS process start), so
                 // the first `now - 0 = uptime` read would misbehave in the first
                 // moments of uptime — the class that flood-killed fresh clients a
-                // sweep ago. Both are re-stamped before they gate anything
-                // (`last_active` at registration, `last_ping_sent` when a PING is
-                // actually sent), so open-time is a correct, sentinel-free floor.
-                last_active: LastActive::new(opened_at),
+                // sweep ago. Each is re-stamped before it gates anything
+                // (`idle_since` at registration, `last_received` by every line,
+                // `last_ping_sent` when a PING is actually sent), so open-time
+                // is a correct, sentinel-free floor.
+                idle_since: IdleSince::new(opened_at),
+                last_received: opened_at,
                 signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,
                 awaiting_pong: false,
@@ -6871,6 +7499,17 @@ impl ServerState {
         );
     }
 
+    /// `ERR_BADCHANNAME (<chan>) :Illegal channel name` — a `#` name the
+    /// server will not create ([`crate::sanitize::ChannelName`]).
+    pub(crate) fn err_badchanname(&mut self, conn: ConnId, chan: &str) {
+        self.numeric(
+            conn,
+            ERR_BADCHANNAME,
+            &[Middle::echo(chan)],
+            Some("Illegal channel name"),
+        );
+    }
+
     /// `ERR_NOTONCHANNEL (<chan>) :You're not on that channel`.
     pub(crate) fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
         self.numeric(
@@ -6922,16 +7561,31 @@ impl ServerState {
         items: &[String],
         sep: char,
     ) {
+        for line in self.numeric_list_lines(conn, code, middle, items, sep) {
+            self.send(conn, &line);
+        }
+    }
+
+    /// The lines [`Self::numeric_list`] sends, formatted rather than sent —
+    /// for a reply paced out later.
+    pub(crate) fn numeric_list_lines(
+        &self,
+        conn: ConnId,
+        code: u16,
+        middle: &[Middle<'_>],
+        items: &[String],
+        sep: char,
+    ) -> Vec<String> {
         let budget = e6irc_proto::message::MAX_LINE_LEN
             .saturating_sub(
                 self.numeric_head_len(conn, code, middle) + 2, /* CRLF */
             )
             .max(1);
-
+        let mut lines = Vec::new();
         let mut line = String::new();
         for item in items {
             if !line.is_empty() && line.len() + 1 + item.len() > budget {
-                self.numeric(conn, code, middle, Some(&line));
+                lines.push(self.numeric_line(conn, code, middle, Some(&line)));
                 line.clear();
             }
             if !line.is_empty() {
@@ -6940,8 +7594,9 @@ impl ServerState {
             line.push_str(item);
         }
         if !line.is_empty() {
-            self.numeric(conn, code, middle, Some(&line));
+            lines.push(self.numeric_line(conn, code, middle, Some(&line)));
         }
+        lines
     }
 
     /// Stamp a new event: a single clock read yielding both the wall-clock
@@ -6964,7 +7619,7 @@ impl ServerState {
     pub(crate) fn originator(&self, conn: ConnId) -> Originator {
         let session = &self.sessions[&conn];
         Originator {
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             bot: session.bot,
         }
     }
@@ -7086,24 +7741,19 @@ impl ServerState {
     /// task then drains its queue — flushing this ERROR — before shutting the
     /// socket down.
     pub fn broadcast_shutdown(&mut self, reason: &str) {
-        let line = format!(
-            "ERROR :Closing Link: {} ({reason})",
-            self.config.server_name
-        );
-        let bytes = Bytes::from(format!("{line}\r\n"));
         // The sessions stay until this worker stops — it still serves the
         // other shards while they drain — but for their clients this is the
         // last line (see `SessionOutput`).
         for session in self.sessions.closing_sessions_mut() {
+            let line = crate::sanitize::closing_link(&session.host, reason);
+            let bytes = Bytes::from(format!("{line}\r\n"));
             session.deferred_replies = 0;
             for held in std::mem::take(&mut session.held) {
                 // A queue too full for it is a connection already lost, as for
                 // the goodbye itself.
                 drop(session.output.write(WireLine::sanitized(held)));
             }
-            session
-                .output
-                .write_goodbye(WireLine::sanitized(bytes.clone()));
+            session.output.write_goodbye(WireLine::sanitized(bytes));
         }
     }
 
@@ -7112,7 +7762,12 @@ impl ServerState {
     /// and for the channel modes ChanServ sets (a mode lock, OP/VOICE, access
     /// on join), so a client sees one ChanServ however it acted.
     pub(crate) fn service_prefix(&self, service: &str) -> String {
-        format!("{service}!{service}@services.{}", self.config.server_name)
+        format!("{service}!{service}@{}", self.services_host())
+    }
+
+    /// The host every services pseudo-client shows, `services.<server>`.
+    pub(crate) fn services_host(&self) -> String {
+        format!("services.{}", self.config.server_name)
     }
 
     /// A notice from a services pseudo-client (NickServ, ChanServ).
@@ -7143,19 +7798,26 @@ impl ServerState {
         {
             return false;
         }
-        let host = session.host.clone();
         self.numeric(
             conn,
             e6irc_proto::numerics::ERR_YOUREBANNEDCREEP,
             &[],
             Some("You need to identify via SASL to use this server"),
         );
-        self.send(
-            conn,
-            &format!("ERROR :Closing Link: {host} (SASL access only)"),
-        );
-        self.close(conn, "SASL access only");
+        self.close_with_error(conn, "SASL access only");
         true
+    }
+
+    /// Close `conn` for `reason`, after telling it why with the one closing
+    /// line every disconnection sends ([`crate::sanitize::closing_link`]).
+    pub(crate) fn close_with_error(&mut self, conn: ConnId, reason: &str) {
+        let host = self
+            .sessions
+            .get(&conn)
+            .map(|session| session.host.clone())
+            .unwrap_or_default();
+        self.send(conn, &crate::sanitize::closing_link(&host, reason));
+        self.close(conn, reason);
     }
 
     /// Tell `conn`'s reader whether its lines are metered: an IRC operator's
@@ -7172,6 +7834,24 @@ impl ServerState {
     }
 
     // ---- teardown -------------------------------------------------------
+
+    /// Kill `conn` for SendQ exceeded, as Solanum does: the backlog its client
+    /// did not take is discarded, and its closing `ERROR` is the one line it
+    /// is still sent. Draining a full SendQ to a client too slow to take it
+    /// only kept a dead session's socket open for as long as it trickled.
+    pub(crate) fn close_for_sendq(&mut self, conn: ConnId) {
+        const REASON: &str = "SendQ exceeded";
+        if let Some(session) = self.sessions.output_mut(&conn) {
+            let goodbye = format!(
+                "{}\r\n",
+                crate::sanitize::closing_link(&session.host, REASON)
+            );
+            session
+                .output
+                .discard_backlog_for_goodbye(WireLine::sanitized(Bytes::from(goodbye)));
+        }
+        self.close(conn, REASON);
+    }
 
     /// Remove a session: broadcast QUIT to channel peers, free the nick,
     /// drop memberships and empty channels.
@@ -7234,8 +7914,8 @@ impl ServerState {
             }
         }
         let session = self.sessions.remove(&conn).expect("checked above");
-        if let Some(account) = &session.account {
-            self.forget_account_session(account, conn);
+        if let Some(login) = &session.login {
+            self.forget_login(login, conn);
         }
         self.memberships.release(conn);
         for key in session.monitoring.keys() {
@@ -7254,7 +7934,7 @@ impl ServerState {
             // the prior occupant's DM rings until LRU eviction — a privacy leak.
             // An authenticated identity is an account (stable, DB-backed) and is
             // deliberately retained.
-            if session.account.is_none() {
+            if session.login.is_none() {
                 self.release_unauthenticated_identity(nick);
             }
         }
@@ -7274,18 +7954,32 @@ impl ServerState {
     /// conversations kept under it — or the next person to take the nick would
     /// read them. A session already logged in keeps nothing under `~nick`, so
     /// changing accounts releases nothing.
-    pub(crate) fn set_account(&mut self, conn: ConnId, account: String) {
+    pub(crate) fn set_account(
+        &mut self,
+        conn: ConnId,
+        account: String,
+        credential: crate::identity::CredentialId,
+        expires_in: Option<std::time::Duration>,
+    ) {
+        let expires_at = expires_in.map(|remaining| {
+            (self.config.mono_clock)()
+                .saturating_add_millis(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX))
+        });
         let key = self.account_key(&account);
         let session = self.sessions.get_mut(&conn).expect("session logging in");
         let released = session
-            .account
+            .login
             .is_none()
             .then(|| session.nick().map(str::to_owned))
             .flatten();
         let mask = session.login_mask();
-        let previous = session.account.replace(account.clone());
+        let previous = session.login.replace(Login {
+            account: account.clone(),
+            credential,
+            expires_at,
+        });
         if let Some(previous) = previous {
-            self.forget_account_session(&previous, conn);
+            self.forget_login(&previous, conn);
         }
         self.numeric(
             conn,
@@ -7314,6 +8008,7 @@ impl ServerState {
             enforcement.settle(nick);
         }
         self.account_sessions.entry(key).or_default().insert(conn);
+        self.signed_in_credentials.hold(credential);
         if let Some(nick) = released {
             self.release_unauthenticated_identity(&nick);
         }
@@ -7325,10 +8020,10 @@ impl ServerState {
     pub(crate) fn clear_account(&mut self, conn: ConnId) {
         let session = self.sessions.get_mut(&conn).expect("session logging out");
         let mask = session.login_mask();
-        let Some(previous) = session.account.take() else {
+        let Some(previous) = session.login.take() else {
             return;
         };
-        self.forget_account_session(&previous, conn);
+        self.forget_login(&previous, conn);
         self.numeric(
             conn,
             RPL_LOGGEDOUT,
@@ -7811,6 +8506,11 @@ mod session_store_tests {
         ];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        // One shard's ids of one millisecond ascend in the order stamped, past
+        // any number of digits: history orders a millisecond by msgid.
+        let mut counting = MsgidSource::with_boot(CoreShardId(0), 7);
+        let stamped: Vec<String> = (0..20).map(|_| counting.next(now)).collect();
+        assert!(stamped.is_sorted(), "{stamped:?}");
         // Tag-safe: no character that needs escaping in a tag value.
         assert!(
             ids.iter()
@@ -7893,8 +8593,8 @@ mod session_store_tests {
                 .collect::<HashSet<_>>()
                 .len()
         }
-        fn key(state: &ServerState, account: &str, target: &str) -> (AccountKey, ChanKey) {
-            (state.account_key(account), state.chan_key(target))
+        fn key(state: &ServerState, account: &str, target: &str) -> MarkerKey {
+            (state.account_key(account), state.marker_target(target))
         }
         let ms = |n: u64| e6irc_proto::time::Millis::from_millis(n);
         let mut state = state();
@@ -8029,17 +8729,42 @@ mod session_store_tests {
         register(&mut state, ConnId(2), "bob");
         register(&mut state, ConnId(3), "carol");
         check(&state);
-        state.set_account(ConnId(1), "Alice".into());
-        state.set_account(ConnId(2), "alice".into());
-        state.set_account(ConnId(3), "carol".into());
+        state.set_account(
+            ConnId(1),
+            "Alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
+        state.set_account(
+            ConnId(2),
+            "alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
+        state.set_account(
+            ConnId(3),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         check(&state);
         assert_eq!(indexed(&state, "ALICE"), vec![ConnId(1), ConnId(2)]);
         // Changing account moves the connection between entries.
-        state.set_account(ConnId(2), "carol".into());
+        state.set_account(
+            ConnId(2),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         check(&state);
         assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
         // Re-setting the same account is idempotent.
-        state.set_account(ConnId(2), "Carol".into());
+        state.set_account(
+            ConnId(2),
+            "Carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         check(&state);
         assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
         state.clear_account(ConnId(1));
@@ -8068,13 +8793,28 @@ mod session_store_tests {
         register(&mut state, ConnId(2), "bob");
         step(&mut state);
         assert_eq!(state.user_counts().users, 2);
-        state.set_account(ConnId(1), "Alice".into());
+        state.set_account(
+            ConnId(1),
+            "Alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         step(&mut state);
         assert_eq!(state.identity_nick("alice"), "alice");
-        state.set_account(ConnId(2), "carol".into());
+        state.set_account(
+            ConnId(2),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         step(&mut state);
         assert_eq!(state.identity_nick("carol"), "bob");
-        state.set_account(ConnId(2), "ALICE".into());
+        state.set_account(
+            ConnId(2),
+            "ALICE".into(),
+            crate::identity::CredentialId::AccountPassword,
+            None,
+        );
         step(&mut state);
         assert_eq!(state.identity_nick("carol"), "carol", "no one is carol now");
         crate::core::handler::dispatch(&mut state, ConnId(2), b"MODE bob +i");

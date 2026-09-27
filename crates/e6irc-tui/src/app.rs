@@ -73,7 +73,7 @@ enum ReadHold {
 /// conversation can share it.
 pub const SERVER_BUFFER: &str = "*server*";
 
-/// One conversation: a channel or a query (PM) with its own scrollback.
+/// One conversation: a channel or a query (a private conversation) with its own scrollback.
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub name: String,
@@ -528,7 +528,7 @@ impl App {
                     .source
                     .as_deref()
                     .is_some_and(|source| source.contains('!'));
-                // A channel message lands in that channel's buffer; a PM to
+                // A channel message lands in that channel's buffer; a private message to
                 // us opens/uses a query buffer named after the sender. What a
                 // server says to us, or to no one in particular (`NOTICE *`,
                 // a bouncer's status), belongs to no conversation.

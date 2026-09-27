@@ -66,6 +66,14 @@ pub(crate) fn handle(
             reason,
             actor,
         } => set_account_suspended(state, &account, suspended, &reason, &actor),
+        AdminRequest::EndAccountSessions {
+            account,
+            reason,
+            actor,
+        } => end_account_sessions(state, &account, &reason, &actor),
+        AdminRequest::EndCredentialSessions { credential } => {
+            end_credential_sessions(state, credential)
+        }
         AdminRequest::MutateOwnedChannel {
             channel,
             actor,
@@ -102,6 +110,78 @@ fn set_account_suspended(
     ))
 }
 
+/// End every live session of `account` because its credentials changed (a
+/// password change), on this shard and every other.
+fn end_account_sessions(
+    state: &mut ServerState,
+    account: &str,
+    reason: &str,
+    actor: &str,
+) -> AdminReply {
+    let disconnected = apply_account_sessions_ended(state, account, reason, actor);
+    state.broadcast_account_sessions_ended(
+        account.to_string(),
+        reason.to_string(),
+        actor.to_string(),
+    );
+    AdminReply::Ok(format!(
+        "Disconnected {disconnected} live connection(s) for {account}"
+    ))
+}
+
+/// [`end_account_sessions`] on one shard: a verdict for a credential check
+/// queued before now is refused when it lands ([`ServerState::credentials_ended_since`]),
+/// then every session authenticated as the account is closed. No gate
+/// stays: a check queued from now on reads the changed credentials.
+pub(crate) fn apply_account_sessions_ended(
+    state: &mut ServerState,
+    account: &str,
+    reason: &str,
+    actor: &str,
+) -> usize {
+    let account_key = state.account_key(account);
+    state.end_credentials(crate::core::state::EndedSignIns::Account(
+        account_key.clone(),
+    ));
+    disconnect_account(state, &account_key, reason, actor)
+}
+
+/// End every live session the revoked `credential` signed in, on this shard
+/// and every other. The account's other sessions stay.
+fn end_credential_sessions(
+    state: &mut ServerState,
+    credential: crate::identity::IssuedCredential,
+) -> AdminReply {
+    let disconnected = apply_credential_sessions_ended(state, credential);
+    state.broadcast_credential_sessions_ended(credential);
+    AdminReply::Ok(format!(
+        "Disconnected {disconnected} live connection(s) signed in with the {credential}"
+    ))
+}
+
+/// [`end_credential_sessions`] on one shard: a verdict for a check of the
+/// credential queued before now is refused when it lands
+/// ([`ServerState::credentials_ended_since`]), then every session it signed
+/// in, registered or still registering, is closed with an `ERROR` naming the
+/// revocation.
+pub(crate) fn apply_credential_sessions_ended(
+    state: &mut ServerState,
+    credential: crate::identity::IssuedCredential,
+) -> usize {
+    state.end_credentials(crate::core::state::EndedSignIns::Credential(credential));
+    let signed_in = crate::identity::CredentialId::Issued(credential);
+    let connections: Vec<ConnId> = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.signed_in_with() == Some(signed_in))
+        .map(|(connection, _)| *connection)
+        .collect();
+    for &connection in &connections {
+        state.close_with_error(connection, credential.revocation_reason());
+    }
+    connections.len()
+}
+
 pub(crate) fn apply_account_suspension(
     state: &mut ServerState,
     account: &str,
@@ -115,13 +195,23 @@ pub(crate) fn apply_account_suspension(
         return 0;
     }
     state.suspended_accounts.insert(account_key.clone());
+    disconnect_account(state, &account_key, reason, actor)
+}
+
+/// Close every session authenticated as `account_key`, registered or not.
+fn disconnect_account(
+    state: &mut ServerState,
+    account_key: &crate::core::state::AccountKey,
+    reason: &str,
+    actor: &str,
+) -> usize {
     let connections: Vec<ConnId> = state
         .sessions
         .iter()
         .filter_map(|(connection, session)| {
             session
                 .account()
-                .is_some_and(|candidate| state.account_key(candidate) == account_key)
+                .is_some_and(|candidate| state.account_key(candidate) == *account_key)
                 .then_some(*connection)
         })
         .collect();
@@ -588,7 +678,7 @@ pub(crate) fn connection_list_entries(
                 oper: session.oper.is_some(),
                 transport: session.transport,
                 connected_at: session.signon,
-                idle_seconds: now.saturating_sub(session.last_active.get()).as_secs(),
+                idle_seconds: now.saturating_sub(session.idle_since.get()).as_secs(),
                 channels,
             }
         })

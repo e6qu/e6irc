@@ -8,9 +8,11 @@ use crate::core::{
 
 // ---- channels -----------------------------------------------------------
 
-/// Cap on each channel list mode (+b/+q/+e/+I). Bounds channel memory and the
-/// per-message match cost; a client that hits it gets ERR_BANLISTFULL.
-/// Advertised as `MAXLIST`.
+/// Cap on a channel's list-mode entries, the four lists (+b/+q/+e/+I)
+/// together, as Solanum's `max_bans` counts them. Bounds channel memory and
+/// the per-message match cost; a client that hits it gets ERR_BANLISTFULL.
+/// Advertised as `MAXLIST=bqeI:<cap>`, which by its grammar is one limit
+/// shared by the four letters, not one per list.
 pub(super) const MAXLIST: usize = 100;
 
 /// Cap on channels a single session may be joined to. Bounds `Channel`
@@ -75,7 +77,7 @@ pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = crate::db::READ_MARKER_LI
 /// `registered_topics`) entry that survives disconnect *and* restart — the maps
 /// are reloaded into RAM at boot — and, unlike account REGISTER, it runs no
 /// argon2 so the per-connection credential budget never throttles it. Without a
-/// cap one authenticated account could register channels in a loop (JOIN → CS
+/// cap one authenticated account could register channels in a loop (JOIN → ChanServ
 /// REGISTER → PART) and grow those maps without bound, forever. Checked by
 /// ChanServ REGISTER and the owner console against the count this shard knows
 /// (founded plus its own in-flight registrations) as a fast path; the database
@@ -330,6 +332,19 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let actor = state.channel_actor(conn);
     for (i, target) in capped_channel_targets(state, conn, targets, JOIN_TARGMAX) {
         let target = target.as_str();
+        // The name is parsed once, here: the channel owner, on this shard or
+        // another, is handed only a name the server may create.
+        let name = match crate::sanitize::ChannelName::parse(target) {
+            Ok(name) => name,
+            Err(crate::sanitize::ChannelNameError::NotAChannel) => {
+                state.err_nosuchchannel(conn, target);
+                continue;
+            }
+            Err(crate::sanitize::ChannelNameError::Illegal) => {
+                state.err_badchanname(conn, target);
+                continue;
+            }
+        };
         let key = state.chan_key(target);
         // The session owner alone owns this index, so it enforces the bound
         // before either a local or remote channel-owner request. A JOIN sent
@@ -354,7 +369,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let owner = state.channel_owner(target);
         let join_key = keys.get(i).copied();
         if state.owns_channel(&owner) {
-            let result = join_on_owner(state, actor.clone(), target, join_key);
+            let result = join_on_owner(state, actor.clone(), &name, join_key);
             emit_join_response(state, conn, result);
         } else {
             state
@@ -366,7 +381,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.route_join(
                 owner,
                 actor.clone(),
-                target.to_string(),
+                name,
                 join_key.map(str::to_string),
                 label,
             );
@@ -377,15 +392,11 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 pub(super) fn join_on_owner(
     state: &mut ServerState,
     actor: ChannelActor,
-    name: &str,
+    name: &crate::sanitize::ChannelName,
     join_key: Option<&str>,
 ) -> ChannelJoinResult {
     let conn = actor.recipient.conn();
-    if !crate::sanitize::valid_channel_name(name) {
-        return ChannelJoinResult::Rejected(ChannelJoinFailure::NoSuchChannel {
-            name: MiddleParam::echo(name).to_string(),
-        });
-    }
+    let name = name.as_str();
     let key = state.chan_key(name);
     let now = (state.config.clock)();
     let casemap = state.casemap;
@@ -600,9 +611,6 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
         // Already a member: nothing changed, so nothing is said (the pending
         // reservation was released by the caller either way).
         ChannelJoinResult::AlreadyMember => {}
-        ChannelJoinResult::Rejected(ChannelJoinFailure::NoSuchChannel { name }) => {
-            state.err_nosuchchannel(conn, &name);
-        }
         ChannelJoinResult::Rejected(ChannelJoinFailure::InviteOnly { name }) => {
             state.numeric(
                 conn,
@@ -672,7 +680,12 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
                 );
             }
             if state.sessions[&conn].caps.read_marker {
-                send_current_markread(state, conn, &join.key, &join.display);
+                send_current_markread(
+                    state,
+                    conn,
+                    &crate::core::state::MarkerTarget::from(&join.key),
+                    &join.display,
+                );
             }
             send_join_names(state, conn, *join);
         }
@@ -812,6 +825,43 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
     send_names_with_caps(state, conn, caps, key, echo);
 }
 
+/// The members of `chan` a NAMES by `conn` shows, sorted, each as the
+/// requester reads a name: its rank sigils (all of them with `multi_prefix`)
+/// and its nick, or its whole `nick!user@host` with `userhost_in_names`.
+///
+/// An invisible member is hidden from a NAMES by an outsider who shares no
+/// channel with them — the same rule WHO applies. Fellow members share this
+/// channel, so they still see each other; only a non-member listing a public
+/// channel is filtered. Without this, `+i` leaks.
+pub(super) fn visible_names(
+    state: &ServerState,
+    chan: &Channel,
+    conn: ConnId,
+    multi_prefix: bool,
+    userhost_in_names: bool,
+) -> Vec<String> {
+    let requester_is_member = chan.is_member(conn);
+    let mut names: Vec<String> = chan
+        .member_identities()
+        .filter(|(m, _, identity)| {
+            *m == conn
+                || !identity.invisible
+                || requester_is_member
+                || state.share_channel(conn, *m)
+        })
+        .map(|(_, modes, identity)| {
+            let shown = if userhost_in_names {
+                &identity.prefix
+            } else {
+                &identity.nick
+            };
+            format!("{}{shown}", modes.sigils(multi_prefix))
+        })
+        .collect();
+    names.sort(); // deterministic order
+    names
+}
+
 fn send_names_with_caps(
     state: &mut ServerState,
     conn: ConnId,
@@ -845,29 +895,13 @@ fn send_names_with_caps(
         );
         return;
     }
-    let requester_is_member = chan.is_member(conn);
-    let mut names: Vec<String> = chan
-        .member_identities()
-        // An invisible member is hidden from a NAMES by an outsider who shares
-        // no channel with them — the same rule WHO applies. Fellow members
-        // share this channel, so they still see each other; only a non-member
-        // listing a public channel is filtered. Without this, `+i` leaks.
-        .filter(|(m, _, identity)| {
-            *m == conn
-                || !identity.invisible
-                || requester_is_member
-                || state.share_channel(conn, *m)
-        })
-        .map(|(_, modes, identity)| {
-            let shown = if requester_caps.userhost_in_names {
-                identity.prefix.clone()
-            } else {
-                identity.nick.clone()
-            };
-            format!("{}{shown}", modes.sigils(requester_caps.multi_prefix))
-        })
-        .collect();
-    names.sort(); // deterministic order
+    let names = visible_names(
+        state,
+        chan,
+        conn,
+        requester_caps.multi_prefix,
+        requester_caps.userhost_in_names,
+    );
     let symbol = if state.channels[key].modes.secret {
         "@"
     } else {
@@ -917,13 +951,42 @@ pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 }
             }
         }
-        None => state.numeric(
+        None => names_everywhere(state, conn),
+    }
+}
+
+/// A bare NAMES: every channel `conn` may see, each with the members it may
+/// see, then the users in no channel — Solanum's `names_global` — paced
+/// through the send queue as a LIST is, over every shard's channels.
+fn names_everywhere(state: &mut ServerState, conn: ConnId) {
+    // One at a time: a second is refused as a WHO past its room is.
+    if state.sessions[&conn].channel_names.is_some() {
+        state.numeric(
+            conn,
+            RPL_TRYAGAIN,
+            &[Middle::own("NAMES")],
+            Some("Please wait a while and try again."),
+        );
+        state.numeric(
             conn,
             RPL_ENDOFNAMES,
             &[Middle::own("*")],
             Some("End of /NAMES list"),
-        ),
+        );
+        return;
     }
+    let caps = state.local_recipient(conn).caps();
+    let label = state.defer_captured_label(conn);
+    let batch = open_channel_sweep(state, conn, label);
+    state.start_channel_list(
+        conn,
+        batch,
+        crate::core::list::ChannelSweep::Names {
+            multi_prefix: caps.multi_prefix,
+            userhost_in_names: caps.userhost_in_names,
+        },
+    );
+    pace_channel_list(state, conn);
 }
 
 pub(super) fn names_on_owner(

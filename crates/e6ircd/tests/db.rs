@@ -13,6 +13,13 @@ use tokio::net::TcpStream;
 
 mod support;
 
+/// A plain pool on `url` for the test's own queries: not the daemon's pool
+/// (`db::connect_and_migrate`), whose migrations a migration test must run
+/// itself.
+async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
+    sqlx::PgPool::connect_with(url.connect_options()).await
+}
+
 #[path = "support/deadline.rs"]
 mod deadline;
 
@@ -92,7 +99,36 @@ async fn list_audit_log(
     .entries)
 }
 
+/// Link an OpenID Connect identity as a recently signed-in browser session of
+/// the account does; the session is removed afterwards, so it counts in
+/// nothing the test goes on to check.
+async fn link_identity(
+    pool: &sqlx::PgPool,
+    account: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<e6ircd::db::LinkOutcome, e6ircd::db::DbError> {
+    let session = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established(account),
+        None,
+    )
+    .await?;
+    let linked = e6ircd::db::link_oidc_identity(pool, &session, account, issuer, subject).await;
+    sqlx::query("DELETE FROM web_sessions WHERE token_hash = sha256(convert_to($1, 'UTF8'))")
+        .bind(&session)
+        .execute(pool)
+        .await
+        .expect("remove the linking session");
+    linked
+}
+
 static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// The client the device grants of these tests are started for.
+fn device_client() -> db::DeviceClientId {
+    db::DeviceClientId::parse("e6irc-test").expect("a visible ASCII client identifier")
+}
 
 const MANAGED_CONFIG_0052_FIELDS: &[&str] = &[
     "server_name",
@@ -243,6 +279,8 @@ async fn verify_password_roundtrip() {
         reply,
         DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         }
     );
@@ -494,6 +532,47 @@ async fn sasl_oauthbearer_with_api_token() {
         .is_err(),
         "invalid token must be refused"
     );
+
+    // The GS2 authorization identity is held to the token's account (RFC 7628
+    // §3.1): naming another account is refused, naming its own is admitted.
+    let oauthbearer_numeric = |authzid: &'static str| {
+        let token = token.clone();
+        async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let response = e6irc_proto::base64::encode(
+                format!("n,{authzid},\x01auth=Bearer {token}\x01\x01").as_bytes(),
+            );
+            write
+                .write_all(
+                    format!(
+                        "CAP REQ :sasl\r\nNICK authz\r\nUSER authz 0 * :A\r\n\
+                         AUTHENTICATE OAUTHBEARER\r\nAUTHENTICATE {response}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+            tokio::time::timeout(deadline::HANG, async {
+                loop {
+                    let line = lines.next_line().await.expect("read").expect("line");
+                    let numeric = line.split(' ').nth(1).unwrap_or_default().to_string();
+                    if numeric == "903" || numeric == "904" {
+                        return numeric;
+                    }
+                }
+            })
+            .await
+            .expect("a SASL verdict")
+        }
+    };
+    assert_eq!(
+        oauthbearer_numeric("a=someone-else").await,
+        "904",
+        "a token must not act as another account"
+    );
+    assert_eq!(oauthbearer_numeric("a=TOKUSER").await, "903");
 }
 
 #[tokio::test]
@@ -1099,9 +1178,13 @@ async fn credential_list_and_revoke() {
     db::issue_app_password(&pool, "creduser", "pw", "phone")
         .await
         .expect("ap2");
-    let session = db::create_web_session(&pool, "creduser", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("creduser"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -1245,8 +1328,9 @@ async fn verify_records_credential_last_used() {
     assert_eq!(
         db::verify_credentials(&pool, "lu", &app)
             .await
-            .expect("verify"),
-        Some("lu".to_string())
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(db::VerifiedAccount::established("lu"))
     );
     let after = db::list_credentials(&pool, "lu").await.expect("list");
     assert!(
@@ -1258,7 +1342,8 @@ async fn verify_records_credential_last_used() {
     assert_eq!(
         db::verify_credentials(&pool, "lu", "wrong")
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         None
     );
 }
@@ -1300,8 +1385,9 @@ async fn revoke_credential_cannot_delete_the_primary_password() {
     assert_eq!(
         db::verify_credentials(&pool, "rc", "pw")
             .await
-            .expect("verify"),
-        Some("rc".to_string())
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(db::VerifiedAccount::established("rc"))
     );
     // The app password IS revocable.
     assert!(
@@ -1344,12 +1430,20 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     // The browser making the change keeps its session; every other one ends —
     // the old password may be in someone else's hands, and they may be signed
     // in with it.
-    let changing_session = db::create_web_session(&pool, "rotate", None)
-        .await
-        .expect("changing session");
-    let other_session = db::create_web_session(&pool, "rotate", None)
-        .await
-        .expect("other session");
+    let changing_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("rotate"),
+        None,
+    )
+    .await
+    .expect("changing session");
+    let other_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("rotate"),
+        None,
+    )
+    .await
+    .expect("other session");
     db::change_local_password(&pool, "ROTATE", "old", "new", &changing_session)
         .await
         .expect("rotate");
@@ -1378,13 +1472,14 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
         db::verify_local_password(&pool, "rotate", "new")
             .await
             .expect("new verify"),
-        Some("rotate".into())
+        Some(db::VerifiedAccount::established("rotate"))
     );
     assert_eq!(
         db::verify_credentials(&pool, "rotate", &app)
             .await
-            .expect("app verify"),
-        Some("rotate".into()),
+            .expect("app verify")
+            .map(|signed_in| signed_in.account),
+        Some(db::VerifiedAccount::established("rotate")),
         "rotating the primary must not silently revoke independent app passwords"
     );
 
@@ -1413,12 +1508,20 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     )
     .await
     .expect("OIDC account");
-    let adding_session = db::create_web_session(&pool, &oidc_account, None)
-        .await
-        .expect("adding session");
-    let stale_session = db::create_web_session(&pool, &oidc_account, None)
-        .await
-        .expect("stale session");
+    let adding_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established(oidc_account.as_str()),
+        None,
+    )
+    .await
+    .expect("adding session");
+    let stale_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established(oidc_account.as_str()),
+        None,
+    )
+    .await
+    .expect("stale session");
     db::set_local_password(&pool, &oidc_account, "first-local", &adding_session)
         .await
         .expect("set first password");
@@ -1426,7 +1529,7 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
         db::verify_local_password(&pool, &oidc_account, "first-local")
             .await
             .expect("verify first password"),
-        Some(oidc_account.clone())
+        Some(db::VerifiedAccount::established(oidc_account.clone()))
     );
     assert_eq!(
         db::list_web_sessions(&pool, &oidc_account, Some(&adding_session))
@@ -1829,16 +1932,24 @@ async fn history_rest_endpoint() {
     .execute(&pool)
     .await
     .expect("register #web");
-    let session = db::create_web_session(&pool, "web", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("web"),
+        None,
+    )
+    .await
+    .expect("session");
     // A second account with no relationship to #web must be refused (IDOR).
     db::create_account_with_contact(&pool, "other", "pw", None)
         .await
         .expect("create other");
-    let other_session = db::create_web_session(&pool, "other", None)
-        .await
-        .expect("other session");
+    let other_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("other"),
+        None,
+    )
+    .await
+    .expect("other session");
     let pool2 = pool.clone();
     drop(pool);
 
@@ -2063,9 +2174,13 @@ PING x
     db::create_account_with_contact(&pool2, "snoop", "pw", None)
         .await
         .expect("snoop");
-    let snoop_session = db::create_web_session(&pool2, "snoop", None)
-        .await
-        .expect("snoop session");
+    let snoop_session = db::create_web_session(
+        &pool2,
+        &e6ircd::db::VerifiedAccount::established("snoop"),
+        None,
+    )
+    .await
+    .expect("snoop session");
     for probe in ["web", "other", "other!web", "web!other"] {
         let v: serde_json::Value = client
             .get(format!("{base}/api/v1/history?target={probe}"))
@@ -2411,6 +2526,9 @@ async fn read_marker_preloaded_after_restart() {
             .unwrap();
         expect_line(&mut reader, "MARKREAD #chan timestamp=2020-01-01").await;
     }
+    // A restart: the first process stops (and gives the serving lease back)
+    // before the second serves.
+    assert_eq!(running.shutdown.run().await, net::ShutdownOutcome::Flushed);
 
     // Second boot on the same database: the marker must be present immediately.
     let running2 = net::start(make_config()).await.expect("restart");
@@ -2980,14 +3098,49 @@ async fn bnc_networks_crud() {
     )
     .await
     .expect("disable matrix");
-    let inventory = db::list_bnc_network_inventory(&pool)
+    // The administrator inventory pages by a stable (owner, name) cursor: a
+    // page of two plus the row that says another follows, then the rest.
+    let page_size = db::BncNetworkInventoryPageSize::new(2).expect("page size");
+    let inventory = db::bnc_network_inventory_page(&pool, None, page_size)
         .await
         .expect("admin inventory");
-    assert_eq!(inventory.len(), 3);
+    assert_eq!(
+        inventory
+            .iter()
+            .map(|row| (row.owner.as_str(), row.network.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("alice", "hq"), ("alice", "libera"), ("bob", "libera")]
+    );
     assert!(
         inventory.iter().any(|row| {
             row.owner == "alice" && row.network.name == "hq" && !row.network.enabled
         })
+    );
+    let after = db::BncInventoryKey::parse_cursor(&inventory[1].key.cursor())
+        .expect("a cursor round-trips");
+    let rest = db::bnc_network_inventory_page(&pool, Some(&after), page_size)
+        .await
+        .expect("next page");
+    assert_eq!(
+        rest.iter()
+            .map(|row| (row.owner.as_str(), row.network.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("bob", "libera")]
+    );
+    // A configuration-defined network sorts before a stored one of the same
+    // key, so a page that ended on it still yields the stored row after it;
+    // one that ended on the stored row does not repeat it.
+    let configured = db::BncInventoryKey::new(Some("BOB"), "Libera", false);
+    let after_configured = db::bnc_network_inventory_page(&pool, Some(&configured), page_size)
+        .await
+        .expect("after a configured key");
+    assert_eq!(after_configured.len(), 1);
+    let stored = db::BncInventoryKey::new(Some("bob"), "libera", true);
+    assert!(
+        db::bnc_network_inventory_page(&pool, Some(&stored), page_size)
+            .await
+            .expect("after the last row")
+            .is_empty()
     );
     db::delete_bnc_network(
         &pool,
@@ -3387,6 +3540,94 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
     assert_eq!(count, db::BNC_READ_MARKER_LIMIT);
 }
 
+/// A stored backlog line keeps the session's own nick as it was when the line
+/// was said (migration 0096), so a restore can start its replay under it: no
+/// nick before the upstream welcomed the session, and rows stored before the
+/// column existed read as recording nothing. The table refuses a nick on a row
+/// that says it recorded none, and a nick that is not one line.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stored_backlog_line_keeps_the_own_nick_it_was_said_under() {
+    use db::StoredOwnNick::{Nick, NoNick, NotRecorded};
+    let pool = db::connect_and_migrate(&support::test_db("bnc_backlog_own_nick").await)
+        .await
+        .expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("alice"),
+        "libera",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    for (own_nick, line) in [
+        (None, ":*bnc* NOTICE * :connecting"),
+        (Some("alice"), ":peer!u@h PRIVMSG alice :hello"),
+        (Some("alice"), ":alice!u@h NICK :bob"),
+        (Some("bob"), ":peer!u@h PRIVMSG bob :again"),
+    ] {
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            own_nick,
+            line,
+            &e6irc_client::NetworkNames::default(),
+        )
+        .await
+        .expect("persist");
+    }
+    let own_nicks = async || {
+        db::recent_bnc_backlog(&pool, "alice", "libera", 10)
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|stored| (stored.line, stored.own_nick))
+            .collect::<Vec<_>>()
+    };
+    let recorded = [
+        (
+            ":peer!u@h PRIVMSG alice :hello".to_string(),
+            Nick("alice".into()),
+        ),
+        (":alice!u@h NICK :bob".to_string(), Nick("alice".into())),
+        (
+            ":peer!u@h PRIVMSG bob :again".to_string(),
+            Nick("bob".into()),
+        ),
+    ];
+    let mut expected = vec![(":*bnc* NOTICE * :connecting".to_string(), NoNick)];
+    expected.extend(recorded.iter().cloned());
+    assert_eq!(own_nicks().await, expected);
+    // A row as a build before migration 0096 left it.
+    sqlx::query("UPDATE bnc_buffer SET own_nick_recorded = false WHERE own_nick IS NULL")
+        .execute(&pool)
+        .await
+        .expect("age a row");
+    expected[0].1 = NotRecorded;
+    assert_eq!(own_nicks().await, expected);
+    for (update, constraint) in [
+        (
+            "UPDATE bnc_buffer SET own_nick_recorded = false WHERE own_nick = 'bob'",
+            "bnc_buffer_own_nick_recorded",
+        ),
+        (
+            "UPDATE bnc_buffer SET own_nick = E'bob\\r\\nQUIT' WHERE own_nick = 'bob'",
+            "bnc_buffer_own_nick_one_line",
+        ),
+        (
+            "UPDATE bnc_buffer SET own_nick = '' WHERE own_nick = 'bob'",
+            "bnc_buffer_own_nick_one_line",
+        ),
+    ] {
+        let error = sqlx::query(update)
+            .execute(&pool)
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains(constraint), "{update}: {error}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_history_page_counts_only_lines_the_client_can_receive() {
@@ -3696,7 +3937,7 @@ async fn bnc_read_markers_follow_the_networks_case_mapping() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn read_marker_display_migration_backfills_from_the_backlog() {
     let url = support::test_db("read_marker_display_migration").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(81, &pool)
         .await
@@ -3759,7 +4000,7 @@ async fn read_marker_display_migration_backfills_from_the_backlog() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn autojoin_key_migration_pairs_every_channel_with_no_key() {
     let url = support::test_db("autojoin_key_migration").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(86, &pool)
         .await
@@ -4286,7 +4527,7 @@ async fn query_history_around_and_between() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn between_selectors_resolve_pivots_in_the_db() {
-    // The DB path resolves each BETWEEN pivot's (ts, id) itself, so a msgid pivot
+    // The DB path resolves each BETWEEN pivot's (ts, msgid) itself, so a msgid pivot
     // that has scrolled out of the ring is still paged correctly — where the old
     // ring-only resolution lost a mixed msgid bound or inverted a reversed-order
     // two-msgid range to empty.
@@ -4370,8 +4611,8 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     .await
     .expect("connect");
     // Five messages that all share the SAME whole second. Timestamp-only
-    // paging cannot separate them; composite `(ts, id)` paging must, ordering
-    // them by the monotonically-increasing insertion id.
+    // paging cannot separate them; composite `(ts, msgid)` paging must,
+    // ordering them by their msgids.
     for tag in ["a", "b", "c", "d", "e"] {
         sqlx::query(
             "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
@@ -4397,7 +4638,7 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     assert_eq!(
         before.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
         vec!["a", "b"],
-        "BEFORE must page by (ts,id), not skip the whole second"
+        "BEFORE must page by (ts, msgid), not skip the whole second"
     );
 
     // AFTER msgid=c → the same-second messages inserted after c.
@@ -4728,7 +4969,7 @@ async fn channel_mlock_persist_and_load() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_mlock_migration_normalizes_historical_rows() {
     let url = support::test_db("channel_mlock_migration_normalizes_historical_rows").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(37, &pool)
         .await
@@ -4819,7 +5060,7 @@ fn oidc_provider(name: &str, account_claim: Option<&str>) -> serde_json::Value {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn managed_config_migration_backfills_legacy_oidc_claims() {
-    let pool = sqlx::PgPool::connect(
+    let pool = plain_pool(
         &support::test_db("managed_config_migration_backfills_legacy_oidc_claims").await,
     )
     .await
@@ -4898,11 +5139,10 @@ async fn managed_config_migration_backfills_legacy_oidc_claims() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn server_password_migration_adds_a_sealed_column_only_irc_may_fill() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("server_password_migration_adds_a_sealed_column").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("server_password_migration_adds_a_sealed_column").await)
+            .await
+            .expect("connect");
     MIGRATIONS
         .run_to(60, &pool)
         .await
@@ -4990,9 +5230,14 @@ async fn a_sealed_server_password_round_trips_through_every_network_query() {
         .await
         .expect("get")
         .expect("network");
-    let inventory = db::list_bnc_network_inventory(&pool)
-        .await
-        .expect("inventory");
+    let inventory = db::bnc_network_inventory_page(
+        &pool,
+        None,
+        db::BncNetworkInventoryPageSize::new(db::BncNetworkInventoryPageSize::MAX)
+            .expect("page size"),
+    )
+    .await
+    .expect("inventory");
     let startable = db::list_startable_bnc_networks(&pool)
         .await
         .expect("startable");
@@ -5046,7 +5291,7 @@ async fn a_sealed_server_password_round_trips_through_every_network_query() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn username_migration_backfills_what_each_network_was_already_sending() {
-    let pool = sqlx::PgPool::connect(
+    let pool = plain_pool(
         &support::test_db("username_migration_backfills_what_each_network_was_sending").await,
     )
     .await
@@ -5194,7 +5439,7 @@ async fn username_migration_backfills_what_each_network_was_already_sending() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged() {
-    let pool = sqlx::PgPool::connect(
+    let pool = plain_pool(
         &support::test_db(
             "managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged",
         )
@@ -5924,17 +6169,25 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
             .await
             .unwrap_or_else(|error| panic!("create {name}: {error}"));
     }
-    db::issue_app_password_for_account(&pool, "Alice", "desktop")
-        .await
-        .expect("app password");
+    db::issue_app_password_for_account(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        "desktop",
+    )
+    .await
+    .expect("app password");
     issue_api_token(&pool, "Alice", "active")
         .await
         .expect("API token");
-    db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("browser session");
+    db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("browser session");
     assert_eq!(
-        db::link_oidc_identity(&pool, "Alice", "https://issuer.example", "alice-subject")
+        link_identity(&pool, "Alice", "https://issuer.example", "alice-subject")
             .await
             .expect("OIDC link"),
         db::LinkOutcome::Linked
@@ -6308,6 +6561,47 @@ async fn audit_log_filters_and_cursor_pages_are_stable() {
     assert_eq!(filtered.next_before_id, None);
 }
 
+/// A save over a revision another process has since replaced
+/// (`rotate-secrets` re-sealing) is refused, and leaves the in-memory
+/// snapshot holding the stored revision — so the conflict it reports is one
+/// the administrator can read, and the retry from it commits. The snapshot
+/// used to stay stale, refusing every later save until a restart.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_save_over_a_stale_revision_reloads_the_stored_one() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("a_save_over_a_stale_revision_reloads_the_stored_one").await,
+    )
+    .await
+    .expect("connect");
+    let bootstrap =
+        e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
+    let mut current = db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    let loaded = current.revision;
+    sqlx::query("UPDATE server_settings SET revision = revision + 1, updated_by = 'rotation'")
+        .execute(&pool)
+        .await
+        .expect("an out-of-band write");
+    let mut changed = current.settings.clone();
+    changed.description = "after the rotation".into();
+    let actor = db::AuditPrincipal::account("alice");
+    let stale = db::save_managed_config_over(&pool, &mut current, &changed, &actor, "stale").await;
+    assert!(
+        matches!(stale, Err(db::DbError::StaleServerSettings)),
+        "{stale:?}"
+    );
+    assert_eq!(current.revision, loaded + 1, "the stored revision is held");
+    assert_eq!(current.updated_by, "rotation");
+    let saved = db::save_managed_config_over(&pool, &mut current, &changed, &actor, "retry")
+        .await
+        .expect("the retry from the stored revision commits");
+    assert_eq!(saved.revision, loaded + 2);
+    assert_eq!(current.revision, saved.revision);
+    assert_eq!(current.settings.description, "after the rotation");
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn managed_configuration_rejects_stale_writes_without_auditing_them() {
@@ -6664,6 +6958,70 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
     );
 }
 
+/// A login identity is linked only for the browser session that asked, checked
+/// with the insert: live, the account's, and recently authenticated. A stolen
+/// cookie that was signed out, or has aged past the step-up window, cannot
+/// finish a link it started.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_identity_links_only_for_a_live_recent_session_of_the_account() {
+    use e6ircd::db::LinkOutcome;
+    let (pool, _) =
+        alice_and_bob("an_identity_links_only_for_a_live_recent_session_of_the_account").await;
+    let issuer = "https://idp.example";
+    let session_of = |account: &'static str| {
+        let pool = pool.clone();
+        async move {
+            db::create_web_session(&pool, &db::VerifiedAccount::established(account), None)
+                .await
+                .expect("session")
+        }
+    };
+    let signed_out = session_of("alice").await;
+    db::delete_web_session(&pool, &signed_out)
+        .await
+        .expect("sign out");
+    assert_eq!(
+        db::link_oidc_identity(&pool, &signed_out, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::SessionEnded
+    );
+    let bobs = session_of("bob").await;
+    assert_eq!(
+        db::link_oidc_identity(&pool, &bobs, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::SessionEnded,
+        "another account's session links nothing to alice"
+    );
+    let stale = session_of("alice").await;
+    sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '11 minutes'")
+        .execute(&pool)
+        .await
+        .expect("age the session");
+    assert_eq!(
+        db::link_oidc_identity(&pool, &stale, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::SessionNotRecent
+    );
+    assert!(
+        db::list_oidc_identities(&pool, "alice")
+            .await
+            .expect("identities")
+            .is_empty(),
+        "no refused link stored an identity"
+    );
+    let fresh = session_of("alice").await;
+    assert_eq!(
+        db::link_oidc_identity(&pool, &fresh, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::Linked
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_identity_link_list_and_conflict() {
@@ -6681,20 +7039,20 @@ async fn oidc_identity_link_list_and_conflict() {
 
     // First link attaches; a repeat for the same account is idempotent.
     assert_eq!(
-        db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-1")
+        link_identity(&pool, "alice", "https://idp.example", "sub-1")
             .await
             .expect("link"),
         LinkOutcome::Linked
     );
     assert_eq!(
-        db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-1")
+        link_identity(&pool, "alice", "https://idp.example", "sub-1")
             .await
             .expect("relink"),
         LinkOutcome::AlreadyYours
     );
     // The same identity cannot be claimed by another account.
     assert_eq!(
-        db::link_oidc_identity(&pool, "bob", "https://idp.example", "sub-1")
+        link_identity(&pool, "bob", "https://idp.example", "sub-1")
             .await
             .expect("steal"),
         LinkOutcome::Conflict
@@ -6704,11 +7062,14 @@ async fn oidc_identity_link_list_and_conflict() {
         .await
         .expect("bob id")
         .expect("bob exists");
+    let bob_session = db::create_web_session(&pool, &db::VerifiedAccount::established("bob"), None)
+        .await
+        .expect("bob session");
     db::set_account_suspended(&pool, bob_id, true, "alice", &[])
         .await
         .expect("suspend bob");
     assert!(matches!(
-        db::link_oidc_identity(&pool, "bob", "https://idp.example", "sub-9").await,
+        db::link_oidc_identity(&pool, &bob_session, "bob", "https://idp.example", "sub-9").await,
         Err(db::DbError::BadCredentials)
     ));
     db::set_account_suspended(&pool, bob_id, false, "alice", &[])
@@ -6716,7 +7077,7 @@ async fn oidc_identity_link_list_and_conflict() {
         .expect("reactivate bob");
 
     // A second identity for alice; listing is issuer/subject-ordered.
-    db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-0")
+    link_identity(&pool, "alice", "https://idp.example", "sub-0")
         .await
         .expect("link2");
     let identities = db::list_oidc_identities(&pool, "alice")
@@ -6741,7 +7102,7 @@ async fn oidc_identity_link_list_and_conflict() {
     // identity. A local session and the other identity's session survive.
     let removed_session = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             issuer: Some("https://idp.example"),
             subject: Some("sub-0"),
@@ -6753,7 +7114,7 @@ async fn oidc_identity_link_list_and_conflict() {
     .expect("removed identity session");
     let retained_session = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             issuer: Some("https://idp.example"),
             subject: Some("sub-1"),
@@ -6763,9 +7124,13 @@ async fn oidc_identity_link_list_and_conflict() {
     )
     .await
     .expect("retained identity session");
-    let local_session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("local session");
+    let local_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("local session");
     assert_eq!(
         db::unlink_oidc_identity(&pool, "alice", identities[0].id)
             .await
@@ -6812,7 +7177,7 @@ async fn oidc_identity_link_list_and_conflict() {
         db::find_or_create_oidc_account(&pool, "https://idp.example", "oidc-only-0", "oidc-only")
             .await
             .expect("OIDC-only account");
-    db::link_oidc_identity(&pool, &oidc_only, "https://idp.example", "oidc-only-1")
+    link_identity(&pool, &oidc_only, "https://idp.example", "oidc-only-1")
         .await
         .expect("second OIDC-only identity");
     let oidc_identities = db::list_oidc_identities(&pool, &oidc_only)
@@ -6860,9 +7225,13 @@ async fn oidc_web_session_records_logout_hint() {
         .expect("acct");
 
     // A plain session carries no logout hint.
-    let plain = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("plain");
+    let plain = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("plain");
     assert_eq!(
         db::session_logout_hint(&pool, &plain).await.expect("hint"),
         db::SessionLogoutHint {
@@ -6874,7 +7243,7 @@ async fn oidc_web_session_records_logout_hint() {
     // An OIDC session records the id token + provider for RP-initiated logout.
     let sso = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("the.id.token"),
             provider: Some("shauth"),
@@ -6924,7 +7293,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         .expect("acct");
     let first = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("first.id.token"),
             provider: Some("shauth"),
@@ -6940,7 +7309,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     .expect("first session");
     let second = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("second.id.token"),
             provider: Some("shauth"),
@@ -7022,7 +7391,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     );
     let third = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("third.id.token"),
             provider: Some("shauth"),
@@ -7134,19 +7503,24 @@ async fn device_grants_are_pruned_on_create() {
     // A grant expired past the grace period, as a never-approved /device/start
     // flood leaves.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ('dead', 'DEADDEAD', now() - interval '1 day')",
+        "INSERT INTO device_grants (device_code_hash, user_code, client_id, expires_at)
+         VALUES (sha256(convert_to('dead', 'UTF8')), 'DEADDEAD', 'e6irc-test',
+                 now() - interval '1 day')",
     )
     .execute(&pool)
     .await
     .expect("insert expired");
     // Creating a new grant prunes expired ones (unauthenticated growth guard).
-    db::create_device_grant(&pool).await.expect("create");
-    let expired: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM device_grants WHERE device_code = 'dead'")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
+    db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("create");
+    let expired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM device_grants
+             WHERE device_code_hash = sha256(convert_to('dead', 'UTF8'))",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
     assert_eq!(expired, 0, "expired grant must be pruned on create");
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM device_grants")
         .fetch_one(&pool)
@@ -7168,14 +7542,15 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         .expect("create account");
     // A pre-approval poll is Pending, not consumed.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ('dc', 'USERCODE1', now() + interval '10 minutes')",
+        "INSERT INTO device_grants (device_code_hash, user_code, client_id, expires_at)
+         VALUES (sha256(convert_to('dc', 'UTF8')), 'USERCODE1', 'e6irc-test',
+                 now() + interval '10 minutes')",
     )
     .execute(&pool)
     .await
     .expect("insert grant");
     assert_eq!(
-        db::poll_device_grant(&pool, "dc", "device")
+        db::poll_device_grant(&pool, "dc", &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Pending,
@@ -7188,8 +7563,13 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         db::DeviceApproval::Approved,
         "a fresh grant approves"
     );
+    // The device waited out its interval.
+    sqlx::query("UPDATE device_grants SET last_polled_at = now() - interval '1 minute'")
+        .execute(&pool)
+        .await
+        .expect("pace");
     // Approved poll: consume + mint atomically, and the token must actually work.
-    let token = match db::poll_device_grant(&pool, "dc", "device")
+    let token = match db::poll_device_grant(&pool, "dc", &device_client())
         .await
         .expect("poll approved")
     {
@@ -7200,6 +7580,7 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         db::api_token_account(&pool, &token)
             .await
             .expect("resolve token")
+            .map(|signed_in| signed_in.account.into_name())
             .as_deref(),
         Some("devacct"),
         "the minted token resolves to the approving account"
@@ -7207,7 +7588,7 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
     // The grant is gone: a replayed poll finds nothing (single-use), and no
     // second token was minted.
     assert_eq!(
-        db::poll_device_grant(&pool, "dc", "device")
+        db::poll_device_grant(&pool, "dc", &device_client())
             .await
             .expect("poll consumed"),
         db::DeviceStatus::Unknown,
@@ -7254,7 +7635,9 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
     }
 
     // Approved with one slot left, which is then taken before the device polls.
-    let (raced_device, raced_user) = db::create_device_grant(&pool).await.expect("grant");
+    let (raced_device, raced_user) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     assert_eq!(
         db::approve_device_grant(&pool, &raced_user, "devacct")
             .await
@@ -7264,7 +7647,9 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
     mint("token 31".into()).await.expect("the last slot");
 
     // At the cap, approval is refused where a person can read why.
-    let (refused_device, refused_user) = db::create_device_grant(&pool).await.expect("grant");
+    let (refused_device, refused_user) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     assert_eq!(
         db::approve_device_grant(&pool, &refused_user, "devacct")
             .await
@@ -7272,7 +7657,7 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
         db::DeviceApproval::TokenLimitReached
     );
     assert_eq!(
-        db::poll_device_grant(&pool, &refused_device, "device")
+        db::poll_device_grant(&pool, &refused_device, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Pending,
@@ -7281,13 +7666,13 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
 
     // The grant approved earlier cannot mint past the cap, and says so once.
     assert_eq!(
-        db::poll_device_grant(&pool, &raced_device, "device")
+        db::poll_device_grant(&pool, &raced_device, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Denied
     );
     assert_eq!(
-        db::poll_device_grant(&pool, &raced_device, "device")
+        db::poll_device_grant(&pool, &raced_device, &device_client())
             .await
             .expect("poll again"),
         db::DeviceStatus::Unknown,
@@ -7433,15 +7818,27 @@ async fn web_session_inventory_and_revocation_are_owner_scoped() {
 
     let desktop_agent = db::SessionUserAgent::from_header(" Desktop\tBrowser ")
         .expect("normalized desktop user agent");
-    let first = db::create_web_session(&pool, "alice", Some(&desktop_agent))
-        .await
-        .expect("first session");
-    let second = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("second session");
-    let bob = db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let first = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        Some(&desktop_agent),
+    )
+    .await
+    .expect("first session");
+    let second = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("second session");
+    let bob = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
 
     let sessions = db::list_web_sessions(&pool, "alice", Some(&second))
         .await
@@ -7507,9 +7904,13 @@ async fn concurrent_browser_session_issuance_enforces_the_active_cap() {
     for _ in 0..(db::MAX_BROWSER_SESSIONS_PER_ACCOUNT + 8) {
         let pool = pool.clone();
         issuers.spawn(async move {
-            db::create_web_session(&pool, "alice", None)
-                .await
-                .expect("concurrent session issuance")
+            db::create_web_session(
+                &pool,
+                &e6ircd::db::VerifiedAccount::established("alice"),
+                None,
+            )
+            .await
+            .expect("concurrent session issuance")
         });
     }
     let mut tokens = Vec::new();
@@ -7671,13 +8072,19 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     let bob_id = db::create_account_with_contact(&pool, "Bob", "bob password", None)
         .await
         .expect("Bob");
-    let session = db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("browser session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("browser session");
     let token = issue_api_token(&pool, "Bob", "automation")
         .await
         .expect("personal access token");
-    let (device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
+    let (device_code, user_code) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("device grant");
     assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Bob")
             .await
@@ -7707,7 +8114,8 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(
         db::verify_credentials(&pool, "Bob", "bob password")
             .await
-            .expect("credential query"),
+            .expect("credential query")
+            .map(|signed_in| signed_in.account),
         None
     );
     assert_eq!(
@@ -7725,17 +8133,23 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(
         db::api_token_account(&pool, &token)
             .await
-            .expect("token lookup"),
+            .expect("token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         None
     );
     assert!(matches!(
-        db::poll_device_grant(&pool, &device_code, "device")
+        db::poll_device_grant(&pool, &device_code, &device_client())
             .await
             .expect("device lookup"),
         db::DeviceStatus::Unknown
     ));
     assert!(matches!(
-        db::create_web_session(&pool, "Bob", None).await,
+        db::create_web_session(
+            &pool,
+            &e6ircd::db::VerifiedAccount::established("Bob"),
+            None
+        )
+        .await,
         Err(db::DbError::BadCredentials)
     ));
     assert!(matches!(
@@ -7750,8 +8164,9 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(
         db::verify_credentials(&pool, "Bob", "bob password")
             .await
-            .expect("credential query"),
-        Some("Bob".into()),
+            .expect("credential query")
+            .map(|signed_in| signed_in.account),
+        Some(db::VerifiedAccount::established("Bob")),
         "reactivation restores durable credentials but not revoked bearers"
     );
     let actions: Vec<String> = sqlx::query_scalar(
@@ -7956,7 +8371,7 @@ async fn account_invitations_are_single_use_expiring_and_digest_only() {
         db::verify_local_password(&pool, "bob", "invited password")
             .await
             .expect("password"),
-        Some("Bob".into())
+        Some(db::VerifiedAccount::established("Bob"))
     );
     assert!(
         db::account_flags(&pool, "Bob")
@@ -8042,9 +8457,13 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
             .expect("transfer"),
         db::FounderTransfer::Transferred { .. }
     ));
-    let session = db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("session");
     let api_token = issue_api_token(&pool, "Bob", "automation")
         .await
         .expect("token");
@@ -8086,7 +8505,9 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     .execute(&pool)
     .await
     .expect("messages");
-    let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device");
+    let (_device_code, user_code) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("device");
     assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Bob")
             .await
@@ -8110,7 +8531,8 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     assert_eq!(
         db::api_token_account(&pool, &api_token)
             .await
-            .expect("token"),
+            .expect("token")
+            .map(|signed_in| signed_in.account.into_name()),
         None
     );
     let residues: (i64, i64, i64, i64) = sqlx::query_as(
@@ -8196,9 +8618,13 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     db::create_account_with_contact(&pool, "Bob", "other password", None)
         .await
         .expect("Bob");
-    let session = db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("session");
     let bearer = issue_api_token(&pool, "Alice", "secret-token-label")
         .await
         .expect("token");
@@ -8455,10 +8881,10 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     // An expired grant is kept for a grace period (a late poll is answered
     // `expired_token`); one past it is pruned.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
+        "INSERT INTO device_grants (device_code_hash, user_code, client_id, expires_at)
          VALUES
-           ('old-device', 'OLDDEV01', now() - interval '1 day'),
-           ('new-device', 'NEWDEV01', now() + interval '1 day')",
+           (sha256('old-device'::bytea), 'OLDDEV01', 'e6irc-test', now() - interval '1 day'),
+           (sha256('new-device'::bytea), 'NEWDEV01', 'e6irc-test', now() + interval '1 day')",
     )
     .execute(&pool)
     .await
@@ -8749,26 +9175,23 @@ async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
     let url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/x",
         refusing_port()
-    );
+    )
+    .parse::<db::DatabaseUrl>()
+    .expect("URL");
     // Eight seconds, not two: on Windows a connect to a closed loopback port
     // can run into the two-second probe bound instead of failing at once, and
     // the wait must still fit an attempt, the one-second pause, and a retry.
     let wait = db::StartupDatabaseWait::from_seconds(8).expect("bounded");
     let mut reported: Vec<(u32, Option<std::time::Duration>)> = Vec::new();
     let started = std::time::Instant::now();
-    let error = db::connect_and_migrate_with_retry(
-        &url,
-        wait,
-        db::DatabasePoolSize::for_this_host(),
-        |attempt| {
-            assert!(
-                matches!(attempt.error, db::DbError::Connect(_)),
-                "{}",
-                attempt.error
-            );
-            reported.push((attempt.attempt, attempt.retry_in));
-        },
-    )
+    let error = db::wait_for_database(&url, wait, |attempt| {
+        assert!(
+            matches!(attempt.error, db::DbError::Connect(_)),
+            "{}",
+            attempt.error
+        );
+        reported.push((attempt.attempt, attempt.retry_in));
+    })
     .await
     .expect_err("nothing listens there");
     let elapsed = started.elapsed();
@@ -8806,17 +9229,14 @@ async fn startup_database_wait_of_zero_is_a_single_attempt() {
     let url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/x",
         refusing_port()
-    );
+    )
+    .parse::<db::DatabaseUrl>()
+    .expect("URL");
     let wait = db::StartupDatabaseWait::from_seconds(0).expect("bounded");
     let mut attempts = 0;
-    let error = db::connect_and_migrate_with_retry(
-        &url,
-        wait,
-        db::DatabasePoolSize::for_this_host(),
-        |_| attempts += 1,
-    )
-    .await
-    .expect_err("refused");
+    let error = db::wait_for_database(&url, wait, |_| attempts += 1)
+        .await
+        .expect_err("refused");
     assert_eq!(attempts, 1);
     assert!(matches!(
         error,
@@ -8849,7 +9269,14 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
         ),
     )
     .expect("config");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"));
+    // The daemon refuses to connect while a libpq variable is set (some hosts,
+    // GitHub's Windows image among them, set `PGUSER` and `PGPASSWORD`); this test
+    // is about the startup wait, so its daemon gets none of them.
+    for variable in db::LIBPQ_ENVIRONMENT {
+        daemon.env_remove(variable);
+    }
+    let output = daemon
         .arg("--config")
         .arg(&config)
         .output()
@@ -8881,7 +9308,7 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
-    let real = support::test_db("startup_database_wait_uses_a_database_that_appears").await;
+    let real = support::test_db_text("startup_database_wait_uses_a_database_that_appears").await;
     // `postgres://user:pass@host:port/name?...` -> the host:port to proxy to.
     let authority = real
         .split_once('@')
@@ -8890,7 +9317,10 @@ async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
         .map(|(authority, _)| authority.to_string())
         .expect("database URL has an authority");
     let port = refusing_port();
-    let proxied = real.replacen(&authority, &format!("127.0.0.1:{port}"), 1);
+    let proxied: db::DatabaseUrl = real
+        .replacen(&authority, &format!("127.0.0.1:{port}"), 1)
+        .parse()
+        .expect("proxied URL");
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -8908,15 +9338,17 @@ async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
         }
     });
     let mut attempts = 0;
-    let pool = db::connect_and_migrate_with_retry(
+    db::wait_for_database(
         &proxied,
         db::StartupDatabaseWait::from_seconds(20).expect("bounded"),
-        db::DatabasePoolSize::for_this_host(),
         |_| attempts += 1,
     )
     .await
     .expect("the database appeared inside the wait");
     assert!(attempts >= 1, "the first attempt was refused");
+    let pool = db::connect_and_migrate(&proxied)
+        .await
+        .expect("the late database serves");
     let one: i32 = sqlx::query_scalar("SELECT 1")
         .fetch_one(&pool)
         .await
@@ -9028,7 +9460,9 @@ async fn corrupt_stored_password_hash_is_a_store_fault_not_a_wrong_password() {
     for password in ["correct password", "wrong password"] {
         assert!(
             matches!(
-                db::verify_credentials(&pool, "Alice", password).await,
+                db::verify_credentials(&pool, "Alice", password)
+                    .await
+                    .map(|verified| verified.map(|signed_in| signed_in.account)),
                 Err(db::DbError::Hash(_))
             ),
             "SASL/IDENTIFY verification must report the damaged hash"
@@ -9064,9 +9498,13 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     db::create_account_with_contact(&pool, "root", "pw", None)
         .await
         .expect("root");
-    let stale_session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let stale_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     // Everything else the lost credential could have been used to mint is
     // revoked with it: an app password, a personal access token, a device
     // grant.
@@ -9083,7 +9521,9 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     )
     .await
     .expect("api token");
-    let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
+    let (_device_code, user_code) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("device grant");
     assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Alice")
             .await
@@ -9097,7 +9537,8 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     assert_eq!(
         db::verify_credentials(&pool, "alice", &app_password)
             .await
-            .expect("app password verify"),
+            .expect("app password verify")
+            .map(|signed_in| signed_in.account),
         None,
         "the app password no longer opens the account"
     );
@@ -9225,7 +9666,9 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn recover_administrator_subcommand_prints_the_password_once() {
-    let url = support::test_db("recover_administrator_subcommand_prints_the_password_once").await;
+    let url_text =
+        support::test_db_text("recover_administrator_subcommand_prints_the_password_once").await;
+    let url: db::DatabaseUrl = url_text.parse().expect("the test database URL");
     let pool = db::connect_and_migrate(&url).await.expect("connect");
     db::create_account_with_contact(&pool, "alice", "forgotten", None)
         .await
@@ -9237,7 +9680,7 @@ async fn recover_administrator_subcommand_prints_the_password_once() {
     std::fs::write(
         &config_path,
         format!(
-            "server_name = \"irc.recover.example\"\nnetwork_name = \"Recover\"\n\n[[listeners]]\naddr = \"127.0.0.1:0\"\n\n[database]\nurl = \"{url}\"\n"
+            "server_name = \"irc.recover.example\"\nnetwork_name = \"Recover\"\n\n[[listeners]]\naddr = \"127.0.0.1:0\"\n\n[database]\nurl = \"{url_text}\"\n"
         ),
     )
     .expect("write config");
@@ -9361,6 +9804,7 @@ async fn migration_0059_revokes_app_passwords_it_cannot_name_and_says_so() {
         db::verify_credentials(&pool, "alice", "primary")
             .await
             .expect("verify")
+            .map(|signed_in| signed_in.account)
             .as_deref(),
         Some("Alice")
     );
@@ -9383,9 +9827,13 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
     let mut secrets = Vec::new();
     for index in 0..3 {
         secrets.push(
-            db::issue_app_password_for_account(&pool, "alice", &format!("device {index}"))
-                .await
-                .expect("app password"),
+            db::issue_app_password_for_account(
+                &pool,
+                &e6ircd::db::VerifiedAccount::established("alice"),
+                &format!("device {index}"),
+            )
+            .await
+            .expect("app password"),
         );
     }
     for secret in secrets.iter().chain([&"primary".to_string()]) {
@@ -9393,6 +9841,7 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
             db::verify_credentials(&pool, "ALICE", secret)
                 .await
                 .expect("verify")
+                .map(|signed_in| signed_in.account)
                 .as_deref(),
             Some("Alice")
         );
@@ -9426,14 +9875,16 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
         assert_eq!(
             db::verify_credentials(&pool, "alice", wrong)
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
     assert_eq!(
         db::verify_credentials(&pool, "nobody", &secrets[0])
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         None,
         "an app password opens only its own account"
     );
@@ -9694,7 +10145,7 @@ async fn a_migration_longer_than_the_statement_timeout_completes() {
         .await
         .expect("a slow migration completes");
     std::fs::remove_dir_all(&directory).expect("clean up");
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     let done: bool = sqlx::query_scalar("SELECT to_regclass('slow_migration_done') IS NOT NULL")
         .fetch_one(&pool)
         .await
@@ -9752,9 +10203,13 @@ async fn a_password_change_waiting_for_argon2_does_not_block_the_account_row() {
     db::create_account_with_contact(&pool, "alice", "current password", None)
         .await
         .expect("alice");
-    let session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
 
     // Keep every Argon2 permit busy for the whole test.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -10001,10 +10456,9 @@ async fn settings_rows_written_by_released_versions_load_after_migrating() {
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture).expect("read fixture"))
                 .expect("fixture JSON");
-        let pool =
-            sqlx::PgPool::connect(&support::test_db(&format!("settings_fixture_{name}")).await)
-                .await
-                .expect("connect");
+        let pool = plain_pool(&support::test_db(&format!("settings_fixture_{name}")).await)
+            .await
+            .expect("connect");
         MIGRATIONS
             .run_to(level, &pool)
             .await
@@ -10028,17 +10482,471 @@ async fn settings_rows_written_by_released_versions_load_after_migrating() {
     }
 }
 
+/// A stored server network whose `buffer_cap` is above what storage keeps is
+/// brought to that bound by 0091, the most of it that ever survived a
+/// restart, so the next start does not refuse the stored settings; a network
+/// within it keeps its value.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stored_buffer_cap_above_storage_is_brought_within_it_by_0091() {
+    let pool =
+        plain_pool(&support::test_db("a_stored_buffer_cap_above_storage_is_brought_within").await)
+            .await
+            .expect("connect");
+    MIGRATIONS.run_to(90, &pool).await.expect("through 0090");
+    let network = |name: &str| e6ircd::config::NetworkEntry {
+        kind: e6ircd::config::NetworkKind::Irc,
+        name: name.into(),
+        owner: None,
+        addr: "irc.example.test:6697".into(),
+        tls: true,
+        nick: "n".into(),
+        username: Some("ident".into()),
+        realname: Some("n".into()),
+        autojoin: vec![],
+        buffer_cap: 1000,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    };
+    let config = Config {
+        networks: vec![network("large"), network("small")],
+        ..Config::default()
+    };
+    let bootstrap = e6ircd::config::ManagedConfig::from_config(&config, None).expect("bootstrap");
+    db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    sqlx::query(
+        "UPDATE server_settings
+         SET settings = jsonb_set(settings, '{networks,0,buffer_cap}', '20000'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .expect("store a buffer_cap the old bound admitted");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let loaded = db::load_managed_config(&pool).await.expect("loads");
+    let caps: Vec<(&str, usize)> = loaded
+        .settings
+        .networks
+        .iter()
+        .map(|network| (network.name.as_str(), network.buffer_cap))
+        .collect();
+    assert_eq!(
+        caps,
+        [
+            ("large", e6ircd::config::MAX_NETWORK_BUFFER_CAP),
+            ("small", 1000)
+        ]
+    );
+    // Not in silence: a revision of its own, audited with the old value.
+    assert_eq!(loaded.updated_by, "migration:0091");
+    assert_eq!(
+        migration_audit(&pool, "migration:0091").await,
+        [format!(
+            "revision {}; networks buffer_cap brought to 5000 (what storage keeps) by migration \
+             0091; previous buffer_cap by network: {{\"large\": 20000}}",
+            loaded.revision
+        )]
+    );
+}
+
+/// The `CONFIG` audit details `actor` (a migration) recorded.
+async fn migration_audit(pool: &sqlx::PgPool, actor: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT detail FROM audit_log
+         WHERE actor = $1 AND actor_kind = 'host' AND action = 'CONFIG'
+           AND target = 'server' AND target_kind = 'server'
+         ORDER BY id",
+    )
+    .bind(actor)
+    .fetch_all(pool)
+    .await
+    .expect("audit rows")
+}
+
+/// Two shards persist their own lines of one conversation, so the database
+/// receives a millisecond's rows in no order the ring could share. Every page
+/// is cut in `(ts, msgid)` order compared byte by byte — the ring's order —
+/// whatever order the rows arrived in and whatever the column's collation: on
+/// a UTF-8 database the column is given one that orders `a1` before `B1`,
+/// which bytes do not.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_millisecond_pages_in_msgid_order_whatever_shard_stored_it_first() {
+    use e6ircd::core::{HistoryQuery, SelectorBound};
+    let pool = db::connect_and_migrate(
+        &support::test_db("a_millisecond_pages_in_msgid_order_whatever_shard").await,
+    )
+    .await
+    .expect("connect");
+    // An International Components for Unicode collation needs a UTF-8 database, which CI's is; a cluster
+    // initialized in the C locale (SQL_ASCII) compares bytes whatever the
+    // column says, and there the arrival order alone tells the orders apart.
+    let encoding: String = sqlx::query_scalar(
+        "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("database encoding");
+    if encoding == "UTF8" {
+        sqlx::query(r#"ALTER TABLE messages ALTER COLUMN msgid TYPE text COLLATE "und-x-icu""#)
+            .execute(&pool)
+            .await
+            .expect("a collation that is not a byte comparison");
+    }
+    // The order the rows reach the database in: neither the byte order nor
+    // the collation's.
+    for msgid in ["a1", "B2", "B1"] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, 'alice!bob', 'x!x@h', NULL, 'privmsg', $1,
+                     to_timestamp(5000::double precision / 1000))",
+        )
+        .bind(msgid)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+    let page = |rows: Vec<e6ircd::core::HistoryRow>| -> Vec<String> {
+        rows.into_iter().map(|row| row.msgid).collect()
+    };
+    let msgid = |m: &str| m.to_string();
+    let at = e6irc_proto::time::Millis::from_millis(5000);
+    let target = "alice!bob";
+    assert_eq!(
+        page(hist(&pool, target, HistoryQuery::Latest { limit: 10 }).await),
+        ["B1", "B2", "a1"]
+    );
+    assert_eq!(
+        page(hist(&pool, target, HistoryQuery::Latest { limit: 2 }).await),
+        ["B2", "a1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::BeforeMsgid {
+                    msgid: msgid("a1"),
+                    limit: 10
+                }
+            )
+            .await
+        ),
+        ["B1", "B2"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::AfterMsgid {
+                    msgid: msgid("B1"),
+                    limit: 10
+                }
+            )
+            .await
+        ),
+        ["B2", "a1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::LatestAfterMsgid {
+                    msgid: msgid("B1"),
+                    limit: 1
+                }
+            )
+            .await
+        ),
+        ["a1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::AroundMsgid {
+                    msgid: msgid("B2"),
+                    limit: 2
+                }
+            )
+            .await
+        ),
+        ["B1", "B2"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::Around {
+                    around_ts: at,
+                    limit: 2
+                }
+            )
+            .await
+        ),
+        ["B1"]
+    );
+    // BETWEEN: two msgids, and a msgid against a timestamp either way round.
+    let before = SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(4999));
+    let between =
+        |first: SelectorBound, second: SelectorBound, limit| HistoryQuery::BetweenSelectors {
+            first,
+            second,
+            limit,
+        };
+    let id = |m: &str| SelectorBound::Msgid(m.to_string());
+    assert_eq!(
+        page(hist(&pool, target, between(id("a1"), id("B1"), 10)).await),
+        ["B2"]
+    );
+    assert_eq!(
+        page(hist(&pool, target, between(before.clone(), id("a1"), 10)).await),
+        ["B1", "B2"]
+    );
+    assert_eq!(
+        page(hist(&pool, target, between(id("B2"), before.clone(), 10)).await),
+        ["B1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                between(
+                    id("B1"),
+                    SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(5001)),
+                    1
+                )
+            )
+            .await
+        ),
+        ["B2"]
+    );
+}
+
+/// A concurrent index build that failed leaves its index behind invalid, and
+/// sqlx records the migration only once its statement succeeds — so the next
+/// start ran it again and failed on the leftover name for good. The leftover
+/// is dropped before migrating, and the build runs again.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_interrupted_concurrent_index_build_is_retried() {
+    let url = support::test_db("an_interrupted_concurrent_index_build_is_retried").await;
+    let directory = std::env::temp_dir().join(format!(
+        "e6irc-concurrent-migration-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("migration directory");
+    std::fs::write(
+        directory.join("0001_rows.sql"),
+        "CREATE TABLE concurrent_rows (value INT);\nINSERT INTO concurrent_rows VALUES (1), (1);\n",
+    )
+    .expect("table migration");
+    std::fs::write(
+        directory.join("0002_unique.sql"),
+        "-- no-transaction\n-- One value per row.\n\
+         CREATE UNIQUE INDEX CONCURRENTLY concurrent_rows_value_idx ON concurrent_rows (value);\n",
+    )
+    .expect("index migration");
+    let migrator = sqlx::migrate::Migrator::new(directory.as_path())
+        .await
+        .expect("migrator");
+    // The duplicate makes the build fail after it created the index.
+    let failed = db::run_migrations(&url, &migrator).await;
+    assert!(failed.is_err(), "{failed:?}");
+    let pool = plain_pool(&url).await.expect("connect");
+    let leftover: Option<bool> = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('concurrent_rows_value_idx')",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("index state");
+    assert_eq!(
+        leftover,
+        Some(false),
+        "the failed build leaves an invalid index"
+    );
+    sqlx::query(
+        "DELETE FROM concurrent_rows WHERE ctid <> (SELECT min(ctid) FROM concurrent_rows)",
+    )
+    .execute(&pool)
+    .await
+    .expect("fix the data");
+    db::run_migrations(&url, &migrator)
+        .await
+        .expect("the build is retried from scratch");
+    std::fs::remove_dir_all(&directory).expect("clean up");
+    let valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('concurrent_rows_value_idx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("index state");
+    assert!(valid);
+}
+
+/// A conversation's read marker stored under the correspondent's nick, before
+/// markers were kept by identity, is moved by 0094 to the key it is now looked
+/// up under: a grouped nick's to its account, a nick registered to no one to
+/// `~nick`. Two markers landing on one key keep the newer position; channels,
+/// account names and `~` identities stay; and running the move again changes
+/// nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn stored_conversation_markers_are_moved_to_identities_by_0094() {
+    let pool = plain_pool(&support::test_db("stored_conversation_markers_are_moved_by_0094").await)
+        .await
+        .expect("connect");
+    MIGRATIONS.run_to(93, &pool).await.expect("through 0093");
+    for account in ["alice", "Bob"] {
+        db::create_account_with_contact(&pool, account, "pw", None)
+            .await
+            .expect("account");
+    }
+    assert!(matches!(
+        db::group_nick(&pool, "Bob", "Bobby").await.expect("group"),
+        db::NickGroupOutcome::Grouped
+    ));
+    let rows: [(&str, i64); 8] = [
+        ("#chan", 1_000),
+        ("bob", 2_000),
+        // The grouped nick's marker is the newer of the two for the account.
+        ("bobby", 3_000),
+        ("carol", 4_000),
+        // Written since markers were kept by identity: newer than `carol`.
+        ("~carol", 5_000),
+        ("dave", 7_000),
+        ("~dave", 6_000),
+        ("~erin", 8_000),
+    ];
+    for (target, millis) in rows {
+        sqlx::query(
+            "INSERT INTO read_markers (account_id, target, marker_ts)
+             SELECT id, $1, to_timestamp($2::double precision / 1000)
+             FROM accounts WHERE name_folded = 'alice'",
+        )
+        .bind(target)
+        .bind(millis)
+        .execute(&pool)
+        .await
+        .expect("marker");
+    }
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let expected = [
+        ("#chan", "1970-01-01T00:00:01.000Z"),
+        ("bob", "1970-01-01T00:00:03.000Z"),
+        ("~carol", "1970-01-01T00:00:05.000Z"),
+        ("~dave", "1970-01-01T00:00:07.000Z"),
+        ("~erin", "1970-01-01T00:00:08.000Z"),
+    ]
+    .map(|(target, at)| (target.to_string(), at.to_string()));
+    assert_eq!(
+        db::list_read_markers(&pool, "alice")
+            .await
+            .expect("markers"),
+        expected
+    );
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0094_markers_by_identity_motd_bytes_history_index.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("the move runs again");
+    assert_eq!(
+        db::list_read_markers(&pool, "alice")
+            .await
+            .expect("markers"),
+        expected,
+        "a second run changes nothing"
+    );
+}
+
+/// A stored MOTD that takes more bytes than half the smallest SendQ as sent at
+/// registration is brought within that bound by 0094, keeping the longest run
+/// of its first lines that fits, so the next start does not refuse the stored
+/// settings — and records it: a revision of its own and a `CONFIG` audit entry
+/// carrying the previous MOTD in full. A MOTD within the bound is untouched.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stored_motd_above_the_byte_bound_is_brought_within_it_by_0094() {
+    use e6ircd::config::{MAX_MOTD_BYTES, motd_reply_bytes};
+    let pool = plain_pool(&support::test_db("a_stored_motd_above_the_byte_bound_0094").await)
+        .await
+        .expect("connect");
+    MIGRATIONS.run_to(93, &pool).await.expect("through 0093");
+    let bootstrap =
+        e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
+    db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    let stored: Vec<String> = (1..=40)
+        .map(|line| format!("line {line} {}", "m".repeat(300)))
+        .collect();
+    sqlx::query("UPDATE server_settings SET settings = jsonb_set(settings, '{motd}', $1)")
+        .bind(sqlx::types::Json(&stored))
+        .execute(&pool)
+        .await
+        .expect("store a MOTD the old bound admitted");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let loaded = db::load_managed_config(&pool).await.expect("loads");
+    let kept = loaded.settings.motd.len();
+    assert_eq!(loaded.settings.motd, stored[..kept].to_vec());
+    // The clamp is the Rust bound's: what it kept fits, one line more would not.
+    assert!(motd_reply_bytes(&loaded.settings.motd) <= MAX_MOTD_BYTES);
+    assert!(
+        motd_reply_bytes(&stored[..=kept]) > MAX_MOTD_BYTES,
+        "{kept}"
+    );
+    assert_eq!(loaded.updated_by, "migration:0094");
+    let previous = serde_json::to_string(&stored).expect("json");
+    let detail = migration_audit(&pool, "migration:0094").await;
+    assert_eq!(detail.len(), 1, "{detail:?}");
+    assert!(
+        detail[0].starts_with(&format!(
+            "revision {}; motd cut to its first {kept} of 40 lines by migration 0094",
+            loaded.revision
+        )),
+        "{detail:?}"
+    );
+    let recorded = detail[0]
+        .split_once("previous motd: ")
+        .map(|(_, motd)| serde_json::from_str::<Vec<String>>(motd).expect("the previous motd"))
+        .expect("the previous motd is recorded");
+    assert_eq!(recorded, stored, "{previous}");
+
+    // Within the bound, the MOTD and the revision are left alone.
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0094_markers_by_identity_motd_bytes_history_index.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("the migration runs again");
+    let again = db::load_managed_config(&pool).await.expect("loads");
+    assert_eq!(again.revision, loaded.revision);
+    assert_eq!(again.settings.motd, loaded.settings.motd);
+    assert_eq!(migration_audit(&pool, "migration:0094").await.len(), 1);
+}
+
 /// A settings row saved while `limits.command_burst` was optional stores it as
 /// `null`, which the required field cannot read: the daemon refused to start on
 /// the deployed row. 0067 turns that `null` into the documented default.
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("a_settings_row_with_a_null_command_burst_loads").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("a_settings_row_with_a_null_command_burst_loads").await)
+            .await
+            .expect("connect");
     MIGRATIONS.run_to(66, &pool).await.expect("through 0066");
     let bootstrap =
         e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
@@ -10076,7 +10984,7 @@ async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_settings_row_counting_the_sendq_in_lines_loads_in_bytes_after_0088() {
     for (sendq, expected) in [(2048_i64, 2048 * 512), (1, 17_406), (65_536, 33_554_432)] {
-        let pool = sqlx::PgPool::connect(
+        let pool = plain_pool(
             &support::test_db(&format!("a_settings_row_counting_the_sendq_{sendq}")).await,
         )
         .await
@@ -10113,11 +11021,10 @@ async fn a_settings_row_counting_the_sendq_in_lines_loads_in_bytes_after_0088() 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn app_password_revocations_from_0059_become_visible_to_their_account() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("app_password_revocations_from_0059_become_visible").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("app_password_revocations_from_0059_become_visible").await)
+            .await
+            .expect("connect");
     MIGRATIONS.run_to(58, &pool).await.expect("through 0058");
     let account: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded) VALUES ('Mixed[Case]', 'mixed{case}')
@@ -10153,11 +11060,10 @@ async fn app_password_revocations_from_0059_become_visible_to_their_account() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bouncer_backlog_is_backfilled_with_its_network_and_cascades() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("bouncer_backlog_is_backfilled_with_its_network").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("bouncer_backlog_is_backfilled_with_its_network").await)
+            .await
+            .expect("connect");
     MIGRATIONS.run_to(61, &pool).await.expect("through 0061");
     let account: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice') RETURNING id",
@@ -10228,10 +11134,9 @@ async fn bouncer_backlog_is_backfilled_with_its_network_and_cascades() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn device_grants_name_their_account_by_id() {
-    let pool =
-        sqlx::PgPool::connect(&support::test_db("device_grants_name_their_account_by_id").await)
-            .await
-            .expect("connect");
+    let pool = plain_pool(&support::test_db("device_grants_name_their_account_by_id").await)
+        .await
+        .expect("connect");
     MIGRATIONS.run_to(64, &pool).await.expect("through 0064");
     let account: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice') RETURNING id",
@@ -10248,7 +11153,7 @@ async fn device_grants_name_their_account_by_id() {
     .execute(&pool)
     .await
     .expect("grants");
-    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    MIGRATIONS.run_to(94, &pool).await.expect("through 0094");
     let rows: Vec<(String, Option<i64>)> =
         sqlx::query_as("SELECT device_code, account_id FROM device_grants ORDER BY device_code")
             .fetch_all(&pool)
@@ -10268,6 +11173,61 @@ async fn device_grants_name_their_account_by_id() {
         .await
         .expect("count");
     assert_eq!(left, 1, "the account's approved grant went with it");
+}
+
+/// 0095 keeps only a device code's digest — the one the server computes — so
+/// a grant started before the upgrade is still collected with its code, and
+/// is its command-line client's.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn device_codes_are_hashed_in_place_by_migration() {
+    let pool = plain_pool(&support::test_db("device_codes_are_hashed_in_place_by_migration").await)
+        .await
+        .expect("connect");
+    MIGRATIONS.run_to(94, &pool).await.expect("through 0094");
+    sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice')")
+        .execute(&pool)
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO device_grants (device_code, user_code, account_id, expires_at)
+         VALUES ('pending-code', 'PENDING1', NULL, now() + interval '5 minutes'),
+                ('approved-code', 'APPROVE1', (SELECT id FROM accounts), now() + interval '5 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("grants");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+         WHERE table_name = 'device_grants' ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    assert!(
+        !columns.iter().any(|column| column == "device_code"),
+        "{columns:?}"
+    );
+    let clients: Vec<String> = sqlx::query_scalar("SELECT DISTINCT client_id FROM device_grants")
+        .fetch_all(&pool)
+        .await
+        .expect("clients");
+    assert_eq!(clients, ["e6irc-cli"]);
+    let client = db::DeviceClientId::parse("e6irc-cli").expect("client");
+    assert_eq!(
+        db::poll_device_grant(&pool, "pending-code", &client)
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Pending,
+        "the digest the migration stored is the one a poll computes"
+    );
+    assert!(matches!(
+        db::poll_device_grant(&pool, "approved-code", &client)
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Approved(_)
+    ));
 }
 
 // ---- audit rows commit with their mutations --------------------------------
@@ -10889,13 +11849,17 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
     )
     .await
     .expect("connect");
-    let (expired, _) = db::create_device_grant(&pool).await.expect("grant");
-    let (stale, _) = db::create_device_grant(&pool).await.expect("grant");
+    let (expired, _) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
+    let (stale, _) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     sqlx::query(
-        "UPDATE device_grants SET expires_at = CASE device_code
-             WHEN $1 THEN now() - interval '1 second'
+        "UPDATE device_grants SET expires_at = CASE device_code_hash
+             WHEN sha256(convert_to($1, 'UTF8')) THEN now() - interval '1 second'
              ELSE now() - interval '1 day' END
-         WHERE device_code IN ($1, $2)",
+         WHERE device_code_hash IN (sha256(convert_to($1, 'UTF8')), sha256(convert_to($2, 'UTF8')))",
     )
     .bind(&expired)
     .bind(&stale)
@@ -10903,7 +11867,9 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
     .await
     .expect("expire");
     // Both pruning paths: a new grant, and storage maintenance.
-    db::create_device_grant(&pool).await.expect("grant");
+    db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     let report = db::run_storage_maintenance(
         &pool,
         db::StorageRetention {
@@ -10916,13 +11882,13 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
     .expect("maintenance");
     assert_eq!(report.device_grants, 0, "the stale grant went at start");
     assert_eq!(
-        db::poll_device_grant(&pool, &expired, "device")
+        db::poll_device_grant(&pool, &expired, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Expired
     );
     assert_eq!(
-        db::poll_device_grant(&pool, &stale, "device")
+        db::poll_device_grant(&pool, &stale, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Unknown,
@@ -10954,7 +11920,8 @@ async fn password_attempts_are_bounded_per_account_name() {
         assert_eq!(
             db::verify_credentials(&pool, "alice", "typo")
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
@@ -10969,11 +11936,12 @@ async fn password_attempts_are_bounded_per_account_name() {
         assert_eq!(
             db::verify_credentials(&pool, "alice", "guess")
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
-    let throttled = |result: Result<Option<String>, db::DbError>| match result {
+    let throttled = |result: Result<Option<db::VerifiedAccount>, db::DbError>| match result {
         Err(db::DbError::LoginThrottled(retry)) => {
             assert!(
                 (1..=db::LOGIN_ATTEMPT_WINDOW.as_secs()).contains(&retry.seconds()),
@@ -10984,7 +11952,9 @@ async fn password_attempts_are_bounded_per_account_name() {
         _ => false,
     };
     assert!(throttled(
-        db::verify_credentials(&pool, "Alice", "correct horse").await
+        db::verify_credentials(&pool, "Alice", "correct horse")
+            .await
+            .map(|verified| verified.map(|signed_in| signed_in.account))
     ));
     assert!(throttled(
         db::verify_local_password(&pool, "alice", "correct horse").await
@@ -10993,9 +11963,13 @@ async fn password_attempts_are_bounded_per_account_name() {
         db::issue_app_password(&pool, "alice", "correct horse", "laptop").await,
         Err(db::DbError::LoginThrottled(_))
     ));
-    let session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     assert!(matches!(
         db::change_local_password(&pool, "alice", "correct horse", "new password", &session).await,
         Err(db::DbError::LoginThrottled(_))
@@ -11005,6 +11979,7 @@ async fn password_attempts_are_bounded_per_account_name() {
         db::verify_credentials(&pool, "bob", "bob password")
             .await
             .expect("verify")
+            .map(|signed_in| signed_in.account)
             .as_deref(),
         Some("bob")
     );
@@ -11014,12 +11989,15 @@ async fn password_attempts_are_bounded_per_account_name() {
         assert_eq!(
             db::verify_credentials(&pool, "nobody", "guess")
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
     assert!(throttled(
-        db::verify_credentials(&pool, "nobody", "guess").await
+        db::verify_credentials(&pool, "nobody", "guess")
+            .await
+            .map(|verified| verified.map(|signed_in| signed_in.account))
     ));
     // Once the window has passed the account is admitted again.
     sqlx::query(
@@ -11033,6 +12011,7 @@ async fn password_attempts_are_bounded_per_account_name() {
         db::verify_credentials(&pool, "alice", "correct horse")
             .await
             .expect("verify")
+            .map(|signed_in| signed_in.account)
             .as_deref(),
         Some("alice")
     );
@@ -11210,8 +12189,9 @@ async fn configured_administrator_names_are_not_claimable_by_invitation() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
-    let url =
-        support::test_db("a_stated_console_setting_must_agree_with_the_stored_revision").await;
+    let url_text =
+        support::test_db_text("a_stated_console_setting_must_agree_with_the_stored_revision").await;
+    let url: db::DatabaseUrl = url_text.parse().expect("the test database URL");
     let key_path =
         std::env::temp_dir().join(format!("e6irc-db-managed-drift-key-{}", std::process::id()));
     std::fs::write(&key_path, e6ircd::secret::SecretKey::generate().to_base64())
@@ -11227,7 +12207,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
             [[listeners]]
             addr = "127.0.0.1:0"
             [database]
-            url = {url:?}
+            url = {url_text:?}
             [secrets]
             key_file = {key_path:?}
             [http]
@@ -11353,14 +12333,15 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
     assert_eq!(
         db::verify_credentials(&pool, "ALICE_AWAY", "administrator password")
             .await
-            .expect("verify"),
-        Some("Alice".to_string())
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(db::VerifiedAccount::established("Alice"))
     );
     assert_eq!(
         db::verify_local_password(&pool, "a2", "administrator password")
             .await
             .expect("verify"),
-        Some("Alice".to_string())
+        Some(db::VerifiedAccount::established("Alice"))
     );
     assert!(matches!(
         db::create_account_with_contact(&pool, "Alice_away", "pw", None).await,
@@ -11506,6 +12487,35 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
     assert_eq!(
         db::list_nick_registrations(&pool).await.expect("list"),
         db::NickRegistrations::default()
+    );
+}
+
+/// The app-password exchange mints for the account the password verified as,
+/// not for the login text: a grouped nick verified, cleared its attempt
+/// window, and was then answered as bad credentials because the mint looked up
+/// the nick as an account name.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_app_password_exchanged_through_a_grouped_nick_is_the_accounts() {
+    let (pool, _) =
+        alice_and_bob("an_app_password_exchanged_through_a_grouped_nick_is_the_accounts").await;
+    assert_eq!(
+        db::group_nick(&pool, "alice", "Alice_Away")
+            .await
+            .expect("group"),
+        db::NickGroupOutcome::Grouped
+    );
+    let app_password =
+        db::issue_app_password(&pool, "alice_away", "administrator password", "laptop")
+            .await
+            .expect("a verified grouped nick exchanges its account's password");
+    assert_eq!(
+        db::verify_credentials(&pool, "Alice", &app_password)
+            .await
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(db::VerifiedAccount::established("Alice")),
+        "the app password is Alice's"
     );
 }
 
@@ -12197,7 +13207,7 @@ async fn direct_message_targets_come_from_a_summary_every_writer_keeps() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn dm_conversation_summary_is_backfilled_from_stored_history() {
     let url = support::test_db("dm_conversation_summary_is_backfilled").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(75, &pool)
         .await
@@ -12344,7 +13354,7 @@ async fn targets_are_dated_in_the_readers_scope() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn dm_conversation_text_time_is_backfilled_from_stored_history() {
     let url = support::test_db("dm_conversation_text_time_is_backfilled").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(81, &pool)
         .await
@@ -12589,9 +13599,13 @@ async fn a_failed_credential_use_record_fails_both_password_checks() {
     .execute(&pool)
     .await
     .expect("trigger");
-    let failed_write = |outcome: Result<Option<String>, db::DbError>| matches!(outcome, Err(error) if error.to_string().contains("last_used_at is not writable"));
+    let failed_write = |outcome: Result<Option<db::VerifiedAccount>, db::DbError>| matches!(outcome, Err(error) if error.to_string().contains("last_used_at is not writable"));
     assert!(
-        failed_write(db::verify_credentials(&pool, "user", &app_password).await),
+        failed_write(
+            db::verify_credentials(&pool, "user", &app_password)
+                .await
+                .map(|verified| verified.map(|signed_in| signed_in.account))
+        ),
         "an app-password login reported success past a failed write"
     );
     assert!(
@@ -12713,7 +13727,7 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
     // be that same session, or it waits on the lock forever.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect_with(url.connect_options())
         .await
         .expect("connect");
     MIGRATIONS
@@ -12782,4 +13796,301 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
             .await
             .expect("markers");
     assert_eq!(markers, ["#ok"]);
+}
+
+/// A sign-in names the credential that verified — the account password, one
+/// app password, a personal access token — and migration 0097 announces the
+/// revocation of an app password or a token by that name, so what it signed
+/// in can end whichever process revoked it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_sign_in_names_its_credential_and_its_revocation_is_announced() {
+    use e6ircd::identity::{CredentialId, IssuedCredential};
+    let url =
+        support::test_db("a_sign_in_names_its_credential_and_its_revocation_is_announced").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "first password", None)
+        .await
+        .expect("alice");
+    let first_secret = db::issue_app_password(&pool, "alice", "first password", "laptop")
+        .await
+        .expect("app password");
+    let second_secret = db::issue_app_password(&pool, "alice", "first password", "phone")
+        .await
+        .expect("app password");
+    let token = db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc client",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Irc])
+            .expect("scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("token");
+    let signed_in_with = async |secret: &str| {
+        let signed_in = db::verify_credentials(&pool, "alice", secret)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert_eq!(signed_in.account.name(), "Alice");
+        signed_in.credential
+    };
+    assert_eq!(
+        signed_in_with("first password").await,
+        CredentialId::AccountPassword
+    );
+    let (CredentialId::Issued(first), CredentialId::Issued(second)) = (
+        signed_in_with(&first_secret).await,
+        signed_in_with(&second_secret).await,
+    ) else {
+        panic!("an app password signs in as itself");
+    };
+    assert!(matches!(first, IssuedCredential::AppPassword(_)));
+    assert!(matches!(second, IssuedCredential::AppPassword(_)));
+    assert_ne!(first, second);
+    let signed_in = db::api_token_account(&pool, &token)
+        .await
+        .expect("token lookup")
+        .expect("an IRC token");
+    let CredentialId::Issued(token @ IssuedCredential::ApiToken(token_id)) = signed_in.credential
+    else {
+        panic!("a token signs in as itself: {:?}", signed_in.credential);
+    };
+    // The sign-in carries how long the token has left, by the store's clock:
+    // its session ends then. A password does not expire.
+    let lifetime = std::time::Duration::from_secs(
+        u64::from(e6ircd::identity::ApiTokenLifetimeDays::DEFAULT.value()) * 86_400,
+    );
+    let left = signed_in.expires_in.expect("a token expires");
+    assert!(
+        left <= lifetime && left > lifetime - std::time::Duration::from_secs(60),
+        "{left:?}"
+    );
+    assert_eq!(
+        db::verify_credentials(&pool, "alice", "first password")
+            .await
+            .expect("verify")
+            .expect("verified")
+            .expires_in,
+        None
+    );
+
+    let every = [first, second, token];
+    let stored = async || {
+        let mut stored: Vec<IssuedCredential> = db::issued_credentials_stored(&pool, &every)
+            .await
+            .expect("stored")
+            .into_iter()
+            .collect();
+        stored.sort_unstable();
+        stored
+    };
+    assert_eq!(stored().await, every.to_vec());
+
+    // The credential channel as any follower hears it; migration 0097 writes
+    // `app_password:<id>` and `api_token:<id>`.
+    let mut listener = sqlx::postgres::PgListener::connect_with(
+        &sqlx::PgPool::connect_with(url.connect_options())
+            .await
+            .expect("listener pool"),
+    )
+    .await
+    .expect("listen");
+    listener
+        .listen("e6irc_credential_changed")
+        .await
+        .expect("listen on the credential channel");
+    let mut revoked = async || loop {
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv())
+                .await
+                .expect("an announcement")
+                .expect("listener");
+        let id = |tag: &str| {
+            notification
+                .payload()
+                .strip_prefix(tag)
+                .map(|id| id.parse::<i64>().expect("a row id"))
+        };
+        if let Some(id) = id("app_password:") {
+            return IssuedCredential::AppPassword(id);
+        }
+        if let Some(id) = id("api_token:") {
+            return IssuedCredential::ApiToken(id);
+        }
+    };
+    let IssuedCredential::AppPassword(first_id) = first else {
+        unreachable!("matched above");
+    };
+    assert!(
+        db::revoke_credential(&pool, "alice", first_id)
+            .await
+            .expect("revoke")
+    );
+    assert_eq!(revoked().await, first);
+    assert!(
+        db::delete_api_token(&pool, "alice", token_id)
+            .await
+            .expect("revoke")
+    );
+    assert_eq!(revoked().await, token);
+    assert_eq!(
+        stored().await,
+        vec![second],
+        "what a listener that missed the announcements reads"
+    );
+    // The other app password still signs in, as itself.
+    assert_eq!(
+        signed_in_with(&second_secret).await,
+        CredentialId::Issued(second)
+    );
+}
+
+/// Migration 0095 counts every change of an account's authority — its
+/// suspension flipping, its primary password added, replaced or removed, by
+/// whichever path — and nothing else, and announces each created account,
+/// counted change and deleted account on the credential channel as
+/// `account:<id>:<folded name>`, which is how the serving process hears a
+/// change another process (`recover-administrator`) made.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_authority_changes_are_counted_and_announced() {
+    let url = support::test_db("account_authority_changes_are_counted_and_announced").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    // Another administrator, so alice may be suspended and, once a recovery
+    // has made her one, deleted.
+    let root = db::create_account_with_contact(&pool, "root", "root password", None)
+        .await
+        .expect("root");
+    sqlx::query("UPDATE accounts SET flags = 1 WHERE id = $1")
+        .bind(root)
+        .execute(&pool)
+        .await
+        .expect("root administers");
+    let mut listener = sqlx::postgres::PgListener::connect_with(
+        &sqlx::PgPool::connect_with(url.connect_options())
+            .await
+            .expect("listener pool"),
+    )
+    .await
+    .expect("listen");
+    listener
+        .listen("e6irc_credential_changed")
+        .await
+        .expect("listen on the credential channel");
+    /// An announced account: its id and folded name.
+    struct Announced {
+        id: i64,
+        folded: String,
+    }
+    let mut announced = async || {
+        loop {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv())
+                    .await
+                    .expect("an announcement")
+                    .expect("listener");
+            if let Some(account) = notification.payload().strip_prefix("account:") {
+                let (id, folded) = account.split_once(':').expect("account:<id>:<name>");
+                return Announced {
+                    id: id.parse().expect("an account id"),
+                    folded: folded.to_owned(),
+                };
+            }
+        }
+    };
+    let generation = async |id: i64| -> i64 {
+        sqlx::query_scalar("SELECT authority_generation FROM accounts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("generation")
+    };
+
+    let id = db::create_account_with_contact(&pool, "Alice", "first password", None)
+        .await
+        .expect("alice");
+    let created = announced().await;
+    assert_eq!((created.id, created.folded.as_str()), (id, "alice"));
+    // Its primary password was added.
+    assert_eq!(generation(id).await, 1);
+
+    // Signing in, an app password, and administrator authority change nothing
+    // the account's sessions stand on.
+    db::verify_credentials(&pool, "alice", "first password")
+        .await
+        .expect("verify")
+        .map(|signed_in| signed_in.account)
+        .expect("verified");
+    db::issue_app_password(&pool, "alice", "first password", "laptop")
+        .await
+        .expect("app password");
+    for granted in [
+        "UPDATE accounts SET flags = flags | 1 WHERE id = $1",
+        "UPDATE accounts SET flags = flags & ~1 WHERE id = $1",
+    ] {
+        sqlx::query(granted)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("administrator");
+    }
+    assert_eq!(generation(id).await, 1);
+
+    let suspended = db::set_account_suspended(&pool, id, true, "root", &[])
+        .await
+        .expect("suspend")
+        .expect("alice");
+    assert_eq!(announced().await.id, id);
+    assert_eq!(
+        (
+            suspended.authority.generation,
+            suspended.authority.suspended
+        ),
+        (2, true)
+    );
+    assert_eq!(generation(id).await, 2);
+    let reactivated = db::set_account_suspended(&pool, id, false, "root", &[])
+        .await
+        .expect("reactivate")
+        .expect("alice");
+    assert_eq!(announced().await.id, id);
+    assert_eq!(
+        (
+            reactivated.authority.generation,
+            reactivated.authority.suspended
+        ),
+        (3, false)
+    );
+
+    let session = db::create_web_session(&pool, &db::VerifiedAccount::established("alice"), None)
+        .await
+        .expect("session");
+    let changed = db::change_local_password(
+        &pool,
+        "alice",
+        "first password",
+        "second password",
+        &session,
+    )
+    .await
+    .expect("change");
+    assert_eq!(announced().await.id, id);
+    assert_eq!((changed.id, changed.generation), (id, 4));
+
+    // A recovery removes the primary password and installs another: one
+    // announcement of the transaction, both counted.
+    db::recover_administrator(&pool, "alice")
+        .await
+        .expect("recover");
+    assert_eq!(announced().await.id, id);
+    assert_eq!(generation(id).await, 6);
+
+    db::delete_account_permanently(&pool, id, "root", &[])
+        .await
+        .expect("delete")
+        .expect("deleted");
+    let deleted = announced().await;
+    assert_eq!((deleted.id, deleted.folded.as_str()), (id, "alice"));
 }

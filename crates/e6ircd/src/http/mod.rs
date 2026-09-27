@@ -53,7 +53,7 @@ use ws::*;
 /// [`pool_of`], which relies on `authenticate`'s fail-closed pool check.)
 macro_rules! require_pool {
     ($state:expr) => {
-        match &$state.pool {
+        match $state.pool() {
             Some(pool) => pool,
             None => {
                 return problem(
@@ -88,9 +88,10 @@ macro_rules! require_managed_config {
 pub struct AppState {
     pub server_name: String,
     pub network_name: String,
-    /// Absent when the server runs without persistence; endpoints that
-    /// need it answer 503, never fake success.
-    pub pool: Option<PgPool>,
+    /// The database and the network registry that goes with it, or neither
+    /// ([`Backing`]). Endpoints that need a database answer 503 without one,
+    /// never fake success.
+    pub backing: Backing,
     pub public_url: Option<String>,
     /// Bootstrap HTTP bind; shown with provenance in the configuration console.
     pub http_bind: Option<std::net::SocketAddr>,
@@ -107,9 +108,10 @@ pub struct AppState {
     pub(crate) monitoring_token_digest: Option<[u8; 32]>,
     /// Per-startup key sealing each in-flight OpenID Connect authorization
     /// into the browser's own state cookie, so the server holds no per-flow
-    /// state an anonymous flood could exhaust. Like `csrf_key`, it protects
-    /// only short-lived browser state and is not derived from the optional
-    /// at-rest `secret_key`: a restart ends flows begun before it.
+    /// state an anonymous flood could exhaust. Unlike `csrf_keys` it is not
+    /// derived from the master key: a restart ends the flows begun before it,
+    /// which is what keeps `spent_oidc_flows`, held in memory, a complete
+    /// record of the flows this key's cookies could still replay.
     pub oidc_flow_key: crate::secret::SecretKey,
     /// Authorization flows whose callback has been answered, so a kept copy
     /// of a flow cookie cannot be answered again.
@@ -120,9 +122,6 @@ pub struct AppState {
     pub next_conn: std::sync::Arc<crate::core::ConnectionIdAllocator>,
     /// Per-connection SendQ capacity, in bytes.
     pub sendq_bytes: usize,
-    /// The always-on network registry shared by web chat, management, and the
-    /// optional raw attach listener. Present whenever PostgreSQL is available.
-    pub bnc_registry: Option<std::sync::Arc<crate::bouncer::Registry>>,
     /// Runtime controller for the client attach listener. Present whenever a
     /// database-backed registry exists, even while the listener is disabled.
     pub bnc_listener: Option<std::sync::Arc<crate::net::BncListenerController>>,
@@ -143,9 +142,9 @@ pub struct AppState {
     /// cannot revoke authority configuration still gives (or pretend it did).
     /// The same set the core refuses as account names.
     pub configured_admin_accounts: crate::identity::ReservedAccountNames,
-    /// Per-startup key for deriving CSRF tokens for cookie-authenticated
-    /// form posts from the server-rendered pages.
-    pub csrf_key: [u8; 32],
+    /// The keys of the CSRF tokens cookie-authenticated form posts carry
+    /// (see [`CsrfKeys`]).
+    pub csrf_keys: CsrfKeys,
     /// Trusted reverse-proxy CIDRs; when the socket peer matches one, the
     /// client IP is taken from `X-Forwarded-For` (see [`client_ip`]).
     pub trusted_proxies: Vec<ipnet::IpNet>,
@@ -173,6 +172,9 @@ pub struct AppState {
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
+    /// Every client connection's task, which an `/ws/irc` session's joins, so
+    /// shutdown waits for its closing `ERROR` as for a raw socket's.
+    pub(crate) connections: crate::net::ConnectionTasks,
     /// The per-address in-flight request bound ([`RequestAdmission`]).
     pub(crate) request_admission: Arc<RequestAdmission>,
     /// `/readyz`'s shared database probe ([`DatabaseReadiness`]).
@@ -186,6 +188,74 @@ pub struct AppState {
     /// Fast presentation state; PostgreSQL remains the transactional authority
     /// that exactly zero accounts exist.
     pub(crate) bootstrap_available: AtomicBool,
+}
+
+/// Where the server keeps durable state, and the always-on network registry
+/// (shared by web chat, management, and the optional raw attach listener)
+/// that goes with it. A database-backed server always has a registry, and a
+/// server without one has none, because configured networks require a
+/// database (DESIGN §18): "a database but no registry" is not a value a
+/// handler can meet, so a handler that reached an authenticated request has
+/// both.
+pub enum Backing {
+    /// No PostgreSQL: nothing authenticates, and no network runs.
+    Stateless,
+    /// PostgreSQL and its registry.
+    Database {
+        pool: PgPool,
+        networks: std::sync::Arc<crate::bouncer::Registry>,
+    },
+}
+
+impl Backing {
+    /// Pair a pool with the registry started for it. Either without the other
+    /// is refused: the process builds a registry exactly when it has a
+    /// database, so a mismatch is a startup bug to report, not a state to
+    /// serve.
+    pub fn new(
+        pool: Option<PgPool>,
+        networks: Option<std::sync::Arc<crate::bouncer::Registry>>,
+    ) -> Result<Self, &'static str> {
+        match (pool, networks) {
+            (Some(pool), Some(networks)) => Ok(Self::Database { pool, networks }),
+            (None, None) => Ok(Self::Stateless),
+            (Some(_), None) => Err("a database-backed server has no network registry"),
+            (None, Some(_)) => Err("a network registry was started without a database"),
+        }
+    }
+
+    pub fn pool(&self) -> Option<&PgPool> {
+        match self {
+            Self::Stateless => None,
+            Self::Database { pool, .. } => Some(pool),
+        }
+    }
+
+    /// The running network registry, when the server has a database.
+    pub fn networks(&self) -> Option<&std::sync::Arc<crate::bouncer::Registry>> {
+        match self {
+            Self::Stateless => None,
+            Self::Database { networks, .. } => Some(networks),
+        }
+    }
+}
+
+impl AppState {
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.backing.pool()
+    }
+}
+
+/// The network registry, once a request has authenticated: authentication
+/// needs the database, and a database-backed server always has a registry
+/// ([`Backing`]), so reaching a handler body proves one.
+pub(super) fn registry_of(state: &AppState) -> &std::sync::Arc<crate::bouncer::Registry> {
+    match &state.backing {
+        Backing::Database { networks, .. } => networks,
+        Backing::Stateless => {
+            panic!("an authenticated request reached a handler on a server without a database")
+        }
+    }
 }
 
 pub(crate) fn bootstrap_token_digest(token: &str) -> [u8; 32] {
@@ -297,25 +367,78 @@ impl AppState {
             http_listener: self.http_bind,
             hsts_include_subdomains: self.hsts_include_subdomains,
             internal_upstreams: self.internal_upstreams,
+            application_release_revision: self.application_release_revision.clone(),
         }
     }
 
-    /// A CSRF token bound to a web session: `HMAC(csrf_key, session)`.
+    /// A CSRF token bound to a web session (see [`CsrfKeys::token`]).
     pub fn csrf_token(&self, session: &str) -> String {
-        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &self.csrf_key);
+        self.csrf_keys.token(session)
+    }
+
+    fn csrf_valid(&self, session: &str, token: &str) -> bool {
+        self.csrf_keys.valid(session, token)
+    }
+}
+
+/// The keys of the session-bound CSRF token: `HMAC-SHA256(key, session)`.
+///
+/// Derived from the master secret key (HKDF,
+/// [`crate::secret::DerivedKeyPurpose::FormCsrf`]), so every process
+/// configured with that key issues and accepts the same tokens: a form open in
+/// a browser still posts after a restart, or after a standby takes over from a
+/// crashed process. During a key rotation a token issued under a previous key
+/// is still accepted, and new ones are issued under the primary. Without a
+/// master key the key is the process's own and a restart invalidates every
+/// open form, which startup says once.
+pub struct CsrfKeys(crate::secret::DerivedKeys);
+
+impl CsrfKeys {
+    /// What a deployment without a master key is told once at startup.
+    const PROCESS_SCOPED_WARNING: &'static str = "e6ircd: no secret key is configured, so \
+        the key of form CSRF tokens is this process's own: forms open in a browser stop \
+        posting after a restart or a standby's takeover";
+
+    /// The keys for this deployment, with the warning to log when they are
+    /// the process's own.
+    pub(crate) fn for_keyring(
+        keyring: Option<&crate::secret::SecretKeyring>,
+    ) -> (Self, Option<&'static str>) {
+        match keyring {
+            Some(keyring) => (
+                Self(keyring.derive(crate::secret::DerivedKeyPurpose::FormCsrf)),
+                None,
+            ),
+            None => (
+                Self(crate::secret::DerivedKeys::random()),
+                Some(Self::PROCESS_SCOPED_WARNING),
+            ),
+        }
+    }
+
+    fn token_under(key: &[u8; 32], session: &str) -> String {
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
         let tag = aws_lc_rs::hmac::sign(&key, session.as_bytes());
         tag.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Constant-time check of a CSRF token against the session.
-    fn csrf_valid(&self, session: &str, token: &str) -> bool {
-        let expected = self.csrf_token(session);
-        expected.len() == token.len()
-            && aws_lc_rs::constant_time::verify_slices_are_equal(
-                expected.as_bytes(),
-                token.as_bytes(),
-            )
-            .is_ok()
+    /// The token issued for `session`: under the primary key.
+    pub fn token(&self, session: &str) -> String {
+        Self::token_under(self.0.primary(), session)
+    }
+
+    /// Whether `token` is `session`'s under any accepted key, each compared in
+    /// constant time.
+    fn valid(&self, session: &str, token: &str) -> bool {
+        self.0.accepted().any(|key| {
+            let expected = Self::token_under(key, session);
+            expected.len() == token.len()
+                && aws_lc_rs::constant_time::verify_slices_are_equal(
+                    expected.as_bytes(),
+                    token.as_bytes(),
+                )
+                .is_ok()
+        })
     }
 }
 
@@ -382,17 +505,37 @@ pub(super) fn validate_label(label: &str) -> Option<Response> {
         .map(|detail| problem(StatusCode::BAD_REQUEST, "Invalid label", Some(&detail)))
 }
 
+/// The bound on a login's account name and presented password, checked before
+/// any Argon2 work ([`presented_password_error`]).
 pub(super) fn credential_input_error(account: &str, password: &str) -> Option<&'static str> {
     if account.is_empty() || account.len() > MAX_ACCOUNT_LEN {
         return Some("Account names must contain 1–64 bytes.");
     }
-    password_input_error(password)
+    presented_password_error(password)
 }
 
-/// The password rule IRC `REGISTER` and NickServ `REGISTER` apply too
-/// ([`crate::identity::NewPassword`]).
-pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
-    crate::identity::NewPassword::parse(password)
+/// The bound on a password presented for *verification* — a login, the
+/// app-password exchange, a re-authentication, a change's current password:
+/// 1–512 bytes. It is not the rule for a password being set
+/// ([`new_password_error`]): an account whose password predates that rule
+/// still signs in with it.
+pub(super) fn presented_password_error(password: &str) -> Option<&'static str> {
+    if password.is_empty() || password.len() > 512 {
+        Some("Passwords must contain 1–512 bytes.")
+    } else {
+        None
+    }
+}
+
+/// The rule for a password being *set*, which IRC `REGISTER` and NickServ
+/// `REGISTER` apply too, from the same `policy`
+/// ([`crate::identity::PasswordPolicy`]).
+pub(super) fn new_password_error(
+    policy: &crate::identity::PasswordPolicy,
+    password: &str,
+) -> Option<String> {
+    policy
+        .new_password(password)
         .err()
         .map(crate::identity::PasswordRefusal::explanation)
 }
@@ -567,10 +710,6 @@ pub(super) fn parse_optional_contact_email(
 /// Run one HTTP control-plane mutation on the core and await its typed outcome.
 /// The core owns live-state ordering and the database verdict; HTTP handlers do
 /// not write durable/live state along a second path.
-async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result<String, String> {
-    state.core_tx.admin_action(req).await
-}
-
 async fn core_reply(
     state: &AppState,
     req: crate::core::AdminRequest,
@@ -585,7 +724,7 @@ fn account_mutation_pool(
     if account_id <= 0 {
         return Err((StatusCode::BAD_REQUEST, "Invalid account id".into()));
     }
-    state.pool.as_ref().ok_or((
+    state.pool().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "No database configured".into(),
     ))
@@ -612,10 +751,7 @@ async fn mutate_account_lifecycle(
     change: AccountLifecycle,
 ) -> Result<String, (StatusCode, String)> {
     account_mutation_pool(state, account_id)?;
-    let registry = state.bnc_registry.clone().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network registry unavailable".into(),
-    ))?;
+    let registry = registry_of(state).clone();
     let (state, actor) = (state.clone(), actor.to_owned());
     registry
         .mutate(move |lane| async move {
@@ -629,6 +765,33 @@ async fn mutate_account_lifecycle(
                     .await
                     .map_err(account_deletion_status),
             }
+        })
+        .await
+}
+
+/// End every live IRC session and bouncer attachment of the account whose
+/// password just changed (`authority`, as the change left it) — by the browser
+/// session that asked, so no IRC session is the one that made the change. The
+/// same sweep as a suspension's, without its gate: attachments are revoked on
+/// the mutation lane, and the core refuses a verdict for a check queued before
+/// the change. Every other server does the same when the change is announced
+/// ([`crate::account_authority`]); this one records it as applied.
+pub(super) async fn end_sessions_after_password_change(
+    state: &Arc<AppState>,
+    authority: crate::db::AccountAuthority,
+) -> Result<(), String> {
+    let registry = registry_of(state).clone();
+    let state = state.clone();
+    registry
+        .mutate(move |lane| async move {
+            lane.authority_ledger().applied(&authority);
+            crate::account_authority::end_sessions_here(
+                &lane,
+                &state.core_tx,
+                &authority.folded,
+                &authority.folded,
+            )
+            .await
         })
         .await
 }
@@ -710,57 +873,78 @@ async fn account_suspension_in_lane(
     .map_err(|error| authority_error_status("account lifecycle mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
+    // Every other server applies the change when it is announced
+    // ([`crate::account_authority`]); this one applies it now.
+    lane.authority_ledger().applied(&change.authority);
     if suspended {
-        let stopped_networks = lane
-            .remove_owner(&change.folded, crate::bouncer::UnwrittenLines::Store)
-            .await;
-        core_action(
-            state,
-            crate::core::AdminRequest::SetAccountSuspended {
-                account: change.folded.clone(),
-                suspended: true,
-                reason: "Account suspended".into(),
-                actor: actor.to_string(),
-            },
+        // Every attachment the account holds ends, its networks stop — the
+        // ones the configuration defines for it held until it is reactivated
+        // — and the core gates it.
+        let crate::account_authority::SuspendedHere {
+            stopped_networks,
+            held_configured,
+        } = crate::account_authority::suspend_here(
+            lane,
+            &state.core_tx,
+            &change.folded,
+            "Account suspended",
+            actor,
         )
         .await
-        .map_err(|error| {
+        .map_err(|(stopped, error)| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "Account was suspended and {stopped_networks} network(s) stopped, but live IRC disconnect failed: {error}"
+                    "Account was suspended and {} owned and {} configured network(s) stopped, \
+                     but live IRC disconnect failed: {error}",
+                    stopped.stopped_networks, stopped.held_configured
                 ),
             )
         })?;
         Ok(format!(
-            "Suspended {} and stopped {stopped_networks} owned network(s).",
+            "Suspended {} and stopped {stopped_networks} owned and {held_configured} configured \
+             network(s).",
             change.name
         ))
     } else {
-        core_action(
-            state,
-            crate::core::AdminRequest::SetAccountSuspended {
-                account: change.folded.clone(),
-                suspended: false,
-                reason: "Account reactivated".into(),
-                actor: actor.to_string(),
-            },
+        let crate::account_authority::ReactivatedHere {
+            started_networks,
+            held,
+            restarted,
+            unbuildable,
+        } = crate::account_authority::reactivate_here(
+            lane,
+            &state.core_tx,
+            &change.folded,
+            actor,
+            prepared_networks,
         )
         .await
         .map_err(|error| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Account was reactivated, but the live IRC core remained gated: {error}"),
+                format!("Account {} was reactivated, but {error}", change.name),
             )
         })?;
-        let started_networks = prepared_networks.len();
-        for (name, driver) in prepared_networks {
-            lane.ensure_running(Some(&change.folded), &name, driver)
-                .await;
-        }
+        let held = if held.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Not started, because the server configuration defines a network of the \
+                 same name: {}.",
+                held.join(", ")
+            )
+        };
+        let unbuildable = if unbuildable.is_empty() {
+            String::new()
+        } else {
+            format!(" Still stopped: {}.", unbuildable.join("; "))
+        };
         Ok(format!(
-            "Reactivated {} and started {started_networks} owned network(s).",
-            change.name
+            "Reactivated {} and started {started_networks} owned and {} configured network(s).\
+             {held}{unbuildable}",
+            change.name,
+            restarted.len()
         ))
     }
 }
@@ -844,8 +1028,8 @@ pub(super) async fn create_account_lifecycle(
             "The account must be a valid IRC nickname of at most 64 bytes.".into(),
         ));
     }
-    if let Some(detail) = password_input_error(password) {
-        return Err((StatusCode::BAD_REQUEST, detail.into()));
+    if let Some(detail) = new_password_error(&state.core_tx.password_policy(), password) {
+        return Err((StatusCode::BAD_REQUEST, detail));
     }
     if let Some(detail) = state.unclaimable_account_name(account) {
         return Err((StatusCode::CONFLICT, detail.into()));
@@ -854,7 +1038,7 @@ pub(super) async fn create_account_lifecycle(
         .map(crate::identity::ContactEmail::parse)
         .transpose()
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let pool = state.pool.as_ref().ok_or((
+    let pool = state.pool().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "No database configured".into(),
     ))?;
@@ -905,18 +1089,16 @@ impl AppState {
     fn account_deletion(
         &self,
     ) -> Result<crate::account_deletion::AccountDeletion, (StatusCode, String)> {
-        let pool = self.pool.clone().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured".into(),
-        ))?;
-        let registry = self.bnc_registry.clone().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Network registry unavailable".into(),
-        ))?;
+        let Backing::Database { pool, networks } = &self.backing else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured".into(),
+            ));
+        };
         Ok(crate::account_deletion::AccountDeletion {
-            pool,
+            pool: pool.clone(),
             core_tx: self.core_tx.clone(),
-            registry,
+            registry: networks.clone(),
             secret_key: self.secret_key.clone(),
             internal_upstreams: self.internal_upstreams,
             configured_administrators: self.configured_admin_accounts.clone(),
@@ -955,11 +1137,29 @@ mod problem_contract_tests {
         ("networks.rs", include_str!("networks.rs")),
         ("observation.rs", include_str!("observation.rs")),
         ("oidc.rs", include_str!("oidc.rs")),
+        ("oidc_provider.rs", include_str!("oidc_provider.rs")),
         ("openapi.rs", include_str!("openapi.rs")),
         ("preflight.rs", include_str!("preflight.rs")),
+        ("revocation.rs", include_str!("revocation.rs")),
         ("sessions.rs", include_str!("sessions.rs")),
         ("ws.rs", include_str!("ws.rs")),
     ];
+
+    /// The guard reads every file of the module, so a new one cannot escape
+    /// it (`oidc_provider.rs` and `revocation.rs` once did).
+    #[test]
+    fn the_sources_are_every_http_file() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/src/http");
+        let mut files: Vec<String> = std::fs::read_dir(directory)
+            .expect("the http module directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| name.ends_with(".rs"))
+            .collect();
+        files.sort();
+        let listed: Vec<&str> = SOURCES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(files, listed);
+    }
 
     fn occurrences(needle: &str) -> Vec<(&'static str, usize)> {
         SOURCES
@@ -986,12 +1186,14 @@ mod problem_contract_tests {
     /// malformed request, a well-formed but invalid logout token included.
     /// Sign-out reads its form only as one of two places the CSRF value may
     /// be (a script sends the header and no body), and answers a request
-    /// that proves it in neither with the CSRF refusal.
+    /// that proves it in neither with the CSRF refusal. The two RFC 8628
+    /// device endpoints answer a malformed form with the OAuth
+    /// `invalid_request` error their protocol specifies.
     #[test]
     fn only_parse_form_unwraps_a_form() {
         assert_eq!(
             occurrences(concat!("Form", "(")),
-            vec![("device.rs", 1), ("mod.rs", 1), ("oidc.rs", 1)]
+            vec![("device.rs", 2), ("mod.rs", 1), ("oidc.rs", 1)]
         );
     }
 
@@ -1099,8 +1301,8 @@ mod query_limit_tests {
 
 pub(crate) fn bnc_counts(state: &AppState) -> (u64, u64) {
     state
-        .bnc_registry
-        .as_ref()
+        .backing
+        .networks()
         .map(|registry| {
             let statuses = registry.list();
             (
@@ -1134,9 +1336,13 @@ async fn observe_http(
     response
 }
 
+/// `/readyz` of the serving process. A standby answers its own
+/// (`net::StandbyHealth`): `role` tells a load balancer's operator which one
+/// answered.
 #[derive(Serialize)]
 struct Readiness {
     ready: bool,
+    role: &'static str,
     core: &'static str,
     database: &'static str,
 }
@@ -1214,7 +1420,7 @@ impl DatabaseReadiness {
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let core_ready = state.telemetry.core_is_fresh(CORE_HEARTBEAT_FRESHNESS);
-    let database_ready = match &state.pool {
+    let database_ready = match state.pool() {
         Some(pool) => {
             state
                 .database_readiness
@@ -1242,8 +1448,9 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         },
         axum::Json(Readiness {
             ready,
+            role: "serving",
             core: if core_ready { "ready" } else { "stale" },
-            database: if state.pool.is_none() {
+            database: if state.pool().is_none() {
                 "not_configured"
             } else if database_ready {
                 "ready"
@@ -1303,7 +1510,7 @@ async fn admin_observability(
     let (networks, connected) = bnc_counts(&state);
     let current = state.telemetry.snapshot(networks, connected);
     let schema_version = current.schema_version;
-    let Some(pool) = &state.pool else {
+    let Some(pool) = state.pool() else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "Monitoring history unavailable",
@@ -1815,14 +2022,21 @@ pub(crate) struct RequestAdmission {
     trusted_proxies: Vec<ipnet::IpNet>,
     limit: usize,
     in_flight: Mutex<HashMap<crate::net::PeerLimitKey, usize>>,
+    /// Where a request refused for an unusable forwarded address is logged.
+    refusals: Arc<crate::net::PeerRefusalLog>,
 }
 
 impl RequestAdmission {
-    pub(crate) fn new(trusted_proxies: Vec<ipnet::IpNet>, limit: usize) -> Self {
+    pub(crate) fn new(
+        trusted_proxies: Vec<ipnet::IpNet>,
+        limit: usize,
+        refusals: Arc<crate::net::PeerRefusalLog>,
+    ) -> Self {
         Self {
             trusted_proxies,
             limit,
             in_flight: Mutex::new(HashMap::new()),
+            refusals,
         }
     }
 
@@ -1879,7 +2093,15 @@ async fn admit_client_request(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             |info| info.0.ip(),
         );
-    let client = client_ip(peer, request.headers(), &admission.trusted_proxies);
+    let client = match resolve_client_ip(
+        peer,
+        request.headers(),
+        &admission.trusted_proxies,
+        &admission.refusals,
+    ) {
+        Ok(client) => client,
+        Err(refusal) => return refusal.into(),
+    };
     let Some(_slot) = admission.admit(client) else {
         return retry_later(
             "Too many requests in flight",
@@ -2285,7 +2507,7 @@ mod pages {
         error: Option<String>,
         status: StatusCode,
     ) -> Response {
-        let local_enabled = state.pool.is_some()
+        let local_enabled = state.pool().is_some()
             && !state
                 .oidc_providers
                 .iter()
@@ -2334,6 +2556,7 @@ mod pages {
         bootstrap_state: String,
         account: String,
         error: Option<String>,
+        minimum_password_length: usize,
     }
 
     fn bootstrap_state_cookie_name(secure: bool) -> &'static str {
@@ -2402,6 +2625,7 @@ mod pages {
             bootstrap_state: bootstrap_state.clone(),
             account,
             error,
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         });
         *response.status_mut() = status;
         let secure = if state.secure_cookies { "; Secure" } else { "" };
@@ -2480,13 +2704,8 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        if let Some(detail) = password_input_error(&form.password) {
-            return bootstrap_response(
-                &state,
-                form.account,
-                Some(detail.into()),
-                StatusCode::BAD_REQUEST,
-            );
+        if let Some(detail) = new_password_error(&state.core_tx.password_policy(), &form.password) {
+            return bootstrap_response(&state, form.account, Some(detail), StatusCode::BAD_REQUEST);
         }
         if form.password != form.password_confirmation {
             return bootstrap_response(
@@ -2528,18 +2747,23 @@ mod pages {
         }
         state.bootstrap_available.store(false, Ordering::Release);
         let user_agent = super::session_user_agent(&headers);
-        let token =
-            match crate::db::create_web_session(pool, &form.account, user_agent.as_ref()).await {
-                Ok(token) => token,
-                Err(error) => {
-                    eprintln!("bootstrap session creation failed: {error}");
-                    return problem(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Administrator created; session storage failed",
-                        Some("Sign in with the administrator account to continue."),
-                    );
-                }
-            };
+        let token = match crate::db::create_web_session(
+            pool,
+            &crate::db::VerifiedAccount::established(form.account.as_str()),
+            user_agent.as_ref(),
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("bootstrap session creation failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Administrator created; session storage failed",
+                    Some("Sign in with the administrator account to continue."),
+                );
+            }
+        };
         authenticated_redirect(
             &token,
             "/console",
@@ -2557,6 +2781,7 @@ mod pages {
         administrator: bool,
         expires_at: String,
         error: Option<String>,
+        minimum_password_length: usize,
     }
 
     fn invitation_state_cookie_name(secure: bool) -> &'static str {
@@ -2590,6 +2815,7 @@ mod pages {
             administrator: preview.administrator,
             expires_at: preview.expires_at,
             error,
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         });
         *response.status_mut() = status;
         let secure = if state.secure_cookies { "; Secure" } else { "" };
@@ -2678,12 +2904,12 @@ mod pages {
                 StatusCode::FORBIDDEN,
             );
         }
-        if let Some(detail) = password_input_error(&form.password) {
+        if let Some(detail) = new_password_error(&state.core_tx.password_policy(), &form.password) {
             return invitation_response(
                 &state,
                 token,
                 preview,
-                Some(detail.into()),
+                Some(detail),
                 StatusCode::BAD_REQUEST,
             );
         }
@@ -2719,7 +2945,12 @@ mod pages {
             }
         };
         let user_agent = super::session_user_agent(&headers);
-        let session = match crate::db::create_web_session(pool, &account, user_agent.as_ref()).await
+        let session = match crate::db::create_web_session(
+            pool,
+            &crate::db::VerifiedAccount::established(account.as_str()),
+            user_agent.as_ref(),
+        )
+        .await
         {
             Ok(session) => session,
             Err(error) => {
@@ -2772,7 +3003,7 @@ mod pages {
                 Some("This deployment authenticates exclusively through Shauth."),
             );
         }
-        let Some(pool) = &state.pool else {
+        let Some(pool) = state.pool() else {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No database configured",
@@ -2993,6 +3224,7 @@ mod pages {
     #[template(path = "console_account.html")]
     struct ConsoleAccount {
         shell: ConsoleShell,
+        minimum_password_length: usize,
     }
 
     /// The browser behind a server-rendered page: its account, the session that
@@ -3096,6 +3328,7 @@ mod pages {
         };
         render_private(ConsoleAccount {
             shell: console_shell(actor, "account"),
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         })
     }
 
@@ -3128,6 +3361,7 @@ mod pages {
     #[template(path = "console_accounts.html")]
     struct ConsoleAccounts {
         shell: ConsoleShell,
+        minimum_password_length: usize,
     }
 
     #[derive(Template)]
@@ -3288,9 +3522,13 @@ mod pages {
         })
     }
 
-    pub async fn console_accounts(AdminPageActor(actor): AdminPageActor) -> Response {
+    pub async fn console_accounts(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor(actor): AdminPageActor,
+    ) -> Response {
         render_private(ConsoleAccounts {
             shell: console_shell(actor, "accounts"),
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         })
     }
 
@@ -3314,7 +3552,10 @@ mod pages {
         AdminPageActor(actor): AdminPageActor,
         QueryParams(params): QueryParams<super::device::RegisteredChannelDirectoryQuery>,
     ) -> Response {
-        let query = match super::device::validate_registered_channel_directory_query(params, 50) {
+        let query = match super::device::validate_registered_channel_directory_query(
+            params.with_unfilled_fields_absent(),
+            50,
+        ) {
             Ok(query) => query,
             Err(response) => return response.into(),
         };
@@ -3324,7 +3565,15 @@ mod pages {
     /// The fleet-wide BNC view: every account's networks with live driver
     /// state, so an operator can spot (and stop) a single misbehaving
     /// upstream without suspending the whole account.
-    pub async fn console_admin_networks(AdminPageActor(actor): AdminPageActor) -> Response {
+    pub async fn console_admin_networks(
+        AdminPageActor(actor): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::AdminNetworkInventoryQuery>,
+    ) -> Response {
+        // The page's own query is the inventory page the browser reads; a bad
+        // one is refused here as the API would refuse it.
+        if let Err(response) = super::device::validate_admin_network_inventory_query(params) {
+            return response.into();
+        }
         render_private(ConsoleAdminNetworks {
             shell: console_shell(actor, "admin-networks"),
         })
@@ -3350,7 +3599,10 @@ mod pages {
         AdminPageActor(actor): AdminPageActor,
         QueryParams(params): QueryParams<super::device::ServerBanDirectoryQuery>,
     ) -> Response {
-        let query = match super::device::validate_server_ban_directory_query(params, 50) {
+        let query = match super::device::validate_server_ban_directory_query(
+            params.with_unfilled_fields_absent(),
+            50,
+        ) {
             Ok(query) => query,
             Err(response) => return response.into(),
         };
@@ -3361,10 +3613,11 @@ mod pages {
         AdminPageActor(page): AdminPageActor,
         QueryParams(params): QueryParams<super::device::AuditQuery>,
     ) -> Response {
-        let query = match super::device::validate_audit_query(params, 50) {
-            Ok(query) => query,
-            Err(response) => return response.into(),
-        };
+        let query =
+            match super::device::validate_audit_query(params.with_unfilled_fields_absent(), 50) {
+                Ok(query) => query,
+                Err(response) => return response.into(),
+            };
         let actor = query.actor.unwrap_or_default();
         let action = query.action.unwrap_or_default();
         let target = query.target.unwrap_or_default();
@@ -3464,12 +3717,8 @@ mod pages {
         account: &str,
         name: &str,
         enabled: bool,
+        runtime: Option<crate::bouncer::NetworkRuntimeSnapshot>,
     ) -> ResponseResult<NetworkOperationsResponse> {
-        let runtime = state
-            .bnc_registry
-            .as_ref()
-            .and_then(|registry| registry.get_owned(account, name))
-            .map(|handle| handle.runtime_snapshot());
         let summary = crate::db::bnc_buffer_summary(pool_of(state), account, name)
             .await
             .map_err(|error| {
@@ -3533,12 +3782,28 @@ mod pages {
         Authenticated(account, _): Authenticated,
         PathParams(name): PathParams<String>,
     ) -> Response {
-        let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
-            Ok(Some(network)) => network,
-            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-            Err(error) => return super::device::admin_db_error("network operations", error),
-        };
-        match network_operations_response(&state, &account, &network.name, network.enabled).await {
+        // The account's stored network, with its own driver's runtime; else a
+        // network the server configuration defines for it, which always runs.
+        let registry = registry_of(&state);
+        let (name, enabled, runtime) =
+            match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
+                Ok(Some(network)) => {
+                    let runtime = registry
+                        .get_stored(&account, &network.name)
+                        .map(|handle| handle.runtime_snapshot());
+                    (network.name, network.enabled, runtime)
+                }
+                Ok(None) => match registry.get_configured_owned(&account, &name) {
+                    Some((configured, handle)) => (
+                        configured.name.clone(),
+                        true,
+                        Some(handle.runtime_snapshot()),
+                    ),
+                    None => return problem(StatusCode::NOT_FOUND, "No such network", None),
+                },
+                Err(error) => return super::device::admin_db_error("network operations", error),
+            };
+        match network_operations_response(&state, &account, &name, enabled, runtime).await {
             Ok(response) => super::json_no_store(response),
             Err(response) => response.into(),
         }
@@ -3647,13 +3912,12 @@ mod pages {
     #[template(path = "console_integrations.html")]
     struct ConsoleIntegrations {
         shell: ConsoleShell,
-        bouncer_enabled: bool,
         platforms: Vec<BridgePlatform>,
     }
 
     /// Console → Integrations (admin): a document shell. The browser reads the
     /// complete stored and shared bridge inventory from the administrator API.
-    fn console_integrations_build(state: &AppState, actor: PageActor) -> ConsoleIntegrations {
+    fn console_integrations_build(actor: PageActor) -> ConsoleIntegrations {
         let platforms = BRIDGE_PLATFORMS
             .iter()
             .map(|meta| BridgePlatform {
@@ -3663,17 +3927,19 @@ mod pages {
             .collect();
         ConsoleIntegrations {
             shell: console_shell(actor, "integrations"),
-            bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
         }
     }
 
     /// Console → Integrations (admin) GET.
     pub async fn console_integrations(
-        State(state): State<Arc<AppState>>,
         AdminPageActor(actor): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::AdminNetworkInventoryQuery>,
     ) -> Response {
-        render_private(console_integrations_build(&state, actor))
+        if let Err(response) = super::device::validate_admin_network_inventory_query(params) {
+            return response.into();
+        }
+        render_private(console_integrations_build(actor))
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.
@@ -4129,16 +4395,33 @@ mod cookie_tests {
 
 #[cfg(test)]
 mod credential_input_tests {
-    use super::{credential_input_error, password_input_error};
+    use super::{credential_input_error, new_password_error, presented_password_error};
 
     #[test]
     fn credential_fields_are_bounded_before_argon2() {
         assert_eq!(credential_input_error("alice", "secret"), None);
         assert!(credential_input_error("", "secret").is_some());
         assert!(credential_input_error(&"a".repeat(65), "secret").is_some());
-        assert!(password_input_error("").is_some());
-        assert!(password_input_error(&"p".repeat(513)).is_some());
-        assert_eq!(password_input_error(&"p".repeat(512)), None);
+        assert!(presented_password_error("").is_some());
+        assert!(presented_password_error(&"p".repeat(513)).is_some());
+        assert_eq!(presented_password_error(&"p".repeat(512)), None);
+    }
+
+    /// The minimum — eight characters unless configured — governs a password
+    /// being set; one being verified — an older account's short password —
+    /// is still admitted.
+    #[test]
+    fn only_a_password_being_set_must_meet_the_minimum() {
+        let policy = crate::identity::PasswordPolicy::default();
+        assert_eq!(presented_password_error("hunter2"), None);
+        assert_eq!(
+            new_password_error(&policy, "hunter2").as_deref(),
+            Some("Passwords must be at least 8 characters and at most 512 bytes.")
+        );
+        assert_eq!(new_password_error(&policy, "hunter22"), None);
+        assert!(new_password_error(&policy, &"p".repeat(513)).is_some());
+        policy.set_minimum_chars(1);
+        assert_eq!(new_password_error(&policy, "sesame"), None);
     }
 }
 
@@ -4157,13 +4440,27 @@ mod invitation_url_tests {
 
 #[cfg(test)]
 mod client_ip_tests {
-    use super::client_ip;
     use crate::net::ClientIp;
+
+    /// The client a request resolves to, when it resolves to one.
+    fn client_ip(
+        peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+        trusted: &[ipnet::IpNet],
+    ) -> ClientIp {
+        super::client_ip(peer, headers, trusted).expect("a resolvable forwarded chain")
+    }
 
     /// The in-flight request bound charges a client's whole IPv6 `/64`.
     #[test]
     fn request_admission_counts_an_ipv6_slash_64_as_one_client() {
-        let admission = std::sync::Arc::new(super::RequestAdmission::new(Vec::new(), 1));
+        let admission = std::sync::Arc::new(super::RequestAdmission::new(
+            Vec::new(),
+            1,
+            std::sync::Arc::new(crate::net::PeerRefusalLog::new(
+                std::time::Duration::from_secs(60),
+            )),
+        ));
         let _held = admission
             .admit(client("2001:db8::1"))
             .expect("the first request");
@@ -4197,7 +4494,7 @@ mod client_ip_tests {
 
     #[test]
     fn trusted_proxy_uses_rightmost_untrusted_forwarded_entry() {
-        // Behind a trusted proxy, the client is the rightmost XFF entry that
+        // Behind a trusted proxy, the client is the rightmost `X-Forwarded-For` entry that
         // isn't itself a trusted hop — a client-appended left entry can't
         // impersonate someone else.
         let trusted = [net("10.0.0.0/8")];
@@ -4326,6 +4623,48 @@ mod client_ip_tests {
             "an untrusted mapped peer is its own IPv4 address"
         );
         assert_eq!(client("::ffff:192.0.2.1").to_string(), "192.0.2.1");
+    }
+    /// An entry a trusted proxy passed on that is not an address — nginx
+    /// writes `unix:` for a client on a Unix socket — breaks the chain it
+    /// vouches for: what lies left of it is only what the client wrote.
+    /// Skipping it let a client choose its own address (its per-IP slots, its
+    /// authentication budget, a ban it evades); the request is refused.
+    #[test]
+    fn an_unusable_forwarded_entry_before_the_client_is_refused() {
+        let trusted = [net("10.0.0.0/8")];
+        for chain in [
+            "6.6.6.6, unix:",
+            "6.6.6.6, unix:, 10.0.0.2",
+            "6.6.6.6,, 10.0.0.2",
+            "6.6.6.6, garbage",
+        ] {
+            let refused = super::client_ip(ip("10.0.0.1"), &xff(chain), &trusted)
+                .expect_err("the chain is broken before any client address");
+            assert!(
+                refused.to_string().contains("is not an address"),
+                "{refused}"
+            );
+        }
+        // Past the client's own address nothing further left is read, so an
+        // unusable entry there is the client's own business.
+        assert_eq!(
+            client_ip(
+                ip("10.0.0.1"),
+                &xff("unix:, 203.0.113.7, 10.0.0.2"),
+                &trusted
+            ),
+            client("203.0.113.7")
+        );
+        // A header with no entries names no client, as no header does.
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &xff(" "), &trusted),
+            client("10.0.0.1")
+        );
+        // An untrusted peer's header is never read.
+        assert_eq!(
+            client_ip(ip("203.0.113.9"), &xff("unix:"), &trusted),
+            client("203.0.113.9")
+        );
     }
 }
 
@@ -4706,7 +5045,11 @@ mod request_bound_tests {
                             StatusCode::NO_CONTENT
                         }),
                     ),
-                    Arc::new(RequestAdmission::new(Vec::new(), 8)),
+                    Arc::new(RequestAdmission::new(
+                        Vec::new(),
+                        8,
+                        Arc::new(crate::net::PeerRefusalLog::new(Duration::from_secs(60))),
+                    )),
                     1,
                 ),
                 Duration::from_millis(50),
@@ -4791,7 +5134,11 @@ mod request_bound_tests {
                         held_route(entered.clone(), release.clone(), "first"),
                     )
                     .route("/second", held_route(entered, release.clone(), "second")),
-                Arc::new(RequestAdmission::new(Vec::new(), 8)),
+                Arc::new(RequestAdmission::new(
+                    Vec::new(),
+                    8,
+                    Arc::new(crate::net::PeerRefusalLog::new(Duration::from_secs(60))),
+                )),
                 1,
             ),
             Duration::from_secs(30),
@@ -4873,5 +5220,69 @@ mod readiness_tests {
             2,
             "a stale answer is probed again"
         );
+    }
+}
+
+#[cfg(test)]
+mod csrf_key_tests {
+    use super::CsrfKeys;
+    use crate::secret::{SecretKey, SecretKeyring};
+
+    fn keyring(primary: &SecretKey, previous: &[&SecretKey]) -> SecretKeyring {
+        let copy = |key: &SecretKey| SecretKey::from_base64(&key.to_base64()).expect("a key");
+        SecretKeyring::new(
+            copy(primary),
+            previous.iter().map(|key| copy(key)).collect(),
+        )
+        .expect("distinct keys")
+    }
+
+    /// A form rendered by one process posts to another configured with the
+    /// same master key: a restart, or a standby's takeover, does not turn every
+    /// open form into a CSRF refusal.
+    #[test]
+    fn a_form_token_from_one_process_is_accepted_by_another_with_the_same_key() {
+        let master = SecretKey::generate();
+        let (first, first_warning) = CsrfKeys::for_keyring(Some(&keyring(&master, &[])));
+        let (second, second_warning) = CsrfKeys::for_keyring(Some(&keyring(&master, &[])));
+        assert_eq!((first_warning, second_warning), (None, None));
+        let token = first.token("session-token");
+        assert!(second.valid("session-token", &token));
+        assert!(
+            !second.valid("another-session", &token),
+            "bound to its session"
+        );
+        let (other, _) = CsrfKeys::for_keyring(Some(&keyring(&SecretKey::generate(), &[])));
+        assert!(!other.valid("session-token", &token), "bound to its key");
+    }
+
+    /// During a rotation a form issued under the old key still posts, and new
+    /// forms are issued under the new one, which a process still on the old
+    /// key alone does not accept.
+    #[test]
+    fn a_rotation_accepts_the_previous_keys_token_and_issues_under_the_primary() {
+        let old = SecretKey::generate();
+        let new = SecretKey::generate();
+        let (before, _) = CsrfKeys::for_keyring(Some(&keyring(&old, &[])));
+        let (rotated, _) = CsrfKeys::for_keyring(Some(&keyring(&new, &[&old])));
+        let (after, _) = CsrfKeys::for_keyring(Some(&keyring(&new, &[])));
+        assert!(rotated.valid("session", &before.token("session")));
+        assert_eq!(rotated.token("session"), after.token("session"));
+        assert!(!before.valid("session", &rotated.token("session")));
+    }
+
+    /// Without a master key each process has its own key, and startup is
+    /// given the one line that says forms will not survive a restart.
+    #[test]
+    fn without_a_master_key_the_key_is_the_process_own_and_startup_says_so() {
+        let (first, warning) = CsrfKeys::for_keyring(None);
+        let (second, _) = CsrfKeys::for_keyring(None);
+        assert_eq!(warning, Some(CsrfKeys::PROCESS_SCOPED_WARNING));
+        assert!(
+            warning.is_some_and(|text| text.contains("restart")),
+            "{warning:?}"
+        );
+        assert!(first.valid("session", &first.token("session")));
+        assert!(!second.valid("session", &first.token("session")));
     }
 }

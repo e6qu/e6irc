@@ -149,8 +149,11 @@ manifest shape. Ordinary pull-request CI proves the native packager's exact
 members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
 incomplete archive set. `systemd-analyze verify` checks the service in CI,
-the same gate compares its stop budget to the daemon's core-drain plus
-database-flush budget, and
+the same gate (`tools/check-systemd-unit.sh`) requires its stop budget to
+exceed the sum of the daemon's four shutdown budgets — bouncer-driver stop,
+core drain, connection drain, and database flush — and holds the budget
+`deploy/README.md` states and the one the production-container test stops with
+to the unit's, and
 `crates/e6ircd/tests/config_cli.rs` drives the binary's environment-stated configuration:
 valid, refused by variable name, and never printing a value. The
 production-container job then boots the distroless image itself and proves it
@@ -300,11 +303,16 @@ A database URL the tools cannot hand to the PostgreSQL clients faithfully is
 refused before any client runs, with the reason and nothing the URL contained:
 a scheme other than `postgres://` or `postgresql://`, several hosts, a port
 outside 1–65535, a bare `#`, a bare `+` in a query value, bytes that are not
-percent-encoded UTF-8, or a query parameter the tools do not forward. Nothing is
+percent-encoded UTF-8, a field stated twice, or a query parameter outside the
+closed set the daemon itself accepts (`hostaddr` and `connect_timeout`, which
+the daemon cannot honour as libpq does, are refused by both). Nothing is
 dropped silently, so `sslmode` and the certificate parameters (in either the
 libpq or the daemon's hyphenated spelling) apply to the backup exactly as they
 do to the daemon; only `statement-cache-capacity`, which sizes a daemon cache,
-is ignored.
+is ignored. Every libpq variable inherited from the caller (`PGSSLMODE`,
+`PGHOST`, ...) is removed and no password file is read, so the URL is the whole
+description of the backup's connection, as it is of the daemon's (which refuses
+to start while one of them is set).
 Restore uses one transaction, so a failed archive application does not leave a
 half-restored schema. Keep the source database and backup unchanged, correct
 the named failure, and retry while e6ircd remains stopped.
@@ -402,12 +410,16 @@ and host process/memory/CPU telemetry is available.
 5. Use `qualify-linux.sh` for controlled Linux runs. It validates host budgets
    and stores a synced load result, host provenance, and common qualification
    evidence. A harness failure records a failed outcome; a preflight failure
-   creates no evidence.
+   creates no evidence. The core-shard count the evidence claims is checked
+   against the one the server reports (its monitoring observation's
+   `core.shards`), and a burst past the server's command burst is refused
+   unless the senders oper up, since past it the run would time the flood
+   limiter rather than fan-out.
 
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires
 every unique expected sequence exactly once, at least 10 connections/second,
-at least 100 fan-out deliveries/second, P99 below five seconds, and graceful
+at least 100 fan-out deliveries/second, 99th-percentile latency below five seconds, and graceful
 process shutdown. The harness exits nonzero on client/socket loss, malformed,
 missing, duplicate, or out-of-range deliveries, or a supplied threshold
 violation. Linux CI also rejects incremental server RSS above 1 MiB per

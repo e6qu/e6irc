@@ -42,7 +42,7 @@ webpki-roots = { version = "1.0.9", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # Atomic replacement of a cached bearer token on Windows. Unix rename already
-# has replace semantics; MoveFileExW supplies the same contract on NTFS.
+# has replace semantics; MoveFileExW supplies the same contract on Windows file systems.
 windows-sys = { version = "0.61.2", default-features = false, features = [
     "Win32_Storage_FileSystem",
 ] }

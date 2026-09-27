@@ -1,4 +1,5 @@
-//! LIST's parameter and the state of a LIST reply still being sent.
+//! LIST's parameter, and the state of a LIST or bare NAMES reply still being
+//! sent.
 //!
 //! The parameter grammar is Solanum's `m_list` (as deployed on Libera), which
 //! advertises it as `ELIST=CMNTU`: up to [`MAX_LIST_CONDITIONS`]
@@ -23,7 +24,8 @@
 //! client its connection. Nor is the list copied to be paced out: the LIST
 //! keeps a cursor per channel shard ([`ChannelListCursor`]) and reads the next
 //! page after it as there is room, as Solanum's SAFELIST keeps its place in
-//! the channel hash rather than a copy of it.
+//! the channel hash rather than a copy of it. A bare `NAMES`, which names every
+//! visible channel's members, is the same sweep with a different row.
 
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::mask::FoldedMask;
@@ -186,10 +188,24 @@ impl ListFilter {
 /// its resume point, and the next one continues from there.
 pub(crate) const LIST_PAGE_SCAN: usize = 1024;
 
-/// A connection's LIST that has not finished answering: a cursor, not a copy
-/// of the channel list. A connection has at most one: a LIST sent while one is
-/// in progress aborts it instead (Solanum), which costs nothing — the cursor
-/// is dropped, and a page still on its way finds no LIST of its `id` to join.
+/// What a sweep over every shard's channels answers.
+#[derive(Debug, Clone)]
+pub(crate) enum ChannelSweep {
+    /// A LIST, with its conditions.
+    List(Arc<ListFilter>),
+    /// A bare NAMES, with how its requester reads a name (`multi-prefix`,
+    /// `userhost-in-names`).
+    Names {
+        multi_prefix: bool,
+        userhost_in_names: bool,
+    },
+}
+
+/// A connection's LIST (or bare NAMES) that has not finished answering: a
+/// cursor, not a copy of the channel list. A connection has at most one of
+/// each: a LIST sent while one is in progress aborts it instead (Solanum),
+/// which costs nothing — the cursor is dropped, and a page still on its way
+/// finds no LIST of its `id` to join.
 ///
 /// The reply is open from the start (its `RPL_LISTSTART` sent, inside `batch`
 /// for a labeled LIST). Each channel shard is read in pages of the rows after
@@ -199,7 +215,7 @@ pub(crate) const LIST_PAGE_SCAN: usize = 1024;
 /// when the page was asked for — never the network's channel list.
 pub(crate) struct ChannelListCursor {
     pub(crate) id: ChannelListRequestId,
-    pub(crate) filter: Arc<ListFilter>,
+    pub(crate) sweep: ChannelSweep,
     pub(crate) batch: Option<String>,
     shards: Vec<ShardCursor>,
 }
@@ -233,13 +249,13 @@ pub(crate) enum NextRow {
 impl ChannelListCursor {
     pub(crate) fn new(
         id: ChannelListRequestId,
-        filter: ListFilter,
+        sweep: ChannelSweep,
         batch: Option<String>,
         shards: usize,
     ) -> Self {
         Self {
             id,
-            filter: Arc::new(filter),
+            sweep,
             batch,
             shards: (0..shards)
                 .map(|_| ShardCursor {

@@ -1,11 +1,12 @@
-//! Closing an HTTP connection without destroying the answer on it.
+//! Closing a connection without destroying the last thing written to it.
 //!
 //! A server that refuses a request before reading all of it — a body over the
-//! limit, a deadline — answers and closes while the client is still sending.
+//! limit, a deadline — answers and closes while the client is still sending;
+//! an IRC session ends with an `ERROR` while its client may still be typing.
 //! Closing a socket that holds unread input makes the kernel send a reset
 //! instead of an orderly close, and a reset lets the client's stack discard
 //! the answer it has not read yet (macOS and Windows do): the client sees
-//! "connection reset" in place of the `413` it was sent. Like nginx's
+//! "connection reset" in place of the `413` or the `ERROR` it was sent. Like nginx's
 //! lingering close, [`LingeringClose`] shuts its write half first, then reads
 //! and discards what the client is still sending until it closes too — within
 //! a bound of time and bytes, so a client that never stops costs no more.
@@ -22,6 +23,19 @@ pub(crate) const LINGER_TIME: Duration = Duration::from_secs(2);
 
 /// How much a closing connection reads and discards before it gives up.
 pub(crate) const LINGER_BYTES: usize = 8 * 1024 * 1024;
+
+/// The longest [`close_within_bound`] takes: the drain's [`LINGER_TIME`], and a
+/// second before it for the shutdown's own write (a TLS `close_notify`) to a
+/// peer that is not reading.
+pub(crate) const LINGER_CLOSE_BOUND: Duration = Duration::from_secs(3);
+
+/// Shut `stream` down — lingering, when it is a [`LingeringClose`] — within
+/// [`LINGER_CLOSE_BOUND`]. The connection is over either way: a close that
+/// fails or runs out of time has no one left to report to.
+pub(crate) async fn close_within_bound<S: AsyncWrite + Unpin>(stream: &mut S) {
+    use tokio::io::AsyncWriteExt;
+    drop(tokio::time::timeout(LINGER_CLOSE_BOUND, stream.shutdown()).await);
+}
 
 /// A stream whose shutdown lingers: see the module documentation.
 pub(crate) struct LingeringClose<S> {
@@ -118,6 +132,85 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
                 Linger::Done => return Poll::Ready(Ok(())),
             }
         }
+    }
+}
+
+/// A stream lent out that comes back when the borrower drops it, so its owner
+/// can still close it properly: hyper drops an upgraded connection's stream
+/// without shutting it down.
+pub(crate) struct Reclaimable<S> {
+    inner: Option<S>,
+    back: Option<tokio::sync::oneshot::Sender<S>>,
+}
+
+impl<S> Reclaimable<S> {
+    /// The stream to lend, and where it comes back.
+    pub(crate) fn new(inner: S) -> (Self, tokio::sync::oneshot::Receiver<S>) {
+        let (back, reclaim) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                inner: Some(inner),
+                back: Some(back),
+            },
+            reclaim,
+        )
+    }
+
+    fn stream(&mut self) -> Pin<&mut S>
+    where
+        S: Unpin,
+    {
+        Pin::new(self.inner.as_mut().expect("the stream is held until drop"))
+    }
+}
+
+impl<S> Drop for Reclaimable<S> {
+    fn drop(&mut self) {
+        if let (Some(inner), Some(back)) = (self.inner.take(), self.back.take()) {
+            // Unclaimed — no upgrade asked for it — the stream is closed by
+            // being dropped here, as it was lent.
+            drop(back.send(inner));
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Reclaimable<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().stream().poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Reclaimable<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().stream().poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().stream().poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.as_ref().is_some_and(S::is_write_vectored)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().stream().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().stream().poll_shutdown(cx)
     }
 }
 

@@ -87,10 +87,14 @@ audit state.
 - **Accounts** can suspend or reactivate a non-current account by immutable ID.
   Suspension atomically revokes browser sessions, personal access tokens, and
   approved device grants; denies primary/app-password and OpenID Connect
-  authentication; disconnects every live IRC session; and stops every owned
-  network while retaining identity, channel, and network definitions.
-  Reactivation restores credential eligibility and validated enabled networks,
-  but never resurrects a revoked bearer.
+  authentication; disconnects every live IRC session, registered or still
+  registering; ends every bouncer attachment, on shared and configured
+  networks too; stops every owned network; and holds the networks the
+  configuration defines for the account stopped (`owner_suspended` in the
+  network inventory), while retaining identity, channel, and network
+  definitions. Reactivation restores credential eligibility, validated enabled
+  networks and the held configured ones, but never resurrects a revoked
+  bearer. Deletion holds the configured networks for good (`owner_deleted`).
 - **Accounts** can grant or revoke durable administrator authority. The page
   distinguishes durable and restart-scoped configuration grants so removing
   one source never claims the other disappeared.
@@ -121,7 +125,9 @@ projections omit secrets, escape user strings, bound filters/pages, and emit
 redacted audit records for mutations. Account lifecycle and network CRUD share
 one mutation lane. The core suspension event installs its deny key before
 disconnecting sessions, so an already-running password verification cannot
-authenticate after the administrative sweep.
+authenticate after the administrative sweep; the attach listener's
+`AccountLease`, revoked on the lane and refused to a credential check that
+began before the revocation, does the same for bouncer attachments.
 
 Every bounded console table and dynamically rendered backlog/live-log region
 is keyboard-scrollable. Shared constructors give dynamic tables and logs their
@@ -134,7 +140,13 @@ active route scrolls into the horizontal navigation viewport on load.
 
 **Evidence.** Proven by PostgreSQL cursor/filter/posture and atomic bearer
 revocation tests; ordered-core late-verdict/disconnect tests; exact-owner
-registry-stop tests; and a real HTTP suspend/reactivate journey covering
+registry-stop and configured-network hold/release tests; account-lease
+revocation and ticket-race tests; a real attach-listener journey
+(`the_account_lifecycle_ends_attachments_and_holds_configured_networks`) in
+which suspension ends attachments to a shared and a configured network, the
+inventory shows the owner-suspended state, reactivation restarts it, and a password
+change ends the attachment and the IRC session; and a real HTTP
+suspend/reactivate journey covering
 durable administrator discovery, self-protection, authorization, revoked
 cookies/tokens, retained credentials, non-resurrection, live authority
 grant/revoke, and authority-source projection. Administrator-only
@@ -190,15 +202,20 @@ network inventory and the registry holds live drivers.
 
 **Flow.**
 
-1. **All networks** (under **Server**, **Chat**) lists every account's
-   networks in the columns Status, Owner, Network, Type, Server, Clients,
-   Errors, Last failure, and Actions.
+1. **All networks** (under **Server**, **Chat**) lists every network — the
+   shared ones, then each account's — in the columns Status, Owner, Network,
+   Type, Server, Clients, Errors, Last failure, and Actions, a page at a time
+   with a link to the next.
 2. `GET /api/v1/admin/networks` returns the same fleet inventory as
    authenticated JSON with stored credentials shown only as presence
-   booleans.
-3. A CSRF-protected toggle disables (or re-enables) one network: the flag
-   persists, the driver stops (or starts) under the shared mutation lane,
-   and the action is audited with the administrator as actor.
+   booleans, paged by a stable cursor (`limit`, `after`, `next_after`). A
+   network the server configuration defines for an account is listed with
+   `configured: true`.
+3. A CSRF-protected toggle disables (or re-enables) one stored network: the
+   flag persists, the driver stops (or starts) under the shared mutation lane,
+   and the action is audited with the administrator as actor. A configured
+   network shows "Managed configuration" instead, and the API refuses its
+   toggle with a `409`: it follows the configuration.
 
 **Visible failures and recovery.** A network with no live driver reads as not
 running, a disabled one as disabled; a flapping upstream shows its error
@@ -216,7 +233,10 @@ actor, `owner/network` target, and enabled/disabled detail.
 
 **Evidence.** Proven by the PostgreSQL admin fleet integration test: gating
 (401/403/200), inventory shape, CSRF toggle, persisted flag flip, and the
-`NETWORK_TOGGLE` audit row.
+`NETWORK_TOGGLE` audit row; and by
+`configured_networks_are_the_operators_and_the_inventory_pages_them`: the
+cursor pages the whole fleet once, in order, and a configured network is
+listed but refuses every account-level change.
 
 ## Monitor traffic, connections, queue pressure, latency, availability, and errors
 

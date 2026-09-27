@@ -4,7 +4,7 @@
 
 use e6ircd::bouncer::{
     DriverConnectionStatus, DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle,
-    NetworkLifecycle, SendOutcome, preflight_irc,
+    NetworkLifecycle, NickRegainTiming, SendOutcome, preflight_irc,
 };
 use e6ircd::config::{Config, ListenerConfig, NetworkKind};
 use e6ircd::egress::InternalUpstreams;
@@ -17,6 +17,9 @@ mod deadline;
 #[path = "support/membership.rs"]
 mod membership;
 use membership::{wait_joined, whois_until};
+#[path = "support/scripted.rs"]
+mod scripted;
+use scripted::ScriptedTask;
 
 /// `line` without the `time` tag the bouncer stamps on every line it takes in
 /// that carries none of its own.
@@ -96,7 +99,11 @@ async fn wait_connected(
                     ..
                 }) => return,
                 Ok(DriverEvent::Status { status, .. })
-                    if !matches!(status, DriverConnectionStatus::Reconnecting(_)) =>
+                    if !matches!(
+                        status,
+                        DriverConnectionStatus::Reconnecting(_)
+                            | DriverConnectionStatus::RegainingNickname
+                    ) =>
                 {
                     panic!("driver disconnected before connecting");
                 }
@@ -203,7 +210,7 @@ async fn driver_registers_relays_and_buffers() {
         "backlog must keep server-time: {got}"
     );
 
-    // ...and it's in the detached buffer for later playback
+    // ...and it's in the detached buffer, to be played back on attach
     let buffer = handle.buffer_snapshot();
     assert!(
         buffer
@@ -444,7 +451,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 /// Provision a fresh single-account database and return its URL. `test` is the
 /// calling test's name — a shared helper must not name the database after
 /// itself, or every test it serves would share one.
-async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
+async fn bnc_account_db(test: &str, account: &str, password: &str) -> e6ircd::db::DatabaseUrl {
     let url = support::test_db(test).await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -460,16 +467,16 @@ async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
 /// database. Not `db::connect_and_migrate`: that is the daemon's pool, whose
 /// 2 s acquire timeout is a production bound, and on a loaded test host it
 /// turned a slow poll into `count: PoolTimedOut`.
-async fn observer_pool(url: &str) -> sqlx::PgPool {
+async fn observer_pool(url: &e6ircd::db::DatabaseUrl) -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(url)
+        .connect_with(url.connect_options())
         .await
         .expect("observer pool")
 }
 
-fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
+fn bnc_config(up: std::net::SocketAddr, url: e6ircd::db::DatabaseUrl) -> Config {
     use e6ircd::config::{BncConfig, DatabaseConfig, NetworkEntry};
     Config {
         server_name: "irc.bnc.example".into(),
@@ -1096,7 +1103,8 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .await
     .expect("timeout");
     assert!(persisted, "line was not persisted to the BNC buffer");
-    drop(running_a);
+    // A restart: server A stops, giving the serving lease back to B.
+    running_a.shutdown.run().await;
 
     // Server B: same DB, but the network points at a dead upstream so the
     // only content is the restored backlog. Attaching replays it. The console
@@ -1162,6 +1170,82 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .await
     .expect("timeout");
     assert!(replayed, "restored backlog was not replayed on attach");
+}
+
+/// A network's whole `buffer_cap` survives a restart. A start used to restore
+/// the newest 1,000 stored lines whatever the network was configured to
+/// replay, so a larger buffer was honoured only until the next restart.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_restart_restores_the_whole_configured_buffer() {
+    const STORED: i32 = 1_500;
+    let url = bnc_account_db(
+        "a_restart_restores_the_whole_configured_buffer",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let pool = observer_pool(&url).await;
+    // Stamped now: the backlog neither keeps nor replays a line older than
+    // the history retention (30 days by default), so a fixed date turned this
+    // test red once the calendar passed it.
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, sent_at)
+         SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :restored ' || n,
+                to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+         FROM generate_series(1, $1) n",
+    )
+    .bind(STORED)
+    .execute(&pool)
+    .await
+    .expect("seed the stored backlog");
+    drop(pool);
+    let up = upstream().await;
+    let mut config = bnc_config(up, url);
+    // Nothing live reaches the buffer: its content is what the start restored.
+    config.networks[0].addr = "127.0.0.1:1".into();
+    config.networks[0].buffer_cap = 2_000;
+    let running = net::start(config).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .unwrap();
+    client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("attach");
+    let replayed = tokio::time::timeout(deadline::HANG, async {
+        let mut replayed = Vec::new();
+        while let Some(message) = client.next_message().await.unwrap() {
+            if message.command != "PRIVMSG" {
+                continue;
+            }
+            let text = message.params.get(1).cloned().unwrap_or_default();
+            let last = text == format!("restored {STORED}");
+            replayed.push(text);
+            if last {
+                break;
+            }
+        }
+        replayed
+    })
+    .await
+    .expect("timeout");
+    assert_eq!(
+        replayed.len(),
+        STORED as usize,
+        "every stored line is replayed"
+    );
+    assert_eq!(replayed.first().map(String::as_str), Some("restored 1"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1589,7 +1673,7 @@ async fn a_connection_test_out_of_budget_names_its_stage_and_still_quits() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
         // Registration is never answered; record whatever else arrives.
@@ -1630,7 +1714,7 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (user_tx, mut user_rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
             session.negotiate_capabilities().await;
@@ -1673,25 +1757,34 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
 fn private_upstream(
     listener: tokio::net::TcpListener,
     first_lines: tokio::sync::mpsc::Sender<String>,
-) {
-    tokio::spawn(async move {
+) -> ScriptedTask<()> {
+    ScriptedTask::spawn(async move {
+        // One script per connection; a failed one fails this one, and so the
+        // test holding it.
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
-            let mut session = fake_accept(&listener).await;
-            let first_lines = first_lines.clone();
-            tokio::spawn(async move {
-                let first = session.read_line().await;
-                first_lines.send(first.clone()).await.ok();
-                match first.as_str() {
-                    "PASS :right" => {
-                        session.complete_registration("private").await;
-                    }
-                    "CAP LS 302" => session.send(":up 464 * :Password required").await,
-                    _ => session.send(":up 464 * :Password incorrect").await,
+            tokio::select! {
+                mut session = fake_accept(&listener) => {
+                    let first_lines = first_lines.clone();
+                    sessions.spawn(async move {
+                        let first = session.read_line().await;
+                        first_lines.send(first.clone()).await.ok();
+                        match first.as_str() {
+                            "PASS :right" => {
+                                session.complete_registration("private").await;
+                            }
+                            "CAP LS 302" => session.send(":up 464 * :Password required").await,
+                            _ => session.send(":up 464 * :Password incorrect").await,
+                        }
+                        while !session.read_line().await.is_empty() {}
+                    });
                 }
-                while !session.read_line().await.is_empty() {}
-            });
+                Some(Err(error)) = sessions.join_next() => {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+            }
         }
-    });
+    })
 }
 
 /// A private server's password goes out as the first line, before `CAP LS`,
@@ -1704,7 +1797,7 @@ async fn a_server_password_is_sent_first_and_its_refusals_are_told_apart() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(64);
-    private_upstream(listener, first_tx);
+    let _upstream = private_upstream(listener, first_tx);
     let config = |server_password: Option<&str>| NetworkConfig {
         addr: addr.to_string(),
         nick: "private".parse().expect("test nickname"),
@@ -1789,7 +1882,7 @@ async fn a_connection_test_joins_nothing_and_still_quits() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("preflight").await;
         loop {
@@ -1844,19 +1937,20 @@ async fn a_connection_test_joins_nothing_and_still_quits() {
     );
 }
 
-/// A taken nickname is reported, never worked around. The driver does not
-/// invent `bncbot_` on the owner's behalf: it says what the upstream said, waits
-/// on the refusal schedule, and -- when the holder was only a ghost of its own
-/// previous session -- registers under the configured nickname once it is free.
+/// A nickname held under its one alternative too is a refusal. The driver
+/// offers the configured nickname and `bncbot_` once, nothing else: it says
+/// what the upstream said, waits on the refusal schedule, and registers under
+/// the configured nickname once it is free.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_taken_nickname_is_reported_and_never_replaced() {
+async fn a_nickname_held_under_its_alternative_too_is_a_refusal() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(8);
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        // First dial: the nickname is held. Record every NICK the driver
-        // offers on this connection; it must offer exactly the configured one.
+    let _upstream = ScriptedTask::spawn(async move {
+        // First dial: the nickname and its alternative are held. Record every
+        // NICK the driver offers on this connection: the configured one and
+        // its one alternative.
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
         loop {
@@ -1928,8 +2022,8 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
     }
     assert_eq!(
         offered,
-        ["bncbot", "bncbot"],
-        "only the configured nickname is ever offered"
+        ["bncbot", "bncbot_", "bncbot"],
+        "the configured nickname and its one alternative, and no other"
     );
 }
 
@@ -1943,7 +2037,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
     let addr = listener.local_addr().unwrap();
     let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         nick_rx.recv().await;
@@ -2044,7 +2138,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
 async fn a_requested_nick_change_is_not_a_forced_rename() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         loop {
@@ -2089,10 +2183,12 @@ async fn a_requested_nick_change_is_not_a_forced_rename() {
 /// Start a driver against a scripted upstream that offers `echo-message` and
 /// answers the first `PRIVMSG` it reads with `answer` (its lines, `{line}`
 /// replaced by what it read).
-async fn echo_message_upstream(answer: &'static [&'static str]) -> NetworkHandle {
+async fn echo_message_upstream(
+    answer: &'static [&'static str],
+) -> (NetworkHandle, ScriptedTask<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session
             .complete_registration_with_echo_message("bncbot")
@@ -2106,12 +2202,13 @@ async fn echo_message_upstream(answer: &'static [&'static str]) -> NetworkHandle
             }
         }
     });
-    IrcNetwork::start(NetworkConfig {
+    let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
-    })
+    });
+    (handle, upstream)
 }
 
 /// Every event the driver emits within `window`.
@@ -2137,7 +2234,8 @@ async fn events_within(
 /// and neither the others nor the backlog.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
-    let handle = echo_message_upstream(&[":up 404 bncbot #room :Cannot send to channel"]).await;
+    let (handle, _upstream) =
+        echo_message_upstream(&[":up 404 bncbot #room :Cannot send to channel"]).await;
     let mut events = handle.subscribe();
     let mut replies = handle.route_replies(7);
     wait_connected(&handle, &mut events).await;
@@ -2176,7 +2274,7 @@ async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
 /// of that line, routed to its originator — never doubled by a synthesized one.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_echo_is_the_only_echo_and_keeps_its_originator() {
-    let handle = echo_message_upstream(&[
+    let (handle, _upstream) = echo_message_upstream(&[
         "@time=2026-09-21T10:00:00.000Z :bncbot!~bncbot@up.example PRIVMSG #room :hello",
     ])
     .await;
@@ -2226,7 +2324,7 @@ async fn an_upstream_echo_is_the_only_echo_and_keeps_its_originator() {
 /// the backlog, as the bouncer's own echo always was.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_echo_of_a_nickserv_password_is_redacted() {
-    let handle =
+    let (handle, _upstream) =
         echo_message_upstream(&[":bncbot!~bncbot@up PRIVMSG NickServ :IDENTIFY hunter2"]).await;
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
@@ -2267,7 +2365,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
     let addr = listener.local_addr().unwrap();
     let (join_tx, mut join_rx) = tokio::sync::mpsc::channel(8);
     let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // First session: register, confirm the autojoin, confirm a runtime
         // JOIN, then die on cue.
         let mut first = fake_accept(&listener).await;
@@ -2352,7 +2450,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
 async fn silent_upstream_trips_keepalive_and_reconnects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // Session 1: register, then go silent (read and discard, never
         // answer the driver's keepalive PING).
         let mut first = fake_accept(&listener).await;
@@ -2418,7 +2516,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("averyveryverylon").await;
         loop {
@@ -2492,7 +2590,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
 async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         session.send(":up CAP bncbot NEW :sasl=PLAIN").await;
@@ -2536,7 +2634,7 @@ async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
 async fn downstream_traffic_does_not_hide_a_silent_upstream() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         // Read and discard everything, the keepalive PING included.
@@ -2588,7 +2686,7 @@ async fn downstream_traffic_does_not_hide_a_silent_upstream() {
 async fn repeated_registration_rejection_parks_the_driver() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
             session.negotiate_capabilities().await;
@@ -2636,7 +2734,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
 async fn a_stopped_driver_says_quit_to_its_upstream() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move {
+    let upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         // The goodbye, or the empty line an unannounced close reads as.
@@ -2655,10 +2753,7 @@ async fn a_stopped_driver_says_quit_to_its_upstream() {
     });
     wait_lifecycle(&handle, NetworkLifecycle::Connected).await;
     handle.shutdown_and_wait().await;
-    assert_eq!(
-        upstream.await.expect("scripted upstream"),
-        "QUIT :e6irc bouncer stopping"
-    );
+    assert_eq!(upstream.finish().await, "QUIT :e6irc bouncer stopping");
 }
 
 /// Solanum withdraws the `sasl` capability while services are down. That
@@ -2672,7 +2767,7 @@ async fn a_services_outage_is_outlasted_not_parked() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         for _ in 0..OUTAGE_DIALS {
             let mut session = fake_accept(&listener).await;
             assert_eq!(session.read_line().await, "CAP LS 302");
@@ -2734,7 +2829,7 @@ async fn rejected_credentials_park_without_a_second_dial() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
             dial_tx.send(()).await.expect("test is still listening");
@@ -2782,18 +2877,28 @@ async fn rejected_credentials_park_without_a_second_dial() {
 async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    // Per dial: the driver's opening line, and everything it sent after the
+    // capability list offered no mechanism it can use, up to its hang-up. The
+    // test body judges it, not the script.
+    let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel::<(String, Vec<String>)>(8);
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
-            assert_eq!(session.read_line().await, "CAP LS 302");
+            let opening = session.read_line().await;
             session
                 .send(":up CAP * LS :sasl=EXTERNAL,ECDSA-NIST256P-CHALLENGE server-time")
                 .await;
-            assert_eq!(
-                session.read_line().await,
-                "",
-                "the driver must hang up without starting a credential exchange"
-            );
+            let mut after = Vec::new();
+            loop {
+                let line = session.read_line().await;
+                if line.is_empty() {
+                    break;
+                }
+                after.push(line);
+            }
+            if dial_tx.send((opening, after)).await.is_err() {
+                return;
+            }
         }
     });
     let handle = IrcNetwork::start(NetworkConfig {
@@ -2817,6 +2922,15 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
     })
     .await
     .expect("the refusal was never recorded");
+    let (opening, after) = tokio::time::timeout(deadline::HANG, dial_rx.recv())
+        .await
+        .expect("the upstream never saw a whole dial")
+        .expect("the upstream script ended");
+    assert_eq!(opening, "CAP LS 302");
+    assert!(
+        after.iter().all(|line| !line.starts_with("AUTHENTICATE")),
+        "the driver must hang up without starting a credential exchange: {after:?}"
+    );
     assert_ne!(
         snapshot.lifecycle,
         NetworkLifecycle::AuthenticationFailed,
@@ -2846,7 +2960,7 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
 async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // Five refusals and the one dropped dial between them; the driver parks
         // after the sixth and never dials again.
         for dial in 1..=6 {
@@ -2856,14 +2970,18 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
                 continue;
             }
             session.negotiate_capabilities().await;
-            loop {
-                if session.read_line().await.starts_with("USER ") {
-                    break;
+            // The nickname and its alternative are both held.
+            let mut refused = 0;
+            while refused < 2 {
+                let line = session.read_line().await;
+                assert!(!line.is_empty(), "the driver left before its alternative");
+                if let Some(nick) = line.strip_prefix("NICK ") {
+                    session
+                        .send(&format!(":up 433 * {nick} :Nickname is already in use"))
+                        .await;
+                    refused += 1;
                 }
             }
-            session
-                .send(":up 433 * bncbot :Nickname is already in use")
-                .await;
         }
     });
     let handle = IrcNetwork::start(NetworkConfig {
@@ -2895,7 +3013,7 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
 async fn a_refused_registration_keeps_its_reason_while_retrying() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session
             .send("ERROR :Closing Link: client (Trying to reconnect too fast.)")
@@ -3537,7 +3655,7 @@ async fn outlasted_never_parked(answer: PreWelcomeAnswer) {
             "You are banned from this server",
         ),
     };
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         for _ in 1..=6 {
             let mut session = fake_accept(&listener).await;
             match answer {
@@ -3621,7 +3739,7 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         drop_rx.recv().await;
@@ -3713,14 +3831,15 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
     );
 }
 
-/// 437 (the nick delay after a recent holder) is a refusal like 433: it is
-/// reported with the upstream's text at once, not after the 30 s registration
-/// timeout as an anonymous `registration_timed_out`.
+/// 437 (the nick delay after a recent holder) is a refusal like 433: on the
+/// nickname it is answered with the alternative, and on the alternative too it
+/// is reported with the upstream's text at once, not after the 30 s
+/// registration timeout as an anonymous `registration_timed_out`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
         loop {
@@ -3730,6 +3849,14 @@ async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
         }
         session
             .send(":up 437 * bncbot :Nick/channel is temporarily unavailable")
+            .await;
+        loop {
+            if session.read_line().await == "NICK bncbot_" {
+                break;
+            }
+        }
+        session
+            .send(":up 437 * bncbot_ :Nick/channel is temporarily unavailable")
             .await;
         // Hold later dials open so the driver stays in its retry wait.
         let _held = fake_accept(&listener).await;
@@ -3782,7 +3909,7 @@ async fn a_rejoin_of_many_channels_takes_few_join_lines() {
     let channels: Vec<String> = (0..100).map(|index| format!("#room{index:02}")).collect();
     let expected = channels.clone();
     let (lines_tx, mut lines_rx) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         let mut named = std::collections::HashSet::new();
@@ -3844,7 +3971,7 @@ async fn self_echoes_carry_the_identity_the_upstream_shows() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         loop {
@@ -3917,7 +4044,7 @@ async fn self_echoes_carry_the_identity_the_upstream_shows() {
 async fn a_server_answering_451_to_capability_discovery_connects_at_once() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         assert_eq!(session.read_line().await, "CAP LS 302");
         session.send(":up 451 * :You have not registered").await;
@@ -3957,7 +4084,8 @@ async fn the_backlog_cap_holds_across_restarts() {
     // A buffer already at the cap, as a long-running network leaves it.
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
-         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n, '2026-01-01T00:00:00.000Z'
+         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n,
+                to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(CAP as i32)
@@ -4193,7 +4321,7 @@ async fn a_list_reaches_only_the_client_that_asked_for_it() {
     const CHANNELS: usize = 5000;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         session.send(":peer!u@h PRIVMSG #room :before").await;
@@ -4291,7 +4419,7 @@ async fn labelled_replies_reach_the_client_whose_command_they_answer() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         let offered = "server-time message-tags account-tag echo-message batch labeled-response";
         register_offering(
@@ -4395,7 +4523,7 @@ async fn client_tags_never_reach_an_upstream_that_cannot_carry_them() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         register_offering(&mut session, "bncbot", "server-time", &["server-time"]).await;
         loop {
@@ -4452,7 +4580,7 @@ async fn a_refused_rejoin_is_not_retried_forever() {
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<(u8, String)>(32);
     let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         for session_number in 1u8.. {
             let mut session = fake_accept(&listener).await;
             session.complete_registration("bncbot").await;
@@ -4585,7 +4713,7 @@ async fn a_withdrawn_echo_message_is_followed_mid_session() {
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
     let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session
             .complete_registration_with_echo_message("bncbot")
@@ -4625,6 +4753,183 @@ async fn a_withdrawn_echo_message_is_followed_mid_session() {
     .expect("the bouncer echoes once the upstream no longer does");
     assert_eq!(echo.1, 7);
     assert!(echo.0.ends_with(" PRIVMSG #room :hello"), "{echo:?}");
+}
+
+/// How a scripted upstream settles `echo-message` around one message the
+/// driver writes while the setting is changing.
+#[derive(Clone, Copy)]
+enum EchoChange {
+    /// Offered mid-session (`CAP NEW`); the driver's request is acknowledged
+    /// only after the message arrives, and the upstream then echoes it.
+    OfferedThenAcknowledged,
+    /// Offered mid-session; the request is refused after the message arrives.
+    OfferedThenRefused,
+    /// Enabled at registration, withdrawn (`CAP DEL`) after the message
+    /// arrives and before any echo of it.
+    WithdrawnBeforeTheEcho,
+}
+
+/// The echoes the driver publishes for one `PRIVMSG #room :hello` from
+/// attachment 7, written while `change` is under way.
+async fn echoes_around(change: EchoChange) -> Vec<(String, u64)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let _upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        match change {
+            EchoChange::WithdrawnBeforeTheEcho => {
+                session
+                    .complete_registration_with_echo_message("bncbot")
+                    .await;
+            }
+            EchoChange::OfferedThenAcknowledged | EchoChange::OfferedThenRefused => {
+                session.complete_registration("bncbot").await;
+                session.send(":up CAP bncbot NEW :echo-message").await;
+                assert_eq!(next_command(&mut session).await, "CAP REQ :echo-message");
+            }
+        }
+        ready_tx.send(()).await.unwrap();
+        let line = next_command(&mut session).await;
+        assert_eq!(line, "PRIVMSG #room :hello");
+        match change {
+            EchoChange::OfferedThenAcknowledged => {
+                session.send(":up CAP bncbot ACK :echo-message").await;
+                session
+                    .send(":bncbot!~bncbot@up.example PRIVMSG #room :hello")
+                    .await;
+            }
+            EchoChange::OfferedThenRefused => {
+                session.send(":up CAP bncbot NAK :echo-message").await;
+            }
+            EchoChange::WithdrawnBeforeTheEcho => {
+                session.send(":up CAP bncbot DEL :echo-message").await;
+            }
+        }
+        loop {
+            next_command(&mut session).await;
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    tokio::time::timeout(deadline::HANG, ready_rx.recv())
+        .await
+        .expect("the upstream is ready")
+        .expect("ready");
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG #room :hello"),
+        SendOutcome::Sent
+    );
+    events_within(&mut events, std::time::Duration::from_secs(2))
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            DriverEvent::Echo {
+                line: e6ircd::bouncer::BufferedLine { line, .. },
+                origin,
+            } => Some((line, origin)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A line written after the driver asked for `echo-message` and before the
+/// upstream's verdict is echoed exactly once, whatever the verdict (§10.1):
+/// by the upstream when it acknowledges — the driver used to synthesize one
+/// too, so the line was echoed twice — and by the driver when it refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_written_while_echo_message_is_requested_is_echoed_once() {
+    let acknowledged = echoes_around(EchoChange::OfferedThenAcknowledged).await;
+    assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+    assert_eq!(acknowledged[0].1, 7);
+    assert!(
+        acknowledged[0]
+            .0
+            .ends_with(":bncbot!~bncbot@up.example PRIVMSG #room :hello"),
+        "the upstream's own echo: {acknowledged:?}"
+    );
+    let refused = echoes_around(EchoChange::OfferedThenRefused).await;
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].1, 7);
+    assert!(
+        refused[0].0.ends_with(" PRIVMSG #room :hello"),
+        "{refused:?}"
+    );
+}
+
+/// A line the upstream had not echoed when it withdrew `echo-message` will
+/// never be echoed by it: the driver echoes it instead, once. It used to get
+/// no echo at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_awaiting_its_echo_when_echo_message_is_withdrawn_is_echoed_once() {
+    let echoes = echoes_around(EchoChange::WithdrawnBeforeTheEcho).await;
+    assert_eq!(echoes.len(), 1, "{echoes:?}");
+    assert_eq!(echoes[0].1, 7);
+    assert!(echoes[0].0.ends_with(" PRIVMSG #room :hello"), "{echoes:?}");
+}
+
+/// Every line the driver writes upstream is paced to the upstream's flood
+/// allowance: a burst of commands from attached clients reaches it at no more
+/// than the allowance — five at once, then two a second — however fast they
+/// are queued, where it used to be written as fast as it was queued and
+/// answered with "Excess Flood".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_driver_paces_what_it_writes_upstream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, std::time::Instant)>();
+    let _upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        loop {
+            let line = session.read_line().await;
+            if line == "CAP END" {
+                continue;
+            }
+            if let Some(token) = line.strip_prefix("PING :e6bnc-route-") {
+                session
+                    .send(&format!(":up PONG up :e6bnc-route-{token}"))
+                    .await;
+            }
+            if heard_tx.send((line, std::time::Instant::now())).is_err() {
+                return;
+            }
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let queued = std::time::Instant::now();
+    for n in 0..40 {
+        assert_eq!(
+            handle.send_from(7, &format!("TOPIC #room{n}")),
+            SendOutcome::Sent
+        );
+    }
+    let window = std::time::Duration::from_millis(2600);
+    let mut heard = Vec::new();
+    let _ = tokio::time::timeout(window, async {
+        while let Some(line) = heard_rx.recv().await {
+            heard.push(line);
+        }
+    })
+    .await;
+    // Within any span, at most the burst plus what the rate regains.
+    for (index, (_, at)) in heard.iter().enumerate() {
+        let since = at.duration_since(queued).as_secs_f64();
+        let allowed = 5 + (since * 2.0).ceil() as usize;
+        assert!(
+            index < allowed,
+            "line {} arrived {since:.2}s after the burst was queued: {heard:?}",
+            index + 1
+        );
+    }
+    assert!(
+        heard.len() >= 5,
+        "the burst itself is not held back: {heard:?}"
+    );
 }
 
 /// A raw client has no cursor; its account's read markers are its position.
@@ -4682,7 +4987,7 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
                 .expect("read");
             if lines
                 .iter()
-                .any(|(line, _)| line.contains("a direct message"))
+                .any(|stored| stored.line.contains("a direct message"))
             {
                 return lines;
             }
@@ -4693,8 +4998,8 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
     .expect("the backlog was never persisted");
     let read_up_to = stored
         .iter()
-        .find(|(line, _)| line.contains("second read"))
-        .map(|(_, sent_at)| sent_at.clone())
+        .find(|stored| stored.line.contains("second read"))
+        .map(|stored| stored.stored_at.clone())
         .expect("stored");
     e6ircd::db::set_bnc_read_marker(
         &pool,
@@ -4728,4 +5033,969 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
                 .is_some_and(|text| text.starts_with("2 message(s) before your read markers"))),
         "{replayed:#?}"
     );
+}
+
+// ---- an attachment ends with its account's authority -----------------------
+
+/// One HTTP/1.1 request, answered in full: its status and body.
+async fn http_call(
+    http: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(http).await.expect("connect");
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: t\r\n{headers}Content-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.expect("read");
+    let response = String::from_utf8_lossy(&response).to_string();
+    let status = response
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("status");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// Attach to `network` as alice through the attach listener.
+async fn attach_alice(
+    bnc: std::net::SocketAddr,
+    network: &str,
+    password: &str,
+) -> e6irc_client::Connection {
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .expect("connect");
+    let nick = format!("alice/{network}");
+    client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: &nick,
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            password,
+        )
+        .await
+        .expect("attach");
+    client
+}
+
+/// An operator's shared network on `up`, which no account owns.
+fn shared_network(up: std::net::SocketAddr) -> e6ircd::config::NetworkEntry {
+    e6ircd::config::NetworkEntry {
+        kind: NetworkKind::Irc,
+        name: "shared".into(),
+        owner: None,
+        addr: up.to_string(),
+        tls: false,
+        nick: "sharednick".into(),
+        username: Some("tester".into()),
+        realname: Some("shared".into()),
+        autojoin: vec![],
+        buffer_cap: 100,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    }
+}
+
+/// An HTTP listener on an ephemeral port.
+fn http_listener() -> e6ircd::config::HttpConfig {
+    e6ircd::config::HttpConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        public_url: None,
+        secure_cookies: false,
+        admin_accounts: vec![],
+        hsts_include_subdomains: false,
+    }
+}
+
+/// An IRC session of alice's, logged in with SASL.
+async fn irc_alice(irc: std::net::SocketAddr, password: &str) -> e6irc_client::Connection {
+    irc_alice_as(irc, "alice", password).await
+}
+
+/// [`irc_alice`] under `nick`, so one server can hold several of her sessions.
+async fn irc_alice_as(
+    irc: std::net::SocketAddr,
+    nick: &str,
+    password: &str,
+) -> e6irc_client::Connection {
+    let mut session = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("connect");
+    session
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick,
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            password,
+        )
+        .await
+        .expect("IRC login");
+    session
+}
+
+/// Change alice's password from a browser session on `http`.
+async fn change_alices_password(
+    pool: &sqlx::PgPool,
+    http: std::net::SocketAddr,
+    current: &str,
+    new: &str,
+) {
+    let browser = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("browser session");
+    let cookie = format!("Cookie: e6irc_session={browser}\r\n");
+    let (status, me) = http_call(http, "GET", "/api/v1/me", &cookie, "").await;
+    assert_eq!(status, 200, "{me}");
+    let me: serde_json::Value = serde_json::from_str(&me).expect("me JSON");
+    let csrf = me["csrf_token"].as_str().expect("CSRF").to_string();
+    let (status, body) = http_call(
+        http,
+        "PUT",
+        "/api/v1/me/password",
+        &format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n"),
+        &format!(r#"{{"current_password":"{current}","new_password":"{new}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("IRC connections"), "{body}");
+}
+
+/// Whether `session` still answers: a PING it sends is answered with a PONG.
+async fn still_open(session: &mut e6irc_client::Connection) -> bool {
+    if session.send_line("PING :still-open").await.is_err() {
+        return false;
+    }
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            match session.next_message().await {
+                Ok(Some(message)) if message.command == "PONG" => return true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Read until the attachment ends, returning what it was told last.
+async fn detached(client: &mut e6irc_client::Connection) -> Vec<String> {
+    tokio::time::timeout(deadline::HANG, async {
+        let mut said = Vec::new();
+        loop {
+            match client.next_message().await {
+                Ok(Some(message)) => said.push(message.params.join(" ")),
+                Ok(None) | Err(_) => return said,
+            }
+        }
+    })
+    .await
+    .expect("the attachment stayed open")
+}
+
+/// The configured network `up` as the administrator inventory shows it.
+async fn inventory_state(http: std::net::SocketAddr, token: &str) -> String {
+    let (status, body) = http_call(
+        http,
+        "GET",
+        "/api/v1/admin/networks",
+        &format!("Authorization: Bearer {token}\r\n"),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let inventory: serde_json::Value = serde_json::from_str(&body).expect("inventory JSON");
+    inventory["networks"]
+        .as_array()
+        .expect("networks")
+        .iter()
+        .find(|network| network["name"] == "up")
+        .and_then(|network| network["runtime"]["state"].as_str())
+        .expect("up's state")
+        .to_string()
+}
+
+/// Suspending an account ends every attachment it holds — on an operator's
+/// shared network and on the network the configuration defines for it, which
+/// the attach listener used to leave open for as long as the client liked —
+/// and holds the configured network stopped, as the administrator inventory
+/// shows, until reactivation restarts it. A password change ends the
+/// account's attachments and live IRC sessions the same way.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_account_lifecycle_ends_attachments_and_holds_configured_networks() {
+    let url = bnc_account_db(
+        "the_account_lifecycle_ends_attachments_and_holds_configured_networks",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_by_administrator(
+        &pool,
+        "root",
+        "administrator password",
+        None,
+        true,
+        "root",
+    )
+    .await
+    .expect("administrator");
+    let admin = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "root",
+        "administrator API",
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("administrator token");
+    let alice_id = e6ircd::db::account_id_by_name(&pool, "alice")
+        .await
+        .expect("lookup")
+        .expect("alice");
+    let up = upstream().await;
+    let mut config = bnc_config(up, url);
+    config.networks.push(shared_network(up));
+    config.http = Some(http_listener());
+    let running = net::start(config).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    let http = running.http_addr.expect("http bound");
+    wait_joined(up, "bncnick", "#lobby").await;
+
+    let mut configured = attach_alice(bnc, "up", "s3cr3t-password").await;
+    let mut shared = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let suspend = |suspended: bool| {
+        let path = format!("/api/v1/admin/accounts/{alice_id}");
+        let authorization = format!("Authorization: Bearer {admin}\r\n");
+        let body = format!(r#"{{"suspended":{suspended}}}"#);
+        async move { http_call(http, "PATCH", &path, &authorization, &body).await }
+    };
+    let (status, body) = suspend(true).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("1 configured"), "{body}");
+    for (network, client) in [("up", &mut configured), ("shared", &mut shared)] {
+        let said = detached(client).await;
+        assert!(
+            said.iter()
+                .any(|text| text.contains("suspended or deleted")),
+            "{network}: {said:#?}"
+        );
+    }
+    assert_eq!(inventory_state(http, &admin).await, "owner_suspended");
+    wait_gone(up, "bncnick").await;
+
+    // Reactivation restarts the operator's network for the account.
+    let (status, body) = suspend(false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("1 configured"), "{body}");
+    wait_joined(up, "bncnick", "#lobby").await;
+    assert_ne!(inventory_state(http, &admin).await, "owner_suspended");
+
+    // A password change ends the account's attachments and IRC sessions.
+    let mut attached = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session = irc_alice(running.addrs[0], "s3cr3t-password").await;
+    change_alices_password(&pool, http, "s3cr3t-password", "a new passphrase").await;
+    let said = detached(&mut attached).await;
+    assert!(
+        said.iter().any(|text| text.contains("password changed")),
+        "{said:#?}"
+    );
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter().any(|text| text.contains("Password changed")),
+        "{said:#?}"
+    );
+    // The new password attaches.
+    attach_alice(bnc, "shared", "a new passphrase").await;
+}
+
+/// One process serves the database, but not every change of an account's
+/// authority is made there: `e6ircd recover-administrator` replaces an
+/// account's password from a process of its own, and an operator may suspend
+/// or reactivate a row by hand. The serving process follows the store's
+/// announcements and applies each: a suspension written elsewhere ends
+/// alice's attachments and IRC session — which used to stay open for as long
+/// as the clients liked — and holds her configured network stopped; a
+/// reactivation runs it again; a recovery's new password ends her attachment
+/// and IRC session. A change the serving process makes itself is applied once:
+/// the session she opens with her new password survives the server hearing
+/// its own announcement.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_account_authority_change_by_another_process_reaches_the_serving_one() {
+    let url = bnc_account_db(
+        "an_account_authority_change_by_another_process_reaches_the",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_by_administrator(
+        &pool,
+        "root",
+        "administrator password",
+        None,
+        true,
+        "root",
+    )
+    .await
+    .expect("administrator");
+    let admin = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "root",
+        "administrator API",
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("administrator token");
+    let alice_id = e6ircd::db::account_id_by_name(&pool, "alice")
+        .await
+        .expect("lookup")
+        .expect("alice");
+    let up = upstream().await;
+    let mut config = bnc_config(up, url.clone());
+    config.networks.push(shared_network(up));
+    config.http = Some(http_listener());
+    // The test polls the administrator inventory; that is not what the
+    // administrator's request budget is for.
+    config.limits.administrator_api_rate_burst = 10_000;
+    let running = net::start(config).await.expect("start the server");
+    let (http, bnc) = (
+        running.http_addr.expect("http bound"),
+        running.bnc_addr.expect("bnc bound"),
+    );
+    // Alice's configured network, as the administrator inventory shows it.
+    let configured_becomes = async |wanted: fn(&str) -> bool| {
+        let mut last = String::new();
+        let reached = tokio::time::timeout(deadline::HANG, async {
+            loop {
+                last = inventory_state(http, &admin).await;
+                if wanted(&last) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(reached.is_ok(), "the configured network stayed {last}");
+    };
+    // Written by another process: this pool is not the server's, and nothing
+    // tells the server but the store's own announcement.
+    let suspend_elsewhere = async |suspended: bool| {
+        e6ircd::db::set_account_suspended(&pool, alice_id, suspended, "root", &[])
+            .await
+            .expect("suspension written by another process")
+            .expect("alice");
+    };
+
+    let mut configured = attach_alice(bnc, "up", "s3cr3t-password").await;
+    let mut shared = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session = irc_alice(running.addrs[0], "s3cr3t-password").await;
+    suspend_elsewhere(true).await;
+    for (network, client) in [("up", &mut configured), ("shared", &mut shared)] {
+        let said = detached(client).await;
+        assert!(
+            said.iter()
+                .any(|text| text.contains("suspended or deleted")),
+            "{network}: {said:#?}"
+        );
+    }
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter().any(|text| text.contains("Account suspended")),
+        "{said:#?}"
+    );
+    configured_becomes(|state| state == "owner_suspended").await;
+
+    suspend_elsewhere(false).await;
+    configured_becomes(|state| state != "owner_suspended").await;
+
+    // `recover-administrator`'s own call, as that command makes it.
+    let mut attached = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session = irc_alice(running.addrs[0], "s3cr3t-password").await;
+    let recovered = e6ircd::db::recover_administrator(&pool, "alice")
+        .await
+        .expect("recovered by another process");
+    let said = detached(&mut attached).await;
+    assert!(
+        said.iter().any(|text| text.contains("password changed")),
+        "{said:#?}"
+    );
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter().any(|text| text.contains("Password changed")),
+        "{said:#?}"
+    );
+    attach_alice(bnc, "shared", &recovered.password).await;
+
+    // The serving process's own change: applied where it is made, once.
+    change_alices_password(&pool, http, &recovered.password, "a new passphrase").await;
+    let mut signed_in_again = irc_alice(running.addrs[0], "a new passphrase").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(still_open(&mut signed_in_again).await);
+    attach_alice(bnc, "shared", "a new passphrase").await;
+}
+
+/// Alice signs in with her password, with each of two app passwords, and with
+/// a personal access token. Another process — the command line, another HTTP
+/// path — revokes one app password and the token in the database; the server
+/// hears the store's announcements and ends the IRC sessions and the
+/// attachment those credentials signed in, saying why, and nothing her
+/// password or her other app password signed in.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_credential_revoked_out_of_process_ends_exactly_what_it_signed_in() {
+    let url = bnc_account_db(
+        "a_credential_revoked_out_of_process_ends_exactly_what_it_signed_in",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let revoked = e6ircd::db::issue_app_password(&pool, "alice", "s3cr3t-password", "laptop")
+        .await
+        .expect("app password");
+    let kept = e6ircd::db::issue_app_password(&pool, "alice", "s3cr3t-password", "phone")
+        .await
+        .expect("app password");
+    let revoked_id = e6ircd::db::list_credentials(&pool, "alice")
+        .await
+        .expect("credentials")
+        .into_iter()
+        .find(|credential| credential.label.as_deref() == Some("laptop"))
+        .expect("the laptop's app password")
+        .id;
+    let token = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc client",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Irc])
+            .expect("scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("token");
+    let token_id = match e6ircd::db::api_token_account(&pool, &token)
+        .await
+        .expect("token lookup")
+        .expect("an IRC token")
+        .credential
+    {
+        e6ircd::identity::CredentialId::Issued(e6ircd::identity::IssuedCredential::ApiToken(
+            id,
+        )) => id,
+        other => panic!("a token signs in as itself: {other:?}"),
+    };
+    let up = upstream().await;
+    let mut config = bnc_config(up, url.clone());
+    config.networks.push(shared_network(up));
+    let server = net::start(config).await.expect("start");
+    let (irc, bnc) = (server.addrs[0], server.bnc_addr.expect("bnc bound"));
+
+    let mut attached_revoked = attach_alice(bnc, "shared", &revoked).await;
+    let mut attached_kept = attach_alice(bnc, "shared", &kept).await;
+    let mut attached_password = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session_revoked = irc_alice_as(irc, "alice1", &revoked).await;
+    let mut session_kept = irc_alice_as(irc, "alice2", &kept).await;
+    let mut session_password = irc_alice_as(irc, "alice3", "s3cr3t-password").await;
+    let mut session_token = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("connect");
+    session_token
+        .register_oauthbearer(
+            &e6irc_client::Identity {
+                nick: "alice4",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            &token,
+        )
+        .await
+        .expect("token login");
+
+    assert!(
+        e6ircd::db::revoke_credential(&pool, "alice", revoked_id)
+            .await
+            .expect("revoke")
+    );
+    let said = detached(&mut attached_revoked).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("app password you signed in with was revoked")),
+        "{said:#?}"
+    );
+    let said = detached(&mut session_revoked).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("App password revoked")),
+        "{said:#?}"
+    );
+    assert!(
+        still_open(&mut session_token).await,
+        "the token was not revoked"
+    );
+    assert!(
+        e6ircd::db::delete_api_token(&pool, "alice", token_id)
+            .await
+            .expect("revoke")
+    );
+    let said = detached(&mut session_token).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("Personal access token revoked")),
+        "{said:#?}"
+    );
+    for (what, client) in [
+        ("the other app password's attachment", &mut attached_kept),
+        ("the password's attachment", &mut attached_password),
+        ("the other app password's session", &mut session_kept),
+        ("the password's session", &mut session_password),
+    ] {
+        assert!(still_open(client).await, "{what} stays open");
+    }
+    // The revoked app password signs in nowhere again.
+    let mut refused = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .expect("connect");
+    assert!(
+        refused
+            .register_sasl(
+                &e6irc_client::Identity {
+                    nick: "alice/shared",
+                    username: "alice",
+                    realname: "Alice",
+                    server_password: None,
+                },
+                "alice",
+                &revoked,
+            )
+            .await
+            .is_err()
+    );
+}
+
+/// Register the driver as an upstream still holding the ghost of its last
+/// session does: the configured nickname is answered with 433, the one
+/// alternative is welcomed, and the burst ends with `isupport`. Returns every
+/// `NICK` the driver offered on the way.
+async fn welcome_past_a_ghost(
+    session: &mut FakeSession,
+    sasl: bool,
+    isupport: &str,
+) -> Vec<String> {
+    if sasl {
+        session.negotiate_sasl_capabilities().await;
+    } else {
+        session.negotiate_capabilities().await;
+    }
+    let mut offered: Vec<String> = Vec::new();
+    let (mut user, mut cap_end, mut authenticated) = (false, false, !sasl);
+    while !(user && cap_end && authenticated && offered.len() == 2) {
+        let line = session.read_line().await;
+        assert!(!line.is_empty(), "the driver left during registration");
+        if let Some(nick) = line.strip_prefix("NICK ") {
+            offered.push(nick.to_string());
+            if offered.len() == 1 {
+                session
+                    .send(&format!(":up 433 * {nick} :Nickname is already in use"))
+                    .await;
+            }
+        } else if line == "AUTHENTICATE PLAIN" {
+            session.send("AUTHENTICATE +").await;
+        } else if line.starts_with("AUTHENTICATE ") {
+            session
+                .send(":up 903 * :SASL authentication successful")
+                .await;
+            authenticated = true;
+        } else if line.starts_with("USER ") {
+            user = true;
+        } else if line == "CAP END" {
+            cap_end = true;
+        }
+    }
+    let alternative = &offered[1];
+    session
+        .send(&format!(":up 001 {alternative} :welcome"))
+        .await;
+    session
+        .send(&format!(
+            ":up 005 {alternative} {isupport} :are supported by this server"
+        ))
+        .await;
+    session
+        .send(&format!(":up 376 {alternative} :End of /MOTD command."))
+        .await;
+    offered
+}
+
+/// The configuration of a network whose ghost the tests make the driver meet.
+fn ghost_network(
+    addr: std::net::SocketAddr,
+    sasl: bool,
+    timing: NickRegainTiming,
+) -> NetworkConfig {
+    NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#lobby".parse().expect("test channel")],
+        sasl: sasl.then(|| ("bncbot".to_string(), "hunter2".to_string())),
+        // No redial within a test: the first attempt's outcome is the subject.
+        rejection_retry_floor: std::time::Duration::from_secs(600),
+        internal_upstreams: InternalUpstreams::Allow,
+        nick_regain: timing,
+        ..NetworkConfig::default()
+    }
+}
+
+/// Wait until the driver is registered under its alternative, and check that
+/// it says so rather than reporting a connection.
+async fn wait_regaining(handle: &NetworkHandle) {
+    wait_lifecycle(handle, NetworkLifecycle::RegainingNickname).await;
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("connected as bncbot_, regaining bncbot"),
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.connected_at, None, "{snapshot:?}");
+}
+
+/// A crash leaves a ghost the next dial meets. Authenticated with SASL, the
+/// driver registers as `bncbot_`, asks NickServ to `REGAIN` the configured
+/// nickname, and only once services have renamed it back joins its channels,
+/// sends what an attached client typed meanwhile, and reports a connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_ghost_is_regained_through_nickserv() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (asked_tx, asked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        let offered =
+            welcome_past_a_ghost(&mut session, true, "CASEMAPPING=rfc1459 MONITOR=100").await;
+        assert_eq!(offered, ["bncbot", "bncbot_"]);
+        assert_eq!(session.read_line().await, "PRIVMSG NickServ :REGAIN bncbot");
+        assert_eq!(session.read_line().await, "MONITOR + bncbot");
+        asked_tx.send(()).unwrap();
+        answer_rx.await.unwrap();
+        session
+            .send(":NickServ!NickServ@services. NOTICE bncbot_ :\x02bncbot\x02 has been regained.")
+            .await;
+        session.send(":bncbot_!~bncbot@up NICK :bncbot").await;
+        // Up to what the client typed during the wait.
+        let mut after = Vec::new();
+        loop {
+            let line = session.read_line().await;
+            assert!(!line.is_empty(), "closed before the held line: {after:?}");
+            let typed = line.starts_with("PRIVMSG");
+            after.push(line);
+            if typed {
+                return after;
+            }
+        }
+    });
+    let handle = IrcNetwork::start(ghost_network(addr, true, NickRegainTiming::default()));
+    let mut events = handle.subscribe();
+    wait_regaining(&handle).await;
+    asked_rx.await.expect("the driver asked for its nickname");
+    // Typed while the session holds only the alternative: held back.
+    assert_eq!(handle.send("PRIVMSG #lobby :hello"), SendOutcome::Sent);
+    answer_tx.send(()).unwrap();
+    wait_connected(&handle, &mut events).await;
+    let snapshot = handle.runtime_snapshot();
+    assert!(
+        snapshot
+            .recent_failures
+            .iter()
+            .all(|failure| failure.code() != "renamed_by_upstream"),
+        "the rename back was asked for: {snapshot:?}"
+    );
+    let after = upstream.finish().await;
+    handle.shutdown_and_wait().await;
+    assert_eq!(
+        after,
+        ["MONITOR - bncbot", "JOIN #lobby", "PRIVMSG #lobby :hello"],
+        "nothing is joined or said before the configured nickname is back"
+    );
+}
+
+/// Without SASL there is no one to ask: the driver watches the ghost with
+/// `MONITOR` and takes the nickname the moment the upstream reaps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ghost_that_times_out_is_regained_through_monitor() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (reaped_tx, reaped_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, false, "MONITOR=100").await;
+        assert_eq!(session.read_line().await, "MONITOR + bncbot");
+        session.send(":up 730 bncbot_ :bncbot!~bncbot@ghost").await;
+        reaped_rx.await.unwrap();
+        session.send(":up 731 bncbot_ :bncbot").await;
+        assert_eq!(session.read_line().await, "NICK bncbot");
+        session.send(":bncbot_!~bncbot@up NICK :bncbot").await;
+        assert_eq!(session.read_line().await, "MONITOR - bncbot");
+        assert_eq!(session.read_line().await, "JOIN #lobby");
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(ghost_network(addr, false, NickRegainTiming::default()));
+    let mut events = handle.subscribe();
+    wait_regaining(&handle).await;
+    reaped_tx.send(()).unwrap();
+    wait_connected(&handle, &mut events).await;
+    handle.shutdown_and_wait().await;
+    upstream.finish().await;
+}
+
+/// An upstream without `MONITOR` is asked with `ISON`, once a poll, until the
+/// ghost is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ghost_that_times_out_is_regained_through_ison() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let poll = std::time::Duration::from_millis(200);
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, false, "CASEMAPPING=rfc1459").await;
+        assert_eq!(session.read_line().await, "ISON bncbot");
+        session.send(":up 303 bncbot_ :bncbot").await;
+        let asked = tokio::time::Instant::now();
+        assert_eq!(session.read_line().await, "ISON bncbot");
+        assert!(asked.elapsed() >= poll / 2, "polled at the interval");
+        session.send(":up 303 bncbot_ :").await;
+        assert_eq!(session.read_line().await, "NICK bncbot");
+        session.send(":bncbot_!~bncbot@up NICK :bncbot").await;
+        assert_eq!(session.read_line().await, "JOIN #lobby");
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(ghost_network(
+        addr,
+        false,
+        NickRegainTiming {
+            poll,
+            window: std::time::Duration::from_secs(60),
+        },
+    ));
+    let mut events = handle.subscribe();
+    wait_regaining(&handle).await;
+    wait_connected(&handle, &mut events).await;
+    handle.shutdown_and_wait().await;
+    upstream.finish().await;
+}
+
+/// A nickname registered to another account is not coming back: services'
+/// refusal ends the session with a `QUIT` (the alternative leaves no ghost of
+/// its own) and parks the network with the reason, without another dial.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nickname_services_refuse_to_regain_parks_the_network() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, true, "CASEMAPPING=rfc1459").await;
+        assert_eq!(session.read_line().await, "PRIVMSG NickServ :REGAIN bncbot");
+        assert_eq!(session.read_line().await, "ISON bncbot");
+        session
+            .send(
+                ":NickServ!NickServ@services. NOTICE bncbot_ :Invalid password for \x02bncbot\x02.",
+            )
+            .await;
+        let goodbye = session.read_line().await;
+        // No second dial follows the refusal.
+        let redial =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        (goodbye, redial.is_ok())
+    });
+    let handle = IrcNetwork::start(ghost_network(addr, true, NickRegainTiming::default()));
+    wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
+    let (goodbye, redialled) = upstream.finish().await;
+    assert_eq!(
+        goodbye,
+        "QUIT :the configured nickname could not be regained"
+    );
+    assert!(!redialled, "a definite refusal is not retried");
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameRegainRefused),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("bncbot cannot be regained: Invalid password for bncbot."),
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.connection_attempts, 1, "{snapshot:?}");
+}
+
+/// A holder that is not a ghost never goes away. However the upstream
+/// answers — the nickname free by `ISON` yet refused on every `NICK` — the
+/// driver sends one `NICK` a poll at most, stops at the end of its window with
+/// a `QUIT`, and takes the ordinary refusal schedule for a nickname in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn regaining_is_bounded_and_never_loops() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let poll = std::time::Duration::from_millis(100);
+    let window = std::time::Duration::from_millis(1_000);
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, false, "CASEMAPPING=rfc1459").await;
+        let mut nicks = 0usize;
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() || line.starts_with("QUIT") {
+                return (nicks, line);
+            }
+            if line == "ISON bncbot" {
+                session.send(":up 303 bncbot_ :").await;
+            } else if line == "NICK bncbot" {
+                nicks += 1;
+                session
+                    .send(":up 433 bncbot_ bncbot :Nickname is already in use")
+                    .await;
+            } else {
+                panic!("unexpected line while regaining: {line}");
+            }
+        }
+    });
+    let handle = IrcNetwork::start(ghost_network(
+        addr,
+        false,
+        NickRegainTiming { poll, window },
+    ));
+    wait_regaining(&handle).await;
+    let (nicks, goodbye) = upstream.finish().await;
+    assert_eq!(
+        goodbye,
+        "QUIT :the configured nickname could not be regained"
+    );
+    let most = (window.as_millis() / poll.as_millis()) as usize + 1;
+    assert!((1..=most).contains(&nicks), "{nicks} NICKs in the window");
+    wait_lifecycle(&handle, NetworkLifecycle::Reconnecting).await;
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("bncbot was still in use 1s after registering as bncbot_"),
+        "{snapshot:?}"
+    );
+    assert!(snapshot.next_retry_at.is_some(), "{snapshot:?}");
+}
+
+/// An IRC session a personal access token signed in ends when the token
+/// expires — the instant the store says it does, as a chat socket's does —
+/// not when storage maintenance later deletes the row; the session is told
+/// why.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_session_a_token_signed_in_ends_when_the_token_expires() {
+    let url = bnc_account_db(
+        "a_session_a_token_signed_in_ends_when_the_token_expires",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let token = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc client",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Irc])
+            .expect("scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("token");
+    // No lifetime shorter than a day can be issued; this one is nearly over.
+    sqlx::query("UPDATE api_tokens SET expires_at = now() + interval '3 seconds'")
+        .execute(&pool)
+        .await
+        .expect("a token about to expire");
+    let up = upstream().await;
+    let server = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
+    let mut session = e6irc_client::Connection::connect(&server.addrs[0].to_string())
+        .await
+        .expect("connect");
+    session
+        .register_oauthbearer(
+            &e6irc_client::Identity {
+                nick: "alice",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            &token,
+        )
+        .await
+        .expect("token login");
+    let mut with_password = irc_alice_as(server.addrs[0], "alice2", "s3cr3t-password").await;
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("Personal access token expired")),
+        "{said:#?}"
+    );
+    let still_stored: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(still_stored, 1, "maintenance has not pruned it: expiry did");
+    assert!(still_open(&mut with_password).await);
 }

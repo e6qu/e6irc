@@ -20,15 +20,21 @@ struct DeviceStartResponse {
     expires_in: u16,
 }
 
+/// A device access token response (RFC 6749 §5.1).
 #[derive(serde::Serialize)]
 struct DeviceTokenResponse {
     access_token: String,
     token_type: &'static str,
+    expires_in: u64,
+    scope: String,
 }
 
+/// An OAuth error response body (RFC 6749 §5.2).
 #[derive(serde::Serialize)]
-struct DeviceErrorResponse<'a> {
-    error: &'a str,
+struct DeviceErrorResponse {
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_description: Option<&'static str>,
 }
 
 #[derive(serde::Serialize)]
@@ -98,6 +104,15 @@ struct AccountInvitationCreatedResponse {
 #[derive(serde::Serialize)]
 struct AdminNetworksResponse {
     networks: Vec<super::networks::AdminNetworkResponse>,
+    /// The `after` cursor of the next page, when there is one.
+    next_after: Option<String>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkInventoryQuery {
+    limit: Option<usize>,
+    after: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -287,12 +302,106 @@ struct ServerInfoResponse {
 
 // ---- device authorization grant (RFC 8628) ------------------------------
 
-/// Start a device grant. No auth: the client is not yet a principal, but each
-/// call inserts a live `device_grants` row that pruning cannot touch for 10
-/// minutes — `RateLimited` caps the per-address rate (`limits.auth_rate_burst`,
-/// on unless the operator turned it off) so an anonymous flood can't
-/// accumulate rows unboundedly.
-pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLimited) -> Response {
+/// The grant type a device access token request names (RFC 8628 §3.4).
+const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// The scope every device grant issues: [`crate::identity::ApiTokenScopes::device_access`],
+/// spelled as an OAuth scope (RFC 6749 §3.3).
+fn device_scope() -> String {
+    crate::identity::ApiTokenScopes::device_access()
+        .iter()
+        .map(crate::identity::ApiTokenScope::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An OAuth error response (RFC 6749 §5.2, which RFC 8628 §3.5 extends): a 400
+/// with a JSON `error` code, never cached.
+fn oauth_error(code: &'static str, description: Option<&'static str>) -> Response {
+    let mut response = (
+        StatusCode::BAD_REQUEST,
+        axum::Json(DeviceErrorResponse {
+            error: code,
+            error_description: description,
+        }),
+    )
+        .into_response();
+    no_store(response.headers_mut());
+    response
+}
+
+/// A device endpoint's form parameters, or the answer to a malformed form:
+/// RFC 6749's `invalid_request` saying `expected`, except a body past the size
+/// limit, which is the `413` every endpoint gives.
+fn oauth_form<T>(
+    form: Result<Form<T>, axum::extract::rejection::FormRejection>,
+    expected: &'static str,
+) -> ResponseResult<T> {
+    match form {
+        Ok(Form(form)) => Ok(form),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(body_rejection(rejection.status(), "Invalid form", &rejection.to_string()).into())
+        }
+        Err(_) => Err(oauth_error("invalid_request", Some(expected)).into()),
+    }
+}
+
+/// An OAuth parameter as RFC 6749 §3.1 reads it: one sent without a value is
+/// treated as omitted.
+fn oauth_parameter(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// The device authorization request (RFC 8628 §3.1), a form body. Parameters
+/// this endpoint does not define are ignored, as RFC 6749 §3.1 requires; one
+/// sent twice is refused.
+#[derive(Deserialize)]
+pub(super) struct DeviceStartForm {
+    client_id: Option<String>,
+    scope: Option<String>,
+}
+
+/// Start a device grant (RFC 8628 §3.1–3.2). No auth: the client is not yet a
+/// principal, but each call inserts a live `device_grants` row that pruning
+/// cannot touch for 10 minutes — `RateLimited` caps the per-address rate
+/// (`limits.auth_rate_burst`, on unless the operator turned it off) so an
+/// anonymous flood can't accumulate rows unboundedly.
+pub(super) async fn device_start(
+    State(state): State<Arc<AppState>>,
+    _rl: RateLimited,
+    form: Result<Form<DeviceStartForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let form = match oauth_form(
+        form,
+        "send client_id as application/x-www-form-urlencoded, each parameter once",
+    ) {
+        Ok(form) => form,
+        Err(response) => return response.into(),
+    };
+    let Some(client) = oauth_parameter(form.client_id) else {
+        return oauth_error("invalid_request", Some("client_id is required"));
+    };
+    let Some(client) = crate::db::DeviceClientId::parse(&client) else {
+        return oauth_error(
+            "invalid_request",
+            Some("client_id is 1-64 visible ASCII characters"),
+        );
+    };
+    // The scope a device grant issues is fixed. A request may name it (in any
+    // order), but not ask for more or less than it gets.
+    if let Some(requested) = oauth_parameter(form.scope) {
+        let mut requested: Vec<&str> = requested.split(' ').collect();
+        requested.sort_unstable();
+        let issued = device_scope();
+        let mut issued: Vec<&str> = issued.split(' ').collect();
+        issued.sort_unstable();
+        if requested != issued {
+            return oauth_error(
+                "invalid_scope",
+                Some("a device grant issues exactly the scope 'read write irc'"),
+            );
+        }
+    }
     let Some(verification_uri) = device_verification_uri(state.public_url.as_deref()) else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -301,12 +410,12 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
         );
     };
     let pool = require_pool!(state);
-    match crate::db::create_device_grant(pool).await {
+    match crate::db::create_device_grant(pool, &client).await {
         Ok((device_code, user_code)) => json_no_store(DeviceStartResponse {
             device_code,
             user_code,
             verification_uri,
-            interval: 5,
+            interval: crate::db::DEVICE_POLL_INTERVAL_SECONDS,
             expires_in: crate::db::DEVICE_GRANT_LIFETIME_SECONDS,
         }),
         Err(e) => {
@@ -324,40 +433,69 @@ fn device_verification_uri(public_url: Option<&str>) -> Option<String> {
     public_url.map(|url| format!("{}/device", url.trim_end_matches('/')))
 }
 
+/// The device access token request (RFC 8628 §3.4), a form body. Parameters
+/// this endpoint does not define are ignored, as RFC 6749 §3.1 requires; one
+/// sent twice is refused.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct DeviceTokenReq {
-    pub(super) device_code: String,
+pub(super) struct DeviceTokenForm {
+    grant_type: Option<String>,
+    device_code: Option<String>,
+    client_id: Option<String>,
 }
 
-/// Poll for the token. RFC 8628 error codes on the not-yet-ready cases.
+/// Poll for the token (RFC 8628 §3.4–3.5): the token on approval, otherwise
+/// one of RFC 8628's error codes as a 400 with a JSON body.
 pub(super) async fn device_token(
     State(state): State<Arc<AppState>>,
     // Unauthenticated and each poll opens a DB transaction in `poll_device_grant`
     // *before* validating the code, so an anonymous flood of bogus codes would
     // saturate the connection pool. Rate-limit per client IP like every sibling.
     _rl: RateLimited,
-    JsonBody(req): JsonBody<DeviceTokenReq>,
+    form: Result<Form<DeviceTokenForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let pool = require_pool!(state);
-    let oauth_err = |code: &str| {
-        (
-            StatusCode::BAD_REQUEST,
-            axum::Json(DeviceErrorResponse { error: code }),
-        )
-            .into_response()
+    let form = match oauth_form(
+        form,
+        "send grant_type, device_code and client_id as \
+         application/x-www-form-urlencoded, each parameter once",
+    ) {
+        Ok(form) => form,
+        Err(response) => return response.into(),
     };
+    let (Some(grant_type), Some(device_code), Some(client)) = (
+        oauth_parameter(form.grant_type),
+        oauth_parameter(form.device_code),
+        oauth_parameter(form.client_id),
+    ) else {
+        return oauth_error(
+            "invalid_request",
+            Some("grant_type, device_code and client_id are required"),
+        );
+    };
+    if grant_type != DEVICE_CODE_GRANT_TYPE {
+        return oauth_error("unsupported_grant_type", None);
+    }
+    // No grant was ever started for a client identifier that does not parse.
+    let Some(client) = crate::db::DeviceClientId::parse(&client) else {
+        return oauth_error("invalid_grant", None);
+    };
+    let pool = require_pool!(state);
     // The grant is consumed and the token minted in one transaction inside
     // `poll_device_grant`, so a mint failure can't destroy an approved grant.
-    match crate::db::poll_device_grant(pool, &req.device_code, "device").await {
+    match crate::db::poll_device_grant(pool, &device_code, &client).await {
         Ok(crate::db::DeviceStatus::Approved(token)) => json_no_store(DeviceTokenResponse {
             access_token: token,
-            token_type: "bearer",
+            token_type: "Bearer",
+            expires_in: u64::from(crate::identity::ApiTokenLifetimeDays::DEFAULT.value()) * 86_400,
+            scope: device_scope(),
         }),
-        Ok(crate::db::DeviceStatus::Pending) => oauth_err("authorization_pending"),
-        Ok(crate::db::DeviceStatus::Denied) => oauth_err("access_denied"),
-        Ok(crate::db::DeviceStatus::Expired) => oauth_err("expired_token"),
-        Ok(crate::db::DeviceStatus::Unknown) => oauth_err("invalid_grant"),
+        Ok(crate::db::DeviceStatus::Pending) => oauth_error("authorization_pending", None),
+        Ok(crate::db::DeviceStatus::SlowDown) => oauth_error(
+            "slow_down",
+            Some("polled sooner than the interval; it is now 5 seconds longer"),
+        ),
+        Ok(crate::db::DeviceStatus::Denied) => oauth_error("access_denied", None),
+        Ok(crate::db::DeviceStatus::Expired) => oauth_error("expired_token", None),
+        Ok(crate::db::DeviceStatus::Unknown) => oauth_error("invalid_grant", None),
         Err(e) => {
             eprintln!("http: device poll failed: {e}");
             problem(
@@ -409,6 +547,37 @@ mod tests {
             device_verification_uri(Some("https://chat.example/e6irc/")),
             Some("https://chat.example/e6irc/device".into())
         );
+    }
+
+    /// A managed network the next start would refuse to build is refused when
+    /// it is saved, with the validator's own reason naming the field — never a
+    /// generic "missing or invalid" that left the operator guessing, and never
+    /// accepted only to make the daemon exit at its next boot.
+    #[test]
+    fn managed_network_request_refuses_what_the_next_start_would_naming_the_field() {
+        let irc = |field: &str, value: serde_json::Value| {
+            let mut request = serde_json::json!({
+                "kind": "irc", "revision": 1, "name": "libera",
+                "addr": "irc.libera.chat:6697", "tls": true, "nick": "alice",
+                "username": "alice", "realname": "Alice", "autojoin": [],
+                "buffer_cap": 1000
+            });
+            request[field] = value;
+            serde_json::from_value::<AdminNetworkBody>(request).expect("well-formed")
+        };
+        for (field, value) in [
+            ("nick", serde_json::json!("alice smith")),
+            ("autojoin", serde_json::json!(["#ops key"])),
+            ("autojoin", serde_json::json!(["ops"])),
+            ("realname", serde_json::json!("Al\rice")),
+            ("username", serde_json::json!("_bot")),
+        ] {
+            let Err(detail) = admin_network_request(irc(field, value.clone())) else {
+                panic!("{field}={value} was accepted");
+            };
+            assert!(detail.contains(field), "{field}={value}: {detail}");
+        }
+        assert!(admin_network_request(irc("autojoin", serde_json::json!(["#ops"]))).is_ok());
     }
 
     #[test]
@@ -526,23 +695,88 @@ pub(super) fn positive_admin_cursor(
     Ok(before_id)
 }
 
-pub(super) fn printable_exact_filter(
+/// A console filter form's field as the page reads it: an HTML `GET` form
+/// cannot leave out a field it did not fill, so it submits it empty, and on the
+/// page an empty field is the filter not given. Only exactly empty: a value of
+/// spaces is still refused by [`exact_filter`]. The API has no such form and
+/// refuses a blank filter outright.
+fn filled_form_field(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+impl RegisteredChannelDirectoryQuery {
+    pub(super) fn with_unfilled_fields_absent(self) -> Self {
+        Self {
+            name: filled_form_field(self.name),
+            founder: filled_form_field(self.founder),
+            ..self
+        }
+    }
+}
+
+impl ServerBanDirectoryQuery {
+    pub(super) fn with_unfilled_fields_absent(self) -> Self {
+        Self {
+            kind: filled_form_field(self.kind),
+            mask: filled_form_field(self.mask),
+            ..self
+        }
+    }
+}
+
+impl AuditQuery {
+    pub(super) fn with_unfilled_fields_absent(self) -> Self {
+        Self {
+            actor: filled_form_field(self.actor),
+            action: filled_form_field(self.action),
+            target: filled_form_field(self.target),
+            ..self
+        }
+    }
+}
+
+/// [`exact_filter`]'s whitespace rule as a JSON Schema (ECMAScript) pattern:
+/// non-empty, beginning and ending with a non-space character.
+pub(super) const EXACT_FILTER_PATTERN: &str = r"^\S(?:.*\S)?$";
+
+/// Longest audit `actor`, `action` and `target` filters, in characters.
+pub(super) const AUDIT_ACTOR_FILTER_CHARS: usize = 128;
+pub(super) const AUDIT_ACTION_FILTER_CHARS: usize = 64;
+pub(super) const AUDIT_TARGET_FILTER_CHARS: usize = 512;
+
+/// One exact-match directory filter, the same rule for every administrator
+/// directory: absent is no filter; present is 1–`maximum_chars` printable
+/// characters (counted as characters, as the contract's `maxLength` counts
+/// them) with no surrounding whitespace. A blank value, or one that would have
+/// to be trimmed to match, is refused naming the parameter rather than read as
+/// "no filter" or silently rewritten into a different one.
+pub(super) fn exact_filter(
     value: Option<String>,
-    maximum_bytes: usize,
+    parameter: &'static str,
+    maximum_chars: usize,
     invalid_title: &'static str,
-    detail: &'static str,
 ) -> ResponseResult<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
+    let characters = value.chars().count();
+    if characters == 0
+        || characters > maximum_chars
+        || value.chars().any(char::is_control)
+        || value.trim() != value
+    {
+        return Err(problem_at_field(
+            StatusCode::BAD_REQUEST,
+            invalid_title,
+            Some(&format!(
+                "The exact {parameter} filter must be 1–{maximum_chars} printable characters \
+                 without surrounding whitespace."
+            )),
+            Some(parameter),
+        )
+        .into());
     }
-    if value.len() > maximum_bytes || value.chars().any(char::is_control) {
-        return Err(problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)).into());
-    }
-    Ok(Some(value.to_owned()))
+    Ok(Some(value))
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -585,11 +819,11 @@ pub(super) fn validate_account_directory_query(
         "Invalid account-directory cursor",
         "The before_id cursor must be a positive account id.",
     )?;
-    let name = printable_exact_filter(
+    let name = exact_filter(
         params.name,
+        "name",
         MAX_ACCOUNT_LEN,
         "Invalid account filter",
-        "The exact account name must contain 1–64 printable bytes.",
     )?;
     Ok(ValidatedAccountDirectoryQuery {
         page_size,
@@ -936,50 +1170,111 @@ pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response 
     )
 }
 
-/// Aggregate server counts (admin only).
+/// The inventory page's size and cursor, for the API and its console page.
+pub(super) fn validate_admin_network_inventory_query(
+    params: AdminNetworkInventoryQuery,
+) -> ResponseResult<(
+    crate::db::BncNetworkInventoryPageSize,
+    Option<crate::db::BncInventoryKey>,
+)> {
+    let page_size = bounded_admin_page_size(
+        params.limit,
+        100,
+        crate::db::BncNetworkInventoryPageSize::new,
+        "Invalid network-inventory limit",
+        "The network-inventory limit must be between 1 and 1,000.",
+    )?;
+    let after = params
+        .after
+        .as_deref()
+        .map(|cursor| {
+            crate::db::BncInventoryKey::parse_cursor(cursor).ok_or_else(|| {
+                ResponseRejection::from(problem_at_field(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid network-inventory cursor",
+                    Some("`after` must be a next_after value this endpoint returned."),
+                    Some("after"),
+                ))
+            })
+        })
+        .transpose()?;
+    Ok((page_size, after))
+}
+
 /// Every account's BNC networks with their live driver state (admin only):
 /// the fleet-wide view an operator needs to spot a misbehaving upstream
 /// without suspending the whole account. Runtime data comes from the same
-/// registry snapshots the owner-scoped endpoints serve.
+/// registry snapshots the owner-scoped endpoints serve. Paged by a stable
+/// [`crate::db::BncInventoryKey`] cursor: shared networks, then each owner's
+/// configured and stored networks, so a network created or deleted between
+/// two pages cannot shift another onto a second page or off both.
 pub(super) async fn admin_networks(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
+    QueryParams(params): QueryParams<AdminNetworkInventoryQuery>,
 ) -> Response {
-    let pool = pool_of(&state);
-    match crate::db::list_bnc_network_inventory(pool).await {
-        Ok(rows) => {
-            let mut networks: Vec<super::networks::AdminNetworkResponse> = rows
-                .into_iter()
-                .map(|row| {
-                    let runtime = state
-                        .bnc_registry
-                        .as_ref()
-                        .and_then(|r| r.get_owned(&row.owner, &row.network.name))
-                        .map(|h| h.runtime_snapshot());
-                    super::networks::owned_admin_network_response(
-                        row.owner,
-                        super::networks::network_response(row.network, runtime.as_ref()),
-                    )
-                })
-                .collect();
-            if let Some(registry) = &state.bnc_registry {
-                networks.extend(
-                    registry
-                        .list()
-                        .into_iter()
-                        .filter(|status| status.owner.is_none())
-                        .map(super::networks::shared_admin_network_response),
-                );
-            }
-            networks.sort_by(|left, right| {
-                (left.owner(), left.name()).cmp(&(right.owner(), right.name()))
-            });
-            admin_json(AdminNetworksResponse { networks })
-        }
-        Err(e) => admin_db_error("network inventory", e),
-    }
+    let (page_size, after) = match validate_admin_network_inventory_query(params) {
+        Ok(query) => query,
+        Err(response) => return response.into(),
+    };
+    let registry = super::registry_of(&state);
+    let rows =
+        match crate::db::bnc_network_inventory_page(pool_of(&state), after.as_ref(), page_size)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return admin_db_error("network inventory", e),
+        };
+    let mut page: Vec<(
+        crate::db::BncInventoryKey,
+        super::networks::AdminNetworkResponse,
+    )> = rows
+        .into_iter()
+        .map(|row| {
+            // A configured network under the same key is not this row's
+            // driver: its runtime belongs to its own entry.
+            let runtime = registry
+                .get_stored(&row.owner, &row.network.name)
+                .map(|handle| handle.runtime_snapshot());
+            (
+                row.key,
+                super::networks::owned_admin_network_response(
+                    row.owner,
+                    super::networks::network_response(row.network, runtime.as_ref()),
+                ),
+            )
+        })
+        .collect();
+    page.extend(
+        registry
+            .list()
+            .into_iter()
+            .filter_map(|status| {
+                let configured = status.configured.clone()?;
+                let key =
+                    crate::db::BncInventoryKey::new(status.owner.as_deref(), &status.name, false);
+                let response = match &configured.owner {
+                    None => super::networks::shared_admin_network_response(status),
+                    Some(owner) => super::networks::owned_admin_network_response(
+                        owner.clone(),
+                        super::networks::configured_network_response(&configured, &status.runtime),
+                    ),
+                };
+                Some((key, response))
+            })
+            .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after)),
+    );
+    page.sort_by(|left, right| left.0.cmp(&right.0));
+    let next_after =
+        (page.len() > page_size.value()).then(|| page[page_size.value() - 1].0.cursor());
+    page.truncate(page_size.value());
+    admin_json(AdminNetworksResponse {
+        networks: page.into_iter().map(|(_, network)| network).collect(),
+        next_after,
+    })
 }
 
+/// Aggregate server counts (admin only).
 pub(super) async fn admin_stats(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
@@ -1012,8 +1307,9 @@ pub(super) async fn admin_stats(
 }
 
 /// Return the revisioned managed configuration without credential material.
-/// A client can use `revision` as the compare-and-swap precondition for later
-/// writes, but no OIDC, oper, or upstream secret ever crosses this boundary.
+/// A client can use `revision` as the compare-and-swap precondition of the
+/// writes that follow, but no OIDC, oper, or upstream secret ever crosses this
+/// boundary.
 pub(super) async fn admin_configuration(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
@@ -1095,7 +1391,11 @@ struct AdminNetworkRequest {
     network: crate::config::NetworkEntry,
 }
 
-fn admin_network_request(body: AdminNetworkBody) -> Result<AdminNetworkRequest, &'static str> {
+/// The managed network a request describes, validated by the configuration's
+/// own choke point — the one that parses what the driver will be built from at
+/// the next start — and refused with that validator's reason, which names the
+/// field at fault.
+fn admin_network_request(body: AdminNetworkBody) -> Result<AdminNetworkRequest, String> {
     let revision = body
         .revision()
         .ok_or("The selected network driver requires revision.")?;
@@ -1103,10 +1403,7 @@ fn admin_network_request(body: AdminNetworkBody) -> Result<AdminNetworkRequest, 
         revision,
         network: body.into_network_entry().normalized_connection_intent(),
     };
-    request
-        .network
-        .validate_connection_intent()
-        .map_err(|_| "The selected network driver has missing or invalid required fields.")?;
+    request.network.validate_connection_intent()?;
     Ok(request)
 }
 
@@ -1200,11 +1497,13 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
     let RegistrationConfig {
         before_connect: _,
         require_email: _,
+        minimum_password_length: _,
     } = &registration;
     let LimitsConfig {
         max_connections_per_ip: _,
         command_burst: _,
         command_rate: _,
+        anti_spam_exit_message_time_seconds: _,
         trusted_proxies: _,
         auth_rate_burst: _,
         api_rate_burst: _,
@@ -1466,11 +1765,7 @@ pub(super) async fn admin_patch_configuration(
     };
     let mut current = config.write().await;
     if current.revision != body.revision {
-        return problem(
-            StatusCode::CONFLICT,
-            "Configuration revision conflict",
-            Some("Reload the configuration and retry with its current revision."),
-        );
+        return stale_configuration_revision();
     }
     // A faithful round-trip is allowed; a changed collection is named, with the
     // endpoint that owns it, rather than quietly ignored.
@@ -1494,9 +1789,8 @@ pub(super) async fn admin_patch_configuration(
             Some(&error.to_string()),
         );
     }
-    let previous_bnc = current.settings.bnc();
     let next_bnc = settings.bnc();
-    let bnc_changed = previous_bnc != next_bnc;
+    let bnc_changed = current.settings.bnc() != next_bnc;
     if bnc_changed {
         let Some(listener) = &state.bnc_listener else {
             return problem(
@@ -1530,9 +1824,9 @@ pub(super) async fn admin_patch_configuration(
         restart_required,
         &current.settings.changed_fields(&settings),
     );
-    match crate::db::save_managed_config(
+    match crate::db::save_managed_config_over(
         pool_of(&state),
-        current.revision,
+        &mut current,
         &settings,
         &crate::db::AuditPrincipal::account(&actor),
         &detail,
@@ -1540,31 +1834,36 @@ pub(super) async fn admin_patch_configuration(
     .await
     {
         Ok(snapshot) => {
-            *current = snapshot.clone();
+            // History retention and the QUIT-comment delay are live: what the
+            // core and the bouncer serve from memory stops at the new bound
+            // now, not when storage maintenance next runs, and the next QUIT
+            // is judged by the new delay.
+            state.core_tx.adopt_live_settings(&snapshot.settings);
             admin_json(ConfigurationPatchResponse {
                 revision: snapshot.revision,
                 restart_required,
             })
         }
         Err(error) => {
-            if bnc_changed && let Some(listener) = &state.bnc_listener {
-                match &previous_bnc {
-                    Some(previous) => {
-                        if let Err(rollback) = listener.enable(previous).await {
-                            eprintln!(
-                                "{}",
-                                bnc_listener_rollback_failure(
-                                    previous.addr,
-                                    settings.bnc_addr,
-                                    &rollback
-                                )
-                            );
-                        }
-                    }
-                    None => listener.stop().await,
-                }
+            // The listener already serves the unsaved settings; it is brought
+            // to the revision now held: the one this save was based on, or —
+            // when the save found it stale — the stored one it reloaded, so
+            // the listener never serves the stale revision again on the way.
+            if bnc_changed
+                && let Some(listener) = &state.bnc_listener
+                && let Err(unbound) =
+                    crate::settings_watch::follow_bnc_listener(listener, &current).await
+            {
+                eprintln!(
+                    "{}",
+                    bnc_listener_rollback_failure(
+                        unbound.wanted,
+                        settings.bnc_addr,
+                        &unbound.error
+                    )
+                );
             }
-            admin_db_error("managed configuration", error)
+            managed_configuration_save_refused(error)
         }
     }
 }
@@ -1595,17 +1894,19 @@ fn configuration_audit_detail(
     )
 }
 
-/// The line logged when the save failed AND the BNC listener could not be put
-/// back: the process is now serving an address no revision records, which the
-/// operator must know to repair (restart, or save the configuration again).
+/// The line logged when the save failed AND the BNC listener could not be
+/// brought to `held`, where the revision the process now holds has it (the
+/// one the save was based on, or the stored one a stale save reloaded): the
+/// process is serving an address no revision records, which the operator must
+/// know to repair (restart, or save the configuration again).
 fn bnc_listener_rollback_failure(
-    previous: std::net::SocketAddr,
+    held: std::net::SocketAddr,
     unsaved: Option<std::net::SocketAddr>,
     error: &std::io::Error,
 ) -> String {
     format!(
         "http: managed configuration save failed and the BNC listener could not be restored to \
-         {previous}: {error}; it is {} — restart or save the configuration again to reconcile",
+         {held}: {error}; it is {} — restart or save the configuration again to reconcile",
         match unsaved {
             Some(address) => format!("still bound to the unsaved {address}"),
             None => "stopped, which no saved revision records".to_string(),
@@ -1725,7 +2026,7 @@ pub(super) async fn admin_create_network(
             return problem(
                 StatusCode::BAD_REQUEST,
                 "Invalid network configuration",
-                Some(detail),
+                Some(&detail),
             );
         }
     };
@@ -1752,24 +2053,49 @@ pub(super) async fn admin_create_network(
         return master_key_required("Upstream credentials");
     }
     let name = network.name.clone();
-    mutate_managed_configuration(&state, &actor, revision, move |settings| {
-        reject_bootstrap_credential_change(settings, "network")?;
-        let sealed_account = if kind.account_is_secret() {
-            seal_configuration_secret(sasl_account, key.as_ref())?
-        } else {
-            sasl_account
-        };
-        let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
-        let sealed_server_password = seal_configuration_secret(server_password, key.as_ref())?;
-        settings.networks.push(crate::config::NetworkEntry {
-            sasl_account: sealed_account,
-            sasl_password: sealed_password,
-            server_password: sealed_server_password,
-            ..network
-        });
-        Ok(format!("added server network {name}"))
-    })
-    .await
+    // On the registry lane, where an account's own network is created: an
+    // account's stored network and the operator's configured one can then
+    // never be saved under one key, whichever of the two came first.
+    let registry = super::registry_of(&state).clone();
+    registry
+        .mutate(move |_lane| async move {
+            if let Some(owner) = network.owner.as_deref() {
+                match crate::db::get_bnc_network(pool_of(&state), owner, &name).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        return problem(
+                            StatusCode::CONFLICT,
+                            "Network name in use",
+                            Some(&format!(
+                                "{owner} already has a network named '{name}'; a configured \
+                                 network for that account needs another name."
+                            )),
+                        );
+                    }
+                    Err(error) => return admin_db_error("network owner lookup", error),
+                }
+            }
+            mutate_managed_configuration(&state, &actor, revision, move |settings| {
+                reject_bootstrap_credential_change(settings, "network")?;
+                let sealed_account = if kind.account_is_secret() {
+                    seal_configuration_secret(sasl_account, key.as_ref())?
+                } else {
+                    sasl_account
+                };
+                let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
+                let sealed_server_password =
+                    seal_configuration_secret(server_password, key.as_ref())?;
+                settings.networks.push(crate::config::NetworkEntry {
+                    sasl_account: sealed_account,
+                    sasl_password: sealed_password,
+                    server_password: sealed_server_password,
+                    ..network
+                });
+                Ok(format!("added server network {name}"))
+            })
+            .await
+        })
+        .await
 }
 
 pub(super) async fn admin_delete_network(
@@ -1989,11 +2315,7 @@ async fn mutate_managed_configuration(
     };
     let mut current = config.write().await;
     if current.revision != revision {
-        return problem(
-            StatusCode::CONFLICT,
-            "Configuration revision conflict",
-            Some("Reload the configuration and retry with its current revision."),
-        );
+        return stale_configuration_revision();
     }
     let mut settings = current.settings.clone();
     let detail = match change(&mut settings) {
@@ -2013,29 +2335,40 @@ async fn mutate_managed_configuration(
             Some(&error.to_string()),
         );
     }
-    match crate::db::save_managed_config(
+    match crate::db::save_managed_config_over(
         pool_of(state),
-        revision,
+        &mut current,
         &settings,
         &crate::db::AuditPrincipal::account(actor),
         &format!("{detail}; restart required"),
     )
     .await
     {
-        Ok(snapshot) => {
-            *current = snapshot.clone();
-            admin_json(RevisionMessageResponse {
-                revision: snapshot.revision,
-                message: detail,
-            })
-        }
-        Err(crate::db::DbError::StaleServerSettings) => problem(
-            StatusCode::CONFLICT,
-            "Configuration revision conflict",
-            Some("Reload the configuration and retry with its current revision."),
-        ),
-        Err(error) => admin_db_error("operator configuration", error),
+        Ok(snapshot) => admin_json(RevisionMessageResponse {
+            revision: snapshot.revision,
+            message: detail,
+        }),
+        Err(error) => managed_configuration_save_refused(error),
     }
+}
+
+/// Why a managed-configuration revision was not saved, the same for every
+/// endpoint that saves one: a revision another writer advanced first is the
+/// documented `409` conflict (reload and retry), anything else the database's
+/// `503`.
+fn managed_configuration_save_refused(error: crate::db::DbError) -> Response {
+    match error {
+        crate::db::DbError::StaleServerSettings => stale_configuration_revision(),
+        error => admin_db_error("managed configuration", error),
+    }
+}
+
+fn stale_configuration_revision() -> Response {
+    problem(
+        StatusCode::CONFLICT,
+        "Configuration revision conflict",
+        Some("Reload the configuration and retry with its current revision."),
+    )
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -2081,17 +2414,17 @@ pub(super) fn validate_registered_channel_directory_query(
         "Invalid registered-channel cursor",
         "The before_id cursor must be a positive registered-channel id.",
     )?;
-    let name = printable_exact_filter(
+    let name = exact_filter(
         params.name,
+        "name",
         crate::sanitize::CHANNELLEN,
         "Invalid registered-channel filter",
-        "The exact channel name must contain 1–50 printable bytes.",
     )?;
-    let founder = printable_exact_filter(
+    let founder = exact_filter(
         params.founder,
+        "founder",
         MAX_ACCOUNT_LEN,
         "Invalid registered-channel filter",
-        "The exact founder name must contain 1–64 printable bytes.",
     )?;
     Ok(ValidatedRegisteredChannelDirectoryQuery {
         page_size,
@@ -2180,8 +2513,8 @@ pub(super) fn validate_server_ban_directory_query(
         "Invalid server-ban cursor",
         "The before_id cursor must be a positive server-ban id.",
     )?;
-    let kind = match params.kind.as_deref().map(str::trim) {
-        None | Some("") => None,
+    let kind = match params.kind.as_deref() {
+        None => None,
         Some(kind @ ("kline" | "dline" | "xline")) => Some(kind.to_owned()),
         Some(_) => {
             return Err(problem(
@@ -2192,11 +2525,11 @@ pub(super) fn validate_server_ban_directory_query(
             .into());
         }
     };
-    let mask = printable_exact_filter(
+    let mask = exact_filter(
         params.mask,
+        "mask",
         e6irc_proto::message::MAX_LINE_LEN,
         "Invalid server-ban filter",
-        "The exact mask must contain 1–512 printable bytes.",
     )?;
     Ok(ValidatedServerBanDirectoryQuery {
         page_size,
@@ -2389,31 +2722,6 @@ impl ValidatedAuditQuery {
     }
 }
 
-fn audit_filter(
-    value: Option<String>,
-    name: &str,
-    maximum: usize,
-) -> ResponseResult<Option<String>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if value.chars().count() > maximum || value.chars().any(char::is_control) {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid audit filter",
-            Some(&format!(
-                "The exact {name} filter must contain 1–{maximum} printable characters."
-            )),
-        )
-        .into());
-    }
-    Ok(Some(value.to_owned()))
-}
-
 pub(super) fn validate_audit_query(
     params: AuditQuery,
     default_limit: usize,
@@ -2433,9 +2741,24 @@ pub(super) fn validate_audit_query(
     Ok(ValidatedAuditQuery {
         page_size,
         before_id,
-        actor: audit_filter(params.actor, "actor", 128)?,
-        action: audit_filter(params.action, "action", 64)?,
-        target: audit_filter(params.target, "target", 512)?,
+        actor: exact_filter(
+            params.actor,
+            "actor",
+            AUDIT_ACTOR_FILTER_CHARS,
+            "Invalid audit filter",
+        )?,
+        action: exact_filter(
+            params.action,
+            "action",
+            AUDIT_ACTION_FILTER_CHARS,
+            "Invalid audit filter",
+        )?,
+        target: exact_filter(
+            params.target,
+            "target",
+            AUDIT_TARGET_FILTER_CHARS,
+            "Invalid audit filter",
+        )?,
     })
 }
 
@@ -2531,13 +2854,78 @@ mod admin_query_tests {
         assert!(serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1}"#).is_err());
     }
 
+    /// Every directory's exact filter is one rule: a blank or whitespace-only
+    /// value is a 400 naming the parameter (it used to read as "no filter" and
+    /// return every row), surrounding whitespace is refused rather than
+    /// trimmed into another value, and the bound counts characters, as the
+    /// contract's `maxLength` does.
+    #[test]
+    fn exact_filters_refuse_blank_and_untrimmed_values_and_count_characters() {
+        for blank in ["", " ", "\u{3000}", " alice", "alice "] {
+            let refused =
+                exact_filter(Some(blank.into()), "name", 64, "Invalid filter").expect_err(blank);
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{blank:?}");
+        }
+        assert_eq!(
+            exact_filter(None, "name", 64, "Invalid filter").ok(),
+            Some(None)
+        );
+        let wide = "é".repeat(64);
+        assert_eq!(
+            exact_filter(Some(wide.clone()), "name", 64, "Invalid filter").ok(),
+            Some(Some(wide)),
+            "64 two-byte characters are 64 characters"
+        );
+        assert!(exact_filter(Some("é".repeat(65)), "name", 64, "Invalid filter").is_err());
+        for params in [
+            AuditQuery {
+                actor: Some("  ".into()),
+                ..AuditQuery::default()
+            },
+            AuditQuery {
+                target: Some(String::new()),
+                ..AuditQuery::default()
+            },
+        ] {
+            assert!(validate_audit_query(params, 100).is_err());
+        }
+        assert!(
+            validate_server_ban_directory_query(
+                ServerBanDirectoryQuery {
+                    kind: Some(String::new()),
+                    ..ServerBanDirectoryQuery::default()
+                },
+                100
+            )
+            .is_err(),
+            "a blank closed-set filter is refused too"
+        );
+    }
+
+    /// A revision another writer advanced first is the documented 409 on
+    /// every managed-configuration save; the scalar PATCH once answered 503.
+    #[test]
+    fn a_stale_configuration_save_is_a_conflict_on_every_endpoint() {
+        assert_eq!(
+            managed_configuration_save_refused(crate::db::DbError::StaleServerSettings).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            managed_configuration_save_refused(crate::db::DbError::InvalidServerSettings(
+                "corrupt".into()
+            ))
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     #[test]
     fn account_directory_query_validation_preserves_exact_bounded_values() {
         let query = validate_account_directory_query(
             AccountDirectoryQuery {
                 limit: Some(25),
                 before_id: Some(42),
-                name: Some(" Alice ".into()),
+                name: Some("Alice".into()),
             },
             100,
         )
@@ -2581,8 +2969,8 @@ mod admin_query_tests {
             RegisteredChannelDirectoryQuery {
                 limit: Some(25),
                 before_id: Some(42),
-                name: Some(" #Ops ".into()),
-                founder: Some(" Alice ".into()),
+                name: Some("#Ops".into()),
+                founder: Some("Alice".into()),
             },
             100,
         )
@@ -2624,7 +3012,7 @@ mod admin_query_tests {
                 limit: Some(25),
                 before_id: Some(42),
                 kind: Some("kline".into()),
-                mask: Some(" Baddie@Host ".into()),
+                mask: Some("Baddie@Host".into()),
             },
             100,
         )
@@ -2665,7 +3053,7 @@ mod admin_query_tests {
             AuditQuery {
                 limit: Some(25),
                 before_id: Some(42),
-                actor: Some(" alice ".into()),
+                actor: Some("alice".into()),
                 action: Some("KLINE".into()),
                 target: Some("user@host".into()),
             },
@@ -2782,12 +3170,53 @@ mod token_request_tests {
         );
     }
 
-    #[test]
-    fn device_requests_reject_unknown_fields() {
+    /// A form body as the device endpoints extract it.
+    async fn oauth_form<T: serde::de::DeserializeOwned + Send>(body: &'static str) -> Option<T> {
+        use axum::extract::FromRequest;
+        let request = axum::http::Request::post("/")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        Form::<T>::from_request(request, &())
+            .await
+            .ok()
+            .map(|form| form.0)
+    }
+
+    /// RFC 6749 §3.1: an OAuth endpoint ignores parameters it does not
+    /// define, and refuses one sent twice.
+    #[tokio::test]
+    async fn device_oauth_forms_ignore_unknown_parameters_and_refuse_repeated_ones() {
+        let form: DeviceTokenForm = oauth_form(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code\
+             &device_code=code&client_id=e6irc-cli&extension=1",
+        )
+        .await
+        .expect("an unknown parameter is ignored");
+        assert_eq!(form.device_code.as_deref(), Some("code"));
+        assert_eq!(form.grant_type.as_deref(), Some(DEVICE_CODE_GRANT_TYPE));
         assert!(
-            serde_json::from_str::<DeviceTokenReq>(r#"{"device_code":"code","extra":true}"#)
-                .is_err()
+            oauth_form::<DeviceTokenForm>("device_code=a&device_code=b")
+                .await
+                .is_none()
         );
+        assert!(
+            oauth_form::<DeviceStartForm>("client_id=a&client_id=b")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            oauth_parameter(Some(String::new())),
+            None,
+            "empty is omitted"
+        );
+    }
+
+    #[test]
+    fn device_approval_rejects_unknown_fields() {
         assert!(
             serde_json::from_str::<DeviceApproveReq>(r#"{"user_code":"ABCD-EFGH","extra":true}"#)
                 .is_err()
@@ -2811,10 +3240,21 @@ mod token_request_tests {
 
         let token = serde_json::to_string(&DeviceTokenResponse {
             access_token: "secret".into(),
-            token_type: "bearer",
+            token_type: "Bearer",
+            expires_in: 2_592_000,
+            scope: device_scope(),
         })
         .unwrap();
-        assert_eq!(token, r#"{"access_token":"secret","token_type":"bearer"}"#);
+        assert_eq!(
+            token,
+            r#"{"access_token":"secret","token_type":"Bearer","expires_in":2592000,"scope":"read write irc"}"#
+        );
+        let error = serde_json::to_string(&DeviceErrorResponse {
+            error: "slow_down",
+            error_description: None,
+        })
+        .unwrap();
+        assert_eq!(error, r#"{"error":"slow_down"}"#);
     }
 }
 

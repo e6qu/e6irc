@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Prove the native packager's members, modes, and reproducibility."""
+"""Prove the native packager's members, modes, and reproducibility, and that
+the release smoke run rejects a binary that does not run or misreports itself.
+
+The binaries here are stand-ins: text files for the packager, which only copies
+them, and POSIX shell scripts for the smoke run, which executes them. The real
+binaries are executed by the same smoke script on each target's own runner in
+release.yml."""
 
 from __future__ import annotations
 
@@ -14,6 +20,8 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PACKAGER = ROOT / "tools/package-native-release.py"
+SMOKE = ROOT / "tools/smoke-native-release.py"
+REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def workspace_version() -> str:
@@ -108,6 +116,88 @@ def assert_zip(path: pathlib.Path, prefix: str) -> None:
         assert all(member.date_time == (1980, 1, 1, 0, 0, 0) for member in members.values())
 
 
+def populate_executables(
+    target_directory: pathlib.Path, target: str, lines: dict[str, str], status: int = 0
+) -> None:
+    """Shell-script stand-ins that print `lines[binary]` for `--version`."""
+    for profile, binary in (
+        ("release", "e6ircd"),
+        ("release-client", "e6irc"),
+        ("release-client", "e6irc-tui"),
+    ):
+        path = target_directory / target / profile / binary
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "#!/bin/sh\n"
+            '[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 64\n'
+            f"printf '%s\\n' '{lines[binary]}'\n"
+            f"exit {status}\n"
+        )
+        path.chmod(0o755)
+
+
+def run_smoke(target_directory: pathlib.Path, target: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            str(SMOKE),
+            "--target",
+            target,
+            "--target-directory",
+            str(target_directory),
+            "--revision",
+            REVISION,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+
+def smoke_checks(root: pathlib.Path, version: str) -> None:
+    target = "x86_64-unknown-linux-gnu"
+    honest = {
+        "e6ircd": f"e6ircd {version} (revision {REVISION})",
+        "e6irc": f"e6irc {version}",
+        "e6irc-tui": f"e6irc-tui {version}",
+    }
+    directory = root / "smoke-honest"
+    populate_executables(directory, target, honest)
+    result = run_smoke(directory, target)
+    assert result.returncode == 0, result.stderr
+    for binary, line in honest.items():
+        assert f"{binary}: {line}" in result.stdout, (binary, result.stdout)
+
+    for case, lines, status, named in (
+        ("a wrong version", {**honest, "e6irc": "e6irc 0.0.0-other"}, 0, "e6irc:"),
+        (
+            "a daemon built from another revision",
+            {**honest, "e6ircd": f"e6ircd {version} (revision unknown)"},
+            0,
+            "e6ircd:",
+        ),
+        ("a binary that fails", honest, 3, "exited 3"),
+    ):
+        directory = root / f"smoke-{case.replace(' ', '-')}"
+        populate_executables(directory, target, lines, status)
+        result = run_smoke(directory, target)
+        assert result.returncode != 0, f"smoke passed {case}"
+        assert named in result.stderr, (case, result.stderr)
+
+    missing = root / "smoke-missing"
+    populate_executables(missing, target, honest)
+    (missing / target / "release-client" / "e6irc-tui").unlink()
+    result = run_smoke(missing, target)
+    assert result.returncode != 0 and "e6irc-tui: did not run" in result.stderr, result.stderr
+
+    bad_revision = subprocess.run(
+        [str(SMOKE), "--target", target, "--revision", "unknown"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert bad_revision.returncode != 0 and "--revision" in bad_revision.stderr
+
+
 def main() -> None:
     version = workspace_version()
     with tempfile.TemporaryDirectory(prefix="e6irc-native-package-") as temporary:
@@ -124,6 +214,7 @@ def main() -> None:
             prefix = f"e6irc-{version}-{target}"
             assertion(first, prefix)
             assert digest(first) == digest(second), f"{target} archive is not reproducible"
+        smoke_checks(root, version)
     print("native release package test passed")
 
 

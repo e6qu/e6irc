@@ -48,7 +48,10 @@ and `console_configuration_enables_and_persists_bnc_listener`.
 ## Add Libera Chat, OFTC, Snoonet, or a custom IRC network
 
 **Actor and goal.** An account holder wants an always-on upstream configured
-from the chat client or **Your networks** in the console.
+from the chat client. The console's **Your networks** page lists networks and
+points to the chat client to add or configure one; bridges are added on
+`/console/integrations` ([Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge)
+covers them).
 
 **Preconditions.** PostgreSQL and the network registry are ready, the caller
 has a browser session, and a master key is configured if upstream SASL
@@ -56,10 +59,9 @@ credentials are supplied.
 
 **Flow.**
 
-The chat client carries the everyday path. Both it and the console read one
-server-side catalog of known networks (`GET /api/v1/network-presets` and the
-console's rendered select are the same constant) and ask for the same things in
-the same words.
+The chat client carries the path. Its dialog reads the server-side catalog of
+known networks (`GET /api/v1/network-presets`, the `IRC_NETWORK_PRESETS`
+constant) rather than keeping a copy of its own.
 
 1. In the chat client choose **+** beside **Networks**, or **Add a network** on
    an empty account. The dialog opens in place.
@@ -89,14 +91,13 @@ the same words.
    states follow the server; a network that is not connected quotes the
    upstream's own reason beside its settings control.
 
-The console at `/console/networks` offers the same form plus **Test
-connection** and the bridge drivers. **Test connection** is optional: the
+The same dialog offers **Test connection**, which is optional: the
 owner-scoped preflight uses the production resolver, prohibited-address
 vetting, TCP/TLS connector, optional SASL, and IRC registration path, renders
 DNS, connect, and registration timings, the confirmed nickname, and vetted
-address count without inserting a row or starting a reconnect loop, temporarily
-joins every configured channel, and says `QUIT` when it is done. It never gates
-**Add network**.
+address count without inserting a row or starting a reconnect loop, joins no
+channel (the requested ones are only validated), and says `QUIT` when it is
+done. It never gates **Save**.
 
 **Visible failures and recovery.**
 
@@ -105,8 +106,8 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
   identifier, so an edited or stale choice is validated exactly like hand-typed
   values and cannot select anything the fields do not say.
 - Invalid network ID, endpoint, nickname, channel list, TLS policy, or
-  credential pair re-renders the form with the specific error and non-secret
-  values preserved.
+  credential pair keeps the dialog open with the typed values, shows the
+  server's specific error, and marks the field at fault.
 - Missing secret key refuses a supplied password before persistence.
 - Duplicate owner/network names conflict under IRC casemapping.
 - **Test connection** answers `429` with `Retry-After` while the same account
@@ -130,9 +131,13 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
 - Rejected credentials park the driver on the first rejection: a retry would
   re-send the same password and count against the account on the upstream.
   Saving corrected or removed credentials restarts it.
-- A taken nickname is never replaced with an invented one. The row says the
-  nickname is in use, quotes the network, and offers the two repairs: choose
-  another nickname in settings, or wait for the old session to time out.
+- A taken nickname is never run under an invented one. The driver waits for
+  it under one alternative, joining and sending nothing (see
+  [Come back after a crash or a standby's takeover](#come-back-after-a-crash-or-a-standbys-takeover));
+  when the alternative is taken too, or the nickname stays held, the row says
+  the nickname is in use, quotes the network, and offers the two repairs:
+  choose another nickname in settings, or wait for the old session to time
+  out.
 - Any other registration refusal retries after 30s, 1m, 2m, and 4m and shows
   the upstream's own sanitized reason and the next attempt time for the whole
   wait. What happens next follows the three retry policies of DESIGN §10.3. A
@@ -181,8 +186,8 @@ API against PostgreSQL.
 The production IRC-driver preflight has a real local registration oracle.
 `console_networks_page_lists_the_callers_networks` proves the rendered
 **Your networks** page against PostgreSQL. In `tools/test-oidc-browser.mjs`
-Chromium, Firefox, and WebKit each find **Add network** enabled before any
-test, run the optional **Test connection** against a local live upstream and
+Chromium, Firefox, and WebKit each find the chat dialog's **Save** enabled
+before any test, run the optional **Test connection** against a local live upstream and
 see that it created nothing, then add the network and watch it join and
 replay; `web/test/visual.spec.js` proves in Chromium that a known network is
 added from a nickname alone, with no forced test.
@@ -287,7 +292,9 @@ monitoring; live runtime diagnosis remains tied to the registry.
 
 1. The network list reads `GET /api/v1/me/networks` and shows
    enabled/disabled, connecting/connected/disconnected, driver kind, upstream,
-   attached clients, and error count.
+   attached clients, and error count. A network the server configuration
+   defines for the account is listed too (`configured: true`), with no
+   enable, edit, or remove control: it is the operator's.
 2. **Inspect** shows configuration without returning the stored secret.
 3. **Operations** refreshes the live snapshot: attempt/success/disconnect
    timestamps, the scheduled time of the next reconnect attempt while the
@@ -316,6 +323,65 @@ owner’s backlog rather than metrics or global logs.
 **Evidence.** Snapshot/accounting/error-ledger behavior is unit-tested; the
 owner-scoped typed Operations API and its browser rendering are HTTP- and
 Chromium-tested; monitoring aggregation/history is tested at HTTP/DB level.
+
+## Come back after a crash or a standby's takeover
+
+**Actor and goal.** An account holder whose e6ircd process crashed (or whose
+standby took over from it) wants each IRC network back under its configured
+nickname, with its channels, without doing anything.
+
+**Preconditions.** An `irc` network was connected when the process died, so
+the upstream still holds a ghost of that session — the configured nickname —
+until its ping timeout reaps it. The network may or may not have a NickServ
+account (SASL) configured.
+
+**Flow.**
+
+1. The new process dials; the upstream answers the configured nickname with
+   433. The driver registers under its one alternative (`bncbot_`, or the
+   configured nickname with its last character replaced when appending could
+   exceed the upstream's NICKLEN).
+2. The row reads **regaining nickname**, and the runtime snapshot and a
+   `*bnc*` notice say `connected as bncbot_, regaining bncbot`. Nothing is
+   joined and nothing an attached client types is sent under the alternative;
+   it waits.
+3. With SASL, the driver asks NickServ to `REGAIN` the nickname, and services
+   rename the session back. In every case it watches the nickname — `MONITOR`
+   where the upstream offers it, otherwise `ISON` every 15 s — and takes it
+   with `NICK` as soon as the ghost is gone.
+4. Back under the configured nickname, the driver joins its channels, sends
+   what waited, and the row reads **connected**.
+
+**Visible failures and recovery.**
+
+- NickServ answering that the nickname is another account's (or a 432) ends
+  the attempt at once: the driver says `QUIT` and parks with
+  `nickname_regain_refused` and services' own words; the row tells the owner to
+  choose another nickname or enter that account's credentials.
+- A nickname still held five minutes after registering under the alternative
+  is not a ghost: the driver says `QUIT` and takes the refusal schedule for
+  `nickname_in_use`, with the reason and the next attempt time on the row.
+- An alternative that is taken too is the ordinary `nickname_in_use` refusal.
+- The driver sends at most one `NICK` at a time and waits a poll after a
+  refused one, so no upstream answer can make it loop.
+
+**Security and observability.** The alternative carries no identity: it joins
+nothing and says nothing, and the rename back is recorded as requested rather
+than as `renamed_by_upstream`. The lifecycle, failure code, and bounded
+diagnostic are the same closed runtime vocabulary as every other network state.
+
+**Evidence.** Real-socket driver tests against a scripted upstream that keeps
+the old session: `a_crash_ghost_is_regained_through_nickserv` (REGAIN with
+SASL, nothing joined or sent before the nickname is back),
+`a_ghost_that_times_out_is_regained_through_monitor`,
+`a_ghost_that_times_out_is_regained_through_ison`,
+`a_nickname_services_refuse_to_regain_parks_the_network`,
+`regaining_is_bounded_and_never_loops`, and
+`a_nickname_held_under_its_alternative_too_is_a_refusal`; the client crate's
+`an_offered_alternative_is_taken_once_when_the_nickname_is_in_use`; the regain
+state's unit tests (`the_alternative_fits_every_nicklen_the_configured_nickname_fits`,
+`services_refusal_ends_the_wait_and_other_answers_do_not`); and
+`web/test/client-state.test.js` for the row's wording.
 
 ## Attach any IRC client to an owned network
 

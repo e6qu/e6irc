@@ -10,7 +10,7 @@ claim.
 | IRCv3 client or bot | Same baseline | Negotiates the server's `CAP LS` surface; unsupported requests receive `NAK` | Core capability and Libera-snapshot tests |
 | BNC attach client | SASL PLAIN plus `NICK` and `USER` | `server-time`, `message-tags`, `account-tag`, `echo-message`, `batch`, `draft/chathistory`, `draft/read-marker`, and `cap-notify` (implied by `CAP LS 302`) | PostgreSQL listener and attach journeys |
 | `e6irc` CLI | Anonymous, SASL password (SCRAM-SHA-512/256 or PLAIN, strongest offered), or OAUTHBEARER | `send` requires `echo-message` to confirm delivery; `history` requires `batch draft/chathistory server-time` | Socket, API, executable, and PostgreSQL journeys |
-| `e6irc-tui` | Same authentication paths as the CLI | Requires `batch draft/chathistory server-time`; requires `draft/read-marker` unless disabled | Duplex, fuzz, and pseudo-terminal journeys |
+| `e6irc-tui` | Same authentication paths as the CLI | Requires `batch draft/chathistory server-time` unless history is off (`--history-lines 0`); requires `draft/read-marker` unless disabled (`--no-read-markers`) | Duplex, fuzz, and pseudo-terminal journeys |
 | Web chat | Browser session and `/api/v1` | REST history and `/ws/ui`; it does not depend on IRC `CAP` | Three-engine browser and API-contract journeys |
 
 **BNC attach CAP LS:** `sasl server-time message-tags account-tag echo-message batch draft/chathistory draft/read-marker cap-notify`

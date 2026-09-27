@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use e6irc_queue::Receiver;
 
-use super::upstream_identity::ChannelKey;
+use super::irc_driver::{JoinedChannels, UpstreamControl};
+use super::upstream_identity::AutojoinChannel;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
 use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
 
@@ -56,7 +57,7 @@ pub struct LocalDriver {
     nick: String,
     username: String,
     realname: String,
-    autojoin: Vec<(String, Option<ChannelKey>)>,
+    autojoin: Vec<AutojoinChannel>,
     buffer_cap: usize,
 }
 
@@ -71,11 +72,7 @@ impl LocalDriver {
             nick: config.nick.to_string(),
             username: config.username.to_string(),
             realname: config.realname.as_str().to_string(),
-            autojoin: config
-                .autojoin
-                .iter()
-                .map(|entry| (entry.channel().to_string(), entry.key().cloned()))
-                .collect(),
+            autojoin: config.autojoin,
             buffer_cap: config.buffer_cap,
         }
     }
@@ -86,7 +83,7 @@ impl NetworkDriver for LocalDriver {
         LOCAL_NETWORK
     }
 
-    fn start(self: Box<Self>) -> NetworkHandle {
+    fn prepare(self: Box<Self>) -> super::PreparedDriver {
         let (handle, ends) = NetworkHandle::channels(self.buffer_cap);
         let this = *self;
         let session = LocalSession {
@@ -95,9 +92,9 @@ impl NetworkDriver for LocalDriver {
             username: this.username,
             realname: this.realname,
             autojoin: this.autojoin,
+            joined: JoinedChannels::default(),
         };
-        tokio::spawn(run(session, ends));
-        handle
+        super::PreparedDriver::new(handle, run(session, ends))
     }
 }
 
@@ -107,8 +104,12 @@ struct LocalSession {
     nick: String,
     username: String,
     realname: String,
-    /// The channels to join, keyed ones with their keys, as `JOIN` takes them.
-    autojoin: Vec<(String, Option<ChannelKey>)>,
+    /// The configured channels to join, keyed ones with their keys.
+    autojoin: Vec<AutojoinChannel>,
+    /// The channels the core confirmed this driver in, kept across sessions:
+    /// after a KILL or a GHOST ends one, the next rejoins them as well as the
+    /// configured ones, as the `irc` driver rejoins an upstream's (§10.2).
+    joined: JoinedChannels,
 }
 
 async fn run(session: LocalSession, mut ends: DriverEnds) {
@@ -221,7 +222,7 @@ async fn await_welcome(
             "001" => {
                 let welcomed = message.params.first().cloned().unwrap_or_default();
                 // Before its 005, a network's names compare as RFC 1459 says.
-                let nick = super::irc_driver::configured_nick_was_granted(
+                let nick = super::irc_driver::requested_nick_was_granted(
                     &e6irc_client::NetworkNames::default(),
                     &session.nick,
                     welcomed,
@@ -229,13 +230,18 @@ async fn await_welcome(
                 .map_err(RegistrationRejected)?;
                 return Ok(Welcome { nick, line });
             }
-            "PING" => {
-                let token = message.params.first().cloned().unwrap_or_default();
-                if !lines.say(format!("PONG :{token}")).await {
-                    return Err(Stopped);
+            _ => match super::irc_driver::upstream_control(&message, ends) {
+                Some(UpstreamControl::Answer(answer)) => {
+                    if !lines.say(answer).await {
+                        return Err(Stopped);
+                    }
                 }
-            }
-            _ => ends.emit_line(line),
+                Some(UpstreamControl::Capabilities | UpstreamControl::Consumed) => {}
+                Some(UpstreamControl::Closed(closed)) => {
+                    return Err(super::SessionOutcome::ClosedByUpstream(closed));
+                }
+                None => ends.emit_line(line),
+            },
         }
     }
 }
@@ -321,11 +327,12 @@ async fn drive_session(
         Ok(welcome) => welcome,
         Err(outcome) => return outcome,
     };
-    // Comma-joined within the wire limit, as the IRC driver joins upstream:
-    // the in-process session is metered like any client of the core, so one
-    // JOIN per channel would spend the command-flood burst on a long autojoin
-    // list and wait out its refill before it finished.
-    for line in super::irc_driver::join_lines(&session.autojoin) {
+    // The configured channels and every one the core confirmed before the
+    // session ended, comma-joined within the wire limit, as the IRC driver
+    // rejoins upstream: the in-process session is metered like any client of
+    // the core, so one JOIN per channel would spend the command-flood burst on
+    // a long list and wait out its refill before it finished.
+    for line in super::irc_driver::join_lines(&session.joined.rejoin(&session.autojoin)) {
         if !lines.say(line).await {
             return Stopped;
         }
@@ -333,7 +340,7 @@ async fn drive_session(
     // `message-tags` is on: client-only tags are relayed, as to any upstream
     // that carries them.
     ends.set_client_tags(super::ClientTags::Relayed);
-    ends.begin_irc_session(welcome.nick);
+    ends.begin_irc_session(welcome.nick.clone());
     ends.emit(ConnectionEvent::Connected);
     if ends.emit_session_line(welcome.line).is_err() {
         return super::SessionOutcome::Dropped(super::NetworkFailure::ChannelLimitExceeded);
@@ -342,6 +349,12 @@ async fn drive_session(
     // in order, like any server; see `super::replies`.
     let mut router = super::replies::ReplyRouter::default();
     let mut echoes = super::irc_driver::UpstreamEchoes::default();
+    let mut requested_nicks = super::irc_driver::RequestedNicks::default();
+    let mut identity = super::irc_driver::SelfIdentity {
+        nick: welcome.nick.clone(),
+        user: session.username.clone(),
+        host: LOCAL_SESSION_HOST.to_string(),
+    };
 
     loop {
         // Past the session's command allowance, the attachments' commands
@@ -360,35 +373,36 @@ async fn drive_session(
                     let message = e6irc_proto::message::Message::parse(&line)
                         .ok()
                         .map(|parsed| e6irc_client::OwnedMessage::from(&parsed));
-                    match message.as_ref().map(|message| message.command.as_str()) {
-                        // The in-process session is a real registered session,
-                        // so the liveness reaper PINGs it after ~2 min idle.
-                        // There is no network peer to answer, so answer here —
-                        // otherwise the reaper times out and drops the session
-                        // every few minutes, churning this always-on network
-                        // (spurious dis/reconnect notices, NICK/JOIN replay).
-                        // The PING is internal keepalive, not conversation, so
-                        // it is not shown in the buffer.
-                        Some("PING") => {
-                            let token = message
-                                .as_ref()
-                                .and_then(|message| message.params.first().cloned())
-                                .unwrap_or_default();
-                            if !lines.say(format!("PONG :{token}")).await {
+                    // The in-process session is a real registered session, so
+                    // the liveness reaper PINGs it after ~2 min idle, and the
+                    // core ends it with `ERROR` on a KILL, a GHOST or a ban:
+                    // the session's own business, read as the `irc` driver
+                    // reads an upstream's, never an attached client's line.
+                    match message
+                        .as_ref()
+                        .and_then(|message| super::irc_driver::upstream_control(message, ends))
+                    {
+                        Some(UpstreamControl::Answer(answer)) => {
+                            if !lines.say(answer).await {
                                 return Stopped;
                             }
                             continue;
                         }
-                        // Capabilities are this session's negotiation with the
-                        // core; an attached client negotiated its own with the
-                        // bouncer and would act on these against the wrong hop.
-                        Some("CAP") => continue,
-                        _ => {}
+                        Some(UpstreamControl::Capabilities | UpstreamControl::Consumed) => continue,
+                        Some(UpstreamControl::Closed(closed)) => {
+                            return super::SessionOutcome::ClosedByUpstream(closed);
+                        }
+                        None => {}
                     }
-                    let own_nick = ends
-                        .irc_session_snapshot()
-                        .map(|snapshot| snapshot.nick)
-                        .unwrap_or_default();
+                    if let Some(message) = &message {
+                        super::irc_driver::follow_membership(
+                            ends,
+                            &session.joined,
+                            message,
+                            &ends.names(),
+                        );
+                    }
+                    let own_nick = identity.nick.clone();
                     let classified = match &message {
                         Some(message) => router.classify(
                             message,
@@ -426,7 +440,15 @@ async fn drive_session(
                                 ),
                                 None => ends.emit_session_line(line),
                             };
-                            if emitted.is_err() {
+                            if super::irc_driver::track(
+                                ends,
+                                &session.joined,
+                                &mut identity,
+                                &mut requested_nicks,
+                                emitted,
+                            )
+                            .is_err()
+                            {
                                 return super::SessionOutcome::Dropped(
                                     super::NetworkFailure::ChannelLimitExceeded,
                                 );
@@ -443,9 +465,15 @@ async fn drive_session(
             // Downstream command -> core.
             cmd = ends.next_command(), if blocked.is_none() => match cmd {
                 Some(cmd) => {
-                    let Some(line) = super::carriable(&cmd, super::ClientTags::Relayed, ends) else {
+                    let Some(line) = super::irc_driver::outgoing(
+                        &cmd,
+                        super::ClientTags::Relayed,
+                        ends,
+                        &session.joined,
+                    ) else {
                         continue;
                     };
+                    requested_nicks.observe(&line);
                     let written = router.forward(
                         cmd.origin,
                         &line,
@@ -485,6 +513,31 @@ mod tests {
         })
     }
 
+    fn core_handles(core_tx: Sender<Input>) -> CoreHandles {
+        CoreHandles {
+            core_tx: CoreIngress::single(core_tx),
+            next_conn: Arc::new(ConnectionIdAllocator::new(std::num::NonZeroU64::MIN)),
+            sendq_bytes: 8 * 512,
+        }
+    }
+
+    fn local_session(core_tx: Sender<Input>, autojoin: Vec<String>) -> LocalSession {
+        LocalSession {
+            core: core_handles(core_tx),
+            nick: "alice".into(),
+            username: "ident".into(),
+            realname: "Alice".into(),
+            autojoin: autojoin
+                .into_iter()
+                .map(|channel| {
+                    AutojoinChannel::from_entry(&super::super::AutojoinEntry { channel, key: None })
+                        .expect("a valid autojoin channel")
+                })
+                .collect(),
+            joined: JoinedChannels::default(),
+        }
+    }
+
     fn spawn_session(
         core_tx: Sender<Input>,
         autojoin: Vec<String>,
@@ -493,20 +546,7 @@ mod tests {
         broadcast::Receiver<super::super::DriverEvent>,
         tokio::task::JoinHandle<super::super::SessionOutcome>,
     ) {
-        let session = LocalSession {
-            core: CoreHandles {
-                core_tx: CoreIngress::single(core_tx),
-                next_conn: Arc::new(ConnectionIdAllocator::new(std::num::NonZeroU64::MIN)),
-                sendq_bytes: 8 * 512,
-            },
-            nick: "alice".into(),
-            username: "ident".into(),
-            realname: "Alice".into(),
-            autojoin: autojoin
-                .into_iter()
-                .map(|channel| (channel, None))
-                .collect(),
-        };
+        let session = local_session(core_tx, autojoin);
         let (handle, mut ends) = NetworkHandle::channels(8);
         let events = handle.subscribe();
         let task = tokio::spawn(async move { session_once(&session, &mut ends).await });
@@ -692,16 +732,14 @@ mod tests {
 
     #[tokio::test]
     async fn autojoin_failure_stops_before_connected() {
-        // Two channel names too long to share one 510-byte JOIN line make two
-        // lines; capacity one lets the first fill the queue and park the second.
-        // Closing the receiver then deterministically fails auto-join.
+        // Nine 60-byte channel names cannot share one 510-byte JOIN line, so
+        // they make two; capacity one lets the first fill the queue and park
+        // the second. Closing the receiver then deterministically fails
+        // auto-join.
         let (core_tx, mut core_rx) = core_queue(1);
         let (_handle, mut events, task) = spawn_session(
             core_tx.clone(),
-            vec![
-                format!("#{}", "r".repeat(300)),
-                format!("#{}", "o".repeat(300)),
-            ],
+            (0..9).map(|n| format!("#{n}{}", "r".repeat(58))).collect(),
         );
         let out_tx = finish_registration(&mut core_rx).await;
         core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
@@ -836,9 +874,9 @@ mod tests {
             core_says(&out_tx, &barrier).await;
             assert_eq!(next_echo(&mut events).await, (echoed.to_string(), 3));
         }
-        let (_, welcome) =
-            super::super::serve::welcome("bnc.test", LOCAL_NETWORK, &handle, "alice".into());
-        let welcome = welcome.join("\n");
+        let welcome = super::super::serve::welcome_to("bnc.test", LOCAL_NETWORK, &handle, "alice")
+            .lines
+            .join("\n");
         assert!(!welcome.contains("CLIENTTAGDENY=*"), "{welcome}");
     }
 
@@ -869,6 +907,102 @@ mod tests {
         core_says(&out_tx, echo).await;
         core_says(&out_tx, &barrier).await;
         assert_eq!(next_echo(&mut events).await, (echo.to_string(), 4));
+    }
+
+    /// The core ends the in-process session with `ERROR` on a KILL, a
+    /// NickServ GHOST or REGAIN, a K- or D-line. The line used to be relayed
+    /// like conversation: every attached client read an `ERROR` as the end of
+    /// its own connection (several reconnect on it), and the backlog replayed
+    /// it on every attach after. It is the session's end, said as a notice.
+    #[tokio::test]
+    async fn the_cores_error_ends_the_session_and_reaches_no_client() {
+        let (_core_rx, handle, mut events, task, out_tx) = connected_session().await;
+        core_says(&out_tx, "ERROR :Closing Link: local (Killed (oper (bye)))").await;
+        let super::super::SessionOutcome::ClosedByUpstream(closed) = stopped(task).await else {
+            panic!("the core's ERROR is the session's end");
+        };
+        assert_eq!(
+            closed.diagnostic(),
+            "Closing Link: local (Killed (oper (bye)))"
+        );
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Some(line) = event.display_line() {
+                published.push(line.to_string());
+            }
+        }
+        let backlog = handle.buffer_snapshot();
+        for line in published.iter().chain(&backlog) {
+            assert!(!line.contains("ERROR"), "{line}");
+        }
+        assert!(
+            backlog.iter().any(|line| line.ends_with(
+                ":*bnc* NOTICE * :upstream closed the link: Closing Link: local (Killed (oper (bye)))"
+            )),
+            "{backlog:?}"
+        );
+    }
+
+    /// A session the core ended (a KILL, a GHOST) is followed by one that
+    /// rejoins every channel the core had confirmed, not only the configured
+    /// ones: a channel joined at runtime used to be lost to the first KILL,
+    /// where the `irc` driver rejoins an upstream's.
+    #[tokio::test]
+    async fn a_session_after_a_kill_rejoins_the_channels_joined_at_runtime() {
+        let (core_tx, mut core_rx) = core_queue(16);
+        let session = local_session(core_tx, vec!["#configured".into()]);
+        let (_handle, mut ends) = NetworkHandle::channels(64);
+        let task = tokio::spawn(async move {
+            let first = session_once(&session, &mut ends).await;
+            let second = session_once(&session, &mut ends).await;
+            (first, second)
+        });
+        let out_tx = finish_registration(&mut core_rx).await;
+        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let Input::Line { line, .. } = core_rx.pop().await.expect("join").payload else {
+            panic!("expected the autojoin line");
+        };
+        assert_eq!(String::from_utf8(line).unwrap(), "JOIN #configured");
+        core_says(&out_tx, ":alice!ident@local JOIN #configured").await;
+        core_says(&out_tx, ":alice!ident@local JOIN #Runtime").await;
+        core_says(&out_tx, "ERROR :Closing Link: local (Killed (oper (bye)))").await;
+        assert!(matches!(
+            core_rx.pop().await.expect("close").payload,
+            Input::Closed { .. }
+        ));
+        let out_tx = finish_registration(&mut core_rx).await;
+        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let Input::Line { line, .. } = core_rx.pop().await.expect("rejoin").payload else {
+            panic!("expected the rejoin line");
+        };
+        assert_eq!(
+            String::from_utf8(line).unwrap(),
+            "JOIN #configured,#Runtime"
+        );
+        task.abort();
+    }
+
+    /// A prepared driver has done nothing: whoever starts it subscribes first
+    /// and receives everything it says. The core session is opened only once
+    /// the task runs.
+    #[tokio::test]
+    async fn a_prepared_driver_says_nothing_until_it_is_launched() {
+        let (core_tx, mut core_rx) = core_queue(16);
+        let driver = Box::new(LocalDriver::new(
+            core_handles(core_tx),
+            NetworkConfig::default(),
+        ));
+        let (handle, run) = driver.prepare().split();
+        let mut events = handle.subscribe();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(core_rx.depth(), 0, "no core session before the task runs");
+        run.spawn();
+        assert!(matches!(
+            core_rx.pop().await.expect("open").payload,
+            Input::Open { .. }
+        ));
+        drop(events.try_recv());
+        handle.shutdown();
     }
 
     #[tokio::test]

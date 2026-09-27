@@ -101,9 +101,9 @@ test("storage denial is explicit on read and write", () => {
 
 test("network projection preserves the closed API state", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
-  const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
+  const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null, configured: false };
   assert.deepEqual(networksFrom({ networks: [offline] }), [
-    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, failureCode: null, failureDetail: null, runtime: null },
+    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, configured: false, state: null, failureCode: null, failureDetail: null, runtime: null },
   ]);
   assert.deepEqual(
     networksFrom({ networks: [{ ...offline, connected: false, runtime: {
@@ -116,6 +116,7 @@ test("network projection preserves the closed API state", () => {
       nick: "alice",
       enabled: true,
       connected: false,
+      configured: false,
       state: "registration_failed",
       failureCode: "registration_rejected",
       failureDetail: "Closing Link: (SASL access only)",
@@ -224,6 +225,23 @@ test("a refusal quotes the network's own reason, while retrying as well as once 
   assert.match(
     networkStateHelp({ state: "reconnecting", failureCode: "nickname_in_use", failureDetail: null }),
     /nickname is in use/,
+  );
+});
+
+// Regaining the nickname is progress, not a refusal: the row says which name
+// the bouncer holds meanwhile, in its own words rather than the network's.
+test("a network regaining its nickname says so and which name it holds", () => {
+  const help = networkStateHelp({
+    state: "regaining_nickname",
+    failureCode: "nickname_in_use",
+    failureDetail: "connected as alice_, regaining alice",
+  });
+  assert.match(help, /temporary one.*\(connected as alice_, regaining alice\)\.$/);
+  assert.doesNotMatch(help, /The network said/);
+  assert.equal(networkStateIsFailure({ state: "regaining_nickname" }), false);
+  assert.match(
+    networkStateHelp({ state: "registration_failed", failureCode: "nickname_regain_refused", failureDetail: null }),
+    /belongs to another account/,
   );
 });
 

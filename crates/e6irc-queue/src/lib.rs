@@ -180,6 +180,7 @@ pub fn weighted_queue<T>(config: Config, weigh: fn(&T) -> usize) -> (Sender<T>, 
             sender_count: 1,
             receiver_alive: true,
             waker: None,
+            gone_wakers: Vec::new(),
             push_wakers: VecDeque::new(),
             next_push_waiter: 0,
         }),
@@ -220,6 +221,8 @@ struct State<T> {
     sender_count: usize,
     receiver_alive: bool,
     waker: Option<Waker>,
+    /// [`SendersGone`] waiters, woken when the last sender goes.
+    gone_wakers: Vec<Waker>,
     /// Producers parked in an async `push` or `room_for`, in arrival order,
     /// each awaiting room for its event's weight.
     push_wakers: VecDeque<PushWaiter>,
@@ -366,6 +369,30 @@ impl<T> Sender<T> {
             waker.wake();
         }
         Ok(seq)
+    }
+
+    /// Take back every event still buffered, in queue order, emptying the
+    /// queue. The producer's retraction of what the consumer has not yet
+    /// taken: nothing is lost, since the events come back to the caller.
+    pub fn take_queued(&self) -> Vec<T> {
+        let (taken, wakers): (Vec<T>, Vec<Waker>);
+        {
+            let mut state = self.shared.lock();
+            taken = std::mem::take(&mut state.buf)
+                .into_iter()
+                .map(|(envelope, _weight)| envelope.payload)
+                .collect();
+            state.load = 0;
+            state.update_mode(self.shared.config.policy);
+            self.shared.publish(&state);
+            // All the room is free now: wake, in line order, every parked
+            // producer whose event fits, by the one admission rule.
+            wakers = state.take_admitted_waiters(self.shared.config.capacity);
+        }
+        for waker in wakers {
+            waker.wake();
+        }
+        taken
     }
 
     /// The total weight buffered (events, for a [`queue`]).
@@ -640,6 +667,16 @@ impl<T> Receiver<T> {
         self.shared.lock().load
     }
 
+    /// A handle that tells when every [`Sender`] is gone, however much is
+    /// still buffered — unlike [`Receiver::pop`], which reports the end only
+    /// once the buffer is drained. It lets a consumer that is still draining
+    /// learn that nothing more will come without having to finish first.
+    pub fn senders_gone(&self) -> SendersGone<T> {
+        SendersGone {
+            shared: self.shared.clone(),
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.shared.lock().mode
     }
@@ -648,6 +685,28 @@ impl<T> Receiver<T> {
     /// change is never silent).
     pub fn mode_switches(&self) -> u64 {
         self.shared.lock().mode_switches
+    }
+}
+
+/// See [`Receiver::senders_gone`].
+pub struct SendersGone<T> {
+    shared: Arc<Shared<T>>,
+}
+
+impl<T> SendersGone<T> {
+    /// Resolve once no [`Sender`] is left.
+    pub async fn wait(&self) {
+        poll_fn(|cx| {
+            let mut state = self.shared.lock();
+            if state.sender_count == 0 {
+                return Poll::Ready(());
+            }
+            if !state.gone_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                state.gone_wakers.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await;
     }
 }
 
@@ -678,7 +737,7 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let waker;
+        let (waker, gone);
         {
             let mut state = self.shared.lock();
             state.sender_count -= 1;
@@ -686,10 +745,15 @@ impl<T> Drop for Sender<T> {
                 return;
             }
             // Last sender gone: wake the receiver so a pending pop can
-            // resolve to None once the buffer drains.
+            // resolve to None once the buffer drains, and whoever waits for
+            // the senders themselves.
             waker = state.waker.take();
+            gone = std::mem::take(&mut state.gone_wakers);
         }
         if let Some(waker) = waker {
+            waker.wake();
+        }
+        for waker in gone {
             waker.wake();
         }
     }
@@ -760,6 +824,40 @@ mod tests {
                 Poll::Pending => thread::park(),
             }
         }
+    }
+
+    /// The end of the senders is observable while events are still buffered;
+    /// `pop` reports it only after the buffer drains.
+    #[test]
+    fn senders_gone_resolves_before_the_buffer_is_drained() {
+        let (tx, mut rx) = fifo(4);
+        let gone = rx.senders_gone();
+        let extra = tx.clone();
+        tx.try_push(1).expect("room");
+        let waiter = thread::spawn(move || block_on(gone.wait()));
+        drop(tx);
+        thread::sleep(Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "one sender is still alive");
+        drop(extra);
+        waiter
+            .join()
+            .expect("the wait resolves once every sender is gone");
+        assert_eq!(rx.try_pop().map(|e| e.payload), Some(1), "still buffered");
+        assert!(block_on(rx.pop()).is_none());
+    }
+
+    /// Taking the queued events back empties the queue, returns them in order
+    /// and frees their room for the producer.
+    #[test]
+    fn take_queued_returns_the_backlog_and_frees_its_room() {
+        let (tx, mut rx) = fifo(2);
+        tx.try_push(1).expect("room");
+        tx.try_push(2).expect("room");
+        assert!(matches!(tx.try_push(3), Err(PushError::Full(3))));
+        assert_eq!(tx.take_queued(), vec![1, 2]);
+        assert_eq!(tx.depth(), 0);
+        tx.try_push(3).expect("room again");
+        assert_eq!(rx.try_pop().map(|e| e.payload), Some(3));
     }
 
     #[test]

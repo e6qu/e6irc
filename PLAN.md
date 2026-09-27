@@ -39,12 +39,13 @@ or environment states one with a value other than the stored one is refused,
 naming each such setting and printing no value.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share the relay-desk visual system and
-accessible light, dark, and forced-colors palettes. Both network forms read one
-server-side preset catalog (`GET /api/v1/network-presets`), use one vocabulary,
-ask first for what a known network cannot supply, and keep the rest under an
-Advanced disclosure. The chat client opens an account's sole runnable network
+accessible light, dark, and forced-colors palettes. The one network form, the
+chat client's dialog, reads the server-side preset catalog
+(`GET /api/v1/network-presets`), asks first for what a known network cannot
+supply, and keeps the rest under an Advanced disclosure. The chat client opens an account's sole runnable network
 by itself (with several, the person chooses), opens a network it has just added, and has one control for each thing: one network
-list, one Server log switch, one command reference. The console navigation
+list, one console (the first conversation, which shows every IRC line the
+network sends and takes raw lines), one command reference. The console navigation
 leads with the account holder's own pages and groups the administrator's. Browser snapshots cover all
 three shells; interaction tests cover Web Content Accessibility Guidelines level AA
 contrast, keyboard focus, Escape
@@ -102,15 +103,22 @@ account never worked from the chat client, and what a rejected account then did:
   credentials kept reading "connected". There is one list, re-read every ten
   seconds, that quotes the upstream's own reason beside the settings control.
 
-The driver no longer answers a taken nickname by silently registering as
-`nick_` (and only when SASL was off). It offers the configured nickname only,
-reports the refusal with the upstream's text, retries on the refusal schedule
-so a ghost of its own session can time out, and parks if the nickname stays
-taken.
+The driver no longer answers a taken nickname by silently running as `nick_`
+(and only when SASL was off). A taken nickname is treated as a possible ghost
+of the network's own session (a crash, a standby's takeover, a link that died
+without `QUIT`): the driver registers under one alternative, is
+`regaining_nickname` ("connected as bncbot_, regaining bncbot") rather than
+connected, joins and sends nothing, and takes the configured nickname back —
+NickServ `REGAIN` with SASL, and `MONITOR` or `ISON` otherwise. A definite
+services refusal parks it at once; a holder that outlasts five minutes, or an
+alternative that is taken too, is the `nickname_in_use` refusal on its
+schedule. The CSRF token's key is derived from the master secret key, so open
+pages keep posting across a restart and a standby's takeover.
 
-Neither browser surface gates saving on a connection test: **Test connection**
-is an optional diagnostic that says `QUIT` when it is done. The console has a bounded,
-owner-scoped **Network log** view for IRC and every bridge driver. Its API reads
+The chat client's network dialog does not gate saving on a connection test:
+**Test connection** is an optional diagnostic that says `QUIT` when it is done.
+A network's console page has a bounded, owner-scoped **IRC transcript** of its
+stored lines, for IRC and every bridge driver. Its API reads
 the live buffer while active and persisted history after stop; typed lifecycle
 and operational failures are safe notices, and storage-failure notices cannot
 retry through the failed writer. Administrators also have a bounded live server
@@ -149,7 +157,7 @@ past while retaining their transcript, and routes server notices to the server
 buffer rather than creating phantom direct messages.
 The BNC marker schema retains the account table's full BIGINT identity width,
 and capacity checks serialize on the durable account row.
-For external networks one routing policy (`conversation_target`) maps
+For external networks one routing policy (`NetworkNames::conversation`) maps
 STATUSMSG `@#channel` and `+#channel` traffic to the underlying channel for live
 delivery, bridge routing, and backlog filing alike; the backlog used to file
 such a line under its sender as a direct message. The core's own STATUSMSG
@@ -169,7 +177,7 @@ Bridge-backed networks now refuse every unsupported or malformed downstream
 command with a bounded notice instead of accepting it into a quiet no-op.
 The browser network rail now distinguishes the driver's parked lifecycle from
 its latest failure code, so rejected Libera credentials and verified-account
-registration policy produce the promised Server log and settings recovery
+registration policy produce the promised console lines and settings recovery
 guidance instead of a bare failed-state label.
 
 A 2026-09-20 review of the whole tree after #333 found, and this change fixes:
@@ -914,12 +922,44 @@ its plain line derived where it is stored. The SendQ is `sendq_bytes` (512
 KiB, the 1,024 lines it held at a full line each; migration 0088 converts the
 stored count), held output and paced LIST/WHO counted in the same bytes. A
 network's backlog holds `buffer_cap` lines of at most 512 bytes' worth each,
-in memory and in storage (5,000 rows, 2.5 MB), trimmed oldest first.
+in memory and in storage (5,000 rows, 2.5 megabytes), trimmed oldest first.
 `limits.auth_rate_burst` defaults to twenty a minute per address and is turned
 off only by `"off"`; a stored unset is migrated to the default (0088). The
 bouncer-shutdown test's upstream now closes the link on `QUIT` as a server
 does, where it had waited for the driver to close first and raced the end of
 the shutdown (DESIGN §7.2, §7.3, §11, §18).
+
+Cross-shard history and message fixes, with the maintainer's decisions
+implemented (DESIGN §2, §7.7, §8, §11):
+
+- **A multiline batch of only blank lines was delivered and stored** when
+  another shard owned the channel: the check lived in the sender's own
+  delivery only. Closing a batch now yields a `CompletedMultiline`, which a
+  batch with no text cannot become, and both deliveries take only that.
+- **Hot rings are sorted by `(ts, arrival)`.** A conversation line from the
+  peer's shard or a stepped-back clock left rings out of time order, so
+  BEFORE missed a message AFTER included, LATEST came out of order and ring and
+  database pages disagreed at their edge. The ring now inserts in order, never
+  takes in an entry older than one it shed (which would sit before a hole),
+  and BETWEEN orders its pivots by that same place, which it had got wrong for
+  a timestamp older than the ring. The new `chathistory_window` fuzz target
+  (named in the code before it existed) checks every covered window against a
+  model of the database.
+- **TARGETS named another shard's channel by its folded key** (`#foo{x}` for
+  `#Foo[x]`) when the database answered; it is named from the published
+  channel directory.
+- **Relayed messages name their target canonically** (Solanum parity): `#foo`
+  for `PRIVMSG #FOO`, `Bob` for `PRIVMSG BOB`, on both shards' paths, so
+  CHATHISTORY replay is the live line byte for byte.
+- **One parser for CHATHISTORY and MARKREAD** in the core and the bouncer: the
+  bouncer refused `BETWEEN #c timestamp=bad foo=1 10` with the wrong code and
+  the core accepted a MARKREAD with a stray parameter.
+- **A conversation's read marker is kept under the peer's identity**, as the
+  conversation is, so it survives their nick change; an away grouped nick
+  resolves to its account for both.
+- **History retention covers memory**: the core's rings and the bouncer's
+  backlogs no longer serve what storage maintenance deleted, and a console
+  change applies at once.
 
 A review of whether the docs, tests, CI and guards tell the truth found, and
 this change fixes:
@@ -1107,7 +1147,7 @@ Maintainer decisions implemented from a review of resource bounds (DESIGN
 
 - **LIST keeps a cursor, not a copy.** A LIST used to clone the name and topic
   of every channel it admitted into one sorted list held on the session until
-  it was paced out — some 65 MB per LIST at 100k channels, rebuilt by every
+  it was paced out — some 65 megabytes per LIST at 100k channels, rebuilt by every
   `LIST`/`LIST` abort. It now holds its conditions and one resume key per
   shard, and each turn asks the shards for the next page after it, no larger
   than the room the client's send queue has; rows come out in casemapped name
@@ -1162,6 +1202,318 @@ before:
 - **DESIGN §7.1 described CAP and SASL state machines in `e6irc-proto`** that
   are not there, and the message module claimed a serializer; both now say
   what the crate holds.
+
+A review of how connections end found, and this change fixes (DESIGN §7.2,
+§13.4, §15, §18):
+
+- **Shutdown did not wait for clients to receive their closing `ERROR`.** It
+  was queued, and the runtime's end cancelled its write. Every connection task
+  (IRC plaintext and TLS, `/ws/irc`, attach) now holds a `ConnectionTask`, and
+  shutdown waits for them for at most 8 s once the core has stopped; the unit's
+  stop budget is 65 s.
+- **The shutdown request itself was unbounded**: a shard with a full queue it
+  no longer took from held it before the core's stop budget began. It is now
+  made within that budget.
+- **A session the core had closed kept its socket, task and per-IP slot** for
+  as long as its client trickled out the backlog, while its reader kept
+  pushing (and counting) lines. A SendQ kill now discards the backlog and sends
+  only the closing `ERROR`, as Solanum does; every ended session has 5 s in
+  all to receive what it is owed, and its reader stops at once.
+- **The closing `ERROR` could be destroyed by a reset.** IRC sockets and
+  `/ws/irc` now close lingering, as HTTP refusals do.
+- **`X-Forwarded-For` skipped an unparsable entry** and walked on into entries
+  the client wrote. Such an entry before the client's address now refuses the
+  request (`400`), with a rate-limited log line naming the proxy.
+- **`/ws/irc` ended sessions by dropping the socket** and reported every end
+  as "WebSocket closed"; a message over the frame limit closed the connection.
+  It now sends a Close frame (1000), reports the transport's reason, answers an
+  over-long message `417` and closes (1009) only past a 64 KiB ceiling.
+- The attach listener showed a mapped IPv4 client in its IPv6 spelling; an
+  unloadable attach certificate was counted as a TLS handshake failure (now
+  `configuration`); `/ws/ui` sent a pong of its own beside the WebSocket
+  layer's (which the layer's replacement of its queued pong kept to one on the
+  wire; the redundant arm is gone and a test holds one ping to one pong).
+
+A review of the bridges found, and this change fixes, each with a test that
+failed before (DESIGN §10.5):
+
+- **One remote message could detach every attached client.** A message was
+  one IRC line per newline, unbounded, published in a tight loop into a
+  broadcast of 1024: two thousand newlines overflowed it, every attached
+  client was detached as too slow, the backlog writer recorded a gap, and
+  blank lines went out as empty `PRIVMSG`s. A message is now at most 16 lines
+  and a counted notice, blank lines are left out, and a burst (a resumed
+  Matrix sync, a Discord RESUME's replay) waits for the subscribers.
+- **One unreadable Discord dispatch ended every session.** A `MESSAGE_CREATE`
+  that did not decode ended the session before its sequence number was
+  counted, so each RESUME replayed it into the same failure; a bad READY spent
+  an IDENTIFY on every attempt. The envelope is read first, each dispatch on
+  its own, and an unreadable one is a "malformed" notice in its channel.
+- **A lost position was never announced.** A Matrix kick forgot the whole sync
+  position, and a refused Discord RESUME started afresh, so what every other
+  channel said meanwhile was skipped without a word. Every bridge now says so
+  in each channel, once, when a session cannot resume; a Matrix kick drops
+  only that room from the position and rejoins it.
+- **Slack configuration errors were retried forever.** Only the token codes
+  parked; `missing_scope`, `not_allowed_token_type`, `invalid_arguments` and
+  the like reconnected on the transient schedule. Slack errors are a typed
+  classification now, and what only the owner can fix parks at once. A
+  Discord channel id is parsed as a snowflake with the configuration.
+- **Slack skipped the shared status check.** Its Web API calls decoded the body
+  of a 3xx or 5xx as the answer and ignored a 429's wait, so failed name
+  lookups hammered a rate-limited Slack. Every bridge request is a
+  `BridgeRequest` whose only send reads the status.
+- **A Slack bot was renamed by its own edits**, to its id and back, and a bot's
+  message could look up nine mentions where eight were meant.
+
+Maintainer decisions implemented for the bridges:
+
+- **Discord text reads literally.** Outbound text is escaped for Discord's
+  Markdown, so IRC text is not rendered as headings, quotes, lists, spoilers
+  or masked links, and a `/me` stays italic whatever underscores it holds.
+- **One policy for threads and edits.** A thread reply is a line in its
+  parent's bridged channel and an edit is `* <new text>` on every bridge;
+  Discord dropped thread messages and ignored edits, and Matrix read an edit
+  only from its fallback body.
+- **Matrix keeps its long poll.** A client's line is delivered while `/sync`
+  waits, instead of cancelling and reissuing it per line.
+
+A review of the administrator and network API found, and this change fixes:
+
+- **A managed server network could be saved that stopped the next start.** Its
+  validator checked nick, real name and autojoin only for blankness while the
+  start parses them strictly and exits on a configured network it cannot
+  build; validation now is that parse (`UpstreamIdentity`), and the `400`
+  carries the validator's reason, naming the field, instead of "missing or
+  invalid required fields".
+- **The OpenAPI create schema had no bounds** on a network's name, address,
+  nick, real name or SASL fields, and `autojoin_keys.keep` had none on its
+  length. Create, replace and the connection test now share one field
+  description built from the handlers' constants, held to them by a test; the
+  handler refuses a `keep` longer than autojoin can be.
+- **A SASL login was trimmed on edit and stored verbatim on create.** All three
+  requests parse it into `UpstreamSaslAccount`, which refuses surrounding
+  whitespace.
+- **The accounts page said "Showing an older page." on the first page** of a
+  directory with more, reading a next cursor as the current position. Every
+  console pager now takes its status from its own query through one renderer.
+- **A stale configuration revision was a `503` on the scalar PATCH** and a
+  `409` everywhere else and in the contract; one save-result mapper serves
+  both.
+- **"Bouncer not enabled" branches answered a state no server can be in** (a
+  database but no registry). The HTTP state now holds the two as one `Backing`
+  value, and the branches, the empty-list fallback, the template banner and
+  the contract's `404` descriptions are gone.
+
+Maintainer decisions implemented from the same review:
+
+- **A network the server configuration defines for an account is the
+  operator's.** An account's create under its name, and PUT, PATCH and DELETE
+  of it (the administrator's per-owner toggle too), are `409`s that leave it
+  running; the registry refuses to replace or stop a configured slot, and a
+  stored row is never shown with its runtime. `/me/networks` and
+  `/admin/networks` list it with `configured: true`, read-only in both clients.
+- **`/admin/networks` pages by a bounded, stable cursor** (`limit`, `after`,
+  `next_after`), like the other administrator directories.
+- **Exact filters are one rule:** a blank value is a `400`, not "no filter";
+  bounds count characters, as the contract's `maxLength` does; the audit
+  `actor` and `target` filters fold against account principals.
+
+Maintainer decisions implemented from a review of configuration, storage and
+qualification (DESIGN §8, §17, §18):
+
+- **A settings revision another process commits reaches the serving one.**
+  `rotate-secrets` writes the stored settings from a process of its own; the
+  table's announcement brings the revision to the serving process, and a save
+  that still finds its revision stale reloads it, so the console never wedges
+  on a revision it cannot see. (Several processes *serving* one database is
+  not supported: one serves, the others stand by — below.)
+- **The load harness measures fan-out, not the flood limiter.** A burst past
+  the server's command burst is refused unless the senders oper up, and
+  `qualify-linux.sh` passes the operator or refuses; the claimed core-shard
+  count is checked against the server's own.
+- **The authentication throttle stays on for upgrades (0088)**, with an
+  upgrade note on `trusted_proxies` and a start-up warning when a loopback-only
+  HTTP listener without trusted proxies makes every user share one budget.
+
+Maintainer decisions implemented from the last sweep (DESIGN §8, §11, §18):
+
+- **History has one total order, `(ts, msgid)`**, byte-compared in the ring
+  and `COLLATE "C"` in the database (index built concurrently, 0093), so a
+  millisecond's lines persisted by different shards page identically from
+  both; msgid counters are fixed-width so one shard's ids ascend as stamped.
+  An interrupted concurrent index build is dropped and rebuilt on the next
+  attempt.
+- **Read markers stored under a nick follow the identity key (0094):** a
+  grouped nick's to its account, an unregistered nick's to `~nick`, the newer
+  of two kept.
+- **The MOTD is bounded in bytes as sent** (`MAX_MOTD_BYTES`, half the
+  smallest SendQ, counted at the longest server name and nickname) as well as
+  per line. Migration clamps of stored values (0091's `buffer_cap`, 0094's
+  MOTD) are revisions of their own with a `CONFIG` audit entry carrying the
+  previous value in full.
+- **`E6IRC_PUBLIC_URL` may be unset**, like a database-backed file's omitted
+  `[http].public_url`: the stored value applies, and a first start with none
+  stored refuses naming `http.public_url`.
+- **A settings save that moved the BNC listener and found its revision stale
+  binds straight to the reloaded revision** (`follow_bnc_listener`, shared with
+  the settings watcher).
+
+Maintainer decisions implemented from a review of Solanum and Libera parity
+(DESIGN §7.2, §7.6, §7.7):
+
+- **NickServ and ChanServ are present to presence queries** — WHOIS, WHO,
+  ISON, USERHOST, MONITOR and INVITE — from one record per service.
+- **Nick changes are throttled** at Solanum's `anti_nick_flood` values as
+  Libera runs them (five per twenty seconds, 438), operators exempt; and one
+  nick keeps at most twenty WHOWAS records.
+- **A bare NAMES lists every visible channel**, then the users in no channel,
+  paced as a LIST is and across every shard.
+- **A young connection's QUIT comment is `Client Quit`** (Solanum's
+  `anti_spam_exit_message_time`, five minutes, as Libera). It is the
+  console-owned `limits.anti_spam_exit_message_time_seconds` (0 to 3600,
+  applied without a restart); irctest runs e6ircd with it at 0, as Solanum's
+  controller runs Solanum, so its `testQuit` runs in the green list.
+
+The same review found, and this change fixes, each with a test that failed
+before:
+
+- **A channel name could hide a formatting control**: `JOIN #lib\x0fera`
+  created a channel shown as `#libera`. Channel names are parsed once
+  (`ChannelName`) and a look-alike or over-long one is 479, as Solanum's
+  `disable_fake_channels` refuses one.
+- **Any command reset WHOIS idle time**; only a PRIVMSG does now, and the
+  reaper keeps its own liveness clock.
+- **INVITE named the invitee as the inviter typed it** and never said they
+  were away; it uses their own nick and follows 341 with 301.
+- **Empty, listed and server targets**: `WHOIS :`, `WHOWAS :` and `PING :`
+  were answered as a missing nick or not at all, `WHOIS a,b` looked up
+  `a,b`, and a server argument to WHOIS, VERSION, TIME, MOTD, ADMIN or LINKS
+  was ignored; they are 431, 409, the first nick, and 402 or answered here.
+- **WHO** matched a mask against nick and host only, and showed `*` for a
+  nick's channel; it matches username, server and realname too and shows a
+  channel the asker may see. Its `o` flag and WHOX selector parse as
+  Solanum's do, and the help says so.
+- **MONITOR stored targets that could never be nicks**, including a spaced one
+  that broke its 731/732 lists.
+- **Closing lines had four shapes**, and a long stored ban reason made an
+  over-long one at registration; one function builds and fits them all.
+- WHOIS 312 carried the network name where Solanum puts the server's
+  description; MODE's help left out `+R`; `MAXLIST`'s comment said per list.
+
+A review of the bouncer's drivers, registry and attach path found, and this
+change fixes, each with a test that failed before (DESIGN §10):
+
+- **The local driver relayed the core's `ERROR :Closing Link`** (a KILL, a
+  GHOST or REGAIN, a K- or D-line) to every attached client and into the
+  backlog. Both drivers now read every line through one control-line function
+  (`PING`, `CAP`, keepalive `PONG`, `ERROR`); `ERROR` is a notice and the
+  drop's diagnostic. The local driver also rejoins the channels joined at
+  runtime after such a drop, sharing the `irc` driver's `JoinedChannels`.
+- **Attach reconciliation flooded the upstream and the shared queue**: two
+  questions per channel whose JOIN had aged out. Every line the `irc` driver
+  writes is now paced (5 at once, then 2 a second, Solanum's allowance); the
+  session follows each channel's topic and members, so an attach and a
+  browser's `NAMES` are answered from them, and at most two channels' lists
+  are asked for per attach; a full command queue is told live, never retained.
+- **Replay misattributed**: it started at the current nick. The ring keeps the
+  session state at its oldest entry, and an attach is reconciled to it before
+  the replay and to the current state after (maintainer decision); the attach
+  layer's numerics follow the client's current nick. A backlog restored from
+  storage after a restart still started at the current nick; each stored line
+  now records the own nick it was said under (migration 0096), and the
+  restored ring's head starts from it.
+- **A client attached before the registration burst never learned the
+  network's ISUPPORT**: the welcome is built from the attach snapshot, and the
+  burst's end is told to each attachment as a `005` of what changed.
+- **Shutdown raced an in-flight replace**, which then started a driver into
+  the emptied registry; shutdown now takes the mutation lane and closes the
+  registry. Drivers are prepared, then launched after persistence subscribes.
+- **Echoes around a `CAP NEW`/`DEL echo-message` were doubled or lost**, and a
+  refused capability was re-requested on every `CAP` line.
+- **Status**: the up-front attach status says why a network is down, a new
+  failure reason within one outage is retained once, and an owned network
+  without a driver says whether it is disabled, being reconfigured, or failed
+  to start and why. The persistence task files a line under the nick it was
+  said under.
+
+A review of account authority found, and this change fixes:
+
+- **A suspended or deleted account stayed attached** through the attach
+  listener to a shared or configured network, and a password checked just
+  before the suspension could attach after the sweep. `attach` now takes an
+  `AccountLease` the account lifecycle revokes on the mutation lane; the
+  listener spends a ticket taken before the credential check on it, so the
+  race is refused. The core's sweep also closes a session that authenticated
+  but had not registered, which it used to skip.
+- **An OIDC link finished from any browser** within ten minutes of its start:
+  link and re-authentication flows now seal a `BoundSession`, and the link is
+  checked live, the account's and recent in the transaction that inserts it.
+- **A grouped nick's app-password exchange** answered 401 after a successful
+  verify: verification yields a `VerifiedAccount`, which minting takes.
+- **OAUTHBEARER ignored its GS2 authorization identity**; a token can no
+  longer act as another account.
+- **Device codes were stored in plaintext**; 0095 keeps their SHA-256.
+
+Maintainer decisions implemented from the same review:
+
+- **Suspension holds the account's configured networks** stopped
+  (`owner_suspended` in the inventory) and reactivation restarts them;
+  deletion holds them for good (`owner_deleted`), across restarts too.
+- **A password change ends every live IRC session and bouncer attachment** of
+  the account, and a verdict for a check queued before it is refused.
+- **The serving process applies an account's authority whoever changed it**:
+  a suspension, deletion or primary password change committed by another
+  process (`recover-administrator`, a hand-written row) ends the account's IRC
+  sessions and attachments there, applied once from the store's announcement
+  (0095's `authority_generation`, `AuthorityLedger`).
+- **Revoking an app password or a personal access token ends what it signed
+  in**, and only that: IRC sessions and bouncer attachments keep the
+  credential that opened them (`CredentialId`), migration 0097 announces each
+  revocation by id, whichever process deletes it, and the server closes that
+  credential's sessions (`App password revoked`) and attachments; a check of
+  it in flight is refused. Before, they stayed open for as long as they lived.
+  A session a token signed in ends at the token's expiry, as `/ws/ui` does,
+  not when maintenance prunes it.
+- **A verdict read while the revocation listener was disconnected** could
+  open a session for a credential revoked meanwhile, after the re-connected
+  listener's re-read. The re-connection now first refuses every check in
+  flight on every core shard and at the attach listener (the client retries),
+  for account authority and issued credentials alike.
+- **The design's SASL OAUTHBEARER row described OIDC JWT validation** the
+  server does not do; it names the personal access token it verifies.
+- **New passwords are at least 8 characters** (NIST SP 800-63B) unless the
+  console-owned `registration.minimum_password_length` (1–128, applied live)
+  says otherwise; existing passwords still verify. irctest runs at 1, so its
+  services suite's short passwords register unmodified.
+- **Device authorization speaks RFC 8628 as written**: form bodies with a
+  bound `client_id`, per-code polling pace with `slow_down`, and RFC 6749
+  error and token responses; `e6irc login` speaks it.
+
+Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
+§18; `deploy/README.md`, High availability):
+
+- **Active/standby, never active/active.** One process serves a database — the
+  core, the bouncer registry and every driver, the database worker, storage
+  maintenance, the sampler, read-marker expiry, and the IRC, attach and HTTP
+  listeners. Several serving processes are IRC linking by another name and
+  stay a non-goal.
+- **A second process stands by automatically**, loudly (a stderr line,
+  `/readyz` 503 naming the holder, `/healthz` 200, nothing else served), and
+  takes over when the lease is released (graceful stop) or expires (crash).
+- **Lease timing is fixed**: a 15-second TTL, a renewal every 3 seconds, a
+  fence 10 seconds after the last confirmed renewal on the monotonic clock,
+  every lease comparison on the database's `now()` (migration 0098).
+- **Fencing is enforced by PostgreSQL too**: every pool connection passes
+  `serving_lease_register_backend`, and a takeover ends the previous holder's
+  recorded connections, so its queued writes fail and none lands.
+- **Only the holder migrates**; a standby older than the schema refuses at
+  boot; `rotate-secrets` and `recover-administrator` never migrate under a
+  serving process and refuse an older schema with "upgrade the serving process
+  first".
+- **PostgreSQL's own high availability must replicate synchronously**, or a
+  failover can roll the lease row back; the first upgrade to this release
+  stops every process.
 
 ## Remaining qualification
 

@@ -16,7 +16,7 @@
 //! the position-specific rules remain. **Upstream** bytes (bridge relays) have
 //! not, so [`upstream_line`] neutralizes those first. Generated-field length
 //! bounding and wire-limit fitting are a separate concern and live with delivery
-//! (`truncate_chars`, `fit_trailing`, `fit_relayed_text`) over
+//! (`truncate_chars`, `fit_trailing`, `relayed_line`) over
 //! `e6irc_proto::message::truncate_on_char_boundary`.
 
 /// Validate a username for the `nick!user@host` source prefix, cut to at most
@@ -313,12 +313,23 @@ pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
     nick.len() <= nicklen && bytes.all(|b| b.is_ascii_alphanumeric() || special(b) || b == b'-')
 }
 
+/// Longest BNC network name, in bytes (every allowed character is one byte).
+pub(crate) const MAX_NETWORK_NAME_LEN: usize = 64;
+
+/// [`valid_network_name`] as a JSON Schema (ECMAScript) pattern, for the API
+/// contract: the name alphabet, with `.` and `..` excluded by construction (a
+/// name of one leading dot continues with a non-dot, one of two leading dots
+/// continues at all). Its length bound is [`MAX_NETWORK_NAME_LEN`], stated
+/// beside it.
+pub(crate) const NETWORK_NAME_PATTERN: &str =
+    r"^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\.\.[A-Za-z0-9._-]+)$";
+
 /// A client-facing BNC network selector. The same value appears in config,
 /// REST paths, HTML, and the raw attach `nick/network` address, so every ingress
 /// admits one bounded, path-safe token language.
 pub(crate) fn valid_network_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= MAX_NETWORK_NAME_LEN
         && name != "."
         && name != ".."
         && name
@@ -326,26 +337,74 @@ pub(crate) fn valid_network_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Maximum channel-name length in bytes. Enforced by [`valid_channel_name`] and
+/// The line a connection is closed with, in Solanum's shape
+/// (`exit_local_client`): `ERROR :Closing Link: <host> (<reason>)`, CRLF not
+/// included. The reason is cut to keep the line within the 512-byte wire
+/// limit — it can be a client's QUIT comment, an operator's KILL reason or a
+/// stored ban reason written before today's bounds — so no reason can make
+/// the one line that explains a disconnection too long to be read.
+pub(crate) fn closing_link(host: &str, reason: &str) -> String {
+    let head = format!("ERROR :Closing Link: {host} (");
+    let room = e6irc_proto::message::MAX_LINE_LEN.saturating_sub(head.len() + ")\r\n".len());
+    let reason = e6irc_proto::message::truncate_on_char_boundary(reason, room);
+    format!("{head}{reason})")
+}
+
+/// Maximum channel-name length in bytes. Enforced by [`ChannelName::parse`] and
 /// advertised as ISUPPORT `CHANNELLEN`; the advertisement reads this const so the
 /// two can never drift (the class the ISUPPORT builder is written to prevent).
 pub(crate) const CHANNELLEN: usize = 50;
 
-/// Whether `name` is a legal channel name: `#`-prefixed, non-empty, ≤ CHANNELLEN
-/// bytes, and free of the bytes that would split it or the line (space, comma,
-/// BEL, `:`, and CR/LF/NUL). A middle parameter, so no space is the load-bearing
-/// rule — but CR/LF/NUL matter too: client names are pre-screened by
-/// `Message::parse`, yet a *bridge* channel name comes from a remote API and
-/// never passes through the parser, so a `#foo\nEVIL` would otherwise flatten
-/// (via `upstream_line`) to the multi-param forge `#foo EVIL` the space-check
-/// exists to prevent.
-pub(crate) fn valid_channel_name(name: &str) -> bool {
-    name.starts_with('#')
-        && name.len() > 1
-        && name.len() <= CHANNELLEN
-        && !name
-            .bytes()
-            .any(|b| matches!(b, b' ' | b',' | 0x07 | b':' | b'\r' | b'\n' | 0))
+/// A channel name the server will create, bridge or keep a marker for:
+/// `#`-prefixed, more than the sigil, at most [`CHANNELLEN`] bytes, and free of
+/// every character that splits it or the line, or makes it look like another
+/// channel — one rule, parsed where a name enters (JOIN, a bridged channel, a
+/// read marker's target):
+///
+/// - a space, `,` or `:`, which split a parameter or JOIN's list;
+/// - every C0 control and DEL: CR/LF/NUL forge lines (a bridge name never
+///   passes `Message::parse`), and the formatting controls render as nothing,
+///   so `#lib\x0fera` would show as `#libera`;
+/// - U+00A0, the no-break space, which renders as a space.
+///
+/// Solanum's `disable_fake_channels` (set on Libera) refuses the same kind of
+/// look-alike: its fake-channel characters are a subset of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelName(String);
+
+/// Why a name is not a [`ChannelName`], in Solanum's order (`m_join`): an
+/// unusable name is `ERR_BADCHANNAME` (479) before a missing `#` is
+/// `ERR_NOSUCHCHANNEL` (403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelNameError {
+    /// Too long, only the sigil, or carrying a forbidden character.
+    Illegal,
+    /// Not a channel name at all: it does not start with `#`.
+    NotAChannel,
+}
+
+impl ChannelName {
+    pub(crate) fn parse(name: &str) -> Result<Self, ChannelNameError> {
+        if name.is_empty() || name.len() > CHANNELLEN || name.chars().any(forbidden_in_channel_name)
+        {
+            return Err(ChannelNameError::Illegal);
+        }
+        if !name.starts_with('#') {
+            return Err(ChannelNameError::NotAChannel);
+        }
+        if name.len() == 1 {
+            return Err(ChannelNameError::Illegal);
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn forbidden_in_channel_name(c: char) -> bool {
+    matches!(c, ' ' | ',' | ':' | '\u{a0}') || c.is_ascii_control()
 }
 
 #[cfg(test)]
@@ -556,22 +615,71 @@ mod tests {
         )));
     }
 
+    /// Every closing line has one shape and fits the wire, whatever the
+    /// reason: a legacy ban reason stored before today's bounds used to make
+    /// an over-long `ERROR` at registration.
     #[test]
-    fn valid_channel_name_rejects_line_and_param_breakers() {
-        assert!(valid_channel_name("#room"));
+    fn closing_link_has_one_shape_and_fits_the_wire() {
+        assert_eq!(
+            closing_link("host.example", "Ping timeout"),
+            "ERROR :Closing Link: host.example (Ping timeout)"
+        );
+        let line = closing_link("host.example", &"\u{e9}".repeat(600));
+        assert!(
+            line.len() + 2 <= e6irc_proto::message::MAX_LINE_LEN,
+            "{}",
+            line.len()
+        );
+        assert!(line.starts_with("ERROR :Closing Link: host.example (\u{e9}"));
+        assert!(line.ends_with("\u{e9})"));
+    }
+
+    #[test]
+    fn channel_name_rejects_line_and_param_breakers() {
+        let illegal = |name: &str| ChannelName::parse(name) == Err(ChannelNameError::Illegal);
+        assert_eq!(
+            ChannelName::parse("#room").map(|name| name.as_str().to_string()),
+            Ok("#room".to_string())
+        );
         // Space/comma/BEL/colon (the original set).
         for bad in ["#a b", "#a,b", "#a\x07b", "#a:b"] {
-            assert!(!valid_channel_name(bad), "{bad:?} must be rejected");
+            assert!(illegal(bad), "{bad:?} must be rejected");
         }
         // CR/LF/NUL — a bridge name that never passes Message::parse. `#foo\nEVIL`
         // would flatten to the `#foo EVIL` param forge without this.
         for bad in ["#foo\nEVIL", "#foo\rEVIL", "#foo\0EVIL"] {
-            assert!(
-                !valid_channel_name(bad),
-                "{bad:?} must be rejected (CR/LF/NUL)"
+            assert!(illegal(bad), "{bad:?} must be rejected (CR/LF/NUL)");
+        }
+        assert!(illegal("#")); // just the sigil
+        assert!(illegal(&format!("#{}", "a".repeat(CHANNELLEN))));
+        assert!(ChannelName::parse(&format!("#{}", "a".repeat(CHANNELLEN - 1))).is_ok());
+        assert_eq!(
+            ChannelName::parse("room"),
+            Err(ChannelNameError::NotAChannel)
+        );
+        // Solanum answers an unusable name before a missing prefix.
+        assert!(illegal("room\x02"));
+    }
+
+    /// Every C0 control, DEL and U+00A0 is refused. Solanum's fake-channel
+    /// characters (`FCHAN_C` in `ircd/match.c`: 0x02, 0x03, 0x16, 0x1d, 0x1f and
+    /// 0xA0), refused by `check_channel_name_loc` (`modules/core/m_join.c`)
+    /// under `disable_fake_channels` as Libera runs it, are among them. A
+    /// non-ASCII letter whose UTF-8 holds an 0xA0 byte (`à`, C3 A0) stays legal.
+    #[test]
+    fn channel_name_rejects_invisible_and_fake_channel_characters() {
+        for byte in (0u8..0x20).chain([0x7f]) {
+            let name = format!("#lib{}era", char::from(byte));
+            assert_eq!(
+                ChannelName::parse(&name),
+                Err(ChannelNameError::Illegal),
+                "{name:?}"
             );
         }
-        assert!(!valid_channel_name("#")); // just the sigil
-        assert!(!valid_channel_name("room")); // no #
+        assert_eq!(
+            ChannelName::parse("#lib\u{a0}era"),
+            Err(ChannelNameError::Illegal)
+        );
+        assert!(ChannelName::parse("#caf\u{e0}").is_ok());
     }
 }

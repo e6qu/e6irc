@@ -33,6 +33,23 @@ target_port() {
   printf '%s\n' "$port"
 }
 
+# e6ircd's default `limits.command_burst`, as `e6irc-load --server-command-burst`
+# assumes it.
+readonly E6IRC_LOAD_DEFAULT_COMMAND_BURST=40
+
+# Whether a sender's burst and its fence line fit the server's default command
+# burst, so the flood limiter does not meter it; past it the senders must oper
+# up (IRC operators are exempt) or the run measures the limiter.
+burst_within_command_burst() {
+  positive_integer "$1" && ((10#$1 + 1 <= E6IRC_LOAD_DEFAULT_COMMAND_BURST))
+}
+
+# The server's HTTP listener as the load harness reads its monitoring
+# observation: plain http://HOST:PORT on the qualification host.
+monitoring_url() {
+  [[ "$1" =~ ^http://([^/?#@]+)/?$ ]] && target_port "${BASH_REMATCH[1]}" >/dev/null
+}
+
 validate_qualification_arguments() {
   local clients="$1" channels="$2" burst="$3"
   positive_integer "$clients" && positive_integer "$channels" && positive_integer "$burst" || return 1

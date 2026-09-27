@@ -133,8 +133,21 @@ async fn attach_relays_over_the_loopback_driver() {
             e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
-            "attacher",
-            "attacher",
+            {
+                let revocations = e6ircd::bouncer::AccountRevocations::new();
+                revocations
+                    .lease(
+                        revocations.ticket(),
+                        "attacher",
+                        e6ircd::identity::CredentialId::AccountPassword,
+                    )
+                    .expect("nothing revoked it")
+            },
+            e6ircd::bouncer::Greeting {
+                server_name: "bnc.test",
+                network: "net",
+                requested_nick: "attacher",
+            },
             e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await
@@ -143,15 +156,25 @@ async fn attach_relays_over_the_loopback_driver() {
     let (r, mut w) = tokio::io::split(client);
     let mut lines = BufReader::new(r).lines();
 
-    // Attach greeting: the current upstream connection status comes first.
-    let status = tokio::time::timeout(deadline::HANG, lines.next_line())
-        .await
-        .expect("timeout")
-        .expect("io")
-        .expect("line");
+    // Attach greeting: the welcome, ending at its 422, then the current
+    // upstream connection status.
+    let mut next = async || {
+        tokio::time::timeout(deadline::HANG, lines.next_line())
+            .await
+            .expect("timeout")
+            .expect("io")
+            .expect("line")
+    };
+    let welcome = next().await;
     assert!(
-        status.contains("*bnc*") && status.contains("upstream"),
-        "attach sends an initial status line: {status}"
+        welcome.starts_with(":bnc.test 001 attacher :"),
+        "attach welcomes the client: {welcome}"
+    );
+    while !next().await.starts_with(":bnc.test 422 ") {}
+    let status = next().await;
+    assert_eq!(
+        status, ":*bnc* NOTICE * :upstream connected",
+        "attach sends an initial status line"
     );
     // Then playback includes lifecycle notices and the buffered line.
     let replayed = tokio::time::timeout(deadline::HANG, async {

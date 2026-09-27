@@ -65,3 +65,70 @@ fn a_hangup_during_the_database_wait_does_not_end_the_process() {
         "SIGHUP during the database wait ended the process: {status:?}"
     );
 }
+
+/// `SIGTERM` while the process waits for PostgreSQL (or stands by for the
+/// serving lease) ends it at once and cleanly: it holds nothing that needs
+/// giving back. It used to meet the default action — death by the signal.
+#[test]
+fn a_terminate_during_the_database_wait_ends_the_process_cleanly() {
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+        .arg("--config-from-environment")
+        .env_clear()
+        .envs([
+            ("E6IRC_SERVER_NAME", "irc.example.test"),
+            ("E6IRC_PUBLIC_URL", "https://irc.example.test"),
+            ("E6IRC_DATABASE_URL", "postgres://e6irc@127.0.0.1:1/e6irc"),
+            (
+                "APPLICATION_RELEASE_REVISION",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+            ("E6IRC_HTTP_ADDR", "127.0.0.1:0"),
+            ("E6IRC_IRC_ADDR", "127.0.0.1:0"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start e6ircd");
+    let stderr = daemon.stderr.take().expect("piped standard error");
+    let (said, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if said.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = lines
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the daemon reports its first database attempt");
+        if line.contains("database connection attempt 1 failed") {
+            break;
+        }
+    }
+    let sent = Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "send SIGTERM: {sent}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = daemon.try_wait().expect("poll the daemon") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGTERM did not end the database wait"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The reader thread ends with the process's standard error.
+    std::thread::sleep(Duration::from_millis(200));
+    let rest: Vec<String> = lines.try_iter().collect();
+    assert!(status.success(), "{status}: {rest:?}");
+    assert!(
+        rest.iter().any(|line| line.contains("not serving yet")),
+        "{rest:?}"
+    );
+}
