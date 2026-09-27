@@ -6732,6 +6732,14 @@ where
             // Network removed/replaced: tell the client and detach.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
+                    // The account lifecycle revokes before it stops the
+                    // account's networks, and both can be ready here at once:
+                    // the network stopped because the authority ended.
+                    if authority.is_revoked() {
+                        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
+                        write.flush().await?;
+                        return Ok(AttachEnd::AccountRevoked);
+                    }
                     write
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
                         .await?;
@@ -8481,6 +8489,60 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).contains("network removed"),
             "the client gets a detach notice"
         );
+    }
+
+    /// A suspension revokes the account's attachments and then stops its
+    /// networks, and an attachment can see both at once: it ends as revoked,
+    /// and says so. It used to end as often as not as a removed network.
+    #[tokio::test]
+    async fn an_attachment_whose_network_stops_with_its_authority_ends_as_revoked() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        // The relay's select picks among ready branches at random; each round
+        // readies both at once, as a suspension does.
+        for _ in 0..20 {
+            let (handle, _ends) = NetworkHandle::channels(16);
+            let handle = std::sync::Arc::new(handle);
+            let revocations = AccountRevocations::new();
+            let lease = revocations
+                .lease(revocations.ticket(), "alice")
+                .expect("lease");
+            let (client_side, server_side) = tokio::io::duplex(4096);
+            let attached = tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    attach(
+                        server_side,
+                        ClientInput::default(),
+                        &handle,
+                        AttachCaps::default(),
+                        lease,
+                        Greeting {
+                            server_name: "bnc.test",
+                            network: "net",
+                            requested_nick: "alice",
+                        },
+                        ATTACH_LIVENESS_INTERVAL,
+                    )
+                    .await
+                }
+            });
+            let mut lines = BufReader::new(client_side).lines();
+            loop {
+                let line = lines.next_line().await.expect("read").expect("welcome");
+                if line.contains("NOTICE") && line.contains("upstream") {
+                    break;
+                }
+            }
+            // A suspension revokes, then stops the account's networks.
+            revocations.revoke("alice");
+            handle.shutdown();
+            let end = tokio::time::timeout(std::time::Duration::from_secs(5), attached)
+                .await
+                .expect("the attachment ends")
+                .expect("attach task")
+                .expect("attach");
+            assert_eq!(end, AttachEnd::AccountRevoked);
+        }
     }
 
     /// An attachment ends with its account's authority: revoking the lease —
