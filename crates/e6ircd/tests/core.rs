@@ -3166,7 +3166,7 @@ fn sasl_unknown_mechanism_gets_908() {
 fn nickserv_register_creates_account() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
-    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter22");
     let req = s.db_requests();
     assert_eq!(
         req,
@@ -3174,7 +3174,7 @@ fn nickserv_register_creates_account() {
             conn: alice,
             name: "alice".into(),
             contact_email: None,
-            password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
+            password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -3250,7 +3250,7 @@ fn register_fail_clips_the_echoed_account_name() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.drain(alice);
-    s.line(alice, &format!("REGISTER {} * hunter2", "a".repeat(480)));
+    s.line(alice, &format!("REGISTER {} * hunter22", "a".repeat(480)));
     let out = s.drain(alice);
     let fail = out
         .iter()
@@ -3267,7 +3267,7 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
     let alice = s.register(1, "alice");
     s.line(
         alice,
-        "PRIVMSG NickServ :REGISTER hunter2 Alice@Example.COM",
+        "PRIVMSG NickServ :REGISTER hunter22 Alice@Example.COM",
     );
     assert_eq!(
         s.db_requests(),
@@ -3278,14 +3278,14 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
                 e6ircd::identity::ContactEmail::parse("Alice@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
+            password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
 
     s.line(
         alice,
-        "PRIVMSG NickServ :REGISTER hunter2 alice@example.com ignored",
+        "PRIVMSG NickServ :REGISTER hunter22 alice@example.com ignored",
     );
     assert!(s.db_requests().is_empty());
     assert!(
@@ -3305,7 +3305,7 @@ fn nickserv_register_duplicate_and_syntax() {
     assert!(out[0].contains("Syntax"), "{out:#?}");
     assert!(s.db_requests().is_empty());
 
-    s.line(alice, "PRIVMSG NickServ :REGISTER pw");
+    s.line(alice, "PRIVMSG NickServ :REGISTER password");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
@@ -3583,7 +3583,7 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     let req = s.db_requests();
     assert!(
         matches!(
@@ -3627,11 +3627,11 @@ fn second_register_while_first_pending_is_refused() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     let first = s.db_requests();
     assert_eq!(first.len(), 1, "first REGISTER enqueues one CreateAccount");
     // Second REGISTER before the first resolves.
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     assert!(
         s.db_requests().is_empty(),
         "a duplicate in-flight REGISTER must not enqueue a second CreateAccount"
@@ -3671,7 +3671,7 @@ fn labeled_register_reply_carries_the_label() {
 
     // A labeled REGISTER must not be ACKed synchronously as empty — the answer
     // is still in flight. Nothing should come back until the DB replies.
-    s.line(alice, "@label=reg1 REGISTER * * hunter2");
+    s.line(alice, "@label=reg1 REGISTER * * hunter22");
     let out = s.drain(alice);
     assert!(
         out.is_empty(),
@@ -3707,7 +3707,7 @@ fn labeled_register_reply_carries_the_label() {
         "batch labeled-response draft/account-registration",
     );
     s.drain(bob);
-    s.line(bob, "@label=reg2 REGISTER * * hunter2");
+    s.line(bob, "@label=reg2 REGISTER * * hunter22");
     assert!(
         s.drain(bob).is_empty(),
         "labeled REGISTER is held for its async reply"
@@ -7460,7 +7460,7 @@ fn account_creation_is_rate_limited_per_ip() {
         host: "shared-ip".into(),
         transport: e6ircd::core::ConnectionTransport::Tcp,
     });
-    for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * pw"] {
+    for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * password"] {
         core.handle(Input::Line {
             conn,
             line: line.as_bytes().to_vec(),
@@ -7482,7 +7482,7 @@ fn account_creation_is_rate_limited_per_ip() {
     // the worker.
     core.handle(Input::Line {
         conn,
-        line: b"REGISTER * * pw".to_vec(),
+        line: b"REGISTER * * password".to_vec(),
     });
     let creates = std::iter::from_fn(|| db_rx.try_pop())
         .filter(|env| matches!(env.payload, e6ircd::core::DbRequest::CreateAccount { .. }))
@@ -7767,7 +7767,7 @@ fn nickserv_register_db_unavailable_notifies() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
-    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter22");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
@@ -9509,7 +9509,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.drain(alice);
-    s.line(alice, "REGISTER bob * hunter2");
+    s.line(alice, "REGISTER bob * hunter22");
     let out = s.drain(alice);
     assert!(
         out.iter()
@@ -9523,7 +9523,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
 
     // `*` and the caller's own nick both name the caller's account.
     for arg in ["*", "alice"] {
-        s.line(alice, &format!("REGISTER {arg} * hunter2"));
+        s.line(alice, &format!("REGISTER {arg} * hunter22"));
         s.drain(alice);
         assert_eq!(
             s.db_requests(),
@@ -9531,7 +9531,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
                 conn: alice,
                 name: "alice".into(),
                 contact_email: None,
-                password: e6ircd::identity::NewPassword::parse("hunter2").expect("valid password"),
+                password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
                 origin: e6ircd::core::AccountOrigin::RegisterCommand,
             }],
             "REGISTER {arg} must register the caller's own nick"
@@ -9558,7 +9558,7 @@ fn register_before_connect_is_refused_unless_enabled() {
     let conn = s.connect(1);
     s.line(conn, "NICK earlybird");
     s.drain(conn);
-    s.line(conn, "REGISTER * * hunter2");
+    s.line(conn, "REGISTER * * hunter22");
     let out = s.drain(conn);
     assert!(
         out.iter()
@@ -9576,7 +9576,7 @@ fn register_reply_waits_behind_nothing_but_arrives_in_order() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.drain(alice);
-    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "REGISTER * * hunter22");
     s.line(alice, "PING :sync");
     let before = s.drain(alice);
     assert!(
@@ -13160,7 +13160,7 @@ fn registering_an_account_frees_the_conversations_of_the_unauthenticated_nick() 
     let bob = s.register(2, "bob");
     s.line(alice, "PRIVMSG bob :the secret");
     s.drain(bob);
-    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter22");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
@@ -14722,6 +14722,129 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
     assert_eq!(page.entries.len(), 1, "reactivation removes the live gate");
 }
 
+/// A connection that authenticated with SASL but has not ended CAP
+/// negotiation, so it holds the account without being registered.
+fn sasl_authenticated_unregistered(s: &mut TestServer, id: u64, account: &str) -> ConnId {
+    let c = s.connect(id);
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(
+        c,
+        &format!("AUTHENTICATE {}", b64(&format!("\0{account}\0pw"))),
+    );
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: account.into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert!(has_numeric(&s.drain(c), "903"));
+    c
+}
+
+/// The suspension sweep closes a connection that authenticated but had not
+/// registered yet: it used to be skipped for want of a nick to KILL, and then
+/// registered as the suspended account.
+#[test]
+fn account_suspension_closes_an_authenticated_session_still_registering() {
+    let mut server = TestServer::new();
+    let registering = sasl_authenticated_unregistered(&mut server, 10, "alice");
+    let suspended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::SetAccountSuspended {
+            account: "alice".into(),
+            suspended: true,
+            reason: "Account suspended".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(
+        matches!(suspended, e6ircd::core::AdminReply::Ok(message) if message.contains("Disconnected 1"))
+    );
+    let out = server.drain(registering);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with("ERROR") && line.contains("Account suspended")),
+        "{out:#?}"
+    );
+    server.line(registering, "NICK alice");
+    server.line(registering, "USER a 0 * :A");
+    server.line(registering, "CAP END");
+    assert!(
+        !has_numeric(&server.drain(registering), "001"),
+        "the closed session does not go on to register"
+    );
+}
+
+/// A password change ends every live session of the account — registered or
+/// still registering — and refuses a verdict for a check queued before it,
+/// without the lasting gate a suspension installs: a check queued afterwards
+/// read the new credentials and logs in.
+#[test]
+fn a_password_change_ends_the_accounts_sessions_and_its_in_flight_verdicts() {
+    use e6ircd::core::AdminReply;
+    let mut server = TestServer::new();
+    let registered = server.register(10, "AliceOne");
+    identify(&mut server, registered, "Alice");
+    let registering = sasl_authenticated_unregistered(&mut server, 20, "ALICE");
+    let bob = server.register(30, "Bob");
+    identify(&mut server, bob, "Bob");
+    // A password checked before the change, whose verdict lands after it.
+    let raced = server.register(40, "Raced");
+    server.line(raced, "PRIVMSG NickServ :IDENTIFY Alice old-password");
+    server.db_requests();
+
+    let ended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::EndAccountSessions {
+            account: "alice".into(),
+            reason: "Password changed".into(),
+            actor: "alice".into(),
+        },
+    );
+    assert!(
+        matches!(&ended, AdminReply::Ok(message) if message.contains("Disconnected 2")),
+        "{ended:?}"
+    );
+    for connection in [registered, registering] {
+        assert!(
+            server
+                .drain(connection)
+                .iter()
+                .any(|line| line.contains("ERROR") && line.contains("Password changed")),
+            "every session of the account ends"
+        );
+    }
+    server.line(bob, "PING :still-here");
+    assert!(server.drain(bob).iter().any(|line| line.contains(" PONG ")));
+
+    server.core.handle(Input::DbReply {
+        conn: raced,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "Alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    assert!(
+        server
+            .drain(raced)
+            .iter()
+            .any(|line| line.contains("Invalid password")),
+        "a verdict for the old password is refused"
+    );
+    identify(&mut server, raced, "Alice");
+    server.line(raced, "WHOIS Raced");
+    assert!(
+        server
+            .drain(raced)
+            .iter()
+            .any(|line| line.contains(" 330 ") && line.contains("Alice")),
+        "a check queued after the change logs in: no gate stays"
+    );
+}
+
 #[test]
 fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
     let mut server = TestServer::new();
@@ -16255,7 +16378,7 @@ fn account_creation_limit_counts_an_ipv6_slash_64_as_one_address() {
     s.line(op, "SETHOST alice cloaked.example");
     s.db_requests();
     for conn in [first, neighbour, elsewhere] {
-        s.line(conn, "PRIVMSG NickServ :REGISTER pw");
+        s.line(conn, "PRIVMSG NickServ :REGISTER password");
     }
     assert_eq!(created_accounts(&mut s), ["alice", "carol"]);
     assert!(
@@ -16278,14 +16401,14 @@ fn configured_administrator_names_cannot_be_registered_over_irc() {
         },
     );
     let root = s.register(1, "rOOt");
-    s.line(root, "PRIVMSG NickServ :REGISTER pw");
+    s.line(root, "PRIVMSG NickServ :REGISTER password");
     let out = s.drain(root);
     assert!(
         out.iter()
             .any(|line| line.starts_with(":NickServ!") && line.contains("reserved")),
         "{out:#?}"
     );
-    s.line(root, "REGISTER * * pw");
+    s.line(root, "REGISTER * * password");
     let out = s.drain(root);
     assert!(
         out.iter()
@@ -16295,7 +16418,7 @@ fn configured_administrator_names_cannot_be_registered_over_irc() {
     assert!(created_accounts(&mut s).is_empty());
     // Any other name registers as before.
     let alice = s.register(2, "alice");
-    s.line(alice, "PRIVMSG NickServ :REGISTER pw");
+    s.line(alice, "PRIVMSG NickServ :REGISTER password");
     assert_eq!(created_accounts(&mut s), ["alice"]);
 }
 
@@ -17110,7 +17233,7 @@ fn every_login_path_sends_900_and_logout_sends_901() {
     );
 
     let bob = s.register(2, "bob");
-    s.line(bob, "PRIVMSG NickServ :REGISTER hunter2");
+    s.line(bob, "PRIVMSG NickServ :REGISTER hunter22");
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: bob,
@@ -17224,19 +17347,30 @@ fn authenticate_during_verification_ends_the_attempt_once() {
     );
 }
 
-/// `REGISTER` refuses a password no login surface would accept, with the
-/// spec's code, and enqueues nothing.
+/// `REGISTER` refuses a password shorter than eight characters — the empty one
+/// no login surface would accept among them — with the spec's code, and
+/// enqueues nothing. NickServ `REGISTER` applies the same rule.
 #[test]
-fn register_refuses_an_empty_password() {
+fn register_refuses_a_password_under_eight_characters() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
     s.db_requests();
-    s.line(alice, "REGISTER * * :");
-    assert_eq!(
-        s.drain(alice),
-        [
-            ":irc.test.example FAIL REGISTER WEAK_PASSWORD alice :Passwords must contain 1–512 bytes."
-        ]
+    for short in ["REGISTER * * :", "REGISTER * * hunter2"] {
+        s.line(alice, short);
+        assert_eq!(
+            s.drain(alice),
+            [
+                ":irc.test.example FAIL REGISTER WEAK_PASSWORD alice :Passwords must be at least 8 characters and at most 512 bytes."
+            ],
+            "{short}"
+        );
+    }
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains("Passwords must be at least 8 characters")),
+        "NickServ REGISTER refuses it too"
     );
     assert!(s.db_requests().is_empty(), "no account is created");
 }
@@ -17256,7 +17390,7 @@ fn register_without_a_nick_needs_one() {
     s.line(c, "CAP LS 302");
     s.line(c, "CAP REQ :draft/account-registration");
     s.drain(c);
-    s.line(c, "REGISTER * * hunter2");
+    s.line(c, "REGISTER * * hunter22");
     let out = s.drain(c);
     assert_eq!(
         out,
@@ -17285,7 +17419,7 @@ fn register_after_a_refused_nick_says_the_name_is_taken() {
     s.line(c, "CAP REQ :draft/account-registration");
     s.line(c, "NICK root");
     s.drain(c);
-    s.line(c, "REGISTER * * hunter2");
+    s.line(c, "REGISTER * * hunter22");
     let out = s.drain(c);
     assert_eq!(
         out,
@@ -17294,7 +17428,7 @@ fn register_after_a_refused_nick_says_the_name_is_taken() {
     // Taking a nick settles it: the refusal no longer names the old one.
     s.line(c, "NICK other");
     s.drain(c);
-    s.line(c, "REGISTER * * hunter2");
+    s.line(c, "REGISTER * * hunter22");
     assert!(
         !s.drain(c)
             .iter()

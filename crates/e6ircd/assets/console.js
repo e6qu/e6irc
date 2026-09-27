@@ -1938,6 +1938,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const passwordField = (label, name, autocomplete) => {
         const { label: field, control: input } = labelledControl("input", name, label);
         input.type = "password"; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
+        if (autocomplete === "new-password") input.minLength = 8;
         addRevealControl(input);
         return field;
       };
@@ -1963,7 +1964,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         void mutateAccount(form, "PUT", body, "Password update failed.")
           .then((result) => {
             if (!result) return;
-            setAccountResult(`${current ? "Local password changed." : "Local password added."} Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.`, true);
+            setAccountResult(`${current ? "Local password changed." : "Local password added."} Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.`, true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
               const credentials = apiCollection(updated, "credentials", "credential directory");
               renderPassword(credentials.some((credential) => credential.kind === "local_password"));

@@ -282,11 +282,21 @@ pub(crate) fn disconnect_suspended(
     reason: &str,
     actor: &str,
 ) -> bool {
-    if registered_nick(state, victim).is_none() {
+    if !state.sessions.contains_key(&victim) {
         return false;
     }
     let server = state.config.server_name.clone();
-    close_killed(state, victim, reason, actor, &server);
+    if registered_nick(state, victim).is_some() {
+        close_killed(state, victim, reason, actor, &server);
+        return true;
+    }
+    // Authenticated but still registering (SASL completes before CAP END):
+    // there is no nick to KILL, but the session must not go on to register
+    // as the account.
+    let head = format!("ERROR :Closing Link: {server} (");
+    let fitted = fit_trailing(&format!("{head})"), reason);
+    state.send(victim, &format!("{head}{fitted})"));
+    state.close(victim, reason);
     true
 }
 

@@ -325,6 +325,7 @@ fn nickserv_identify(state: &mut ServerState, conn: ConnId, args: &[&str]) {
             .get_mut(&conn)
             .expect("checked")
             .pending_identify = Some(crate::core::state::PendingServiceReply::new(label));
+        state.credential_check_queued(conn);
     }
 }
 

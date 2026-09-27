@@ -373,7 +373,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         Ok(password) => password,
         Err(refusal) => {
             let code = match refusal {
-                crate::identity::PasswordRefusal::Empty => "WEAK_PASSWORD",
+                crate::identity::PasswordRefusal::TooShort => "WEAK_PASSWORD",
                 crate::identity::PasswordRefusal::TooLong => "UNACCEPTABLE_PASSWORD",
             };
             register_fail(state, conn, code, &nick, refusal.explanation());

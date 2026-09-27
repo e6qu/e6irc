@@ -189,6 +189,10 @@ impl CredentialWatch {
                         self.refresh(&pool, &credential).await;
                     }
                     Ok(CredentialChange::Resynchronize) => self.refresh_all(&pool).await,
+                    // An account's authority: the account-authority watcher's.
+                    // A suspension or deletion also ends the account's browser
+                    // credentials, which are announced themselves.
+                    Ok(CredentialChange::Account(_)) => {}
                     Err(error) => {
                         eprintln!("http: credential-change listener lost: {error}");
                         break;
@@ -217,6 +221,22 @@ impl CredentialLease {
                 *current = answer;
                 true
             });
+        }
+    }
+
+    /// Read the credential again now, and say whether the store says it has
+    /// ended; if so every socket holding it is told. A socket asks when its
+    /// network stops: a suspension or deletion ends the account's credentials
+    /// and stops its networks in one change, and the network's stop can reach
+    /// the socket before the credential's announcement does. A store that
+    /// cannot be asked says nothing either way.
+    pub(crate) async fn has_ended_now(&self, pool: &sqlx::PgPool) -> bool {
+        match crate::db::credential_remaining(pool, &self.credential).await {
+            Ok(None) => {
+                self.watch.announce(&self.credential, Ok(None));
+                true
+            }
+            Ok(Some(_)) | Err(_) => false,
         }
     }
 

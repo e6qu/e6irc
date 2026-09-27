@@ -288,7 +288,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asynchronous answer — held (`emit_deferred_labeled`) or not
     (`emit_labeled_unheld`) — is gathered with what the command answered on the
     spot into the one labeled response.
-  - `NewPassword` — a password an account may be given (1–512 bytes) is parsed
+  - `NewPassword` — a password an account may be given (8 characters to 512 bytes) is parsed
     once; account creation takes only this type, and the REST/web validators
     call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
     cannot store a password another surface refuses to verify (an empty one
@@ -566,6 +566,26 @@ These are project-wide rules, enforced in review and (where possible) CI:
     download) goes through `DeadlineWriter` or `within_send_deadline`, so a peer that stops reading
     ends its connection at the deadline instead of parking the task that owns
     it — and every resource that task holds — forever.
+  - `AccountLease` — `attach` takes a lease on the account it serves instead
+    of its name, so no attachment can outlive a suspension, deletion or
+    password change: the account lifecycle revokes leases on the mutation
+    lane, and a lease is refused to a credential check that began before the
+    revocation. Attachments to shared and configured networks, which do not
+    stop with the account, once stayed open (§9).
+  - `AuthorityLedger` — a change of an account's authority is applied on
+    every server serving the database, each exactly once: the accounts row
+    counts each change (`authority_generation`, migration 0095), the server
+    that commits one records it as applied on the mutation lane, and the
+    others apply it from the announcement. Another server's suspension, or a
+    password change there, once left this server's sessions and attachments
+    open (§9).
+  - `BoundSession` — an OIDC link and a re-authentication flow both seal the
+    session that started them, so neither can be built unbound; its callback
+    acts only for that session, presented again, still live (§9).
+  - `VerifiedAccount` — a credential check yields the account's stored name,
+    and minting an app password or a browser session takes only that type: a
+    grouped nick's exchange once minted for the typed nick and answered 401
+    after a successful verify.
   - `MutationLane` — the registry's transitions (replace, ensure running,
     remove, remove an owner's networks) exist only on the lane
     `Registry::mutate` hands to a unit of work it runs as its own task, so a
@@ -1742,6 +1762,11 @@ Principal tables (columns abridged):
   and suspension; a database constraint rejects every other value. At least
   one effective durable-or-configured administrator remains active across
   HTTP deletion. `nick_enforce` is NickServ `SET ENFORCE` (migration 0075).
+  `authority_generation` counts each change of the account's authority — its
+  suspension flipping, its primary password added, replaced or removed — and
+  triggers announce every created account, counted change and deleted account
+  on `e6irc_credential_changed`, so every server serving the database ends the
+  account's sessions (migration 0095, §9).
 - `account_nicks` (casefolded nick, display nick, account_id, registered_at) —
   NickServ `GROUP`, cascading with the account (migration 0075). Two triggers,
   under the per-name lock account creation and deletion take, keep a nick from
@@ -1895,7 +1920,14 @@ Principal tables (columns abridged):
   `accounts(id)` ON DELETE CASCADE (migration 0065). A grant lives
   `DEVICE_GRANT_LIFETIME_SECONDS` (the advertised `expires_in`) and is pruned
   only a grace period after expiry, so a late poll is answered RFC 8628
-  `expired_token` rather than `invalid_grant`.
+  `expired_token` rather than `invalid_grant`. The device code is a bearer
+  secret and is stored only as its SHA-256 (`device_code_hash`, migration
+  0095, which hashed the codes of pending grants in place with the built-in
+  `sha256()`), like every other bearer. A grant records the `client_id` that
+  started it — a poll naming another client is `invalid_grant` — and paces its
+  polls: `poll_interval_seconds` (5 to start) and `last_polled_at`; a poll
+  sooner than the interval after the last is answered `slow_down` and adds 5
+  seconds to the interval (RFC 8628 §3.5).
 - `bnc_read_markers` (BIGINT account_id, network, target, timestamp) —
   per-account, per-BNC-network read position, the source for
   `draft/read-marker` on the attach listener. Distinct from `read_markers`
@@ -2091,8 +2123,11 @@ the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge — including the password rule
-(`NewPassword`, 1–512 bytes, which the web and REST API apply too): `REGISTER`
-refuses an empty password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
+(`NewPassword`: at least 8 characters, the NIST SP 800-63B floor, and at most
+512 bytes, which the web forms and REST API apply too, NickServ `REGISTER` and a
+password change included; a password set before the floor still verifies):
+`REGISTER`
+refuses a shorter password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
 one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
 account after with `NEED_NICK`; the capability's advertised value states
 the policy (`before-connect`, `email-required`) so a client knows the rules
@@ -2178,6 +2213,17 @@ provider-verified email claim.
   spends the per-address authentication budget like the start. A refused
   callback leaves the cookie alone, so an attacker who learns a victim's
   `state` cannot burn the victim's login.
+- The two flows that grant or prove authority over an existing account — a
+  link and a re-authentication — carry a `BoundSession`: the account and the
+  SHA-256 of the browser session that started the flow (never its token). No
+  such flow can be built unbound, and its callback acts only when this browser
+  presents that same session again. A link then checks the session in the
+  transaction that inserts the identity — live, the account's, and within
+  `STEP_UP_WINDOW` of proving its person — holding its row until the insert
+  commits; a re-authentication marks only that session. A cookie stolen while
+  recently authenticated therefore cannot start a link and finish it after its
+  owner signed out or changed the password: the callback is refused (`403`)
+  and links nothing.
 - The session-bound CSRF value never travels in a URL, where it would reach
   browser history and proxy access logs for the session's lifetime. Linking an
   identity is a `POST` carrying the `X-E6IRC-CSRF` header like every other
@@ -2256,7 +2302,9 @@ Personal access tokens are hashed at rest, expire after a caller-selected
 `read` for safe API methods and `write` for mutations; administrator routes
 also require both the `administrator` grant and the account's current durable
 or configured administrator authority. IRC SASL OAUTHBEARER independently
-requires `irc`. Device authorization issues `read`/`write`/`irc`, never
+requires `irc`, and its GS2 header is parsed, not skipped (RFC 7628 §3.1): an
+authorization identity (`a=`) that does not name the token's own account is
+refused, as a PLAIN `authzid` naming another account is. Device authorization issues `read`/`write`/`irc`, never
 administrator authority. Token issuance and device approval require the
 browser session plus its `X-E6IRC-CSRF` value, so an existing bearer cannot
 mint a broader replacement. Every unsafe cookie-authenticated REST method
@@ -2393,9 +2441,13 @@ per process, on its own connection, re-reads each announced credential that a
 socket holds; after its connection is lost it re-reads every held credential,
 because what was announced in between was not heard. A credential that cannot
 be re-read (the database is unavailable) closes its sockets with 1013 instead,
-which the client retries, authenticating again. `/ws/irc` is not such a
-socket: it carries no HTTP credential, and its SASL login is an IRC session's,
-with the same lifetime as one on a TCP listener.
+which the client retries, authenticating again. A chat socket whose network
+is removed, disabled or stopped sends its terminal `unavailable` status and
+closes with 1000; when its credential ended with the network — a suspension or
+deletion does both in one change, and the network's stop can arrive first — it
+reads the credential again and closes with 1008 as the credential's end.
+`/ws/irc` is not such a socket: it carries no HTTP credential, and its SASL
+login is an IRC session's, with the same lifetime as one on a TCP listener.
 The account directory also projects effective administrator authority, its
 durable/configuration sources, and suspension posture.
 `PATCH /api/v1/admin/accounts/{id}` and matching CSRF-protected console forms
@@ -2403,14 +2455,61 @@ change exactly one durable authority or suspension state by immutable account
 ID. Self-suspension, self-demotion, and suspending/demoting the last active
 durable administrator are conflicts. Account-state
 and network CRUD share one mutation lane. After the durable transaction,
-suspension installs a case-folded deny key on the ordered core thread before
-disconnecting every authenticated IRC session, then stops every active network
-owned by that account. A password verdict already in flight is therefore
-converted to denial instead of recreating a session after the sweep.
-Reactivation removes the core deny key and rebuilds every enabled owned
-network; invalid persisted network configuration fails before changing the
-durable state. A runtime reconciliation failure reports the exact committed
-partial state instead of claiming success.
+suspension revokes, on that lane, every bouncer attachment the account holds —
+on an operator's shared or configured network too (`AccountLease`, below) —
+stops every active network the account stored, holds stopped every network
+the configuration defines for it (`owner_suspended` in the administrator
+inventory), and installs a case-folded deny key on the ordered core thread
+before disconnecting every authenticated IRC session, registered or still
+registering. A password verdict already in flight is therefore converted to
+denial instead of recreating a session after the sweep. Reactivation removes
+the core deny key, rebuilds every enabled owned network and restarts the
+configured ones its suspension held; invalid persisted network configuration
+fails before changing the durable state. Deletion revokes and stops the same
+way, and holds the configured networks for good (`owner_deleted`: their owner
+is gone); a process that starts after a suspension or deletion starts them
+held. A runtime reconciliation failure reports the exact committed partial
+state instead of claiming success.
+
+An attachment ends with its account's authority. `attach` takes an
+`AccountLease` on the account it serves — it cannot be called without one —
+and relays until the lease is revoked, telling the client why. The attach
+listener takes a `RevocationTicket` before it checks any credential and spends
+it on the lease after the handshake: a suspension, deletion or password change
+of the account in between refuses the lease, so a password verified a moment
+before the suspension committed cannot open an attachment after the sweep.
+`/ws/ui` sockets end with their browser credential (`CredentialLease`, above).
+
+A password change — rotation or a first password, from a browser session, so
+never from an IRC session — also ends every live IRC session and bouncer
+attachment of the account, however they authenticated (app passwords and
+tokens included; they stay valid and can sign in again). It is the suspension
+sweep without its gate: attachments are revoked on the mutation lane, and every
+core shard closes the account's sessions and refuses a verdict for a
+credential check queued before the change (`EndAccountSessions`); a check
+queued afterwards reads the new credentials.
+
+Several servers may serve one database, and each of them ends the account's
+sessions and attachments, whichever server committed the change
+(`account_authority`). The accounts row counts every change of an account's
+authority in `authority_generation` — its suspended flag flipping, its primary
+password added, replaced or removed, by any path, the host's
+`recover-administrator` included — and migration 0095's triggers announce each
+created account, counted change and deleted account on
+`e6irc_credential_changed` as `account:<id>:<folded name>`. One listener per
+process, on its own connection, re-reads the announced row on the mutation lane
+and compares it with its `AuthorityLedger`, the generation and standing this
+server has applied: a suspension is applied as here (sessions, attachments,
+stored networks, configured networks held, core gate), a reactivation lifts
+the gate and runs the networks again, a counted change of an active account
+ends its sessions and attachments as a password change, and a deleted row is
+applied as a suspension whose configured networks stay held. The server that
+committed the change records it as applied in the same turn on the lane, so it
+never applies its own change twice — which would end the sessions opened with
+the new password. The ledger's baseline is read at boot before the server
+reads which accounts are suspended, and every account is read again after the
+listener's connection is lost, since what was announced in between was not
+heard.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and
@@ -4390,7 +4489,19 @@ that refuses and closes can make the client's next registration write fail
 first; the client then reads what the server sent before it left (for at most
 two seconds) and reports that refusal, not the broken pipe.
 
-`e6irc login` implements the RFC 8628 device flow: it prints the verification
+The two device endpoints speak RFC 8628 as written: `/api/v1/auth/device/start`
+takes a form with a required `client_id` (and an optional `scope`, which may
+only name the fixed `read write irc`), and `/api/v1/auth/device/token` a form
+with `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `device_code`
+and `client_id` (§3.4). Parameters they do not define are ignored and a
+repeated one is refused, as RFC 6749 §3.1 requires; errors are RFC 6749 §5.2
+JSON (`invalid_request`, `unsupported_grant_type`, `invalid_grant`,
+`invalid_scope`) and §3.5's `authorization_pending`, `slow_down`,
+`access_denied` and `expired_token`, each a 400. The token response is RFC
+6749 §5.1's: `access_token`, `token_type` `Bearer`, `expires_in` and
+`scope`. Every answer is `Cache-Control: no-store`.
+
+`e6irc login` implements the RFC 8628 device flow as client `e6irc-cli`: it prints the verification
 URI and user code, honors the server's polling interval/slow-down/expiry
 contract, and atomically stores the issued bearer token without printing it.
 The shared cache includes the issuing API origin so `api` cannot silently send
@@ -4585,7 +4696,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   account held (local and app passwords, personal access tokens, device
   grants, browser sessions) exactly as suspension does, through one shared
   revocation. A primary password change or addition ends every other browser
-  session in the same transaction; app passwords and personal access tokens
+  session in the same transaction, then every live IRC session and bouncer
+  attachment of the account (§9); app passwords and personal access tokens
   are separately managed and left unchanged, and the response says so.
   Console pages authenticate by browser session only: a bearer — whatever its
   scopes — gets 401, and suspension or an unavailable database surface as
@@ -4722,7 +4834,10 @@ but the CLI, TUI, and BNC must surface the rejection.
   cookie, the shared authentication rate limit, a 32–512-byte deployment
   secret, constant-time digest comparison, and an atomic empty-store check.
   Account suspension revokes bearer material transactionally and is enforced
-  again by the ordered core so in-flight verification cannot race the action.
+  again by the ordered core so in-flight verification cannot race the action,
+  and by the attach listener's ticket-then-lease (`AccountLease`, §9), so a
+  bouncer attachment cannot either — on every server serving the database,
+  which each apply it from the store's announcement (`AuthorityLedger`, §9).
 
 ---
 

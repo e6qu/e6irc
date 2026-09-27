@@ -318,22 +318,18 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     sasl_verify_queued(state, conn);
                 }
             } else {
-                // RFC 7628: gs2-header then \x01-separated key=value fields;
-                // the credential is the `auth=Bearer <token>` field.
-                let token = e6irc_proto::base64::decode(&payload).and_then(|raw| {
-                    raw.split(|&b| b == 0x01).find_map(|field| {
-                        std::str::from_utf8(field)
-                            .ok()
-                            .and_then(|s| s.strip_prefix("auth=Bearer "))
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string)
-                    })
-                });
-                let Some(token) = require_cred_payload(token, state, conn) else {
+                // RFC 7628 §3.1: the GS2 header's authorization identity is
+                // held to the token's account by the verifier.
+                let parsed = e6irc_proto::sasl::parse_oauthbearer_payload(&payload);
+                let Some(credentials) = require_cred_payload(parsed, state, conn) else {
                     return;
                 };
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
-                let request = crate::core::DbRequest::VerifyToken { conn, token };
+                let request = crate::core::DbRequest::VerifyToken {
+                    conn,
+                    token: credentials.token,
+                    authzid: credentials.authzid,
+                };
                 if state.db_tx.try_push(request).is_err() {
                     // DB worker unreachable: fail loudly, never hang. The verify
                     // was never enqueued, so no reply will clear a pending flag —
@@ -369,6 +365,7 @@ fn sasl_verify_queued(state: &mut ServerState, conn: ConnId) {
     let label = state.defer_captured_label(conn);
     state.sessions.get_mut(&conn).expect("checked").sasl_verify =
         Some(crate::core::state::PendingServiceReply::new(label));
+    state.credential_check_queued(conn);
 }
 
 pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core::DbReply) {
@@ -432,8 +429,10 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     // the administrative event installs this deny gate, even a successful DB
     // verification that was already in flight is converted to a denial rather
     // than recreating an authenticated session after the disconnect sweep.
+    // A password change is the same, for a check queued before it: the
+    // verdict speaks for a credential that no longer stands.
     if let crate::core::DbReply::PasswordVerified { account, origin } = &reply
-        && state.is_account_suspended(account)
+        && (state.is_account_suspended(account) || state.credentials_ended_since(conn, account))
     {
         verify_denied(state, conn, *origin, sasl_label, Denial::Rejected);
         return;

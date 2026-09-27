@@ -133,7 +133,12 @@ async fn attach_relays_over_the_loopback_driver() {
             e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
-            "attacher",
+            {
+                let revocations = e6ircd::bouncer::AccountRevocations::new();
+                revocations
+                    .lease(revocations.ticket(), "attacher")
+                    .expect("nothing revoked it")
+            },
             e6ircd::bouncer::Greeting {
                 server_name: "bnc.test",
                 network: "net",

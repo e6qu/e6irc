@@ -755,4 +755,12 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     .await
     .expect("ws/ui must detach, not dangle on the removed network");
     assert!(detached);
+    // Then it closes with a close frame. It used to drop the connection
+    // without the closing handshake.
+    match tokio::time::timeout(deadline::HANG, ws.next()).await {
+        Ok(Some(Ok(Tung::Close(Some(frame))))) => {
+            assert_eq!(u16::from(frame.code), 1000, "{frame:?}");
+        }
+        other => panic!("no close frame after the terminal status: {other:?}"),
+    }
 }

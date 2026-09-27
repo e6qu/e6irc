@@ -559,7 +559,12 @@ pub(super) async fn create_session_app_password(
         return response;
     }
     app_password_issue_response(
-        crate::db::issue_app_password_for_account(pool_of(&state), &account, &request.label).await,
+        crate::db::issue_app_password_for_account(
+            pool_of(&state),
+            &crate::db::VerifiedAccount::established(account.as_str()),
+            &request.label,
+        )
+        .await,
         request.label,
     )
 }
@@ -577,8 +582,9 @@ pub(super) struct ChangePasswordRequest {
 /// someone else's hands; app passwords and personal access tokens are
 /// separately managed credentials and are deliberately left alone, so the
 /// person is told to revoke those themselves if they suspect them.
-pub(super) const PASSWORD_CHANGE_DETAIL: &str = "Other browser sessions were signed out; app \
-     passwords and access tokens are unchanged — revoke them below if you suspect them.";
+pub(super) const PASSWORD_CHANGE_DETAIL: &str = "Other browser sessions, IRC connections and \
+     bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke \
+     them below if you suspect them.";
 
 #[derive(serde::Serialize)]
 struct PasswordChangeResponse {
@@ -603,8 +609,8 @@ pub(super) async fn change_password(
     if let Some(detail) = req
         .current_password
         .as_deref()
-        .and_then(password_input_error)
-        .or_else(|| password_input_error(&req.new_password))
+        .and_then(presented_password_error)
+        .or_else(|| new_password_error(&req.new_password))
     {
         return problem(StatusCode::BAD_REQUEST, "Invalid password", Some(detail));
     }
@@ -631,9 +637,19 @@ pub(super) async fn change_password(
         }
     };
     match result {
-        Ok(()) => json_no_store(PasswordChangeResponse {
-            detail: PASSWORD_CHANGE_DETAIL,
-        }),
+        Ok(authority) => match super::end_sessions_after_password_change(&state, authority).await {
+            Ok(()) => json_no_store(PasswordChangeResponse {
+                detail: PASSWORD_CHANGE_DETAIL,
+            }),
+            Err(error) => problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Password changed; live IRC sessions not ended",
+                Some(&format!(
+                    "The password changed and other browser sessions were signed out, but live \
+                     IRC connections could not be ended: {error}"
+                )),
+            ),
+        },
         Err(crate::db::DbError::BadCredentials) => problem(
             StatusCode::UNAUTHORIZED,
             "Current password is incorrect",

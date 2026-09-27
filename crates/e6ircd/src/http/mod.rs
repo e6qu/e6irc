@@ -452,16 +452,31 @@ pub(super) fn validate_label(label: &str) -> Option<Response> {
         .map(|detail| problem(StatusCode::BAD_REQUEST, "Invalid label", Some(&detail)))
 }
 
+/// The bound on a login's account name and presented password, checked before
+/// any Argon2 work ([`presented_password_error`]).
 pub(super) fn credential_input_error(account: &str, password: &str) -> Option<&'static str> {
     if account.is_empty() || account.len() > MAX_ACCOUNT_LEN {
         return Some("Account names must contain 1–64 bytes.");
     }
-    password_input_error(password)
+    presented_password_error(password)
 }
 
-/// The password rule IRC `REGISTER` and NickServ `REGISTER` apply too
-/// ([`crate::identity::NewPassword`]).
-pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
+/// The bound on a password presented for *verification* — a login, the
+/// app-password exchange, a re-authentication, a change's current password:
+/// 1–512 bytes. It is not the rule for a password being set
+/// ([`new_password_error`]): an account whose password predates that rule
+/// still signs in with it.
+pub(super) fn presented_password_error(password: &str) -> Option<&'static str> {
+    if password.is_empty() || password.len() > 512 {
+        Some("Passwords must contain 1–512 bytes.")
+    } else {
+        None
+    }
+}
+
+/// The rule for a password being *set*, which IRC `REGISTER` and NickServ
+/// `REGISTER` apply too ([`crate::identity::NewPassword`]).
+pub(super) fn new_password_error(password: &str) -> Option<&'static str> {
     crate::identity::NewPassword::parse(password)
         .err()
         .map(crate::identity::PasswordRefusal::explanation)
@@ -637,10 +652,6 @@ pub(super) fn parse_optional_contact_email(
 /// Run one HTTP control-plane mutation on the core and await its typed outcome.
 /// The core owns live-state ordering and the database verdict; HTTP handlers do
 /// not write durable/live state along a second path.
-async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result<String, String> {
-    state.core_tx.admin_action(req).await
-}
-
 async fn core_reply(
     state: &AppState,
     req: crate::core::AdminRequest,
@@ -696,6 +707,33 @@ async fn mutate_account_lifecycle(
                     .await
                     .map_err(account_deletion_status),
             }
+        })
+        .await
+}
+
+/// End every live IRC session and bouncer attachment of the account whose
+/// password just changed (`authority`, as the change left it) — by the browser
+/// session that asked, so no IRC session is the one that made the change. The
+/// same sweep as a suspension's, without its gate: attachments are revoked on
+/// the mutation lane, and the core refuses a verdict for a check queued before
+/// the change. Every other server does the same when the change is announced
+/// ([`crate::account_authority`]); this one records it as applied.
+pub(super) async fn end_sessions_after_password_change(
+    state: &Arc<AppState>,
+    authority: crate::db::AccountAuthority,
+) -> Result<(), String> {
+    let registry = registry_of(state).clone();
+    let state = state.clone();
+    registry
+        .mutate(move |lane| async move {
+            lane.authority_ledger().applied(&authority);
+            crate::account_authority::end_sessions_here(
+                &lane,
+                &state.core_tx,
+                &authority.folded,
+                &authority.folded,
+            )
+            .await
         })
         .await
 }
@@ -777,70 +815,59 @@ async fn account_suspension_in_lane(
     .map_err(|error| authority_error_status("account lifecycle mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
+    // Every other server applies the change when it is announced
+    // ([`crate::account_authority`]); this one applies it now.
+    lane.authority_ledger().applied(&change.authority);
     if suspended {
-        let stopped_networks = lane
-            .remove_owner(&change.folded, crate::bouncer::UnwrittenLines::Store)
-            .await;
-        core_action(
-            state,
-            crate::core::AdminRequest::SetAccountSuspended {
-                account: change.folded.clone(),
-                suspended: true,
-                reason: "Account suspended".into(),
-                actor: actor.to_string(),
-            },
+        // Every attachment the account holds ends, its networks stop — the
+        // ones the configuration defines for it held until it is reactivated
+        // — and the core gates it.
+        let crate::account_authority::SuspendedHere {
+            stopped_networks,
+            held_configured,
+        } = crate::account_authority::suspend_here(
+            lane,
+            &state.core_tx,
+            &change.folded,
+            "Account suspended",
+            actor,
         )
         .await
-        .map_err(|error| {
+        .map_err(|(stopped, error)| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "Account was suspended and {stopped_networks} network(s) stopped, but live IRC disconnect failed: {error}"
+                    "Account was suspended and {} owned and {} configured network(s) stopped, \
+                     but live IRC disconnect failed: {error}",
+                    stopped.stopped_networks, stopped.held_configured
                 ),
             )
         })?;
         Ok(format!(
-            "Suspended {} and stopped {stopped_networks} owned network(s).",
+            "Suspended {} and stopped {stopped_networks} owned and {held_configured} configured \
+             network(s).",
             change.name
         ))
     } else {
-        core_action(
-            state,
-            crate::core::AdminRequest::SetAccountSuspended {
-                account: change.folded.clone(),
-                suspended: false,
-                reason: "Account reactivated".into(),
-                actor: actor.to_string(),
-            },
+        let crate::account_authority::ReactivatedHere {
+            started_networks,
+            held,
+            restarted,
+            unbuildable,
+        } = crate::account_authority::reactivate_here(
+            lane,
+            &state.core_tx,
+            &change.folded,
+            actor,
+            prepared_networks,
         )
         .await
         .map_err(|error| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Account was reactivated, but the live IRC core remained gated: {error}"),
+                format!("Account {} was reactivated, but {error}", change.name),
             )
         })?;
-        let mut started_networks = 0_usize;
-        let mut held = Vec::new();
-        for (name, driver) in prepared_networks {
-            match lane
-                .ensure_running(Some(&change.folded), &name, driver)
-                .await
-            {
-                Ok(_) => started_networks += 1,
-                Err(crate::bouncer::RegistryRefusal::ConfiguredNetworkHeld(_)) => held.push(name),
-                Err(crate::bouncer::RegistryRefusal::Closed(closed)) => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "Reactivated {}, but started only {started_networks} owned \
-                             network(s): {closed}",
-                            change.name
-                        ),
-                    ));
-                }
-            }
-        }
         let held = if held.is_empty() {
             String::new()
         } else {
@@ -850,9 +877,16 @@ async fn account_suspension_in_lane(
                 held.join(", ")
             )
         };
+        let unbuildable = if unbuildable.is_empty() {
+            String::new()
+        } else {
+            format!(" Still stopped: {}.", unbuildable.join("; "))
+        };
         Ok(format!(
-            "Reactivated {} and started {started_networks} owned network(s).{held}",
-            change.name
+            "Reactivated {} and started {started_networks} owned and {} configured network(s).\
+             {held}{unbuildable}",
+            change.name,
+            restarted.len()
         ))
     }
 }
@@ -936,7 +970,7 @@ pub(super) async fn create_account_lifecycle(
             "The account must be a valid IRC nickname of at most 64 bytes.".into(),
         ));
     }
-    if let Some(detail) = password_input_error(password) {
+    if let Some(detail) = new_password_error(password) {
         return Err((StatusCode::BAD_REQUEST, detail.into()));
     }
     if let Some(detail) = state.unclaimable_account_name(account) {
@@ -1094,12 +1128,14 @@ mod problem_contract_tests {
     /// malformed request, a well-formed but invalid logout token included.
     /// Sign-out reads its form only as one of two places the CSRF value may
     /// be (a script sends the header and no body), and answers a request
-    /// that proves it in neither with the CSRF refusal.
+    /// that proves it in neither with the CSRF refusal. The two RFC 8628
+    /// device endpoints answer a malformed form with the OAuth
+    /// `invalid_request` error their protocol specifies.
     #[test]
     fn only_parse_form_unwraps_a_form() {
         assert_eq!(
             occurrences(concat!("Form", "(")),
-            vec![("device.rs", 1), ("mod.rs", 1), ("oidc.rs", 1)]
+            vec![("device.rs", 2), ("mod.rs", 1), ("oidc.rs", 1)]
         );
     }
 
@@ -2603,7 +2639,7 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        if let Some(detail) = password_input_error(&form.password) {
+        if let Some(detail) = new_password_error(&form.password) {
             return bootstrap_response(
                 &state,
                 form.account,
@@ -2651,18 +2687,23 @@ mod pages {
         }
         state.bootstrap_available.store(false, Ordering::Release);
         let user_agent = super::session_user_agent(&headers);
-        let token =
-            match crate::db::create_web_session(pool, &form.account, user_agent.as_ref()).await {
-                Ok(token) => token,
-                Err(error) => {
-                    eprintln!("bootstrap session creation failed: {error}");
-                    return problem(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Administrator created; session storage failed",
-                        Some("Sign in with the administrator account to continue."),
-                    );
-                }
-            };
+        let token = match crate::db::create_web_session(
+            pool,
+            &crate::db::VerifiedAccount::established(form.account.as_str()),
+            user_agent.as_ref(),
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("bootstrap session creation failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Administrator created; session storage failed",
+                    Some("Sign in with the administrator account to continue."),
+                );
+            }
+        };
         authenticated_redirect(
             &token,
             "/console",
@@ -2801,7 +2842,7 @@ mod pages {
                 StatusCode::FORBIDDEN,
             );
         }
-        if let Some(detail) = password_input_error(&form.password) {
+        if let Some(detail) = new_password_error(&form.password) {
             return invitation_response(
                 &state,
                 token,
@@ -2842,7 +2883,12 @@ mod pages {
             }
         };
         let user_agent = super::session_user_agent(&headers);
-        let session = match crate::db::create_web_session(pool, &account, user_agent.as_ref()).await
+        let session = match crate::db::create_web_session(
+            pool,
+            &crate::db::VerifiedAccount::established(account.as_str()),
+            user_agent.as_ref(),
+        )
+        .await
         {
             Ok(session) => session,
             Err(error) => {
@@ -4280,16 +4326,29 @@ mod cookie_tests {
 
 #[cfg(test)]
 mod credential_input_tests {
-    use super::{credential_input_error, password_input_error};
+    use super::{credential_input_error, new_password_error, presented_password_error};
 
     #[test]
     fn credential_fields_are_bounded_before_argon2() {
         assert_eq!(credential_input_error("alice", "secret"), None);
         assert!(credential_input_error("", "secret").is_some());
         assert!(credential_input_error(&"a".repeat(65), "secret").is_some());
-        assert!(password_input_error("").is_some());
-        assert!(password_input_error(&"p".repeat(513)).is_some());
-        assert_eq!(password_input_error(&"p".repeat(512)), None);
+        assert!(presented_password_error("").is_some());
+        assert!(presented_password_error(&"p".repeat(513)).is_some());
+        assert_eq!(presented_password_error(&"p".repeat(512)), None);
+    }
+
+    /// The eight-character floor governs a password being set; one being
+    /// verified — an older account's short password — is still admitted.
+    #[test]
+    fn only_a_password_being_set_must_be_eight_characters() {
+        assert_eq!(presented_password_error("hunter2"), None);
+        assert_eq!(
+            new_password_error("hunter2"),
+            Some("Passwords must be at least 8 characters and at most 512 bytes.")
+        );
+        assert_eq!(new_password_error("hunter22"), None);
+        assert!(new_password_error(&"p".repeat(513)).is_some());
     }
 }
 

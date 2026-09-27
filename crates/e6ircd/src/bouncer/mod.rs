@@ -19,6 +19,8 @@ use std::future::Future;
 
 use e6irc_proto::message::MiddleParam;
 
+mod account_lease;
+pub use account_lease::{AccountLease, AccountRevocations, AccountRevoked, RevocationTicket};
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -3421,6 +3423,12 @@ pub enum NetworkLifecycle {
     Reconnecting,
     AuthenticationFailed,
     RegistrationFailed,
+    /// An operator-configured network held stopped because its owning account
+    /// is suspended; reactivating the account restarts it.
+    OwnerSuspended,
+    /// An operator-configured network held stopped because its owning account
+    /// was deleted. It stays stopped: its owner is gone.
+    OwnerDeleted,
 }
 
 impl NetworkLifecycle {
@@ -3431,6 +3439,25 @@ impl NetworkLifecycle {
             Self::Reconnecting => "reconnecting",
             Self::AuthenticationFailed => "authentication_failed",
             Self::RegistrationFailed => "registration_failed",
+            Self::OwnerSuspended => "owner_suspended",
+            Self::OwnerDeleted => "owner_deleted",
+        }
+    }
+}
+
+/// Why an operator-configured network is held stopped by its owner's account
+/// lifecycle (its [`NetworkLifecycle`] while held).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerHold {
+    Suspended,
+    Deleted,
+}
+
+impl OwnerHold {
+    const fn lifecycle(self) -> NetworkLifecycle {
+        match self {
+            Self::Suspended => NetworkLifecycle::OwnerSuspended,
+            Self::Deleted => NetworkLifecycle::OwnerDeleted,
         }
     }
 }
@@ -3734,6 +3761,8 @@ enum NetworkRuntimePhase {
         connected_at: e6irc_proto::time::Millis,
     },
     Terminal(TerminalNetworkLifecycle),
+    /// Stopped by its owner's account lifecycle; the driver is gone.
+    Held(OwnerHold),
 }
 
 impl NetworkRuntimePhase {
@@ -3743,20 +3772,23 @@ impl NetworkRuntimePhase {
             Self::Reconnecting { .. } => NetworkLifecycle::Reconnecting,
             Self::Connected { .. } => NetworkLifecycle::Connected,
             Self::Terminal(lifecycle) => lifecycle.lifecycle(),
+            Self::Held(hold) => hold.lifecycle(),
         }
     }
 
     const fn next_retry_at(self) -> Option<e6irc_proto::time::Millis> {
         match self {
             Self::Reconnecting { next_retry_at } => next_retry_at,
-            Self::Connecting | Self::Connected { .. } | Self::Terminal(_) => None,
+            Self::Connecting | Self::Connected { .. } | Self::Terminal(_) | Self::Held(_) => None,
         }
     }
 
     const fn connected_at(self) -> Option<e6irc_proto::time::Millis> {
         match self {
             Self::Connected { connected_at } => Some(connected_at),
-            Self::Connecting | Self::Reconnecting { .. } | Self::Terminal(_) => None,
+            Self::Connecting | Self::Reconnecting { .. } | Self::Terminal(_) | Self::Held(_) => {
+                None
+            }
         }
     }
 }
@@ -3829,6 +3861,18 @@ impl NetworkRuntime {
     fn is_connected(&self) -> bool {
         let state = self.state.lock().expect("network runtime poisoned");
         matches!(state.phase, NetworkRuntimePhase::Connected { .. })
+    }
+
+    /// Record that the network is held stopped by its owner's account
+    /// lifecycle. Its driver has stopped, so nothing moves it again.
+    fn hold(&self, hold: OwnerHold) {
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        state.phase = NetworkRuntimePhase::Held(hold);
+        state.state_changed_at = epoch_millis();
+        state.status_revision = state
+            .status_revision
+            .checked_add(1)
+            .expect("network status revision exhausted");
     }
 
     fn connected(&self) -> u64 {
@@ -5281,6 +5325,13 @@ impl NetworkHandle {
     /// until [`SHUTDOWN_WAIT_DEADLINE`] passes — whichever is first. The stop is
     /// signalled either way; the deadline only bounds how long the caller (the
     /// registry, under its one mutation guard) holds still for one driver.
+    /// Stop the driver and mark the network held by its owner's account
+    /// lifecycle ([`OwnerHold`]); its runtime reports the hold from then on.
+    pub(crate) async fn hold(&self, hold: OwnerHold) {
+        self.shutdown_and_wait().await;
+        self.runtime.hold(hold);
+    }
+
     pub async fn shutdown_and_wait(&self) {
         if !self.shutdown_and_wait_within(SHUTDOWN_WAIT_DEADLINE).await {
             eprintln!(
@@ -6320,9 +6371,15 @@ impl std::fmt::Display for AttachEnd {
             Self::ClientUnresponsive => "the client stopped answering liveness pings",
             Self::NetworkRemoved => "the network was removed or replaced",
             Self::DriverStopped => "the network's driver stopped",
+            Self::AccountRevoked => "the account was suspended or deleted, or its password changed",
         })
     }
 }
+
+/// What a client whose account's authority ended is told as it is detached.
+const ACCOUNT_REVOKED_NOTICE: &[u8] =
+    b":*bnc* NOTICE * :your account was suspended or deleted, or \
+    its password changed; detaching\r\n";
 
 /// How long an attached client may stay silent before the bouncer pings it,
 /// and again before it gives up on it. A quiet or parked network writes
@@ -6348,6 +6405,9 @@ pub enum AttachEnd {
     NetworkRemoved,
     /// The network's driver is gone.
     DriverStopped,
+    /// The account's authority ended: it was suspended or deleted, or its
+    /// password changed.
+    AccountRevoked,
 }
 
 /// Attach a downstream client stream to a running network: welcome it, replay
@@ -6359,8 +6419,12 @@ pub enum AttachEnd {
 /// `input` is what the client already sent on `stream` that nothing handled
 /// (see [`ClientInput`]); it is handled first, after the replay, as the
 /// attached session's own input.
-/// `account` is the authenticated account, used to key the BNC-local
-/// per-target read markers (shared networks keep per-account positions).
+/// `authority` is the lease on the authenticated account's authority: the
+/// account keys the BNC-local per-target read markers (shared networks keep
+/// per-account positions), and the attachment ends
+/// ([`AttachEnd::AccountRevoked`]) when the account is suspended or deleted or
+/// its password changes — on any network, the operator's shared and
+/// configured ones included. An attachment cannot be made without one.
 /// `greeting` names who welcomes the client and the nick it registered with.
 /// `liveness` is how long the client may stay silent before it is pinged, and
 /// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
@@ -6375,7 +6439,7 @@ pub async fn attach<S>(
     input: ClientInput,
     handle: &NetworkHandle,
     caps: AttachCaps,
-    account: &str,
+    authority: AccountLease,
     greeting: Greeting<'_>,
     liveness: std::time::Duration,
 ) -> std::io::Result<AttachEnd>
@@ -6384,7 +6448,7 @@ where
 {
     let stream =
         crate::peer_write::DeadlineWriter::new(stream, crate::peer_write::PEER_WRITE_DEADLINE);
-    match relay_attached(stream, input, handle, caps, account, greeting, liveness).await {
+    match relay_attached(stream, input, handle, caps, authority, greeting, liveness).await {
         Err(error) if crate::peer_write::is_stalled(&error) => Ok(AttachEnd::ClientTooSlow),
         ended => ended,
     }
@@ -6424,7 +6488,7 @@ async fn relay_attached<S>(
     input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
-    account: &str,
+    mut authority: AccountLease,
     greeting: Greeting<'_>,
     liveness: std::time::Duration,
 ) -> std::io::Result<AttachEnd>
@@ -6433,7 +6497,15 @@ where
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let account = authority.account().to_string();
+    let account = account.as_str();
     let (mut read, mut write) = tokio::io::split(stream);
+    // Revoked between the lease and here: the attachment never begins.
+    if authority.is_revoked() {
+        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
+        write.flush().await?;
+        return Ok(AttachEnd::AccountRevoked);
+    }
 
     // Detach the client if the network is removed. The broadcast does not close
     // on its own (the registry's `NetworkHandle` keeps an events sender), so
@@ -6651,9 +6723,23 @@ where
     let mut awaiting_pong = false;
     loop {
         tokio::select! {
+            // The account's authority ended: tell the client and detach.
+            () = authority.revoked() => {
+                write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
+                write.flush().await?;
+                return Ok(AttachEnd::AccountRevoked);
+            }
             // Network removed/replaced: tell the client and detach.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
+                    // The account lifecycle revokes before it stops the
+                    // account's networks, and both can be ready here at once:
+                    // the network stopped because the authority ended.
+                    if authority.is_revoked() {
+                        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
+                        write.flush().await?;
+                        return Ok(AttachEnd::AccountRevoked);
+                    }
                     write
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
                         .await?;
@@ -8432,7 +8518,7 @@ mod tests {
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
-                "testuser",
+                account_lease::lease_for_test("testuser"),
                 Greeting {
                     server_name: "bnc.test",
                     network: "net",
@@ -8456,6 +8542,144 @@ mod tests {
         );
     }
 
+    /// A suspension revokes the account's attachments and then stops its
+    /// networks, and an attachment can see both at once: it ends as revoked,
+    /// and says so. It used to end as often as not as a removed network.
+    #[tokio::test]
+    async fn an_attachment_whose_network_stops_with_its_authority_ends_as_revoked() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        // The relay's select picks among ready branches at random; each round
+        // readies both at once, as a suspension does.
+        for _ in 0..20 {
+            let (handle, _ends) = NetworkHandle::channels(16);
+            let handle = std::sync::Arc::new(handle);
+            let revocations = AccountRevocations::new();
+            let lease = revocations
+                .lease(revocations.ticket(), "alice")
+                .expect("lease");
+            let (client_side, server_side) = tokio::io::duplex(4096);
+            let attached = tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    attach(
+                        server_side,
+                        ClientInput::default(),
+                        &handle,
+                        AttachCaps::default(),
+                        lease,
+                        Greeting {
+                            server_name: "bnc.test",
+                            network: "net",
+                            requested_nick: "alice",
+                        },
+                        ATTACH_LIVENESS_INTERVAL,
+                    )
+                    .await
+                }
+            });
+            let mut lines = BufReader::new(client_side).lines();
+            loop {
+                let line = lines.next_line().await.expect("read").expect("welcome");
+                if line.contains("NOTICE") && line.contains("upstream") {
+                    break;
+                }
+            }
+            // A suspension revokes, then stops the account's networks.
+            revocations.revoke("alice");
+            handle.shutdown();
+            let end = tokio::time::timeout(std::time::Duration::from_secs(5), attached)
+                .await
+                .expect("the attachment ends")
+                .expect("attach task")
+                .expect("attach");
+            assert_eq!(end, AttachEnd::AccountRevoked);
+        }
+    }
+
+    /// An attachment ends with its account's authority: revoking the lease —
+    /// a suspension, deletion or password change — detaches the client from a
+    /// network that keeps running (a shared or configured one), and a lease
+    /// revoked before the attachment began never starts one.
+    #[tokio::test]
+    async fn a_revoked_account_lease_detaches_the_client_from_a_running_network() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (handle, _ends) = NetworkHandle::channels(16);
+        let handle = std::sync::Arc::new(handle);
+        let revocations = AccountRevocations::new();
+        let lease = revocations
+            .lease(revocations.ticket(), "Alice")
+            .expect("lease");
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let attached = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                attach(
+                    server_side,
+                    ClientInput::default(),
+                    &handle,
+                    AttachCaps::default(),
+                    lease,
+                    Greeting {
+                        server_name: "bnc.test",
+                        network: "net",
+                        requested_nick: "alice",
+                    },
+                    ATTACH_LIVENESS_INTERVAL,
+                )
+                .await
+            }
+        });
+        let mut lines = BufReader::new(client_side).lines();
+        // Attached: the welcome, then the up-front status, arrive.
+        loop {
+            let line = lines.next_line().await.expect("read").expect("welcome");
+            if line.contains("NOTICE") && line.contains("upstream") {
+                break;
+            }
+        }
+        assert_eq!(revocations.revoke("ALICE"), 1);
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), attached)
+            .await
+            .expect("a revoked attachment ends")
+            .expect("attach task")
+            .expect("attach");
+        assert_eq!(end, AttachEnd::AccountRevoked);
+        let notice = lines.next_line().await.expect("read").expect("notice");
+        assert!(notice.contains("suspended or deleted"), "{notice}");
+        assert!(
+            !*handle.watch_shutdown().borrow(),
+            "the network keeps running"
+        );
+
+        // Revoked between the lease and the attachment: it never begins.
+        let late = revocations
+            .lease(revocations.ticket(), "alice")
+            .expect("lease");
+        revocations.revoke("alice");
+        let (_client_side, server_side) = tokio::io::duplex(4096);
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            attach(
+                server_side,
+                ClientInput::default(),
+                &handle,
+                AttachCaps::default(),
+                late,
+                Greeting {
+                    server_name: "bnc.test",
+                    network: "net",
+                    requested_nick: "alice",
+                },
+                ATTACH_LIVENESS_INTERVAL,
+            ),
+        )
+        .await
+        .expect("returns at once")
+        .expect("attach");
+        assert_eq!(end, AttachEnd::AccountRevoked);
+        assert_eq!(handle.runtime_snapshot().attached_clients, 0);
+    }
+
     /// An attached client that stops reading ends its attachment as too slow
     /// at the write deadline. The relay used to park in the write, never seeing
     /// the network's removal or the client's silence, and held the network
@@ -8470,7 +8694,7 @@ mod tests {
             ClientInput::default(),
             &handle,
             AttachCaps::default(),
-            "testuser",
+            account_lease::lease_for_test("testuser"),
             Greeting {
                 server_name: "bnc.test",
                 network: "net",
@@ -9975,7 +10199,7 @@ mod tests {
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
-                "alice",
+                account_lease::lease_for_test("alice"),
                 Greeting {
                     server_name: "bnc.test",
                     network: "net",
@@ -10035,7 +10259,7 @@ mod tests {
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
-                "alice",
+                account_lease::lease_for_test("alice"),
                 Greeting {
                     server_name: "bnc.test",
                     network: "net",
@@ -10094,7 +10318,7 @@ mod tests {
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
-                "alice",
+                account_lease::lease_for_test("alice"),
                 Greeting {
                     server_name: "bnc.test",
                     network: "net",
@@ -10196,7 +10420,7 @@ mod tests {
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
-                "alice",
+                account_lease::lease_for_test("alice"),
                 Greeting {
                     server_name: "bnc.test",
                     network: "net",
@@ -10635,7 +10859,7 @@ mod tests {
                 ClientInput::default(),
                 &handle,
                 caps,
-                "alice",
+                account_lease::lease_for_test("alice"),
                 Greeting {
                     server_name: "bnc.test",
                     network: "net",

@@ -233,9 +233,13 @@ async fn pat_bearer_auth_works() {
     e6ircd::db::create_account_with_contact(&pool, "patuser", "pw", None)
         .await
         .expect("create");
-    let session = e6ircd::db::create_web_session(&pool, "patuser", None)
-        .await
-        .expect("session");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("patuser"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -330,13 +334,20 @@ async fn oidc_identity_link_flow_and_conflict() {
     e6ircd::db::create_account_with_contact(&pool, "bob", "pw", None)
         .await
         .expect("bob");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("s1");
-    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("s2");
-    drop(pool);
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("s1");
+    let bob_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("s2");
 
     let http_addr: std::net::SocketAddr = "127.0.0.1:18081".parse().unwrap();
     let config = Config {
@@ -377,27 +388,37 @@ async fn oidc_identity_link_flow_and_conflict() {
         .unwrap_or_else(|e| panic!("start failed: {e}"));
     let base = format!("http://{}", running.http_addr.expect("http"));
 
+    /// What happens to the browser between leaving for the provider and
+    /// coming back to the callback.
+    enum MeanWhile<'a> {
+        Nothing,
+        /// The session that started the link ends (a sign-out).
+        SignOut(&'a sqlx::PgPool),
+        /// The browser comes back holding another account's session.
+        Present(&'a str),
+    }
+
     // Drive one link flow as `session_account`, following dex's auto-approve
     // hops back to our callback. Returns the callback's HTTP status.
-    async fn run_link(base: &str, session: &str) -> reqwest::StatusCode {
+    async fn run_link(base: &str, session: &str, meanwhile: MeanWhile<'_>) -> reqwest::StatusCode {
+        let origin: reqwest::Url = base.parse().expect("base URL");
+        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+        jar.add_cookie_str(&format!("e6irc_session={session}; Path=/"), &origin);
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .cookie_store(true)
+            .cookie_provider(jar.clone())
             .build()
             .expect("client");
-        let cookie = format!("e6irc_session={session}");
         // Without the session's CSRF header the link is refused: a cross-site
         // form carries the cookie but cannot know it.
         let resp = client
             .post(format!("{base}/api/v1/auth/oidc/dex/link"))
-            .header("cookie", &cookie)
             .send()
             .await
             .expect("link start without csrf");
         assert_eq!(resp.status(), 403, "link start without csrf");
         let me: serde_json::Value = client
             .get(format!("{base}/api/v1/me"))
-            .header("cookie", &cookie)
             .send()
             .await
             .expect("me")
@@ -408,7 +429,6 @@ async fn oidc_identity_link_flow_and_conflict() {
         let resp = client
             .post(format!("{base}/api/v1/auth/oidc/dex/link"))
             .header("X-E6IRC-CSRF", csrf)
-            .header("cookie", &cookie)
             .send()
             .await
             .expect("link start");
@@ -445,7 +465,17 @@ async fn oidc_identity_link_flow_and_conflict() {
             location.starts_with(base),
             "never returned to callback: {location}"
         );
-        // The callback carries no auth of its own — the sealed flow cookie does.
+        match meanwhile {
+            MeanWhile::Nothing => {}
+            MeanWhile::SignOut(pool) => e6ircd::db::delete_web_session(pool, session)
+                .await
+                .expect("sign out"),
+            MeanWhile::Present(other) => {
+                jar.add_cookie_str(&format!("e6irc_session={other}; Path=/"), &origin);
+            }
+        }
+        // The sealed flow cookie names the session that started the link; the
+        // callback acts only for that session, presented again.
         client
             .get(&location)
             .send()
@@ -454,8 +484,37 @@ async fn oidc_identity_link_flow_and_conflict() {
             .status()
     }
 
+    // A link whose starting session ended before the provider answered is
+    // refused, and links nothing: a stolen cookie that was signed out cannot
+    // finish one.
+    assert_eq!(
+        run_link(&base, &alice_session, MeanWhile::SignOut(&pool)).await,
+        403
+    );
+    assert!(
+        e6ircd::db::list_oidc_identities(&pool, "alice")
+            .await
+            .expect("identities")
+            .is_empty()
+    );
+    let alice_session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("s1 again");
+    // Nor can another session finish a flow bob's session started.
+    assert_eq!(
+        run_link(&base, &bob_session, MeanWhile::Present(&alice_session)).await,
+        403
+    );
+
     // alice links the mock identity: callback redirects home.
-    assert_eq!(run_link(&base, &alice_session).await, 303);
+    assert_eq!(
+        run_link(&base, &alice_session, MeanWhile::Nothing).await,
+        303
+    );
     // it now shows up on her account.
     let ids: serde_json::Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/me/identities"))
@@ -471,7 +530,7 @@ async fn oidc_identity_link_flow_and_conflict() {
     assert!(list[0]["issuer"].as_str().unwrap().contains("dex"), "{ids}");
 
     // bob tries to link the *same* dex identity → 409 conflict.
-    assert_eq!(run_link(&base, &bob_session).await, 409);
+    assert_eq!(run_link(&base, &bob_session, MeanWhile::Nothing).await, 409);
 }
 
 /// prompt=none silent SSO: once the browser holds a provider session, a

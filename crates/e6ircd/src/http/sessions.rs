@@ -119,7 +119,7 @@ pub(super) async fn reauthenticate_with_password(
     SessionMutation(account, session): SessionMutation,
     JsonBody(request): JsonBody<ReauthenticateRequest>,
 ) -> Response {
-    if let Some(detail) = password_input_error(&request.password) {
+    if let Some(detail) = presented_password_error(&request.password) {
         return problem_at_field(
             StatusCode::BAD_REQUEST,
             "Invalid password",

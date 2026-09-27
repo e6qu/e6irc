@@ -1425,6 +1425,42 @@ change fixes, each with a test that failed before (DESIGN §10):
   to start and why. The persistence task files a line under the nick it was
   said under.
 
+A review of account authority found, and this change fixes:
+
+- **A suspended or deleted account stayed attached** through the attach
+  listener to a shared or configured network, and a password checked just
+  before the suspension could attach after the sweep. `attach` now takes an
+  `AccountLease` the account lifecycle revokes on the mutation lane; the
+  listener spends a ticket taken before the credential check on it, so the
+  race is refused. The core's sweep also closes a session that authenticated
+  but had not registered, which it used to skip.
+- **An OIDC link finished from any browser** within ten minutes of its start:
+  link and re-authentication flows now seal a `BoundSession`, and the link is
+  checked live, the account's and recent in the transaction that inserts it.
+- **A grouped nick's app-password exchange** answered 401 after a successful
+  verify: verification yields a `VerifiedAccount`, which minting takes.
+- **OAUTHBEARER ignored its GS2 authorization identity**; a token can no
+  longer act as another account.
+- **Device codes were stored in plaintext**; 0095 keeps their SHA-256.
+
+Maintainer decisions implemented from the same review:
+
+- **Suspension holds the account's configured networks** stopped
+  (`owner_suspended` in the inventory) and reactivation restarts them;
+  deletion holds them for good (`owner_deleted`), across restarts too.
+- **A password change ends every live IRC session and bouncer attachment** of
+  the account, and a verdict for a check queued before it is refused.
+- **Every server serving the database applies an account's authority**: a
+  suspension, deletion or primary password change committed by any server (or
+  by `recover-administrator`) ends the account's IRC sessions and attachments
+  on each, which apply it once from the store's announcement (0095's
+  `authority_generation`, `AuthorityLedger`).
+- **New passwords are at least 8 characters** (NIST SP 800-63B); existing
+  passwords still verify.
+- **Device authorization speaks RFC 8628 as written**: form bodies with a
+  bound `client_id`, per-code polling pace with `slow_down`, and RFC 6749
+  error and token responses; `e6irc login` speaks it.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

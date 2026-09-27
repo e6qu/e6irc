@@ -255,7 +255,9 @@
                     ]
                   },
                   "password": {
+                    "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes.",
                     "maxLength": 512,
+                    "minLength": 8,
                     "type": "string"
                   }
                 },
@@ -4247,12 +4249,15 @@
                                         "type": "array"
                                       },
                                       "state": {
+                                        "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                                         "enum": [
                                           "connecting",
                                           "connected",
                                           "reconnecting",
                                           "authentication_failed",
-                                          "registration_failed"
+                                          "registration_failed",
+                                          "owner_suspended",
+                                          "owner_deleted"
                                         ],
                                         "type": "string"
                                       },
@@ -4501,12 +4506,15 @@
                                         "type": "array"
                                       },
                                       "state": {
+                                        "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                                         "enum": [
                                           "connecting",
                                           "connected",
                                           "reconnecting",
                                           "authentication_failed",
-                                          "registration_failed"
+                                          "registration_failed",
+                                          "owner_suspended",
+                                          "owner_deleted"
                                         ],
                                         "type": "string"
                                       },
@@ -5768,9 +5776,39 @@
     },
     "/api/v1/auth/device/start": {
       "post": {
+        "description": "RFC 8628 §3.1: a form body naming the client. Parameters the endpoint does not define are ignored (RFC 6749 §3.1); one sent twice is refused. Every device grant issues the scope `read write irc`; a request may name exactly that scope.",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "client_id": {
+                    "description": "The client starting the grant; the grant is bound to it and its token is labelled with it.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "pattern": "^[\\x20-\\x7E]+$",
+                    "type": "string"
+                  },
+                  "scope": {
+                    "description": "Optional; if sent, exactly `read write irc` in any order.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "client_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
-            "description": "device_code, user_code, verification_uri"
+            "description": "RFC 8628 §3.2: device_code, user_code, verification_uri, expires_in, and interval (the seconds a device waits between polls)"
+          },
+          "400": {
+            "description": "RFC 6749 §5.2 error: invalid_request (not a form, a repeated parameter, or a missing or malformed client_id) or invalid_scope"
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"
@@ -5790,19 +5828,33 @@
     },
     "/api/v1/auth/device/token": {
       "post": {
+        "description": "RFC 8628 §3.4: a form body. Parameters the endpoint does not define are ignored (RFC 6749 §3.1); one sent twice is refused. Each device code's polls are paced: one sooner than the grant's interval after the previous poll is answered `slow_down` and lengthens the interval by 5 seconds (§3.5).",
         "requestBody": {
           "content": {
-            "application/json": {
+            "application/x-www-form-urlencoded": {
               "schema": {
-                "additionalProperties": false,
                 "properties": {
+                  "client_id": {
+                    "description": "The client that started the grant; another client's device code is `invalid_grant`.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "device_code": {
                     "minLength": 1,
+                    "type": "string"
+                  },
+                  "grant_type": {
+                    "enum": [
+                      "urn:ietf:params:oauth:grant-type:device_code"
+                    ],
                     "type": "string"
                   }
                 },
                 "required": [
-                  "device_code"
+                  "grant_type",
+                  "device_code",
+                  "client_id"
                 ],
                 "type": "object"
               }
@@ -5812,10 +5864,10 @@
         },
         "responses": {
           "200": {
-            "description": "access_token once approved"
+            "description": "RFC 6749 §5.1 once approved: access_token, token_type Bearer, expires_in, and scope"
           },
           "400": {
-            "description": "RFC 8628 error: authorization_pending, expired_token, invalid_grant, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop"
+            "description": "RFC 8628 §3.5 error: authorization_pending (poll again after the interval), slow_down (the interval grew by 5 seconds), expired_token, invalid_grant (unknown, consumed, or another client's device code), invalid_request, unsupported_grant_type, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop"
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"
@@ -8346,12 +8398,15 @@
                                     "type": "array"
                                   },
                                   "state": {
+                                    "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                                     "enum": [
                                       "connecting",
                                       "connected",
                                       "reconnecting",
                                       "authentication_failed",
-                                      "registration_failed"
+                                      "registration_failed",
+                                      "owner_suspended",
+                                      "owner_deleted"
                                     ],
                                     "type": "string"
                                   },
@@ -9077,12 +9132,15 @@
                               "type": "array"
                             },
                             "state": {
+                              "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                               "enum": [
                                 "connecting",
                                 "connected",
                                 "reconnecting",
                                 "authentication_failed",
-                                "registration_failed"
+                                "registration_failed",
+                                "owner_suspended",
+                                "owner_deleted"
                               ],
                               "type": "string"
                             },
@@ -9950,12 +10008,15 @@
                               "type": "array"
                             },
                             "state": {
+                              "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped).",
                               "enum": [
                                 "connecting",
                                 "connected",
                                 "reconnecting",
                                 "authentication_failed",
-                                "registration_failed"
+                                "registration_failed",
+                                "owner_suspended",
+                                "owner_deleted"
                               ],
                               "type": "string"
                             },
@@ -10106,8 +10167,9 @@
                     "type": "string"
                   },
                   "new_password": {
+                    "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes.",
                     "maxLength": 512,
-                    "minLength": 1,
+                    "minLength": 8,
                     "type": "string"
                   }
                 },
@@ -10128,7 +10190,7 @@
                   "additionalProperties": false,
                   "properties": {
                     "detail": {
-                      "const": "Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.",
+                      "const": "Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.",
                       "type": "string"
                     }
                   },
@@ -10139,7 +10201,7 @@
                 }
               }
             },
-            "description": "primary password changed; other browser sessions signed out"
+            "description": "primary password changed; other browser sessions, IRC connections and bouncer attachments signed out"
           },
           "400": {
             "description": "password is empty or exceeds 512 bytes"

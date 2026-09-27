@@ -933,14 +933,50 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
 
     let next_conn = Arc::new(ConnectionIdAllocator::new(random_connection_id_start()?));
 
+    // Several servers may serve one database: an account's authority changed
+    // by any of them is followed here (DESIGN §9.1). The follower's baseline is
+    // read before this boot reads which accounts are suspended (the registry's
+    // holds, the core's gate), so a change committed while it boots is
+    // announced after the baseline and applied once the core runs.
+    let authority_baseline = match (&pool, &config.database) {
+        (Some(pool), Some(database)) => Some(
+            crate::account_authority::listen(&database.url, pool)
+                .await
+                .map_err(io::Error::other)?,
+        ),
+        _ => None,
+    };
+
     // The BNC registry is shared between the HTTP management API (which
     // adds/removes networks) and the BNC listener (which attaches to
     // them). Server-level [[network]]s start first, then each account's
     // persisted networks are loaded and started.
     let bnc_registry = if pool.is_some() || !config.networks.is_empty() {
+        // A configured network whose owner is suspended or deleted starts
+        // held, as the account lifecycle left it.
+        let mut holds = std::collections::HashMap::new();
+        if let Some(pool) = &pool {
+            let owners: Vec<String> = config
+                .networks
+                .iter()
+                .filter_map(|entry| entry.owner.as_deref())
+                .map(|owner| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner))
+                .collect();
+            for (owner, standing) in crate::db::inactive_network_owners(pool, &owners)
+                .await
+                .map_err(io::Error::other)?
+            {
+                let hold = match standing {
+                    crate::db::OwnerStanding::Suspended => crate::bouncer::OwnerHold::Suspended,
+                    crate::db::OwnerStanding::Deleted => crate::bouncer::OwnerHold::Deleted,
+                };
+                holds.insert(owner, hold);
+            }
+        }
         let reg = Arc::new(
             crate::bouncer::Registry::start_observed(
                 &config.networks,
+                &holds,
                 pool.clone(),
                 crate::bouncer::CoreHandles {
                     core_tx: core_tx.clone(),
@@ -1390,6 +1426,24 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         ready
             .await
             .map_err(|_| io::Error::other("core worker stopped during startup"))?;
+    }
+
+    if let (Some(baseline), Some(pool), Some(registry), Some(database)) =
+        (authority_baseline, &pool, &bnc_registry, &config.database)
+    {
+        let watcher = crate::account_authority::AccountAuthorityWatcher {
+            url: database.url.clone(),
+            pool: pool.clone(),
+            core_tx: core_tx.clone(),
+            registry: registry.clone(),
+            secret_key: secret_key.clone(),
+            internal_upstreams: config.internal_upstreams,
+        };
+        listeners.push(supervise_listener(
+            "account-authority listener",
+            tokio::spawn(watcher.run(baseline)),
+            critical_tx.clone(),
+        ));
     }
 
     // Liveness reaper tick: drives the core's registration deadline and idle
@@ -3139,6 +3193,7 @@ mod tests {
                     sasl_password: None,
                     server_password: None,
                 }],
+                &std::collections::HashMap::new(),
                 None,
                 crate::bouncer::CoreHandles {
                     core_tx: CoreIngress::single(core_tx),
@@ -3286,6 +3341,7 @@ mod tests {
         let registry = Arc::new(
             crate::bouncer::Registry::start_observed(
                 &[],
+                &std::collections::HashMap::new(),
                 None,
                 crate::bouncer::CoreHandles {
                     core_tx: CoreIngress::single(core_tx),

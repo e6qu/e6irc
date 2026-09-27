@@ -425,7 +425,7 @@ pub async fn verify_attached_client(
                 echo_message: true,
                 ..super::AttachCaps::default()
             },
-            "alice",
+            super::account_lease::lease_for_test("alice"),
             super::Greeting {
                 server_name: "e6irc.test",
                 network: "team",

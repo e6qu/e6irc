@@ -432,6 +432,9 @@ impl Input {
             Input::AccountSuspensionApplied { .. } => {
                 panic!("account-suspension event must be broadcast by a core worker")
             }
+            Input::AccountSessionsEnded { .. } => {
+                panic!("account-sessions event must be broadcast by a core worker")
+            }
             Input::ReadMarkerApplied { .. } => {
                 panic!("read-marker event must be broadcast by a core worker")
             }
@@ -940,6 +943,12 @@ pub enum Input {
         reason: String,
         actor: String,
     },
+    /// An account's credentials changed: every core shard ends its sessions.
+    AccountSessionsEnded {
+        account: String,
+        reason: String,
+        actor: String,
+    },
     /// A stored account read marker applied on every non-origin core shard.
     ReadMarkerApplied {
         account: String,
@@ -1054,6 +1063,15 @@ pub enum AdminRequest {
     SetAccountSuspended {
         account: String,
         suspended: bool,
+        reason: String,
+        actor: String,
+    },
+    /// End every live session of an account whose credentials changed (a
+    /// password change): a verdict for a credential check queued before it is
+    /// refused when it lands, then every authenticated session is closed.
+    /// Unlike a suspension, no gate stays.
+    EndAccountSessions {
+        account: String,
         reason: String,
         actor: String,
     },
@@ -1608,7 +1626,14 @@ pub enum DbRequest {
     /// Verify a bearer token (SASL OAUTHBEARER); answered with the same
     /// `PasswordVerified`/`PasswordRejected` replies as a password. A token is
     /// only ever presented by SASL, so its reply origin is always `Sasl`.
-    VerifyToken { conn: ConnId, token: String },
+    /// `authzid` is the GS2 authorization identity the client asked to act
+    /// as; a token is refused unless it is absent or names the token's own
+    /// account (RFC 7628 §3.1).
+    VerifyToken {
+        conn: ConnId,
+        token: String,
+        authzid: Option<String>,
+    },
     CreateAccount {
         conn: ConnId,
         name: String,
@@ -2535,6 +2560,11 @@ pub(crate) enum CoreEffect {
         reason: String,
         actor: String,
     },
+    BroadcastAccountSessionsEnded {
+        account: String,
+        reason: String,
+        actor: String,
+    },
     BroadcastReadMarker {
         account: String,
         target: String,
@@ -2595,6 +2625,18 @@ impl CoreEffect {
                 Input::AccountSuspensionApplied {
                     account: account.clone(),
                     suspended: *suspended,
+                    reason: reason.clone(),
+                    actor: actor.clone(),
+                },
+                false,
+            ),
+            CoreEffect::BroadcastAccountSessionsEnded {
+                account,
+                reason,
+                actor,
+            } => (
+                Input::AccountSessionsEnded {
+                    account: account.clone(),
                     reason: reason.clone(),
                     actor: actor.clone(),
                 },
@@ -3435,6 +3477,18 @@ impl Core {
             }
             Input::ServerBanApplied { mutation } => {
                 handler::oper::apply_committed_server_ban(&mut self.state, mutation);
+            }
+            Input::AccountSessionsEnded {
+                account,
+                reason,
+                actor,
+            } => {
+                handler::admin::apply_account_sessions_ended(
+                    &mut self.state,
+                    &account,
+                    &reason,
+                    &actor,
+                );
             }
             Input::AccountSuspensionApplied {
                 account,
