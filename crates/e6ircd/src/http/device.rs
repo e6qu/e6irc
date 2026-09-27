@@ -336,13 +336,13 @@ fn oauth_error(code: &'static str, description: Option<&'static str>) -> Respons
 fn oauth_form<T>(
     form: Result<Form<T>, axum::extract::rejection::FormRejection>,
     expected: &'static str,
-) -> Result<T, Response> {
+) -> ResponseResult<T> {
     match form {
         Ok(Form(form)) => Ok(form),
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => Err(
-            body_rejection(rejection.status(), "Invalid form", &rejection.to_string()),
-        ),
-        Err(_) => Err(oauth_error("invalid_request", Some(expected))),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(body_rejection(rejection.status(), "Invalid form", &rejection.to_string()).into())
+        }
+        Err(_) => Err(oauth_error("invalid_request", Some(expected)).into()),
     }
 }
 
@@ -376,7 +376,7 @@ pub(super) async fn device_start(
         "send client_id as application/x-www-form-urlencoded, each parameter once",
     ) {
         Ok(form) => form,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let Some(client) = oauth_parameter(form.client_id) else {
         return oauth_error("invalid_request", Some("client_id is required"));
@@ -459,7 +459,7 @@ pub(super) async fn device_token(
          application/x-www-form-urlencoded, each parameter once",
     ) {
         Ok(form) => form,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let (Some(grant_type), Some(device_code), Some(client)) = (
         oauth_parameter(form.grant_type),
