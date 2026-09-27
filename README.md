@@ -25,6 +25,7 @@ surface. See the [client capability matrix](docs/client-capabilities.md).
 | `e6irc-client` | — | Async client library shared by the CLI/TUI and the load harness |
 | `e6irc-proto` | — | IRC message framing and parsing |
 | `e6irc-queue` | — | The core's async work queue (loom-checked) |
+| `e6irc-edge` | — | The connection-holding edge: accept, TLS, framing, client writes (no database) |
 | `e6irc-load` | `e6irc-load` | Load harness for the concurrency/fan-out targets |
 | `e6irc-qualification` | `e6irc-qualification` | Runs credential-gated qualifications against external services and writes and verifies their evidence files |
 

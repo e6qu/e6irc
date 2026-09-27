@@ -5,6 +5,7 @@ exclude = ["fuzz"]
 members = [
     "crates/e6irc-proto",
     "crates/e6irc-queue",
+    "crates/e6irc-edge",
     "crates/e6ircd",
     "crates/e6irc-client",
     "crates/e6irc-cli",

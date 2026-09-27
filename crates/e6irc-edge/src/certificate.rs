@@ -12,14 +12,23 @@
 //! check until it succeeds.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::SystemTime;
 
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use serde::{Deserialize, Serialize};
 use tokio_rustls::TlsAcceptor;
 
-use crate::config::TlsConfig;
+/// Where a TLS listener's certificate chain and private key are read from, as
+/// the configuration names them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
 
 /// How often the certificate files' identities are compared with the ones the
 /// served certificate was read at, and a failing read is retried.
@@ -97,24 +106,10 @@ struct ReadState {
     failing: Option<Failure>,
 }
 
-/// Read every certificate/key pair `config` names — each TLS IRC listener's
-/// and the attach listener's — and match each key to its certificate, as start
-/// does before it serves any of them. The one judgement `check-config` and
-/// every console save make of the files, so neither can accept a certificate
-/// the next start refuses.
-pub(crate) fn load_configured(config: &crate::config::Config) -> io::Result<()> {
-    let listener_files = config.listeners.iter().filter_map(|l| l.tls.as_ref());
-    let bnc_files = config.bnc.iter().filter_map(|bnc| bnc.tls.as_ref());
-    for files in listener_files.chain(bnc_files) {
-        ReloadingCertificate::load(files)?;
-    }
-    Ok(())
-}
-
 /// A server certificate read from `cert_path`/`key_path`, replaced in place
 /// when the files are read again successfully.
 #[derive(Debug)]
-pub(crate) struct ReloadingCertificate {
+pub struct ReloadingCertificate {
     files: TlsConfig,
     current: RwLock<Arc<CertifiedKey>>,
     state: Mutex<ReadState>,
@@ -123,7 +118,7 @@ pub(crate) struct ReloadingCertificate {
 impl ReloadingCertificate {
     /// Read the certificate the listener starts with. A failure here is a
     /// startup error: there is no earlier certificate to keep serving.
-    pub(crate) fn load(files: &TlsConfig) -> io::Result<Self> {
+    pub fn load(files: &TlsConfig) -> io::Result<Self> {
         let stamp = FileStamp::of(files)?;
         let certified = read(files)?;
         Ok(Self {
@@ -240,14 +235,14 @@ fn read(files: &TlsConfig) -> io::Result<CertifiedKey> {
 /// the database wait: a `SIGHUP` sent to reload certificates while the
 /// process was still waiting for PostgreSQL used to kill it — and a service
 /// manager does not restart a unit that died of `SIGHUP`.
-pub(crate) struct Hangups {
+pub struct Hangups {
     #[cfg(unix)]
     signal: tokio::signal::unix::Signal,
 }
 
 impl Hangups {
     /// Take over `SIGHUP`. Needs the Tokio runtime.
-    pub(crate) fn install() -> io::Result<Self> {
+    pub fn install() -> io::Result<Self> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -276,14 +271,14 @@ impl Hangups {
 /// listener, from the console) drops its certificate; the registry holds only
 /// weak references, so a dropped one simply stops being reloaded.
 #[derive(Clone, Default)]
-pub(crate) struct CertificateReloads {
+pub struct CertificateReloads {
     certificates: Arc<Mutex<Vec<Weak<ReloadingCertificate>>>>,
 }
 
 impl CertificateReloads {
     /// A TLS acceptor serving the certificate `files` names, reloaded with
     /// every other one this registry holds.
-    pub(crate) fn acceptor(&self, files: &TlsConfig) -> io::Result<TlsAcceptor> {
+    pub fn acceptor(&self, files: &TlsConfig) -> io::Result<TlsAcceptor> {
         let certificate = Arc::new(ReloadingCertificate::load(files)?);
         {
             let mut certificates = self.certificates.lock().expect("certificate registry lock");
@@ -337,7 +332,7 @@ impl CertificateReloads {
 
     /// Reload on each of `hangups` and whenever the files change, until the
     /// process ends. Supervised: its exit is a critical failure.
-    pub(crate) async fn run(self, mut hangups: Hangups) {
+    pub async fn run(self, mut hangups: Hangups) {
         let mut check = tokio::time::interval(CERTIFICATE_CHECK_INTERVAL);
         check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         check.tick().await;
@@ -366,6 +361,19 @@ fn report_failure(certificate: &ReloadingCertificate, error: &io::Error) {
     );
 }
 
+/// Select aws-lc-rs as the process-wide rustls provider exactly once.
+/// Anything in the dependency tree may enable rustls's `ring` feature
+/// (test HTTP clients did), which breaks auto-selection — pinning here
+/// makes that whole failure class impossible.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("no other rustls provider installed before e6ircd");
+    });
+}
+
 /// A fresh self-signed certificate for `localhost` and its key, written to
 /// `files`; returns the certificate's DER form for a client to trust.
 #[cfg(test)]
@@ -380,6 +388,7 @@ pub(crate) fn write_self_signed(files: &TlsConfig) -> rustls_pki_types::Certific
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     fn scratch(name: &str) -> (std::path::PathBuf, TlsConfig) {
         let dir = std::env::temp_dir().join(format!("e6irc-{name}-{}", std::process::id()));
@@ -389,6 +398,102 @@ mod tests {
             key_path: dir.join("key.pem"),
         };
         (dir, files)
+    }
+
+    /// A self-signed certificate for `localhost` written to `dir`, and its DER
+    /// form for a client to trust.
+    fn write_certificate(
+        dir: &std::path::Path,
+    ) -> (TlsConfig, rustls_pki_types::CertificateDer<'static>) {
+        let files = TlsConfig {
+            cert_path: dir.join("cert.pem"),
+            key_path: dir.join("key.pem"),
+        };
+        let trusted = write_self_signed(&files);
+        (files, trusted)
+    }
+
+    /// The certificate a TLS client is shown by `acceptor`.
+    async fn presented_certificate(
+        acceptor: &TlsAcceptor,
+        trusted: &rustls_pki_types::CertificateDer<'static>,
+    ) -> Result<rustls_pki_types::CertificateDer<'static>, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(acceptor.accept(stream).await);
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted.clone()).expect("root");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let tls = connector
+            .connect("localhost".try_into().expect("name"), stream)
+            .await?;
+        let presented = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .expect("a certificate")
+            .clone()
+            .into_owned();
+        drop(tls);
+        drop(server.await);
+        Ok(presented)
+    }
+
+    /// A renewed certificate is served without a restart: after the files are
+    /// rewritten and a reload runs, the next handshake presents the new one.
+    /// A file that does not parse keeps the certificate being served.
+    #[tokio::test]
+    async fn a_reloaded_certificate_is_presented_to_the_next_handshake() {
+        install_crypto_provider();
+        let dir = std::env::temp_dir().join(format!(
+            "e6irc-certificate-reload-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let (files, first) = write_certificate(&dir);
+        let certificate = Arc::new(ReloadingCertificate::load(&files).expect("load"));
+        let acceptor = TlsAcceptor::from(Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(certificate.clone()),
+        ));
+        assert_eq!(
+            presented_certificate(&acceptor, &first)
+                .await
+                .expect("handshake"),
+            first
+        );
+
+        let (_, second) = write_certificate(&dir);
+        assert_ne!(first, second);
+        certificate.reload().expect("the renewed files parse");
+        assert_eq!(
+            presented_certificate(&acceptor, &second)
+                .await
+                .expect("handshake with the renewed certificate"),
+            second
+        );
+
+        std::fs::write(&files.cert_path, "not a certificate").expect("corrupt the file");
+        assert!(certificate.reload().is_err(), "a broken file is refused");
+        assert_eq!(
+            presented_certificate(&acceptor, &second)
+                .await
+                .expect("the last good certificate is still served"),
+            second
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn set_modified(path: &std::path::Path, time: SystemTime) {

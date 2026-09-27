@@ -117,6 +117,9 @@ step "no-ops" tools/check-noops.sh
 # an integration test, a fuzz target, or inline test-only code.
 step "dead public items" tools/check-dead-pub.sh
 step "duplication" tools/check-duplication.sh
+# DESIGN §2: the edge cannot reach the database — no sqlx, core or bridge crate
+# anywhere in e6irc-edge's dependency graph.
+step "edge isolation" tools/check-edge-isolation.sh
 # Every user-facing outcome carries one complete contract row.
 step "journeys" python3 tools/check-journeys.py
 # Every abbreviation in the docs and code comments is defined in

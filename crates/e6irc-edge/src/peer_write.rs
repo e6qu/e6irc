@@ -17,18 +17,18 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// How long one write to a peer may wait for the peer to take it.
-pub(crate) const PEER_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+pub const PEER_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Why an outbound frame was not delivered. Either way the connection is over.
 #[derive(Debug)]
-pub(crate) enum SendFailure {
+pub enum SendFailure {
     Transport,
     Stalled,
 }
 
 /// Run one framed send, giving up on a peer that has not taken it by
 /// `deadline`.
-pub(crate) async fn within_send_deadline<T, E>(
+pub async fn within_send_deadline<T, E>(
     deadline: Duration,
     send: impl Future<Output = Result<T, E>>,
 ) -> Result<T, SendFailure> {
@@ -58,7 +58,7 @@ impl std::error::Error for WriteStalled {}
 
 /// Whether `error` is a [`DeadlineWriter`] giving up on a peer that stopped
 /// reading, as opposed to the transport failing.
-pub(crate) fn is_stalled(error: &io::Error) -> bool {
+pub fn is_stalled(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|inner| inner.is::<WriteStalled>())
@@ -70,14 +70,14 @@ pub(crate) fn is_stalled(error: &io::Error) -> bool {
 /// The deadline runs from the first poll that could not make progress to the
 /// next one that does, so a peer that reads slowly but steadily is never cut
 /// off, however long a whole burst takes.
-pub(crate) struct DeadlineWriter<W> {
+pub struct DeadlineWriter<W> {
     inner: W,
     deadline: Duration,
     stalled_since: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<W> DeadlineWriter<W> {
-    pub(crate) fn new(inner: W, deadline: Duration) -> Self {
+    pub fn new(inner: W, deadline: Duration) -> Self {
         Self {
             inner,
             deadline,
@@ -85,7 +85,7 @@ impl<W> DeadlineWriter<W> {
         }
     }
 
-    pub(crate) fn into_inner(self) -> W {
+    pub fn into_inner(self) -> W {
         self.inner
     }
 

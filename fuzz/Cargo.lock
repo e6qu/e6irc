@@ -754,6 +754,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "e6irc-edge"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "bytes",
+ "e6irc-proto",
+ "e6irc-queue",
+ "ipnet",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "e6irc-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -799,6 +817,7 @@ dependencies = [
  "axum",
  "bytes",
  "e6irc-client",
+ "e6irc-edge",
  "e6irc-proto",
  "e6irc-queue",
  "http",
@@ -808,11 +827,8 @@ dependencies = [
  "ipnet",
  "libc",
  "openidconnect",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
- "socket2",
  "sqlx",
  "time",
  "tokio",

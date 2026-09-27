@@ -123,6 +123,20 @@ impl ErrorKind {
     }
 }
 
+/// The transport's failures are counted as the error kinds of the same name.
+impl From<e6irc_edge::connection::TransportError> for ErrorKind {
+    fn from(kind: e6irc_edge::connection::TransportError) -> Self {
+        use e6irc_edge::connection::TransportError;
+        match kind {
+            TransportError::Accept => Self::Accept,
+            TransportError::ConnectionSetup => Self::ConnectionSetup,
+            TransportError::TlsHandshake => Self::TlsHandshake,
+            TransportError::Read => Self::Read,
+            TransportError::Write => Self::Write,
+        }
+    }
+}
+
 /// One safe, bounded event from a server component. The event carries no
 /// external error text, so an operator view cannot disclose a secret by
 /// replaying a diagnostic.
@@ -1145,6 +1159,17 @@ fn render_histogram(out: &mut String, kind: LatencyKind, latency: &LatencySnapsh
         latency.sum_us as f64 / 1_000_000.0,
         latency.count
     ));
+}
+
+/// The edge's connections count into the same telemetry as everything else.
+impl e6irc_edge::connection::TransportTelemetry for Telemetry {
+    fn record_error(&self, kind: e6irc_edge::connection::TransportError) {
+        Telemetry::record_error(self, kind.into());
+    }
+
+    fn record_connection_rejected(&self) {
+        Telemetry::record_connection_rejected(self);
+    }
 }
 
 #[cfg(test)]

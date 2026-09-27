@@ -701,7 +701,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     The one exception is an upstream `PING` during a core gap, answered on an
     edge-held bouncer upstream where the edge is the client.
   - *The edge cannot reach the database*: the `e6irc-edge` crate has no sqlx
-    in its dependency tree, held by a `tools/gate.sh` guard over `cargo tree`.
+    in its dependency tree, held by a `tools/gate.sh` guard over `cargo tree`
+    (`tools/check-edge-isolation.sh`, phase 1): its normal, build and dev
+    dependencies, with every feature and on every target platform, name no
+    sqlx crate or other PostgreSQL client, no `e6ircd` (the core, which holds
+    the database) and no `reqwest` (the bridges' client).
 
 - **The boy-scout rule (hard).** Leave the code cleaner than you found
   it; if you see something broken, fix it — even when it looks unrelated.
@@ -769,6 +773,10 @@ e6irc/
 │   ├── e6irc-queue/          # custom bounded queue: the core↔DB and SendQ
 │   │                         #   communication primitive (§7.3); loom-verified,
 │   │                         #   step-schedulable for deterministic tests
+│   ├── e6irc-edge/           # the connection-holding edge (§19): accept, TLS
+│   │                         #   and certificate reload, client addresses,
+│   │                         #   line and WebSocket framing, every write to a
+│   │                         #   client; no database dependency (§2)
 │   ├── e6ircd/               # the monolithic server binary
 │   ├── e6irc-client/         # client library: connection, TLS, SASL (SCRAM-
 │   │                         #   SHA-512/256, PLAIN, OAUTHBEARER), chathistory helpers
@@ -1025,6 +1033,13 @@ strip = "symbols"
 
 ### 7.2 Connection lifecycle
 
+- Where it lives: everything that holds a client connection — listening,
+  the batched accept, TLS termination and certificate reload, the client's
+  canonical address and per-address slot, the read and write loops, the
+  closing drain and lingering close, WebSocket framing — is the `e6irc-edge`
+  crate (§19.1); what a line means is the core's. A connection reaches the
+  core only through `CorePort` (open, framed lines, end), which e6ircd
+  implements over the core's ingress (`core::CoreIngress`).
 - Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
@@ -5009,8 +5024,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   dual-stack listener and a proxy in a trusted IPv4 range is trusted. Every
   operator-written range — a CIDR ban or D-line, `limits.trusted_proxies`,
   `limits.require_sasl_from` — is canonicalised the same way where it is read
-  (`net::canonical_network`): an IPv4-mapped range is its IPv4 range
-  (`::ffff:203.0.113.0/120` is `203.0.113.0/24`), and a mapped range shorter
+  (`e6irc_edge::address::canonical_network`): an IPv4-mapped range is its IPv4
+  range (`::ffff:203.0.113.0/120` is `203.0.113.0/24`), and a mapped range shorter
   than `/96`, which spans non-IPv4 addresses too, is refused, so no stored
   range can be one no canonical address falls in.
 - The attach listener shows that same canonical address in its
@@ -5680,9 +5695,10 @@ core — the process holding the serving lease (§18) — can be replaced, on th
 same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
-Status: designed, and built in the phases of `PLAN.md` "Edge tier". Until a
-phase lands, the rest of this document describes the running system; §19.9
-lists the sections each phase rewrites.
+Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
+(the `e6irc-edge` crate, "Phase 1 as built" below) has landed, and phase 2 is
+next. Until a phase lands, the rest of this document describes the running
+system; §19.9 lists the sections each phase rewrites.
 
 ### 19.1 The split
 
@@ -5739,6 +5755,28 @@ lists the sections each phase rewrites.
   then gets 503 with `Retry-After`; one in flight at a crash gets 502. A
   graceful stop finishes the requests in flight before the cut, so a deploy
   costs no HTTP error.
+- **Phase 1 as built.** `e6irc-edge` holds, moved unchanged from e6ircd:
+  `connection` (`bind_listener`, the batched accept with `TCP_NODELAY` and the
+  TLS handshake bound, `serve_conn` with its read and write loops and
+  vectored writes, the closing drain, `ConnectionTasks`, and the session
+  identity the accept assigns — `ConnId`, `ConnectionIdAllocator`,
+  `ConnectionTransport` and the `Output` line), `certificate` (the TLS files,
+  the reloading certificate, the hang-up signal, the process's rustls
+  provider), `address` (`ClientIp`, `canonical_network`, `PeerLimitKey`,
+  `SessionLimitKey`, `ConnLimiter`, the peer-refusal log), `peer_write`,
+  `lingering_close` and `websocket` (the `/ws/irc` message ceiling, the frame
+  mode, frame writes within the deadline, close frames). The crate names no
+  core type: a connection reaches the core through `CorePort` — open a
+  session with its send queue, hand over framed lines through the meter,
+  report the end — which e6ircd implements over `CoreIngress` by pushing the
+  very `Input` it pushed before, and counts through `TransportTelemetry`,
+  which e6ircd's telemetry implements as the error kinds of the same name.
+  Phase 2 puts the link's frames behind `CorePort` and moves the meter.
+  Still in e6ircd, each until the phase that moves it: the `/ws/irc` and
+  `/ws/ui` upgrade handlers and connection loops and the attach listener's
+  accept loop (phase 2, as link session kinds), and X-Forwarded-For
+  resolution (`http::oidc::client_ip`) with HTTP admission (phase 3, HTTP
+  proxying).
 
 ### 19.2 The core link
 

@@ -102,7 +102,7 @@ impl TokenBucket {
 
 /// One connection's allowance, held by the task that hands its lines to the
 /// core.
-pub(crate) struct LineMeter {
+pub struct LineMeter {
     conn: ConnId,
     /// `None` only for an ingress built without a bucket: the test harnesses',
     /// which pipeline whole scripted sessions at once.

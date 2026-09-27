@@ -504,7 +504,7 @@ pub struct LimitsConfig {
     /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsed
     /// when the configuration is read: an invalid CIDR is a hard error, and an
     /// IPv4-mapped one is read as its IPv4 range
-    /// ([`crate::net::canonical_network`]).
+    /// ([`e6irc_edge::address::canonical_network`]).
     #[serde(default, deserialize_with = "deserialize_canonical_networks")]
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Token-bucket size for the work-inducing authentication endpoints
@@ -993,7 +993,7 @@ impl ManagedConfig {
         };
         self.apply_to(&mut config);
         config.validate()?;
-        crate::certificate::load_configured(&config).map_err(|error| {
+        load_configured_certificates(&config).map_err(|error| {
             ConfigError::Invalid(format!(
                 "a configured TLS certificate cannot be used: {error}"
             ))
@@ -1662,7 +1662,7 @@ where
     Vec::<ipnet::IpNet>::deserialize(deserializer)?
         .into_iter()
         .map(|net| {
-            crate::net::canonical_network(net).ok_or_else(|| {
+            e6irc_edge::address::canonical_network(net).ok_or_else(|| {
                 serde::de::Error::custom(format!(
                     "{net} is an IPv4-mapped range shorter than /96, which also spans \
                      addresses that are not IPv4; write the IPv4 range instead"
@@ -2062,11 +2062,20 @@ pub struct ListenerConfig {
     pub websocket: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TlsConfig {
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
+pub use e6irc_edge::certificate::TlsConfig;
+
+/// Read every certificate/key pair `config` names — each TLS IRC listener's
+/// and the attach listener's — and match each key to its certificate, as start
+/// does before it serves any of them. The one judgement `check-config` and
+/// every console save make of the files, so neither can accept a certificate
+/// the next start refuses.
+pub(crate) fn load_configured_certificates(config: &Config) -> std::io::Result<()> {
+    let listener_files = config.listeners.iter().filter_map(|l| l.tls.as_ref());
+    let bnc_files = config.bnc.iter().filter_map(|bnc| bnc.tls.as_ref());
+    for files in listener_files.chain(bnc_files) {
+        e6irc_edge::certificate::ReloadingCertificate::load(files)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2344,8 +2353,9 @@ impl Config {
     /// they ask for the same nonzero port on the same address, or on a wildcard
     /// address of the same family (`0.0.0.0` covers every IPv4 address), or when
     /// one is `[::]` and the other any IPv4 address: the daemon binds `[::]`
-    /// dual-stack on every platform (`net::bind_listener`), so it covers every
-    /// IPv4 address too. Port 0 asks for any free port and never collides.
+    /// dual-stack on every platform (`e6irc_edge::connection::bind_listener`),
+    /// so it covers every IPv4 address too. Port 0 asks for any free port and
+    /// never collides.
     fn refuse_colliding_listeners(&self) -> Result<(), ConfigError> {
         let mut sockets: Vec<(String, std::net::SocketAddr)> = self
             .listeners
@@ -3010,6 +3020,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh self-signed certificate for `localhost` and its key, written to
+    /// `files`.
+    fn write_self_signed(files: &TlsConfig) {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        std::fs::write(&files.cert_path, generated.cert.pem()).expect("write certificate");
+        std::fs::write(&files.key_path, generated.signing_key.serialize_pem()).expect("write key");
+    }
 
     /// The context of a console save on a server with no HTTP listener, no
     /// internal upstreams allowed and no release revision.
@@ -5095,7 +5114,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             .to_string();
         assert!(refusal.contains("TLS certificate"), "{refusal}");
         assert!(refusal.contains("cert.pem"), "{refusal}");
-        crate::certificate::write_self_signed(&files);
+        write_self_signed(&files);
         managed
             .validate(context.clone())
             .expect("a certificate that loads");
@@ -5103,7 +5122,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             cert_path: directory.join("other-cert.pem"),
             key_path: directory.join("other-key.pem"),
         };
-        crate::certificate::write_self_signed(&other);
+        write_self_signed(&other);
         managed.listeners[1].tls = Some(TlsConfig {
             cert_path: files.cert_path.clone(),
             key_path: other.key_path.clone(),
@@ -5457,7 +5476,7 @@ account_claim = "preferred_username"
             cert_path: directory.join("cert.pem"),
             key_path: directory.join("key.pem"),
         };
-        crate::certificate::write_self_signed(&files);
+        write_self_signed(&files);
         managed.bnc_tls = Some(files);
         managed.validate(bootstrap).expect("with a certificate");
         std::fs::remove_dir_all(directory).expect("remove the scratch directory");
