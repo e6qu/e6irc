@@ -1518,6 +1518,152 @@ Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
   failover can roll the lease row back; the first upgrade to this release
   stops every process.
 
+## Edge tier
+
+Goal: e6irc deploys and redeploys without dropping a client connection
+(DESIGN §1, §19). A connection-holding edge (`e6ircd edge`) holds client
+sockets and the core's records of them; the core, the serving-lease holder,
+can then be replaced gracefully or after a crash while every socket stays
+open. The phases run in order, each on the one open pull request of its
+time, and each lands green on its own: it builds in every feature
+configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
+fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
+with it.
+
+Status: phase 0 done; phase 1 is the next to build; every other phase is
+scheduled in the order below.
+
+- **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
+  tier's invariants), §19 (the design and its settled decisions), a §18
+  cross-reference, and the glossary's "Edge tier" terms. *Green because*
+  documentation only; the terminology, no-deferral and journey guards pass.
+- **Phase 1 — extract `e6irc-edge`.** Move accept, the TLS acceptor and
+  certificate reload, client-address resolution (`ClientIp`, `PeerLimitKey`,
+  `ConnLimiter`), `peer_write`, `lingering_close`, the framing read and write
+  loops and the WebSocket framing helpers into an `e6irc-edge` crate with no
+  sqlx; a `tools/gate.sh` guard over `cargo tree` holds "no sqlx in
+  `e6irc-edge`". DESIGN §4 and §7.2. *Green because* a pure move: the single
+  process is unchanged and every existing test passes as is.
+- **Phase 2 — in-process link.** The core reaches connections only through
+  link frames: the remote send queue with `Drained` accounting, credits,
+  `Kill` and `End`, pacing woken by `Drained`; bouncer attach and `/ws/ui`
+  become link session kinds; the flood meter moves to the edge. DESIGN §7.2.
+  *Green because* every existing test, irctest included, runs through the
+  in-process edge with "SendQ exceeded", pacing and the closing drain
+  unchanged.
+- **Phase 3 — process boundary.** The `e6irc-link` codec and its
+  `link_frames` fuzz target; `e6ircd edge`; the mutual-TLS link and
+  `e6ircd edge-credentials`; the epoch fence; `/readyz`-based discovery; HTTP
+  proxying and upgrade authorization; edge configuration from `Welcome`; the
+  `core_edges` roster; the PROXY protocol version 2 on edge listeners; the
+  `Hello` role field, with the observer role refused loudly by name; the
+  connection directory paged by a monotonic directory key the core allocates
+  at `Open` (re-allocated in the records' original order at a rebuild), with
+  `ConnectionIdAllocator` and `LiveConnectionQuery` documented as promising a
+  unique, never reused, unpredictable wire identity and no order. A core
+  restart still closes sessions, loudly (`ERROR … (server restarting)`), and
+  so does a link reset. DESIGN §4, §8, §9.4, §17. *Green because* behaviour is
+  identical except for the process boundary, and the first process-level
+  tests run on Linux, macOS and Windows.
+- **Phase 4 — graceful rebuild.** Session records, channel replicas,
+  acknowledge after effect with retained lines, the graceful cut and
+  rebuild, re-authorization, durable ring epochs and `ReplayCursor`s, paced
+  replies resumed, `local` driver sessions homed on an edge, the handover and
+  final stops (`e6ircd stop --handover|--final`); the deterministic
+  restart-at-every-step test; the zero-drop suite's graceful scenarios. DESIGN
+  §7.3, §8, §10, §11.2. *Green because* a graceful core restart becomes
+  drop-free and exact, and a crash still closes sessions loudly.
+- **Phase 5 — crash takeover.** The rebuild without a cut, catch-up lines,
+  `NOTE INPUT_UNCONFIRMED`, the roster wait and late edges, the core-absence
+  limit, resending after a link reset, and the interplay with the
+  database-outage hold. *Green because* a crash becomes drop-free, with the
+  zero-drop suite's crash scenarios asserting losses equal the reported
+  counts.
+- **Phase 5b — warm standby.** A standby registry beside the lease: each
+  standby records its observer-link address in a row heartbeated and expiring
+  as the lease is, announced on change. The holder pushes the current standby
+  list to its edges over the core link (`Welcome` and on each change), and
+  edges dial observers from it, with no operator configuration naming a
+  standby under systemd, containers or Kubernetes. Standbys receive every
+  record and replica as written; at `Hello{cut}` the new core fetches only
+  the revisions that differ, so the upload leaves the gap. DESIGN §8, §18. *Green because*
+  the observer role is additive (a standby without it still takes over by
+  full upload, the phase 5 path), and the zero-drop suite runs its graceful
+  and crash scenarios both with and without a warm standby, recording the
+  gap of each.
+- **Phase 6 — edge-held IRC upstreams.** `UpstreamPort` with its edge and
+  in-process implementations, upstream records, gap PONG and the bounded gap
+  buffer, the egress verdict pushed to the edge. DESIGN §10. *Green because*
+  core-held stays the default until the zero-drop upstream test (no `QUIT`,
+  no second registration, the nick unchanged) passes on all three operating
+  systems.
+- **Phase 7 — edge handover.** Listener and plaintext socket handover:
+  `SCM_RIGHTS` and in-place re-execution under systemd on Linux and macOS,
+  `WSADuplicateSocketW` on Windows outside the Service Control Manager; the
+  overlap drain with its operator deadline. *Green because* it is a new,
+  opt-in operation, proven by the zero-drop suite's handover and drain
+  scenarios.
+- **Phase 8 — kernel TLS on Linux.** The unbuffered handshake,
+  `dangerous_into_kernel_connection`, record counting against the
+  confidentiality limit, and the loud end of a connection on a key update
+  after handover. *Green because* it is opt-in (`tls_handover = "kernel"`),
+  refuses to start when the module is unavailable, and has its own Linux
+  zero-drop scenario.
+- **Phase 9 — deployment and qualification.** systemd units, Compose,
+  Kubernetes manifests and `deploy/README.md`; DESIGN §18's edge mode; the
+  stop-budget guard gains the handover budget; the chaos soak; the 100k
+  scale qualification with its gap measurement; the journey that proves the
+  outcome (`docs/journeys/`). *Green because* documentation, guards and
+  measurement.
+
+Maintainer decisions for the edge tier (DESIGN §19.10), every recommendation
+of the design adopted:
+
+- **D1** `e6ircd edge` subcommand over a database-free `e6irc-edge` crate.
+- **D2** Single process stays the default, as an in-process edge.
+- **D3** Client TLS terminates at the edge (kernel TLS on Linux, primary) or
+  at a load balancer; both supported.
+- **D4** Edge upgrade is live handover plus the overlap drain; no in-repo TLS
+  record layer.
+- **D5** Input of unknown fate after a crash: at most once, with
+  `NOTE INPUT_UNCONFIRMED`.
+- **D6** Unauthenticated conversations' rings live in the participants'
+  records; WHOWAS and the LUSERS maximum travel in the cut state and are lost
+  at a crash, declared.
+- **D7** Edge-held IRC upstreams are built (phase 6).
+- **D8** Mutual TLS on every link, loopback included.
+- **D9** In edge mode listeners belong to the edge's bootstrap configuration,
+  shown read-only in the console.
+- **D10** Per-address limits are core-authoritative, with an edge pre-filter.
+- **D11** Record bodies: read N and N−1; advance the written version with
+  `e6ircd records advance`.
+- **D12** A 10-minute core-absence limit and a 30-second roster wait.
+- **D13** `local` driver sessions are homed on an edge.
+- **D14** Windows under the Service Control Manager upgrades by overlap
+  drain; live handover under any other supervisor.
+- **D15** PostgreSQL 18 is installed natively on the macOS and Windows
+  runners for the zero-drop suite.
+- **D16** In edge mode SIGTERM is a handover; `e6ircd stop --final` closes
+  clients.
+- **D17** The edge proxies all HTTP.
+- **D18** The warm standby is phase 5b, right after crash takeover, with the
+  observer role reserved in `Hello` in phase 3; standbys are found through a
+  standby registry beside the lease that the holder pushes to its edges.
+
+Maintainer answers to the phase 0 review:
+
+- **Replay marking.** The core marks accumulating lines *retained for replay*
+  in the acknowledgement; the edge replays exactly those and never reads a
+  payload (DESIGN §2, §19.2).
+- **Standby discovery** is the standby registry, not operator configuration
+  (DESIGN §19.8, phase 5b).
+- **Connection-directory order.** A directory walk that can miss a live
+  connection is a bug: the directory pages by a core-allocated monotonic
+  directory key, and the slot-prefixed identifier is only the wire identity
+  (DESIGN §2, §19.2, phase 3).
+- **PROXY protocol version 2** lands in phase 3; **`e6ircd stop
+  --handover|--final`** lands in phase 4.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

@@ -32,6 +32,14 @@ product outcomes and their automated evidence are mapped in
 - **Active/standby high availability**: one process serves a database; any
   other process started against it stands by and takes over when the serving
   one stops or dies (the serving lease, §18).
+- **Redeploy without dropping connections** (the edge tier, §19): a redeploy
+  of the core — a new binary, on another host, or a standby taking over after
+  a crash — keeps every client connection open. Clients may see a pause of
+  seconds, never a disconnect; bouncer sessions to external IRC networks stay
+  registered upstream. Client sockets are held by an **edge** process
+  (`e6ircd edge`, the same binary) that interprets nothing and stores what the
+  one serving core writes to it; the default single-process deployment is the
+  same code with the edge in process.
 - **Small binary, high performance**: no needless dependencies, one TLS stack,
   one async runtime, compile-time templates, feature flags for optional
   subsystems.
@@ -53,7 +61,21 @@ product outcomes and their automated evidence are mapped in
   processes *serving* one database at once — active/active replicas — are the
   same thing by another name (each would hold a share of the live state and
   every bouncer network would be dialled twice) and are equally a non-goal:
-  one process serves, and the others are standbys (§18).
+  one process serves, and the others are standbys (§18). Edges (§19) do not
+  change this: they serve no state of their own and hold only what the one
+  serving core writes to them, so they are storage for that core, not
+  replicas in this sense.
+- Holding bridge sockets (Matrix, Discord, Slack) at the edge. Each provider
+  resumes by design (a Matrix `/sync` `since` token, a Discord gateway
+  `RESUME`, a Slack Socket Mode reconnect with retried envelopes), so a core
+  restart re-dials them from the core (§19.4).
+- Transferring userspace TLS state between processes. A TLS session
+  terminated in userspace cannot move to a successor edge; live handover of a
+  TLS connection is kernel TLS on Linux, and every other TLS connection is
+  carried through an edge upgrade by the overlap drain (§19.5). An in-repo TLS
+  record layer fed by extracted secrets would be a second TLS stack.
+- Surviving the loss of the host an edge runs on. A socket dies with its
+  host; the edge tier makes core processes, not edge hosts, disposable.
 - Dynamic plugin loading (`dlopen`). Bridges are compiled in behind feature
   flags; the monolith stays statically linked.
 - Supporting non-vanilla Postgres or other SQL backends. PostgreSQL is the
@@ -112,7 +134,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     `chan_key`/`nick_key`/`account_key`, so "index the channel/account table with
     un-casefolded input" cannot be written. `AccountKey` types every in-core
     account map (read markers, registered founders, channel access) onto the
-    folded convention; the DB enforces the same at the `name_folded` edge.
+    folded convention; the DB enforces the same at the `name_folded` boundary.
   - `MaskKey` — the casefold-key discipline extended from map keys to *list*
     elements: a channel's ban/quiet/exception `Vec`s and the **server-ban list**
     hold `MaskKey`, which folds once in its constructor and carries the display
@@ -127,7 +149,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     resolve the case-insensitive network row but miss (or orphan) backlog stored
     under `libera`. The storage API accepts display spellings only at this one
     constructor boundary; callers cannot issue an un-folded buffer query.
-  - Stored BNC driver kinds are a closed set at both edges: PostgreSQL constrains
+  - Stored BNC driver kinds are a closed set at both boundaries: PostgreSQL constrains
     `bnc_networks.kind` to the compiled model's `irc`/bridge variants, and row
     decoding returns `InvalidNetworkKind` instead of defaulting an unknown value
     to `irc`. Corrupt or future-schema data fails startup/read loudly rather than
@@ -387,7 +409,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     same-typed `String` columns, transposing any two compiled cleanly and
     silently mis-mapped (a replayed message showing its body as the source
     prefix); the computed `ts_millis` column is aliased so it has a name to bind
-    to. Same class as `WhoxRow`, closed at the SQL edge.
+    to. Same class as `WhoxRow`, closed at the SQL boundary.
   - `DbRequest::QueryHistory.target` — a database history read names one exact
     stored buffer: a channel, or the conversation key of two accounts. There is
     no fallback to guess between, because a conversation with an
@@ -560,7 +582,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     does not compile. Both historical unit bugs (a whole-second clock that made
     same-second messages unpageable, and a `* 1000` that put REST timestamps a
     thousandfold into the future for six sweeps) are now type errors; the two
-    conversions live behind `as_secs()` and the SQL edge, named and greppable.
+    conversions live behind `as_secs()` and the SQL boundary, named and greppable.
     The SQL boundary rejects pre-epoch and precision-losing values, so corrupt
     signed storage cannot wrap into a future protocol time or become epoch.
   - `logRegion` — every dynamically rendered console backlog or live log gets
@@ -626,6 +648,57 @@ These are project-wide rules, enforced in review and (where possible) CI:
     fuzz suites instead. The technique generalizes: when the value can't be
     typed, put one check at the one choke point and let the fuzzers find
     regressions.
+
+  The invariants the edge tier (§19) installs. Each is held by its type, its
+  choke point or its guard from the phase of `PLAN.md` "Edge tier" that
+  builds it; until then the single-process system holds the older statement:
+  - `EdgeEpoch` — an edge speaks to at most one core: the one holding the
+    highest serving-lease epoch the edge has accepted. A lower epoch is
+    refused at `Hello`; a higher one closes the current link first. A core
+    that lost the lease cannot write to a client after a takeover — the
+    edge-side counterpart of the takeover's `pg_terminate_backend`.
+  - `SessionRecord` / `ChannelReplica` — core-written, edge-stored, opaque to
+    the edge past a small header, revisioned. Both are written only by the one
+    function that republishes after `Core::handle` (the choke point that
+    records what an event touched), so "forgot to replicate" is
+    unrepresentable as "forgot to publish" is. A `Session` is built from a
+    record by a total `From<SessionRecord>`, and a record from a `Session` by
+    destructuring it without `..`: a new session field does not compile until
+    it is placed in the record or declared ephemeral, so a missed field cannot
+    become a silent reset at a restart.
+  - *A channel's state lives with its members*: every edge hosting a member
+    holds that channel's replica, so a channel survives any core restart
+    exactly when it has a member — the condition for it to exist at all.
+  - *Acknowledge after effect*: an input line is acknowledged to the edge only
+    once its effect has been emitted, is in a record already sent, or was
+    refused. A line that only accumulates core memory (an open
+    `draft/multiline` batch, incomplete `AUTHENTICATE` chunks, capability
+    negotiation before `CAP END`) is marked *retained for replay* by the core,
+    in the acknowledgement itself, until the accumulation completes. At a
+    restart the edge replays exactly the retained lines and counts the rest
+    past the acknowledgement as of unknown fate; it never reads a payload to
+    decide which is which.
+  - *A connection directory walk never misses a live connection*: the core
+    allocates a monotonic directory key at `Open` and the directory pages by
+    it, so a connection opened on any edge sorts after every cursor already
+    handed out. A rebuild re-allocates keys in the records' original order;
+    the slot-prefixed `ConnId` stays the wire identity.
+  - *One recovery path*: a graceful restart and a crash takeover both rebuild
+    from what the edges hold; the cut only removes ambiguity. The crash
+    machinery runs on every deploy.
+  - *Rebuilt sessions are re-authorized, never trusted from a record*: account
+    standing, credential liveness and server bans are re-checked against
+    PostgreSQL before a rebuilt session is resumed.
+  - *A rebuild does not depend on the previous core's shard count*.
+  - *The send-queue bound is measured at the client socket*: bytes count
+    against it until the edge reports them written, and `core::send_queue`
+    stays the only constructor of the measure.
+  - *The edge never answers for the core*: no PONG, numeric or CAP reply is
+    synthesized at the edge, so held output never overtakes a deferred reply.
+    The one exception is an upstream `PING` during a core gap, answered on an
+    edge-held bouncer upstream where the edge is the client.
+  - *The edge cannot reach the database*: the `e6irc-edge` crate has no sqlx
+    in its dependency tree, held by a `tools/gate.sh` guard over `cargo tree`.
 
 - **The boy-scout rule (hard).** Leave the code cleaner than you found
   it; if you see something broken, fix it — even when it looks unrelated.
@@ -4791,7 +4864,7 @@ flushed while disconnected, so one that meets a disconnect is sent after
 reconnecting rather than reported as a lost message. Startup failures print
 `e6irc-tui: <message>` and exit 1. While the current
 buffer is in scrollback, new messages increase its unread count and cannot
-advance its marker; returning to the live edge clears that count and queues the
+advance its marker; returning to the live end clears that count and queues the
 latest marker. Unread counts are visible and history/live overlap is
 deduplicated by stable message ID.
 The composer and socket-writer queue are both bounded. A message is locally
@@ -5485,7 +5558,8 @@ Layers, bottom to top:
   everything after it, including deliveries that arrive from other shards
   while they drain. Durable
   network/history state is continuously persisted; there is no separate
-  driver-checkpoint format.
+  driver-checkpoint format. In edge mode a stop is a handover instead (§19.3):
+  it closes no client, and `e6ircd stop --final` is the only stop that does.
 - Main owns and supervises the core and PostgreSQL worker join handles while
   serving; listener join handles have explicit supervisors. Any unexpected
   completion or panic names the failed task, initiates the same bounded drain,
@@ -5575,7 +5649,584 @@ Layers, bottom to top:
 
 ---
 
-## 19. Scope boundaries
+## 19. Edge tier: redeploy without dropping connections
+
+A connection-holding **edge** sits in front of a restartable **core**, so the
+core — the process holding the serving lease (§18) — can be replaced, on the
+same host or another, gracefully or after a crash, while every client socket
+stays open. This is §1's "redeploy without dropping connections"; the terms
+are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
+Status: designed, and built in the phases of `PLAN.md` "Edge tier". Until a
+phase lands, the rest of this document describes the running system; §19.9
+lists the sections each phase rewrites.
+
+### 19.1 The split
+
+- **One binary.** The edge is `e6ircd edge`, backed by an `e6irc-edge` crate
+  with no database dependency (D1). The default deployment stays one process:
+  the edge runs in process over an in-memory link that passes typed frames,
+  and edge mode is opt-in (D2). One code path covers both.
+- **The edge holds the transport**, and only the transport:
+  - socket accept (batched accept, `TCP_NODELAY`) and TLS termination for IRC
+    and the attach listener, with certificate reload on the hang-up signal
+    from the edge host's own files;
+  - WebSocket upgrade and framing for `/ws/irc` and `/ws/ui` (frame mode,
+    close code 1009 on an oversize frame, WebSocket Ping liveness);
+  - IRC line framing (`LineBuffer`, the line limit, over-long-line detection
+    with its label), sent to the core as `Line` and `OverlongLine` frames —
+    the core still answers 417;
+  - the command-flood meter (`TokenBucket`, unchanged; the core pushes the
+    operator exemption flag in the session record), because "the reader stops
+    reading" must happen where the socket is;
+  - the send-queue *buffer* and every write (`write_loop`, vectored writes,
+    `peer_write`'s deadline, the closing drain, `lingering_close`);
+  - client-address resolution — `trusted_proxies` and X-Forwarded-For,
+    `PeerLimitKey`'s `/64` folding, and the PROXY protocol version 2 per
+    listener — carried to the core as a typed field of `Open`, never as a
+    header, with the connection's TLS facts (version, cipher suite, server
+    name, client-certificate fingerprint);
+  - HTTP admission (connections and requests in flight per address, the
+    header timeout);
+  - connection identifiers (§19.2), so an edge accepts while no core is
+    linked.
+- **The core keeps everything that interprets a line**: dispatch and every
+  handler; directories, channels, modes and bans; services; SASL and its
+  database verification; history and CHATHISTORY; the database worker; the
+  bouncer registry and attach logic (`serve.rs`, `attach`, `relay_attached`,
+  `ws_ui_conn`); every driver (the socket half of the `irc` driver excepted,
+  §19.4); maintenance; observability; the console and REST; client liveness
+  PING and the registration timeout; the HTTP authentication throttle.
+- **The send-queue *bound* stays in the core** as a remote send queue: the
+  same byte-weighted accounting, where "in flight" means sent to the edge and
+  not yet reported written to the client socket (§19.2). "SendQ exceeded" and
+  pacing at half full are IRC semantics and survive an edge swap.
+- **Per-address connection limits are core-authoritative** at `Open`, with an
+  edge-local pre-filter (D10): across several edges a per-edge limit would
+  multiply.
+- **The edge never interprets a payload** past framing and never answers for
+  the core (§2): no PONG, numeric or CAP reply, which would let held output
+  overtake a deferred reply (`Session::deferred_replies`).
+- **Plain HTTP** (D17). The edge owns the public HTTP port. It completes
+  WebSocket upgrades itself after asking the core to authorize each one
+  (authentication, `require_same_origin_upgrade`, the socket slot, the
+  credential lease), and forwards every other request to the core as
+  HTTP/1.1 over a pool of separate authenticated link connections. During a
+  core gap a request not yet forwarded waits at the edge for at most 10 s and
+  then gets 503 with `Retry-After`; one in flight at a crash gets 502. A
+  graceful stop finishes the requests in flight before the cut, so a deploy
+  costs no HTTP error.
+
+### 19.2 The core link
+
+- **Transport and authentication** (D8). TCP carrying TLS 1.3 with mutual
+  certificates, on loopback and across hosts alike: one transport on Linux,
+  macOS and Windows (Windows has no tokio Unix-domain stream), and rustls
+  offers no TLS 1.3 external pre-shared key. `e6ircd edge-credentials
+  init|issue` mints a deployment-private certificate authority, a core
+  certificate and one certificate per edge. The edge holds no master key and
+  no database address, and trusts any peer holding a core certificate — the
+  trust boundary of the database role.
+- **Codec.** An I/O-free `e6irc-link` crate holds a hand-written,
+  length-prefixed binary codec (no new dependency, §5): each frame is
+  `u32 length | u8 kind | u64 session | payload`, fuzzed by `link_frames`
+  (round trip, bounds, no panic, no frame admitted past its bound).
+- **Session kinds**: `Irc` (TCP, TLS or `/ws/irc`, to the core shards),
+  `Attach` (bouncer attach logic), `Ui` (`ws_ui_conn`), `Upstream` (an
+  edge-held outbound IRC socket, §19.4) and `Local` (the socketless home of a
+  `local` driver session, D13).
+- **Connection identifiers.** A session's `ConnId` is `edge slot (16 bits) |
+  counter (48 bits)`. The core assigns the slot when an edge first registers
+  and records it in the roster (§19.3); each edge seeds its counter randomly
+  and never wraps. Identifiers stay unique, never reused and unpredictable
+  across restarts without asking a core; a colliding `Open` is refused
+  loudly. They are ordered per edge only, so they are not the order the
+  connection directory pages by: at `Open` (where the core is authoritative,
+  D10) the core allocates each session a monotonic **directory key**, and
+  keyset pagination runs on that key, so a walk in progress never misses a
+  connection opened on another edge. A rebuild re-allocates directory keys in
+  the records' original order; the `ConnId` stays the session's wire
+  identity. `ConnectionIdAllocator`'s documented promise changes with it:
+  unique, never reused, unpredictable — and ordered no longer.
+- **Streams.** One link stream per core shard (`shard = conn % N`); each shard
+  worker writes only its own stream, which orders each session's traffic with
+  no cross-worker locking. A new core with a different `core_workers` has the
+  edge re-bucket its sessions at handshake.
+- **Frames, edge to core**: `Hello` (version range, edge identifier, slot,
+  highest epoch seen, cut identifier, role — serving or observer, §19.8),
+  `Open` (identifier, kind, client address and its provenance, listener,
+  transport, TLS facts, WebSocket mode), `Line` (with an input sequence
+  number), `OverlongLine`, `Closed` (with a reason), `Drained` (bytes written
+  to the client socket), `RecordUpload` and `ReplicaUpload` (rebuild only),
+  `UpstreamLine`, `HttpRequest` (upgrade authorization).
+- **Frames, core to edge**: `Welcome` (epoch, chosen version, slot, and the
+  configuration the edge follows: `trusted_proxies`, limits, the attach
+  listener's state, send-queue size, flood shape), `Output` (bytes, plus the
+  input acknowledgement), `Kill` (discard the queue, send this final
+  `ERROR`), `End` (drain, then close), `Pause` and `Resume`, `Record` (a whole
+  record with its revision), `Replica` (whole or a delta, with the channel's
+  revision), `Cut`, `Credit`, `UpstreamControl`.
+- **Flow control.** Client to core: the edge meters each session, and each
+  stream runs on *credits* the core grants equal to its free shard-queue
+  capacity, replacing today's awaited push into the core queue. An edge out of
+  credits stops reading sockets round-robin, so one noisy session cannot
+  starve the rest; a client past its allowance waits in its own socket buffer,
+  as today. Core to client: the edge reports `Drained(bytes)`, coalesced every
+  64 KiB or 50 ms; `try_push` over the bound is "SendQ exceeded", and pacing
+  (`Sender::room_for`, for LIST, WHO and NAMES) wakes on `Drained`. The link's
+  buffer is bounded by the same sum as today's in-process send queues: the
+  bound moves, its size does not. The edge keeps its own per-session cap (the
+  send-queue size plus one line); a core that over-sends — a core bug — has
+  that session closed with a counted error, never an unbounded buffer. An
+  edge that has not read its link for 30 s is a peer that stopped reading: the
+  link is reset and the edge re-handshakes, and the reset closes no client
+  (§19.3, "Link loss").
+- **Ordering.** Per session, first in first out in both directions: what a
+  core shard writes to a session's stream is exactly its wire order,
+  including the deferred-reply hold, labeled batches, and "`ERROR` is the last
+  line". No order across sessions is added; none existed. A `Record` or
+  `Replica` travels in band after the `Output` of the event that caused it, on
+  the affected session's stream, so an edge's copy never runs ahead of what
+  its clients saw.
+- **Acknowledge after effect** (§2). The acknowledgement on `Output` and
+  `Record` advances past a line only once its effect is emitted (deliveries
+  queued or routed to other shards), its session-local result is in a
+  `Record` already sent, or it was refused. A line that only accumulates core
+  memory (an open multiline batch, `AUTHENTICATE` chunks before the payload is
+  complete, capability negotiation before `CAP END`) is marked *retained for
+  replay* by the core in the acknowledgement itself. The edge replays exactly
+  the retained lines, counts the rest past the acknowledgement as of unknown
+  fate, and never reads a payload to decide; it drops retained lines when the
+  core reports the accumulation complete.
+- **Finding the lease holder; the epoch fence.** The core binds its serving
+  link listener only while it holds the lease; a standby binds its HTTP
+  answers (§18) and the observer listener (§19.8). Edges dial one configured
+  address — a DNS name listing every core host, a Kubernetes Service, or an
+  internal network load balancer health-checked on `/readyz` — trying each
+  address round-robin every 250 ms while unlinked. `Hello` and `Welcome`
+  exchange the lease epoch (`ServingLease::epoch`); the edge keeps the highest
+  epoch it has accepted, refuses a lower one, and closes its current link
+  before accepting a higher one (`EdgeEpoch`, §2).
+- **Versioning.** Each release has a link version. `Hello` carries the edge's
+  range; the core accepts its own version and the previous one and refuses an
+  older edge with an error naming both versions and the upgrade required —
+  never a silent downgrade — so a core release never forces an edge restart.
+  `/readyz` and `e6irc_edge_link_version` report each edge's version and
+  whether an edge upgrade is needed before the following core release. Record
+  and replica bodies are opaque to the edge past a header it reads itself
+  (kind, revision, flood exemption, WebSocket mode), and the core versions the
+  body (D11): a core reads body versions N and N−1, and a release introducing
+  a version keeps writing the previous one until the operator runs `e6ircd
+  records advance` (two steps, like a migration), so a one-release rollback
+  never meets an unreadable record. An unreadable body refuses the rebuild of
+  that one session with `ERROR :Closing Link … (server upgrade: session state
+  unreadable)`, never a silent drop.
+
+### 19.3 Restart and rebuild
+
+- **One recovery path.** A graceful restart and a crash takeover both rebuild
+  from what the edges hold; they differ only in whether a **cut** exists, so
+  the crash machinery runs on every deploy.
+- **Graceful sequence** (old core A, new core B, same host or another):
+  1. B runs as a standby (§18); as a warm standby it observes the edges
+     (§19.8).
+  2. A is asked to stop: SIGTERM, `e6ircd stop --handover` (the control that
+     is the same on every operating system, and Windows' only one), or the
+     console. In edge mode a stop is a handover; `e6ircd stop --final` is the
+     only stop that closes clients (D16).
+  3. A quiesces: `Pause` to every edge (edges keep reading into a bounded
+     per-session input buffer of 64 KiB, and credits stop); the shards drain;
+     every database round trip in flight (SASL and IDENTIFY verdicts,
+     CHATHISTORY pages, MARKREAD, ChanServ, server-ban verdicts) completes, so
+     `deferred_replies` reaches 0 and held output is released; HTTP requests
+     in flight finish; drivers stop without `QUIT` when their upstreams are
+     edge-held, and as §18 says otherwise.
+  4. A flushes every pending `Record` and `Replica` and the PostgreSQL write
+     paths, writes the roster, sends `Cut{cut, epoch}` with the cut state to
+     every edge, and releases the lease (announced).
+  5. B takes the lease, migrates, preloads durable state (§7.3), and binds the
+     serving link listener.
+  6. Edges link with `Hello{cut}`. B compares the revisions it observed with
+     each edge's and has only the difference uploaded; without an observed
+     copy the edge uploads every record and replica. B waits for every
+     rostered edge for at most 30 s (D12); a missing edge is logged loudly
+     and its sessions count as gone. An edge linking later has each session
+     re-admitted if it is still consistent (nick free, channels joinable) and
+     otherwise closed with an explicit `ERROR`.
+  7. B rebuilds, re-authorizes, and sends `Resume`. Edges release buffered
+     input head first: lines retained for replay, then lines received during
+     the gap.
+
+  The gap is the lease announcement (well under a second), B's boot (pool,
+  settings, preloads, the whole read-marker table), the upload (1–2 kilobytes
+  per session, about 100–200 megabytes at 100k sessions, plus replicas; the warm
+  standby removes most of it) and the rebuild. The target is under 5 s at 100k
+  sessions on loopback, measured by the scale qualification (§19.11).
+- **Where rebuilt state comes from.** "Record" is the session record,
+  "replica" the channel replica, "cut state" the global state sent with the
+  cut (D6), "database" PostgreSQL as persisted today (§8).
+
+  | State | Source at rebuild | After a crash |
+  |---|---|---|
+  | Session address facts (`host` after SETHOST, `real_ip`, `limit_key`, `transport`) | record, and `Open`'s address and transport | same |
+  | Registration, capability negotiation, `Caps` | record | as of the last change |
+  | `login` (account, `CredentialId`) | record, then re-validated against the database: a suspended or deleted account or a revoked credential ends or logs out the session as the live revocation path does | same |
+  | SASL and services verification in progress | settled before the cut | the session gets `906 ERR_SASLABORTED` or a NickServ notice that the check was interrupted; retained `AUTHENTICATE` chunks are replayed |
+  | `credential_attempts` | record; the budget never resets, so crashing a core buys no guesses | same |
+  | Nick enforcement, drop confirmation, nick changes, KNOCK clocks | record, clocks stored as milliseconds before the cut and re-seeded on B's monotonic clock | same |
+  | Away, oper, user modes, bot, flood exemption, monitor list, anonymous read markers | record; the directories are rebuilt from it | same |
+  | Membership, pending joins | membership from the replicas; pending joins are 0 at a cut | the JOIN in flight is retained and replayed |
+  | Open multiline batch | not recorded; its lines are retained and replayed | same |
+  | Paced LIST, NAMES and WHO | record: the filter and the last name sent (rows go out in global casemapped order, so resuming after that name is exact for any shard count); WHO's remaining rows | same |
+  | Label groups, deferred replies, held output | empty at a cut | the command is of unknown fate (D5) |
+  | Idle and signon times, last input, PONG awaited | record, plus the edge's milliseconds since the last input line | same |
+  | Published user, user and nick directories, LUSERS counts, account-to-connections index | derived from rebuilt sessions by the indices' own maintenance functions | same |
+  | Channel name, `created_at`, topic, modes, list modes with setter and time, invitations | the replica with the highest revision across edges; `created_at` is kept, so the history floor (§11.2) holds and no new incarnation begins | the highest revision wins, and lagging members get catch-up lines |
+  | Member ranks | each edge's replica carries its own members' ranks; the union is the member list | same |
+  | Registered channels and access, retained topics, nick registrations, server bans, read markers, suspended accounts | database preload, as today | same |
+  | Pending channel, ban and topic mutations | empty at a cut | the database is re-read as the source of truth and the hot mirrors reconciled; the requester's command is of unknown fate (D5) |
+  | Hot history rings of stored targets | refilled from the database and marked not the whole record, so reads fall through at the front (§11.3) | at most one history-writer batch lost, today's recovery point |
+  | Rings of conversations with an unauthenticated party (never stored, §11.1) | each participant's record, bounded to 500 entries (D6) | same |
+  | WHOWAS, the LUSERS maximum, registration buckets | cut state | lost, declared |
+  | Message identifier stem | a new boot value; uniqueness holds by construction | same |
+  | Credential epoch, ended credentials, deleted accounts | fresh: the revocation follower's reconnection refuses verdicts in flight, and re-validation covers the gap | same |
+  | Bouncer networks and owner holds | database, as today | same |
+  | Driver rings | `bnc_buffer` restore, with the ring epoch and sequence number made durable (a per-network epoch on `bnc_networks`, the sequence number on each row), so a `ReplayCursor` from before the restart stays valid | lines not yet persisted are a gap: attachments behind it get the existing gap notice |
+  | Upstream session state (`IrcSessionSnapshot`, reply router, echo table, nick regain) | edge-held upstream: the upstream record (§19.4); core-held: re-dialled | §19.4 |
+  | Attachment and `/ws/ui` state (network, capabilities, shown nick, delivered cursor, composer authority) | record; the `AccountLease` is re-taken, and one refused to a revoked account ends the attachment as revoked | same |
+
+- **Nothing new is written to PostgreSQL per event.** The only new tables and
+  columns are the `core_edges` roster (edge identifier, slot, last epoch
+  seen, last cut), the durable ring epochs and sequence numbers, and the
+  warm standby's standby registry (§19.8), so the database-outage hold (§19.7) never makes a JOIN depend on the database.
+- **Roster.** The serving core writes `core_edges` when an edge links or
+  unlinks and at the cut; B's wait set is the roster. A roster write that
+  fails in a database outage is retried without blocking: a stale roster only
+  lengthens B's bounded wait or lets a late edge re-admit its sessions, and
+  never lets a session be forgotten silently.
+- **Re-authorization.** Before `Resume` the credential follower's
+  `RefuseVerdictsInFlight` has run, and every rebuilt login, attachment lease
+  and client address is checked against account standing, credential
+  liveness and server bans exactly as the live paths check them (§2).
+- **What clients observe.**
+  - *A gap* is a pause: typed lines are buffered at the edge and delivered in
+    order at `Resume`; past the 64 KiB input bound the edge stops reading (the
+    client's own TCP backpressure). Nothing is closed. The edge does not
+    answer client PINGs: a 5 s gap is far below common ping timeouts, and the
+    core-absence limit (§19.7) bounds the longest gap.
+  - *A graceful cut is exact*: no line duplicated or lost, and no
+    server-originated line — no rejoin, mode reset or burst.
+  - *A crash may leave replicas disagreeing* (a MODE sent to one edge's
+    members and not yet to another's). B takes the highest revision — some
+    client saw it — and sends the lagging edges' members a catch-up built by
+    the existing funnels (a MODE difference, a TOPIC, a list change) from the
+    server name, counted in `e6irc_rebuild_catchup_lines_total`. It is the
+    only server-originated output of a rebuild: a correction, never a reset.
+  - *A crash leaves input of unknown fate* (D5, at most once). Retained lines
+    are replayed. A line past the acknowledgement may have had its effect
+    emitted, so it is not replayed: the edge reports the count, and B sends
+    the session `NOTE * INPUT_UNCONFIRMED <n> :…` (a client with
+    `standard-replies`) or a server NOTICE. No message reaches another user
+    twice, and no loss is silent.
+  - *A crash may lose CHATHISTORY* up to one history-writer batch
+    (`deploy/README.md`, "Recovery point").
+- **Link loss without core loss.** A link reset (a network fault, an edge
+  slow to read) is not a restart: the edge re-links with the same epoch and
+  uploads nothing, and the core resends each session's output from its
+  acknowledged point, out of a bounded per-session unconfirmed-output buffer
+  equal to the send-queue bytes in flight, which the remote send queue already
+  counts. A session whose unconfirmed output was discarded under the "SendQ
+  exceeded" rules is killed with its `ERROR`, as today.
+
+### 19.4 Bouncer upstreams held at the edge
+
+"A user's nick on Libera never QUITs" is the promise of a bouncer, and every
+deploy breaks it today: a stop sends `QUIT` (§18), and a crash leaves a ghost
+the next holder regains (§10.3). For the `irc` driver the socket half moves to
+the edge (D7):
+
+- **At the edge**: dialling the resolved, vetted address list the core sends
+  (the egress verdict stays one function, `egress.rs`); upstream TLS as a
+  client, with the same rustls and web-PKI roots as `e6irc-client`; line
+  framing and `decode_server_line`; the upstream flood bucket; and, during a
+  core gap only, answering upstream `PING` and buffering inbound lines up to
+  4 MiB per network. Overflowing that bound ends the upstream connection
+  loudly, with the reason in the network's failure record; the buffer is
+  never truncated.
+- **In the core**: registration, CAP, SASL, the reply router, echo matching,
+  nick regain, persistence and attachments. The driver talks to an
+  `UpstreamPort` — the edge's frames in edge-held mode, an in-process
+  implementation over `e6irc-client` in core-held mode — and `NetworkDriver`
+  is unchanged. Core-held stays the default until the zero-drop upstream test
+  passes on all three operating systems.
+- **Upstream record** (core-written, edge-stored, opaque): the
+  `IrcSessionSnapshot` (nick, confirmed channels, ISUPPORT including
+  CASEMAPPING, CHANTYPES and STATUSMSG), negotiated capabilities and a pending
+  `CAP REQ`, the reply router's pending queue (bounded by its 60 s ageing) and
+  echo table (at most 256), nick-regain state, the keepalive clock, and the
+  persisted ring position.
+- **Rebuild**: B resumes the registered upstream without registering again
+  and drains the gap buffer through the ordinary ingest path. A reply to a
+  command pending at a crash is routed by the recorded queue; one the router
+  cannot place is dropped with the router's attachment-level notice and never
+  enters the ring (the `ReplyRouter` invariant, §2).
+- **Bridges stay in the core** (§1, non-goals). The **`local` driver's**
+  session is homed on an edge as a socketless `Local` session (D13), so its
+  record and membership survive as any client's do.
+
+### 19.5 Edge upgrade
+
+The edge is small and stable by construction: it interprets no payload and
+stores opaque records, and the core accepts link versions N and N−1, so only
+a link, framing, TLS or WebSocket change — realistically a rustls or
+tungstenite security fix — needs a new edge (D4). The mechanisms, in order of
+preference:
+
+- **Live handover on the same host** of every socket whose state is in the
+  kernel: listeners, plaintext TCP, every WebSocket (the HTTP listener never
+  terminates TLS, so `/ws/*` is plaintext at the edge), and plaintext
+  edge-held upstreams, each with its session's state (header, opaque records,
+  framing remainder, unwritten output, input buffer, meter, WebSocket framing
+  state).
+  - Linux and macOS: descriptors pass to a successor over a Unix socket as
+    `SCM_RIGHTS` (the socket-control message that carries open descriptors).
+    Under systemd the edge re-executes in place instead — close-on-exec
+    cleared, state serialized to a sealed memory file, `execve` of the new
+    binary under the same process identifier, then `sd_notify` `RELOADING`
+    and `READY` (`ExecReload=`) — so systemd adopts no second process.
+  - Windows: `WSADuplicateSocketW` (the Windows Sockets function that exports
+    a socket to another process) fills one `WSAPROTOCOL_INFOW` per socket,
+    sent over a named pipe to a successor that opens it with `WSASocketW`.
+    Under the Service Control Manager a service process cannot hand itself to
+    a successor and remain the service, so there the upgrade is the overlap
+    drain; under any other supervisor it is live handover (D14).
+  - `libc` and `windows-sys` become direct dependencies (both are already in
+    the tree through tokio and mio), justified in that change as §5 requires.
+- **Kernel TLS on Linux** for edge-terminated TLS (IRC, attach, edge-held
+  upstreams). rustls can extract a connection's traffic keys but cannot import
+  them into another process's connection, so no userspace TLS session moves.
+  With `tls_handover = "kernel"` every TLS connection is driven through
+  rustls's unbuffered API to its first traffic state and converted with
+  `dangerous_into_kernel_connection`; `TLS_TX` and `TLS_RX` are installed, and
+  the socket is plaintext to userspace from then on, so it hands over like any
+  other. The kernel connection (the key-update secret) does not cross a
+  handover: afterwards a peer `KeyUpdate` (read as a control record) or
+  nearing the cipher suite's confidentiality limit (the edge counts records)
+  ends that connection with a logged, counted reason — both rare for IRC. It
+  needs the `tls` kernel module (TLS 1.3 receive from Linux 5.2,
+  ChaCha20-Poly1305 from 5.11); the edge refuses to start in this mode when
+  the module is unavailable, naming it, and never falls back silently.
+- **Overlap drain**, on every platform and for every TLS connection kernel TLS
+  does not carry. A new edge takes the listeners (descriptor handover,
+  `SO_REUSEPORT` on Linux, or a load-balancer target swap); the old edge stops
+  accepting, stays linked with its existing sessions, and exits when the last
+  one closes or at the operator's `--drain-deadline`, which has no default.
+  At the deadline the remaining sessions get `ERROR :Closing Link … (edge
+  upgrade)`. It is the only path that closes a client for an upgrade, and the
+  operator always chooses it.
+- **Client TLS termination** (D3): at the edge with kernel TLS on Linux (the
+  documented primary), or at a TLS-terminating load balancer whose
+  connections the edge holds as plaintext; either way every edge socket can be
+  handed over. The container image publishes no TLS listener, so container
+  edges are plaintext and hand over everywhere.
+
+### 19.6 Deployment shapes
+
+- **systemd, one host.** `e6ircd-edge.service` binds the IRC, HTTP and attach
+  ports, is rarely restarted, and reloads by in-place handover.
+  `e6ircd@a.service` and `e6ircd@b.service` are cores on loopback, one serving
+  and one standing by. A redeploy installs the binary, restarts the standby,
+  stops the serving core (a handover to the standby), and starts it again as
+  the new standby. A lone core with no standby also works: the edge holds its
+  clients paused while the core restarts. The stop budget's guard (§18) gains
+  the handover budget; in edge mode the driver-`QUIT` and connection-drain
+  steps do not apply.
+- **Two hosts, active/standby cores.** Each host runs an edge and a core; the
+  load balancer spreads clients across both edges, which link to the lease
+  holder across hosts. A core crash or redeploy drops nobody; losing a host
+  drops that host's edge clients only. Dedicated edge hosts separate the two
+  failure domains fully.
+- **Containers** (Compose, ECS). A long-lived edge service behind a network
+  load balancer (TCP) or an ALB (HTTP and WebSocket, its idle timeout above
+  the gap), health-checked by `e6ircd healthcheck --edge`. A core service of
+  two tasks, reached through internal service discovery health-checked on
+  `/readyz`, so only the holder is a target. A core rolling update starts the
+  new task and then stops the old one (a stop timeout of at least 65 s); an
+  edge upgrade is the overlap drain, since a container restart keeps no
+  descriptor.
+- **Kubernetes.** Edges as a Deployment or DaemonSet behind a `LoadBalancer`
+  Service with `externalTrafficPolicy: Local` (or the PROXY protocol), with a
+  pod disruption budget, readiness meaning "the edge is healthy" —
+  deliberately not "a core is linked", so a core gap deregisters no edge — and
+  upgrades by overlap drain with a long `terminationGracePeriodSeconds`
+  (Kubernetes restarts containers, not processes). Cores as a two-replica
+  Deployment, readiness `/readyz`, a `ClusterIP` Service `e6irc-core-link`
+  selecting the ready pod, and a rolling update with `maxSurge: 1,
+  maxUnavailable: 0`.
+- **Load balancer to edges**, in every shape: TCP pass-through (or TLS
+  termination) for IRC and the attach port, HTTP with WebSocket upgrades for
+  the web port, health-checked on the edge's own `/healthz`.
+- **Listener configuration** (D9). In edge mode listeners and certificates
+  are the edge's bootstrap configuration, and the console shows them
+  read-only as the edges report them; the console-owned `[[listeners]]`
+  applies to single-process mode.
+
+### 19.7 Serving lease, followers and the database-outage hold
+
+- **The lease keeps its role** (§18): it decides which core serves. The edge
+  adds the epoch fence (§19.2). A core whose lease ended (`LeaseEnd::Taken` or
+  `Fenced`) stops talking to edges — it never closes clients — and its links
+  are superseded by the new epoch. The critical-failure path becomes a stop
+  without a cut; the next holder rebuilds as after a crash.
+- **Announcement followers** (`follow_announcements`: settings, credentials,
+  lease) run per core and restart with it; each re-reads its table at its
+  first resynchronization, and the credential follower refuses verdicts in
+  flight before any rebuilt session is authorized. Edges run no follower:
+  they take their configuration from `Welcome` and its updates.
+- **The database-outage hold** (§18: the holder keeps its connections through
+  a database outage unless it is taken over) composes with the edges. While
+  the database is down no standby can take the lease, and edges are
+  unaffected. A takeover after the database returns no longer drops clients:
+  B rebuilds from the edges, which hold the state as the old holder evolved it
+  during the outage, including channel changes that lived only in memory.
+  What the old holder could not persist follows the hold's own rules, and a
+  command whose database verdict never came is of unknown fate (D5). The
+  edges accepting the higher epoch cut the old holder off, the edge-side
+  counterpart of the takeover's `pg_terminate_backend`.
+- **Core-absence limit** (D12). A core crashing during an outage cannot be
+  replaced until the database returns, so edges hold paused clients for at
+  most `edge.core_absence_limit` (default 10 minutes) and then close them with
+  `ERROR :Closing Link … (server unavailable)`: loud, bounded, configurable.
+
+### 19.8 Warm standby
+
+A standby keeps read-only **observer links** to the edges and receives every
+`Record` and `Replica` as it is written, so at a takeover the upload leaves
+the gap and B starts its rebuild from state it already holds (D18).
+
+- **Standby registry.** Each standby records its observer-link address in the
+  database next to the lease: one row per standby in a standby registry,
+  heartbeated and expiring as the lease is (the same TTL and renewal cadence,
+  every comparison on the database's `now()`), and announced on change. A
+  standby that stops renewing drops out of the registry at its expiry.
+- **The holder tells its edges.** The serving core reads the registry and
+  pushes the current standby list to every edge over the core link (in
+  `Welcome` and on each change); edges dial observers from that list. No
+  operator configuration names a standby, so the mechanism is the same under
+  systemd, containers and Kubernetes; a headless Service is an optional
+  detail of how a standby's address is reachable, never required. The
+  registry only lists: an edge dials a listed observer with the same mutual
+  TLS as any link and trusts nothing it sends.
+- **Protocol room.** `Hello` carries a role, serving or observer, from the
+  first link version; a core without the warm standby refuses the observer
+  role with an error naming it. The observer listener is the only link
+  listener a standby binds.
+- **Observer links are read-only.** They carry no client input and no output,
+  the edge acts on nothing an observer sends, and the epoch fence applies
+  unchanged: an observer serves only by taking the lease and presenting the
+  new epoch, at which point its observer links are superseded by serving
+  links.
+- **At the takeover**, `Hello{cut}` lets the new core compare the revisions
+  it observed with the edge's and fetch only what differs (§19.3, step 6).
+
+### 19.9 Sections this rewrites
+
+Each rewrite lands in the phase that makes it true (`PLAN.md`, "Edge tier"):
+
+- §4 (the `e6irc-edge` crate) and §7.2 (connection lifecycle: which half
+  lives where, the flood meter at the edge) — extraction and the in-process
+  link.
+- §4 (the `e6irc-link` crate), §8 (`core_edges`), §9.4 (the connection
+  directory paged by the directory key, and the connection-identifier
+  allocator promising uniqueness and unpredictability but no order), §17 (the
+  zero-drop suite's first process-level tests) — the process boundary.
+- §7.3 ("the core's mirrors are single-writer" gains the edge's records and
+  replicas), §11.2 ("a restart keeps every incarnation": `created_at` is in
+  the replica), §8 and §10 (durable ring epochs and `ReplayCursor`s) — the
+  graceful rebuild.
+- §8 and §18 (the standby registry beside the lease) — the warm standby.
+- §10 (`UpstreamPort`, the upstream record) — edge-held upstreams.
+- §18 (edge mode, handover and final stops, the edge's configuration, the
+  roster, the core-absence limit, the budgets) and `deploy/README.md` — the
+  deployment phase; each earlier phase states in §18 what it makes
+  operable.
+
+### 19.10 Settled decisions
+
+- **D1 Packaging**: the `e6ircd edge` subcommand over a database-free
+  `e6irc-edge` crate; one artifact, one release matrix.
+- **D2 Single process**: the default, as an in-process edge; edge mode is
+  opt-in.
+- **D3 Client TLS termination**: both at the edge (kernel TLS on Linux, the
+  documented primary) and at a TLS-terminating load balancer.
+- **D4 Edge upgrade**: live handover (plaintext everywhere, TLS through kernel
+  TLS on Linux) plus the overlap drain; no in-repo TLS record layer.
+- **D5 Input of unknown fate after a crash**: at most once, with
+  `NOTE INPUT_UNCONFIRMED`.
+- **D6 Conversations with an unauthenticated party, and WHOWAS**: the rings in
+  the participants' records (kept across a crash); WHOWAS and the LUSERS
+  maximum in the cut state (lost at a crash, declared).
+- **D7 Edge-held IRC upstreams**: built, once the client path is proven.
+- **D8 Link authentication**: mutual TLS on every link, loopback included,
+  with `e6ircd edge-credentials`.
+- **D9 Listener configuration**: the edge's bootstrap configuration in edge
+  mode, shown read-only in the console; `[[listeners]]` for single-process
+  mode.
+- **D10 Per-address limits**: core-authoritative at `Open`, with an edge-local
+  pre-filter.
+- **D11 Record-format window**: read N and N−1; keep writing the previous
+  version until `e6ircd records advance`.
+- **D12 Core absence**: a 10-minute core-absence limit, then an explicit
+  close; a 30 s roster wait.
+- **D13 `local` driver sessions**: homed on an edge as socketless sessions.
+- **D14 Windows under the Service Control Manager**: overlap drain; live
+  handover under any other supervisor.
+- **D15 Continuous integration on macOS and Windows**: PostgreSQL 18
+  installed natively on those runners for the zero-drop suite.
+- **D16 Stop semantics**: in edge mode SIGTERM is a handover; `e6ircd stop
+  --final` closes clients.
+- **D17 HTTP**: the edge proxies all HTTP and holds new requests through a
+  gap; no layer-7 path split at a load balancer.
+- **D18 Warm standby**: built as its own phase right after crash takeover,
+  with the observer role reserved in `Hello` from the first link version.
+  Standbys are found through a standby registry beside the lease, pushed by
+  the holder to its edges; no operator configuration names them (§19.8).
+
+### 19.11 Evidence
+
+- **Codec and records**: the `link_frames` fuzz target; property tests that a
+  record body of version N decodes under N and N+1; the replica merge picks
+  the highest revision, and the member union equals live membership.
+- **Restart at every step, in process**: `CoreScheduler` runs a scripted
+  multi-client, multi-shard scenario and, at every event boundary, takes the
+  edges' records and replicas, builds a fresh core with a different shard
+  count, and continues. A graceful restart reproduces the no-restart
+  transcripts byte for byte (message-identifier stems aside); a crash may
+  differ only by the counted catch-up lines and `INPUT_UNCONFIRMED` notes. The
+  `core_multi` fuzz target gains a "restart now" event.
+- **Driver restart**: the `irc` driver against a scripted upstream through
+  both `UpstreamPort` implementations, restarted mid-registration, mid-LIST
+  and mid-echo; the upstream sees no `QUIT` and no second `NICK` or `USER`,
+  and the reply router's invariants hold.
+- **Zero-drop suite**, on Linux, macOS and Windows, amd64 and arm64:
+  PostgreSQL 18 (D15), an edge, core A and standby B; TCP, TLS, `/ws/irc`,
+  `/ws/ui` and attach clients plus a fake upstream, each sending a numbered
+  PRIVMSG stream through a graceful handover, a killed core, an edge handover
+  of plaintext sockets, an edge handover with kernel TLS (Linux), and an
+  overlap drain. No client sees end of file or `ERROR`; a graceful handover
+  delivers every message exactly once and in order; a crash loses exactly the
+  reported `INPUT_UNCONFIRMED` counts; every gap is under its bound; the
+  upstream nick never changes. Cores are stopped by `e6ircd stop --handover`,
+  the same on every operating system.
+- **Chaos soak**, nightly on Linux: random core kills and link resets under
+  `e6irc-load` traffic, with an invariant checker (no drops, bounded gaps,
+  consistent counters).
+- **Scale qualification**: 100k connections through one edge — edge memory
+  per session, link throughput, gap time — recorded as the existing load
+  tracking is.
+
+---
+
+## 20. Scope boundaries
 
 - Bridges are account-owned or explicitly shared attached networks, not
   synthetic-user relay bots in public local channels (§10.5).
@@ -5585,7 +6236,7 @@ Layers, bottom to top:
 - Process diagnostics are human-readable stderr lines. Structured operational
   consumers use the typed JSON and Prometheus telemetry contract (§16).
 
-## 20. References
+## 21. References
 
 - Modern IRC: https://modern.ircdocs.horse · RFC 1459 · RFC 2812
 - IRCv3 specs: https://ircv3.net/irc/
