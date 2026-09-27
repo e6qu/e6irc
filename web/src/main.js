@@ -1926,7 +1926,18 @@ function renderNetworkList(networks, failure = null) {
       cog.href = `/console/networks/${encodeURIComponent(item.name)}`;
     }
 
-    row.append(open, power, cog);
+    // A network the server configuration defines is the operator's: the
+    // account can chat on it but not switch or edit it, which the server
+    // would refuse.
+    if (item.configured) {
+      const managed = document.createElement("span");
+      managed.className = "network-managed";
+      managed.textContent = "server";
+      managed.title = `${item.name} is defined by the server configuration`;
+      row.append(open, managed);
+    } else {
+      row.append(open, power, cog);
+    }
     // Last, so it wraps onto its own line under the controls it names.
     if (rowNote) row.append(rowNote);
     networksEl.append(row);

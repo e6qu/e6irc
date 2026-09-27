@@ -56,10 +56,13 @@
             }
           },
           {
+            "description": "Exact name filter, under RFC1459 case-folding. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "name",
             "schema": {
               "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           }
@@ -598,26 +601,35 @@
             }
           },
           {
+            "description": "Exact actor filter, an account under RFC1459 case-folding (as account principals are recorded) and any other principal as spelled. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "actor",
             "schema": {
               "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           },
           {
+            "description": "Exact action filter. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "action",
             "schema": {
               "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           },
           {
+            "description": "Exact target filter, an account under RFC1459 case-folding (as account principals are recorded) and any other principal as spelled. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "target",
             "schema": {
               "maxLength": 512,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           }
@@ -755,10 +767,13 @@
             }
           },
           {
+            "description": "Exact mask filter, under RFC1459 case-folding. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "mask",
             "schema": {
               "maxLength": 512,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           }
@@ -1055,18 +1070,24 @@
             }
           },
           {
+            "description": "Exact name filter, under RFC1459 case-folding. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "name",
             "schema": {
               "maxLength": 50,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           },
           {
+            "description": "Exact founder filter, under RFC1459 case-folding. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "founder",
             "schema": {
               "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           }
@@ -3302,10 +3323,13 @@
             }
           },
           {
+            "description": "Exact nick filter. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "nick",
             "schema": {
               "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           },
@@ -3331,10 +3355,13 @@
             }
           },
           {
+            "description": "Exact account filter. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "account",
             "schema": {
               "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           }
@@ -3966,7 +3993,30 @@
     },
     "/api/v1/admin/networks": {
       "get": {
-        "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
+        "description": "Every network with its configuration (credentials as presence booleans only) and live driver runtime state: the shared networks, then each owner's, by RFC1459-folded owner and network name, a network the server configuration defines for an owner (`configured: true`) before a stored one of the same name. Pages are stable: `after` selects strictly the networks after the one whose `next_after` it repeats, so networks created or removed meanwhile cannot duplicate or skip another.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "A `next_after` value from the previous page.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3996,6 +4046,10 @@
                                   "type": "string"
                                 },
                                 "type": "array"
+                              },
+                              "configured": {
+                                "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409).",
+                                "type": "boolean"
                               },
                               "connected": {
                                 "type": [
@@ -4265,6 +4319,7 @@
                               "enabled",
                               "connected",
                               "runtime",
+                              "configured",
                               "owner"
                             ],
                             "type": "object"
@@ -4501,17 +4556,30 @@
                           }
                         ]
                       },
+                      "maxItems": 1000,
                       "type": "array"
+                    },
+                    "next_after": {
+                      "description": "The `after` cursor of the next page; null on the last.",
+                      "minLength": 1,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
-                    "networks"
+                    "networks",
+                    "next_after"
                   ],
                   "type": "object"
                 }
               }
             },
             "description": "networks with runtime snapshots"
+          },
+          "400": {
+            "description": "invalid limit or cursor"
           },
           "401": {
             "description": "not signed in, or the token or session is invalid or expired"
@@ -4626,13 +4694,13 @@
             "description": "not an admin account"
           },
           "404": {
-            "description": "network or bouncer missing"
+            "description": "no such stored network for that owner"
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"
           },
           "409": {
-            "description": "the owner is suspended, or the stored network cannot start"
+            "description": "the owner is suspended, the stored network cannot start, or the server configuration defines this network (change it in the configuration)"
           },
           "413": {
             "description": "the request body is larger than 1 MiB (a problem document)"
@@ -7216,10 +7284,13 @@
             }
           },
           {
+            "description": "Exact nick filter. A blank value, or one with surrounding whitespace, is refused (400) rather than read as no filter.",
             "in": "query",
             "name": "nick",
             "schema": {
               "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^\\S(?:.*\\S)?$",
               "type": "string"
             }
           },
@@ -7879,6 +7950,8 @@
                   "autojoin": {
                     "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none.",
                     "items": {
+                      "maxLength": 165,
+                      "minLength": 1,
                       "type": "string"
                     },
                     "maxItems": 64,
@@ -7890,18 +7963,19 @@
                     "type": "string"
                   },
                   "realname": {
+                    "description": "IRC real name sent in USER.",
                     "maxLength": 128,
                     "minLength": 1,
                     "type": "string"
                   },
                   "sasl_account": {
+                    "description": "The SASL login, sent exactly as given: surrounding whitespace is refused, never trimmed.",
                     "maxLength": 255,
                     "minLength": 1,
                     "type": [
                       "string",
                       "null"
-                    ],
-                    "writeOnly": true
+                    ]
                   },
                   "sasl_password": {
                     "maxLength": 512,
@@ -8047,7 +8121,7 @@
     },
     "/api/v1/me/networks": {
       "get": {
-        "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
+        "description": "The account's stored networks, then the networks the server configuration defines for it (`configured: true`: the operator's, always enabled, and refused with 409 by PUT, PATCH, and DELETE). Each network includes its configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
         "responses": {
           "200": {
             "content": {
@@ -8075,6 +8149,10 @@
                               "type": "string"
                             },
                             "type": "array"
+                          },
+                          "configured": {
+                            "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409).",
+                            "type": "boolean"
                           },
                           "connected": {
                             "type": [
@@ -8339,7 +8417,8 @@
                           "has_server_password",
                           "enabled",
                           "connected",
-                          "runtime"
+                          "runtime",
+                          "configured"
                         ],
                         "type": "object"
                       },
@@ -8398,11 +8477,15 @@
                     "additionalProperties": false,
                     "properties": {
                       "addr": {
+                        "maxLength": 255,
+                        "minLength": 1,
                         "type": "string"
                       },
                       "autojoin": {
                         "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none.",
                         "items": {
+                          "maxLength": 165,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "maxItems": 64,
@@ -8412,25 +8495,40 @@
                         "const": "irc"
                       },
                       "name": {
+                        "description": "The network's selector in URLs and in the raw attach address: letters, digits, '.', '_' and '-', never '.' or '..'.",
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "pattern": "^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+)$",
                         "type": "string"
                       },
                       "nick": {
+                        "maxLength": 64,
+                        "minLength": 1,
                         "type": "string"
                       },
                       "realname": {
+                        "description": "IRC real name sent in USER.",
+                        "maxLength": 128,
+                        "minLength": 1,
                         "type": "string"
                       },
                       "sasl_account": {
+                        "description": "The SASL login, sent exactly as given: surrounding whitespace is refused, never trimmed.",
+                        "maxLength": 255,
+                        "minLength": 1,
                         "type": [
                           "string",
                           "null"
                         ]
                       },
                       "sasl_password": {
+                        "maxLength": 512,
+                        "minLength": 1,
                         "type": [
                           "string",
                           "null"
-                        ]
+                        ],
+                        "writeOnly": true
                       },
                       "server_password": {
                         "description": "The network's connection password, sent as PASS before registration; only for a private server that requires one. Stored sealed; never returned.",
@@ -8467,24 +8565,38 @@
                     "additionalProperties": false,
                     "properties": {
                       "addr": {
+                        "maxLength": 255,
+                        "minLength": 1,
                         "type": "string"
                       },
                       "autojoin": {
+                        "description": "The rooms or channel ids to bridge, one per entry; a bridge's entries take no key.",
                         "items": {
+                          "maxLength": 64,
+                          "minLength": 1,
                           "type": "string"
                         },
+                        "maxItems": 64,
                         "type": "array"
                       },
                       "kind": {
                         "const": "matrix"
                       },
                       "name": {
+                        "description": "The network's selector in URLs and in the raw attach address: letters, digits, '.', '_' and '-', never '.' or '..'.",
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "pattern": "^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+)$",
                         "type": "string"
                       },
                       "nick": {
+                        "maxLength": 64,
+                        "minLength": 1,
                         "type": "string"
                       },
                       "sasl_password": {
+                        "maxLength": 512,
+                        "minLength": 1,
                         "type": "string",
                         "writeOnly": true
                       },
@@ -8507,21 +8619,33 @@
                     "additionalProperties": false,
                     "properties": {
                       "addr": {
+                        "maxLength": 255,
+                        "minLength": 0,
                         "type": "string"
                       },
                       "autojoin": {
+                        "description": "The rooms or channel ids to bridge, one per entry; a bridge's entries take no key.",
                         "items": {
+                          "maxLength": 64,
+                          "minLength": 1,
                           "type": "string"
                         },
+                        "maxItems": 64,
                         "type": "array"
                       },
                       "kind": {
                         "const": "discord"
                       },
                       "name": {
+                        "description": "The network's selector in URLs and in the raw attach address: letters, digits, '.', '_' and '-', never '.' or '..'.",
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "pattern": "^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+)$",
                         "type": "string"
                       },
                       "sasl_password": {
+                        "maxLength": 512,
+                        "minLength": 1,
                         "type": "string",
                         "writeOnly": true
                       },
@@ -8543,25 +8667,39 @@
                     "additionalProperties": false,
                     "properties": {
                       "addr": {
+                        "maxLength": 255,
+                        "minLength": 0,
                         "type": "string"
                       },
                       "autojoin": {
+                        "description": "The rooms or channel ids to bridge, one per entry; a bridge's entries take no key.",
                         "items": {
+                          "maxLength": 64,
+                          "minLength": 1,
                           "type": "string"
                         },
+                        "maxItems": 64,
                         "type": "array"
                       },
                       "kind": {
                         "const": "slack"
                       },
                       "name": {
+                        "description": "The network's selector in URLs and in the raw attach address: letters, digits, '.', '_' and '-', never '.' or '..'.",
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "pattern": "^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+)$",
                         "type": "string"
                       },
                       "sasl_account": {
+                        "maxLength": 255,
+                        "minLength": 1,
                         "type": "string",
                         "writeOnly": true
                       },
                       "sasl_password": {
+                        "maxLength": 512,
+                        "minLength": 1,
                         "type": "string",
                         "writeOnly": true
                       },
@@ -8621,14 +8759,11 @@
           "403": {
             "description": "the account is suspended, the token lacks the scope this method needs, or a cookie-authenticated unsafe method carried no valid X-E6IRC-CSRF value"
           },
-          "404": {
-            "description": "the bouncer is not enabled on this server"
-          },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"
           },
           "409": {
-            "description": "duplicate name, or upstream secret with no master key"
+            "description": "duplicate name, a name the server configuration defines for this account, or upstream secret with no master key"
           },
           "413": {
             "description": "the request body is larger than 1 MiB (a problem document)"
@@ -8684,6 +8819,9 @@
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"
+          },
+          "409": {
+            "description": "the server configuration defines this network (only the operator removes it)"
           },
           "413": {
             "description": "the request body is larger than 1 MiB (a problem document)"
@@ -8742,6 +8880,10 @@
                         "type": "string"
                       },
                       "type": "array"
+                    },
+                    "configured": {
+                      "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409).",
+                      "type": "boolean"
                     },
                     "connected": {
                       "type": [
@@ -9006,7 +9148,8 @@
                     "has_server_password",
                     "enabled",
                     "connected",
-                    "runtime"
+                    "runtime",
+                    "configured"
                   ],
                   "type": "object"
                 }
@@ -9123,7 +9266,7 @@
             "description": "the request passed the 30-second deadline (a problem document)"
           },
           "409": {
-            "description": "cannot start (stored secret, no master key)"
+            "description": "cannot start (stored secret, no master key), or the server configuration defines this network (only the operator starts or stops it)"
           },
           "413": {
             "description": "the request body is larger than 1 MiB (a problem document)"
@@ -9167,11 +9310,15 @@
                 "additionalProperties": false,
                 "properties": {
                   "addr": {
+                    "maxLength": 255,
+                    "minLength": 0,
                     "type": "string"
                   },
                   "autojoin": {
                     "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing. An IRC entry `#channel key` sets that channel's key.",
                     "items": {
+                      "maxLength": 165,
+                      "minLength": 1,
                       "type": "string"
                     },
                     "maxItems": 64,
@@ -9184,8 +9331,11 @@
                       "keep": {
                         "description": "Channels, listed in autojoin without a new key, that keep their stored key. Every other channel's stored key is removed.",
                         "items": {
+                          "maxLength": 64,
+                          "minLength": 1,
                           "type": "string"
                         },
+                        "maxItems": 64,
                         "type": "array"
                       }
                     },
@@ -9224,13 +9374,19 @@
                         "additionalProperties": false,
                         "properties": {
                           "account": {
+                            "description": "An IRC SASL login, sent exactly as given (surrounding whitespace is refused, never trimmed), or a Slack bot token.",
+                            "maxLength": 255,
+                            "minLength": 1,
                             "type": "string"
                           },
                           "action": {
                             "const": "set"
                           },
                           "password": {
-                            "type": "string"
+                            "maxLength": 512,
+                            "minLength": 1,
+                            "type": "string",
+                            "writeOnly": true
                           }
                         },
                         "required": [
@@ -9241,10 +9397,14 @@
                     ]
                   },
                   "nick": {
+                    "maxLength": 64,
+                    "minLength": 0,
                     "type": "string"
                   },
                   "realname": {
                     "description": "IRC real name sent in USER. Required when the stored network is kind=irc (400 with field=realname when absent); refused for a bridge.",
+                    "maxLength": 128,
+                    "minLength": 1,
                     "type": "string"
                   },
                   "server_password": {
@@ -9338,7 +9498,7 @@
             "description": "the request passed the 30-second deadline (a problem document)"
           },
           "409": {
-            "description": "cannot seal credentials or start replacement driver, or a stored secret would be sent to a new destination (field names it)"
+            "description": "cannot seal credentials or start replacement driver, a stored secret would be sent to a new destination (field names it), or the server configuration defines this network (only the operator changes it)"
           },
           "413": {
             "description": "the request body is larger than 1 MiB (a problem document)"
@@ -11262,7 +11422,7 @@
             "description": "the Origin is not this application's, or the credential is refused as for any authenticated read"
           },
           "404": {
-            "description": "no such network of yours, or the bouncer is not enabled"
+            "description": "no such network of yours"
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"

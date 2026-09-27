@@ -190,15 +190,20 @@ network inventory and the registry holds live drivers.
 
 **Flow.**
 
-1. **All networks** (under **Server**, **Chat**) lists every account's
-   networks in the columns Status, Owner, Network, Type, Server, Clients,
-   Errors, Last failure, and Actions.
+1. **All networks** (under **Server**, **Chat**) lists every network — the
+   shared ones, then each account's — in the columns Status, Owner, Network,
+   Type, Server, Clients, Errors, Last failure, and Actions, a page at a time
+   with a link to the next.
 2. `GET /api/v1/admin/networks` returns the same fleet inventory as
    authenticated JSON with stored credentials shown only as presence
-   booleans.
-3. A CSRF-protected toggle disables (or re-enables) one network: the flag
-   persists, the driver stops (or starts) under the shared mutation lane,
-   and the action is audited with the administrator as actor.
+   booleans, paged by a stable cursor (`limit`, `after`, `next_after`). A
+   network the server configuration defines for an account is listed with
+   `configured: true`.
+3. A CSRF-protected toggle disables (or re-enables) one stored network: the
+   flag persists, the driver stops (or starts) under the shared mutation lane,
+   and the action is audited with the administrator as actor. A configured
+   network shows "Managed configuration" instead, and the API refuses its
+   toggle with a `409`: it follows the configuration.
 
 **Visible failures and recovery.** A network with no live driver reads as not
 running, a disabled one as disabled; a flapping upstream shows its error
@@ -216,7 +221,10 @@ actor, `owner/network` target, and enabled/disabled detail.
 
 **Evidence.** Proven by the PostgreSQL admin fleet integration test: gating
 (401/403/200), inventory shape, CSRF toggle, persisted flag flip, and the
-`NETWORK_TOGGLE` audit row.
+`NETWORK_TOGGLE` audit row; and by
+`configured_networks_are_the_operators_and_the_inventory_pages_them`: the
+cursor pages the whole fleet once, in order, and a configured network is
+listed but refuses every account-level change.
 
 ## Monitor traffic, connections, queue pressure, latency, availability, and errors
 

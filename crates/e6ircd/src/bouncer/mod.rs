@@ -48,13 +48,13 @@ pub use irc_driver::{
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
-pub use serve::{DriverStops, NetworkStatus, Registry, bnc_serve};
-pub(crate) use serve::{MutationLane, UnwrittenLines};
+pub use serve::{ConfiguredNetwork, DriverStops, NetworkStatus, Registry, bnc_serve};
+pub(crate) use serve::{ConfiguredNetworkHeld, MutationLane, NetworkDefinition, UnwrittenLines};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 pub use upstream_identity::{
-    AutojoinChannel, AutojoinEntry, ConfirmedChannel, UpstreamChannel, UpstreamIdentityError,
-    UpstreamNick, UpstreamRealname, UpstreamUsername,
+    AutojoinChannel, AutojoinEntry, ConfirmedChannel, UpstreamChannel, UpstreamIdentity,
+    UpstreamIdentityError, UpstreamNick, UpstreamRealname, UpstreamSaslAccount, UpstreamUsername,
 };
 
 /// The ISUPPORT a network is described with when it has reported nothing of
@@ -370,13 +370,20 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 .map(e6irc_client::ServerPassword::parse)
                 .transpose()
                 .map_err(|error| format!("kind=irc has an invalid server password: {error}"))?;
+            let UpstreamIdentity {
+                nick,
+                username,
+                realname,
+                autojoin,
+            } = UpstreamIdentity::parse(&nick, &username, &realname, &autojoin)
+                .map_err(identity_error)?;
             Ok(Box::new(IrcDriver::new(NetworkConfig {
                 addr,
                 tls,
-                nick: nick.parse().map_err(identity_error)?,
-                username: username.parse().map_err(identity_error)?,
-                realname: realname.parse().map_err(identity_error)?,
-                autojoin: AutojoinChannel::parse_list(&autojoin).map_err(identity_error)?,
+                nick,
+                username,
+                realname,
+                autojoin,
                 buffer_cap,
                 sasl,
                 server_password,

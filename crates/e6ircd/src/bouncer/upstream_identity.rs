@@ -329,6 +329,9 @@ impl AutojoinEntry {
     /// Most entries a network may be configured to join.
     pub const MAX_CONFIGURED: usize = 64;
 
+    /// Longest entry a request can write: a channel, a space, and its key.
+    pub const MAX_SUBMITTED_BYTES: usize = UpstreamChannel::MAX_BYTES + 1 + ChannelKey::MAX_BYTES;
+
     /// A channel joined without a key.
     pub fn unkeyed(channel: impl Into<String>) -> Self {
         Self {
@@ -411,6 +414,77 @@ impl AutojoinChannel {
     }
 }
 
+/// The account name an `irc` driver logs in to its upstream with over SASL.
+/// It is a public login, not a secret, and it is stored and sent exactly as
+/// given, so a value with surrounding whitespace is refused rather than
+/// trimmed into another name: the create, edit and connection-test requests
+/// all parse it here and cannot disagree about what they store or send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamSaslAccount(String);
+
+impl UpstreamSaslAccount {
+    pub const MAX_BYTES: usize = 255;
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for UpstreamSaslAccount {
+    type Err = UpstreamIdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let error = |reason| UpstreamIdentityError {
+            field: "sasl_account",
+            reason,
+        };
+        if value.is_empty() {
+            return Err(error("is required"));
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(error("is limited to 255 bytes"));
+        }
+        if value.trim() != value {
+            return Err(error("must not begin or end with whitespace"));
+        }
+        // PLAIN separates its fields with NUL, and CR or LF would end the
+        // AUTHENTICATE line.
+        if value.contains(['\r', '\n', '\0']) {
+            return Err(error("must not contain CR, LF or NUL"));
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+
+/// Everything an `irc` or `local` driver presents about itself — its `NICK`,
+/// both `USER` fields, and the channels it joins — parsed together. Building a
+/// driver and validating the configuration that will build one both go
+/// through [`UpstreamIdentity::parse`], so a configuration cannot be accepted
+/// on save and then refused when the driver is built at the next start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamIdentity {
+    pub nick: UpstreamNick,
+    pub username: UpstreamUsername,
+    pub realname: UpstreamRealname,
+    pub autojoin: Vec<AutojoinChannel>,
+}
+
+impl UpstreamIdentity {
+    pub fn parse(
+        nick: &str,
+        username: &str,
+        realname: &str,
+        autojoin: &[AutojoinEntry],
+    ) -> Result<Self, UpstreamIdentityError> {
+        Ok(Self {
+            nick: nick.parse()?,
+            username: username.parse()?,
+            realname: realname.parse()?,
+            autojoin: AutojoinChannel::parse_list(autojoin)?,
+        })
+    }
+}
+
 impl FromStr for AutojoinChannel {
     type Err = UpstreamIdentityError;
 
@@ -424,6 +498,32 @@ impl FromStr for AutojoinChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SASL login is stored and sent as given: create once stored
+    /// `" alice"` verbatim while an edit trimmed it to `alice`, so the same
+    /// input logged in as two different accounts depending on the route.
+    #[test]
+    fn a_sasl_account_is_refused_rather_than_trimmed() {
+        assert_eq!(
+            "alice"
+                .parse::<UpstreamSaslAccount>()
+                .map(UpstreamSaslAccount::into_string),
+            Ok("alice".to_string())
+        );
+        for refused in [
+            "",
+            " alice",
+            "alice ",
+            "\talice",
+            "al\u{0}ice",
+            "al\rice",
+            "a".repeat(256).as_str(),
+        ] {
+            let error = refused.parse::<UpstreamSaslAccount>().expect_err(refused);
+            assert_eq!(error.field(), "sasl_account", "{refused:?}");
+        }
+        assert!("a".repeat(255).parse::<UpstreamSaslAccount>().is_ok());
+    }
 
     #[test]
     fn a_channel_key_is_one_parameter_and_never_shown() {

@@ -612,7 +612,7 @@ async fn complete_flow(
     headers: &axum::http::HeaderMap,
 ) -> Response {
     use openidconnect::{AuthorizationCode, Nonce, PkceCodeVerifier, TokenResponse};
-    let Some(pool) = state.pool.clone() else {
+    let Some(pool) = state.pool().cloned() else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "No database configured",
@@ -1756,7 +1756,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RateLimited {
 /// The pool, once a request has authenticated. Authentication fails closed
 /// when no database is configured, so reaching a handler body proves one.
 pub(super) fn pool_of(state: &AppState) -> &sqlx::PgPool {
-    state.pool.as_ref().expect("authenticate checked the pool")
+    state.pool().expect("authenticate checked the pool")
 }
 
 /// The account a request authenticated as, the credential that proved it, and
@@ -1851,7 +1851,7 @@ async fn authenticate_principal(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> ResponseResult<RequestPrincipal> {
-    let Some(pool) = &state.pool else {
+    let Some(pool) = state.pool() else {
         return Err(problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "No database configured",

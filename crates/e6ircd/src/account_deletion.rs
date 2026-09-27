@@ -115,8 +115,18 @@ impl AccountDeletion {
             }
             Err(error) => {
                 for (name, driver) in restart {
-                    lane.ensure_running(Some(&target.folded), &name, driver)
-                        .await;
+                    // Only a stored network that was running is restarted, and
+                    // the lane has been held since: a configured network cannot
+                    // have taken its key, but say so rather than assume it.
+                    if let Err(held) = lane
+                        .ensure_running(Some(&target.folded), &name, driver)
+                        .await
+                    {
+                        eprintln!(
+                            "account deletion: network {}/{name} not restarted: {held}",
+                            target.name
+                        );
+                    }
                 }
                 self.undo_gate(&target, actor).await?;
                 return Err(deletion_error(error));
@@ -168,7 +178,7 @@ impl AccountDeletion {
         };
         let mut restart = Vec::new();
         for row in rows {
-            if registry.get_owned(&target.folded, &row.name).is_none() {
+            if registry.get_stored(&target.folded, &row.name).is_none() {
                 continue;
             }
             match crate::bouncer::driver_from_row(

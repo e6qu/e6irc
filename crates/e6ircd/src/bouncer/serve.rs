@@ -68,8 +68,6 @@ pub struct Registry {
     internal_upstreams: crate::egress::InternalUpstreams,
 }
 
-/// A registered network: its driver handle plus the persistence task that
-/// mirrors upstream lines to the database.
 /// [`Registry::add`] found a live driver already registered under the key.
 #[derive(Debug)]
 pub struct NetworkAlreadyRunning {
@@ -84,12 +82,102 @@ impl std::fmt::Display for NetworkAlreadyRunning {
 
 impl std::error::Error for NetworkAlreadyRunning {}
 
+/// A registry transition refused because the key is held by a network the
+/// server's configuration defines: the operator owns it, so no account-level
+/// mutation (create, edit, enable, disable, delete) may replace or stop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfiguredNetworkHeld;
+
+impl std::fmt::Display for ConfiguredNetworkHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the server configuration defines this network; only the operator can change it",
+        )
+    }
+}
+
+impl std::error::Error for ConfiguredNetworkHeld {}
+
+/// What a configuration-defined network states, without its secrets: the
+/// fields an owner or administrator view shows, with each credential reduced
+/// to whether it is present (an IRC SASL account is a public login and is
+/// shown; a bridge's account field is a token and is not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredNetwork {
+    /// The name as the configuration spells it.
+    pub name: String,
+    /// The owning account as the configuration spells it; `None` when shared.
+    pub owner: Option<String>,
+    pub kind: crate::config::NetworkKind,
+    pub addr: String,
+    pub tls: bool,
+    pub nick: String,
+    pub username: Option<String>,
+    pub realname: Option<String>,
+    pub autojoin: Vec<String>,
+    pub sasl_account: Option<String>,
+    pub has_sasl_account: bool,
+    pub has_sasl_password: bool,
+    pub has_server_password: bool,
+}
+
+impl ConfiguredNetwork {
+    pub(crate) fn from_entry(entry: &NetworkEntry) -> Self {
+        Self {
+            name: entry.name.clone(),
+            owner: entry.owner.clone(),
+            kind: entry.kind,
+            addr: entry.addr.clone(),
+            tls: entry.tls,
+            nick: entry.nick.clone(),
+            username: entry.username.clone(),
+            realname: entry.realname.clone(),
+            autojoin: entry.autojoin.clone(),
+            sasl_account: entry
+                .sasl_account
+                .clone()
+                .filter(|_| !entry.kind.account_is_secret()),
+            has_sasl_account: entry.sasl_account.is_some(),
+            has_sasl_password: entry.sasl_password.is_some(),
+            has_server_password: entry.server_password.is_some(),
+        }
+    }
+}
+
+/// Where a registered network is defined, which decides who may change it
+/// and what its stored lines may name.
+#[derive(Debug, Clone)]
+pub enum NetworkDefinition {
+    /// A network in the server's configuration: the operator's.
+    Configured(Arc<ConfiguredNetwork>),
+    /// A `bnc_networks` row an account created: the account's.
+    Stored,
+}
+
+impl NetworkDefinition {
+    fn storage(&self) -> crate::db::BncNetworkDefinition {
+        match self {
+            Self::Configured(_) => crate::db::BncNetworkDefinition::Configured,
+            Self::Stored => crate::db::BncNetworkDefinition::Stored,
+        }
+    }
+}
+
+/// A registered network: its driver handle, the persistence task that
+/// mirrors upstream lines to the database, and where it is defined.
 struct Slot {
     handle: Arc<NetworkHandle>,
     persistence: Option<Persistence>,
     /// The driver's stable kind (`irc`, `matrix`, `discord`, `slack`, …),
     /// captured before `start()` consumes the driver — for status views.
     kind: &'static str,
+    definition: NetworkDefinition,
+}
+
+impl Slot {
+    fn is_configured(&self) -> bool {
+        matches!(self.definition, NetworkDefinition::Configured(_))
+    }
 }
 
 /// A read-only snapshot of one registered network, for status/management views.
@@ -100,6 +188,9 @@ pub struct NetworkStatus {
     pub kind: &'static str,
     pub connected: bool,
     pub runtime: super::NetworkRuntimeSnapshot,
+    /// What the configuration states, for a configuration-defined network;
+    /// `None` for an account's stored network.
+    pub configured: Option<Arc<ConfiguredNetwork>>,
 }
 
 /// A network's persistence task and the signal that ends it.
@@ -197,14 +288,14 @@ impl Slot {
 const PRELOAD_LIMIT: i64 = 1000;
 
 impl Registry {
-    /// Start a driver per configured (server-level) network. `pool`, when
-    /// present, enables buffer persistence and backlog restore; `core`
-    /// (the in-process handles) is required for any `local` network.
     /// The server's policy on upstreams inside its own network.
     pub fn internal_upstreams(&self) -> crate::egress::InternalUpstreams {
         self.internal_upstreams
     }
 
+    /// Start a driver per configured (server-level) network. `pool`, when
+    /// present, enables buffer persistence and backlog restore; `core`
+    /// (the in-process handles) is required for any `local` network.
     pub(crate) fn start_observed(
         entries: &[NetworkEntry],
         pool: Option<PgPool>,
@@ -234,40 +325,20 @@ impl Registry {
             // `local` needs the in-process core handles, so it stays special; all
             // other kinds go through the shared feature-gated `build_driver`
             // factory (the same one the DB create/boot/re-enable paths use).
-            let realname = match e.kind {
-                NetworkKind::Irc | NetworkKind::Local => e.realname.clone().ok_or_else(|| {
-                    format!(
-                        "network '{}' (kind={}) requires realname",
-                        e.name,
-                        e.kind.as_db_str()
-                    )
-                })?,
-                NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => String::new(),
-            };
-            // A server-level network's autojoin is public configuration (the
-            // administrator API returns it), so it names channels only: an
-            // entry with a key in it is refused by the channel grammar rather
-            // than read as a key nobody could keep secret.
-            let autojoin: Vec<super::AutojoinEntry> = e
-                .autojoin
-                .iter()
-                .map(|channel| super::AutojoinEntry::unkeyed(channel.as_str()))
-                .collect();
+            // Both parse the identity with the parser configuration validation
+            // uses ([`NetworkEntry::upstream_identity`]), so an entry accepted
+            // when it was saved starts.
             let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
-                let identity_error = |error: super::UpstreamIdentityError| {
-                    format!("network '{}' (kind=local) has invalid {error}", e.name)
-                };
-                let username = e.username.as_deref().ok_or_else(|| {
-                    format!("network '{}' (kind=local) requires username", e.name)
-                })?;
+                let identity = e
+                    .upstream_identity()
+                    .map_err(|error| format!("network '{}': {error}", e.name))?;
                 let config = NetworkConfig {
                     addr: e.addr.clone(),
                     tls: e.tls,
-                    nick: e.nick.parse().map_err(identity_error)?,
-                    username: username.parse().map_err(identity_error)?,
-                    realname: realname.parse().map_err(identity_error)?,
-                    autojoin: super::AutojoinChannel::parse_list(&autojoin)
-                        .map_err(identity_error)?,
+                    nick: identity.nick,
+                    username: identity.username,
+                    realname: identity.realname,
+                    autojoin: identity.autojoin,
                     buffer_cap: e.buffer_cap,
                     sasl: None,
                     server_password: None,
@@ -278,6 +349,20 @@ impl Registry {
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
+                let realname = match e.kind {
+                    NetworkKind::Irc | NetworkKind::Local => {
+                        e.realname.clone().ok_or_else(|| {
+                            format!(
+                                "network '{}' (kind={}) requires realname",
+                                e.name,
+                                e.kind.as_db_str()
+                            )
+                        })?
+                    }
+                    NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => {
+                        String::new()
+                    }
+                };
                 super::build_driver(super::DriverSpec {
                     kind: e.kind,
                     owner: e.owner.clone(),
@@ -287,7 +372,7 @@ impl Registry {
                     nick: e.nick.clone(),
                     username: e.username.clone(),
                     realname,
-                    autojoin,
+                    autojoin: e.autojoin_entries(),
                     buffer_cap: e.buffer_cap,
                     sasl_account: e.sasl_account.clone(),
                     sasl_password: e.sasl_password.clone(),
@@ -301,7 +386,7 @@ impl Registry {
                 .add(
                     e.owner.as_deref(),
                     &e.name,
-                    crate::db::BncNetworkDefinition::Configured,
+                    NetworkDefinition::Configured(Arc::new(ConfiguredNetwork::from_entry(e))),
                     driver,
                 )
                 .map_err(|error| error.to_string())?;
@@ -358,7 +443,7 @@ impl Registry {
         &self,
         owner: Option<&str>,
         name: &str,
-        definition: crate::db::BncNetworkDefinition,
+        definition: NetworkDefinition,
         driver: Box<dyn super::NetworkDriver>,
     ) -> Result<(), NetworkAlreadyRunning> {
         let key = NetworkKey::new(owner, name);
@@ -386,7 +471,7 @@ impl Registry {
                 pool,
                 key.owner.clone(),
                 key.name.clone(),
-                definition,
+                definition.storage(),
                 handle.clone(),
             )
         });
@@ -396,6 +481,7 @@ impl Registry {
                 handle,
                 persistence,
                 kind,
+                definition,
             },
         );
         Ok(())
@@ -457,6 +543,73 @@ impl Registry {
             .map(|slot| slot.handle.clone())
     }
 
+    /// The driver of the account's STORED network of that name, if one runs.
+    /// A configuration-defined network under the same key is not it: its
+    /// runtime must not be shown against, or read through, a stored row.
+    pub fn get_stored(&self, account: &str, name: &str) -> Option<Arc<NetworkHandle>> {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
+            .get(&NetworkKey::new(Some(account), name))
+            .filter(|slot| !slot.is_configured())
+            .map(|slot| slot.handle.clone())
+    }
+
+    /// Whether the configuration defines the network `(owner, name)` running
+    /// here — the operator's, which no account-level mutation may touch.
+    pub fn holds_configured(&self, owner: Option<&str>, name: &str) -> bool {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
+            .get(&NetworkKey::new(owner, name))
+            .is_some_and(Slot::is_configured)
+    }
+
+    /// The networks the server configuration defines for `account`, with
+    /// their drivers, by name.
+    pub fn configured_owned(
+        &self,
+        account: &str,
+    ) -> Vec<(Arc<ConfiguredNetwork>, Arc<NetworkHandle>)> {
+        let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account);
+        let mut owned: Vec<_> = self
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .iter()
+            .filter(|(key, _)| key.owner.as_deref() == Some(owner.as_str()))
+            .filter_map(|(key, slot)| match &slot.definition {
+                NetworkDefinition::Configured(configured) => {
+                    Some((key.name.clone(), configured.clone(), slot.handle.clone()))
+                }
+                NetworkDefinition::Stored => None,
+            })
+            .collect();
+        owned.sort_by(|left, right| left.0.cmp(&right.0));
+        owned
+            .into_iter()
+            .map(|(_, configured, handle)| (configured, handle))
+            .collect()
+    }
+
+    /// The configuration-defined network `(account, name)`, with its driver.
+    pub fn get_configured_owned(
+        &self,
+        account: &str,
+        name: &str,
+    ) -> Option<(Arc<ConfiguredNetwork>, Arc<NetworkHandle>)> {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
+            .get(&NetworkKey::new(Some(account), name))
+            .and_then(|slot| match &slot.definition {
+                NetworkDefinition::Configured(configured) => {
+                    Some((configured.clone(), slot.handle.clone()))
+                }
+                NetworkDefinition::Stored => None,
+            })
+    }
+
     /// A shared (ownerless) network of that name, if any.
     pub fn get_shared(&self, name: &str) -> Option<Arc<NetworkHandle>> {
         self.networks
@@ -481,6 +634,10 @@ impl Registry {
                     kind: slot.kind,
                     connected: runtime.lifecycle == super::NetworkLifecycle::Connected,
                     runtime,
+                    configured: match &slot.definition {
+                        NetworkDefinition::Configured(configured) => Some(configured.clone()),
+                        NetworkDefinition::Stored => None,
+                    },
                 }
             })
             .collect()
@@ -503,26 +660,38 @@ impl std::ops::Deref for MutationLane {
 }
 
 impl MutationLane {
+    /// The stored network's slot under `(owner, name)`, taken out of the
+    /// registry, or `None` when nothing runs there. A configuration-defined
+    /// network there is refused and left running: the operator owns it.
+    fn take_stored(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Slot>, ConfiguredNetworkHeld> {
+        let mut networks = self.registry.networks.lock().expect("registry poisoned");
+        let key = NetworkKey::new(owner, name);
+        if networks.get(&key).is_some_and(Slot::is_configured) {
+            return Err(ConfiguredNetworkHeld);
+        }
+        Ok(networks.remove(&key))
+    }
+
     /// Replace one live driver of a stored network only after its predecessor
-    /// has disconnected.
+    /// has disconnected. A configuration-defined network under the key is
+    /// refused and keeps running.
     pub(crate) async fn replace(
         &self,
         owner: Option<&str>,
         name: &str,
         driver: Box<dyn super::NetworkDriver>,
-    ) {
-        let old = self
-            .registry
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .remove(&NetworkKey::new(owner, name));
-        if let Some(old) = old {
+    ) -> Result<(), ConfiguredNetworkHeld> {
+        if let Some(old) = self.take_stored(owner, name)? {
             old.stop(UnwrittenLines::Store).await;
         }
         self.registry
-            .add(owner, name, crate::db::BncNetworkDefinition::Stored, driver)
+            .add(owner, name, NetworkDefinition::Stored, driver)
             .expect("the mutation lane serializes registry writers");
+        Ok(())
     }
 
     /// Make the stored network `(owner, name)` run: start `driver` when nothing is registered,
@@ -534,66 +703,66 @@ impl MutationLane {
         owner: Option<&str>,
         name: &str,
         driver: Box<dyn super::NetworkDriver>,
-    ) -> bool {
-        let running = self
-            .registry
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .get(&NetworkKey::new(owner, name))
-            .map(|slot| slot.handle.runtime_snapshot().lifecycle);
+    ) -> Result<bool, ConfiguredNetworkHeld> {
+        let running = {
+            let networks = self.registry.networks.lock().expect("registry poisoned");
+            match networks.get(&NetworkKey::new(owner, name)) {
+                Some(slot) if slot.is_configured() => return Err(ConfiguredNetworkHeld),
+                Some(slot) => Some(slot.handle.runtime_snapshot().lifecycle),
+                None => None,
+            }
+        };
         match running {
             Some(
                 super::NetworkLifecycle::Connecting
                 | super::NetworkLifecycle::Connected
                 | super::NetworkLifecycle::Reconnecting,
-            ) => false,
+            ) => Ok(false),
             Some(
                 super::NetworkLifecycle::AuthenticationFailed
                 | super::NetworkLifecycle::RegistrationFailed,
             )
             | None => {
-                self.replace(owner, name, driver).await;
-                true
+                self.replace(owner, name, driver).await?;
+                Ok(true)
             }
         }
     }
 
-    /// Remove `owner`'s network `name`, stopping its driver. Returns
-    /// whether a network was removed.
+    /// Remove `owner`'s stored network `name`, stopping its driver. Returns
+    /// whether a network was removed; a configuration-defined network under
+    /// the key is refused and keeps running.
     pub(crate) async fn remove(
         &self,
         owner: Option<&str>,
         name: &str,
         unwritten: UnwrittenLines,
-    ) -> bool {
-        let removed = self
-            .registry
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .remove(&NetworkKey::new(owner, name));
-        match removed {
+    ) -> Result<bool, ConfiguredNetworkHeld> {
+        match self.take_stored(owner, name)? {
             Some(slot) => {
                 slot.stop(unwritten).await;
-                true
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 
-    /// Stop every active upstream owned by one account while preserving its
-    /// durable definitions for possible reactivation. The account's drivers
-    /// stop concurrently, as a process shutdown stops them, so one slow
-    /// goodbye does not hold up the rest.
+    /// Stop every active stored upstream owned by one account while preserving
+    /// its durable definitions for possible reactivation. The account's
+    /// drivers stop concurrently, as a process shutdown stops them, so one
+    /// slow goodbye does not hold up the rest. A network the configuration
+    /// defines for the account is the operator's and keeps running: nothing
+    /// the account's lifecycle does could start it again before a restart.
     pub(crate) async fn remove_owner(&self, owner: &str, unwritten: UnwrittenLines) -> usize {
         let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner);
         let removed: Vec<Slot> = {
             let mut networks = self.registry.networks.lock().expect("registry poisoned");
             let keys: Vec<NetworkKey> = networks
-                .keys()
-                .filter(|key| key.owner.as_deref() == Some(owner.as_str()))
-                .cloned()
+                .iter()
+                .filter(|(key, slot)| {
+                    key.owner.as_deref() == Some(owner.as_str()) && !slot.is_configured()
+                })
+                .map(|(key, _)| key.clone())
                 .collect();
             keys.into_iter()
                 .filter_map(|key| networks.remove(&key))
@@ -2209,7 +2378,7 @@ mod key_tests {
             .add(
                 Some("alice"),
                 "libera",
-                crate::db::BncNetworkDefinition::Configured,
+                NetworkDefinition::Stored,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -2219,7 +2388,7 @@ mod key_tests {
             .add(
                 Some("ALICE"),
                 "Libera",
-                crate::db::BncNetworkDefinition::Configured,
+                NetworkDefinition::Stored,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect_err("the casefolded key is occupied");
@@ -2230,6 +2399,162 @@ mod key_tests {
         let still = registry.get_owned("alice", "libera").expect("same driver");
         assert!(Arc::ptr_eq(&first, &still));
         assert!(!*first.watch_shutdown().borrow());
+    }
+
+    /// Saving a configured network and starting it are one judgement: an
+    /// entry the configuration validator accepts starts, and one the start
+    /// would refuse — refusing it made the daemon exit at the next boot — is
+    /// refused when it is saved. (A nick with a space, a keyed or unprefixed
+    /// autojoin entry, and a control character in the real name were saved,
+    /// then bricked the next start.)
+    #[tokio::test]
+    async fn a_configured_network_validates_exactly_when_it_starts() {
+        use crate::config::NetworkKind;
+        let entry = |kind, nick: &str, realname: &str, autojoin: &[&str]| NetworkEntry {
+            kind,
+            name: "net".into(),
+            owner: None,
+            addr: "127.0.0.1:1".into(),
+            tls: false,
+            nick: nick.into(),
+            username: Some("ident".into()),
+            realname: Some(realname.into()),
+            autojoin: autojoin.iter().map(|channel| channel.to_string()).collect(),
+            buffer_cap: 16,
+            sasl_account: None,
+            sasl_password: None,
+            server_password: None,
+        };
+        let cases = [
+            (
+                entry(NetworkKind::Irc, "alice", "Alice Liddell", &["#ops"]),
+                true,
+            ),
+            (entry(NetworkKind::Irc, "alice smith", "Alice", &[]), false),
+            (entry(NetworkKind::Irc, "alice", "Al\rice", &[]), false),
+            (
+                entry(NetworkKind::Irc, "alice", "Alice", &["#ops key"]),
+                false,
+            ),
+            (entry(NetworkKind::Irc, "alice", "Alice", &["ops"]), false),
+            (entry(NetworkKind::Irc, "alice", "Alice", &["#a,#b"]), false),
+            (entry(NetworkKind::Local, "alice", "Alice", &["#ops"]), true),
+            (
+                entry(NetworkKind::Local, "alice smith", "Alice", &[]),
+                false,
+            ),
+            (
+                entry(NetworkKind::Local, "alice", "Alice", &["#ops key"]),
+                false,
+            ),
+        ];
+        for (network, valid) in cases {
+            let validated = network.validate_connection_intent();
+            assert_eq!(validated.is_ok(), valid, "{network:?}: {validated:?}");
+            let (core_tx, _core_rx) = e6irc_queue::queue(e6irc_queue::Config {
+                name: "configured-network-test-core",
+                capacity: 16,
+                policy: e6irc_queue::Policy::Fifo,
+            });
+            let started = Registry::start_inner(
+                std::slice::from_ref(&network),
+                None,
+                super::super::CoreHandles {
+                    core_tx: crate::core::CoreIngress::single(core_tx),
+                    next_conn: Arc::new(crate::core::ConnectionIdAllocator::new(
+                        std::num::NonZeroU64::MIN,
+                    )),
+                    sendq_bytes: 64 * 512,
+                },
+                None,
+                crate::egress::InternalUpstreams::Allow,
+            );
+            assert_eq!(
+                started.is_ok(),
+                valid,
+                "{network:?} validated {validated:?} but started {:?}",
+                started.as_ref().err()
+            );
+            if let Ok(registry) = started {
+                registry
+                    .stop_all_within(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        }
+    }
+
+    fn configured_definition(owner: Option<&str>, name: &str) -> NetworkDefinition {
+        NetworkDefinition::Configured(Arc::new(ConfiguredNetwork::from_entry(
+            &crate::config::NetworkEntry {
+                kind: crate::config::NetworkKind::Irc,
+                name: name.into(),
+                owner: owner.map(str::to_string),
+                addr: "irc.example.test:6697".into(),
+                tls: true,
+                nick: "alice".into(),
+                username: Some("alice".into()),
+                realname: Some("Alice".into()),
+                autojoin: vec!["#e6irc".into()],
+                buffer_cap: 100,
+                sasl_account: None,
+                sasl_password: None,
+                server_password: None,
+            },
+        )))
+    }
+
+    /// A network the configuration defines is the operator's: every
+    /// account-level transition under its key is refused and leaves it running,
+    /// and the stored-network lookups do not mistake it for the account's row.
+    #[tokio::test]
+    async fn a_configured_network_refuses_every_account_level_transition() {
+        let registry = Arc::new(empty_registry());
+        registry
+            .add(
+                Some("alice"),
+                "libera",
+                configured_definition(Some("alice"), "libera"),
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
+        let configured = registry.get_owned("alice", "libera").expect("running");
+        assert!(registry.holds_configured(Some("ALICE"), "Libera"));
+        assert!(registry.get_stored("alice", "libera").is_none());
+        assert_eq!(registry.configured_owned("Alice").len(), 1);
+        assert!(registry.get_configured_owned("alice", "LIBERA").is_some());
+        let refusals = registry
+            .mutate(|lane| async move {
+                (
+                    lane.replace(
+                        Some("alice"),
+                        "libera",
+                        Box::new(crate::bouncer::LoopbackDriver::new(16)),
+                    )
+                    .await,
+                    lane.ensure_running(
+                        Some("alice"),
+                        "libera",
+                        Box::new(crate::bouncer::LoopbackDriver::new(16)),
+                    )
+                    .await,
+                    lane.remove(Some("alice"), "libera", UnwrittenLines::Store)
+                        .await,
+                )
+            })
+            .await;
+        assert_eq!(
+            refusals,
+            (
+                Err(ConfiguredNetworkHeld),
+                Err(ConfiguredNetworkHeld),
+                Err(ConfiguredNetworkHeld)
+            )
+        );
+        let still = registry
+            .get_owned("alice", "libera")
+            .expect("still running");
+        assert!(Arc::ptr_eq(&configured, &still));
+        assert!(!*configured.watch_shutdown().borrow());
     }
 
     /// Starts `(alice, libera)` through the mutation lane unless a working
@@ -2243,6 +2568,7 @@ mod key_tests {
                     Box::new(crate::bouncer::LoopbackDriver::new(16)),
                 )
                 .await
+                .expect("no configured network holds the key")
             })
             .await
     }
@@ -2268,7 +2594,7 @@ mod key_tests {
             .add(
                 Some("Alice"),
                 "libera",
-                crate::db::BncNetworkDefinition::Configured,
+                NetworkDefinition::Stored,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -2276,7 +2602,7 @@ mod key_tests {
             .add(
                 Some("alice"),
                 "oftc",
-                crate::db::BncNetworkDefinition::Configured,
+                NetworkDefinition::Stored,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -2284,7 +2610,7 @@ mod key_tests {
             .add(
                 Some("Bob"),
                 "libera",
-                crate::db::BncNetworkDefinition::Configured,
+                NetworkDefinition::Stored,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -2292,7 +2618,15 @@ mod key_tests {
             .add(
                 None,
                 "shared",
-                crate::db::BncNetworkDefinition::Configured,
+                NetworkDefinition::Stored,
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
+        registry
+            .add(
+                Some("alice"),
+                "home",
+                configured_definition(Some("alice"), "home"),
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -2300,6 +2634,7 @@ mod key_tests {
             .get_owned("ALICE", "LIBERA")
             .expect("Alice network");
         let alice_oftc = registry.get_owned("alice", "oftc").expect("Alice network");
+        let alice_home = registry.get_owned("alice", "home").expect("configured");
         let bob = registry.get_owned("bob", "libera").expect("Bob network");
         let shared = registry.get_shared("shared").expect("shared network");
 
@@ -2311,6 +2646,10 @@ mod key_tests {
         assert_eq!(remove_owner("aLICE").await, 2);
         assert!(*alice_libera.watch_shutdown().borrow());
         assert!(*alice_oftc.watch_shutdown().borrow());
+        assert!(
+            !*alice_home.watch_shutdown().borrow(),
+            "the operator's configured network is not the account's to stop"
+        );
         assert!(!*bob.watch_shutdown().borrow());
         assert!(!*shared.watch_shutdown().borrow());
         assert!(registry.get_owned("alice", "libera").is_none());
@@ -2342,7 +2681,8 @@ mod key_tests {
                             "libera",
                             Box::new(crate::bouncer::LoopbackDriver::new(16)),
                         )
-                        .await;
+                        .await
+                        .expect("no configured network holds the key");
                     })
                     .await;
             })
@@ -2384,6 +2724,7 @@ mod key_tests {
             handle: Arc::new(handle),
             persistence: Some(Persistence { stop, task }),
             kind: "loopback",
+            definition: NetworkDefinition::Stored,
         }
     }
 

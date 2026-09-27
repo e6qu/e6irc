@@ -53,7 +53,7 @@ use ws::*;
 /// [`pool_of`], which relies on `authenticate`'s fail-closed pool check.)
 macro_rules! require_pool {
     ($state:expr) => {
-        match &$state.pool {
+        match $state.pool() {
             Some(pool) => pool,
             None => {
                 return problem(
@@ -88,9 +88,10 @@ macro_rules! require_managed_config {
 pub struct AppState {
     pub server_name: String,
     pub network_name: String,
-    /// Absent when the server runs without persistence; endpoints that
-    /// need it answer 503, never fake success.
-    pub pool: Option<PgPool>,
+    /// The database and the network registry that goes with it, or neither
+    /// ([`Backing`]). Endpoints that need a database answer 503 without one,
+    /// never fake success.
+    pub backing: Backing,
     pub public_url: Option<String>,
     /// Bootstrap HTTP bind; shown with provenance in the configuration console.
     pub http_bind: Option<std::net::SocketAddr>,
@@ -120,9 +121,6 @@ pub struct AppState {
     pub next_conn: std::sync::Arc<crate::core::ConnectionIdAllocator>,
     /// Per-connection SendQ capacity, in bytes.
     pub sendq_bytes: usize,
-    /// The always-on network registry shared by web chat, management, and the
-    /// optional raw attach listener. Present whenever PostgreSQL is available.
-    pub bnc_registry: Option<std::sync::Arc<crate::bouncer::Registry>>,
     /// Runtime controller for the client attach listener. Present whenever a
     /// database-backed registry exists, even while the listener is disabled.
     pub bnc_listener: Option<std::sync::Arc<crate::net::BncListenerController>>,
@@ -186,6 +184,74 @@ pub struct AppState {
     /// Fast presentation state; PostgreSQL remains the transactional authority
     /// that exactly zero accounts exist.
     pub(crate) bootstrap_available: AtomicBool,
+}
+
+/// Where the server keeps durable state, and the always-on network registry
+/// (shared by web chat, management, and the optional raw attach listener)
+/// that goes with it. A database-backed server always has a registry, and a
+/// server without one has none, because configured networks require a
+/// database (DESIGN §18): "a database but no registry" is not a value a
+/// handler can meet, so a handler that reached an authenticated request has
+/// both.
+pub enum Backing {
+    /// No PostgreSQL: nothing authenticates, and no network runs.
+    Stateless,
+    /// PostgreSQL and its registry.
+    Database {
+        pool: PgPool,
+        networks: std::sync::Arc<crate::bouncer::Registry>,
+    },
+}
+
+impl Backing {
+    /// Pair a pool with the registry started for it. Either without the other
+    /// is refused: the process builds a registry exactly when it has a
+    /// database, so a mismatch is a startup bug to report, not a state to
+    /// serve.
+    pub fn new(
+        pool: Option<PgPool>,
+        networks: Option<std::sync::Arc<crate::bouncer::Registry>>,
+    ) -> Result<Self, &'static str> {
+        match (pool, networks) {
+            (Some(pool), Some(networks)) => Ok(Self::Database { pool, networks }),
+            (None, None) => Ok(Self::Stateless),
+            (Some(_), None) => Err("a database-backed server has no network registry"),
+            (None, Some(_)) => Err("a network registry was started without a database"),
+        }
+    }
+
+    pub fn pool(&self) -> Option<&PgPool> {
+        match self {
+            Self::Stateless => None,
+            Self::Database { pool, .. } => Some(pool),
+        }
+    }
+
+    /// The running network registry, when the server has a database.
+    pub fn networks(&self) -> Option<&std::sync::Arc<crate::bouncer::Registry>> {
+        match self {
+            Self::Stateless => None,
+            Self::Database { networks, .. } => Some(networks),
+        }
+    }
+}
+
+impl AppState {
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.backing.pool()
+    }
+}
+
+/// The network registry, once a request has authenticated: authentication
+/// needs the database, and a database-backed server always has a registry
+/// ([`Backing`]), so reaching a handler body proves one.
+pub(super) fn registry_of(state: &AppState) -> &std::sync::Arc<crate::bouncer::Registry> {
+    match &state.backing {
+        Backing::Database { networks, .. } => networks,
+        Backing::Stateless => {
+            panic!("an authenticated request reached a handler on a server without a database")
+        }
+    }
 }
 
 pub(crate) fn bootstrap_token_digest(token: &str) -> [u8; 32] {
@@ -585,7 +651,7 @@ fn account_mutation_pool(
     if account_id <= 0 {
         return Err((StatusCode::BAD_REQUEST, "Invalid account id".into()));
     }
-    state.pool.as_ref().ok_or((
+    state.pool().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "No database configured".into(),
     ))
@@ -612,10 +678,7 @@ async fn mutate_account_lifecycle(
     change: AccountLifecycle,
 ) -> Result<String, (StatusCode, String)> {
     account_mutation_pool(state, account_id)?;
-    let registry = state.bnc_registry.clone().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network registry unavailable".into(),
-    ))?;
+    let registry = registry_of(state).clone();
     let (state, actor) = (state.clone(), actor.to_owned());
     registry
         .mutate(move |lane| async move {
@@ -753,13 +816,28 @@ async fn account_suspension_in_lane(
                 format!("Account was reactivated, but the live IRC core remained gated: {error}"),
             )
         })?;
-        let started_networks = prepared_networks.len();
+        let mut started_networks = 0_usize;
+        let mut held = Vec::new();
         for (name, driver) in prepared_networks {
-            lane.ensure_running(Some(&change.folded), &name, driver)
-                .await;
+            match lane
+                .ensure_running(Some(&change.folded), &name, driver)
+                .await
+            {
+                Ok(_) => started_networks += 1,
+                Err(crate::bouncer::ConfiguredNetworkHeld) => held.push(name),
+            }
         }
+        let held = if held.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Not started, because the server configuration defines a network of the \
+                 same name: {}.",
+                held.join(", ")
+            )
+        };
         Ok(format!(
-            "Reactivated {} and started {started_networks} owned network(s).",
+            "Reactivated {} and started {started_networks} owned network(s).{held}",
             change.name
         ))
     }
@@ -854,7 +932,7 @@ pub(super) async fn create_account_lifecycle(
         .map(crate::identity::ContactEmail::parse)
         .transpose()
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let pool = state.pool.as_ref().ok_or((
+    let pool = state.pool().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "No database configured".into(),
     ))?;
@@ -905,18 +983,16 @@ impl AppState {
     fn account_deletion(
         &self,
     ) -> Result<crate::account_deletion::AccountDeletion, (StatusCode, String)> {
-        let pool = self.pool.clone().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured".into(),
-        ))?;
-        let registry = self.bnc_registry.clone().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Network registry unavailable".into(),
-        ))?;
+        let Backing::Database { pool, networks } = &self.backing else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured".into(),
+            ));
+        };
         Ok(crate::account_deletion::AccountDeletion {
-            pool,
+            pool: pool.clone(),
             core_tx: self.core_tx.clone(),
-            registry,
+            registry: networks.clone(),
             secret_key: self.secret_key.clone(),
             internal_upstreams: self.internal_upstreams,
             configured_administrators: self.configured_admin_accounts.clone(),
@@ -1099,8 +1175,8 @@ mod query_limit_tests {
 
 pub(crate) fn bnc_counts(state: &AppState) -> (u64, u64) {
     state
-        .bnc_registry
-        .as_ref()
+        .backing
+        .networks()
         .map(|registry| {
             let statuses = registry.list();
             (
@@ -1214,7 +1290,7 @@ impl DatabaseReadiness {
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let core_ready = state.telemetry.core_is_fresh(CORE_HEARTBEAT_FRESHNESS);
-    let database_ready = match &state.pool {
+    let database_ready = match state.pool() {
         Some(pool) => {
             state
                 .database_readiness
@@ -1243,7 +1319,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         axum::Json(Readiness {
             ready,
             core: if core_ready { "ready" } else { "stale" },
-            database: if state.pool.is_none() {
+            database: if state.pool().is_none() {
                 "not_configured"
             } else if database_ready {
                 "ready"
@@ -1303,7 +1379,7 @@ async fn admin_observability(
     let (networks, connected) = bnc_counts(&state);
     let current = state.telemetry.snapshot(networks, connected);
     let schema_version = current.schema_version;
-    let Some(pool) = &state.pool else {
+    let Some(pool) = state.pool() else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "Monitoring history unavailable",
@@ -2285,7 +2361,7 @@ mod pages {
         error: Option<String>,
         status: StatusCode,
     ) -> Response {
-        let local_enabled = state.pool.is_some()
+        let local_enabled = state.pool().is_some()
             && !state
                 .oidc_providers
                 .iter()
@@ -2772,7 +2848,7 @@ mod pages {
                 Some("This deployment authenticates exclusively through Shauth."),
             );
         }
-        let Some(pool) = &state.pool else {
+        let Some(pool) = state.pool() else {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No database configured",
@@ -3314,7 +3390,10 @@ mod pages {
         AdminPageActor(actor): AdminPageActor,
         QueryParams(params): QueryParams<super::device::RegisteredChannelDirectoryQuery>,
     ) -> Response {
-        let query = match super::device::validate_registered_channel_directory_query(params, 50) {
+        let query = match super::device::validate_registered_channel_directory_query(
+            params.with_unfilled_fields_absent(),
+            50,
+        ) {
             Ok(query) => query,
             Err(response) => return response.into(),
         };
@@ -3324,7 +3403,15 @@ mod pages {
     /// The fleet-wide BNC view: every account's networks with live driver
     /// state, so an operator can spot (and stop) a single misbehaving
     /// upstream without suspending the whole account.
-    pub async fn console_admin_networks(AdminPageActor(actor): AdminPageActor) -> Response {
+    pub async fn console_admin_networks(
+        AdminPageActor(actor): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::AdminNetworkInventoryQuery>,
+    ) -> Response {
+        // The page's own query is the inventory page the browser reads; a bad
+        // one is refused here as the API would refuse it.
+        if let Err(response) = super::device::validate_admin_network_inventory_query(params) {
+            return response.into();
+        }
         render_private(ConsoleAdminNetworks {
             shell: console_shell(actor, "admin-networks"),
         })
@@ -3350,7 +3437,10 @@ mod pages {
         AdminPageActor(actor): AdminPageActor,
         QueryParams(params): QueryParams<super::device::ServerBanDirectoryQuery>,
     ) -> Response {
-        let query = match super::device::validate_server_ban_directory_query(params, 50) {
+        let query = match super::device::validate_server_ban_directory_query(
+            params.with_unfilled_fields_absent(),
+            50,
+        ) {
             Ok(query) => query,
             Err(response) => return response.into(),
         };
@@ -3361,10 +3451,11 @@ mod pages {
         AdminPageActor(page): AdminPageActor,
         QueryParams(params): QueryParams<super::device::AuditQuery>,
     ) -> Response {
-        let query = match super::device::validate_audit_query(params, 50) {
-            Ok(query) => query,
-            Err(response) => return response.into(),
-        };
+        let query =
+            match super::device::validate_audit_query(params.with_unfilled_fields_absent(), 50) {
+                Ok(query) => query,
+                Err(response) => return response.into(),
+            };
         let actor = query.actor.unwrap_or_default();
         let action = query.action.unwrap_or_default();
         let target = query.target.unwrap_or_default();
@@ -3464,12 +3555,8 @@ mod pages {
         account: &str,
         name: &str,
         enabled: bool,
+        runtime: Option<crate::bouncer::NetworkRuntimeSnapshot>,
     ) -> ResponseResult<NetworkOperationsResponse> {
-        let runtime = state
-            .bnc_registry
-            .as_ref()
-            .and_then(|registry| registry.get_owned(account, name))
-            .map(|handle| handle.runtime_snapshot());
         let summary = crate::db::bnc_buffer_summary(pool_of(state), account, name)
             .await
             .map_err(|error| {
@@ -3533,12 +3620,28 @@ mod pages {
         Authenticated(account, _): Authenticated,
         PathParams(name): PathParams<String>,
     ) -> Response {
-        let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
-            Ok(Some(network)) => network,
-            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-            Err(error) => return super::device::admin_db_error("network operations", error),
-        };
-        match network_operations_response(&state, &account, &network.name, network.enabled).await {
+        // The account's stored network, with its own driver's runtime; else a
+        // network the server configuration defines for it, which always runs.
+        let registry = registry_of(&state);
+        let (name, enabled, runtime) =
+            match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
+                Ok(Some(network)) => {
+                    let runtime = registry
+                        .get_stored(&account, &network.name)
+                        .map(|handle| handle.runtime_snapshot());
+                    (network.name, network.enabled, runtime)
+                }
+                Ok(None) => match registry.get_configured_owned(&account, &name) {
+                    Some((configured, handle)) => (
+                        configured.name.clone(),
+                        true,
+                        Some(handle.runtime_snapshot()),
+                    ),
+                    None => return problem(StatusCode::NOT_FOUND, "No such network", None),
+                },
+                Err(error) => return super::device::admin_db_error("network operations", error),
+            };
+        match network_operations_response(&state, &account, &name, enabled, runtime).await {
             Ok(response) => super::json_no_store(response),
             Err(response) => response.into(),
         }
@@ -3647,13 +3750,12 @@ mod pages {
     #[template(path = "console_integrations.html")]
     struct ConsoleIntegrations {
         shell: ConsoleShell,
-        bouncer_enabled: bool,
         platforms: Vec<BridgePlatform>,
     }
 
     /// Console → Integrations (admin): a document shell. The browser reads the
     /// complete stored and shared bridge inventory from the administrator API.
-    fn console_integrations_build(state: &AppState, actor: PageActor) -> ConsoleIntegrations {
+    fn console_integrations_build(actor: PageActor) -> ConsoleIntegrations {
         let platforms = BRIDGE_PLATFORMS
             .iter()
             .map(|meta| BridgePlatform {
@@ -3663,17 +3765,19 @@ mod pages {
             .collect();
         ConsoleIntegrations {
             shell: console_shell(actor, "integrations"),
-            bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
         }
     }
 
     /// Console → Integrations (admin) GET.
     pub async fn console_integrations(
-        State(state): State<Arc<AppState>>,
         AdminPageActor(actor): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::AdminNetworkInventoryQuery>,
     ) -> Response {
-        render_private(console_integrations_build(&state, actor))
+        if let Err(response) = super::device::validate_admin_network_inventory_query(params) {
+            return response.into();
+        }
+        render_private(console_integrations_build(actor))
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.

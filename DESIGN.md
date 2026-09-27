@@ -289,6 +289,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     page cannot forget the gate: the ungated handler fails to compile for want
     of the argument, rather than relying on every handler to open with the same
     line.
+  - `Backing` — the HTTP state holds the database and the network registry as
+    one value, so "a database but no registry" cannot be constructed: every
+    handler that reached an authenticated request has both (`registry_of`, as
+    `pool_of` has the pool), and the "bouncer not enabled" branches that
+    answered a state no server could be in are gone.
   - `SessionUserAgent` and owner-scoped browser-session queries — login
     provenance is bounded and neutralized exactly once before storage, while
     inventory and revocation always bind both the folded account and the
@@ -2349,7 +2354,19 @@ wire is parsed, not checked: `UpstreamNick`, `UpstreamRealname`, and
 `AutojoinChannel` (an `UpstreamChannel` and, for a keyed channel, its
 `ChannelKey`) are built only by `FromStr` at the one driver factory, so the
 configuration file, a stored row, and the API admit exactly the same values and
-a driver cannot be handed an unchecked one. The grammar is structural — what no
+a driver cannot be handed an unchecked one. Validating a configured network is
+that same parse, not a looser check beside it: `UpstreamIdentity::parse` is
+what the driver factory builds from and what `NetworkEntry::validate_connection_intent`
+runs — for the configuration file's loader and for every save of a managed
+server network — so a network accepted when it is saved is one the next start
+can build. (The validator used to check these fields only for blankness, so the
+managed-network API stored a nick with a space, a keyed or unprefixed autojoin
+entry, or a control character in a real name, and the next start — which
+refuses a configured network it cannot build, §18 — exited.) The refusal is the
+validator's own sentence, naming the field. The SASL login is parsed the same
+way, once, into `UpstreamSaslAccount` by create, edit and the connection test
+alike: sent exactly as given, so surrounding whitespace is refused rather than
+trimmed (an edit used to trim it while a create stored it verbatim). The grammar is structural — what no
 server could read as one nickname, one channel, or one key (`al ice` is a
 two-parameter `NICK`; an autojoin entry of `0` means "leave every channel";
 `#a,#b` is two channels; a key with a space, a comma, or a leading `:` is not
@@ -3478,7 +3495,22 @@ Surface (initial):
   so whoever may edit a network cannot point it at their own listener and have
   the server send them a password or key the API never reveals. The rule lives
   in the one function that applies every credential action, comparing the
-  stored row with the edited one. Both browser clients omit a blank credential field rather
+  stored row with the edited one. A network the server configuration defines
+  for an account (a `[[network]]` with an `owner`) is the operator's: the
+  account's list shows it after its stored networks with `configured: true`
+  (always enabled; GET, the buffer and the operations read work), and every
+  account-level mutation under its key — a create of that name, whether the
+  network runs now or is saved for the next start, and PUT, PATCH, DELETE, or
+  the administrator's per-owner toggle — is a `409` that leaves it running. The
+  registry holds this as a type (`NetworkDefinition::Configured`): its
+  replace/ensure-running/remove transitions refuse a configured slot, an
+  account's suspension or deletion leaves one running, and a stored network's
+  runtime is read only through `get_stored`, so a stored row is never shown
+  with a configured driver's state. (A create used to supersede the operator's
+  driver, and an edit or delete of a same-named row stopped it.) The
+  managed-network API likewise refuses a configured network whose owner
+  already stores that name, on the same registry lane an account's create
+  takes. Both browser clients omit a blank credential field rather
   than sending null; an
   account box emptied against a stored account, or a value typed under a
   ticked Remove, is refused at the box rather than resolved one way or the
@@ -3501,10 +3533,23 @@ Surface (initial):
   IRC's own rule, truncation, because an IRC client expects it.)
 - `history`: paged queries per §11.2
 - `admin`: bounded, exact-filtered/stable-cursor account posture, registered
-  channel policy, global K/D/X-line policy, and audit log; server stats;
+  channel policy, global K/D/X-line policy, audit log, and fleet network
+  inventory (shared networks, then each owner's by folded owner and name, a
+  configured network before a stored one of the same name; `after` repeats the
+  previous page's `next_after`); server stats;
   account suspension/reactivation; live/historical observability; Prometheus
   exposition. Personalized
   administrator JSON and metrics responses carry `Cache-Control: no-store`.
+  Every exact directory filter is one rule (`exact_filter`): absent is no
+  filter; present is 1–N printable characters, counted as characters as the
+  contract's `maxLength` counts them, with no surrounding whitespace. A blank
+  value is a `400` naming the parameter — it used to read as no filter and
+  return every row — and a closed-set filter (`kind`, `transport`, `oper`)
+  refuses one too. Only a console page reads an exactly empty field as not
+  given, because an HTML `GET` form cannot leave an unfilled field out. The
+  audit `actor` and `target` filters fold as the account `name` filter does,
+  against account principals, which are recorded folded; any other principal
+  is matched as spelled.
 - `healthz` (liveness; no auth): the process answers and every core shard's
   heartbeat is within 45 s; database-free, so a database outage shows on
   `readyz` and never restart-loops the container, while a stalled shard is a
@@ -3518,7 +3563,11 @@ The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
 dependency). Its method/path inventory and path/query parameter declarations
 are checked against the Axum API router; a mismatch is a unit-test failure and
-the endpoint refuses to serve a plausible but incomplete contract. The
+the endpoint refuses to serve a plausible but incomplete contract. Network
+create, replace, and the connection test describe each connection field once,
+bounded by the constants its handler enforces (name alphabet and length,
+address, nick, real name, SASL fields, autojoin count and entry length), and a
+test holds the document to those constants. The
 statuses a request can meet before its handler runs are derived, not listed:
 the route table records each handler's argument types, so every operation
 whose handler takes `RateLimited` documents its `429`, every account-

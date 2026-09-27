@@ -31,7 +31,7 @@ const upstreamRuntime = (state, extra = {}) => ({
 const ircNetwork = (name, extra = {}) => ({
   name, kind: "irc", addr: `irc.${name.toLowerCase()}.example:6697`, tls: true, nick: "viewer",
   username: "viewer", realname: "Viewer", autojoin: [], sasl_account: null, autojoin_keyed: [],
-  has_sasl_account: false, has_sasl_password: false, has_server_password: false,
+  has_sasl_account: false, has_sasl_password: false, has_server_password: false, configured: false,
   enabled: true, connected: true, runtime: upstreamRuntime("connected"), ...extra,
 });
 // The served OpenAPI document, as crates/e6ircd/src/http/openapi.rs builds it
@@ -312,7 +312,7 @@ test("console bridge editor sends only the fields the contract declares for a br
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   const network = {
     kind: "slack", name: "team", addr: "https://slack.com/api", tls: true, nick: "", username: null, realname: null,
-    autojoin: ["C123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: true, has_sasl_password: true, has_server_password: false, enabled: true,
+    autojoin: ["C123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: true, has_sasl_password: true, has_server_password: false, enabled: true, configured: false,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network });
   await expect(page.getByRole("button", { name: "Save bridge", exact: true })).toBeVisible();
@@ -348,7 +348,7 @@ test("console network page points at the one settings editor and registers on re
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
-    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true, configured: false,
   };
   const operations = { enabled: true, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
   await mountConsoleRuntime(page, `<main>${detail}</main>`, await consoleStyles(), {
@@ -431,7 +431,7 @@ test("the network page loads the whole stored log into the transcript it already
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "Alice",
-    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true, configured: false,
   };
   const recent = Array.from({ length: 100 }, (_, index) => `recent ${index}`);
   const whole = Array.from({ length: 400 }, (_, index) => `line ${index}`);
@@ -480,7 +480,7 @@ test("a background refresh never pulls a page out from under a pending confirmat
     "/api/v1/me/networks/libera": {
       name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice",
       username: "alice", realname: "Alice", autojoin: [], sasl_account: null, autojoin_keyed: [],
-      has_sasl_account: false, has_sasl_password: false, has_server_password: false,
+      has_sasl_account: false, has_sasl_password: false, has_server_password: false, configured: false,
       enabled: true, connected: true,
       runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
     },

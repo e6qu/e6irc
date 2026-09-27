@@ -488,7 +488,7 @@ pub(super) async fn create_app_password(
     _rl: RateLimited,
     body: Result<axum::Json<AppPasswordRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Some(pool) = &state.pool else {
+    let Some(pool) = state.pool() else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "No database configured",

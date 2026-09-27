@@ -1121,6 +1121,47 @@ Maintainer decisions implemented from a review of resource bounds (DESIGN
   Excess Flood. The allowance keeps Solanum's shape (40, then 20 a second) and
   its operator exemption.
 
+A review of the administrator and network API found, and this change fixes:
+
+- **A managed server network could be saved that stopped the next start.** Its
+  validator checked nick, real name and autojoin only for blankness while the
+  start parses them strictly and exits on a configured network it cannot
+  build; validation now is that parse (`UpstreamIdentity`), and the `400`
+  carries the validator's reason, naming the field, instead of "missing or
+  invalid required fields".
+- **The OpenAPI create schema had no bounds** on a network's name, address,
+  nick, real name or SASL fields, and `autojoin_keys.keep` had none on its
+  length. Create, replace and the connection test now share one field
+  description built from the handlers' constants, held to them by a test; the
+  handler refuses a `keep` longer than autojoin can be.
+- **A SASL login was trimmed on edit and stored verbatim on create.** All three
+  requests parse it into `UpstreamSaslAccount`, which refuses surrounding
+  whitespace.
+- **The accounts page said "Showing an older page." on the first page** of a
+  directory with more, reading a next cursor as the current position. Every
+  console pager now takes its status from its own query through one renderer.
+- **A stale configuration revision was a `503` on the scalar PATCH** and a
+  `409` everywhere else and in the contract; one save-result mapper serves
+  both.
+- **"Bouncer not enabled" branches answered a state no server can be in** (a
+  database but no registry). The HTTP state now holds the two as one `Backing`
+  value, and the branches, the empty-list fallback, the template banner and
+  the contract's `404` descriptions are gone.
+
+Maintainer decisions implemented from the same review:
+
+- **A network the server configuration defines for an account is the
+  operator's.** An account's create under its name, and PUT, PATCH and DELETE
+  of it (the administrator's per-owner toggle too), are `409`s that leave it
+  running; the registry refuses to replace or stop a configured slot, and a
+  stored row is never shown with its runtime. `/me/networks` and
+  `/admin/networks` list it with `configured: true`, read-only in both clients.
+- **`/admin/networks` pages by a bounded, stable cursor** (`limit`, `after`,
+  `next_after`), like the other administrator directories.
+- **Exact filters are one rule:** a blank value is a `400`, not "no filter";
+  bounds count characters, as the contract's `maxLength` does; the audit
+  `actor` and `target` filters fold against account principals.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

@@ -313,12 +313,23 @@ pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
     nick.len() <= nicklen && bytes.all(|b| b.is_ascii_alphanumeric() || special(b) || b == b'-')
 }
 
+/// Longest BNC network name, in bytes (every allowed character is one byte).
+pub(crate) const MAX_NETWORK_NAME_LEN: usize = 64;
+
+/// [`valid_network_name`] as a JSON Schema (ECMAScript) pattern, for the API
+/// contract: the name alphabet, with `.` and `..` excluded by construction (a
+/// name of one leading dot continues with a non-dot, one of two leading dots
+/// continues at all). Its length bound is [`MAX_NETWORK_NAME_LEN`], stated
+/// beside it.
+pub(crate) const NETWORK_NAME_PATTERN: &str =
+    r"^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\.\.[A-Za-z0-9._-]+)$";
+
 /// A client-facing BNC network selector. The same value appears in config,
 /// REST paths, HTML, and the raw attach `nick/network` address, so every ingress
 /// admits one bounded, path-safe token language.
 pub(crate) fn valid_network_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= MAX_NETWORK_NAME_LEN
         && name != "."
         && name != ".."
         && name

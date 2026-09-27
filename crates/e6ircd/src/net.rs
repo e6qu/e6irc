@@ -825,7 +825,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                         if let Err(error) = reg.add(
                             Some(&owner),
                             &row.name,
-                            crate::db::BncNetworkDefinition::Stored,
+                            crate::bouncer::NetworkDefinition::Stored,
                             driver,
                         ) {
                             telemetry.record_error(ErrorKind::Bouncer);
@@ -987,7 +987,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         Some(Arc::new(crate::http::AppState {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
-            pool: pool.clone(),
+            backing: crate::http::Backing::new(pool.clone(), bnc_registry.clone())
+                .map_err(io::Error::other)?,
             public_url,
             http_bind: config.http.as_ref().map(|http| http.addr),
             hsts_include_subdomains: config
@@ -1004,7 +1005,6 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),
             sendq_bytes: config.sendq_bytes,
-            bnc_registry: bnc_registry.clone(),
             bnc_listener: bnc_listener.clone(),
             managed_config: managed_config.clone(),
             telemetry: telemetry.clone(),

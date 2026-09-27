@@ -749,7 +749,10 @@ try {
   // durable policy mutation through the rendered controls.
   let administratorNetworkReads = 0;
   const administratorNetworkFailureErrorStart = applicationErrors.length;
-  await page.route(`${applicationOrigin}/api/v1/admin/networks`, async (route) => {
+  // The console reads the inventory's first page (`?limit=100`).
+  const administratorNetworkRead = `${applicationOrigin}/api/v1/admin/networks?limit=100`;
+  const administratorNetworkReadMatches = (url) => url.href === administratorNetworkRead;
+  await page.route(administratorNetworkReadMatches, async (route) => {
     administratorNetworkReads += 1;
     if (administratorNetworkReads === 1) {
       await route.fulfill({
@@ -773,7 +776,7 @@ try {
     [`503 GET ${applicationOrigin}/api/v1/admin/networks`],
     "the deliberate fleet failure was the only browser diagnostic during recovery",
   );
-  await page.unroute(`${applicationOrigin}/api/v1/admin/networks`);
+  await page.unroute(administratorNetworkReadMatches);
 
   let overviewStatsReads = 0;
   const overviewFailureErrorStart = applicationErrors.length;
@@ -1624,6 +1627,7 @@ try {
             has_sasl_account: false,
             has_sasl_password: false,
             has_server_password: false,
+            configured: false,
             enabled: true,
             connected: false,
             runtime: {

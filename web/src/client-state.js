@@ -22,6 +22,9 @@ function networkSummary(value) {
     nick: value.nick,
     enabled: value.enabled,
     connected: value.connected,
+    // The server configuration defines it: the operator's, never switched
+    // or edited from the account.
+    configured: value.configured,
     state: value.runtime?.state ?? null,
     failureCode: value.runtime?.last_error?.code ?? null,
     failureDetail: value.runtime?.last_error?.diagnostic ?? null,

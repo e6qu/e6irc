@@ -97,7 +97,7 @@ pub(super) async fn application_observation(
     }
 
     let core_ready = state.telemetry.core_is_fresh(Duration::from_secs(45));
-    let database_ready = match &state.pool {
+    let database_ready = match state.pool() {
         Some(pool) => {
             let started = Instant::now();
             let ready = database_is_ready(pool).await;
