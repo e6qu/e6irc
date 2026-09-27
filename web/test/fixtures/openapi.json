@@ -11466,7 +11466,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "all configured dependencies are ready"
+            "description": "this process serves (role \"serving\") and all configured dependencies are ready"
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"
@@ -11475,7 +11475,7 @@
             "description": "the request body is larger than 1 MiB (a problem document)"
           },
           "503": {
-            "description": "the core heartbeat is stale or PostgreSQL is unavailable"
+            "description": "the core heartbeat is stale or PostgreSQL is unavailable, or this process is a standby (role \"standby\", naming the serving lease's holder)"
           }
         },
         "summary": "Core and PostgreSQL readiness probe"

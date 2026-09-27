@@ -25,6 +25,7 @@ use crate::core::{
     Output, TimerWheel,
 };
 use crate::observability::{ErrorKind, Telemetry};
+use crate::serving_lease::{self, AcquireRefusal, HolderId, ServingLease};
 use e6irc_proto::framing::LineBuffer;
 use e6irc_queue::{Policy, Receiver, queue};
 
@@ -89,6 +90,10 @@ pub const MAX_HTTP_REQUESTS_IN_FLIGHT_PER_IP: usize = 32;
 /// which case we exit with a non-success code rather than hang a service
 /// restart forever.
 const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long the last shutdown step waits to give the serving lease back. A
+/// release that does not finish leaves the lease to expire, which delays a
+/// standby's takeover by at most the lease's TTL.
+const SHUTDOWN_LEASE_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long graceful shutdown waits for every core shard to stop. Stopping is
 /// a drain — each shard serves the others until nothing is passing between
@@ -247,6 +252,10 @@ pub struct ShutdownHandle {
     bnc_registry: Option<Arc<crate::bouncer::Registry>>,
     /// Every client connection's task, waited for once the core has stopped.
     connections: ConnectionTasks,
+    /// The serving lease, given back last — after the flush, so nothing this
+    /// process writes can land after a standby has taken over. `None` without
+    /// a database.
+    lease: Option<ServingLease>,
 }
 
 /// How graceful shutdown ended, so `main` can pick an honest exit code.
@@ -293,8 +302,8 @@ impl ShutdownHandle {
     /// connections, stop every bouncer driver (each says `QUIT` upstream),
     /// ask the core to notify clients and stop, wait for the connections to
     /// deliver that and close, then wait for the DB worker to flush its
-    /// buffered history. Every step is bounded; returns once the worker has
-    /// drained or its timeout elapses.
+    /// buffered history, and last give the serving lease back. Every step is
+    /// bounded; returns once the lease is given back or its timeout elapses.
     pub async fn run(self) -> ShutdownOutcome {
         self.run_within(ShutdownBudget {
             core_stop: SHUTDOWN_CORE_STOP_TIMEOUT,
@@ -414,6 +423,12 @@ impl ShutdownHandle {
                 Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
             },
         };
+        // 6. Give the serving lease back. Its release is announced, so a
+        //    standby takes over at once instead of after the lease's TTL; this
+        //    process has written its last by now.
+        if let Some(lease) = self.lease.take() {
+            give_back_lease(lease, "shutting down").await;
+        }
         core_failure.unwrap_or(flush)
     }
 }
@@ -759,8 +774,37 @@ pub fn check_offline(config: &Config) -> io::Result<()> {
     crate::certificate::load_configured(config)
 }
 
-/// Bind listeners, spawn core workers, and start acceptors.
-pub async fn start(mut config: Config) -> io::Result<Running> {
+/// How [`start_unless`] ended.
+pub enum Started {
+    /// This process serves: it holds the serving lease (when it has a
+    /// database) and its listeners are bound.
+    Serving(Box<Running>),
+    /// The stop came first, while the process was still waiting for the
+    /// database or standing by; it had taken nothing that needs giving back.
+    StoppedWhileWaiting,
+}
+
+/// [`start_unless`] with nothing to stop it: bind listeners, spawn core
+/// workers, and start acceptors once this process holds the serving lease —
+/// standing by as long as another process holds it.
+pub async fn start(config: Config) -> io::Result<Running> {
+    match start_unless(config, std::future::pending()).await? {
+        Started::Serving(running) => Ok(*running),
+        Started::StoppedWhileWaiting => unreachable!("a pending stop never resolves"),
+    }
+}
+
+/// Start serving: wait for the database, take the serving lease — standing by
+/// while another process holds it (DESIGN §18) — migrate, then build and bind
+/// everything. `stop` is raced against the waiting only: before the lease is
+/// held there is nothing to drain, so a shutdown signal then ends the wait
+/// ([`Started::StoppedWhileWaiting`]); once it is held, the boot completes and
+/// the caller shuts the server down as usual. A boot that fails after the
+/// lease is held gives it back before returning the failure.
+pub async fn start_unless(
+    config: Config,
+    stop: impl std::future::Future<Output = ()>,
+) -> io::Result<Started> {
     // First, before anything that can wait: a SIGHUP sent to reload
     // certificates during the database wait must not be the default action,
     // which terminates the process.
@@ -772,6 +816,255 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         .secret_keyring()
         .map_err(io::Error::other)?
         .map(Arc::new);
+    let mut lease = match &config.database {
+        Some(database) => {
+            let waiting = wait_and_acquire(database, &config);
+            tokio::select! {
+                lease = waiting => Some(lease?),
+                () = stop => return Ok(Started::StoppedWhileWaiting),
+            }
+        }
+        None => None,
+    };
+    match serve(config, hangups, secret_key, &mut lease).await {
+        Ok(running) => Ok(Started::Serving(Box::new(running))),
+        Err(error) => {
+            if let Some(lease) = lease.take() {
+                give_back_lease(lease, "the boot failed").await;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Wait for the database ([`crate::db::wait_for_database`]), then take the
+/// serving lease or stand by until it can be taken.
+async fn wait_and_acquire(
+    database: &crate::config::DatabaseConfig,
+    config: &Config,
+) -> io::Result<ServingLease> {
+    crate::db::refuse_libpq_process_environment().map_err(io::Error::other)?;
+    let wait = crate::db::StartupDatabaseWait::from_seconds(database.startup_wait_seconds)
+        .map_err(io::Error::other)?;
+    crate::db::wait_for_database(&database.url, wait, |attempt| match attempt.retry_in {
+        Some(pause) => eprintln!(
+            "e6ircd: database connection attempt {} failed after {:.1}s: {}; retrying in {:.1}s \
+             (giving up after {}s)",
+            attempt.attempt,
+            attempt.waited.as_secs_f64(),
+            attempt.error,
+            pause.as_secs_f64(),
+            wait.duration().as_secs(),
+        ),
+        None => eprintln!(
+            "e6ircd: database connection attempt {} failed after {:.1}s: {}; giving up",
+            attempt.attempt,
+            attempt.waited.as_secs_f64(),
+            attempt.error,
+        ),
+    })
+    .await
+    .map_err(io::Error::other)?;
+    acquire_or_stand_by(&database.url, &HolderId::generate(), config).await
+}
+
+/// Take the serving lease, or stand by until it can be taken: say so on
+/// stderr, answer `/healthz` 200 and `/readyz` 503 naming the holder on the
+/// HTTP address (when there is one), and try again whenever the lease's holder
+/// changes (its announcement) and every [`serving_lease::STANDBY_POLL`]. A
+/// schema a later release migrated ends the wait: this binary could not serve
+/// it. The health listener is closed before this returns, so the server can
+/// bind the address itself.
+async fn acquire_or_stand_by(
+    url: &crate::db::DatabaseUrl,
+    holder: &HolderId,
+    config: &Config,
+) -> io::Result<ServingLease> {
+    let purpose = serving_lease::serving_purpose();
+    let held = match serving_lease::acquire(url, holder, &purpose).await {
+        Ok(lease) => return Ok(lease),
+        Err(AcquireRefusal::Held(held)) => held,
+        Err(AcquireRefusal::Database(error)) => return Err(io::Error::other(error)),
+    };
+    eprintln!(
+        "e6ircd: standing by: the serving lease is held by {held}; this process serves once it is \
+         released, or {}s after its last renewal",
+        serving_lease::LEASE_TTL.as_secs()
+    );
+    let (holder_now, holder_watch) = tokio::sync::watch::channel(held);
+    let health = match &config.http {
+        Some(http) => Some(StandbyHealth::bind(
+            http.addr,
+            holder_watch,
+            config.limits.trusted_proxies.clone(),
+        )?),
+        None => None,
+    };
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let follower = AbortOnDrop(tokio::spawn(crate::db::follow_announcements(
+        url.clone(),
+        crate::db::SERVING_LEASE_CHANNEL,
+        "e6ircd: standby: serving-lease listener",
+        None,
+        LeaseWaker(wake.clone()),
+    )));
+    loop {
+        tokio::select! {
+            () = wake.notified() => {}
+            () = tokio::time::sleep(serving_lease::STANDBY_POLL) => {}
+        }
+        match crate::db::refuse_newer_schema(url).await {
+            Ok(()) => {}
+            Err(error @ crate::db::DbError::Connect(_)) => {
+                eprintln!("e6ircd: standby: the database could not be reached: {error}");
+                continue;
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        }
+        match serving_lease::acquire(url, holder, &purpose).await {
+            Ok(lease) => {
+                drop(follower);
+                if let Some(health) = health {
+                    health.close().await;
+                }
+                eprintln!(
+                    "e6ircd: took the serving lease (epoch {}); starting to serve",
+                    lease.epoch()
+                );
+                return Ok(lease);
+            }
+            Err(AcquireRefusal::Held(held)) => {
+                if holder_now.borrow().label != held.label {
+                    eprintln!("e6ircd: standing by: the serving lease is now held by {held}");
+                }
+                holder_now.send_replace(held);
+            }
+            Err(AcquireRefusal::Database(error)) => {
+                eprintln!("e6ircd: standby: the serving lease could not be tried: {error}");
+            }
+        }
+    }
+}
+
+/// Wakes a standby to try the lease: on every announced change of holder, and
+/// after a re-established connection, which may have missed one.
+struct LeaseWaker(Arc<tokio::sync::Notify>);
+
+impl crate::db::Follower for LeaseWaker {
+    async fn on_change(&mut self, _: crate::db::Announcement) -> Result<(), String> {
+        self.0.notify_one();
+        Ok(())
+    }
+}
+
+/// A task aborted when this is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A standby's HTTP listener: `/healthz` answers 200 (the process is alive),
+/// `/readyz` 503 with its role and the lease's holder, anything else 503. Each
+/// answer closes its connection, so a load balancer's kept-alive health check
+/// cannot outlive the listener into the serving process's.
+struct StandbyHealth(AbortOnDrop);
+
+#[derive(serde::Serialize)]
+struct StandbyReadiness {
+    ready: bool,
+    role: &'static str,
+    holder: String,
+    holder_renewed_at: String,
+}
+
+impl StandbyHealth {
+    fn bind(
+        addr: SocketAddr,
+        holder: tokio::sync::watch::Receiver<serving_lease::LeaseHeld>,
+        trusted_proxies: Vec<ipnet::IpNet>,
+    ) -> io::Result<Self> {
+        use axum::http::{StatusCode, header};
+        let listener = bind_listener(addr)?;
+        let close = || [(header::CONNECTION, "close")];
+        let router = axum::Router::new()
+            .route(
+                "/healthz",
+                axum::routing::get(move || async move { (close(), "ok") }),
+            )
+            .route(
+                "/readyz",
+                axum::routing::get(move || {
+                    let held = holder.borrow().clone();
+                    async move {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            close(),
+                            axum::Json(StandbyReadiness {
+                                ready: false,
+                                role: "standby",
+                                holder: held.label,
+                                holder_renewed_at: held.renewed_at,
+                            }),
+                        )
+                    }
+                }),
+            )
+            .fallback(move || async move {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    close(),
+                    "this e6ircd process is a standby; another process serves the database\n",
+                )
+            });
+        Ok(Self(AbortOnDrop(tokio::spawn(serve_http(
+            listener,
+            router,
+            HttpAdmission::new(trusted_proxies),
+            Arc::new(Telemetry::new()),
+        )))))
+    }
+
+    /// Stop answering and release the address.
+    async fn close(mut self) {
+        self.0.0.abort();
+        if let Err(error) = (&mut self.0.0).await
+            && !error.is_cancelled()
+        {
+            eprintln!("e6ircd: the standby health listener failed: {error}");
+        }
+    }
+}
+
+/// Give the lease back on a path that will not serve with it, saying how that
+/// went.
+async fn give_back_lease(lease: ServingLease, why: &str) {
+    let epoch = lease.epoch();
+    match lease.release(SHUTDOWN_LEASE_RELEASE_TIMEOUT).await {
+        Ok(true) => eprintln!("e6ircd: released the serving lease (epoch {epoch}): {why}"),
+        Ok(false) => eprintln!(
+            "e6ircd: the serving lease (epoch {epoch}) was no longer this process's to release"
+        ),
+        Err(error) => eprintln!(
+            "e6ircd: the serving lease (epoch {epoch}) could not be released ({why}); a standby \
+             takes over {}s after its last renewal: {error}",
+            serving_lease::LEASE_TTL.as_secs()
+        ),
+    }
+}
+
+/// Everything [`start_unless`] does once the lease is held (or there is no
+/// database): migrate, load the stored settings, build the core, the bouncer
+/// registry and the listeners. On success the lease moves into the returned
+/// shutdown handle, which gives it back last.
+async fn serve(
+    mut config: Config,
+    hangups: crate::certificate::Hangups,
+    secret_key: Option<Arc<crate::secret::SecretKeyring>>,
+    lease: &mut Option<ServingLease>,
+) -> io::Result<Running> {
     // Load persisted settings before constructing anything that consumes
     // them. In particular, a queue's capacity cannot be changed after the
     // queue exists; loading `core_queue` later would make that console setting
@@ -779,40 +1072,26 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     let (pool, managed_config) = match config
         .database
         .as_ref()
-        .map(|db| (db.url.clone(), db.startup_wait_seconds, db.pool_size()))
+        .map(|db| (db.url.clone(), db.pool_size()))
     {
-        Some((database_url, startup_wait_seconds, pool_size)) => {
-            crate::db::refuse_libpq_process_environment().map_err(io::Error::other)?;
-            let wait = crate::db::StartupDatabaseWait::from_seconds(startup_wait_seconds)
+        Some((database_url, pool_size)) => {
+            let holder = lease
+                .as_ref()
+                .expect("a database-backed start holds the serving lease")
+                .holder()
+                .clone();
+            // Only the lease's holder migrates, so no process changes the
+            // schema under a serving one.
+            crate::db::migrate(&database_url)
+                .await
                 .map_err(io::Error::other)?;
             eprintln!(
                 "e6ircd: database pool holds at most {} connections",
                 pool_size.get()
             );
-            let pool = crate::db::connect_and_migrate_with_retry(
-                &database_url,
-                wait,
-                pool_size,
-                |attempt| match attempt.retry_in {
-                    Some(pause) => eprintln!(
-                        "e6ircd: database connection attempt {} failed after {:.1}s: {}; retrying \
-                         in {:.1}s (giving up after {}s)",
-                        attempt.attempt,
-                        attempt.waited.as_secs_f64(),
-                        attempt.error,
-                        pause.as_secs_f64(),
-                        wait.duration().as_secs(),
-                    ),
-                    None => eprintln!(
-                        "e6ircd: database connection attempt {} failed after {:.1}s: {}; giving up",
-                        attempt.attempt,
-                        attempt.waited.as_secs_f64(),
-                        attempt.error,
-                    ),
-                },
-            )
-            .await
-            .map_err(io::Error::other)?;
+            let pool = crate::db::connect_pool(&database_url, pool_size, Some(&holder))
+                .await
+                .map_err(io::Error::other)?;
             let imported =
                 crate::config::ManagedConfig::from_config(&config, secret_key.as_deref())
                     .map_err(io::Error::other)?;
@@ -934,13 +1213,32 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // Accept-loop tasks, collected so shutdown can stop admitting connections.
     let mut listeners: Vec<tokio::task::AbortHandle> = Vec::new();
 
+    // A lease that ends while serving — taken over, or fenced for want of a
+    // confirmed renewal — ends the serving: the same bounded drain as a
+    // signal, and a non-zero exit.
+    if let Some(lease) = lease.as_ref() {
+        telemetry.observe_serving_lease(lease.status());
+        let ended = lease.end_watch();
+        let critical_tx = critical_tx.clone();
+        let watcher = tokio::spawn(async move {
+            let end = ended.ended().await;
+            drop(critical_tx.send(CriticalTaskFailure {
+                task: "serving lease",
+                reason: end.to_string(),
+            }));
+        });
+        listeners.push(watcher.abort_handle());
+    }
+
     let next_conn = Arc::new(ConnectionIdAllocator::new(random_connection_id_start()?));
 
-    // Several servers may serve one database: an account's authority changed
-    // by any of them is followed here (DESIGN §9.1). The follower's baseline is
-    // read before this boot reads which accounts are suspended (the registry's
-    // holds, the core's gate), so a change committed while it boots is
-    // announced after the baseline and applied once the core runs.
+    // An account's authority changed by another process (`e6ircd
+    // recover-administrator`, a hand-written row) is followed here (DESIGN
+    // §9.1); this process's own changes are applied where they are made. The
+    // follower's baseline is read before this boot reads which accounts are
+    // suspended (the registry's holds, the core's gate), so a change committed
+    // while it boots is announced after the baseline and applied once the core
+    // runs.
     let authority_baseline = match (&pool, &config.database) {
         (Some(pool), Some(database)) => Some(
             crate::account_authority::listen(&database.url, pool)
@@ -1543,6 +1841,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             bnc_listener,
             bnc_registry,
             connections,
+            lease: lease.take(),
         },
     })
 }
@@ -1592,11 +1891,15 @@ struct HttpAdmission {
 }
 
 impl HttpAdmission {
-    fn for_state(state: &crate::http::AppState) -> Self {
+    fn new(trusted_proxies: Vec<ipnet::IpNet>) -> Self {
         Self {
             connections: ConnLimiter::new(Some(MAX_HTTP_CONNECTIONS_PER_IP)),
-            trusted_proxies: state.trusted_proxies.clone(),
+            trusted_proxies,
         }
+    }
+
+    fn for_state(state: &crate::http::AppState) -> Self {
+        Self::new(state.trusted_proxies.clone())
     }
 }
 
@@ -3117,6 +3420,7 @@ mod tests {
             bnc_listener: None,
             bnc_registry: None,
             connections: ConnectionTasks::default(),
+            lease: None,
         }
     }
 

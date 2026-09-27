@@ -1316,11 +1316,12 @@ Maintainer decisions implemented from the same review:
 Maintainer decisions implemented from a review of configuration, storage and
 qualification (DESIGN §8, §17, §18):
 
-- **Several replicas against one database are supported.** The stored settings
-  revision reaches every running server when another process commits one (a
-  replica's console, `rotate-secrets`), through the table's own announcement;
-  a save that still finds its revision stale reloads it, so the console never
-  wedges on a revision it cannot see.
+- **A settings revision another process commits reaches the serving one.**
+  `rotate-secrets` writes the stored settings from a process of its own; the
+  table's announcement brings the revision to the serving process, and a save
+  that still finds its revision stale reloads it, so the console never wedges
+  on a revision it cannot see. (Several processes *serving* one database is
+  not supported: one serves, the others stand by — below.)
 - **The load harness measures fan-out, not the flood limiter.** A burst past
   the server's command burst is refused unless the senders oper up, and
   `qualify-linux.sh` passes the operator or refuses; the claimed core-shard
@@ -1455,16 +1456,41 @@ Maintainer decisions implemented from the same review:
   deletion holds them for good (`owner_deleted`), across restarts too.
 - **A password change ends every live IRC session and bouncer attachment** of
   the account, and a verdict for a check queued before it is refused.
-- **Every server serving the database applies an account's authority**: a
-  suspension, deletion or primary password change committed by any server (or
-  by `recover-administrator`) ends the account's IRC sessions and attachments
-  on each, which apply it once from the store's announcement (0095's
-  `authority_generation`, `AuthorityLedger`).
+- **The serving process applies an account's authority whoever changed it**:
+  a suspension, deletion or primary password change committed by another
+  process (`recover-administrator`, a hand-written row) ends the account's IRC
+  sessions and attachments there, applied once from the store's announcement
+  (0095's `authority_generation`, `AuthorityLedger`).
 - **New passwords are at least 8 characters** (NIST SP 800-63B); existing
   passwords still verify.
 - **Device authorization speaks RFC 8628 as written**: form bodies with a
   bound `client_id`, per-code polling pace with `slow_down`, and RFC 6749
   error and token responses; `e6irc login` speaks it.
+
+Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
+§18; `deploy/README.md`, High availability):
+
+- **Active/standby, never active/active.** One process serves a database — the
+  core, the bouncer registry and every driver, the database worker, storage
+  maintenance, the sampler, read-marker expiry, and the IRC, attach and HTTP
+  listeners. Several serving processes are IRC linking by another name and
+  stay a non-goal.
+- **A second process stands by automatically**, loudly (a stderr line,
+  `/readyz` 503 naming the holder, `/healthz` 200, nothing else served), and
+  takes over when the lease is released (graceful stop) or expires (crash).
+- **Lease timing is fixed**: a 15-second TTL, a renewal every 3 seconds, a
+  fence 10 seconds after the last confirmed renewal on the monotonic clock,
+  every lease comparison on the database's `now()` (migration 0098).
+- **Fencing is enforced by PostgreSQL too**: every pool connection passes
+  `serving_lease_register_backend`, and a takeover ends the previous holder's
+  recorded connections, so its queued writes fail and none lands.
+- **Only the holder migrates**; a standby older than the schema refuses at
+  boot; `rotate-secrets` and `recover-administrator` never migrate under a
+  serving process and refuse an older schema with "upgrade the serving process
+  first".
+- **PostgreSQL's own high availability must replicate synchronously**, or a
+  failover can roll the lease row back; the first upgrade to this release
+  stops every process.
 
 ## Remaining qualification
 

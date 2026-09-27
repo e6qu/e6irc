@@ -2520,6 +2520,9 @@ async fn read_marker_preloaded_after_restart() {
             .unwrap();
         expect_line(&mut reader, "MARKREAD #chan timestamp=2020-01-01").await;
     }
+    // A restart: the first process stops (and gives the serving lease back)
+    // before the second serves.
+    assert_eq!(running.shutdown.run().await, net::ShutdownOutcome::Flushed);
 
     // Second boot on the same database: the marker must be present immediately.
     let running2 = net::start(make_config()).await.expect("restart");
@@ -6552,8 +6555,8 @@ async fn audit_log_filters_and_cursor_pages_are_stable() {
     assert_eq!(filtered.next_before_id, None);
 }
 
-/// A save over a revision another process has since replaced (a replica's
-/// console, `rotate-secrets` re-sealing) is refused, and leaves the in-memory
+/// A save over a revision another process has since replaced
+/// (`rotate-secrets` re-sealing) is refused, and leaves the in-memory
 /// snapshot holding the stored revision — so the conflict it reports is one
 /// the administrator can read, and the retry from it commits. The snapshot
 /// used to stay stale, refusing every later save until a restart.
@@ -9170,19 +9173,14 @@ async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
     let wait = db::StartupDatabaseWait::from_seconds(8).expect("bounded");
     let mut reported: Vec<(u32, Option<std::time::Duration>)> = Vec::new();
     let started = std::time::Instant::now();
-    let error = db::connect_and_migrate_with_retry(
-        &url,
-        wait,
-        db::DatabasePoolSize::for_this_host(),
-        |attempt| {
-            assert!(
-                matches!(attempt.error, db::DbError::Connect(_)),
-                "{}",
-                attempt.error
-            );
-            reported.push((attempt.attempt, attempt.retry_in));
-        },
-    )
+    let error = db::wait_for_database(&url, wait, |attempt| {
+        assert!(
+            matches!(attempt.error, db::DbError::Connect(_)),
+            "{}",
+            attempt.error
+        );
+        reported.push((attempt.attempt, attempt.retry_in));
+    })
     .await
     .expect_err("nothing listens there");
     let elapsed = started.elapsed();
@@ -9225,14 +9223,9 @@ async fn startup_database_wait_of_zero_is_a_single_attempt() {
     .expect("URL");
     let wait = db::StartupDatabaseWait::from_seconds(0).expect("bounded");
     let mut attempts = 0;
-    let error = db::connect_and_migrate_with_retry(
-        &url,
-        wait,
-        db::DatabasePoolSize::for_this_host(),
-        |_| attempts += 1,
-    )
-    .await
-    .expect_err("refused");
+    let error = db::wait_for_database(&url, wait, |_| attempts += 1)
+        .await
+        .expect_err("refused");
     assert_eq!(attempts, 1);
     assert!(matches!(
         error,
@@ -9334,15 +9327,17 @@ async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
         }
     });
     let mut attempts = 0;
-    let pool = db::connect_and_migrate_with_retry(
+    db::wait_for_database(
         &proxied,
         db::StartupDatabaseWait::from_seconds(20).expect("bounded"),
-        db::DatabasePoolSize::for_this_host(),
         |_| attempts += 1,
     )
     .await
     .expect("the database appeared inside the wait");
     assert!(attempts >= 1, "the first attempt was refused");
+    let pool = db::connect_and_migrate(&proxied)
+        .await
+        .expect("the late database serves");
     let one: i32 = sqlx::query_scalar("SELECT 1")
         .fetch_one(&pool)
         .await
@@ -13773,8 +13768,9 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
 /// Migration 0095 counts every change of an account's authority — its
 /// suspension flipping, its primary password added, replaced or removed, by
 /// whichever path — and nothing else, and announces each created account,
-/// counted change and deleted account on the credential channel, which is how
-/// every server serving the database hears a change another one made.
+/// counted change and deleted account on the credential channel as
+/// `account:<id>:<folded name>`, which is how the serving process hears a
+/// change another process (`recover-administrator`) made.
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_authority_changes_are_counted_and_announced() {
@@ -13790,17 +13786,35 @@ async fn account_authority_changes_are_counted_and_announced() {
         .execute(&pool)
         .await
         .expect("root administers");
-    let mut listener = db::CredentialChangeListener::connect(&url)
+    let mut listener = sqlx::postgres::PgListener::connect_with(
+        &sqlx::PgPool::connect_with(url.connect_options())
+            .await
+            .expect("listener pool"),
+    )
+    .await
+    .expect("listen");
+    listener
+        .listen("e6irc_credential_changed")
         .await
-        .expect("listen");
+        .expect("listen on the credential channel");
+    /// An announced account: its id and folded name.
+    struct Announced {
+        id: i64,
+        folded: String,
+    }
     let mut announced = async || {
         loop {
-            let change = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
-                .await
-                .expect("an announcement")
-                .expect("listener");
-            if let db::CredentialChange::Account(account) = change {
-                return account;
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv())
+                    .await
+                    .expect("an announcement")
+                    .expect("listener");
+            if let Some(account) = notification.payload().strip_prefix("account:") {
+                let (id, folded) = account.split_once(':').expect("account:<id>:<name>");
+                return Announced {
+                    id: id.parse().expect("an account id"),
+                    folded: folded.to_owned(),
+                };
             }
         }
     };

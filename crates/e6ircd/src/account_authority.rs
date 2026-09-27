@@ -1,22 +1,25 @@
-//! An account's authority on every server that serves its database (DESIGN
-//! §9.1).
+//! An account's authority in the serving process, whichever process changed
+//! it (DESIGN §9.1).
 //!
-//! Several servers may serve one database. A suspension, a deletion or a
-//! primary password change is committed by one of them, but the account's IRC
-//! sessions and bouncer attachments live on all of them, and each must end
-//! them. Migration 0095 has the accounts table count every change of an
-//! account's authority (`authority_generation`) and announce it on the
-//! credential channel; each server follows the announcements here.
+//! One process serves a database (DESIGN §18), and a suspension, a deletion
+//! or a primary password change is usually committed by that process itself.
+//! Not always: `e6ircd recover-administrator` replaces an account's password
+//! from a process of its own, and an operator may change a row by hand. The
+//! account's IRC sessions and bouncer attachments live in the serving process,
+//! which must end them either way. Migration 0095 has the accounts table count
+//! every change of an account's authority (`authority_generation`) and
+//! announce it on the credential channel; the serving process follows the
+//! announcements here.
 //!
-//! Each server applies each counted change once. The [`AuthorityLedger`]
-//! remembers, per account, the generation this server has applied and the
-//! standing it left: the server that made a change records it as applied on
-//! the registry's mutation lane, in the same turn it applies it, and the
-//! watcher reads the announced row on that lane too, so a server never applies
-//! its own change a second time — which would end the sessions an account had
-//! just opened with its new password. The watcher's baseline is read before
-//! the rest of the server reads suspended accounts at boot, and read again
-//! whenever its connection is lost, so nothing committed in between is missed.
+//! Each counted change is applied once. The [`AuthorityLedger`] remembers, per
+//! account, the generation this process has applied and the standing it left:
+//! a change this process makes is recorded as applied on the registry's
+//! mutation lane, in the same turn it is applied, and the watcher reads the
+//! announced row on that lane too, so a change is never applied a second time
+//! — which would end the sessions an account had just opened with its new
+//! password. The watcher's baseline is read before the rest of the server
+//! reads suspended accounts at boot, and read again whenever its connection is
+//! lost, so nothing committed in between is missed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,11 +27,12 @@ use std::sync::{Arc, Mutex};
 use crate::bouncer::{MutationLane, OwnerHold, Registry, RegistryRefusal, UnwrittenLines};
 use crate::core::{AdminRequest, CoreIngress};
 use crate::db::{
-    AccountAnnouncement, AccountAuthority, CredentialChange, CredentialChangeListener,
+    AccountAnnouncement, AccountAuthority, Announcements, CREDENTIAL_CHANGED_CHANNEL,
+    CredentialChange,
 };
 
-/// Who the core is told acted, for a change another server committed.
-const ANOTHER_SERVER: &str = "another server";
+/// Who the core is told acted, for a change another process committed.
+const ANOTHER_PROCESS: &str = "another process";
 
 /// An account's standing as this server last applied it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,18 +310,18 @@ pub(crate) async fn listen(
     url: &crate::db::DatabaseUrl,
     pool: &sqlx::PgPool,
 ) -> Result<AuthorityBaseline, crate::db::DbError> {
-    let listener = CredentialChangeListener::connect(url).await?;
+    let listener = Announcements::connect(url, CREDENTIAL_CHANGED_CHANNEL).await?;
     let accounts = crate::db::every_account_authority(pool).await?;
     Ok(AuthorityBaseline { listener, accounts })
 }
 
 /// A listener connected at boot, with the accounts as the boot saw them.
 pub(crate) struct AuthorityBaseline {
-    listener: CredentialChangeListener,
+    listener: Announcements,
     accounts: Vec<AccountAuthority>,
 }
 
-/// Everything following another server's changes touches.
+/// Everything following another process's changes touches.
 pub(crate) struct AccountAuthorityWatcher {
     pub(crate) url: crate::db::DatabaseUrl,
     pub(crate) pool: sqlx::PgPool,
@@ -333,59 +337,18 @@ impl AccountAuthorityWatcher {
     /// account is read again once it is, because what was announced in
     /// between was not heard.
     pub(crate) async fn run(self, baseline: AuthorityBaseline) {
-        const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
-        const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
         let AuthorityBaseline { listener, accounts } = baseline;
         self.registry
             .mutate(move |lane| async move { lane.authority_ledger().seed(&accounts) })
             .await;
-        let mut listener = Some(listener);
-        let mut retry = RETRY_MIN;
-        loop {
-            let mut connected = match listener.take() {
-                Some(connected) => connected,
-                None => match CredentialChangeListener::connect(&self.url).await {
-                    Ok(connected) => match self.resynchronize().await {
-                        Ok(()) => connected,
-                        Err(error) => {
-                            eprintln!(
-                                "account authority: accounts could not be read again, retrying \
-                                 in {}s: {error}",
-                                retry.as_secs()
-                            );
-                            tokio::time::sleep(retry).await;
-                            retry = (retry * 2).min(RETRY_MAX);
-                            continue;
-                        }
-                    },
-                    Err(error) => {
-                        eprintln!(
-                            "account authority: listener unavailable, retrying in {}s: {error}",
-                            retry.as_secs()
-                        );
-                        tokio::time::sleep(retry).await;
-                        retry = (retry * 2).min(RETRY_MAX);
-                        continue;
-                    }
-                },
-            };
-            retry = RETRY_MIN;
-            loop {
-                let followed = match connected.next().await {
-                    Ok(CredentialChange::Account(announced)) => self.follow(announced).await,
-                    // A browser credential: the chat sockets' listener's.
-                    Ok(CredentialChange::Changed(_)) => Ok(()),
-                    Ok(CredentialChange::Resynchronize) => self.resynchronize().await,
-                    Err(error) => Err(error.to_string()),
-                };
-                if let Err(error) = followed {
-                    // The announcement is lost with the connection; every
-                    // account is read again once it is back.
-                    eprintln!("account authority: listener lost: {error}");
-                    break;
-                }
-            }
-        }
+        crate::db::follow_announcements(
+            self.url.clone(),
+            CREDENTIAL_CHANGED_CHANNEL,
+            "account authority: listener",
+            Some(listener),
+            self,
+        )
+        .await;
     }
 
     /// Apply what one announced account asks of this server.
@@ -431,6 +394,17 @@ impl AccountAuthorityWatcher {
     }
 }
 
+impl crate::db::Follower for AccountAuthorityWatcher {
+    async fn on_change(&mut self, announcement: crate::db::Announcement) -> Result<(), String> {
+        match CredentialChange::of(announcement) {
+            CredentialChange::Account(announced) => self.follow(announced).await,
+            // A browser credential: the chat sockets' listener's.
+            CredentialChange::Changed(_) => Ok(()),
+            CredentialChange::Resynchronize => self.resynchronize().await,
+        }
+    }
+}
+
 /// What applying a step touches, moved onto the mutation lane.
 struct Handles {
     pool: sqlx::PgPool,
@@ -440,8 +414,8 @@ struct Handles {
 }
 
 impl Handles {
-    /// Apply a change another server committed. What cannot be applied is
-    /// said on stderr: the change itself is committed, and this server's
+    /// Apply a change another process committed. What cannot be applied is
+    /// said on stderr: the change itself is committed, and this process's
     /// share of it is as much as it could do.
     async fn apply(&self, lane: &MutationLane, step: AuthorityStep) {
         match step {
@@ -451,7 +425,7 @@ impl Handles {
                     &self.core_tx,
                     &folded,
                     "Account suspended",
-                    ANOTHER_SERVER,
+                    ANOTHER_PROCESS,
                 )
                 .await
                 {
@@ -463,7 +437,7 @@ impl Handles {
             }
             AuthorityStep::Reactivate(folded) => {
                 let stored = self.stored_drivers(&folded).await;
-                match reactivate_here(lane, &self.core_tx, &folded, ANOTHER_SERVER, stored).await {
+                match reactivate_here(lane, &self.core_tx, &folded, ANOTHER_PROCESS, stored).await {
                     Ok(reactivated) => {
                         for name in reactivated.held {
                             eprintln!(
@@ -485,7 +459,7 @@ impl Handles {
             }
             AuthorityStep::EndSessions(folded) => {
                 if let Err(error) =
-                    end_sessions_here(lane, &self.core_tx, &folded, ANOTHER_SERVER).await
+                    end_sessions_here(lane, &self.core_tx, &folded, ANOTHER_PROCESS).await
                 {
                     eprintln!(
                         "account authority: {folded}'s password changed elsewhere, but its live \
@@ -499,7 +473,7 @@ impl Handles {
                     &self.core_tx,
                     &folded,
                     "Account permanently deleted",
-                    ANOTHER_SERVER,
+                    ANOTHER_PROCESS,
                 )
                 .await;
                 // Its name is retired: nothing of it runs here again.

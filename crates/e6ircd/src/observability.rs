@@ -360,6 +360,7 @@ pub(crate) struct Telemetry {
     latency: [LatencyHistogram; LatencyKind::COUNT],
     operational_log: OperationalLog,
     database_pool: std::sync::OnceLock<(sqlx::PgPool, crate::db::DatabasePoolSize)>,
+    serving_lease: std::sync::OnceLock<std::sync::Arc<crate::serving_lease::LeaseStatus>>,
 }
 
 pub(crate) struct BncClientConnection {
@@ -406,6 +407,7 @@ impl Telemetry {
             latency: std::array::from_fn(|_| LatencyHistogram::new()),
             operational_log: OperationalLog::new(),
             database_pool: std::sync::OnceLock::new(),
+            serving_lease: std::sync::OnceLock::new(),
         }
     }
 
@@ -418,6 +420,17 @@ impl Telemetry {
     ) {
         if self.database_pool.set((pool, size)).is_err() {
             eprintln!("observability: the database pool was already being observed");
+        }
+    }
+
+    /// Report the serving lease in every Prometheus rendering from now on.
+    /// Called once, when the lease is held.
+    pub(crate) fn observe_serving_lease(
+        &self,
+        status: std::sync::Arc<crate::serving_lease::LeaseStatus>,
+    ) {
+        if self.serving_lease.set(status).is_err() {
+            eprintln!("observability: the serving lease was already being observed");
         }
     }
 
@@ -823,6 +836,22 @@ impl Telemetry {
         if let Some(pool) = snapshot.database_pool {
             render_database_pool(&mut out, pool);
         }
+        if let Some(lease) = self.serving_lease.get() {
+            one_metric(
+                &mut out,
+                "e6irc_serving_lease_held",
+                "Whether this process holds the database's serving lease (1) or has lost it (0).",
+                "gauge",
+                u64::from(lease.held()),
+            );
+            one_metric(
+                &mut out,
+                "e6irc_serving_lease_epoch",
+                "Acquisitions of the serving lease so far, as of this process's.",
+                "gauge",
+                u64::try_from(lease.epoch()).unwrap_or(0),
+            );
+        }
         out.push_str("# HELP e6irc_errors_total Operational errors by fixed subsystem.\n");
         out.push_str("# TYPE e6irc_errors_total counter\n");
         for kind in ErrorKind::ALL {
@@ -1153,6 +1182,20 @@ mod tests {
         assert_eq!(entries[0].component, ErrorKind::Read);
         assert_eq!(entries[0].severity, OperationalSeverity::Error);
         assert_eq!(entries[0].message, "An operational error was recorded.");
+    }
+
+    #[test]
+    fn the_serving_lease_is_reported_once_held_and_when_lost() {
+        let telemetry = Telemetry::new();
+        assert!(!telemetry.prometheus(0, 0).contains("e6irc_serving_lease"));
+        let lease = crate::serving_lease::LeaseStatus::held_at(7);
+        telemetry.observe_serving_lease(lease.clone());
+        let text = telemetry.prometheus(0, 0);
+        assert!(text.contains("e6irc_serving_lease_held 1\n"), "{text}");
+        assert!(text.contains("e6irc_serving_lease_epoch 7\n"), "{text}");
+        lease.lose();
+        let text = telemetry.prometheus(0, 0);
+        assert!(text.contains("e6irc_serving_lease_held 0\n"), "{text}");
     }
 
     #[tokio::test]

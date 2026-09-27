@@ -5154,7 +5154,7 @@ async fn admin_accounts_endpoint_is_gated() {
     assert_eq!(status, 403);
     // Authority is read from the account row on every request: a grant
     // written to the database behind the running server's back — as
-    // `e6ircd recover-administrator` or another replica writes it — is
+    // `e6ircd recover-administrator` or an operator's hand writes it — is
     // honoured by the very next request, and its revocation likewise.
     let bob_id = e6ircd::db::account_id_by_name(&pool, "bob")
         .await
@@ -10121,18 +10121,18 @@ async fn configuration_when(
     panic!("the configuration never reached the expected state");
 }
 
-/// Several processes write the stored settings: another replica's console,
-/// and `e6ircd rotate-secrets`, which bumps the revision as it re-seals. Each
-/// running server used to hold the revision it loaded or saved last, so after
-/// any other write its console refused every save as stale until it was
-/// restarted. Now a committed revision reaches every running server (the
-/// table announces it), a server that finds its revision stale reloads it,
-/// and what the other writer changed live — here, turning the attach listener
-/// off — is applied as that writer's own process applied it.
+/// One process serves the database, but it is not the only writer of the
+/// stored settings: `e6ircd rotate-secrets` bumps the revision as it re-seals,
+/// from a process of its own. The serving process used to hold the revision
+/// it loaded or saved last, so after any other write its console refused
+/// every save as stale until it was restarted. Now a committed revision
+/// reaches it (the table announces it), and what the other writer changed
+/// live — here, turning the attach listener off — is applied as a console
+/// save in the serving process applies it; the console then saves over it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn a_settings_revision_written_elsewhere_reaches_every_running_server() {
-    let url = support::test_db("a_settings_revision_written_elsewhere_reaches_every").await;
+async fn a_settings_revision_written_by_another_process_reaches_the_serving_one() {
+    let url = support::test_db("a_settings_revision_written_by_another_process").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -10146,29 +10146,20 @@ async fn a_settings_revision_written_elsewhere_reaches_every_running_server() {
     )
     .await
     .expect("session");
-    let first = start_with_database(&url, &["root"]).await;
-    let second = start_with_database(&url, &["root"]).await;
-    let (a, b) = (
-        first.http_addr.expect("first http"),
-        second.http_addr.expect("second http"),
-    );
-    wait_http_ready(a).await;
-    wait_http_ready(b).await;
-    // Each process keys its own CSRF values.
-    let csrf_of = async |http| {
-        let (status, _, page) = request(
-            http,
-            &format!(
-                "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
-                 Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-            ),
-        )
-        .await;
-        assert_eq!(status, 200, "{page}");
-        csrf_from_html(&page).to_string()
-    };
-    let (csrf, csrf_b) = (csrf_of(a).await, csrf_of(b).await);
-    let loaded = configuration_of(a, &session).await["revision"]
+    let running = start_with_database(&url, &["root"]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+    let loaded = configuration_of(http, &session).await["revision"]
         .as_i64()
         .expect("revision");
 
@@ -10178,40 +10169,46 @@ async fn a_settings_revision_written_elsewhere_reaches_every_running_server() {
         .await
         .expect("bump the stored revision");
     let bumped = loaded + 1;
-    for http in [a, b] {
-        configuration_when(http, &session, |current| current["revision"] == bumped).await;
-    }
+    configuration_when(http, &session, |current| current["revision"] == bumped).await;
 
-    // One replica's save reaches the other, which can then save over it; the
-    // attach listener the first turned off is off on the second too.
-    let current = configuration_of(a, &session).await;
+    // Another process saves a revision that turns the attach listener off:
+    // the serving process adopts it and its listener follows.
+    let current = configuration_of(http, &session).await;
     assert!(
         current["runtime"]["bound_bnc_addr"].is_string(),
         "{current}"
     );
-    let mut settings = current["settings"].clone();
-    settings["description"] = "saved on the first replica".into();
-    settings["bnc_addr"] = serde_json::Value::Null;
-    let (status, body) =
-        patch_configuration(a, &session, &csrf, &current["revision"], &settings).await;
-    assert_eq!(status, 200, "{body}");
-    let seen = configuration_when(b, &session, |current| {
+    let stored = e6ircd::db::load_managed_config(&pool)
+        .await
+        .expect("the stored revision");
+    let mut elsewhere = stored.settings.clone();
+    elsewhere.description = "saved by another process".into();
+    elsewhere.bnc_addr = None;
+    e6ircd::db::save_managed_config(
+        &pool,
+        stored.revision,
+        &elsewhere,
+        &e6ircd::db::AuditPrincipal::host("rotate-secrets"),
+        "written by another process",
+    )
+    .await
+    .expect("another process's revision");
+    let seen = configuration_when(http, &session, |current| {
         current["revision"] == bumped + 1 && current["runtime"]["bound_bnc_addr"].is_null()
     })
     .await;
-    assert_eq!(
-        seen["settings"]["description"],
-        "saved on the first replica"
-    );
+    assert_eq!(seen["settings"]["description"], "saved by another process");
+
+    // The console saves over the adopted revision without a conflict.
     let mut settings = seen["settings"].clone();
-    settings["description"] = "saved on the second replica".into();
+    settings["description"] = "saved in the console".into();
     let (status, body) =
-        patch_configuration(b, &session, &csrf_b, &seen["revision"], &settings).await;
+        patch_configuration(http, &session, &csrf, &seen["revision"], &settings).await;
     assert_eq!(status, 200, "{body}");
-    configuration_when(a, &session, |current| {
-        current["settings"]["description"] == "saved on the second replica"
-    })
-    .await;
+    let stored = e6ircd::db::load_managed_config(&pool)
+        .await
+        .expect("the stored revision");
+    assert_eq!(stored.settings.description, "saved in the console");
 }
 
 /// A save that moves the attach listener and then finds its revision stale
@@ -10346,7 +10343,13 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
         refusal.contains("does not state server_name, network_name, listeners, http.public_url"),
         "{refusal}"
     );
-    drop(net::start(document(true)).await.expect("the first start"));
+    // A restart: the first process stops, giving the serving lease back.
+    net::start(document(true))
+        .await
+        .expect("the first start")
+        .shutdown
+        .run()
+        .await;
     let running = net::start(document(false))
         .await
         .expect("a later start takes the names from the stored settings");

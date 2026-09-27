@@ -22,6 +22,7 @@ pub(crate) mod peer_write;
 pub(crate) mod recency;
 pub(crate) mod sanitize;
 pub mod secret;
+pub mod serving_lease;
 pub(crate) mod settings_watch;
 
 /// The commit this binary was built from: `E6IRC_BUILD_REVISION` at compile

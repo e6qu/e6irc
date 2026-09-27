@@ -1,33 +1,33 @@
-//! Every running server follows the stored managed settings, whoever writes
+//! The serving process follows the stored managed settings, whoever writes
 //! them.
 //!
-//! More than one replica may serve one database, and `e6ircd rotate-secrets`
-//! writes the settings row from a process of its own. Each server keeps the
+//! One process serves a database (DESIGN §18), but it is not the settings
+//! row's only writer: `e6ircd rotate-secrets` re-seals the stored credentials
+//! and bumps the revision from a process of its own. The server keeps the
 //! stored revision in memory: the console answers from it and saves against
 //! it, storage maintenance and the observability sampler read it every cycle,
 //! and the BNC attach listener is bound to what it says. The table announces
-//! every committed write (migration 0090, [`crate::db::SettingsChangeListener`]);
-//! this follows the announcements and adopts a revision another process
-//! committed exactly as a console save in this process applies its own: the
-//! snapshot is replaced (which the maintenance loops and the console read) and
-//! the attach listener is rebound when its settings differ. Nothing
-//! restart-only is applied: a console save does not apply it either, and says
-//! so.
+//! every committed write (migration 0090); this follows the announcements and
+//! adopts a revision another process committed exactly as a console save in
+//! this process applies its own: the snapshot is replaced (which the
+//! maintenance loops and the console read) and the attach listener is rebound
+//! when its settings differ. Nothing restart-only is applied: a console save
+//! does not apply it either, and says so.
 
 use std::sync::Arc;
 
 use crate::db::{
-    DatabaseUrl, ManagedConfigSnapshot, SettingsChange, SettingsChangeListener, load_managed_config,
+    Announcement, DatabaseUrl, Follower, ManagedConfigSnapshot, SETTINGS_CHANGED_CHANNEL,
+    follow_announcements, load_managed_config,
 };
 use crate::net::BncListenerController;
 
 /// The shared, in-memory stored revision.
 pub(crate) type SharedSettings = Arc<tokio::sync::RwLock<ManagedConfigSnapshot>>;
 
-/// Follow the store's settings announcements for the life of the process. A
-/// lost connection is re-established with a bounded backoff, and the stored
-/// row is read again once it is, because what was announced in between was
-/// not heard.
+/// Follow the store's settings announcements for the life of the process.
+/// Every announcement, and every re-established connection (which may have
+/// missed any number of them), reads the stored row again.
 pub(crate) async fn run(
     url: DatabaseUrl,
     pool: sqlx::PgPool,
@@ -35,36 +35,39 @@ pub(crate) async fn run(
     bnc_listener: Option<Arc<BncListenerController>>,
     core: crate::core::CoreIngress,
 ) {
-    const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
-    const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-    let mut retry = RETRY_MIN;
-    loop {
-        let mut listener = match SettingsChangeListener::connect(&url).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!(
-                    "managed configuration: settings-change listener unavailable, retrying in \
-                     {}s: {error}",
-                    retry.as_secs()
-                );
-                tokio::time::sleep(retry).await;
-                retry = (retry * 2).min(RETRY_MAX);
-                continue;
-            }
-        };
-        retry = RETRY_MIN;
-        adopt_stored(&pool, &settings, bnc_listener.as_deref(), &core).await;
-        loop {
-            match listener.next().await {
-                Ok(SettingsChange::Committed | SettingsChange::Resynchronize) => {
-                    adopt_stored(&pool, &settings, bnc_listener.as_deref(), &core).await;
-                }
-                Err(error) => {
-                    eprintln!("managed configuration: settings-change listener lost: {error}");
-                    break;
-                }
-            }
-        }
+    follow_announcements(
+        url,
+        SETTINGS_CHANGED_CHANNEL,
+        "managed configuration: settings-change listener",
+        None,
+        SettingsFollower {
+            pool,
+            settings,
+            bnc_listener,
+            core,
+        },
+    )
+    .await;
+}
+
+struct SettingsFollower {
+    pool: sqlx::PgPool,
+    settings: SharedSettings,
+    bnc_listener: Option<Arc<BncListenerController>>,
+    core: crate::core::CoreIngress,
+}
+
+impl Follower for SettingsFollower {
+    /// Whatever was announced, the stored row is read again.
+    async fn on_change(&mut self, _: Announcement) -> Result<(), String> {
+        adopt_stored(
+            &self.pool,
+            &self.settings,
+            self.bnc_listener.as_deref(),
+            &self.core,
+        )
+        .await;
+        Ok(())
     }
 }
 

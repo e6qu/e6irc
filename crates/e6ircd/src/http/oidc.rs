@@ -1827,8 +1827,9 @@ pub(super) struct RequestPrincipal {
     pub(super) account: String,
     pub(super) credential: RequestCredential,
     /// Read from the account row on every request, so authority granted or
-    /// revoked outside this process — `e6ircd recover-administrator`, another
-    /// replica — is honoured by the next request without a restart.
+    /// revoked outside this process — `e6ircd recover-administrator`, an
+    /// operator's hand-written row — is honoured by the next request without
+    /// a restart.
     pub(super) flags: crate::db::AccountFlags,
 }
 
