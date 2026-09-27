@@ -341,6 +341,7 @@ def main() -> None:
                 ready = json.loads(ready_body)
                 assert ready == {
                     "ready": True,
+                    "role": "serving",
                     "core": "ready",
                     "database": "ready",
                 }, ready
