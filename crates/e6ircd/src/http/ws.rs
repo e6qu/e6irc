@@ -511,6 +511,13 @@ const UI_SOCKET_CREDENTIAL_ENDED_REASON: &str =
 /// WebSocket close code 1013, "try again later" (RFC 6455 §7.4.1 registry).
 const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
 
+/// WebSocket close code 1000: the socket did what it was for. A socket whose
+/// network is removed, disabled or stopped ends so, after its terminal status.
+const CLOSE_NORMAL: u16 = 1000;
+
+/// What a socket whose network stopped says as it closes.
+const UI_SOCKET_NETWORK_UNAVAILABLE_REASON: &str = "This network is unavailable.";
+
 /// What a socket whose credential could not be re-checked says. Reconnecting
 /// authenticates again, so the client's ordinary reconnect is the right answer.
 const UI_SOCKET_CREDENTIAL_UNVERIFIABLE_REASON: &str =
@@ -599,6 +606,7 @@ pub(super) async fn ws_ui(
         .credential_watch
         .lease(pool_of(&state), credential.revocable())
         .await;
+    let store = pool_of(&state).clone();
     let resume = params.after.as_deref().map(ReplayRequest::from_cursor);
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
@@ -609,6 +617,7 @@ pub(super) async fn ws_ui(
                 UiSocketAuthority {
                     composer,
                     credential,
+                    store,
                 },
                 slot,
                 resume,
@@ -638,6 +647,8 @@ impl ReplayRequest {
 pub(super) struct UiSocketAuthority {
     pub(super) composer: ComposerAuthority,
     pub(super) credential: super::revocation::CredentialLease,
+    /// Where the credential is read again when the network stops.
+    pub(super) store: sqlx::PgPool,
 }
 
 /// Serve one live chat socket until either side ends it, or the credential
@@ -668,6 +679,7 @@ pub(super) async fn ws_ui_conn(
     let UiSocketAuthority {
         composer,
         credential: mut lease,
+        store,
     } = authority;
     let Some(_slot) = slot else {
         send_close(&mut socket, CLOSE_POLICY_VIOLATION, UI_SOCKET_LIMIT_REASON).await;
@@ -807,7 +819,18 @@ pub(super) async fn ws_ui_conn(
             // loop instead of retrying a network that cannot accept a socket.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
-                    send_unavailable(&mut socket).await;
+                    // Stopped with its owner's authority: the socket ends as
+                    // its credential, which the client does not retry.
+                    if lease.has_ended_now(&store).await {
+                        send_close(
+                            &mut socket,
+                            CLOSE_POLICY_VIOLATION,
+                            UI_SOCKET_CREDENTIAL_ENDED_REASON,
+                        )
+                        .await;
+                    } else {
+                        send_unavailable(&mut socket).await;
+                    }
                     break;
                 }
             }
@@ -1017,14 +1040,18 @@ async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str) {
     drop(send_frame(socket, WsMessage::Close(Some(close))).await);
 }
 
+/// Tell the client its network cannot be attached to, and close the socket.
+/// The status is terminal for the client whatever the close says.
 async fn send_unavailable(socket: &mut WebSocket) {
-    drop(
-        send_frame(
-            socket,
-            WsMessage::text(status_event(ConnStatus::Unavailable, None)),
-        )
-        .await,
-    );
+    if send_frame(
+        socket,
+        WsMessage::text(status_event(ConnStatus::Unavailable, None)),
+    )
+    .await
+    .is_ok()
+    {
+        send_close(socket, CLOSE_NORMAL, UI_SOCKET_NETWORK_UNAVAILABLE_REASON).await;
+    }
 }
 
 #[derive(Debug)]
@@ -1807,6 +1834,13 @@ mod ui_socket_bound_tests {
                             UiSocketAuthority {
                                 composer: ComposerAuthority::MaySend,
                                 credential,
+                                // No store: a stopped network finds the
+                                // credential unverifiable and says it is
+                                // unavailable, at once.
+                                store: sqlx::postgres::PgPoolOptions::new()
+                                    .acquire_timeout(std::time::Duration::from_millis(1))
+                                    .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                                    .expect("lazy pool"),
                             },
                             slot,
                             None,

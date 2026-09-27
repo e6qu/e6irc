@@ -2424,9 +2424,13 @@ per process, on its own connection, re-reads each announced credential that a
 socket holds; after its connection is lost it re-reads every held credential,
 because what was announced in between was not heard. A credential that cannot
 be re-read (the database is unavailable) closes its sockets with 1013 instead,
-which the client retries, authenticating again. `/ws/irc` is not such a
-socket: it carries no HTTP credential, and its SASL login is an IRC session's,
-with the same lifetime as one on a TCP listener.
+which the client retries, authenticating again. A chat socket whose network
+is removed, disabled or stopped sends its terminal `unavailable` status and
+closes with 1000; when its credential ended with the network — a suspension or
+deletion does both in one change, and the network's stop can arrive first — it
+reads the credential again and closes with 1008 as the credential's end.
+`/ws/irc` is not such a socket: it carries no HTTP credential, and its SASL
+login is an IRC session's, with the same lifetime as one on a TCP listener.
 The account directory also projects effective administrator authority, its
 durable/configuration sources, and suspension posture.
 `PATCH /api/v1/admin/accounts/{id}` and matching CSRF-protected console forms

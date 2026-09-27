@@ -224,6 +224,22 @@ impl CredentialLease {
         }
     }
 
+    /// Read the credential again now, and say whether the store says it has
+    /// ended; if so every socket holding it is told. A socket asks when its
+    /// network stops: a suspension or deletion ends the account's credentials
+    /// and stops its networks in one change, and the network's stop can reach
+    /// the socket before the credential's announcement does. A store that
+    /// cannot be asked says nothing either way.
+    pub(crate) async fn has_ended_now(&self, pool: &sqlx::PgPool) -> bool {
+        match crate::db::credential_remaining(pool, &self.credential).await {
+            Ok(None) => {
+                self.watch.announce(&self.credential, Ok(None));
+                true
+            }
+            Ok(Some(_)) | Err(_) => false,
+        }
+    }
+
     /// Wait until the credential stops authorizing, and say how it ended:
     /// [`CredentialStanding::Ended`] or [`CredentialStanding::Unverifiable`].
     /// Cancel-safe: dropped inside `select!`, the next call picks up where

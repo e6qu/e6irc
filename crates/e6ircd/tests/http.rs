@@ -10351,8 +10351,9 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
     assert_eq!(running.addrs.len(), 1, "the stored listener is bound");
     let (status, _, body) = request(
         http,
-        "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\
-         Connection: close\r\n\r\n",
+        "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 19\r\n\
+         Connection: close\r\n\r\nclient_id=e6irc-cli",
     )
     .await;
     assert_eq!(status, 200, "{body}");
