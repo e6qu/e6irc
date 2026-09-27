@@ -17,7 +17,7 @@ mod support;
 /// (`db::connect_and_migrate`), whose migrations a migration test must run
 /// itself.
 async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
-    sqlx::PgPool::connect_with(url.connect_options()).await
+    sqlx::PgPool::connect_with(url.connect_options().expect("connect options")).await
 }
 
 #[path = "support/deadline.rs"]
@@ -12864,7 +12864,7 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
     // be that same session, or it waits on the lock forever.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect_with(url.connect_options())
+        .connect_with(url.connect_options().expect("connect options"))
         .await
         .expect("connect");
     MIGRATIONS

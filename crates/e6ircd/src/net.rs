@@ -750,6 +750,10 @@ fn serves_http(config: &Config) -> bool {
 ///
 /// [`ManagedConfig::bootstrap_drift`]: crate::config::ManagedConfig::bootstrap_drift
 pub fn check_offline(config: &Config) -> io::Result<()> {
+    if config.database.is_some() {
+        crate::db::refuse_libpq_environment(&crate::environment_config::process_environment)
+            .map_err(io::Error::other)?;
+    }
     if serves_http(config) {
         crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
     }

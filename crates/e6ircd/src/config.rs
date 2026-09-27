@@ -2021,44 +2021,9 @@ impl Config {
     /// enough, and a sealed client secret that opens to nothing is never empty.
     fn checked(mut config: Self) -> Result<Self, ConfigError> {
         config.validate()?;
-        config.refuse_libpq_environment(&crate::environment_config::process_environment)?;
         config.resolve_secrets()?;
         config.validate_secrets()?;
         Ok(config)
-    }
-
-    /// Refuse a database-backed configuration while one of libpq's
-    /// environment variables is set. sqlx fills every field the URL leaves
-    /// out from them (`crate::db::DatabaseUrl`), so `PGSSLMODE=disable` left
-    /// in a service's environment would turn TLS off and `PGHOST` would
-    /// redirect the connection — each without a word. The URL is the whole
-    /// description of the connection; the refusal names every variable set
-    /// and none of their values.
-    fn refuse_libpq_environment(
-        &self,
-        environment: &impl Fn(&str) -> crate::environment_config::Lookup,
-    ) -> Result<(), ConfigError> {
-        if self.database.is_none() {
-            return Ok(());
-        }
-        let set: Vec<&str> = crate::db::LIBPQ_ENVIRONMENT
-            .into_iter()
-            .filter(|variable| {
-                !matches!(
-                    crate::environment_config::optional(environment, variable),
-                    Ok(None)
-                )
-            })
-            .collect();
-        if set.is_empty() {
-            return Ok(());
-        }
-        Err(ConfigError::Invalid(format!(
-            "{} set in the environment: e6ircd connects with what database.url states and \
-             nothing else, so state the connection there and unset {}",
-            set.join(", "),
-            if set.len() == 1 { "it" } else { "them" }
-        )))
     }
 
     /// Resolve the primary and rotation fallback keys from `[secrets]` or the
@@ -2943,36 +2908,6 @@ mod tests {
             !rendered.contains("hunter2") && rendered.contains("libera"),
             "{rendered}"
         );
-    }
-
-    /// A libpq variable set beside a database-backed configuration is refused
-    /// by name — sqlx would otherwise read it into every connection the URL
-    /// leaves a field of unstated — and one set without a database is none of
-    /// the configuration's business.
-    #[test]
-    fn a_libpq_variable_in_the_environment_is_refused_by_name() {
-        let environment = |variable: &str| -> crate::environment_config::Lookup {
-            Ok(match variable {
-                "PGSSLMODE" => Some("disable".into()),
-                "PGHOST" => Some("elsewhere.example".into()),
-                "PGPASSWORD" => Some(String::new()),
-                _ => None,
-            })
-        };
-        let mut config = listening_config();
-        assert!(config.refuse_libpq_environment(&environment).is_ok());
-        config.database = db();
-        let refusal = config
-            .refuse_libpq_environment(&environment)
-            .expect_err("PGSSLMODE and PGHOST are refused")
-            .to_string();
-        assert!(refusal.contains("PGHOST, PGSSLMODE set"), "{refusal}");
-        assert!(
-            !refusal.contains("PGPASSWORD"),
-            "set-but-empty is unset: {refusal}"
-        );
-        assert!(!refusal.contains("disable") && !refusal.contains("elsewhere"));
-        assert!(config.refuse_libpq_environment(&|_: &str| Ok(None)).is_ok());
     }
 
     fn listening_config() -> Config {
