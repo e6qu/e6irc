@@ -1338,13 +1338,17 @@ async fn observe_http(
 
 /// `/readyz` of the serving process. A standby answers its own
 /// (`net::StandbyHealth`): `role` tells a load balancer's operator which one
-/// answered.
+/// answered. `lease` is where the serving lease stands: `held`, or
+/// `unconfirmed` while the process is fenced for want of a confirmed renewal
+/// (it keeps its clients and does not use the database), `ended` once it is
+/// given up or taken, `not_configured` without a database.
 #[derive(Serialize)]
 struct Readiness {
     ready: bool,
     role: &'static str,
     core: &'static str,
     database: &'static str,
+    lease: &'static str,
 }
 
 const READINESS_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1439,7 +1443,10 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         }
         None => true,
     };
-    let ready = core_ready && database_ready;
+    let lease = state.telemetry.serving_lease_standing();
+    let lease_ready =
+        lease.is_none_or(|standing| standing == crate::serving_lease::LeaseStanding::Held);
+    let ready = core_ready && database_ready && lease_ready;
     (
         if ready {
             StatusCode::OK
@@ -1457,6 +1464,10 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             } else {
                 "unavailable"
             },
+            lease: lease.map_or(
+                "not_configured",
+                crate::serving_lease::LeaseStanding::as_str,
+            ),
         }),
     )
         .into_response()

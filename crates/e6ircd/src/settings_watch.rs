@@ -58,7 +58,9 @@ struct SettingsFollower {
 }
 
 impl Follower for SettingsFollower {
-    /// Whatever was announced, the stored row is read again.
+    /// Whatever was announced, the stored row is read again. A read that
+    /// fails is an error, so the connection is made again and the row read
+    /// once more: swallowed, the announced revision would wait for the next.
     async fn on_change(&mut self, _: Announcement) -> Result<(), String> {
         adopt_stored(
             &self.pool,
@@ -66,8 +68,7 @@ impl Follower for SettingsFollower {
             self.bnc_listener.as_deref(),
             &self.core,
         )
-        .await;
-        Ok(())
+        .await
     }
 }
 
@@ -85,18 +86,16 @@ async fn adopt_stored(
     settings: &SharedSettings,
     bnc_listener: Option<&BncListenerController>,
     core: &crate::core::CoreIngress,
-) {
+) -> Result<(), String> {
     let mut current = settings.write().await;
     match load_managed_config(pool).await {
         Ok(stored) if stored.revision > current.revision => *current = stored,
         Ok(_) => {}
         Err(error) => {
-            eprintln!(
-                "managed configuration: the stored revision could not be read, still serving \
-                 revision {}: {error}",
+            return Err(format!(
+                "the stored revision could not be read, still serving revision {}: {error}",
                 current.revision
-            );
-            return;
+            ));
         }
     }
     core.adopt_live_settings(&current.settings);
@@ -110,6 +109,7 @@ async fn adopt_stored(
             current.revision
         );
     }
+    Ok(())
 }
 
 /// A revision's attach listener that could not be bound: where it was wanted,

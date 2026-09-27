@@ -607,7 +607,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     previous holder opened. Two processes each dialling every bouncer network
     and each holding its own in-memory mirror of single-writer state (§7.3)
     cannot be configured, and a stalled holder's in-flight writes cannot land
-    after another has taken over.
+    after another has taken over. A holder that cannot confirm a renewal is
+    fenced, not stopped: it keeps its clients until a renewal that reaches
+    the database says whether the lease is still its own (it resumes) or
+    another's (it drains and exits).
   - `BoundSession` — an OIDC link and a re-authentication flow both seal the
     session that started them, so neither can be built unbound; its callback
     acts only for that session, presented again, still live (§9).
@@ -4231,7 +4234,9 @@ Surface (initial):
   idle core is not "stalled" in the moments before its first tick); database-free, so a database outage shows on
   `readyz` and never restart-loops the container, while a stalled shard is a
   503 the health check acts on. It used to be a constant.
-- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth).
+- `readyz` (the same core check plus configured-PostgreSQL readiness and, with
+  a database, a confirmed serving lease — `lease` is `unconfirmed` while the
+  process is fenced (§18); no auth).
   The database probe is shared: one request at a time runs it and its answer
   is reused for one second, so a flood of this unauthenticated route, which
   bypasses admission, holds at most one pool connection.
@@ -5071,7 +5076,8 @@ The snapshot is the sole source for:
   (`core_heartbeat_age_ms` is the stalest shard's age, so a silent shard is not
   masked by a healthy one) or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
-  query deadline (one shared probe, its answer reused for a second).
+  query deadline (one shared probe, its answer reused for a second), or the
+  serving lease is unconfirmed (`lease`, §18).
 
 The production image carries no HTTP client, so a container `HEALTHCHECK`
 cannot be a `curl`. `e6ircd healthcheck [--ready]
@@ -5230,23 +5236,48 @@ Layers, bottom to top:
   changes nothing means the lease was taken), and every comparison is the
   database's `now()`, so host clocks never have to agree. The TTL, the renewal
   interval and the 10-second fence are named constants, not settings.
-  *Fence.* The holder stops serving when no renewal has been confirmed for
-  10 s, counted on the monotonic clock from when the confirmed renewal's
-  request started, so it has stopped before the lease can expire and be
-  taken; a renewal that finds the lease another's does the same. Either is a
-  critical failure: the bounded drain below, and a non-zero exit. The database
-  fences it too: every connection of the serving pool runs
+  *Fence.* When no renewal has been confirmed for 10 s, counted on the
+  monotonic clock from when the confirmed renewal's request started, the
+  holder is fenced — before the lease can expire and be taken. It holds on:
+  it keeps every IRC connection and all hot state and serves them without
+  the database, as through any outage (the bounded write paths drop and
+  count what they cannot write, the core never waits on them); `/readyz`
+  answers 503 with `"lease":"unconfirmed"` (`database` is `unavailable`
+  while it cannot be reached); `e6irc_serving_lease_held` is 0; and it keeps
+  renewing on the lease's own connection. A renewal that reaches the
+  database and finds the row still naming this holder and epoch — nobody
+  took it, however long ago it expired — lifts the fence and `/readyz`
+  answers 200 again. The pool has opened connections since the database
+  answered (its after-connect check passes: the row names this process), and
+  every announcement follower, whose listening connection the outage ended,
+  reconnects and reads what it follows again (its reconnect hook first: the
+  account-authority follower refuses the sign-in verdicts in flight), so
+  nothing announced meanwhile is missed; a follower whose read fails
+  reconnects and reads again rather than wait for the next announcement. A renewal that finds the lease another's — at once, or when the
+  database answers again after a fence — is a critical failure: the bounded
+  drain below, and a non-zero exit. A PostgreSQL restart or outage on a
+  single server therefore disconnects nobody. The cost is a network split's:
+  the clients on the old holder stay there, served from hot state without
+  the database (and its bouncer networks stay connected), until it reaches
+  the database again and sees the takeover; only then does it drain and
+  exit. The process does not close its own pool while fenced: what still
+  reaches the database (the lease row held locked, say, rather than the
+  database gone) is the holder's, since the row still names it, and what
+  would reach it after a takeover cannot land, since the database fences it
+  too: every connection of the serving pool runs
   `serving_lease_register_backend` as it is made (the pool's after-connect
   hook), which refuses a process that is not the holder and records the
   connection (process id and backend start time — not `application_name`,
   which the operator may state) as the holder's; taking the lease ends every
   connection a previous holder recorded (`pg_terminate_backend`), inside the
   takeover's transaction. Nothing a stalled holder had in flight commits
-  after the takeover, and it cannot open another connection; once its lease
-  has ended it records why (`db::mark_fenced`), and a pool timeout or refused
-  connection then reads "this process no longer holds the serving lease (held
-  by …)" rather than a bare timeout, from the one place database errors are
-  made (`db::query_error`).
+  after the takeover, and it cannot open another connection. The renewal
+  task records the fence (`db::set_lease_fence`), per holder, and a pool
+  timeout or refused connection then reads, from the one place database
+  errors are made (`db::query_error`), "this process's serving lease is
+  unconfirmed: no renewal has reached the database for N s" while fenced,
+  and "this process no longer holds the serving lease (held by …)" once a
+  takeover is seen, rather than a bare timeout.
   *Standby.* A process that finds the lease held says so on stderr, binds only
   its HTTP address — `/healthz` 200, `/readyz` 503 with its role and the
   holder's label (address, process id, release), everything else 503, every

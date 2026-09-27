@@ -476,10 +476,12 @@ serves: it binds only its HTTP health answers and takes the lease over when
 the holder stops or dies. **Active/standby** is this arrangement; active/active
 (several processes serving one database) is not supported.
 
-**Fence** — what keeps a process that has lost the lease from acting as if it
-held it: the holder stops serving when it cannot confirm a renewal in time,
-and PostgreSQL refuses its new connections and ends its open ones at a
-takeover.
+**Fence** — what keeps a process that may have lost the lease from acting as
+if it held it: a holder that cannot confirm a renewal in time reports its
+lease unconfirmed and is not ready, keeping its clients until a renewal says
+whether the lease is still its own (it resumes) or another's (it stops
+serving); PostgreSQL refuses a non-holder's new connections and ends the
+previous holder's open ones at a takeover.
 
 **Universally unique identifier (UUID)** — a 128-bit random identifier; a
 process names itself as a lease holder by one.

@@ -434,6 +434,11 @@ impl Telemetry {
         }
     }
 
+    /// Where the serving lease stands, once one is observed (`/readyz`).
+    pub(crate) fn serving_lease_standing(&self) -> Option<crate::serving_lease::LeaseStanding> {
+        self.serving_lease.get().map(|lease| lease.standing())
+    }
+
     fn database_pool_snapshot(&self) -> Option<DatabasePoolSnapshot> {
         self.database_pool
             .get()
@@ -840,7 +845,8 @@ impl Telemetry {
             one_metric(
                 &mut out,
                 "e6irc_serving_lease_held",
-                "Whether this process holds the database's serving lease (1) or has lost it (0).",
+                "Whether this process holds the database's serving lease with a renewal confirmed \
+                 within the fence (1), or not: unconfirmed, or lost (0).",
                 "gauge",
                 u64::from(lease.held()),
             );

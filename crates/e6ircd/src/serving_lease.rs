@@ -11,16 +11,21 @@
 //!
 //! The holder fences itself: when no renewal has been confirmed for
 //! [`FENCE_AFTER`] — less than the TTL, counted on the monotonic clock from
-//! when the confirmed renewal's request started — it stops serving (the
-//! bounded drain) before anyone can have taken the lease over. The database
-//! fences it too: every connection of the serving pool is checked against the
-//! lease as it is made (`serving_lease_register_backend`), and a new holder
-//! ends every connection the previous one recorded, so nothing a fenced
-//! process had in flight commits after the takeover.
+//! when the confirmed renewal's request started — it is fenced before anyone
+//! can have taken the lease over: not ready, its database errors naming the
+//! unconfirmed lease, and still serving its clients from hot state. It keeps
+//! renewing: a renewal that reaches the database and finds the lease still
+//! its own (the same holder and epoch) lifts the fence, and one that finds it
+//! another's ends the serving (the bounded drain). What the process writes
+//! meanwhile is fenced by the database: every connection of the serving pool
+//! is checked against the lease as it is made
+//! (`serving_lease_register_backend`), and a new holder ends every connection
+//! the previous one recorded, so nothing a fenced process had in flight
+//! commits after the takeover.
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use sqlx::Connection;
@@ -33,7 +38,8 @@ use crate::db::{AuditPrincipal, DatabaseUrl, DbError};
 pub const LEASE_TTL: Duration = Duration::from_secs(15);
 /// How often the holder renews.
 pub const RENEW_INTERVAL: Duration = Duration::from_secs(3);
-/// How long after its last confirmed renewal the holder stops serving.
+/// How long after its last confirmed renewal the holder is fenced (not
+/// ready), until a renewal is confirmed again or finds the lease taken.
 pub const FENCE_AFTER: Duration = Duration::from_secs(10);
 /// How often a standby tries the lease between the holder's announcements.
 pub const STANDBY_POLL: Duration = Duration::from_secs(5);
@@ -129,14 +135,14 @@ impl From<DbError> for AcquireRefusal {
     }
 }
 
-/// How a held lease ended while its holder was serving.
+/// How a held lease ended while its holder was serving. An unconfirmed
+/// renewal does not end it: the holder is fenced ([`LeaseStanding::Unconfirmed`])
+/// until a renewal is confirmed, or finds the lease taken.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseEnd {
     /// A renewal found the lease in another holder's hands (or released by
     /// someone else): `by` is who holds it now, when that could be read.
     Taken { by: Option<LeaseHeld> },
-    /// No renewal was confirmed for [`FENCE_AFTER`].
-    Fenced,
     /// The renewal task stopped without saying why (it panicked).
     RenewalsStopped,
 }
@@ -148,10 +154,6 @@ impl LeaseEnd {
         match self {
             Self::Taken { by: Some(held) } => format!("held by {held}"),
             Self::Taken { by: None } => "taken over by another process".to_owned(),
-            Self::Fenced => format!(
-                "fenced: no renewal was confirmed for {}s",
-                FENCE_AFTER.as_secs()
-            ),
             Self::RenewalsStopped => "its renewals stopped".to_owned(),
         }
     }
@@ -169,13 +171,6 @@ impl fmt::Display for LeaseEnd {
                 formatter,
                 "the serving lease is no longer this process's; it no longer serves the database"
             ),
-            Self::Fenced => write!(
-                formatter,
-                "no serving-lease renewal was confirmed for {}s; this process fences itself \
-                 before another can take the lease ({}s after the last renewal)",
-                FENCE_AFTER.as_secs(),
-                LEASE_TTL.as_secs()
-            ),
             Self::RenewalsStopped => {
                 write!(
                     formatter,
@@ -186,17 +181,73 @@ impl fmt::Display for LeaseEnd {
     }
 }
 
-/// Whether the lease is held and at which epoch, as the telemetry reports it
-/// (`e6irc_serving_lease_held`, `e6irc_serving_lease_epoch`).
-#[derive(Debug, Default)]
+/// Where a lease this process took stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseStanding {
+    /// Held, with a renewal confirmed within [`FENCE_AFTER`].
+    Held,
+    /// No renewal confirmed for [`FENCE_AFTER`]: the process is not ready and
+    /// serves its clients from hot state until one is, or a renewal finds the
+    /// lease taken.
+    Unconfirmed,
+    /// Released, or taken over: this process no longer holds it.
+    Ended,
+}
+
+impl LeaseStanding {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Held => 0,
+            Self::Unconfirmed => 1,
+            Self::Ended => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Held,
+            1 => Self::Unconfirmed,
+            _ => Self::Ended,
+        }
+    }
+
+    /// As `/readyz` names it.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Unconfirmed => "unconfirmed",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+/// Where the lease stands and at which epoch, as `/readyz` and the telemetry
+/// report it (`e6irc_serving_lease_held` is 1 only while [`LeaseStanding::Held`],
+/// `e6irc_serving_lease_epoch`).
+#[derive(Debug)]
 pub(crate) struct LeaseStatus {
-    held: AtomicBool,
+    standing: AtomicU8,
     epoch: AtomicI64,
 }
 
 impl LeaseStatus {
+    fn new(standing: LeaseStanding, epoch: i64) -> Self {
+        Self {
+            standing: AtomicU8::new(standing.code()),
+            epoch: AtomicI64::new(epoch),
+        }
+    }
+
+    pub(crate) fn standing(&self) -> LeaseStanding {
+        LeaseStanding::from_code(self.standing.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, standing: LeaseStanding) {
+        self.standing.store(standing.code(), Ordering::Relaxed);
+    }
+
     pub(crate) fn held(&self) -> bool {
-        self.held.load(Ordering::Relaxed)
+        self.standing() == LeaseStanding::Held
     }
 
     pub(crate) fn epoch(&self) -> i64 {
@@ -206,16 +257,13 @@ impl LeaseStatus {
     /// A lease held at `epoch`, as the telemetry tests observe one.
     #[cfg(test)]
     pub(crate) fn held_at(epoch: i64) -> Arc<Self> {
-        Arc::new(Self {
-            held: AtomicBool::new(true),
-            epoch: AtomicI64::new(epoch),
-        })
+        Arc::new(Self::new(LeaseStanding::Held, epoch))
     }
 
     /// The lease is no longer held.
     #[cfg(test)]
     pub(crate) fn lose(&self) {
-        self.held.store(false, Ordering::Relaxed);
+        self.set(LeaseStanding::Ended);
     }
 }
 
@@ -269,14 +317,15 @@ impl ServingLease {
         self.status.clone()
     }
 
-    /// Resolves when the lease ends while held — taken over, or fenced.
+    /// Resolves when the lease ends while held: taken over. An unconfirmed
+    /// renewal fences the process but does not end the lease.
     pub(crate) fn end_watch(&self) -> LeaseEndWatch {
         LeaseEndWatch(self.ended.clone())
     }
 
     /// Stop renewing and give the lease up, within `within`, announcing the
     /// release to a standby. `Ok(false)`: it was no longer this process's to
-    /// give (taken over, or never renewed again after a fence and taken).
+    /// give (taken over). The holder's fence is forgotten with the lease.
     pub async fn release(mut self, within: Duration) -> Result<bool, DbError> {
         self.renewals.abort();
         if let Err(error) = (&mut self.renewals).await
@@ -284,7 +333,8 @@ impl ServingLease {
         {
             eprintln!("e6ircd: the serving-lease renewal task failed: {error}");
         }
-        self.status.held.store(false, Ordering::Relaxed);
+        self.status.set(LeaseStanding::Ended);
+        crate::db::set_lease_fence(&self.holder, None);
         let released =
             tokio::time::timeout(within, release_row(&self.url, &self.holder, self.epoch))
                 .await
@@ -432,9 +482,7 @@ pub async fn acquire(
     )
     .await?;
     transaction.commit().await.map_err(crate::db::query_error)?;
-    let status = Arc::new(LeaseStatus::default());
-    status.held.store(true, Ordering::Relaxed);
-    status.epoch.store(epoch, Ordering::Relaxed);
+    let status = Arc::new(LeaseStatus::new(LeaseStanding::Held, epoch));
     let (ended_tx, ended) = tokio::sync::watch::channel(None);
     let renewals = tokio::spawn(renew(Renewal {
         url: url.clone(),
@@ -467,21 +515,42 @@ struct Renewal {
     ended: tokio::sync::watch::Sender<Option<LeaseEnd>>,
 }
 
-/// Renew every [`RENEW_INTERVAL`] until the lease ends: a renewal finds it no
-/// longer this holder's, or none is confirmed for [`FENCE_AFTER`]. A renewal
-/// counts from when its request started, and no request outlives the fence.
+/// Renew every [`RENEW_INTERVAL`] until a renewal finds the lease no longer
+/// this holder's. A renewal counts from when its request started. When none
+/// has been confirmed for [`FENCE_AFTER`] the holder is fenced — its database
+/// errors say so ([`crate::db::set_lease_fence`]), and so does its status —
+/// and it keeps trying; a confirmed renewal lifts the fence. No request
+/// outlives the fence, or, once fenced, [`FENCE_AFTER`] of its own.
 async fn renew(mut renewal: Renewal) {
     let mut next = renewal.confirmed + RENEW_INTERVAL;
+    let mut unconfirmed = false;
     let end = loop {
         let fence_at = renewal.confirmed + FENCE_AFTER;
-        tokio::time::sleep_until(next.min(fence_at)).await;
-        if Instant::now() >= fence_at {
-            break LeaseEnd::Fenced;
+        tokio::time::sleep_until(if unconfirmed {
+            next
+        } else {
+            next.min(fence_at)
+        })
+        .await;
+        if !unconfirmed && Instant::now() >= fence_at {
+            unconfirmed = true;
+            renewal.fence();
         }
         let started = Instant::now();
         next = started + RENEW_INTERVAL;
-        match tokio::time::timeout_at(fence_at, renew_once(&mut renewal)).await {
-            Ok(Ok(true)) => renewal.confirmed = started,
+        let deadline = if unconfirmed {
+            started + FENCE_AFTER
+        } else {
+            fence_at
+        };
+        match tokio::time::timeout_at(deadline, renew_once(&mut renewal)).await {
+            Ok(Ok(true)) => {
+                renewal.confirmed = started;
+                if unconfirmed {
+                    unconfirmed = false;
+                    renewal.resume();
+                }
+            }
             Ok(Ok(false)) => {
                 break LeaseEnd::Taken {
                     by: current_holder(&renewal.url).await.ok().flatten(),
@@ -489,18 +558,58 @@ async fn renew(mut renewal: Renewal) {
             }
             Ok(Err(error)) => {
                 renewal.connection = None;
-                eprintln!(
-                    "e6ircd: serving lease: a renewal failed ({error}); this process stops \
-                     serving {}s after its last confirmed renewal unless one succeeds",
-                    FENCE_AFTER.as_secs()
-                );
+                // Once fenced, the fence's own line has said it; every
+                // failed attempt of an outage would repeat it.
+                if !unconfirmed {
+                    eprintln!(
+                        "e6ircd: serving lease: a renewal failed ({error}); this process is \
+                         fenced {}s after its last confirmed renewal unless one succeeds",
+                        FENCE_AFTER.as_secs()
+                    );
+                }
             }
             Err(_deadline) => renewal.connection = None,
         }
     };
-    renewal.status.held.store(false, Ordering::Relaxed);
-    crate::db::mark_fenced(end.fence_reason());
+    renewal.status.set(LeaseStanding::Ended);
+    crate::db::set_lease_fence(
+        &renewal.holder,
+        Some(crate::db::LeaseFence::Lost(end.fence_reason())),
+    );
     renewal.ended.send_replace(Some(end));
+}
+
+impl Renewal {
+    /// No renewal confirmed for [`FENCE_AFTER`]: not ready, clients served
+    /// from hot state, and said.
+    fn fence(&self) {
+        crate::db::set_lease_fence(
+            &self.holder,
+            Some(crate::db::LeaseFence::Unconfirmed {
+                since: self.confirmed,
+            }),
+        );
+        self.status.set(LeaseStanding::Unconfirmed);
+        eprintln!(
+            "e6ircd: serving lease: no renewal was confirmed for {}s; this process is not \
+             ready, keeps its clients and keeps renewing: it resumes if the lease is still its \
+             own when the database answers, and stops serving if another process has taken it",
+            FENCE_AFTER.as_secs()
+        );
+    }
+
+    /// A renewal confirmed the lease still this holder's (epoch unchanged):
+    /// ready again. What was announced while fenced is read again by each
+    /// follower as its listener reconnects.
+    fn resume(&self) {
+        self.status.set(LeaseStanding::Held);
+        crate::db::set_lease_fence(&self.holder, None);
+        eprintln!(
+            "e6ircd: serving lease: a renewal was confirmed again (epoch {}); this process \
+             serves as the holder again",
+            self.epoch
+        );
+    }
 }
 
 async fn renew_once(renewal: &mut Renewal) -> Result<bool, DbError> {
@@ -571,8 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_end_says_what_happened_and_the_bounds() {
-        assert!(LeaseEnd::Fenced.to_string().contains("10s"));
+    fn a_lease_end_says_what_happened() {
         let taken = LeaseEnd::Taken {
             by: Some(LeaseHeld {
                 label: "10.0.0.2 pid 7, e6ircd".into(),
