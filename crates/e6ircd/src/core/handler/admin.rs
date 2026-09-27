@@ -71,6 +71,9 @@ pub(crate) fn handle(
             reason,
             actor,
         } => end_account_sessions(state, &account, &reason, &actor),
+        AdminRequest::EndCredentialSessions { credential } => {
+            end_credential_sessions(state, credential)
+        }
         AdminRequest::MutateOwnedChannel {
             channel,
             actor,
@@ -137,8 +140,46 @@ pub(crate) fn apply_account_sessions_ended(
     actor: &str,
 ) -> usize {
     let account_key = state.account_key(account);
-    state.end_credentials(account_key.clone());
+    state.end_credentials(crate::core::state::EndedSignIns::Account(
+        account_key.clone(),
+    ));
     disconnect_account(state, &account_key, reason, actor)
+}
+
+/// End every live session the revoked `credential` signed in, on this shard
+/// and every other. The account's other sessions stay.
+fn end_credential_sessions(
+    state: &mut ServerState,
+    credential: crate::identity::IssuedCredential,
+) -> AdminReply {
+    let disconnected = apply_credential_sessions_ended(state, credential);
+    state.broadcast_credential_sessions_ended(credential);
+    AdminReply::Ok(format!(
+        "Disconnected {disconnected} live connection(s) signed in with the {credential}"
+    ))
+}
+
+/// [`end_credential_sessions`] on one shard: a verdict for a check of the
+/// credential queued before now is refused when it lands
+/// ([`ServerState::credentials_ended_since`]), then every session it signed
+/// in, registered or still registering, is closed with an `ERROR` naming the
+/// revocation.
+pub(crate) fn apply_credential_sessions_ended(
+    state: &mut ServerState,
+    credential: crate::identity::IssuedCredential,
+) -> usize {
+    state.end_credentials(crate::core::state::EndedSignIns::Credential(credential));
+    let signed_in = crate::identity::CredentialId::Issued(credential);
+    let connections: Vec<ConnId> = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.signed_in_with() == Some(signed_in))
+        .map(|(connection, _)| *connection)
+        .collect();
+    for &connection in &connections {
+        state.close_with_error(connection, credential.revocation_reason());
+    }
+    connections.len()
 }
 
 pub(crate) fn apply_account_suspension(

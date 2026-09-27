@@ -20,7 +20,9 @@ use std::future::Future;
 use e6irc_proto::message::MiddleParam;
 
 mod account_lease;
-pub use account_lease::{AccountLease, AccountRevocations, AccountRevoked, RevocationTicket};
+pub use account_lease::{
+    AccountLease, AccountRevocations, AccountRevoked, Revocation, RevocationTicket,
+};
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -6418,15 +6420,10 @@ impl std::fmt::Display for AttachEnd {
             Self::ClientUnresponsive => "the client stopped answering liveness pings",
             Self::NetworkRemoved => "the network was removed or replaced",
             Self::DriverStopped => "the network's driver stopped",
-            Self::AccountRevoked => "the account was suspended or deleted, or its password changed",
+            Self::Revoked(revocation) => return write!(f, "{revocation}"),
         })
     }
 }
-
-/// What a client whose account's authority ended is told as it is detached.
-const ACCOUNT_REVOKED_NOTICE: &[u8] =
-    b":*bnc* NOTICE * :your account was suspended or deleted, or \
-    its password changed; detaching\r\n";
 
 /// How long an attached client may stay silent before the bouncer pings it,
 /// and again before it gives up on it. A quiet or parked network writes
@@ -6435,6 +6432,18 @@ const ACCOUNT_REVOKED_NOTICE: &[u8] =
 /// holds its task, its socket and its place in `attached_clients` until the
 /// next broadcast line — which on a parked network never comes.
 pub const ATTACH_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Tell a client whose account's authority or credential ended why, and end
+/// its attachment.
+async fn detach_revoked<W>(write: &mut W, revocation: Revocation) -> std::io::Result<AttachEnd>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    write.write_all(revocation.notice().as_bytes()).await?;
+    write.flush().await?;
+    Ok(AttachEnd::Revoked(revocation))
+}
 
 /// Why an attachment ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6452,9 +6461,10 @@ pub enum AttachEnd {
     NetworkRemoved,
     /// The network's driver is gone.
     DriverStopped,
-    /// The account's authority ended: it was suspended or deleted, or its
-    /// password changed.
-    AccountRevoked,
+    /// The account's authority ended — it was suspended or deleted, or its
+    /// password changed — or the app password the client signed in with was
+    /// revoked.
+    Revoked(Revocation),
 }
 
 /// Attach a downstream client stream to a running network: welcome it, replay
@@ -6469,9 +6479,10 @@ pub enum AttachEnd {
 /// `authority` is the lease on the authenticated account's authority: the
 /// account keys the BNC-local per-target read markers (shared networks keep
 /// per-account positions), and the attachment ends
-/// ([`AttachEnd::AccountRevoked`]) when the account is suspended or deleted or
-/// its password changes — on any network, the operator's shared and
-/// configured ones included. An attachment cannot be made without one.
+/// ([`AttachEnd::Revoked`]) when the account is suspended or deleted or its
+/// password changes, or the credential it signed in with is revoked — on any
+/// network, the operator's shared and configured ones included. An attachment
+/// cannot be made without one.
 /// `greeting` names who welcomes the client and the nick it registered with.
 /// `liveness` is how long the client may stay silent before it is pinged, and
 /// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
@@ -6548,10 +6559,8 @@ where
     let account = account.as_str();
     let (mut read, mut write) = tokio::io::split(stream);
     // Revoked between the lease and here: the attachment never begins.
-    if authority.is_revoked() {
-        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
-        write.flush().await?;
-        return Ok(AttachEnd::AccountRevoked);
+    if let Some(revocation) = authority.revocation() {
+        return detach_revoked(&mut write, revocation).await;
     }
 
     // Detach the client if the network is removed. The broadcast does not close
@@ -6770,11 +6779,10 @@ where
     let mut awaiting_pong = false;
     loop {
         tokio::select! {
-            // The account's authority ended: tell the client and detach.
-            () = authority.revoked() => {
-                write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
-                write.flush().await?;
-                return Ok(AttachEnd::AccountRevoked);
+            // The account's authority or the credential ended: tell the
+            // client and detach.
+            revocation = authority.revoked() => {
+                return detach_revoked(&mut write, revocation).await;
             }
             // Network removed/replaced: tell the client and detach.
             res = shutdown.changed() => {
@@ -6782,10 +6790,8 @@ where
                     // The account lifecycle revokes before it stops the
                     // account's networks, and both can be ready here at once:
                     // the network stopped because the authority ended.
-                    if authority.is_revoked() {
-                        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
-                        write.flush().await?;
-                        return Ok(AttachEnd::AccountRevoked);
+                    if let Some(revocation) = authority.revocation() {
+                        return detach_revoked(&mut write, revocation).await;
                     }
                     write
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
@@ -8621,7 +8627,11 @@ mod tests {
             let handle = std::sync::Arc::new(handle);
             let revocations = AccountRevocations::new();
             let lease = revocations
-                .lease(revocations.ticket(), "alice")
+                .lease(
+                    revocations.ticket(),
+                    "alice",
+                    crate::identity::CredentialId::AccountPassword,
+                )
                 .expect("lease");
             let (client_side, server_side) = tokio::io::duplex(4096);
             let attached = tokio::spawn({
@@ -8658,7 +8668,7 @@ mod tests {
                 .expect("the attachment ends")
                 .expect("attach task")
                 .expect("attach");
-            assert_eq!(end, AttachEnd::AccountRevoked);
+            assert_eq!(end, AttachEnd::Revoked(Revocation::Account));
         }
     }
 
@@ -8673,7 +8683,11 @@ mod tests {
         let handle = std::sync::Arc::new(handle);
         let revocations = AccountRevocations::new();
         let lease = revocations
-            .lease(revocations.ticket(), "Alice")
+            .lease(
+                revocations.ticket(),
+                "Alice",
+                crate::identity::CredentialId::AccountPassword,
+            )
             .expect("lease");
         let (client_side, server_side) = tokio::io::duplex(4096);
         let attached = tokio::spawn({
@@ -8709,7 +8723,7 @@ mod tests {
             .expect("a revoked attachment ends")
             .expect("attach task")
             .expect("attach");
-        assert_eq!(end, AttachEnd::AccountRevoked);
+        assert_eq!(end, AttachEnd::Revoked(Revocation::Account));
         let notice = lines.next_line().await.expect("read").expect("notice");
         assert!(notice.contains("suspended or deleted"), "{notice}");
         assert!(
@@ -8719,7 +8733,11 @@ mod tests {
 
         // Revoked between the lease and the attachment: it never begins.
         let late = revocations
-            .lease(revocations.ticket(), "alice")
+            .lease(
+                revocations.ticket(),
+                "alice",
+                crate::identity::CredentialId::AccountPassword,
+            )
             .expect("lease");
         revocations.revoke("alice");
         let (_client_side, server_side) = tokio::io::duplex(4096);
@@ -8742,8 +8760,64 @@ mod tests {
         .await
         .expect("returns at once")
         .expect("attach");
-        assert_eq!(end, AttachEnd::AccountRevoked);
+        assert_eq!(end, AttachEnd::Revoked(Revocation::Account));
         assert_eq!(handle.runtime_snapshot().attached_clients, 0);
+    }
+
+    /// Revoking the app password an attachment signed in with detaches it,
+    /// saying so, from a network that keeps running.
+    #[tokio::test]
+    async fn a_revoked_credential_detaches_the_client_it_signed_in() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let revoked = crate::identity::IssuedCredential::AppPassword(7);
+        let (handle, _ends) = NetworkHandle::channels(16);
+        let revocations = AccountRevocations::new();
+        let lease = revocations
+            .lease(
+                revocations.ticket(),
+                "alice",
+                crate::identity::CredentialId::Issued(revoked),
+            )
+            .expect("lease");
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let attached = attach(
+            server_side,
+            ClientInput::default(),
+            &handle,
+            AttachCaps::default(),
+            lease,
+            Greeting {
+                server_name: "bnc.test",
+                network: "net",
+                requested_nick: "alice",
+            },
+            ATTACH_LIVENESS_INTERVAL,
+        );
+        let revoke = async {
+            let mut lines = BufReader::new(client_side).lines();
+            loop {
+                let line = lines.next_line().await.expect("read").expect("welcome");
+                if line.contains("NOTICE") && line.contains("upstream") {
+                    break;
+                }
+            }
+            assert_eq!(revocations.revoke_credential(revoked), 1);
+            lines.next_line().await.expect("read").expect("notice")
+        };
+        let (end, notice) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(attached, revoke)
+        })
+        .await
+        .expect("a revoked attachment ends");
+        assert_eq!(
+            end.expect("attach"),
+            AttachEnd::Revoked(Revocation::Credential(revoked))
+        );
+        assert!(
+            notice.contains("the app password you signed in with was revoked"),
+            "{notice}"
+        );
+        assert!(!*handle.watch_shutdown().borrow());
     }
 
     /// An attached client that stops reading ends its attachment as too slow

@@ -5728,13 +5728,15 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
     assert_eq!(
         e6ircd::db::verify_credentials(&verification, "Bob", "bob password")
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         Some(e6ircd::db::VerifiedAccount::established("Bob"))
     );
     assert_eq!(
         e6ircd::db::api_token_account(&verification, &bob_token)
             .await
-            .expect("old token lookup"),
+            .expect("old token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         None,
         "reactivation never resurrects a revoked bearer"
     );
@@ -9042,14 +9044,16 @@ async fn personal_access_token_scopes_gate_reads_writes_admin_and_irc() {
     assert_eq!(
         e6ircd::db::api_token_account(&pool, &read)
             .await
-            .expect("read token lookup"),
+            .expect("read token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         None,
         "a read-only API grant must not silently gain IRC authentication"
     );
     assert_eq!(
         e6ircd::db::api_token_account(&pool, &irc)
             .await
-            .expect("IRC token lookup"),
+            .expect("IRC token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         Some("alice".into())
     );
     drop(pool);

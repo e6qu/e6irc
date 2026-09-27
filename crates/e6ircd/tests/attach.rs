@@ -18,7 +18,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 fn lease(account: &str) -> e6ircd::bouncer::AccountLease {
     let revocations = e6ircd::bouncer::AccountRevocations::new();
     revocations
-        .lease(revocations.ticket(), account)
+        .lease(
+            revocations.ticket(),
+            account,
+            e6ircd::identity::CredentialId::AccountPassword,
+        )
         .expect("nothing revoked it")
 }
 

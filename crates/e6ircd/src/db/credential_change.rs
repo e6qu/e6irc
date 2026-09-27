@@ -13,8 +13,13 @@
 //! reactivation, a primary password added, replaced or removed), which the
 //! row counts in `authority_generation`. [`AccountAuthority`] is that row as
 //! a listener re-reads it.
+//!
+//! Migration 0097 has the app-password and personal-access-token rows announce
+//! their deletion there too, by row id ([`IssuedCredential`]): an IRC session
+//! or a bouncer attachment opened with one ends when it is revoked.
 
 use super::{ACCOUNT_FLAG_SUSPENDED, DbError, query_error, token_hash};
+use crate::identity::IssuedCredential;
 
 /// The notification channel migration 0077's triggers publish on.
 const CREDENTIAL_CHANGED_CHANNEL: &str = "e6irc_credential_changed";
@@ -201,6 +206,65 @@ pub async fn every_account_authority(
     Ok(rows.into_iter().map(account_authority_of).collect())
 }
 
+/// The notification tag migration 0097's trigger writes for each kind of
+/// issued credential, before the row id.
+fn issued_credential_tag(credential: IssuedCredential) -> &'static str {
+    match credential {
+        IssuedCredential::AppPassword(_) => "app_password",
+        IssuedCredential::ApiToken(_) => "api_token",
+    }
+}
+
+/// The issued credential a `<kind>:<row id>` payload of migration 0097's
+/// trigger names, or `None` for a payload it does not write.
+fn revoked_issued_credential(payload: &str) -> Option<IssuedCredential> {
+    let (tag, id) = payload.split_once(':')?;
+    let id: i64 = id.parse().ok().filter(|id: &i64| *id > 0)?;
+    [
+        IssuedCredential::AppPassword(id),
+        IssuedCredential::ApiToken(id),
+    ]
+    .into_iter()
+    .find(|credential| issued_credential_tag(*credential) == tag)
+}
+
+/// Which of `credentials` are still stored: an issued credential is revoked by
+/// deleting its row, so one missing here has been revoked. What a listener
+/// asks after it has missed announcements.
+pub async fn issued_credentials_stored(
+    pool: &sqlx::PgPool,
+    credentials: &[IssuedCredential],
+) -> Result<std::collections::HashSet<IssuedCredential>, DbError> {
+    let (app_passwords, tokens): (Vec<i64>, Vec<i64>) = credentials.iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut app, mut token), credential| {
+            match *credential {
+                IssuedCredential::AppPassword(id) => app.push(id),
+                IssuedCredential::ApiToken(id) => token.push(id),
+            }
+            (app, token)
+        },
+    );
+    let stored_app_passwords: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM account_credentials WHERE kind = 'app_password' AND id = ANY($1)",
+    )
+    .bind(&app_passwords)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    let stored_tokens: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM api_tokens WHERE id = ANY($1)")
+            .bind(&tokens)
+            .fetch_all(pool)
+            .await
+            .map_err(query_error)?;
+    Ok(stored_app_passwords
+        .into_iter()
+        .map(IssuedCredential::AppPassword)
+        .chain(stored_tokens.into_iter().map(IssuedCredential::ApiToken))
+        .collect())
+}
+
 /// What the credential-change listener heard.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CredentialChange {
@@ -208,6 +272,9 @@ pub enum CredentialChange {
     Changed(RevocableCredential),
     /// This account was created or deleted, or its authority changed.
     Account(AccountAnnouncement),
+    /// This app password or personal access token was revoked: its row was
+    /// deleted.
+    IssuedRevoked(IssuedCredential),
     /// The listening connection was lost and re-established: announcements
     /// made in between are gone, so every watched credential must be read
     /// again.
@@ -243,6 +310,7 @@ impl CredentialChangeListener {
             .or_else(|| {
                 AccountAnnouncement::from_notification(payload).map(CredentialChange::Account)
             })
+            .or_else(|| revoked_issued_credential(payload).map(CredentialChange::IssuedRevoked))
             .unwrap_or(CredentialChange::Resynchronize))
     }
 }
@@ -272,6 +340,42 @@ mod tests {
         );
         for junk in ["", "session", "other:00", "session:0", "session:zz"] {
             assert_eq!(RevocableCredential::from_notification(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn an_issued_credential_notification_names_its_kind_and_row() {
+        assert_eq!(
+            revoked_issued_credential("app_password:17"),
+            Some(IssuedCredential::AppPassword(17))
+        );
+        assert_eq!(
+            revoked_issued_credential("api_token:17"),
+            Some(IssuedCredential::ApiToken(17))
+        );
+        for credential in [
+            IssuedCredential::AppPassword(9),
+            IssuedCredential::ApiToken(9),
+        ] {
+            let id = match credential {
+                IssuedCredential::AppPassword(id) | IssuedCredential::ApiToken(id) => id,
+            };
+            let payload = format!("{}:{id}", issued_credential_tag(credential));
+            assert_eq!(revoked_issued_credential(&payload), Some(credential));
+        }
+        for junk in [
+            "",
+            "app_password",
+            "app_password:",
+            "app_password:0",
+            "app_password:-3",
+            "app_password:x",
+            "token:17",
+            "session:17",
+            "account:17:alice",
+            "api_tokens:17",
+        ] {
+            assert_eq!(revoked_issued_credential(junk), None, "{junk}");
         }
     }
 

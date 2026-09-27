@@ -85,6 +85,58 @@ impl CredentialAttemptBudget {
     }
 }
 
+/// The credential a sign-in presented, which an IRC session and a bouncer
+/// attachment keep for as long as they live, so revoking that one credential
+/// ends exactly what it opened. SASL PLAIN, NickServ `IDENTIFY` and the attach
+/// listener accept the account password or an app password; SASL OAUTHBEARER
+/// accepts a personal access token; IRC and NickServ `REGISTER` sign in with
+/// the password they just set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CredentialId {
+    /// The account's primary password. It is never revoked on its own:
+    /// changing or removing it changes the account's authority, which ends
+    /// every session the account has, however it signed in.
+    AccountPassword,
+    /// A credential issued alongside the password, revocable by itself.
+    Issued(IssuedCredential),
+}
+
+/// A credential issued to an account besides its password, named by its row:
+/// revoking it deletes that row, and the table announces the deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IssuedCredential {
+    /// An app password, by its `account_credentials` id.
+    AppPassword(i64),
+    /// A personal access token, by its `api_tokens` id.
+    ApiToken(i64),
+}
+
+impl IssuedCredential {
+    /// What kind of credential this is, in words.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::AppPassword(_) => "app password",
+            Self::ApiToken(_) => "personal access token",
+        }
+    }
+
+    /// Why a session or attachment this credential opened is closed when it is
+    /// revoked.
+    pub fn revocation_reason(self) -> &'static str {
+        match self {
+            Self::AppPassword(_) => "App password revoked",
+            Self::ApiToken(_) => "Personal access token revoked",
+        }
+    }
+}
+
+impl fmt::Display for IssuedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::AppPassword(id) | Self::ApiToken(id)) = self;
+        write!(f, "{} {id}", self.kind())
+    }
+}
+
 /// Casefolded nicks the built-in services pseudo-clients occupy. No session may
 /// take one (NICK refuses it, and PRIVMSG to it is intercepted), and no account
 /// may be named after one.

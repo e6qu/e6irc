@@ -5112,13 +5112,22 @@ fn http_listener() -> e6ircd::config::HttpConfig {
 
 /// An IRC session of alice's, logged in with SASL.
 async fn irc_alice(irc: std::net::SocketAddr, password: &str) -> e6irc_client::Connection {
+    irc_alice_as(irc, "alice", password).await
+}
+
+/// [`irc_alice`] under `nick`, so one server can hold several of her sessions.
+async fn irc_alice_as(
+    irc: std::net::SocketAddr,
+    nick: &str,
+    password: &str,
+) -> e6irc_client::Connection {
     let mut session = e6irc_client::Connection::connect(&irc.to_string())
         .await
         .expect("connect");
     session
         .register_sasl(
             &e6irc_client::Identity {
-                nick: "alice",
+                nick,
                 username: "alice",
                 realname: "Alice",
                 server_password: None,
@@ -5449,4 +5458,145 @@ async fn an_account_authority_change_on_one_server_reaches_every_server() {
     assert!(still_open(&mut signed_in_again).await);
     // The new password attaches on the second server.
     attach_alice(bnc, "shared", "a new passphrase").await;
+}
+
+/// Alice signs in with her password, with each of two app passwords, and with
+/// a personal access token. Another process — the command line, another HTTP
+/// path — revokes one app password and the token in the database; the server
+/// hears the store's announcements and ends the IRC sessions and the
+/// attachment those credentials signed in, saying why, and nothing her
+/// password or her other app password signed in.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_credential_revoked_out_of_process_ends_exactly_what_it_signed_in() {
+    let url = bnc_account_db(
+        "a_credential_revoked_out_of_process_ends_exactly_what_it_signed_in",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let revoked = e6ircd::db::issue_app_password(&pool, "alice", "s3cr3t-password", "laptop")
+        .await
+        .expect("app password");
+    let kept = e6ircd::db::issue_app_password(&pool, "alice", "s3cr3t-password", "phone")
+        .await
+        .expect("app password");
+    let revoked_id = e6ircd::db::list_credentials(&pool, "alice")
+        .await
+        .expect("credentials")
+        .into_iter()
+        .find(|credential| credential.label.as_deref() == Some("laptop"))
+        .expect("the laptop's app password")
+        .id;
+    let token = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc client",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Irc])
+            .expect("scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("token");
+    let token_id = match e6ircd::db::api_token_account(&pool, &token)
+        .await
+        .expect("token lookup")
+        .expect("an IRC token")
+        .credential
+    {
+        e6ircd::identity::CredentialId::Issued(e6ircd::identity::IssuedCredential::ApiToken(
+            id,
+        )) => id,
+        other => panic!("a token signs in as itself: {other:?}"),
+    };
+    let up = upstream().await;
+    let mut config = bnc_config(up, url.clone());
+    config.networks.push(shared_network(up));
+    let server = net::start(config).await.expect("start");
+    let (irc, bnc) = (server.addrs[0], server.bnc_addr.expect("bnc bound"));
+
+    let mut attached_revoked = attach_alice(bnc, "shared", &revoked).await;
+    let mut attached_kept = attach_alice(bnc, "shared", &kept).await;
+    let mut attached_password = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session_revoked = irc_alice_as(irc, "alice1", &revoked).await;
+    let mut session_kept = irc_alice_as(irc, "alice2", &kept).await;
+    let mut session_password = irc_alice_as(irc, "alice3", "s3cr3t-password").await;
+    let mut session_token = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("connect");
+    session_token
+        .register_oauthbearer(
+            &e6irc_client::Identity {
+                nick: "alice4",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            &token,
+        )
+        .await
+        .expect("token login");
+
+    assert!(
+        e6ircd::db::revoke_credential(&pool, "alice", revoked_id)
+            .await
+            .expect("revoke")
+    );
+    let said = detached(&mut attached_revoked).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("app password you signed in with was revoked")),
+        "{said:#?}"
+    );
+    let said = detached(&mut session_revoked).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("App password revoked")),
+        "{said:#?}"
+    );
+    assert!(
+        still_open(&mut session_token).await,
+        "the token was not revoked"
+    );
+    assert!(
+        e6ircd::db::delete_api_token(&pool, "alice", token_id)
+            .await
+            .expect("revoke")
+    );
+    let said = detached(&mut session_token).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("Personal access token revoked")),
+        "{said:#?}"
+    );
+    for (what, client) in [
+        ("the other app password's attachment", &mut attached_kept),
+        ("the password's attachment", &mut attached_password),
+        ("the other app password's session", &mut session_kept),
+        ("the password's session", &mut session_password),
+    ] {
+        assert!(still_open(client).await, "{what} stays open");
+    }
+    // The revoked app password signs in nowhere again.
+    let mut refused = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .expect("connect");
+    assert!(
+        refused
+            .register_sasl(
+                &e6irc_client::Identity {
+                    nick: "alice/shared",
+                    username: "alice",
+                    realname: "Alice",
+                    server_password: None,
+                },
+                "alice",
+                &revoked,
+            )
+            .await
+            .is_err()
+    );
 }

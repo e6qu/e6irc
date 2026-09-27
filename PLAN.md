@@ -1460,6 +1460,14 @@ Maintainer decisions implemented from the same review:
   by `recover-administrator`) ends the account's IRC sessions and attachments
   on each, which apply it once from the store's announcement (0095's
   `authority_generation`, `AuthorityLedger`).
+- **Revoking an app password or a personal access token ends what it signed
+  in**, and only that: IRC sessions and bouncer attachments keep the
+  credential that opened them (`CredentialId`), migration 0097 announces each
+  revocation by id, whichever process deletes it, and the server closes that
+  credential's sessions (`App password revoked`) and attachments; a check of
+  it in flight is refused. Before, they stayed open for as long as they lived.
+- **The design's SASL OAUTHBEARER row described OIDC JWT validation** the
+  server does not do; it names the personal access token it verifies.
 - **New passwords are at least 8 characters** (NIST SP 800-63B); existing
   passwords still verify.
 - **Device authorization speaks RFC 8628 as written**: form bodies with a
