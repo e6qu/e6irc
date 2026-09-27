@@ -2673,6 +2673,11 @@ pub(crate) struct CoreWorker {
 
 impl CoreWorker {
     pub(crate) fn new(core: Core, receiver: Receiver<Input>, ingress: CoreIngress) -> Self {
+        // Heard from the moment it is built to run, not from its first
+        // finished event: a probe answered in the milliseconds before an idle
+        // core's first tick is not a stalled core, and a worker that never
+        // gets to run still shows as stalled once the heartbeat bound passes.
+        core.state.telemetry.record_core_heartbeat(core.shard.0);
         let backlog = (0..ingress.shards.len()).map(|_| VecDeque::new()).collect();
         Self {
             core,

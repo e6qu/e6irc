@@ -1706,10 +1706,13 @@ async fn core_worker(
     ingress: CoreIngress,
     ready: tokio::sync::oneshot::Sender<()>,
 ) {
+    // Built before startup is told this shard is ready, so the shard is heard
+    // (its first heartbeat) before anything can probe its liveness.
+    let worker = CoreWorker::new(core, rx, ingress);
     if ready.send(()).is_err() {
         return;
     }
-    let exit = CoreWorker::new(core, rx, ingress).run().await;
+    let exit = worker.run().await;
     if exit != crate::core::CoreWorkerExit::Stopped {
         // Whoever supervises this task treats its end as the failure it is;
         // this says which.

@@ -266,21 +266,16 @@ fn temporary_path(label: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn healthz_is_public_and_ok() {
-    // Liveness is the process plus every core shard's heartbeat, so it turns
-    // 200 once each shard has finished its first event (its first tick).
+    // Liveness is the process plus every core shard's heartbeat, and a shard
+    // is heard from the moment its worker is built — before startup returns —
+    // so the very first probe answers 200. It used to wait for each shard's
+    // first finished event, and a probe in the milliseconds before an idle
+    // core's first tick was told "core stalled".
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    let mut last = (0, String::new());
-    for _ in 0..200 {
-        let (status, _, body) = request(http, &get("/healthz")).await;
-        last = (status, body);
-        if last.0 == 200 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert_eq!(last.0, 200, "{}", last.1);
-    assert_eq!(last.1, "ok");
+    let (status, _, body) = request(http, &get("/healthz")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "ok");
 }
 
 #[tokio::test]

@@ -3943,7 +3943,9 @@ Surface (initial):
   against account principals, which are recorded folded; any other principal
   is matched as spelled.
 - `healthz` (liveness; no auth): the process answers and every core shard's
-  heartbeat is within 45 s; database-free, so a database outage shows on
+  heartbeat is within 45 s (a shard is heard from the moment its worker is
+  built, before startup returns, and again as it finishes each event — so an
+  idle core is not "stalled" in the moments before its first tick); database-free, so a database outage shows on
   `readyz` and never restart-loops the container, while a stalled shard is a
   503 the health check acts on. It used to be a constant.
 - `readyz` (the same core check plus configured-PostgreSQL readiness; no auth).
