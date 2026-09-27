@@ -221,6 +221,9 @@ impl ScramClient {
             .next()
             .and_then(|part| part.strip_prefix("s="))
             .and_then(e6irc_proto::base64::decode)
+            // An empty salt is no salt: every account with this password would
+            // share one derived key, precomputable across servers.
+            .filter(|salt| !salt.is_empty())
             .ok_or_else(malformed)?;
         let iterations: u32 = attributes
             .next()
@@ -395,6 +398,20 @@ mod tests {
             start().client_final("s=c2FsdA==,r=abcdef,i=4096"),
             Err(ScramError::MalformedServerFirst(_))
         ));
+    }
+
+    /// RFC 5802 §5.1 makes the salt a required, non-empty attribute; an empty
+    /// one would give every account with this password the same derived key.
+    #[test]
+    fn an_empty_salt_is_a_malformed_server_first() {
+        let client =
+            ScramClient::with_nonce(ScramHash::Sha256, "user", "pencil", "abc").expect("prepared");
+        assert_eq!(
+            client.client_final("r=abcdef,s=,i=4096").err(),
+            Some(ScramError::MalformedServerFirst(
+                "r=abcdef,s=,i=4096".into()
+            ))
+        );
     }
 
     /// Libera answers the client's first message with `e=other-error` when the

@@ -244,3 +244,26 @@ async fn ws_overlong_line_is_refused() {
     let reply = read_until(&mut ws, " 417 ").await;
     assert!(reply.contains("417"), "{reply}");
 }
+
+/// The over-long WebSocket message's label is recovered as over TCP, so a
+/// client that negotiated labeled responses gets the refusal under it.
+#[tokio::test]
+async fn ws_overlong_line_is_refused_under_its_label() {
+    let running = net::start(config()).await.expect("start");
+    let http = running.http_addr.expect("http");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{http}/ws/irc"))
+        .await
+        .expect("ws connect");
+    ws.send(Tung::text("CAP REQ :batch labeled-response"))
+        .await
+        .unwrap();
+    let _ = read_until(&mut ws, " ACK ").await;
+    ws.send(Tung::text("CAP END")).await.unwrap();
+    ws.send(Tung::text("NICK labelc")).await.unwrap();
+    ws.send(Tung::text("USER l 0 * :L")).await.unwrap();
+    let _ = read_until(&mut ws, " 001 ").await;
+    let overlong = format!("@label=ws1 PRIVMSG #x :{}", "A".repeat(1024));
+    ws.send(Tung::text(overlong)).await.unwrap();
+    let reply = read_until(&mut ws, " 417 ").await;
+    assert!(reply.starts_with("@label=ws1 "), "{reply}");
+}

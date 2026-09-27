@@ -220,9 +220,25 @@ struct State<T> {
     sender_count: usize,
     receiver_alive: bool,
     waker: Option<Waker>,
-    /// Producers parked in an async `push` awaiting a free slot.
-    push_wakers: VecDeque<(u64, Waker)>,
+    /// Producers parked in an async `push` or `room_for`, in arrival order,
+    /// each awaiting room for its event's weight.
+    push_wakers: VecDeque<PushWaiter>,
     next_push_waiter: u64,
+}
+
+/// One parked producer: its place in line, the weight it waits to fit, and
+/// how to wake it.
+struct PushWaiter {
+    id: u64,
+    weight: usize,
+    waker: Waker,
+}
+
+/// The one admission rule: an event of `weight` fits a queue holding `load`
+/// when the total stays within `capacity`, or when the queue is empty (see
+/// [`weighted_queue`]).
+fn fits(load: usize, weight: usize, capacity: usize) -> bool {
+    load == 0 || load.saturating_add(weight) <= capacity
 }
 
 impl<T> State<T> {
@@ -238,7 +254,30 @@ impl<T> State<T> {
     /// Whether an event of `weight` fits now: within capacity, or into an
     /// empty queue (see [`weighted_queue`]).
     fn admits(&self, weight: usize, capacity: usize) -> bool {
-        self.load == 0 || self.load.saturating_add(weight) <= capacity
+        fits(self.load, weight, capacity)
+    }
+
+    /// Take, from the front of the line, every parked producer whose event
+    /// fits once the ones ahead of it have pushed theirs — the same
+    /// [`State::admits`] rule, applied as if each woken producer had already
+    /// pushed. The line stays FIFO: a producer whose event does not fit
+    /// blocks the ones behind it, so a stream of light events cannot starve a
+    /// heavy one. A pop that frees too little for the front producer wakes
+    /// nobody (waking it would only have it find the queue still full).
+    fn take_admitted_waiters(&mut self, capacity: usize) -> Vec<Waker> {
+        let mut load = self.load;
+        let mut admitted = 0;
+        for waiter in &self.push_wakers {
+            if !fits(load, waiter.weight, capacity) {
+                break;
+            }
+            load = load.saturating_add(waiter.weight);
+            admitted += 1;
+        }
+        self.push_wakers
+            .drain(..admitted)
+            .map(|waiter| waiter.waker)
+            .collect()
     }
 
     fn enqueue(&mut self, envelope: Envelope<T>, weight: usize) {
@@ -356,41 +395,52 @@ impl<T> Sender<T> {
     /// simply stops reading its socket until the consumer catches up.
     pub fn push(&self, payload: T) -> Push<'_, T> {
         Push {
-            parked: ParkedProducer::new(self),
+            parked: ParkedProducer::new(self, self.shared.weight_of(&payload)),
             payload: Some(payload),
         }
     }
 
-    /// Await the moment the queue has room (or its receiver is gone), without
-    /// committing a payload to the wait. For a producer that must keep doing
-    /// other work while it waits — it holds its events itself, selects on this
-    /// beside its other duties, and offers them with [`Sender::try_push`] once
-    /// it resolves. Room seen is not room held: another producer may take the
-    /// slot first, and the `try_push` then says so.
-    pub fn room(&self) -> Room<'_, T> {
+    /// Await the moment the queue has room for `pending` (or its receiver is
+    /// gone), without committing it to the wait. For a producer that must keep
+    /// doing other work while it waits — it holds its events itself, selects on
+    /// this beside its other duties, and offers `pending` with
+    /// [`Sender::try_push`] once it resolves. Room is judged by the same
+    /// admission rule `try_push` applies to `pending`'s weight, so on a
+    /// weighted queue it does not resolve for room a heavier event cannot use.
+    /// Room seen is not room held: another producer may take it first, and the
+    /// `try_push` then says so.
+    pub fn room_for(&self, pending: &T) -> Room<'_, T> {
         Room {
-            parked: ParkedProducer::new(self),
+            parked: ParkedProducer::new(self, self.shared.weight_of(pending)),
         }
     }
 }
 
-/// One producer's place in a full queue's FIFO line of waiters.
+/// One producer's place in a full queue's FIFO line of waiters, waiting for
+/// room for `weight`.
 ///
 /// Dropping it while still in line leaves the line, so a cancelled producer
 /// cannot consume a later wakeup and leave a live producer parked. Dropping it
-/// after a pop already chose it — the freed slot's only wakeup was spent on
-/// it — passes that wakeup to the next in line, for the same reason.
+/// after a pop already chose it — the room it was woken for will not be used
+/// by it — offers that room to the line again, for the same reason.
 struct ParkedProducer<'a, T> {
     sender: &'a Sender<T>,
+    weight: usize,
     waiter: Option<u64>,
 }
 
 impl<'a, T> ParkedProducer<'a, T> {
-    fn new(sender: &'a Sender<T>) -> Self {
+    fn new(sender: &'a Sender<T>, weight: usize) -> Self {
         Self {
             sender,
+            weight,
             waiter: None,
         }
+    }
+
+    /// Whether this producer's event fits now.
+    fn admitted(&self, state: &State<T>) -> bool {
+        state.admits(self.weight, self.sender.shared.config.capacity)
     }
 
     /// Join the line (once), or refresh the waker already in it.
@@ -410,10 +460,14 @@ impl<'a, T> ParkedProducer<'a, T> {
         match state
             .push_wakers
             .iter_mut()
-            .find(|(candidate, _)| *candidate == waiter)
+            .find(|candidate| candidate.id == waiter)
         {
-            Some((_, registered)) => registered.clone_from(cx.waker()),
-            None => state.push_wakers.push_back((waiter, cx.waker().clone())),
+            Some(registered) => registered.waker.clone_from(cx.waker()),
+            None => state.push_wakers.push_back(PushWaiter {
+                id: waiter,
+                weight: self.weight,
+                waker: cx.waker().clone(),
+            }),
         }
     }
 
@@ -433,15 +487,17 @@ impl<T> Drop for ParkedProducer<'_, T> {
             let mut state = self.sender.shared.lock();
             let still_parked = remove_push_waiter(&mut state, Some(waiter));
             // Parked once and no longer listed: a pop took this registration
-            // and spent the freed slot's only wakeup on this producer. It will
-            // never use the slot, so the next parked producer must be told —
-            // nothing else will wake it while the consumer waits on an empty
-            // queue.
-            next = (!still_parked && state.load < self.sender.shared.config.capacity)
-                .then(|| state.push_wakers.pop_front())
-                .flatten();
+            // and counted this producer's event against the room it freed. It
+            // will never use that room, so the line must be offered it again —
+            // nothing else wakes the next producer while the consumer waits on
+            // an empty queue.
+            next = if still_parked {
+                Vec::new()
+            } else {
+                state.take_admitted_waiters(self.sender.shared.config.capacity)
+            };
         }
-        if let Some((_, waker)) = next {
+        for waker in next {
             waker.wake();
         }
     }
@@ -475,16 +531,11 @@ impl<T> Future for Push<'_, T> {
                     .take()
                     .expect("push future polled after ready")));
             }
-            let payload = this
-                .payload
-                .as_ref()
-                .expect("push future polled after ready");
-            let weight = sender.shared.weight_of(payload);
-            if state.admits(weight, sender.shared.config.capacity) {
+            if this.parked.admitted(&state) {
                 this.parked.served(&mut state);
                 let seq = state.next_sequence();
                 let payload = this.payload.take().expect("push future polled after ready");
-                state.enqueue(Envelope { seq, payload }, weight);
+                state.enqueue(Envelope { seq, payload }, this.parked.weight);
                 state.update_mode(sender.shared.config.policy);
                 sender.shared.publish(&state);
                 receiver_waker = state.waker.take();
@@ -501,8 +552,8 @@ impl<T> Future for Push<'_, T> {
     }
 }
 
-/// Resolves once the queue has room or its receiver is gone; see
-/// [`Sender::room`].
+/// Resolves once the queue has room for the pending event or its receiver is
+/// gone; see [`Sender::room_for`].
 pub struct Room<'a, T> {
     parked: ParkedProducer<'a, T>,
 }
@@ -514,7 +565,7 @@ impl<T> Future for Room<'_, T> {
         let this = self.get_mut();
         let sender = this.parked.sender;
         let mut state = sender.shared.lock();
-        if !state.receiver_alive || state.load < sender.shared.config.capacity {
+        if !state.receiver_alive || this.parked.admitted(&state) {
             this.parked.served(&mut state);
             Poll::Ready(())
         } else {
@@ -530,9 +581,7 @@ fn remove_push_waiter<T>(state: &mut State<T>, waiter: Option<u64>) -> bool {
         return false;
     };
     let parked = state.push_wakers.len();
-    state
-        .push_wakers
-        .retain(|(candidate, _)| *candidate != waiter);
+    state.push_wakers.retain(|candidate| candidate.id != waiter);
     state.push_wakers.len() != parked
 }
 
@@ -540,15 +589,15 @@ impl<T> Receiver<T> {
     /// Non-blocking pop; also the primitive a deterministic stepper
     /// drives. `None` means "currently empty", not "closed".
     pub fn try_pop(&mut self) -> Option<Envelope<T>> {
-        let (env, waker);
+        let (env, wakers);
         {
             let mut state = self.shared.lock();
             env = state.dequeue()?;
             state.update_mode(self.shared.config.policy);
             self.shared.publish(&state);
-            waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
+            wakers = state.take_admitted_waiters(self.shared.config.capacity);
         }
-        if let Some(waker) = waker {
+        for waker in wakers {
             waker.wake();
         }
         Some(env)
@@ -561,7 +610,7 @@ impl<T> Receiver<T> {
     }
 
     fn poll_pop(&mut self, cx: &mut Context<'_>) -> Poll<Option<Envelope<T>>> {
-        let (popped, waker);
+        let (popped, wakers);
         {
             let mut state = self.shared.lock();
             popped = state.dequeue();
@@ -569,7 +618,7 @@ impl<T> Receiver<T> {
                 Some(_) => {
                     state.update_mode(self.shared.config.policy);
                     self.shared.publish(&state);
-                    waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
+                    wakers = state.take_admitted_waiters(self.shared.config.capacity);
                 }
                 None => {
                     if state.sender_count == 0 {
@@ -580,7 +629,7 @@ impl<T> Receiver<T> {
                 }
             }
         }
-        if let Some(waker) = waker {
+        for waker in wakers {
             waker.wake();
         }
         Poll::Ready(popped)
@@ -656,8 +705,8 @@ impl<T> Drop for Receiver<T> {
             // payloads back.
             wakers = std::mem::take(&mut state.push_wakers);
         }
-        for (_, waker) in wakers {
-            waker.wake();
+        for waiter in wakers {
+            waiter.waker.wake();
         }
     }
 }
@@ -1057,7 +1106,7 @@ mod tests {
     impl<'a> CountedRoom<'a> {
         fn on(sender: &'a Sender<u32>) -> Self {
             Self {
-                room: Box::pin(sender.room()),
+                room: Box::pin(sender.room_for(&0)),
                 wakes: StdArc::new(CountWakes(Default::default())),
             }
         }
@@ -1115,6 +1164,120 @@ mod tests {
         assert!(next.poll().is_ready());
     }
 
+    fn bytes(capacity: usize) -> (Sender<Vec<u8>>, Receiver<Vec<u8>>) {
+        weighted_queue(
+            Config {
+                name: "bytes",
+                capacity,
+                policy: Policy::Fifo,
+            },
+            Vec::len,
+        )
+    }
+
+    /// Poll `future` once with a waker that counts its wakeups.
+    fn poll_counting<F: Future>(
+        future: Pin<&mut F>,
+        wakes: &StdArc<CountWakes>,
+    ) -> Poll<F::Output> {
+        let waker = Waker::from(wakes.clone());
+        future.poll(&mut Context::from_waker(&waker))
+    }
+
+    fn counter() -> StdArc<CountWakes> {
+        StdArc::new(CountWakes(Default::default()))
+    }
+
+    /// Room is room for the pending event's weight, by the admission rule
+    /// `try_push` applies — not "below capacity". Otherwise a producer holding
+    /// a 41-byte event beside a 90-byte load sees room, is refused by
+    /// `try_push`, and waits for room again: a busy spin.
+    #[test]
+    fn room_on_a_weighted_queue_waits_until_the_pending_event_fits() {
+        let (tx, mut rx) = bytes(100);
+        tx.try_push(vec![0; 60]).unwrap();
+        tx.try_push(vec![0; 30]).unwrap();
+        let pending = vec![0; 41];
+        let wakes = counter();
+        let mut room = Box::pin(tx.room_for(&pending));
+        assert!(
+            poll_counting(room.as_mut(), &wakes).is_pending(),
+            "90 + 41 bytes do not fit a 100-byte queue"
+        );
+        assert_eq!(rx.try_pop().unwrap().payload.len(), 60);
+        assert_eq!(wakes.count(), 1);
+        assert!(poll_counting(room.as_mut(), &wakes).is_ready());
+        tx.try_push(pending).unwrap();
+    }
+
+    /// A pop wakes, in line order, every parked producer whose event fits once
+    /// those ahead of it have pushed — not exactly one regardless of how much
+    /// it freed, which leaves producers parked beside room they could use.
+    #[test]
+    fn a_pop_wakes_every_parked_producer_whose_event_fits() {
+        let (tx, mut rx) = bytes(10);
+        tx.try_push(vec![0; 10]).unwrap();
+        let mut parked: Vec<_> = [3, 3, 5]
+            .into_iter()
+            .map(|weight| (Box::pin(tx.push(vec![0; weight])), counter()))
+            .collect();
+        for (push, wakes) in &mut parked {
+            assert!(poll_counting(push.as_mut(), wakes).is_pending());
+        }
+        rx.try_pop().unwrap();
+        let woken: Vec<_> = parked.iter().map(|(_, wakes)| wakes.count()).collect();
+        assert_eq!(woken, [1, 1, 0], "3 + 3 bytes fit; 3 + 3 + 5 do not");
+        for (push, wakes) in &mut parked[..2] {
+            assert!(poll_counting(push.as_mut(), wakes).is_ready());
+        }
+        assert_eq!(tx.depth(), 6);
+    }
+
+    /// The line is FIFO by weight too: a pop that frees too little for the
+    /// front producer wakes nobody — not the front producer, who would only
+    /// find the queue still full, and not a lighter one behind it, who would
+    /// overtake it and could starve it indefinitely.
+    #[test]
+    fn a_pop_that_frees_too_little_for_the_front_producer_wakes_nobody() {
+        let (tx, mut rx) = bytes(10);
+        tx.try_push(vec![0; 5]).unwrap();
+        tx.try_push(vec![0; 5]).unwrap();
+        let (heavy_wakes, light_wakes) = (counter(), counter());
+        let mut heavy = Box::pin(tx.push(vec![0; 8]));
+        let mut light = Box::pin(tx.push(vec![0; 1]));
+        assert!(poll_counting(heavy.as_mut(), &heavy_wakes).is_pending());
+        assert!(poll_counting(light.as_mut(), &light_wakes).is_pending());
+        rx.try_pop().unwrap();
+        assert_eq!((heavy_wakes.count(), light_wakes.count()), (0, 0));
+        // Emptied: 8 + 1 bytes fit, so both go, the heavy one first.
+        rx.try_pop().unwrap();
+        assert_eq!((heavy_wakes.count(), light_wakes.count()), (1, 1));
+        assert!(poll_counting(heavy.as_mut(), &heavy_wakes).is_ready());
+        assert!(poll_counting(light.as_mut(), &light_wakes).is_ready());
+        assert_eq!(rx.try_pop().unwrap().payload.len(), 8);
+    }
+
+    /// The handoff when a woken producer is dropped unused is weight-aware
+    /// too: the room it was counted against goes to every producer that now
+    /// fits.
+    #[test]
+    fn a_weighted_producer_dropped_after_its_wakeup_hands_its_room_on() {
+        let (tx, mut rx) = bytes(10);
+        tx.try_push(vec![0; 10]).unwrap();
+        let (dropped_wakes, first_wakes, second_wakes) = (counter(), counter(), counter());
+        let mut dropped = Box::pin(tx.push(vec![0; 10]));
+        let mut first = Box::pin(tx.push(vec![0; 4]));
+        let mut second = Box::pin(tx.push(vec![0; 4]));
+        assert!(poll_counting(dropped.as_mut(), &dropped_wakes).is_pending());
+        assert!(poll_counting(first.as_mut(), &first_wakes).is_pending());
+        assert!(poll_counting(second.as_mut(), &second_wakes).is_pending());
+        rx.try_pop().unwrap();
+        assert_eq!(dropped_wakes.count(), 1);
+        assert_eq!((first_wakes.count(), second_wakes.count()), (0, 0));
+        drop(dropped);
+        assert_eq!((first_wakes.count(), second_wakes.count()), (1, 1));
+    }
+
     #[test]
     #[should_panic(expected = "capacity must be > 0")]
     fn zero_capacity_is_a_loud_construction_error() {
@@ -1147,14 +1310,7 @@ mod loom_tests {
     /// the waker protocol only runs in the async path.
     #[test]
     fn async_push_pop_wakers_lose_no_wakeup_under_all_interleavings() {
-        // Bounded exploration: three threads of async machinery explode the
-        // unbounded state space past any CI budget. A preemption bound of 2
-        // is loom's own recommended setting — most real bugs (including lost
-        // wakeups, which need exactly one preemption between registration and
-        // re-check) surface within it.
-        let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(2);
-        model.check(|| {
+        bounded_model(|| {
             let (tx, mut rx) = queue::<u32>(Config {
                 name: "loom-async",
                 capacity: 1,
@@ -1180,7 +1336,7 @@ mod loom_tests {
     }
 
     /// The cross-shard lane's way of producing — hold the event, wait for
-    /// `room`, offer it with `try_push` — under contention: two such producers
+    /// `room_for` it, offer it with `try_push` — under contention: two such producers
     /// share a capacity-1 queue. A lost wakeup parks one forever (a deadlocked
     /// branch in loom); losing the race for a slot must only mean waiting again.
     #[test]
@@ -1191,15 +1347,13 @@ mod loom_tests {
                     Ok(_) => return,
                     Err(PushError::Full(back)) => {
                         payload = back;
-                        tx.room().await;
+                        tx.room_for(&payload).await;
                     }
                     Err(PushError::Closed(_)) => panic!("receiver alive"),
                 }
             }
         }
-        let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(2);
-        model.check(|| {
+        bounded_model(|| {
             let (tx, mut rx) = queue::<u32>(Config {
                 name: "loom-room",
                 capacity: 1,
@@ -1217,6 +1371,108 @@ mod loom_tests {
             t2.join().unwrap();
             got.sort_unstable();
             assert_eq!(got, vec![1, 2]);
+        });
+    }
+
+    /// Bounded exploration: three threads of async machinery explode the
+    /// unbounded state space past any CI budget. A preemption bound of 2 is
+    /// loom's own recommended setting — most real bugs (including lost
+    /// wakeups, which need exactly one preemption between registration and
+    /// re-check) surface within it.
+    fn bounded_model(body: impl Fn() + Sync + Send + 'static) {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(body);
+    }
+
+    /// The handoff in `ParkedProducer::drop`: a producer parks on a full queue
+    /// and is then dropped, in every order relative to the pop that frees the
+    /// slot. Dropped after that pop chose it, it must pass the wakeup on, or
+    /// the other parked producer waits forever beside a drained queue — a
+    /// deadlocked branch in loom.
+    #[test]
+    fn a_parked_producer_dropped_after_its_wakeup_loses_no_wakeup() {
+        bounded_model(|| {
+            let (tx, mut rx) = queue::<u32>(Config {
+                name: "loom-handoff",
+                capacity: 1,
+                policy: Policy::Fifo,
+            });
+            tx.try_push(0).unwrap();
+            let tx2 = tx.clone();
+            let t1 = loom::thread::spawn(move || {
+                let mut push = tx.push(1);
+                let mut cx = Context::from_waker(Waker::noop());
+                // Poll once, then give up: dropped while parked, or after.
+                match Pin::new(&mut push).poll(&mut cx) {
+                    Poll::Ready(result) => result.is_ok(),
+                    Poll::Pending => false,
+                }
+            });
+            let t2 = loom::thread::spawn(move || {
+                loom::future::block_on(tx2.push(2)).expect("receiver alive");
+            });
+            let mut got = Vec::new();
+            while !got.contains(&2) {
+                let env = loom::future::block_on(rx.pop()).expect("a push in flight");
+                got.push(env.payload);
+            }
+            let pushed_one = t1.join().unwrap();
+            t2.join().unwrap();
+            while let Some(env) = rx.try_pop() {
+                got.push(env.payload);
+            }
+            got.sort_unstable();
+            let expected = if pushed_one {
+                vec![0, 1, 2]
+            } else {
+                vec![0, 2]
+            };
+            assert_eq!(got, expected);
+        });
+    }
+
+    /// The receiver goes away while producers are parked on its full queue:
+    /// every one of them is woken and gets its own payload back.
+    #[test]
+    fn a_dropped_receiver_returns_every_parked_payload() {
+        bounded_model(|| {
+            let (tx, rx) = queue::<u32>(Config {
+                name: "loom-close",
+                capacity: 1,
+                policy: Policy::Fifo,
+            });
+            tx.try_push(0).unwrap();
+            let tx2 = tx.clone();
+            let t1 = loom::thread::spawn(move || loom::future::block_on(tx.push(1)));
+            let t2 = loom::thread::spawn(move || loom::future::block_on(tx2.push(2)));
+            drop(rx);
+            assert_eq!(t1.join().unwrap(), Err(1));
+            assert_eq!(t2.join().unwrap(), Err(2));
+        });
+    }
+
+    /// The last sender goes away while the receiver is parked in `pop`: the
+    /// pop drains what was pushed and then resolves to `None`, never waits on.
+    #[test]
+    fn a_parked_pop_resolves_to_none_when_the_last_sender_drops() {
+        bounded_model(|| {
+            let (tx, mut rx) = queue::<u32>(Config {
+                name: "loom-senders-gone",
+                capacity: 1,
+                policy: Policy::Fifo,
+            });
+            let tx2 = tx.clone();
+            let t1 = loom::thread::spawn(move || {
+                tx.try_push(1).unwrap();
+                drop(tx);
+            });
+            let t2 = loom::thread::spawn(move || drop(tx2));
+            let first = loom::future::block_on(rx.pop()).map(|env| env.payload);
+            assert_eq!(first, Some(1));
+            assert_eq!(loom::future::block_on(rx.pop()), None);
+            t1.join().unwrap();
+            t2.join().unwrap();
         });
     }
 

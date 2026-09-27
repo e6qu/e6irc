@@ -1121,6 +1121,48 @@ Maintainer decisions implemented from a review of resource bounds (DESIGN
   Excess Flood. The allowance keeps Solanum's shape (40, then 20 a second) and
   its operator exemption.
 
+A further review found, and this change fixes, each with a test that failed
+before:
+
+- **`server-time` parsing accepted many spellings of one instant**:
+  `2026-7-18T12:0:0Z`, `02026-…`, an empty fraction (`.Z`), trailing garbage
+  after the fraction (`.000garbageZ`), and a fourth fraction digit, silently
+  truncated. Fields are now fixed-width, and the fraction is absent or one to
+  three digits up to the `Z` (the server emits three; one or two still come
+  from third-party upstreams the bouncer ingests).
+- **An empty secret or account passed through from the command line** of the
+  CLI and TUI (`--password ''`, `--oauth-token ''`, `--account ''`), where an
+  empty environment variable or file was refused; one check now covers every
+  source.
+- **The bounded queue judged room by count on a weighted queue**: `room()`
+  resolved while the pending event did not fit (a busy spin), and a pop woke
+  exactly one parked producer whatever weight it freed. Room is now asked for
+  an event (`room_for`), and a pop wakes, in line order, every producer whose
+  event fits; three new loom models cover the drop handoff, a receiver dropped
+  under parked producers, and the last sender dropped under a parked pop
+  (DESIGN §7.3).
+- **An over-long line the framer dropped was answered without its label**,
+  though a line refused later for the same reason was labeled; the framer now
+  recovers the label from the prefix it held, over TCP and WebSocket alike
+  (DESIGN §7.1).
+- **The SCRAM client accepted an empty salt**; it is a malformed server-first
+  message now.
+- **An IPv4-mapped CIDR ban (`*!*@::ffff:203.0.113.0/120`) was stored but
+  could never match**, subjects' addresses being canonical IPv4; the same held
+  for `limits.trusted_proxies` and `limits.require_sasl_from`. A mapped range
+  is now read as its IPv4 range everywhere, and one shorter than `/96` is
+  refused.
+- **An attachment was counted as attached before it subscribed** to the
+  network's live events, so `attached_clients` could report a client that
+  would only see what was published in between through the ring's replay;
+  `lagged_attach_is_not_left_open_with_stale_session_state` waits on that count
+  and hung under load (its burst went into the 8-line ring instead of lagging
+  the live feed). The count is now taken by the subscription itself
+  (`AttachSnapshot::attachment`), for raw-IRC and web attachments alike.
+- **DESIGN §7.1 described CAP and SASL state machines in `e6irc-proto`** that
+  are not there, and the message module claimed a serializer; both now say
+  what the crate holds.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

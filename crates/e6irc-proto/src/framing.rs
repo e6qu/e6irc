@@ -2,9 +2,11 @@
 //!
 //! IRC lines end in CRLF; lenient implementations also accept bare LF
 //! (Solanum does), so we do too. A line longer than the limit is
-//! reported as an error carrying the truncated prefix — the caller must
-//! answer `ERR_INPUTTOOLONG`/`FAIL`, never silently truncate — and the
-//! remainder of that over-long line is discarded up to its terminator.
+//! reported as [`LineEvent::TooLong`], carrying the `label` its retained
+//! prefix names (when that prefix holds a complete, well-formed tag section)
+//! so the caller can answer `ERR_INPUTTOOLONG` under the label the client is
+//! waiting on — never silently truncate — and the rest of that over-long line
+//! is discarded up to its terminator.
 
 /// Accumulates raw socket bytes and yields complete lines.
 #[derive(Debug)]
@@ -21,9 +23,27 @@ pub enum LineEvent {
     /// **not** stripped here — it is passed through for `Message::parse` to
     /// reject, so the framing layer never silently alters line content.
     Line(Vec<u8>),
-    /// A line exceeded the limit; the overflowing content is dropped
-    /// (this event fires once per over-long line, at detection time).
-    TooLong,
+    /// A line exceeded the limit; its content is dropped (this event fires
+    /// once per over-long line, at detection time). `label` is the unescaped
+    /// value of its `label` tag, when the retained prefix holds the whole tag
+    /// section (see [`LineEvent::too_long`]).
+    TooLong { label: Option<String> },
+}
+
+impl LineEvent {
+    /// The event for an over-long line of which `prefix` was received: its
+    /// label, read from the tag section exactly as for a line refused after
+    /// framing (the last occurrence wins). None when the tag section is
+    /// malformed, or does not end within the client tag budget
+    /// ([`MAX_CLIENT_TAGS_LEN`](crate::message::MAX_CLIENT_TAGS_LEN)) — so the
+    /// label a reply echoes is bounded by that budget, however long the
+    /// prefix (a WebSocket message is one whole line).
+    pub fn too_long(prefix: &[u8]) -> Self {
+        let window = &prefix[..prefix.len().min(crate::message::MAX_CLIENT_TAGS_LEN)];
+        Self::TooLong {
+            label: crate::message::tag_section_value(window, "label"),
+        }
+    }
 }
 
 impl LineBuffer {
@@ -65,9 +85,9 @@ impl LineBuffer {
             // will overflow on its next byte anyway.
             let effective = self.buf.len() - usize::from(self.buf.last() == Some(&b'\r'));
             if effective > self.limit {
+                out.push(LineEvent::too_long(&self.buf));
                 self.buf.clear();
                 self.discarding = true;
-                out.push(LineEvent::TooLong);
             }
         }
     }
@@ -127,7 +147,10 @@ mod tests {
     fn overlong_line_reports_once_and_discards_to_terminator() {
         let mut lb = LineBuffer::new(8);
         let got = feed_all(&mut lb, &[b"0123456789ABCDEF\r\nPING x\r\n"]);
-        assert_eq!(got, vec![LineEvent::TooLong, line("PING x")]);
+        assert_eq!(
+            got,
+            vec![LineEvent::TooLong { label: None }, line("PING x")]
+        );
     }
 
     #[test]
@@ -135,7 +158,62 @@ mod tests {
         let mut lb = LineBuffer::new(8);
         // 6 bytes, then 6 more: crosses the limit mid-second-chunk.
         let got = feed_all(&mut lb, &[b"AAAAAA", b"BBBBBB", b"CC\r\nPING y\r\n"]);
-        assert_eq!(got, vec![LineEvent::TooLong, line("PING y")]);
+        assert_eq!(
+            got,
+            vec![LineEvent::TooLong { label: None }, line("PING y")]
+        );
+    }
+
+    /// The client is waiting on the over-long line's label, so the event
+    /// carries it whenever the retained prefix holds the whole tag section —
+    /// wherever the chunk boundaries fall.
+    #[test]
+    fn overlong_line_carries_the_label_its_tag_section_names() {
+        let wire = b"@label=a\\sb;x=y PRIVMSG #c :0123456789012345678901234567890\r\nPING z\r\n";
+        for chunk in [1, 7, wire.len()] {
+            let mut lb = LineBuffer::new(32);
+            let chunks: Vec<&[u8]> = wire.chunks(chunk).collect();
+            assert_eq!(
+                feed_all(&mut lb, &chunks),
+                vec![
+                    LineEvent::TooLong {
+                        label: Some("a b".into())
+                    },
+                    line("PING z")
+                ],
+                "chunk {chunk}"
+            );
+        }
+        // A tag section cut off by the limit, or malformed, names no label.
+        for wire in [
+            &b"@label=abc;padding=0123456789012345678901234567 PING\r\n"[..],
+            b"@label=abc;;=x PRIVMSG #c :0123456789012345678901234567890\r\n",
+        ] {
+            let mut lb = LineBuffer::new(32);
+            assert_eq!(
+                feed_all(&mut lb, &[wire]),
+                vec![LineEvent::TooLong { label: None }]
+            );
+        }
+    }
+
+    /// A reply echoes the recovered label, so it is recovered only from a tag
+    /// section within the client tag budget — a WebSocket message hands over
+    /// the whole over-long line, not a framer-bounded prefix.
+    #[test]
+    fn a_label_is_recovered_only_within_the_client_tag_budget() {
+        let budget = crate::message::MAX_CLIENT_TAGS_LEN;
+        // `@label=` + value + ` ` is exactly the budget: recovered.
+        let fits = format!("@label={} PRIVMSG #c :x", "v".repeat(budget - 8));
+        assert!(matches!(
+            LineEvent::too_long(fits.as_bytes()),
+            LineEvent::TooLong { label: Some(label) } if label.len() == budget - 8
+        ));
+        let over = format!("@label={} PRIVMSG #c :x", "v".repeat(budget - 7));
+        assert_eq!(
+            LineEvent::too_long(over.as_bytes()),
+            LineEvent::TooLong { label: None }
+        );
     }
 
     #[test]

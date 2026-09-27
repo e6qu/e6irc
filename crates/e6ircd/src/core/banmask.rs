@@ -62,7 +62,8 @@ pub(crate) enum MaskError {
     /// or carrying a `$#channel` ban forward (not implemented).
     MalformedExtban,
     /// A host of the form `<address>/<bits>` whose prefix length is not one the
-    /// address family has.
+    /// address family has — or, for an IPv4-mapped IPv6 network, is shorter
+    /// than `/96` (see [`canonical_network`]).
     MalformedCidr,
 }
 
@@ -92,9 +93,10 @@ impl MaskShape {
             // `<address>/<bits>`. A host with a `/` whose left side is not an
             // address is an ordinary glob — Libera's cloaks (`user/alice`)
             // are exactly that.
-            Some((address, _)) if address.parse::<IpAddr>().is_ok() => host
-                .parse::<ipnet::IpNet>()
-                .map_err(|_| MaskError::MalformedCidr)?,
+            Some((address, _)) if address.parse::<IpAddr>().is_ok() => canonical_network(
+                host.parse::<ipnet::IpNet>()
+                    .map_err(|_| MaskError::MalformedCidr)?,
+            )?,
             Some(_) => return Ok(Self::Glob),
             // A bare address is its own single-address network, so every
             // spelling of it (`2001:DB8::1`, `2001:db8:0::1`) matches alike.
@@ -172,6 +174,13 @@ impl MaskShape {
             }
         }
     }
+}
+
+/// `net` as a subject's canonical address is matched against it
+/// ([`crate::net::canonical_network`]); a mapped network shorter than `/96` is
+/// refused as [`MaskError::MalformedCidr`] rather than stored half-matchable.
+fn canonical_network(net: ipnet::IpNet) -> Result<ipnet::IpNet, MaskError> {
+    crate::net::canonical_network(net).ok_or(MaskError::MalformedCidr)
 }
 
 /// Who a mask is tested against.
@@ -253,6 +262,23 @@ mod tests {
         assert!(!hit("*!*@203.0.113.0/24", &v6), "another family");
     }
 
+    /// A subject's address is canonical (IPv4, never IPv4-mapped IPv6), so an
+    /// IPv4-mapped network matches as the IPv4 range it names — stored as
+    /// written, it could never match anyone.
+    #[test]
+    fn an_ipv4_mapped_network_matches_as_its_ipv4_range() {
+        let subject = user("n!u@cloak.test", "203.0.113.9", None);
+        assert!(hit("*!*@::ffff:203.0.113.0/120", &subject));
+        assert!(hit("*!*@::FFFF:CB00:7100/120", &subject), "any spelling");
+        assert!(hit("*!*@::ffff:203.0.113.9/128", &subject));
+        assert!(hit("::ffff:0.0.0.0/96", &subject), "every IPv4 address");
+        assert!(!hit("*!*@::ffff:203.0.114.0/120", &subject));
+        let Ok(MaskShape::Cidr { net, .. }) = MaskShape::parse("*!*@::ffff:203.0.113.0/120") else {
+            panic!("a CIDR mask");
+        };
+        assert_eq!(net, "203.0.113.0/24".parse::<ipnet::IpNet>().expect("net"));
+    }
+
     #[test]
     fn a_glob_still_matches_the_shown_host() {
         let cloaked = user("n!u@user/alice", "203.0.113.9", None);
@@ -295,6 +321,8 @@ mod tests {
             ("*!*@203.0.113.0/x", MaskError::MalformedCidr),
             ("*!*@2001:db8::/129", MaskError::MalformedCidr),
             ("203.0.113.0/", MaskError::MalformedCidr),
+            ("*!*@::ffff:203.0.113.0/95", MaskError::MalformedCidr),
+            ("::ffff:0.0.0.0/64", MaskError::MalformedCidr),
         ] {
             assert_eq!(MaskShape::parse(mask).err(), Some(error), "{mask}");
         }

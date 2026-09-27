@@ -1514,6 +1514,25 @@ impl ClientIp {
     }
 }
 
+/// An address range in the spelling a [`ClientIp`] is matched in. A client's
+/// address is canonical (IPv4, never IPv4-mapped IPv6), so an IPv4-mapped
+/// network is its IPv4 equivalent — `::ffff:203.0.113.0/120` is
+/// `203.0.113.0/24` — or it could never contain anyone. `None` for a mapped
+/// network shorter than `/96`: it also spans addresses that are not
+/// IPv4-mapped, so it names no IPv4 range, and no single intent. Every
+/// operator-written range (a ban, a trusted proxy, a SASL-only range) goes
+/// through this one conversion where it is read.
+pub(crate) fn canonical_network(net: ipnet::IpNet) -> Option<ipnet::IpNet> {
+    let ipnet::IpNet::V6(v6) = net else {
+        return Some(net);
+    };
+    let Some(v4) = v6.addr().to_ipv4_mapped() else {
+        return Some(net);
+    };
+    let prefix = v6.prefix_len().checked_sub(96)?;
+    ipnet::Ipv4Net::new(v4, prefix).ok().map(ipnet::IpNet::V4)
+}
+
 impl std::fmt::Display for ClientIp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)

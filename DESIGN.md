@@ -350,8 +350,9 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - Nor does it await another worker's queue, which is the same deadlock with
     two participants. It `try_push`es; what does not fit waits in a bounded
     per-destination backlog (65,536, in order) while the worker keeps reading
-    its own queue, woken by `Sender::room()` — a future that holds no payload
-    and is therefore cancel-safe. Exceeding the backlog stops the worker with
+    its own queue, woken by `Sender::room_for(oldest)` — a future that
+    resolves when the oldest backlogged event fits, holds no payload, and is
+    therefore cancel-safe. Exceeding the backlog stops the worker with
     the typed `CoreWorkerExit::Backlogged`, which supervision treats as the
     critical failure it is.
   - One worker and N workers give the same answers by construction. The
@@ -579,7 +580,7 @@ e6irc/
 ├── Cargo.toml                # workspace
 ├── crates/
 │   ├── e6irc-proto/          # IRC message model, parser, tag escaping, casemapping,
-│   │                         #   numerics, ISUPPORT, CAP/SASL state machines (no I/O)
+│   │                         #   numerics, ISUPPORT, framing, SASL limits/PLAIN (no I/O)
 │   ├── e6irc-queue/          # custom bounded queue: the core↔DB and SendQ
 │   │                         #   communication primitive (§7.3); loom-verified,
 │   │                         #   step-schedulable for deterministic tests
@@ -788,8 +789,14 @@ strip = "symbols"
   `bouncer_lines` fuzz target pins that.
 - Casemapping: **`rfc1459`** (what Libera/Solanum advertises), implemented
   once here and used for every nick/channel comparison in the entire system.
-- Includes the numerics table, ISUPPORT token model, and the CAP and SASL
-  client/server state machines (pure, I/O-free, unit-tested).
+- Includes the numerics table, the ISUPPORT token model, the byte-stream line
+  framer, `server-time` formatting and parsing, and the SASL pieces both sides
+  share: the `AUTHENTICATE` chunk and credential limits and SASL PLAIN payload
+  parsing (`sasl`), plus the `base64` codec (all pure, I/O-free,
+  unit-tested). Capability negotiation is not modelled here: the server's CAP
+  handling is the core's (`core/handler/registration.rs`) and the bouncer
+  attach listener's (`bouncer/serve.rs`), the client's is `e6irc-client`'s
+  connection, and the SCRAM-SHA-256/512 client is `e6irc-client/src/scram.rs`.
 - Fuzz coverage also pins the byte-stream framer (`LineBuffer::feed`: every
   emitted line fits the inbound limit, and the line sequence is independent of
   how the stream is chunked into reads), `base64` (decode never panics on
@@ -1006,10 +1013,16 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   invariant, not a best effort.
 - Consumer API: `async pop()` in runtime mode (custom waker, no tokio
   channel underneath); `try_pop()` as the nonblocking/manual-step primitive.
-- Async producers wait in FIFO order. One freed slot wakes one live producer,
-  and dropping a pending push removes its waiter registration; cancellation
-  cannot consume a future wakeup and a single pop cannot create a
-  thundering-herd repoll.
+- Async producers (`push`, and `room_for` for a producer holding its own
+  event) wait in FIFO order, each for room for its event's *weight*, judged by
+  the same admission rule `try_push` applies. A pop wakes, from the front of the
+  line, exactly the producers whose events fit once those ahead of them have
+  pushed — on an unweighted queue, one per freed slot; a front producer that
+  still does not fit blocks those behind it, so light events cannot starve a
+  heavy one, and a pop that frees too little wakes nobody. Dropping a pending
+  push removes its waiter registration, and dropping one a pop already woke
+  offers its room to the line again; cancellation cannot consume a future
+  wakeup and a single pop cannot create a thundering-herd repoll.
 - Instrumentation built in: depth, current FIFO/LIFO mode, and mode-switch
   count.
 - **Adaptive degraded mode (FIFO→LIFO)**: per-queue opt-in policy. When
@@ -1277,7 +1290,8 @@ subset's exact behavior.
   The account extban `$a` / `$a:<glob>` / `$~a…` (Solanum `extb_account`)
   works on all four lists; ISUPPORT advertises exactly that
   (`EXTBAN=$,a`, `ACCOUNTEXTBAN=a`). A mask that could never match as written
-  — another extban type, a CIDR prefix out of range — is refused with 696,
+  — another extban type, a CIDR prefix out of range, an IPv4-mapped range
+  shorter than `/96` (a longer one is its IPv4 range, §15) — is refused with 696,
   never stored. What a mask means is decided once when it is stored
   (`core/banmask.rs`), not on every match.
 - JOIN admission runs Solanum's `can_join` order: ban, key (compared
@@ -4177,7 +4191,13 @@ but the CLI, TUI, and BNC must surface the rejection.
 - A client address is canonicalised once (`ClientIp`): IPv4-mapped IPv6
   becomes IPv4 for limiter keys, ban hosts, trusted-proxy matching and each
   forwarded entry, so a D-line on an IPv4 address matches a `/ws/irc` user on a
-  dual-stack listener and a proxy in a trusted IPv4 range is trusted.
+  dual-stack listener and a proxy in a trusted IPv4 range is trusted. Every
+  operator-written range — a CIDR ban or D-line, `limits.trusted_proxies`,
+  `limits.require_sasl_from` — is canonicalised the same way where it is read
+  (`net::canonical_network`): an IPv4-mapped range is its IPv4 range
+  (`::ffff:203.0.113.0/120` is `203.0.113.0/24`), and a mapped range shorter
+  than `/96`, which spans non-IPv4 addresses too, is refused, so no stored
+  range can be one no canonical address falls in.
 - The master key is zeroized when dropped, and key text read from files or
   the environment is wiped; the process is non-dumpable on Linux
   (`PR_SET_DUMPABLE`) and the systemd unit sets `LimitCORE=0`, so an abort
@@ -4345,7 +4365,8 @@ Given/When/Then scenario DSL.
 Layers, bottom to top:
 
 1. **Unit/property**: proto crate (parser, tag escaping, casemapping,
-   CAP/SASL state machines), multiplexer buffer logic; **loom
+   framing, `server-time`, SASL PLAIN parsing), the SCRAM client, multiplexer
+   buffer logic; **loom
    model-checking** of `e6irc-queue`'s concurrency core.
 2. **Fuzzing**: CI smoke runs every declared cargo-fuzz target, including
    parser/tag input, single- and multi-client stateful core
