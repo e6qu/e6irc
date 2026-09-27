@@ -855,12 +855,12 @@ enum Registered {
 /// account store, pick the network from the `nick/network` suffix,
 /// greet, and attach. The client's NICK/USER are consumed here (the
 /// driver owns the upstream registration).
-pub async fn bnc_serve<S>(
+pub(crate) async fn bnc_serve<S>(
     stream: S,
     registry: Arc<Registry>,
     pool: &PgPool,
     server_name: &str,
-    peer_host: &str,
+    peer: crate::net::ClientIp,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -876,7 +876,7 @@ where
     // CAP negotiation) must not hold a task + socket indefinitely.
     let (account, network, requested_nick, caps, input) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        handshake(&mut read, &mut write, pool, server_name, peer_host),
+        handshake(&mut read, &mut write, pool, server_name, peer),
     )
     .await
     {
@@ -1086,7 +1086,7 @@ async fn handshake<R, W>(
     write: &mut W,
     pool: &PgPool,
     server_name: &str,
-    peer_host: &str,
+    peer: crate::net::ClientIp,
 ) -> std::io::Result<Registered>
 where
     R: AsyncRead + Unpin,
@@ -1337,7 +1337,7 @@ where
                                         let mask = logged_in_mask(
                                             nick.as_deref(),
                                             username.as_deref(),
-                                            peer_host,
+                                            peer,
                                         );
                                         let target =
                                             MiddleParam::echo(nick.as_deref().unwrap_or("*"));
@@ -1723,7 +1723,11 @@ where
 /// `nick!user@host` for RPL_LOGGEDIN: the nick part of the attach selector
 /// (a `nick/network` selector names the nick first), the USER name, and the
 /// client's address — each `*` while not yet known.
-fn logged_in_mask(nick: Option<&str>, username: Option<&str>, host: &str) -> String {
+fn logged_in_mask(
+    nick: Option<&str>,
+    username: Option<&str>,
+    host: crate::net::ClientIp,
+) -> String {
     let nick = MiddleParam::echo(nick.map_or("*", |selector| {
         selector.split_once('/').map_or(selector, |(nick, _)| nick)
     }));
@@ -1975,7 +1979,7 @@ mod handshake_tests {
                 &mut server_write,
                 &pool,
                 "bnc.example",
-                "192.0.2.1",
+                crate::net::ClientIp::new("192.0.2.1".parse().expect("address")),
             )
             .await
         });
@@ -2111,11 +2115,21 @@ mod handshake_tests {
 
     #[test]
     fn logged_in_mask_names_what_is_known() {
+        let host = |text: &str| crate::net::ClientIp::new(text.parse().expect("address"));
         assert_eq!(
-            logged_in_mask(Some("alice/libera"), Some("al"), "192.0.2.1"),
+            logged_in_mask(Some("alice/libera"), Some("al"), host("192.0.2.1")),
             "alice!al@192.0.2.1"
         );
-        assert_eq!(logged_in_mask(None, None, "192.0.2.1"), "*!*@192.0.2.1");
+        assert_eq!(
+            logged_in_mask(None, None, host("192.0.2.1")),
+            "*!*@192.0.2.1"
+        );
+        // A dual-stack attach listener sees an IPv4 client IPv4-mapped; the
+        // mask shows the address as every other listener does.
+        assert_eq!(
+            logged_in_mask(None, None, host("::ffff:192.0.2.1")),
+            "*!*@192.0.2.1"
+        );
     }
 
     #[tokio::test]

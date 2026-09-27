@@ -7173,6 +7173,21 @@ impl ServerState {
 
     // ---- teardown -------------------------------------------------------
 
+    /// Kill `conn` for SendQ exceeded, as Solanum does: the backlog its client
+    /// did not take is discarded, and its closing `ERROR` is the one line it
+    /// is still sent. Draining a full SendQ to a client too slow to take it
+    /// only kept a dead session's socket open for as long as it trickled.
+    pub(crate) fn close_for_sendq(&mut self, conn: ConnId) {
+        const REASON: &str = "SendQ exceeded";
+        if let Some(session) = self.sessions.output_mut(&conn) {
+            let goodbye = format!("ERROR :Closing Link: {} ({REASON})\r\n", session.host);
+            session
+                .output
+                .discard_backlog_for_goodbye(WireLine::sanitized(Bytes::from(goodbye)));
+        }
+        self.close(conn, REASON);
+    }
+
     /// Remove a session: broadcast QUIT to channel peers, free the nick,
     /// drop memberships and empty channels.
     pub fn close(&mut self, conn: ConnId, reason: &str) {

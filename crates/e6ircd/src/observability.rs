@@ -72,10 +72,13 @@ pub(crate) enum ErrorKind {
     Database,
     Bouncer,
     Http,
+    /// A listener could not be set up from its configuration: an unreadable
+    /// or mismatched certificate, say. Not a peer's failure.
+    Configuration,
 }
 
 impl ErrorKind {
-    pub(crate) const COUNT: usize = 9;
+    pub(crate) const COUNT: usize = 10;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Accept,
         Self::ConnectionSetup,
@@ -86,6 +89,7 @@ impl ErrorKind {
         Self::Database,
         Self::Bouncer,
         Self::Http,
+        Self::Configuration,
     ];
 
     const fn index(self) -> usize {
@@ -99,6 +103,7 @@ impl ErrorKind {
             Self::Database => 6,
             Self::Bouncer => 7,
             Self::Http => 8,
+            Self::Configuration => 9,
         }
     }
 
@@ -113,6 +118,7 @@ impl ErrorKind {
             Self::Database => "database",
             Self::Bouncer => "bouncer",
             Self::Http => "http",
+            Self::Configuration => "configuration",
         }
     }
 }

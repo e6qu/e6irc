@@ -708,6 +708,24 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     // caused by the removal below.
     events_until_snapshot(&mut ws).await;
 
+    // A ping is answered once: the WebSocket layer answers it itself, and the
+    // socket used to send a second pong of its own.
+    ws.send(Tung::Ping(b"once".to_vec().into())).await.unwrap();
+    let mut pongs = 0;
+    let window = tokio::time::sleep(std::time::Duration::from_secs(1));
+    tokio::pin!(window);
+    loop {
+        tokio::select! {
+            () = &mut window => break,
+            frame = ws.next() => match frame {
+                Some(Ok(Tung::Pong(payload))) if payload.as_ref() == b"once" => pongs += 1,
+                Some(Ok(_)) => {}
+                other => panic!("socket ended while waiting for the pong: {other:?}"),
+            },
+        }
+    }
+    assert_eq!(pongs, 1, "one ping, one pong");
+
     // Remove the network.
     let (status, _) = http_req(
         http,

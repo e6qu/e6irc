@@ -471,7 +471,7 @@ fn operations() -> serde_json::Value {
                 "required": ["at_ms", "component", "severity", "message"],
                 "properties": {
                     "at_ms": { "type": "integer", "minimum": 0 },
-                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http"] },
+                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http", "configuration"] },
                     "severity": { "const": "error" },
                     "message": { "const": "An operational error was recorded." }
                 }

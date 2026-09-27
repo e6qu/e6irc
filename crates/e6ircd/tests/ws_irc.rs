@@ -267,3 +267,81 @@ async fn ws_overlong_line_is_refused_under_its_label() {
     let reply = read_until(&mut ws, " 417 ").await;
     assert!(reply.starts_with("@label=ws1 "), "{reply}");
 }
+
+/// Open a `/ws/irc` session registered as `nick`.
+async fn registered_ws(
+    http: std::net::SocketAddr,
+    nick: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{http}/ws/irc"))
+        .await
+        .expect("ws connect");
+    ws.send(Tung::text(format!("NICK {nick}"))).await.unwrap();
+    ws.send(Tung::text(format!("USER {nick} 0 * :{nick}")))
+        .await
+        .unwrap();
+    read_until(&mut ws, " 001 ").await;
+    ws
+}
+
+/// The next frame that is not a text line: the close, with its code.
+async fn close_code(
+    ws: &mut (impl StreamExt<Item = Result<Tung, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> u16 {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Close(Some(frame)))) => return u16::from(frame.code),
+                Some(Ok(Tung::Text(_))) => continue,
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the close")
+}
+
+/// A session the core ends is closed with a Close frame (1000), after its
+/// closing ERROR — not by dropping the socket, which a WebSocket client sees
+/// as an abnormal closure (1006).
+#[tokio::test]
+async fn a_session_the_server_ends_gets_a_normal_close_frame() {
+    let running = net::start(config()).await.expect("start");
+    let http = running.http_addr.expect("http");
+    let mut ws = registered_ws(http, "leaver").await;
+    ws.send(Tung::text("QUIT :bye")).await.unwrap();
+    read_until(&mut ws, "ERROR :Closing Link").await;
+    assert_eq!(close_code(&mut ws).await, 1000);
+}
+
+/// A message over the IRC line limit is refused with 417 and the connection
+/// kept, as an over-long TCP line is — however long, up to the ceiling on what
+/// one message may be. Past that ceiling it is not read: the socket is closed
+/// with 1009, and the session ends saying why.
+#[tokio::test]
+async fn an_overlong_message_is_refused_and_only_one_past_the_ceiling_closes() {
+    let running = net::start(config()).await.expect("start");
+    let http = running.http_addr.expect("http");
+    let mut watcher = registered_ws(http, "watcher").await;
+    watcher.send(Tung::text("JOIN #big")).await.unwrap();
+    read_until(&mut watcher, " 366 ").await;
+    let mut ws = registered_ws(http, "sender").await;
+    ws.send(Tung::text("JOIN #big")).await.unwrap();
+    read_until(&mut ws, " 366 ").await;
+
+    // Past every IRC frame limit, well under the ceiling.
+    ws.send(Tung::text(format!("PRIVMSG #big :{}", "A".repeat(20_000))))
+        .await
+        .unwrap();
+    read_until(&mut ws, " 417 ").await;
+    ws.send(Tung::text("PING :still-here")).await.unwrap();
+    read_until(&mut ws, "still-here").await;
+
+    ws.send(Tung::text(format!("PRIVMSG #big :{}", "A".repeat(70_000))))
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut ws).await, 1009);
+    let quit = read_until(&mut watcher, " QUIT ").await;
+    assert!(quit.starts_with(":sender!"), "{quit}");
+    assert!(quit.ends_with(":Message too big"), "{quit}");
+}

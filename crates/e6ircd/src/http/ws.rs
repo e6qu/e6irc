@@ -10,9 +10,12 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
 use crate::bouncer::SessionAuthority;
 
-/// IRCv3 WebSocket carries exactly one CRLF-stripped IRC line per message, so
-/// the protocol's full client frame allowance is also the transport cap.
-const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
+/// The largest WebSocket message `/ws/irc` reads. IRCv3 WebSocket carries one
+/// IRC line per message; one over the line limit is refused with 417 and the
+/// connection kept, as an over-long TCP line is. But a message is read whole
+/// before it can be judged, so one past this is not read at all: the
+/// connection is closed with 1009 (message too big).
+const MAX_IRC_WS_MESSAGE: usize = 64 * 1024;
 /// JSON can escape one input byte as six ASCII bytes. Bound the UI envelope
 /// before deserialization while admitting every wire-sized composer command.
 const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
@@ -59,6 +62,7 @@ problem_extractor!(
 pub(super) async fn ws_irc(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    upgraded: Option<axum::extract::Extension<crate::net::UpgradedStream>>,
     headers: axum::http::HeaderMap,
     UpgradeRequest(ws): UpgradeRequest,
 ) -> Response {
@@ -66,7 +70,24 @@ pub(super) async fn ws_irc(
     // keyed on the real client IP (X-Forwarded-For behind a trusted proxy) so
     // /ws/irc can't be used to sidestep it. The guard is held for the
     // connection's lifetime and releases the slot on drop.
-    let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let ip = match resolve_client_ip(
+        peer.ip(),
+        &headers,
+        &state.trusted_proxies,
+        state.conn_limiter.refusals(),
+    ) {
+        Ok(ip) => ip,
+        Err(refusal) => return refusal.into(),
+    };
+    // The stream under this connection, to close properly once the socket is
+    // done with. Every connection the HTTP listeners serve carries it.
+    let Some(stream) = upgraded.and_then(|upgraded| upgraded.claim()) else {
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Connection cannot be upgraded",
+            Some("The connection's stream is not available to the WebSocket."),
+        );
+    };
     // Umode +Z: this listener never terminates TLS, so a connection is secure
     // only when a trusted proxy says its client reached it over HTTPS.
     let transport = if super::oidc::forwarded_https(peer.ip(), &headers, &state.trusted_proxies) {
@@ -105,8 +126,8 @@ pub(super) async fn ws_irc(
         _ => WsFrameMode::Auto,
     };
     let mut upgrade = ws
-        .max_message_size(MAX_IRC_WS_FRAME)
-        .max_frame_size(MAX_IRC_WS_FRAME);
+        .max_message_size(MAX_IRC_WS_MESSAGE)
+        .max_frame_size(MAX_IRC_WS_MESSAGE);
     if let Some(proto) = chosen {
         upgrade = upgrade.protocols([proto]);
     }
@@ -124,7 +145,46 @@ pub(super) async fn ws_irc(
             );
         }
     };
-    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode, transport, conn))
+    let connection = WsIrcConnection {
+        conn,
+        ip,
+        mode,
+        transport,
+        stream,
+        _guard: guard,
+        _task: state.connections.task(),
+    };
+    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, connection))
+}
+
+/// One `/ws/irc` connection: its session's identifier and address, its
+/// framing and transport, the stream under it, and what it holds while it
+/// lives — its per-IP slot and its place among the tasks shutdown waits for.
+pub(super) struct WsIrcConnection {
+    conn: crate::core::ConnId,
+    ip: crate::net::ClientIp,
+    mode: WsFrameMode,
+    transport: crate::core::ConnectionTransport,
+    stream: crate::net::HttpStreamReclaim,
+    _guard: crate::net::ConnGuard,
+    _task: crate::net::ConnectionTask,
+}
+
+/// How a `/ws/irc` connection's loop ended.
+enum WsIrcEnd {
+    /// The core ended the session; what it still queued is owed.
+    SessionOver,
+    /// The client closed, or its side failed or overran the message ceiling;
+    /// the core is told why.
+    ClientEnded {
+        reason: String,
+        /// The close frame owed to the client, if any.
+        close: Option<(u16, &'static str)>,
+    },
+    /// A frame could not be written; the core is told why.
+    WriteFailed(&'static str),
+    /// The core is gone.
+    CoreGone,
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -135,15 +195,20 @@ pub(super) async fn ws_irc(
 pub(super) async fn ws_irc_conn(
     state: Arc<AppState>,
     mut socket: WebSocket,
-    _conn_guard: crate::net::ConnGuard,
-    ip: crate::net::ClientIp,
-    mode: WsFrameMode,
-    transport: crate::core::ConnectionTransport,
-    conn: crate::core::ConnId,
+    connection: WsIrcConnection,
 ) {
     use crate::core::Input;
-    // Held for the whole connection; its Drop releases the per-IP slot.
+    let WsIrcConnection {
+        conn,
+        ip,
+        mode,
+        transport,
+        stream,
+        ..
+    } = connection;
     let (out_tx, mut out_rx) = crate::core::send_queue("ws-sendq", state.sendq_bytes);
+    // The core ends the session by dropping its end of the send queue.
+    let session_over = out_rx.senders_gone();
     if state
         .core_tx
         .push(Input::Open {
@@ -163,43 +228,23 @@ pub(super) async fn ws_irc_conn(
     }
     let core_tx = state.core_tx.clone();
     let mut meter = core_tx.line_meter(conn);
-    'conn: loop {
+    let end = loop {
         // Past its command allowance the connection is not read until a
         // token is back, while what the core sends it keeps flowing.
         let blocked = meter.blocked_until(tokio::time::Instant::now());
         tokio::select! {
             () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
+            // The core ended the session (QUIT, KILL, SendQ, shutdown): the
+            // client is not read from again, and what it is owed is sent below.
+            () = session_over.wait() => break WsIrcEnd::SessionOver,
             // Outbound: a core Output line becomes one text frame.
             out = out_rx.pop() => {
-                let Some(env) = out else { break };
-                let bytes = env.payload.0;
-                // The core's Output is a full wire line terminated with exactly
-                // "\r\n" (state.rs `send_bytes`). Strip only that terminator:
-                // `trim_end()` would eat significant trailing spaces in a
-                // `:`-prefixed trailing parameter, silently dropping content.
-                let line = bytes
-                    .strip_suffix(b"\r\n")
-                    .or_else(|| bytes.strip_suffix(b"\n"))
-                    .unwrap_or(&bytes);
-                // Frame type follows the negotiated subprotocol. Under Auto (no
-                // subprotocol) a non-UTF-8 body goes out as a binary frame rather
-                // than being corrupted by lossy U+FFFD replacement; under the
-                // text subprotocol the client asked for text, so it is replaced.
-                let sent = match mode {
-                    WsFrameMode::Binary => send_frame(&mut socket, WsMessage::binary(line.to_vec())).await,
-                    WsFrameMode::Text => {
-                        send_frame(&mut socket, WsMessage::text(String::from_utf8_lossy(line).into_owned())).await
-                    }
-                    WsFrameMode::Auto => match std::str::from_utf8(line) {
-                        Ok(text) => send_frame(&mut socket, WsMessage::text(text)).await,
-                        Err(_) => send_frame(&mut socket, WsMessage::binary(line.to_vec())).await,
-                    },
-                };
-                if sent.is_err() {
+                let Some(env) = out else { break WsIrcEnd::SessionOver };
+                if let Err(failure) = send_irc_line(&mut socket, mode, &env.payload.0).await {
                     state
                         .telemetry
                         .record_error(crate::observability::ErrorKind::Write);
-                    break;
+                    break WsIrcEnd::WriteFailed(write_failure_reason(&failure));
                 }
             }
             // Inbound: frame(s) -> lines -> core.
@@ -210,18 +255,19 @@ pub(super) async fn ws_irc_conn(
                     // Tungstenite queues matching Pong and Close replies while
                     // reading control frames; the next read flushes them.
                     Some(Ok(_)) => continue,
-                    Some(Err(_)) => {
-                        state
-                            .telemetry
-                            .record_error(crate::observability::ErrorKind::Read);
-                        break;
-                    }
-                    None => break,
+                    Some(Err(error)) => break read_failure(&state, error),
+                    None => break WsIrcEnd::ClientEnded {
+                        reason: "Connection closed".into(),
+                        close: None,
+                    },
                 };
                 // IRCv3 WebSocket messages are already framed: one message is
                 // one IRC line, with no CR/LF terminator. Feed the whole value
                 // to the parser so an embedded delimiter is rejected as one
                 // malformed command rather than forged into a second command.
+                // A message over the line limit is refused (417) under its
+                // label when one is recoverable, and the connection kept, as
+                // an over-long TCP line is.
                 let event = if e6irc_proto::message::client_frame_fits(&data) {
                     e6irc_proto::framing::LineEvent::Line(data)
                 } else {
@@ -230,21 +276,128 @@ pub(super) async fn ws_irc_conn(
                 let input = Input::framed(conn, event);
                 meter.spend().await;
                 if core_tx.push(input).await.is_err() {
-                    break 'conn; // core gone: stop the connection directly
+                    break WsIrcEnd::CoreGone;
                 }
             }
         }
-    }
-    // Queue closure means the core is already gone, which has already closed
-    // this connection's authoritative state.
-    drop(
-        core_tx
-            .push(Input::Closed {
-                conn,
-                reason: "WebSocket closed".into(),
+    };
+    match end {
+        WsIrcEnd::SessionOver => {
+            // Everything still queued, then a normal close, within the bound a
+            // finished session's output has on every transport.
+            let delivered = tokio::time::timeout(crate::net::CLOSING_DRAIN, async {
+                while let Some(env) = out_rx.pop().await {
+                    send_irc_line(&mut socket, mode, &env.payload.0).await?;
+                }
+                send_frame(
+                    &mut socket,
+                    WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::close_code::NORMAL,
+                        reason: "".into(),
+                    })),
+                )
+                .await
             })
-            .await,
-    );
+            .await;
+            if !matches!(delivered, Ok(Ok(()))) {
+                return;
+            }
+        }
+        WsIrcEnd::ClientEnded { reason, close } => {
+            // Queue closure means the core is already gone, which has already
+            // closed this connection's authoritative state.
+            drop(core_tx.push(Input::Closed { conn, reason }).await);
+            if let Some((code, text)) = close {
+                let closed = tokio::time::timeout(
+                    crate::net::CLOSING_DRAIN,
+                    send_close(&mut socket, code, text),
+                )
+                .await;
+                if closed.is_err() {
+                    return;
+                }
+            }
+        }
+        WsIrcEnd::WriteFailed(reason) => {
+            drop(
+                core_tx
+                    .push(Input::Closed {
+                        conn,
+                        reason: reason.into(),
+                    })
+                    .await,
+            );
+            return;
+        }
+        WsIrcEnd::CoreGone => return,
+    }
+    // The socket is done with; its stream comes back when it is dropped, and
+    // is closed without letting unread input reset away the last frames.
+    drop(socket);
+    if let Ok(mut stream) = stream.await {
+        crate::lingering_close::close_within_bound(&mut stream).await;
+    }
+}
+
+/// The session's `Input::Closed` reason for a frame the client did not take.
+fn write_failure_reason(failure: &SendFailure) -> &'static str {
+    match failure {
+        SendFailure::Stalled => "Write timeout",
+        SendFailure::Transport => "Write error",
+    }
+}
+
+/// How a failed read ends the connection: a message past the ceiling is
+/// closed with 1009 (message too big); anything else is a broken connection.
+fn read_failure(state: &AppState, error: axum::Error) -> WsIrcEnd {
+    use tokio_tungstenite::tungstenite::Error as Tungstenite;
+    let error = error.into_inner();
+    if let Some(Tungstenite::Capacity(_)) = error.downcast_ref::<Tungstenite>() {
+        return WsIrcEnd::ClientEnded {
+            reason: "Message too big".into(),
+            close: Some((axum::extract::ws::close_code::SIZE, "Message too big")),
+        };
+    }
+    state
+        .telemetry
+        .record_error(crate::observability::ErrorKind::Read);
+    WsIrcEnd::ClientEnded {
+        reason: format!("Read error: {error}"),
+        close: None,
+    }
+}
+
+/// Send one core Output line as one frame. The core's Output is a full wire
+/// line terminated with exactly "\r\n" (state.rs `send_bytes`). Strip only
+/// that terminator: `trim_end()` would eat significant trailing spaces in a
+/// `:`-prefixed trailing parameter, silently dropping content.
+async fn send_irc_line(
+    socket: &mut WebSocket,
+    mode: WsFrameMode,
+    bytes: &[u8],
+) -> Result<(), SendFailure> {
+    let line = bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(bytes);
+    // Frame type follows the negotiated subprotocol. Under Auto (no
+    // subprotocol) a non-UTF-8 body goes out as a binary frame rather than
+    // being corrupted by lossy U+FFFD replacement; under the text subprotocol
+    // the client asked for text, so it is replaced.
+    match mode {
+        WsFrameMode::Binary => send_frame(socket, WsMessage::binary(line.to_vec())).await,
+        WsFrameMode::Text => {
+            send_frame(
+                socket,
+                WsMessage::text(String::from_utf8_lossy(line).into_owned()),
+            )
+            .await
+        }
+        WsFrameMode::Auto => match std::str::from_utf8(line) {
+            Ok(text) => send_frame(socket, WsMessage::text(text)).await,
+            Err(_) => send_frame(socket, WsMessage::binary(line.to_vec())).await,
+        },
+    }
 }
 
 // ---- live web UI socket (DESIGN §13.2) ----------------------------------
@@ -836,12 +989,9 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
-                Some(Ok(WsMessage::Ping(payload))) => {
-                    if send_frame(&mut socket, WsMessage::Pong(payload)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(WsMessage::Pong(_))) => {}
+                // Tungstenite answers a Ping itself, queueing the Pong while it
+                // reads and flushing it with the next read or write.
+                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
                 Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
                 }
             },

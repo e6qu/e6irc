@@ -1740,7 +1740,13 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RateLimited {
             .await
             .map(|ci| ci.0.ip())
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-        let ip = client_ip(peer, &parts.headers, &state.trusted_proxies);
+        let ip = resolve_client_ip(
+            peer,
+            &parts.headers,
+            &state.trusted_proxies,
+            state.conn_limiter.refusals(),
+        )
+        .map_err(Response::from)?;
         spend_auth_budget(state, ip)
             .map(|()| RateLimited)
             .map_err(|retry_after| {
@@ -2127,22 +2133,51 @@ async fn require_active_account(
     }
 }
 
+/// A trusted proxy passed on an `X-Forwarded-For` entry that is not an address
+/// before any client address, reading from the right: the chain it vouches for
+/// is broken there (nginx writes `unix:` for a client on a Unix socket), what
+/// lies left of the entry is only what the client wrote, and no client address
+/// can be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UnusableForwardedFor {
+    /// The trusted proxy that sent it.
+    proxy: crate::net::ClientIp,
+    /// The entry, as sent.
+    entry: String,
+}
+
+impl std::fmt::Display for UnusableForwardedFor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Header text is printable ASCII, but only the proxy's own share of it
+        // is its: bound what a client can put in the log line.
+        let entry: String = self.entry.chars().take(64).collect();
+        write!(
+            formatter,
+            "entry {entry:?} is not an address; the proxy must forward its \
+             client's address (for nginx, `$proxy_add_x_forwarded_for` on a TCP listener)"
+        )
+    }
+}
+
 /// Resolve the real client IP: if the socket peer is a trusted proxy, take the
 /// rightmost non-trusted `X-Forwarded-For` entry (the client the proxy chain
 /// received from); otherwise the peer is the client. XFF is only consulted for
-/// trusted peers so a direct client cannot spoof its IP with the header.
+/// trusted peers so a direct client cannot spoof its IP with the header. An
+/// entry that is not an address, reached before that client, refuses the
+/// request ([`UnusableForwardedFor`]): skipping it would walk on into entries
+/// the client wrote.
 pub(super) fn client_ip(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     trusted: &[ipnet::IpNet],
-) -> crate::net::ClientIp {
+) -> Result<crate::net::ClientIp, UnusableForwardedFor> {
     // Every address is judged in its canonical spelling: a dual-stack listener
     // presents an IPv4 proxy mapped, and a proxy may forward a mapped client.
     let peer = crate::net::ClientIp::new(peer);
     let is_trusted =
         |address: crate::net::ClientIp| trusted.iter().any(|net| net.contains(&address.ip()));
     if !is_trusted(peer) {
-        return peer;
+        return Ok(peer);
     }
     // Concatenate *every* X-Forwarded-For header in header order before scanning
     // right-to-left for the first non-trusted entry (the real client the trusted
@@ -2157,14 +2192,49 @@ pub(super) fn client_ip(
         .filter_map(|v| v.to_str().ok())
         .collect::<Vec<_>>()
         .join(",");
+    // A header with no entries at all names no client, as no header does.
+    if joined.trim().is_empty() {
+        return Ok(peer);
+    }
     for part in joined.rsplit(',') {
-        if let Some(ip) = parse_forwarded_ip(part)
-            && !is_trusted(ip)
-        {
-            return ip;
+        let Some(ip) = parse_forwarded_ip(part) else {
+            return Err(UnusableForwardedFor {
+                proxy: peer,
+                entry: part.trim().to_string(),
+            });
+        };
+        if !is_trusted(ip) {
+            return Ok(ip);
         }
     }
-    peer
+    Ok(peer)
+}
+
+/// [`client_ip`], with its refusal answered: a `400` naming the problem, and a
+/// line in the log — one a minute per proxy — naming the proxy's
+/// misconfiguration for the operator.
+pub(super) fn resolve_client_ip(
+    peer: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[ipnet::IpNet],
+    refusals: &crate::net::PeerRefusalLog,
+) -> ResponseResult<crate::net::ClientIp> {
+    client_ip(peer, headers, trusted).map_err(|unusable| {
+        refusals.note(
+            unusable.proxy,
+            crate::net::PeerRefusal::UnusableForwardedFor,
+            Some(&unusable),
+        );
+        problem(
+            StatusCode::BAD_REQUEST,
+            "Unusable X-Forwarded-For",
+            Some(
+                "A trusted proxy forwarded an X-Forwarded-For entry that is not an address, so \
+                 the request's client cannot be determined.",
+            ),
+        )
+        .into()
+    })
 }
 
 /// Whether a request reached this server over HTTPS, which only a trusted
@@ -2195,10 +2265,8 @@ pub(super) fn forwarded_https(
 /// Parse one `X-Forwarded-For` entry to an IP, tolerating the `ip:port` and
 /// bracketed-IPv6 forms some proxies emit (`203.0.113.9:443`, `[2001:db8::1]`,
 /// `[2001:db8::1]:443`). A bare `parse::<IpAddr>()` rejects all of those, which
-/// would make `client_ip` silently skip the real rightmost client and fall back
-/// to a spoofable left-hand entry or the proxy's own IP — collapsing per-IP
-/// rate limits and bans onto one key. Returns `None` only for a truly malformed
-/// entry.
+/// would make `client_ip` refuse every request from such a proxy. Returns
+/// `None` only for an entry that is not an address.
 fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
     let s = entry.trim();
     let address = if let Ok(ip) = s.parse::<std::net::IpAddr>() {

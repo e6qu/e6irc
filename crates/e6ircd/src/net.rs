@@ -102,9 +102,86 @@ const SHUTDOWN_CORE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// write (`QUIT`, 2 s at most); a Matrix driver logs its device out; the
 /// backlog write is a few INSERTs. Without
 /// this step a restart met its own ghost on every network (433, then the
-/// refusal schedule). `tools/check-systemd-unit.sh` sums it with the core and
-/// database budgets for the unit's stop timeout.
+/// refusal schedule). `tools/check-systemd-unit.sh` sums it with the core,
+/// connection and database budgets for the unit's stop timeout.
 const SHUTDOWN_DRIVER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long graceful shutdown waits, once the core has stopped, for the client
+/// connections to deliver their closing `ERROR` and close: each has
+/// [`CLOSING_DRAIN`] to write what it is still owed, then a lingering close
+/// ([`crate::lingering_close::LINGER_CLOSE_BOUND`]), all of them at once.
+/// `tools/check-systemd-unit.sh` sums it into the unit's stop budget.
+const SHUTDOWN_CONNECTION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const _: () = assert!(
+    SHUTDOWN_CONNECTION_DRAIN_TIMEOUT.as_secs()
+        >= CLOSING_DRAIN.as_secs() + crate::lingering_close::LINGER_CLOSE_BOUND.as_secs()
+);
+
+/// How long a connection whose session is over — ended by the core, or
+/// half-closed by its client — may take to receive what it is still owed (the
+/// replies to what it sent, its closing `ERROR`) before it is torn down
+/// regardless. Its reader has stopped; this bounds the writer, whose own
+/// deadline counts only stalls, so a client reading a byte at a time cannot
+/// keep a finished session's socket, task and per-IP slot.
+pub(crate) const CLOSING_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Every task that serves a client connection — an IRC socket, plaintext or
+/// TLS, an IRC WebSocket, a bouncer attach — holds a [`ConnectionTask`] from
+/// here, the only place one is made. Graceful shutdown waits for them, bounded
+/// ([`SHUTDOWN_CONNECTION_DRAIN_TIMEOUT`]), so a client's closing `ERROR` is
+/// delivered rather than cancelled with the runtime.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionTasks(Arc<ConnectionTasksInner>);
+
+#[derive(Default)]
+struct ConnectionTasksInner {
+    live: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// One live connection task, counted by its [`ConnectionTasks`] until dropped.
+pub(crate) struct ConnectionTask(ConnectionTasks);
+
+impl ConnectionTasks {
+    pub(crate) fn task(&self) -> ConnectionTask {
+        self.0
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ConnectionTask(self.clone())
+    }
+
+    fn live(&self) -> usize {
+        self.0.live.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until no connection task is left, or `bound` has passed; how many
+    /// are left.
+    async fn drained_within(&self, bound: std::time::Duration) -> usize {
+        let drained = async {
+            loop {
+                let idle = self.0.idle.notified();
+                tokio::pin!(idle);
+                idle.as_mut().enable();
+                if self.live() == 0 {
+                    return;
+                }
+                idle.await;
+            }
+        };
+        // Expiry is reported by the count still live.
+        drop(tokio::time::timeout(bound, drained).await);
+        self.live()
+    }
+}
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        let inner = &(self.0).0;
+        if inner.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            inner.idle.notify_waiters();
+        }
+    }
+}
 
 fn core_queue_name(index: usize) -> &'static str {
     Box::leak(format!("core-{index}").into_boxed_str())
@@ -168,6 +245,8 @@ pub struct ShutdownHandle {
     /// to its upstream before the process exits. `None` when no network can
     /// exist (no database and no configured network).
     bnc_registry: Option<Arc<crate::bouncer::Registry>>,
+    /// Every client connection's task, waited for once the core has stopped.
+    connections: ConnectionTasks,
 }
 
 /// How graceful shutdown ended, so `main` can pick an honest exit code.
@@ -212,19 +291,25 @@ impl ShutdownHandle {
 
     /// Run the graceful-shutdown sequence (DESIGN §18): stop accepting new
     /// connections, stop every bouncer driver (each says `QUIT` upstream),
-    /// ask the core to notify clients and stop, then wait for the DB worker to
-    /// flush its buffered history. Returns once the worker has drained or the
-    /// bounded timeout elapses.
+    /// ask the core to notify clients and stop, wait for the connections to
+    /// deliver that and close, then wait for the DB worker to flush its
+    /// buffered history. Every step is bounded; returns once the worker has
+    /// drained or its timeout elapses.
     pub async fn run(self) -> ShutdownOutcome {
-        self.run_within(SHUTDOWN_CORE_STOP_TIMEOUT, SHUTDOWN_DRIVER_STOP_TIMEOUT)
-            .await
+        self.run_within(ShutdownBudget {
+            core_stop: SHUTDOWN_CORE_STOP_TIMEOUT,
+            driver_stop: SHUTDOWN_DRIVER_STOP_TIMEOUT,
+            connection_drain: SHUTDOWN_CONNECTION_DRAIN_TIMEOUT,
+        })
+        .await
     }
 
-    async fn run_within(
-        mut self,
-        core_stop_timeout: std::time::Duration,
-        driver_stop_timeout: std::time::Duration,
-    ) -> ShutdownOutcome {
+    async fn run_within(mut self, budget: ShutdownBudget) -> ShutdownOutcome {
+        let ShutdownBudget {
+            core_stop: core_stop_timeout,
+            driver_stop: driver_stop_timeout,
+            connection_drain: connection_drain_timeout,
+        } = budget;
         // 1. Stop accepting: abort every listener task up front so nothing new
         //    is admitted while we drain.
         for listener in &self.listeners {
@@ -259,19 +344,11 @@ impl ShutdownHandle {
                 );
             }
         }
-        // 3. Tell the core to notify clients (terminal ERROR) and stop. A push
-        //    failure can only mean the core queue is already closed, i.e. the
-        //    core is already gone — nothing more to ask of it.
-        // Queue closure means the core already stopped, which is the requested
-        // shutdown state.
-        let core_tx = self.core_tx.take().expect("shutdown core ingress present");
-        if core_tx.broadcast_shutdown().await.is_err() {
-            eprintln!("e6ircd: core ingress closed before shutdown broadcast");
-        }
-        // Drop our own sender clone so it isn't left keeping the core queue's
-        // producer count up. (The core breaks on the Shutdown event regardless;
-        // this just keeps the shutdown intent honest.)
-        drop(core_tx);
+        // 3. Tell the core to notify clients (terminal ERROR) and stop, within
+        //    the core's stop budget: a shard whose queue is full and that no
+        //    longer takes from it would otherwise hold the telling itself
+        //    forever. A push failure can only mean the core queue is already
+        //    closed, i.e. the core is already gone — nothing more to ask of it.
         // Every shard is joined, whatever happens to one of them. A shard that
         // failed has lost its own state, but the database worker still holds
         // buffered history that is good — and it can only flush once *every*
@@ -279,6 +356,22 @@ impl ShutdownHandle {
         // remembered and reported after the flush, never instead of it.
         let mut core_failure = None;
         let deadline = tokio::time::Instant::now() + core_stop_timeout;
+        let core_tx = self.core_tx.take().expect("shutdown core ingress present");
+        match tokio::time::timeout_at(deadline, core_tx.broadcast_shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(())) => eprintln!("e6ircd: core ingress closed before shutdown broadcast"),
+            Err(_elapsed) => {
+                eprintln!(
+                    "e6ircd: a core shard did not take the shutdown request within {}s",
+                    core_stop_timeout.as_secs()
+                );
+                core_failure = Some(ShutdownOutcome::CoreTimedOut);
+            }
+        }
+        // Drop our own sender clone so it isn't left keeping the core queue's
+        // producer count up. (The core breaks on the Shutdown event regardless;
+        // this just keeps the shutdown intent honest.)
+        drop(core_tx);
         loop {
             match tokio::time::timeout_at(deadline, self.core_workers.join_next()).await {
                 Ok(Some(Ok(()))) => {}
@@ -296,7 +389,22 @@ impl ShutdownHandle {
                 }
             }
         }
-        // 4. Wait for the DB worker to observe its now-dropped sender, drain,
+        // 4. The core is gone, and with it every session's send queue: each
+        //    connection now delivers what it is still owed — its closing
+        //    ERROR — and closes. Wait for that, bounded, or dropping the
+        //    runtime would cancel the writes.
+        let unclosed = self
+            .connections
+            .drained_within(connection_drain_timeout)
+            .await;
+        if unclosed > 0 {
+            eprintln!(
+                "e6ircd: {unclosed} client connections had not closed {}s after the core \
+                 stopped; they may not have received their closing ERROR",
+                connection_drain_timeout.as_secs()
+            );
+        }
+        // 5. Wait for the DB worker to observe its now-dropped sender, drain,
         //    and flush. Bounded so a wedged database can't hang the shutdown.
         let flush = match self.db_worker.take() {
             None => ShutdownOutcome::Flushed,
@@ -308,6 +416,13 @@ impl ShutdownHandle {
         };
         core_failure.unwrap_or(flush)
     }
+}
+
+/// The bounds of the shutdown steps [`ShutdownHandle::run_within`] waits on.
+struct ShutdownBudget {
+    core_stop: std::time::Duration,
+    driver_stop: std::time::Duration,
+    connection_drain: std::time::Duration,
 }
 
 impl Drop for ShutdownHandle {
@@ -374,6 +489,7 @@ pub struct BncListenerController {
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
     certificates: CertificateReloads,
+    connections: ConnectionTasks,
 }
 
 impl BncListenerController {
@@ -384,6 +500,7 @@ impl BncListenerController {
         limiter: ConnLimiter,
         telemetry: Arc<Telemetry>,
         certificates: CertificateReloads,
+        connections: ConnectionTasks,
     ) -> Self {
         Self {
             state: tokio::sync::Mutex::new(None),
@@ -393,6 +510,7 @@ impl BncListenerController {
             limiter,
             telemetry,
             certificates,
+            connections,
         }
     }
 
@@ -411,7 +529,7 @@ impl BncListenerController {
     pub async fn enable(&self, requested: &BncConfig) -> io::Result<SocketAddr> {
         let acceptor = match &requested.tls {
             Some(tls) => Some(self.certificates.acceptor(tls).inspect_err(|_error| {
-                self.telemetry.record_error(ErrorKind::TlsHandshake);
+                self.telemetry.record_error(ErrorKind::Configuration);
             })?),
             None => None,
         };
@@ -424,11 +542,14 @@ impl BncListenerController {
         let task = spawn_bnc_listener(
             listener,
             acceptor,
-            self.registry.clone(),
-            self.pool.clone(),
-            self.server_name.clone(),
-            self.limiter.clone(),
-            self.telemetry.clone(),
+            BncAttachContext {
+                registry: self.registry.clone(),
+                pool: self.pool.clone(),
+                server_name: self.server_name.clone(),
+                limiter: self.limiter.clone(),
+                telemetry: self.telemetry.clone(),
+                connections: self.connections.clone(),
+            },
         );
         let replacement = BncListenerState {
             requested: requested.clone(),
@@ -452,15 +573,29 @@ impl BncListenerController {
     }
 }
 
-fn spawn_bnc_listener(
-    listener: TcpListener,
-    tls: Option<TlsAcceptor>,
+/// What every attach connection is served with.
+struct BncAttachContext {
     registry: Arc<crate::bouncer::Registry>,
     pool: sqlx::PgPool,
     server_name: String,
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
+    connections: ConnectionTasks,
+}
+
+fn spawn_bnc_listener(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    context: BncAttachContext,
 ) -> tokio::task::JoinHandle<()> {
+    let BncAttachContext {
+        registry,
+        pool,
+        server_name,
+        limiter,
+        telemetry,
+        connections,
+    } = context;
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -479,7 +614,9 @@ fn spawn_bnc_listener(
                     let telemetry = telemetry.clone();
                     let refusals = limiter.refusals().clone();
                     let tls = tls.clone();
+                    let task = connections.task();
                     tokio::spawn(async move {
+                        let _task = task;
                         let _guard = guard;
                         if let Err(e) = stream.set_nodelay(true) {
                             telemetry.record_error(ErrorKind::ConnectionSetup);
@@ -503,7 +640,7 @@ fn spawn_bnc_listener(
                                             registry,
                                             &pool,
                                             &server_name,
-                                            &peer.ip().to_string(),
+                                            client,
                                         )
                                         .await
                                     }
@@ -533,7 +670,7 @@ fn spawn_bnc_listener(
                                     registry,
                                     &pool,
                                     &server_name,
-                                    &peer.ip().to_string(),
+                                    client,
                                 )
                                 .await
                             }
@@ -890,6 +1027,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // IRC-over-WebSocket path, so a client can't sidestep the cap by opening
     // its sessions through /ws/irc instead of the raw port.
     let limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
+    // Every client connection's task, whichever listener accepted it, so
+    // shutdown can wait for their closing ERRORs.
+    let connections = ConnectionTasks::default();
 
     // Database-backed network management and the attach listener are separate
     // capabilities. The registry exists as soon as persistence does; the
@@ -911,6 +1051,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             limiter.clone(),
             telemetry.clone(),
             certificates.clone(),
+            connections.clone(),
         ))),
         _ => None,
     };
@@ -1029,10 +1170,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             credential_watch: credential_watch.clone(),
             account_exports: crate::http::AccountExportSlots::new(),
             conn_limiter: limiter.clone(),
+            connections: connections.clone(),
             database_readiness: crate::http::DatabaseReadiness::default(),
             request_admission: Arc::new(crate::http::RequestAdmission::new(
                 trusted_proxies.clone(),
                 MAX_HTTP_REQUESTS_IN_FLIGHT_PER_IP,
+                limiter.refusals().clone(),
             )),
             observation: Arc::new(crate::http::RequestObservation::new(
                 telemetry.clone(),
@@ -1272,12 +1415,15 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         };
         let accept_task = tokio::spawn(accept_loop(
             listener,
-            acceptor,
-            core_tx.clone(),
-            next_conn.clone(),
-            config.sendq_bytes,
-            limiter.clone(),
-            telemetry.clone(),
+            AcceptContext {
+                tls: acceptor,
+                core_tx: core_tx.clone(),
+                next_conn: next_conn.clone(),
+                sendq_bytes: config.sendq_bytes,
+                limiter: limiter.clone(),
+                telemetry: telemetry.clone(),
+                connections: connections.clone(),
+            },
         ));
         listeners.push(supervise_listener(
             "IRC listener",
@@ -1298,6 +1444,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             critical_failures: critical_rx,
             bnc_listener,
             bnc_registry,
+            connections,
         },
     })
 }
@@ -1429,6 +1576,19 @@ async fn serve_http_connection(
     // every ten seconds and filled the log with "refused" lines.
     let served_a_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let served_flag = served_a_request.clone();
+    // Every write — a response body, an upgraded WebSocket's frames — fails
+    // once the peer has taken nothing for `write_deadline`, which ends the
+    // connection ([`crate::peer_write`]). A refusal answered before the
+    // request was read (a body over the limit) closes without a reset that
+    // would discard the answer ([`crate::lingering_close`]). The stream is
+    // lent to hyper reclaimably, so an upgraded connection's own task can
+    // close it the same way when it is done with it.
+    let (stream, reclaim) =
+        crate::lingering_close::Reclaimable::new(crate::peer_write::DeadlineWriter::new(
+            crate::lingering_close::LingeringClose::new(stream),
+            write_deadline,
+        ));
+    let upgraded = UpgradedStream(Arc::new(std::sync::Mutex::new(Some(reclaim))));
     // `ConnectInfo` so handlers see the socket peer (rate limiting, and the
     // forwarded-address resolution behind a trusted proxy).
     let service = router.map_request(move |mut request: axum::http::Request<_>| {
@@ -1436,22 +1596,14 @@ async fn serve_http_connection(
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(peer));
+        request.extensions_mut().insert(upgraded.clone());
         request
     });
     let served = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
         .serve_connection(
-            // Every write — a response body, an upgraded WebSocket's frames —
-            // fails once the peer has taken nothing for `write_deadline`,
-            // which ends the connection ([`crate::peer_write`]).
-            // A refusal answered before the request was read (a body over the
-            // limit) closes without a reset that would discard the answer
-            // ([`crate::lingering_close`]).
-            hyper_util::rt::TokioIo::new(crate::peer_write::DeadlineWriter::new(
-                crate::lingering_close::LingeringClose::new(stream),
-                write_deadline,
-            )),
+            hyper_util::rt::TokioIo::new(stream),
             hyper_util::service::TowerToHyperService::new(service),
         )
         .with_upgrades()
@@ -1468,6 +1620,31 @@ async fn serve_http_connection(
         // A peer that resets or abandons its connection mid-request: counted,
         // not logged per occurrence.
         Err(_) => telemetry.record_error(ErrorKind::Http),
+    }
+}
+
+/// The stream under an HTTP connection, as every request on it is handed it
+/// (a request extension). hyper drops an upgraded connection's stream without
+/// shutting it down, which with unread input is a reset that can destroy the
+/// last frames written; the handler that takes the upgrade claims this, and
+/// gets the stream back when the upgraded socket is dropped, to close it
+/// properly ([`crate::lingering_close::close_within_bound`]).
+#[derive(Clone)]
+pub(crate) struct UpgradedStream(Arc<std::sync::Mutex<Option<HttpStreamReclaim>>>);
+
+/// The stream an HTTP connection serves.
+pub(crate) type HttpStream = crate::peer_write::DeadlineWriter<
+    crate::lingering_close::LingeringClose<tokio::net::TcpStream>,
+>;
+
+/// Resolves to the HTTP connection's stream once hyper has dropped it.
+pub(crate) type HttpStreamReclaim = tokio::sync::oneshot::Receiver<HttpStream>;
+
+impl UpgradedStream {
+    /// Claim the stream for the upgrade this request asks for; `None` once
+    /// claimed (a connection is upgraded at most once).
+    pub(crate) fn claim(&self) -> Option<HttpStreamReclaim> {
+        self.0.lock().expect("upgraded stream lock").take()
     }
 }
 
@@ -1604,6 +1781,7 @@ pub(crate) enum PeerRefusal {
     TlsHandshakeFailed,
     TlsHandshakeTimedOut,
     HttpHeaderTimedOut,
+    UnusableForwardedFor,
 }
 
 impl PeerRefusal {
@@ -1615,6 +1793,9 @@ impl PeerRefusal {
             Self::SocketSetup => "socket setup failed",
             Self::TlsHandshakeFailed => "TLS handshake failed",
             Self::TlsHandshakeTimedOut => "TLS handshake timed out",
+            Self::UnusableForwardedFor => {
+                "request from a trusted proxy refused: its X-Forwarded-For is misconfigured"
+            }
         }
     }
 }
@@ -1786,23 +1967,8 @@ impl Drop for ConnGuard {
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    tls: Option<TlsAcceptor>,
-    core_tx: CoreIngress,
-    next_conn: Arc<ConnectionIdAllocator>,
-    sendq_bytes: usize,
-    limiter: ConnLimiter,
-    telemetry: Arc<Telemetry>,
-) {
-    let context = AcceptContext {
-        tls: &tls,
-        core_tx: &core_tx,
-        next_conn: &next_conn,
-        sendq_bytes,
-        limiter: &limiter,
-        telemetry: &telemetry,
-    };
+async fn accept_loop(listener: TcpListener, context: AcceptContext) {
+    let telemetry = &context.telemetry;
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -1836,16 +2002,18 @@ async fn accept_loop(
     }
 }
 
-struct AcceptContext<'a> {
-    tls: &'a Option<TlsAcceptor>,
-    core_tx: &'a CoreIngress,
-    next_conn: &'a Arc<ConnectionIdAllocator>,
+/// What an IRC listener serves each accepted connection with.
+struct AcceptContext {
+    tls: Option<TlsAcceptor>,
+    core_tx: CoreIngress,
+    next_conn: Arc<ConnectionIdAllocator>,
     sendq_bytes: usize,
-    limiter: &'a ConnLimiter,
-    telemetry: &'a Arc<Telemetry>,
+    limiter: ConnLimiter,
+    telemetry: Arc<Telemetry>,
+    connections: ConnectionTasks,
 }
 
-fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &AcceptContext<'_>) {
+fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &AcceptContext) {
     let refusals = context.limiter.refusals().clone();
     let client = ClientIp::new(peer.ip());
     let Some(guard) = context.limiter.try_acquire(client) else {
@@ -1865,6 +2033,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     let tls = context.tls.clone();
     let telemetry = context.telemetry.clone();
     let sendq_bytes = context.sendq_bytes;
+    let task = context.connections.task();
     tokio::spawn(async move {
         let _guard = guard;
         if let Err(e) = stream.set_nodelay(true) {
@@ -1883,9 +2052,12 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     Ok(Ok(tls_stream)) => {
                         serve_conn(
                             tls_stream,
-                            conn,
-                            peer,
-                            crate::core::ConnectionTransport::Tls,
+                            AcceptedConnection {
+                                conn,
+                                peer,
+                                transport: crate::core::ConnectionTransport::Tls,
+                                task,
+                            },
                             core_tx,
                             Outbound::with_sendq(sendq_bytes),
                             telemetry,
@@ -1905,9 +2077,12 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
             None => {
                 serve_conn(
                     stream,
-                    conn,
-                    peer,
-                    crate::core::ConnectionTransport::Tcp,
+                    AcceptedConnection {
+                        conn,
+                        peer,
+                        transport: crate::core::ConnectionTransport::Tcp,
+                        task,
+                    },
                     core_tx,
                     Outbound::with_sendq(sendq_bytes),
                     telemetry,
@@ -1918,11 +2093,13 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     });
 }
 
-/// The bounds on what a connection is sent: its SendQ capacity in bytes, and
-/// how long one write may wait for a client that has stopped reading.
+/// The bounds on what a connection is sent: its SendQ capacity in bytes, how
+/// long one write may wait for a client that has stopped reading, and how long
+/// the whole of what is left may take once the session is over.
 struct Outbound {
     sendq_bytes: usize,
     write_deadline: std::time::Duration,
+    closing_drain: std::time::Duration,
 }
 
 impl Outbound {
@@ -1930,23 +2107,39 @@ impl Outbound {
         Self {
             sendq_bytes,
             write_deadline: crate::peer_write::PEER_WRITE_DEADLINE,
+            closing_drain: CLOSING_DRAIN,
         }
     }
 }
 
-async fn serve_conn<S>(
-    stream: S,
+/// One accepted client connection: its identifier, its peer, how it arrived,
+/// and its place among the tasks shutdown waits for.
+struct AcceptedConnection {
     conn: ConnId,
     peer: SocketAddr,
     transport: crate::core::ConnectionTransport,
+    task: ConnectionTask,
+}
+
+async fn serve_conn<S>(
+    stream: S,
+    accepted: AcceptedConnection,
     core_tx: CoreIngress,
     outbound: Outbound,
     telemetry: Arc<Telemetry>,
 ) where
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (read_half, write_half) = tokio::io::split(stream);
+    let AcceptedConnection {
+        conn,
+        peer,
+        transport,
+        task: _task,
+    } = accepted;
+    let (mut read_half, write_half) = tokio::io::split(stream);
     let (out_tx, out_rx) = crate::core::send_queue("sendq", outbound.sendq_bytes);
+    // The core ends the session by dropping its end of the send queue.
+    let session_over = out_rx.senders_gone();
     if core_tx
         .push(Input::Open {
             conn,
@@ -1963,30 +2156,48 @@ async fn serve_conn<S>(
     }
     let write_half = crate::peer_write::DeadlineWriter::new(write_half, outbound.write_deadline);
     let mut writer = tokio::spawn(write_loop(write_half, out_rx, telemetry.clone()));
-    let reason = tokio::select! {
+    let written_first = tokio::select! {
         // The client closed its sending side (or errored), or the core queue is
         // gone. `read_loop` has told the core, which answers what the client
         // sent before closing — a pipelined `NICK`/`USER`/`QUIT` from a
         // half-closing client is owed its welcome and its `ERROR` — and then
-        // drops this session's sendq. The writer delivers all of that and
-        // returns; it is aborted only if that takes longer than
-        // `HALF_CLOSE_DRAIN`.
-        () = read_loop(read_half, conn, &core_tx, &telemetry) => {
-            if tokio::time::timeout(HALF_CLOSE_DRAIN, &mut writer).await.is_err() {
+        // ends the session.
+        () = read_loop(&mut read_half, conn, &core_tx, &telemetry) => None,
+        // The core ended the session (QUIT, KILL, SendQ, shutdown). Nothing the
+        // client sends is wanted any more, so reading stops here, and no line
+        // is pushed for a connection the core has forgotten.
+        () = session_over.wait() => None,
+        end = &mut writer => Some(end),
+    };
+    let end = match written_first {
+        Some(end) => end,
+        // The session is over: what it is still owed goes out within
+        // `closing_drain`, or not at all.
+        None => match tokio::time::timeout(outbound.closing_drain, &mut writer).await {
+            Ok(end) => end,
+            Err(_elapsed) => {
                 writer.abort();
+                return;
             }
+        },
+    };
+    let reason = match end {
+        Ok(WriterEnd::Drained(write_half)) => {
+            // Everything was written: close without letting unread input turn
+            // the close into a reset that could destroy the closing `ERROR`.
+            let stream = read_half.unsplit(write_half.into_inner());
+            crate::lingering_close::close_within_bound(
+                &mut crate::lingering_close::LingeringClose::new(stream),
+            )
+            .await;
             return;
         }
-        // The writer returned. Two causes: the core dropped this session's
-        // `Sender<Output>` (session already gone core-side), OR a write error
-        // or stall on a still-present session. Cancelling the read future frees
-        // the peer's read task and per-IP ConnGuard now, so the core must be
-        // told here; `close` is idempotent, so the already-gone case is a
-        // harmless no-op.
-        reason = &mut writer => reason.unwrap_or("Write task panicked"),
+        Ok(WriterEnd::Failed(reason)) => reason,
+        Err(_join_error) => "Write task panicked",
     };
-    // Queue closure means the core has already removed all connection state,
-    // so there is no remaining observer for this close event.
+    // A write failed or stalled while the session may still be live; the core
+    // must hear of it. For a session it already ended this is a no-op, and a
+    // closed queue means the core itself is gone.
     drop(
         core_tx
             .push(Input::Closed {
@@ -1996,10 +2207,6 @@ async fn serve_conn<S>(
             .await,
     );
 }
-
-/// How long a client that closed its sending side waits for the replies to
-/// what it sent before its connection is torn down regardless.
-const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn read_loop<R>(mut read_half: R, conn: ConnId, core_tx: &CoreIngress, telemetry: &Telemetry)
 where
@@ -2030,24 +2237,31 @@ where
     drop(core_tx.push(Input::Closed { conn, reason }).await);
 }
 
-/// Drain the sendq to the socket. Returns the reason it stopped, which the
-/// caller turns into the session's `Input::Closed` — distinguishing a core-side
-/// close (sender dropped) from a write error (peer gone) so neither is conflated
+/// How a connection's writer ended.
+enum WriterEnd<W> {
+    /// The core ended the session and everything it queued was written; the
+    /// writer hands its half of the stream back for the close.
+    Drained(W),
+    /// The peer could not be written to, for the reason given — which the
+    /// caller turns into the session's `Input::Closed`.
+    Failed(&'static str),
+}
+
+/// Drain the sendq to the socket until the core ends the session (its sender
+/// dropped) or a write fails, distinguishing the two so neither is conflated
 /// nor silently skipped.
 async fn write_loop<W>(
     mut write_half: W,
     mut rx: Receiver<Output>,
     telemetry: Arc<Telemetry>,
-) -> &'static str
+) -> WriterEnd<W>
 where
     W: AsyncWrite + Unpin,
 {
     let mut batch = Vec::new();
     loop {
         let Some(envelope) = rx.pop().await else {
-            // Core dropped the session (sender gone): flush and close.
-            drop(write_half.shutdown().await);
-            return "Connection closed";
+            return WriterEnd::Drained(write_half);
         };
         // Drain everything currently queued and present the shared Bytes as
         // vectored slices. Fan-out already serialized each capability variant
@@ -2063,13 +2277,13 @@ where
         };
         if let Err(error) = written {
             telemetry.record_error(ErrorKind::Write);
-            // The session is still live core-side: a broken pipe / RST, or a
-            // peer that stopped reading while output was queued for it.
-            return if crate::peer_write::is_stalled(&error) {
+            // A broken pipe / RST, or a peer that stopped reading while output
+            // was queued for it.
+            return WriterEnd::Failed(if crate::peer_write::is_stalled(&error) {
                 "Write timeout"
             } else {
                 "Write error"
-            };
+            });
         }
     }
 }
@@ -2564,6 +2778,16 @@ mod tests {
         }
     }
 
+    /// An accepted plaintext connection from `peer`, as connection 1.
+    fn accepted(peer: SocketAddr) -> AcceptedConnection {
+        AcceptedConnection {
+            conn: ConnId(1),
+            peer,
+            transport: crate::core::ConnectionTransport::Tcp,
+            task: ConnectionTasks::default().task(),
+        }
+    }
+
     /// A small bounded `Input` channel for the `serve_conn` wiring tests.
     fn test_core_channel() -> (Sender<Input>, Receiver<Input>) {
         queue::<Input>(e6irc_queue::Config {
@@ -2581,9 +2805,7 @@ mod tests {
         let peer: SocketAddr = peer.parse().unwrap();
         let served = tokio::spawn(serve_conn(
             DeadPeer,
-            ConnId(1),
-            peer,
-            crate::core::ConnectionTransport::Tcp,
+            accepted(peer),
             CoreIngress::single(core_tx),
             Outbound::with_sendq(4096),
             Arc::new(Telemetry::new()),
@@ -2618,13 +2840,12 @@ mod tests {
         let (core_tx, mut core_rx) = test_core_channel();
         let served = tokio::spawn(serve_conn(
             server,
-            ConnId(1),
-            peer,
-            crate::core::ConnectionTransport::Tcp,
+            accepted(peer),
             CoreIngress::single(core_tx),
             Outbound {
                 sendq_bytes: 4096 * 512,
                 write_deadline: std::time::Duration::from_millis(300),
+                closing_drain: CLOSING_DRAIN,
             },
             Arc::new(Telemetry::new()),
         ));
@@ -2664,10 +2885,10 @@ mod tests {
             .await
             .expect("test output");
 
-        assert_eq!(
+        assert!(matches!(
             write_loop(FlushFails, rx, Arc::new(Telemetry::new())).await,
-            "Write error"
-        );
+            WriterEnd::Failed("Write error")
+        ));
     }
 
     #[tokio::test]
@@ -2683,10 +2904,14 @@ mod tests {
         // the sendq, so write_loop returns — and serve_conn must then cancel the
         // parked read and finish, rather than hang until an OS TCP timeout.
         drop(tx);
-        tokio::time::timeout(std::time::Duration::from_secs(2), served)
-            .await
-            .expect("serve_conn must return promptly after the core closes the session")
-            .expect("serve_conn task panicked");
+        // A silent peer is lingered on for its bound before the close.
+        tokio::time::timeout(
+            crate::lingering_close::LINGER_CLOSE_BOUND + std::time::Duration::from_secs(2),
+            served,
+        )
+        .await
+        .expect("serve_conn must return promptly after the core closes the session")
+        .expect("serve_conn task panicked");
     }
 
     #[tokio::test]
@@ -2706,10 +2931,13 @@ mod tests {
             "a mapped IPv4 peer must be canonicalized to its IPv4 host"
         );
         drop(tx);
-        tokio::time::timeout(std::time::Duration::from_secs(2), served)
-            .await
-            .expect("serve_conn must return after its sendq closes")
-            .expect("serve_conn task");
+        tokio::time::timeout(
+            crate::lingering_close::LINGER_CLOSE_BOUND + std::time::Duration::from_secs(2),
+            served,
+        )
+        .await
+        .expect("serve_conn must return after its sendq closes")
+        .expect("serve_conn task");
     }
 
     /// Minimal core config for the shutdown wiring test — no PostgreSQL needed.
@@ -2760,6 +2988,16 @@ mod tests {
             critical_failures,
             bnc_listener: None,
             bnc_registry: None,
+            connections: ConnectionTasks::default(),
+        }
+    }
+
+    /// The shutdown budget with the core's stop bounded by `core_stop`.
+    fn budget_with_core_stop(core_stop: std::time::Duration) -> ShutdownBudget {
+        ShutdownBudget {
+            core_stop,
+            driver_stop: SHUTDOWN_DRIVER_STOP_TIMEOUT,
+            connection_drain: SHUTDOWN_CONNECTION_DRAIN_TIMEOUT,
         }
     }
 
@@ -2895,13 +3133,243 @@ mod tests {
         let mut core_workers = tokio::task::JoinSet::new();
         core_workers.spawn(std::future::pending());
         let outcome = shutdown_handle(core_workers, flushed.clone())
-            .run_within(
-                std::time::Duration::from_millis(100),
-                SHUTDOWN_DRIVER_STOP_TIMEOUT,
-            )
+            .run_within(budget_with_core_stop(std::time::Duration::from_millis(100)))
             .await;
         assert_eq!(outcome, ShutdownOutcome::CoreTimedOut);
         assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A shard whose queue is full and that takes nothing from it used to
+    /// hold the shutdown request itself forever, before the core's stop
+    /// budget had even started. The request is made within that budget; on
+    /// its expiry the shards are ended and the database still flushes.
+    #[tokio::test]
+    async fn a_shard_that_will_not_take_the_shutdown_request_is_bounded_too() {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut core_workers = tokio::task::JoinSet::new();
+        core_workers.spawn(std::future::pending());
+        let mut handle = shutdown_handle(core_workers, flushed.clone());
+        // A live shard queue, full, that nothing drains.
+        let (core_tx, core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-stuck-core",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        core_tx.try_push(Input::Shutdown).expect("room for one");
+        handle.core_tx = Some(CoreIngress::single(core_tx));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle.run_within(budget_with_core_stop(std::time::Duration::from_millis(100))),
+        )
+        .await
+        .expect("shutdown must not wait on a shard that takes nothing");
+        assert_eq!(outcome, ShutdownOutcome::CoreTimedOut);
+        assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(core_rx);
+    }
+
+    /// Once the core has stopped, shutdown waits — bounded — for every
+    /// connection task: returning while they still write would let the
+    /// runtime's end cancel the clients' closing ERROR.
+    #[tokio::test]
+    async fn shutdown_waits_for_the_connection_tasks_within_its_bound() {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = handle.connections.task();
+        let marker = finished.clone();
+        tokio::spawn(async move {
+            let _task = task;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            marker.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        // One that never ends costs the bound, not forever.
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
+        let stuck = handle.connections.task();
+        let started = tokio::time::Instant::now();
+        let outcome = handle
+            .run_within(ShutdownBudget {
+                connection_drain: std::time::Duration::from_millis(100),
+                ..budget_with_core_stop(SHUTDOWN_CORE_STOP_TIMEOUT)
+            })
+            .await;
+        assert_eq!(outcome, ShutdownOutcome::Flushed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(stuck);
+    }
+
+    /// A certificate the attach listener cannot load is the operator's
+    /// configuration, not a client's failed handshake, and is counted so.
+    #[tokio::test]
+    async fn an_unloadable_attach_certificate_is_a_configuration_error() {
+        install_crypto_provider();
+        let telemetry = Arc::new(Telemetry::new());
+        let (core_tx, _core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-bnc-cert-core",
+            capacity: 4,
+            policy: Policy::Fifo,
+        });
+        let registry = Arc::new(
+            crate::bouncer::Registry::start_observed(
+                &[],
+                None,
+                crate::bouncer::CoreHandles {
+                    core_tx: CoreIngress::single(core_tx),
+                    next_conn: Arc::new(ConnectionIdAllocator::new(
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    )),
+                    sendq_bytes: 64 * 512,
+                },
+                telemetry.clone(),
+                crate::egress::InternalUpstreams::Allow,
+            )
+            .expect("registry"),
+        );
+        let controller = BncListenerController::new(
+            registry,
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+                .expect("lazy pool"),
+            "bnc.test".into(),
+            ConnLimiter::new(None),
+            telemetry.clone(),
+            CertificateReloads::default(),
+            ConnectionTasks::default(),
+        );
+        let missing = std::env::temp_dir().join(format!("e6irc-missing-{}", std::process::id()));
+        let requested = BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: Some(TlsConfig {
+                cert_path: missing.join("cert.pem"),
+                key_path: missing.join("key.pem"),
+            }),
+        };
+        assert!(controller.enable(&requested).await.is_err());
+        let errors = telemetry.snapshot(0, 0).errors;
+        assert_eq!(errors["configuration"], 1, "{errors:?}");
+        assert_eq!(errors["tls_handshake"], 0, "{errors:?}");
+    }
+
+    /// A client still sending when its session ends — its input unread in
+    /// the server's socket — reads its closing ERROR and an orderly end of
+    /// stream. Closing a socket with unread input sends a reset instead, and
+    /// a reset reaches the client as "connection reset" in place of the end
+    /// (on some stacks in place of the ERROR itself).
+    #[tokio::test]
+    async fn a_client_still_sending_reads_its_error_and_an_orderly_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .expect("connect");
+        let (server, peer) = listener.accept().await.expect("accept");
+        // Nothing takes from the core queue: once it is full the reader stops
+        // taking input, which piles up unread.
+        let (core_tx, mut core_rx) = test_core_channel();
+        let served = tokio::spawn(serve_conn(
+            server,
+            accepted(peer),
+            CoreIngress::single(core_tx),
+            Outbound::with_sendq(64 * 512),
+            Arc::new(Telemetry::new()),
+        ));
+        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+            panic!("expected Open");
+        };
+        let (mut client_read, mut client_write) = client.into_split();
+        let sender = tokio::spawn(async move {
+            let junk = "PING :x\r\n".repeat(8 * 1024).into_bytes();
+            for _ in 0..16 {
+                if client_write.write_all(&junk).await.is_err() {
+                    return;
+                }
+            }
+            drop(client_write.shutdown().await);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tx.0.try_push(Output(bytes::Bytes::from_static(
+            b"ERROR :Closing Link: 127.0.0.1 (Killed)\r\n",
+        )))
+        .expect("room");
+        drop(tx);
+        let mut received = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_read.read_to_end(&mut received),
+        )
+        .await
+        .expect("the connection closes");
+        assert_eq!(received, b"ERROR :Closing Link: 127.0.0.1 (Killed)\r\n");
+        read.expect("an orderly end of stream, not a reset");
+        served.await.expect("serve_conn task");
+        drop(sender);
+    }
+
+    /// A reader that takes one byte every 10 ms, forever.
+    async fn trickle(mut from: impl AsyncRead + Unpin) {
+        let mut byte = [0u8; 1];
+        while matches!(from.read(&mut byte).await, Ok(1)) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A session the core has ended is torn down within the closing drain,
+    /// however slowly its client reads: the write deadline counts only a
+    /// stall, and a client taking a byte every few milliseconds used to keep a
+    /// killed session's socket, task and per-IP slot for as long as a full
+    /// SendQ took it. Its reader stops at once, so nothing more it sends is
+    /// pushed for — or counted against — a session the core has forgotten.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_the_core_ended_stops_reading_and_drains_within_its_bound() {
+        let (client, server) = tokio::io::duplex(64);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-closing-core",
+            capacity: 65_536,
+            policy: Policy::Fifo,
+        });
+        let closing_drain = std::time::Duration::from_secs(1);
+        let served = tokio::spawn(serve_conn(
+            server,
+            accepted("127.0.0.1:5000".parse().unwrap()),
+            CoreIngress::single(core_tx),
+            Outbound {
+                sendq_bytes: 4096 * 512,
+                write_deadline: crate::peer_write::PEER_WRITE_DEADLINE,
+                closing_drain,
+            },
+            Arc::new(Telemetry::new()),
+        ));
+        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+            panic!("expected Open");
+        };
+        tokio::spawn(trickle(client_read));
+        // The client keeps sending lines.
+        tokio::spawn(async move {
+            while client_write.write_all(b"PING :x\r\n").await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
+        for _ in 0..100 {
+            tx.0.try_push(Output(line.clone())).expect("room");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(tx);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        while core_rx.try_pop().is_some() {}
+        let ended = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(60), served)
+            .await
+            .expect("the drain of an ended session is bounded as a whole")
+            .expect("serve_conn task");
+        assert!(ended.elapsed() <= closing_drain + std::time::Duration::from_millis(100));
+        let pushed_after = std::iter::from_fn(|| core_rx.try_pop())
+            .filter(|event| matches!(event.payload, Input::Line { .. }))
+            .count();
+        assert_eq!(pushed_after, 0, "the reader stopped with the session");
     }
 
     /// The graceful-shutdown chain that guarantees no buffered history is lost:

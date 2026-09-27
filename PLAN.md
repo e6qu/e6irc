@@ -1163,6 +1163,37 @@ before:
   are not there, and the message module claimed a serializer; both now say
   what the crate holds.
 
+A review of how connections end found, and this change fixes (DESIGN §7.2,
+§13.4, §15, §18):
+
+- **Shutdown did not wait for clients to receive their closing `ERROR`.** It
+  was queued, and the runtime's end cancelled its write. Every connection task
+  (IRC plaintext and TLS, `/ws/irc`, attach) now holds a `ConnectionTask`, and
+  shutdown waits for them for at most 8 s once the core has stopped; the unit's
+  stop budget is 65 s.
+- **The shutdown request itself was unbounded**: a shard with a full queue it
+  no longer took from held it before the core's stop budget began. It is now
+  made within that budget.
+- **A session the core had closed kept its socket, task and per-IP slot** for
+  as long as its client trickled out the backlog, while its reader kept
+  pushing (and counting) lines. A SendQ kill now discards the backlog and sends
+  only the closing `ERROR`, as Solanum does; every ended session has 5 s in
+  all to receive what it is owed, and its reader stops at once.
+- **The closing `ERROR` could be destroyed by a reset.** IRC sockets and
+  `/ws/irc` now close lingering, as HTTP refusals do.
+- **`X-Forwarded-For` skipped an unparsable entry** and walked on into entries
+  the client wrote. Such an entry before the client's address now refuses the
+  request (`400`), with a rate-limited log line naming the proxy.
+- **`/ws/irc` ended sessions by dropping the socket** and reported every end
+  as "WebSocket closed"; a message over the frame limit closed the connection.
+  It now sends a Close frame (1000), reports the transport's reason, answers an
+  over-long message `417` and closes (1009) only past a 64 KiB ceiling.
+- The attach listener showed a mapped IPv4 client in its IPv6 spelling; an
+  unloadable attach certificate was counted as a TLS handshake failure (now
+  `configuration`); `/ws/ui` sent a pong of its own beside the WebSocket
+  layer's (which the layer's replacement of its queued pong kept to one on the
+  wire; the redundant arm is gone and a test holds one ping to one pong).
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

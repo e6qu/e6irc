@@ -9505,6 +9505,40 @@ fn a_few_huge_lines_overrun_the_sendq_by_bytes() {
     assert!(sent <= TEST_SENDQ_BYTES / 4_000 + 1, "{sent} lines");
 }
 
+/// A client killed for SendQ exceeded is sent its closing ERROR and nothing
+/// else: the backlog it could not take is discarded, as Solanum does, rather
+/// than drained to it for as long as it trickles.
+#[test]
+fn a_sendq_kill_discards_the_backlog_and_sends_only_the_closing_error() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    s.drain(alice);
+    s.drain(bob);
+    let text = "x".repeat(400);
+    let mut sent = 0;
+    loop {
+        s.line(alice, &format!("PRIVMSG #c :{text}"));
+        sent += 1;
+        let killed = s
+            .drain(alice)
+            .iter()
+            .any(|line| line.starts_with(":bob!") && line.contains(" QUIT "));
+        if killed {
+            break;
+        }
+        assert!(sent < 10_000, "bob was never killed for SendQ");
+    }
+    assert_eq!(
+        s.drain(bob),
+        ["ERROR :Closing Link: host2.example (SendQ exceeded)"],
+        "only the closing line is left in the killed client's queue"
+    );
+}
+
 #[test]
 fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
     // A CHATHISTORY page that reaches PostgreSQL is answered asynchronously,

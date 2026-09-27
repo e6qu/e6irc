@@ -3454,14 +3454,14 @@ impl Core {
         handler::pace_replies(&mut self.state);
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
-        // overflows someone else's queue — hence the loop). Dropping the
-        // session drops its queue Sender, which is what closes the
-        // socket: write_loop drains, flushes, and shuts down on None.
+        // overflows someone else's queue — hence the loop). Its backlog is
+        // replaced by its closing ERROR, and dropping the session drops its
+        // queue Sender, which is what closes the socket.
         while let Some(conn) = self.state.doomed.pop() {
             if self.state.sessions.contains_key(&conn) {
                 self.state.telemetry.record_sendq_kill();
             }
-            self.state.close(conn, "SendQ exceeded");
+            self.state.close_for_sendq(conn);
         }
         self.state.publish_changed_channels();
         self.state.publish_census();
@@ -3554,6 +3554,14 @@ impl SessionOutput {
     pub(crate) fn write_goodbye(&mut self, line: WireLine) {
         drop(self.write(line));
         self.said_goodbye = true;
+    }
+
+    /// Discard everything still queued, then queue the closing line — which
+    /// the emptied queue always has room for. For a connection killed because
+    /// it could not take what it was sent.
+    pub(crate) fn discard_backlog_for_goodbye(&mut self, line: WireLine) {
+        drop(self.tx.0.take_queued());
+        self.write_goodbye(line);
     }
 }
 
