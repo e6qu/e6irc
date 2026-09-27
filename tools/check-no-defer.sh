@@ -66,7 +66,7 @@ done < "$untracked"
 # What the rest of the work is put off to.
 later='(dedicated|future|later|next|separate|subsequent|follow-?up) '
 unit='(pass|sweep|pr|pull request|change|commit|round|iteration|follow-?up)'
-# `[^a-z0-9_]` stands for a word boundary: BSD grep has no `\b` in -E.
+# `[^a-z0-9_]` stands for a word boundary: macOS's grep has no `\b` in -E.
 edge='(^|[^a-z0-9_])'
 end='([^a-z0-9_]|$)'
 banned="surfaced,? (but )?not (yet )?(done|changed|fixed|addressed|handled|implemented|resolved|acted on)"

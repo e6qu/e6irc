@@ -104,18 +104,19 @@ NOT_ABBREVIATIONS = {
         WE
         """,
     # Placeholders in a usage line or a `SAFETY:` note, standing for a value.
-    "placeholders": "ADDR BASE BURST CODE COUNTS DIGEST DIR FILE HOST IMAGE NAME PATH PORT REASON TARGET TOKEN",
+    "placeholders": "ADDR BASE BURST CODE COUNTS DIGEST DIR FILE HOST IMAGE JOB NAME PATH PORT REASON REV TARGET TOKEN",
     # Proper names spelled in capitals by their owners, not abbreviations of
     # anything this repository means: products (LLVM and QEMU are no longer
     # expansions; GNU is a recursive name; ZNC is a bouncer), licences by
     # their SPDX identifiers, the RSA algorithm by its inventors, the OFTC
     # network, the KOI8-R character set, and the TEST-NET documentation
-    # address ranges (RFC 5737).
-    "names": "GNU LLVM QEMU ZNC MIT MPL NCSA RSA OFTC KOI8 TEST",
+    # address ranges (RFC 5737), and the Arm processor architecture (a brand
+    # name, as GitHub's `windows-11-arm` and `ubuntu-24.04-arm` runners use it).
+    "names": "GNU LLVM QEMU ZNC MIT MPL NCSA RSA OFTC KOI8 TEST ARM",
     # Operating-system signal and error names, spelled as the system spells them.
     "system names": "SIGHUP SIGINT SIGTERM SIGKILL EMFILE ENFILE EPERM EINTR EOF",
     # Unicode's names for its control and directional characters.
-    "unicode names": "NUL BEL ESC DEL LRE RLE PDF LRO RLO LRI RLI FSI PDI CR LF",
+    "unicode names": "NUL BEL ESC DEL LRE RLE PDF LRO RLO LRI RLI FSI PDI CR LF TAB",
 }
 KNOWN_WORDS = {word for words in NOT_ABBREVIATIONS.values() for word in words.split()}
 
