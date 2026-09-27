@@ -231,7 +231,7 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_MONITORING_TOKEN` | no (secret; at least 32 non-whitespace characters) | Bearer for the read-only `/api/v1/monitoring/observation` endpoint; unset, the endpoint is closed |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated administrator account names, imported on the first start and console-owned afterwards (see above); empty fields name no account |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
-| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
+| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for the serving process's pool, a few connections per standby (see High availability), and your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
@@ -261,9 +261,12 @@ The command re-seals managed configuration and every account-network
 credential in one PostgreSQL transaction and writes a redacted audit record.
 It exits nonzero and rolls the whole transaction back if any value cannot be
 proven readable. After success, remove `E6IRC_PREVIOUS_SECRET_KEYS` and restart.
-The re-seal writes a new settings revision; every running server (and every
-replica) hears it and adopts it at once, so the console keeps saving without a
-restart.
+The re-seal writes a new settings revision; the serving process hears it and
+adopts it at once, so the console keeps saving without a restart. Run
+`rotate-secrets` and `recover-administrator` with the binary the serving
+process runs: against a schema older than its binary, a command refuses while a
+process serves (`upgrade the serving process first`) rather than migrate under
+it.
 
 ### Recover a lost administrator login
 
@@ -289,6 +292,13 @@ the password.
 
 Read these before deploying a release that includes the change named.
 
+- **One process serves a database (migration 0098).** The first upgrade to a
+  release with the serving lease needs every e6ircd process on the database
+  stopped: an older release knows no lease, so one left running would serve
+  beside the new one. Stop them all, start one with the new release (it
+  migrates), then start any standbys. Every later upgrade is the rolling
+  procedure under High availability. A second process on the same database no
+  longer serves beside the first: it stands by (below).
 - **The HTTP authentication throttle is on (migration 0088).** A stored
   `limits.auth_rate_burst` of `null` used to mean off; it now takes the
   default, twenty requests a minute per client address, on the routes that
@@ -343,15 +353,75 @@ Read these before deploying a release that includes the change named.
 ## Stop timeout
 
 On SIGTERM the daemon stops accepting work, tells every bouncer network's
-upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so a
-restart never meets its own ghost), drains its core shards for at most 5
-seconds, lets every client connection deliver its closing `ERROR` and close for
-at most 8 seconds, then flushes buffered writes to PostgreSQL for at most 30
-seconds. Give the container at least 65 seconds before it is killed, as
+upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so the
+next process to serve does not meet its session there still logged in),
+drains its core shards for at most 5 seconds, lets every client connection
+deliver its closing `ERROR` and close for at most 8 seconds, flushes buffered
+writes to PostgreSQL for at most 30 seconds, and then gives the serving lease
+back for at most 5 seconds, so a standby takes over at once. A process that is
+killed instead says no goodbye: its upstream sessions end when the upstream
+notices the dropped connection, and until then the next process to serve
+finds its nick held there — it registers under the alternative nickname and
+takes the configured one back once the ghost is gone or NickServ regains it. Give the container at least 65 seconds
+before it is killed, as
 `e6ircd.service` does: `stopTimeout: 65` (or more) in the ECS container
 definition, `docker stop --time 65`, or `stop_grace_period: 65s` in Compose.
 The Docker default of 10 seconds and the ECS default of 30 can both kill a
 shutdown that was still flushing cleanly.
+
+## High availability
+
+One e6ircd process serves a database: it runs the IRC core, the bouncer
+drivers (one upstream session per network), the database writer, storage
+maintenance and sampling, and binds the IRC, attach and HTTP listeners. Any
+other process started with the same configuration and database is a
+**standby**. Two processes serving one database — the IRC equivalent of two
+servers linked — is not supported: the lease makes it impossible.
+
+- **Lease.** The serving process holds the one row of `serving_lease` and
+  renews it every 3 seconds; the lease stands for 15 seconds after the last
+  renewal, measured on PostgreSQL's clock (the hosts' clocks do not matter). A
+  process that cannot confirm a renewal for 10 seconds stops serving by itself
+  — the same bounded drain as SIGTERM, and a non-zero exit, so its service
+  manager restarts it as a standby — before anyone else can take the lease.
+  When a standby takes the lease it ends every PostgreSQL connection the
+  previous holder opened, and a process without the lease cannot open a new
+  one: nothing a stalled holder had in flight lands after the takeover. Every
+  process must connect as the same database role, so the new holder can see
+  and end the old one's connections. Each takeover is an audit entry
+  (`SERVING_LEASE_ACQUIRE`); `e6irc_serving_lease_held` and
+  `e6irc_serving_lease_epoch` are on the metrics.
+- **Standby.** A standby says so on stderr (`standing by: the serving lease is
+  held by ADDRESS pid PID, e6ircd VERSION ...`), binds only the HTTP address,
+  and answers there `/healthz` 200 and `/readyz` 503 with
+  `{"role":"standby","holder":...}`; everything else is 503. It takes over the
+  moment the holder releases the lease (a graceful stop announces it) or 15
+  seconds after the holder's last renewal (a crash), then closes that listener,
+  migrates, and binds everything as a serving process does. A standby whose
+  binary is older than the schema refuses to start: it could never serve.
+- **Load balancer.** Route to the process whose `/readyz` answers 200: HTTP
+  and WebSockets on the HTTP port, and TCP 6697 (IRC) and the attach port with
+  that same HTTP check as their health check — a standby does not bind them.
+- **Service manager.** Run the same unit (`e6ircd.service`) with the same
+  configuration on two hosts; whichever starts first serves. `Restart=` brings
+  a fenced or crashed process back as the standby.
+- **Rolling upgrade.** Restart the standby with the new release (a standby may
+  be newer than the schema); send SIGTERM to the serving process — the
+  upgraded standby takes over and migrates; then start the old serving host
+  with the new release, as the standby. The first upgrade to a release with the
+  lease is the exception above: stop every process.
+- **Recovery point.** A graceful handoff loses nothing: the serving process
+  flushes to PostgreSQL before it releases. After a crash the new process
+  serves what PostgreSQL committed; lines the dead process had buffered and not
+  yet written (at most one batch of the history writer, and a bouncer
+  network's last backlog lines) are lost. Clients reconnect; bouncer networks
+  are dialled again by the new holder.
+- **PostgreSQL itself must fail over with synchronous replication**
+  (`synchronous_commit = on` with a synchronous standby, or a managed service
+  that promises no committed transaction is lost at failover). An asynchronous
+  replica promoted after a crash can roll the lease row back to an earlier
+  holder — and with it every write after that point — so two processes could
+  each believe the lease theirs until the next renewal.
 
 ## Running on any container host
 
@@ -375,8 +445,9 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   exits non-zero. Migrations run on a connection of their own with no
   statement timeout, so a long one (an index on a table that has grown for
   months) completes; one that waits more than 10 s for a lock — another
-  replica migrating, a long transaction — is abandoned and retried, up to six
-  attempts, one stderr line each. Back it up with `tools/backup-postgres.sh`.
+  process migrating, a long transaction — is abandoned and retried, up to six
+  attempts, one stderr line each. Only the process holding the serving lease
+  migrates (see High availability). Back it up with `tools/backup-postgres.sh`.
 - **The master key**, `E6IRC_SECRET_KEY`, kept outside the database and backed
   up separately. Without it the daemon cannot store upstream or managed
   credentials, and a database restored without it holds ciphertext nothing can

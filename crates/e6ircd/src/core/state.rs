@@ -1336,11 +1336,14 @@ pub(crate) struct CoreDirectories {
     pub(crate) password_policy: crate::identity::PasswordPolicy,
 }
 
-/// A session's login: the account, and the credential that signed it in.
+/// A session's login: the account, the credential that signed it in, and,
+/// for a personal access token, the instant the token expires and the login
+/// with it.
 #[derive(Debug, Clone)]
 struct Login {
     account: String,
     credential: crate::identity::CredentialId,
+    expires_at: Option<e6irc_proto::time::MonoMillis>,
 }
 
 /// What a credential verdict is refused for, once it no longer stands
@@ -1351,6 +1354,23 @@ pub(crate) enum EndedSignIns {
     Account(AccountKey),
     /// One app password or personal access token: it was revoked.
     Credential(crate::identity::IssuedCredential),
+    /// Every credential: the revocation listener was re-connected and
+    /// re-checks what it may have missed, which a verdict read before it
+    /// cannot have seen ([`ServerState::refuse_verdicts_in_flight`]).
+    Every,
+}
+
+/// Why a verdict that landed is refused although the store verified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleVerdict {
+    /// Its account's credentials changed, or the credential was revoked,
+    /// after the check was queued.
+    CredentialEnded,
+    /// The revocation listener was re-connected after the check was queued:
+    /// what was revoked meanwhile is re-checked, and a verdict read before
+    /// that cannot be told apart from one for a revoked credential. The client
+    /// may simply try again.
+    Rechecked,
 }
 
 /// The app passwords and personal access tokens live sessions on every shard
@@ -6212,30 +6232,67 @@ impl ServerState {
         }
     }
 
-    /// Whether `account`'s credentials changed, or the issued `credential`
-    /// was revoked, after `conn` queued the check whose verdict is landing:
-    /// that verdict speaks for a credential that no longer stands, and is
+    /// Whether the verdict landing for `conn` is stale: `account`'s
+    /// credentials changed, or the issued `credential` was revoked, after the
+    /// check was queued — the verdict speaks for a credential that no longer
+    /// stands — or the revocation listener was re-connected since, and the
+    /// verdict was read before what it missed was re-checked. Either is
     /// refused.
-    pub(crate) fn credentials_ended_since(
+    pub(crate) fn stale_verdict(
         &self,
         conn: ConnId,
         account: &str,
         credential: crate::identity::CredentialId,
-    ) -> bool {
-        let Some(session) = self.sessions.get(&conn) else {
-            return false;
-        };
+    ) -> Option<StaleVerdict> {
+        let session = self.sessions.get(&conn)?;
         let ended_since = |key: &EndedSignIns| {
             self.credentials_ended
                 .get(key)
                 .is_some_and(|ended| *ended > session.verify_epoch)
         };
-        ended_since(&EndedSignIns::Account(self.account_key(account)))
+        if ended_since(&EndedSignIns::Account(self.account_key(account)))
             || matches!(
                 credential,
                 crate::identity::CredentialId::Issued(issued)
                     if ended_since(&EndedSignIns::Credential(issued))
             )
+        {
+            Some(StaleVerdict::CredentialEnded)
+        } else if ended_since(&EndedSignIns::Every) {
+            Some(StaleVerdict::Rechecked)
+        } else {
+            None
+        }
+    }
+
+    /// The revocation listener was re-connected: a verdict for any check
+    /// queued before now is refused when it lands, as it may speak for a
+    /// credential revoked while nothing listened. Run on every shard before
+    /// the listener re-reads what the live sessions hold, so a verdict either
+    /// lands first — and its session is among those re-read — or is refused.
+    pub(crate) fn refuse_verdicts_in_flight(&mut self) {
+        self.end_credentials(EndedSignIns::Every);
+    }
+
+    /// Close every session whose login has expired by `now`: one a personal
+    /// access token signed in ends when the token does. Driven by the periodic
+    /// tick.
+    pub(crate) fn expire_logins(&mut self, now: e6irc_proto::time::MonoMillis) {
+        let expired: Vec<ConnId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session
+                    .login
+                    .as_ref()
+                    .and_then(|login| login.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at)
+            })
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in expired {
+            self.close_with_error(conn, "Personal access token expired");
+        }
     }
 
     /// `ended` — an account's credentials, or one issued credential — no
@@ -7902,7 +7959,12 @@ impl ServerState {
         conn: ConnId,
         account: String,
         credential: crate::identity::CredentialId,
+        expires_in: Option<std::time::Duration>,
     ) {
+        let expires_at = expires_in.map(|remaining| {
+            (self.config.mono_clock)()
+                .saturating_add_millis(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX))
+        });
         let key = self.account_key(&account);
         let session = self.sessions.get_mut(&conn).expect("session logging in");
         let released = session
@@ -7914,6 +7976,7 @@ impl ServerState {
         let previous = session.login.replace(Login {
             account: account.clone(),
             credential,
+            expires_at,
         });
         if let Some(previous) = previous {
             self.forget_login(&previous, conn);
@@ -8670,16 +8733,19 @@ mod session_store_tests {
             ConnId(1),
             "Alice".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         state.set_account(
             ConnId(2),
             "alice".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         state.set_account(
             ConnId(3),
             "carol".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         check(&state);
         assert_eq!(indexed(&state, "ALICE"), vec![ConnId(1), ConnId(2)]);
@@ -8688,6 +8754,7 @@ mod session_store_tests {
             ConnId(2),
             "carol".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         check(&state);
         assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
@@ -8696,6 +8763,7 @@ mod session_store_tests {
             ConnId(2),
             "Carol".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         check(&state);
         assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
@@ -8729,6 +8797,7 @@ mod session_store_tests {
             ConnId(1),
             "Alice".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         step(&mut state);
         assert_eq!(state.identity_nick("alice"), "alice");
@@ -8736,6 +8805,7 @@ mod session_store_tests {
             ConnId(2),
             "carol".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         step(&mut state);
         assert_eq!(state.identity_nick("carol"), "bob");
@@ -8743,6 +8813,7 @@ mod session_store_tests {
             ConnId(2),
             "ALICE".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         step(&mut state);
         assert_eq!(state.identity_nick("carol"), "carol", "no one is carol now");

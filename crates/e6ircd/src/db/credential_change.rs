@@ -21,9 +21,6 @@
 use super::{ACCOUNT_FLAG_SUSPENDED, DbError, query_error, token_hash};
 use crate::identity::IssuedCredential;
 
-/// The notification channel migration 0077's triggers publish on.
-const CREDENTIAL_CHANGED_CHANNEL: &str = "e6irc_credential_changed";
-
 /// The table a revocable credential lives in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum RevocableCredentialKind {
@@ -265,9 +262,10 @@ pub async fn issued_credentials_stored(
         .collect())
 }
 
-/// What the credential-change listener heard.
+/// What an announcement on the credential channel
+/// ([`super::CREDENTIAL_CHANGED_CHANNEL`]) asks of a follower.
 #[derive(Debug, PartialEq, Eq)]
-pub enum CredentialChange {
+pub(crate) enum CredentialChange {
     /// This credential was deleted or changed.
     Changed(RevocableCredential),
     /// This account was created or deleted, or its authority changed.
@@ -275,43 +273,24 @@ pub enum CredentialChange {
     /// This app password or personal access token was revoked: its row was
     /// deleted.
     IssuedRevoked(IssuedCredential),
-    /// The listening connection was lost and re-established: announcements
-    /// made in between are gone, so every watched credential must be read
-    /// again.
+    /// Announcements may have been missed (the listening connection was
+    /// re-established), or one named nothing a shipped trigger writes: every
+    /// watched credential and account must be read again.
     Resynchronize,
 }
 
-/// A dedicated connection listening for credential changes.
-pub struct CredentialChangeListener(sqlx::postgres::PgListener);
-
-impl CredentialChangeListener {
-    /// Connect and start listening. The listener has its own connection, not
-    /// one of the shared pool's, which it would hold for the process lifetime.
-    pub async fn connect(url: &super::DatabaseUrl) -> Result<Self, DbError> {
-        let mut listener = super::notification_listener(url).await?;
-        listener
-            .listen(CREDENTIAL_CHANGED_CHANNEL)
-            .await
-            .map_err(query_error)?;
-        Ok(Self(listener))
-    }
-
-    /// The next change. An error means the connection could not be
-    /// re-established; the caller connects again.
-    pub async fn next(&mut self) -> Result<CredentialChange, DbError> {
-        let Some(notification) = self.0.try_recv().await.map_err(query_error)? else {
-            return Ok(CredentialChange::Resynchronize);
+impl CredentialChange {
+    /// What `announcement` asks. A payload no shipped trigger writes still
+    /// says *something* changed; not knowing what, everything is read again.
+    pub(crate) fn of(announcement: super::Announcement) -> Self {
+        let super::Announcement::Notified(payload) = announcement else {
+            return Self::Resynchronize;
         };
-        // A payload no shipped trigger writes still says *something* changed;
-        // not knowing what, every watched credential is read again.
-        let payload = notification.payload();
-        Ok(RevocableCredential::from_notification(payload)
-            .map(CredentialChange::Changed)
-            .or_else(|| {
-                AccountAnnouncement::from_notification(payload).map(CredentialChange::Account)
-            })
-            .or_else(|| revoked_issued_credential(payload).map(CredentialChange::IssuedRevoked))
-            .unwrap_or(CredentialChange::Resynchronize))
+        RevocableCredential::from_notification(&payload)
+            .map(Self::Changed)
+            .or_else(|| AccountAnnouncement::from_notification(&payload).map(Self::Account))
+            .or_else(|| revoked_issued_credential(&payload).map(Self::IssuedRevoked))
+            .unwrap_or(Self::Resynchronize)
     }
 }
 
@@ -341,6 +320,38 @@ mod tests {
         for junk in ["", "session", "other:00", "session:0", "session:zz"] {
             assert_eq!(RevocableCredential::from_notification(junk), None, "{junk}");
         }
+    }
+
+    #[test]
+    fn an_announcement_asks_for_what_it_names_and_anything_else_resynchronizes() {
+        let notified = |payload: &str| {
+            CredentialChange::of(super::super::Announcement::Notified(payload.into()))
+        };
+        assert_eq!(
+            notified("account:7:bob"),
+            CredentialChange::Account(AccountAnnouncement {
+                id: 7,
+                folded: "bob".into(),
+            })
+        );
+        let session = RevocableCredential::browser_session("cookie");
+        let hex: String = session
+            .digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            notified(&format!("session:{hex}")),
+            CredentialChange::Changed(session)
+        );
+        assert_eq!(
+            notified("a future trigger's payload"),
+            CredentialChange::Resynchronize
+        );
+        assert_eq!(
+            CredentialChange::of(super::super::Announcement::Resynchronize),
+            CredentialChange::Resynchronize
+        );
     }
 
     #[test]

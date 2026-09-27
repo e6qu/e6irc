@@ -17,17 +17,21 @@ use crate::core::{DbReply, DbRequest, Input};
 use crate::observability::Telemetry;
 use e6irc_queue::Receiver;
 
+mod announcements;
 mod credential_change;
 mod secret_rotation;
-mod settings_change;
 mod url;
+pub(crate) use announcements::{
+    Announcement, Announcements, CREDENTIAL_CHANGED_CHANNEL, Follower, SERVING_LEASE_CHANNEL,
+    SETTINGS_CHANGED_CHANNEL, follow_announcements,
+};
+pub(crate) use credential_change::CredentialChange;
 pub use credential_change::{
-    AccountAnnouncement, AccountAuthority, CredentialChange, CredentialChangeListener,
-    RevocableCredential, credential_remaining, issued_credentials_stored,
+    AccountAnnouncement, AccountAuthority, RevocableCredential, credential_remaining,
+    issued_credentials_stored,
 };
 pub(crate) use credential_change::{account_authority, every_account_authority};
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
-pub(crate) use settings_change::{SettingsChange, SettingsChangeListener};
 pub use url::{DatabaseUrl, DatabaseUrlError};
 pub use url::{LIBPQ_ENVIRONMENT, refuse_libpq_process_environment};
 
@@ -125,6 +129,23 @@ pub enum DbError {
         completed: Box<StorageMaintenanceReport>,
         failures: Vec<MaintenanceFailure>,
     },
+    /// The database holds migrations this binary does not know: a later
+    /// release migrated it. Nothing is served or changed.
+    SchemaNewerThanBinary {
+        applied: i64,
+        known: i64,
+    },
+    /// The database schema is older than this binary, and a serving process
+    /// holds the lease: only the serving process migrates, so a command-line
+    /// process refuses instead.
+    ServedSchemaOlder(crate::serving_lease::LeaseHeld),
+    /// Taking the serving lease could not end this many connections of the
+    /// previous holder; the lease was not taken.
+    PreviousHolderLingers(i64),
+    /// This process has lost the serving lease (fenced, or taken over), so
+    /// the database refuses it connections: what a pool timeout or a refused
+    /// connection means once [`mark_fenced`] has recorded why.
+    NotServing(String),
 }
 
 impl std::fmt::Display for DbError {
@@ -228,6 +249,26 @@ impl std::fmt::Display for DbError {
                 }
                 write!(f, "; every other collection committed its batch")
             }
+            Self::SchemaNewerThanBinary { applied, known } => write!(
+                f,
+                "the database schema is at migration {applied}, newer than this binary knows \
+                 (its newest is {known}); run the release that migrated it"
+            ),
+            Self::ServedSchemaOlder(held) => write!(
+                f,
+                "the database schema is older than this binary and {held} serves it; upgrade \
+                 the serving process first, which migrates it"
+            ),
+            Self::NotServing(why) => write!(
+                f,
+                "this process no longer holds the serving lease ({why}); it cannot use the \
+                 database"
+            ),
+            Self::PreviousHolderLingers(count) => write!(
+                f,
+                "{count} connection(s) of the previous serving-lease holder did not end when \
+                 terminated; the lease was not taken"
+            ),
         }
     }
 }
@@ -239,13 +280,42 @@ impl std::error::Error for DbError {}
 /// telemetry as `e6irc_database_pool_acquire_timeouts_total`.
 static POOL_ACQUIRE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Why this process lost the serving lease, once it has: set once, by the
+/// lease's renewal task when the lease ends ([`mark_fenced`]).
+static FENCED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record that this process no longer holds the serving lease, and why (who
+/// holds it now, or that it fenced itself). From then on a pool that cannot
+/// hand out a connection — the database refuses every new one this process
+/// opens — reports that, not a bare timeout. The first reason stands.
+pub(crate) fn mark_fenced(why: String) {
+    FENCED.get_or_init(|| why);
+}
+
+/// SQLSTATE `serving_lease_register_backend` (migration 0098) raises for a
+/// process that does not hold the lease.
+const NOT_THE_LEASE_HOLDER: &str = "E6L01";
+
 /// Every query failure in this module passes through here on its way into a
-/// [`DbError`], so an exhausted pool is counted wherever it is met.
-fn query_error(error: sqlx::Error) -> DbError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+/// [`DbError`], so an exhausted pool is counted wherever it is met, and a
+/// process that has lost the serving lease says so.
+pub(crate) fn query_error(error: sqlx::Error) -> DbError {
+    classify_query_error(error, FENCED.get().map(String::as_str))
+}
+
+fn classify_query_error(error: sqlx::Error, fenced: Option<&str>) -> DbError {
+    let timed_out = matches!(error, sqlx::Error::PoolTimedOut);
+    if timed_out {
         POOL_ACQUIRE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    DbError::Query(error)
+    let refused = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == NOT_THE_LEASE_HOLDER);
+    match fenced {
+        Some(why) if timed_out || refused => DbError::NotServing(why.to_owned()),
+        _ => DbError::Query(error),
+    }
 }
 
 pub(crate) fn pool_acquire_timeouts() -> u64 {
@@ -292,8 +362,9 @@ fn seconds_for_database(value: u64, column: &str) -> Result<f64, DbError> {
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: i64 = 60_000;
 
 /// How long one migration statement may wait for a lock (the migrator's own
-/// advisory lock included — another replica migrating — or a table lock held
-/// by a live server) before the attempt is abandoned and retried.
+/// advisory lock included — another process migrating a database that has no
+/// serving lease yet — or a table lock held by a long transaction) before the
+/// attempt is abandoned and retried.
 const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Attempts [`run_migrations`] makes when a migration keeps timing out on a
 /// lock; the pause between two of them doubles from one second.
@@ -364,7 +435,7 @@ impl TryFrom<u32> for DatabasePoolSize {
 /// must see. This fails at once with that reason, and the bound keeps an
 /// unroutable address from hanging startup on the operating system's connect
 /// timeout.
-async fn connect_directly(url: &DatabaseUrl) -> Result<sqlx::PgConnection, DbError> {
+pub(crate) async fn connect_directly(url: &DatabaseUrl) -> Result<sqlx::PgConnection, DbError> {
     tokio::time::timeout(
         DATABASE_ACQUIRE_TIMEOUT,
         <sqlx::PgConnection as sqlx::Connection>::connect_with(&url.connect_options()),
@@ -421,8 +492,9 @@ fn migration_waited_on_a_lock(error: &sqlx::migrate::MigrateError) -> bool {
 /// a request and wrong for a migration, which may rewrite or index a table
 /// that has grown for months — a deployment that large would crash-loop on
 /// every upgrade. Here there is no statement timeout, and a bounded lock
-/// timeout instead: a migration stuck behind a lock (another replica
-/// migrating, a long transaction on a live server) gives up after
+/// timeout instead: a migration stuck behind a lock (another process
+/// migrating a database that has no serving lease yet, a long transaction)
+/// gives up after
 /// [`MIGRATION_LOCK_TIMEOUT`], says so on stderr, and is retried on a fresh
 /// connection with a doubling pause, [`MIGRATION_LOCK_ATTEMPTS`] times in all.
 /// Every other migration failure is a fact about the schema and is returned at
@@ -512,7 +584,7 @@ fn concurrent_index_name(sql: &str) -> Option<String> {
 /// Take the migrator's advisory lock, drop what an interrupted concurrent
 /// index build left ([`drop_interrupted_index_builds`]), and migrate. The
 /// lock is taken first because a build in progress is invalid too: another
-/// replica migrating holds it for the build's whole length. It is a
+/// process migrating holds it for the build's whole length. It is a
 /// session-level lock and re-entrant — the migrator takes it again and
 /// releases its own hold — and closing the connection releases this one.
 async fn migrate_holding_the_lock(
@@ -566,19 +638,148 @@ async fn drop_interrupted_index_builds(
     Ok(())
 }
 
-/// Migrate, then open a pool of the default size — for a one-shot command
-/// (`recover-administrator`, secret rotation), which opens connections only as
-/// it uses them. The daemon opens its pool through
-/// [`connect_and_migrate_with_retry`], at its configured size.
-pub async fn connect_and_migrate(url: &DatabaseUrl) -> Result<PgPool, DbError> {
-    connect_and_migrate_sized(url, DatabasePoolSize::for_this_host()).await
+/// The migrations a database has and this binary's, compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaState {
+    /// Whether migration 0098's `serving_lease` exists: until it does, no
+    /// process holds a lease, and the schema is brought up to it under the
+    /// migrator's advisory lock alone.
+    lease_table: bool,
+    /// Applied migrations this binary does not know (a later release's).
+    unknown: Vec<i64>,
+    /// This binary's migrations the database has not applied.
+    pending: Vec<i64>,
 }
 
-async fn connect_and_migrate_sized(
+impl SchemaState {
+    async fn read(url: &DatabaseUrl) -> Result<Self, DbError> {
+        let mut connection = connect_directly(url).await?;
+        let (lease_table, ledger): (bool, bool) = sqlx::query_as(
+            "SELECT to_regclass('serving_lease') IS NOT NULL,
+                    to_regclass('_sqlx_migrations') IS NOT NULL",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(DbError::Connect)?;
+        let applied: Vec<i64> = if ledger {
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+                .fetch_all(&mut connection)
+                .await
+                .map_err(DbError::Connect)?
+        } else {
+            Vec::new()
+        };
+        <sqlx::PgConnection as sqlx::Connection>::close(connection)
+            .await
+            .map_err(DbError::Connect)?;
+        let known: Vec<i64> = MIGRATOR.iter().map(|migration| migration.version).collect();
+        Ok(Self {
+            lease_table,
+            unknown: applied
+                .iter()
+                .copied()
+                .filter(|version| !known.contains(version))
+                .collect(),
+            pending: known
+                .into_iter()
+                .filter(|version| !applied.contains(version))
+                .collect(),
+        })
+    }
+
+    /// Refuse a schema a later release migrated: this binary cannot serve it,
+    /// and must not take the lease from a process that can.
+    fn refuse_newer(&self) -> Result<(), DbError> {
+        match self.unknown.iter().max() {
+            Some(&applied) => Err(DbError::SchemaNewerThanBinary {
+                applied,
+                known: MIGRATOR
+                    .iter()
+                    .map(|migration| migration.version)
+                    .max()
+                    .unwrap_or(0),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Before any lease can exist: a database without migration 0098's lease
+/// table is migrated as every release before it migrated, under the
+/// migrator's advisory lock, since no process can hold a lease on it yet.
+/// Then a schema a later release migrated is refused.
+async fn bootstrap_and_check_schema(url: &DatabaseUrl) -> Result<SchemaState, DbError> {
+    let mut schema = SchemaState::read(url).await?;
+    if !schema.lease_table {
+        run_migrations(url, &MIGRATOR).await?;
+        schema = SchemaState::read(url).await?;
+    }
+    schema.refuse_newer()?;
+    Ok(schema)
+}
+
+/// Refuse a schema a later release migrated, as boot does: a standby checks
+/// before each attempt at the lease, so one that could not serve never takes
+/// it from one that can.
+pub(crate) async fn refuse_newer_schema(url: &DatabaseUrl) -> Result<(), DbError> {
+    SchemaState::read(url).await?.refuse_newer()
+}
+
+/// Bring the schema up to this binary. Only the lease holder calls this (the
+/// serving process after taking the lease, a command-line process holding it
+/// for the migration), so no process migrates under a serving one.
+pub(crate) async fn migrate(url: &DatabaseUrl) -> Result<(), DbError> {
+    run_migrations(url, &MIGRATOR).await
+}
+
+/// A pool for a one-shot command (`recover-administrator`, secret rotation),
+/// of the default size; it opens connections only as it uses them. The daemon
+/// opens its pool through [`connect_pool`], at its configured size.
+///
+/// A command is not the serving process, and does not migrate under one: a
+/// schema older than this binary is migrated only while no process serves the
+/// database, holding the serving lease for the migration; with a serving
+/// holder it is refused ([`DbError::ServedSchemaOlder`]) — upgrade the serving
+/// process, which migrates it. A schema a later release migrated is refused
+/// too. A database without the lease table yet is migrated as before it.
+pub async fn connect_and_migrate(url: &DatabaseUrl) -> Result<PgPool, DbError> {
+    let schema = bootstrap_and_check_schema(url).await?;
+    if !schema.pending.is_empty() {
+        let purpose = format!(
+            "{} running a command-line migration",
+            crate::serving_lease::serving_purpose()
+        );
+        let holder = crate::serving_lease::HolderId::generate();
+        match crate::serving_lease::acquire(url, &holder, &purpose).await {
+            Ok(lease) => {
+                let migrated = migrate(url).await;
+                let released = lease.release(COMMAND_LEASE_RELEASE_TIMEOUT).await;
+                migrated?;
+                released?;
+            }
+            Err(crate::serving_lease::AcquireRefusal::Held(held)) => {
+                return Err(DbError::ServedSchemaOlder(held));
+            }
+            Err(crate::serving_lease::AcquireRefusal::Database(error)) => return Err(error),
+        }
+    }
+    connect_pool(url, DatabasePoolSize::for_this_host(), None).await
+}
+
+/// How long a command-line migration waits to hand the serving lease back.
+const COMMAND_LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open the shared pool. With `fence`, the serving process's own: every
+/// connection is checked, as it is made, to belong to the serving lease's
+/// holder and recorded as the holder's (`serving_lease_register_backend`,
+/// migration 0098), so a process that has lost the lease cannot open one, and
+/// the next holder can end every one it has open.
+pub async fn connect_pool(
     url: &DatabaseUrl,
     size: DatabasePoolSize,
+    fence: Option<&crate::serving_lease::HolderId>,
 ) -> Result<PgPool, DbError> {
-    run_migrations(url, &MIGRATOR).await?;
+    let fence = fence.map(|holder| holder.as_str().to_owned());
     // Every caller shares this pool, including HTTP handlers and the database
     // worker. A dependency interruption must therefore produce a bounded,
     // typed query failure instead of parking unrelated requests on SQLx's
@@ -586,7 +787,8 @@ async fn connect_and_migrate_sized(
     PgPoolOptions::new()
         .max_connections(size.get())
         .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
-        .after_connect(|connection, _metadata| {
+        .after_connect(move |connection, _metadata| {
+            let fence = fence.clone();
             Box::pin(async move {
                 for (setting, value) in [
                     ("statement_timeout", DATABASE_STATEMENT_TIMEOUT_MS),
@@ -599,6 +801,12 @@ async fn connect_and_migrate_sized(
                     sqlx::query("SELECT set_config($1, $2, false)")
                         .bind(setting)
                         .bind(value.to_string())
+                        .execute(&mut *connection)
+                        .await?;
+                }
+                if let Some(holder) = fence {
+                    sqlx::query("SELECT serving_lease_register_backend($1::uuid)")
+                        .bind(holder)
                         .execute(&mut *connection)
                         .await?;
                 }
@@ -653,25 +861,28 @@ pub struct StartupDatabaseAttempt<'a> {
     pub retry_in: Option<std::time::Duration>,
 }
 
-/// [`connect_and_migrate`] for process startup: a refused or not-yet-listening
+/// Wait for the database at process startup: a refused or not-yet-listening
 /// PostgreSQL (a container that starts a few seconds after this one, a
 /// restarting server) is retried with a doubling, capped backoff until `wait`
-/// is spent, and every failed attempt is reported. Only connection failures
-/// are retried: a migration failure is a fact about the schema that waiting
-/// cannot change, and is returned at once.
-pub async fn connect_and_migrate_with_retry(
+/// is spent, and every failed attempt is reported. An attempt connects, brings
+/// a database without the serving-lease table up to it
+/// ([`bootstrap_and_check_schema`]), and refuses a schema a later release
+/// migrated. Only connection failures are retried: a migration failure or a
+/// newer schema is a fact that waiting cannot change, and is returned at once.
+/// No lease is taken and nothing else is migrated here; the caller takes the
+/// lease ([`crate::serving_lease::acquire`]) and then [`migrate`]s.
+pub async fn wait_for_database(
     url: &DatabaseUrl,
     wait: StartupDatabaseWait,
-    size: DatabasePoolSize,
     mut report: impl FnMut(StartupDatabaseAttempt<'_>),
-) -> Result<PgPool, DbError> {
+) -> Result<(), DbError> {
     let started = std::time::Instant::now();
     let mut backoff = StartupDatabaseWait::FIRST_BACKOFF;
     let mut attempts: u32 = 0;
     loop {
         attempts = attempts.saturating_add(1);
-        let error = match connect_and_migrate_sized(url, size).await {
-            Ok(pool) => return Ok(pool),
+        let error = match bootstrap_and_check_schema(url).await {
+            Ok(_) => return Ok(()),
             Err(error @ DbError::Connect(_)) => error,
             Err(error) => return Err(error),
         };
@@ -1388,8 +1599,8 @@ pub async fn save_managed_config(
 
 /// [`save_managed_config`] over the revision `current` holds, keeping `current`
 /// what is stored: the new revision when the save commits, and the stored row
-/// when another writer (a replica's console, `e6ircd rotate-secrets`) got there
-/// first. Without the reload a stale snapshot stayed stale, and every later
+/// when another writer (`e6ircd rotate-secrets`, from a process of its own) got
+/// there first. Without the reload a stale snapshot stayed stale, and every later
 /// save from it failed the same way until the process restarted; with it, the
 /// [`DbError::StaleServerSettings`] this returns is true of a revision the
 /// administrator can now read, and a retry from it works. What the stored
@@ -6176,7 +6387,7 @@ impl AuditPrincipal {
     }
 }
 
-async fn insert_audit_log_with<'executor>(
+pub(crate) async fn insert_audit_log_with<'executor>(
     executor: impl sqlx::Executor<'executor, Database = sqlx::Postgres>,
     actor: &AuditPrincipal,
     action: &str,
@@ -6888,6 +7099,7 @@ impl VerifyOutcome {
             Self::Verified(signed_in) => DbReply::PasswordVerified {
                 account: signed_in.account.into_name(),
                 credential: signed_in.credential,
+                expires_in: signed_in.expires_in,
                 origin,
             },
             Self::Rejected => DbReply::PasswordRejected { origin },
@@ -7690,6 +7902,10 @@ impl std::ops::Deref for VerifiedAccount {
 pub struct VerifiedSignIn {
     pub account: VerifiedAccount,
     pub credential: crate::identity::CredentialId,
+    /// How much longer the credential authorizes, by PostgreSQL's clock — the
+    /// one its expiry was written against: a personal access token's
+    /// remaining lifetime, `None` for a password, which does not expire.
+    pub expires_in: Option<std::time::Duration>,
 }
 
 /// Verify an account password or app password.
@@ -7754,6 +7970,7 @@ async fn verify_any_credential(
     Ok(Some(VerifiedSignIn {
         account: VerifiedAccount(display_name),
         credential,
+        expires_in: None,
     }))
 }
 
@@ -10646,8 +10863,10 @@ pub async fn api_token_account(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<VerifiedSignIn>, DbError> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT a.name, t.id FROM api_tokens t
+    let row: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT a.name, t.id,
+                (EXTRACT(EPOCH FROM (t.expires_at - now())) * 1000)::BIGINT
+         FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
            AND t.expires_at > now()
@@ -10659,11 +10878,14 @@ pub async fn api_token_account(
     .fetch_optional(pool)
     .await
     .map_err(query_error)?;
-    Ok(row.map(|(name, id)| VerifiedSignIn {
+    Ok(row.map(|(name, id, remaining_ms)| VerifiedSignIn {
         account: VerifiedAccount(name),
         credential: crate::identity::CredentialId::Issued(
             crate::identity::IssuedCredential::ApiToken(id),
         ),
+        expires_in: Some(std::time::Duration::from_millis(
+            remaining_ms.max(0).unsigned_abs(),
+        )),
     }))
 }
 
@@ -10934,6 +11156,34 @@ mod pool_size_tests {
         let parsed: DatabasePoolSize = serde_json::from_str("48").expect("in bounds");
         assert_eq!(parsed.get(), 48);
         assert!(serde_json::from_str::<DatabasePoolSize>("0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod fence_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_fenced_process_s_refused_or_timed_out_pool_names_the_lease() {
+        let why = "held by 10.0.0.2 pid 7, e6ircd 0.1.0";
+        let fenced = classify_query_error(sqlx::Error::PoolTimedOut, Some(why));
+        assert!(matches!(&fenced, DbError::NotServing(reason) if reason == why));
+        assert!(
+            fenced
+                .to_string()
+                .starts_with("this process no longer holds the serving lease (held by 10.0.0.2"),
+            "{fenced}"
+        );
+        // Serving still: a timeout is a timeout.
+        assert!(matches!(
+            classify_query_error(sqlx::Error::PoolTimedOut, None),
+            DbError::Query(sqlx::Error::PoolTimedOut)
+        ));
+        // Fenced, but an unrelated failure is itself.
+        assert!(matches!(
+            classify_query_error(sqlx::Error::RowNotFound, Some(why)),
+            DbError::Query(sqlx::Error::RowNotFound)
+        ));
     }
 }
 

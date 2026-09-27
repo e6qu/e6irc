@@ -464,7 +464,25 @@ each element of an array, which is how a direct message is found by either
 of its participants (`dm_peers`).
 
 **Migration** — a numbered, checksum-pinned SQL schema change under
-`migrations/`, run at startup.
+`migrations/`, run at startup by the process that holds the serving lease.
+
+**Serving lease** — the one row (`serving_lease`, migration 0098) that names
+the one process serving a database. Its holder renews it every few seconds;
+another process may take it once it is released or its **time to live
+(TTL)** — how long it stands after the last renewal — has passed.
+
+**Standby** — an e6ircd process started against a database another process
+serves: it binds only its HTTP health answers and takes the lease over when
+the holder stops or dies. **Active/standby** is this arrangement; active/active
+(several processes serving one database) is not supported.
+
+**Fence** — what keeps a process that has lost the lease from acting as if it
+held it: the holder stops serving when it cannot confirm a renewal in time,
+and PostgreSQL refuses its new connections and ends its open ones at a
+takeover.
+
+**Universally unique identifier (UUID)** — a 128-bit random identifier; a
+process names itself as a lease holder by one.
 
 **Read marker** (`draft/read-marker`) — a per-account, per-target timestamp
 of how far a user has read, set via `MARKREAD` and synced across clients.

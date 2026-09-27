@@ -1348,9 +1348,13 @@ async fn observe_http(
     response
 }
 
+/// `/readyz` of the serving process. A standby answers its own
+/// (`net::StandbyHealth`): `role` tells a load balancer's operator which one
+/// answered.
 #[derive(Serialize)]
 struct Readiness {
     ready: bool,
+    role: &'static str,
     core: &'static str,
     database: &'static str,
 }
@@ -1456,6 +1460,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         },
         axum::Json(Readiness {
             ready,
+            role: "serving",
             core: if core_ready { "ready" } else { "stale" },
             database: if state.pool().is_none() {
                 "not_configured"

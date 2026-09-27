@@ -29,6 +29,9 @@ product outcomes and their automated evidence are mapped in
   the shared Libera protocol surface, and the BNC connector targets Libera as
   its primary external network. The client matrix records qualification limits.
 - Designed for **~100k+ concurrent connections** on one machine.
+- **Active/standby high availability**: one process serves a database; any
+  other process started against it stands by and takes over when the serving
+  one stops or dies (the serving lease, §18).
 - **Small binary, high performance**: no needless dependencies, one TLS stack,
   one async runtime, compile-time templates, feature flags for optional
   subsystems.
@@ -46,7 +49,11 @@ product outcomes and their automated evidence are mapped in
 ### Non-goals
 
 - Server-to-server federation (IRC linking). Single-server only; the internal
-  state model is not required to keep seams for a linking protocol.
+  state model is not required to keep seams for a linking protocol. Several
+  processes *serving* one database at once — active/active replicas — are the
+  same thing by another name (each would hold a share of the live state and
+  every bouncer network would be dialled twice) and are equally a non-goal:
+  one process serves, and the others are standbys (§18).
 - Dynamic plugin loading (`dlopen`). Bridges are compiled in behind feature
   flags; the monolith stays statically linked.
 - Supporting non-vanilla Postgres or other SQL backends. PostgreSQL is the
@@ -580,13 +587,27 @@ These are project-wide rules, enforced in review and (where possible) CI:
     so revoking an app password or a personal access token ends exactly what
     it opened. Neither recorded it, and a revoked credential's sessions and
     attachments stayed open for as long as they lived (§9.1).
-  - `AuthorityLedger` — a change of an account's authority is applied on
-    every server serving the database, each exactly once: the accounts row
-    counts each change (`authority_generation`, migration 0095), the server
-    that commits one records it as applied on the mutation lane, and the
-    others apply it from the announcement. Another server's suspension, or a
-    password change there, once left this server's sessions and attachments
-    open (§9).
+  - `RefuseVerdictsInFlight` — a re-connected revocation listener (each new `Follower::reconnected` generation) refuses
+    every credential check in flight, on every shard and at the attach
+    listener, before it re-reads what it missed, so no verdict read while
+    nothing listened can open a session after the re-read, for an account's
+    authority or an issued credential alike (§9.1).
+  - `AuthorityLedger` — a change of an account's authority is applied in the
+    serving process exactly once, whichever process committed it: the
+    accounts row counts each change (`authority_generation`, migration 0095),
+    a change the serving process commits is recorded as applied on the
+    mutation lane where it is made, and one another process commits
+    (`recover-administrator`'s new password, a hand-written row) is applied
+    from the announcement. A change made outside the serving process once left
+    its sessions and attachments open (§9).
+  - `ServingLease` — one process serves a database (§18): the core, the
+    bouncer drivers, the database worker and maintenance start only in the
+    process holding the lease; every connection of its pool is checked
+    against the lease as it is made, and a takeover ends every connection the
+    previous holder opened. Two processes each dialling every bouncer network
+    and each holding its own in-memory mirror of single-writer state (§7.3)
+    cannot be configured, and a stalled holder's in-flight writes cannot land
+    after another has taken over.
   - `BoundSession` — an OIDC link and a re-authentication flow both seal the
     session that started them, so neither can be built unbound; its callback
     acts only for that session, presented again, still live (§9).
@@ -1204,6 +1225,17 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   enqueues ticks, so even time-driven mutations flow through queues (and
   are injectable in tests).
 
+**The core's mirrors are single-writer, across processes too.** The shards
+preload durable state at boot — registered channels and their access, server
+bans, read markers, suspended accounts, nick registrations — and from then on
+keep it current from the writes this process makes, never by re-reading. That is correct
+only because no other process writes those tables while this one serves, and
+that is an invariant, not an assumption: one process serves a database (the
+serving lease, §18). The writes that do come from elsewhere — the settings
+row and an account's authority, written by `rotate-secrets` and
+`recover-administrator` — are the ones the tables announce and the serving
+process follows (§9.1, §18).
+
 ### 7.4 Performance engineering (cross-cutting)
 
 The following is the performance target and review checklist, not a claim that
@@ -1745,7 +1777,9 @@ we never *diverge* on surface Libera defines.
 ## 8. Persistence (PostgreSQL)
 
 Vanilla PostgreSQL 18 (current stable) via sqlx; migrations embedded and run
-on startup (refusing to start on drift, loudly). CI provisions `postgres:18`
+on startup by the process that takes the serving lease (§18), before it
+serves — a standby, or a command-line process while another serves, never
+migrates — refusing to start on drift, loudly. CI provisions `postgres:18`
 for every database-backed suite — legacy majors are deliberately not a
 support target, so "it happens to work on an older server" is not a claim
 this project makes or tests. The shared application pool is sized by
@@ -1778,8 +1812,8 @@ Principal tables (columns abridged):
   `authority_generation` counts each change of the account's authority — its
   suspension flipping, its primary password added, replaced or removed — and
   triggers announce every created account, counted change and deleted account
-  on `e6irc_credential_changed`, so every server serving the database ends the
-  account's sessions (migration 0095, §9).
+  on `e6irc_credential_changed`, so the serving process ends the account's
+  sessions whichever process changed it (migration 0095, §9).
 - `account_nicks` (casefolded nick, display nick, account_id, registered_at) —
   NickServ `GROUP`, cascading with the account (migration 0075). Two triggers,
   under the per-name lock account creation and deletion take, keep a nick from
@@ -1975,6 +2009,12 @@ Principal tables (columns abridged):
   broadcasts them to every core shard, which drops each mirror entry still at
   (or behind) the deleted value — the database's delete is the one source of
   what expired, so the mirror's cap count cannot hold slots the table freed.
+- `serving_lease` (one row: holder, holder label, epoch, acquisition and
+  renewal times, TTL) and `serving_lease_backends` (the holder's connections,
+  by process id and backend start time) — the lease one serving process holds
+  (migration 0098, §18). `serving_lease_register_backend` is the pool's
+  after-connect fence; a trigger announces every change of holder on
+  `e6irc_serving_lease`.
 - `audit_log` (stable id, actor, action, target, detail, creation time for
   privileged oper/control-plane actions). Exact actor/action/target queries use
   `(filter, id DESC)` indexes and paginate with `id < before_id`; a concurrently
@@ -2552,27 +2592,55 @@ the credentials its live sessions signed in with; after the listener's
 connection is lost it asks which of those and of the attachments' are still
 stored and ends what the others signed in.
 
-Several servers may serve one database, and each of them ends the account's
-sessions and attachments, whichever server committed the change
-(`account_authority`). The accounts row counts every change of an account's
-authority in `authority_generation` — its suspended flag flipping, its primary
-password added, replaced or removed, by any path, the host's
+A session a personal access token signed in also ends when the token expires,
+at the instant the store's clock says — the one a `/ws/ui` socket ends at —
+not when storage maintenance later prunes the row: the verification carries
+how long the token has left (`VerifiedSignIn::expires_in`), the session's login
+holds the deadline, and the core's one-second tick closes it with
+`ERROR :Closing Link: … (Personal access token expired)`.
+
+A lost listener leaves a window neither the announcements nor the re-read
+close by themselves: a credential check that read the store before a
+revocation committed, while nothing listened, can land its verdict after the
+re-connected listener has re-read what live sessions and attachments hold —
+which it was not yet among. So a re-connected listener, before it re-reads
+anything, has every core shard refuse the verdict of each check queued before
+(`RefuseVerdictsInFlight`, the credential epoch's `EndedSignIns::Every`), and
+waits until each has, and has the attach listener refuse the lease of each
+check under way (`AccountRevocations::refuse_in_flight`). A verdict that landed
+first is held by a live session and so re-read; one that lands after is
+refused with a 904 or NickServ notice saying the credentials were re-checked
+and to try again, and a refused attachment is told to sign in again. This
+holds for the account-authority re-read below as for issued credentials: both
+run behind the one refusal.
+
+One process serves a database (§18), and the account's sessions and
+attachments live there, but not every change of an account's authority is
+made there: the host's `recover-administrator` replaces a password from a
+process of its own, and an operator may change a row by hand. The serving
+process ends the account's sessions and attachments whichever process
+committed the change (`account_authority`). The accounts row counts every
+change of an account's authority in `authority_generation` — its suspended
+flag flipping, its primary password added, replaced or removed, by any path,
 `recover-administrator` included — and migration 0095's triggers announce each
 created account, counted change and deleted account on
-`e6irc_credential_changed` as `account:<id>:<folded name>`. One listener per
-process, on its own connection, re-reads the announced row on the mutation lane
-and compares it with its `AuthorityLedger`, the generation and standing this
-server has applied: a suspension is applied as here (sessions, attachments,
+`e6irc_credential_changed` as `account:<id>:<folded name>`. One listener, on
+its own connection, re-reads the announced row on the mutation lane and
+compares it with its `AuthorityLedger`, the generation and standing the
+process has applied: a suspension is applied as here (sessions, attachments,
 stored networks, configured networks held, core gate), a reactivation lifts
 the gate and runs the networks again, a counted change of an active account
 ends its sessions and attachments as a password change, and a deleted row is
-applied as a suspension whose configured networks stay held. The server that
-committed the change records it as applied in the same turn on the lane, so it
-never applies its own change twice — which would end the sessions opened with
+applied as a suspension whose configured networks stay held. A change the
+serving process commits itself is recorded as applied in the same turn on the
+lane, so it is never applied twice — which would end the sessions opened with
 the new password. The ledger's baseline is read at boot before the server
 reads which accounts are suspended, and every account is read again after the
 listener's connection is lost, since what was announced in between was not
-heard.
+heard — behind the refusal of every check in flight, above. Like every
+follower of the store's announcements, it runs in `db::follow_announcements`,
+the one listen-and-resynchronize loop, whose `Follower::reconnected` hook is
+where the refusal runs, before the re-read.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and
@@ -4942,8 +5010,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   Account suspension revokes bearer material transactionally and is enforced
   again by the ordered core so in-flight verification cannot race the action,
   and by the attach listener's ticket-then-lease (`AccountLease`, §9), so a
-  bouncer attachment cannot either — on every server serving the database,
-  which each apply it from the store's announcement (`AuthorityLedger`, §9).
+  bouncer attachment cannot either — whichever process suspended it, since
+  the serving process applies a suspension written elsewhere from the store's
+  announcement (`AuthorityLedger`, §9).
 
 ---
 
@@ -5157,7 +5226,54 @@ Layers, bottom to top:
   immediate) and then exits non-zero, so a host whose database comes up later
   than the daemon is a loud wait rather than a crash loop; the first probe is
   one plain connection, so the reason (refused, authentication, "starting up")
-  is reported instead of the pool's "timed out".
+  is reported instead of the pool's "timed out". A SIGTERM or SIGINT during
+  that wait, or while standing by (below), ends the process at once and
+  cleanly: it holds nothing yet.
+- **One process serves a database; the others stand by** (the non-goal of
+  §1 made mechanical). The serving process holds the one row of
+  `serving_lease` (migration 0098, `serving_lease.rs`): it takes the row when
+  nobody holds it or the holder's last renewal is older than the TTL (15 s),
+  renews it every 3 s (`WHERE holder = me AND epoch = mine`: a renewal that
+  changes nothing means the lease was taken), and every comparison is the
+  database's `now()`, so host clocks never have to agree. The TTL, the renewal
+  interval and the 10-second fence are named constants, not settings.
+  *Fence.* The holder stops serving when no renewal has been confirmed for
+  10 s, counted on the monotonic clock from when the confirmed renewal's
+  request started, so it has stopped before the lease can expire and be
+  taken; a renewal that finds the lease another's does the same. Either is a
+  critical failure: the bounded drain below, and a non-zero exit. The database
+  fences it too: every connection of the serving pool runs
+  `serving_lease_register_backend` as it is made (the pool's after-connect
+  hook), which refuses a process that is not the holder and records the
+  connection (process id and backend start time — not `application_name`,
+  which the operator may state) as the holder's; taking the lease ends every
+  connection a previous holder recorded (`pg_terminate_backend`), inside the
+  takeover's transaction. Nothing a stalled holder had in flight commits
+  after the takeover, and it cannot open another connection; once its lease
+  has ended it records why (`db::mark_fenced`), and a pool timeout or refused
+  connection then reads "this process no longer holds the serving lease (held
+  by …)" rather than a bare timeout, from the one place database errors are
+  made (`db::query_error`).
+  *Standby.* A process that finds the lease held says so on stderr, binds only
+  its HTTP address — `/healthz` 200, `/readyz` 503 with its role and the
+  holder's label (address, process id, release), everything else 503, every
+  answer closing its connection — and waits: on `e6irc_serving_lease`, which
+  announces every change of holder, and every 5 s (a third of the TTL). A
+  standby refuses a schema a later release migrated, at boot and before each
+  attempt, so one that could not serve never takes the lease from one that
+  can. *Takeover*: take the lease (ending the previous holder's connections,
+  audited as `SERVING_LEASE_ACQUIRE`), close the standby listener, migrate,
+  open the fenced pool, load the stored settings, and build and bind
+  everything as any start does; a boot that fails after the lease is taken
+  gives it back. Only the holder migrates — a database without the lease table
+  yet is brought up to it under the migrator's advisory lock, the one
+  exception. A command (`rotate-secrets`, `recover-administrator`) never
+  migrates while a process serves: against a schema older than its binary it
+  refuses naming the holder ("upgrade the serving process first"); with no
+  holder it takes the lease for the migration and gives it back. Metrics:
+  `e6irc_serving_lease_held`, `e6irc_serving_lease_epoch`. PostgreSQL's own
+  failover must be synchronous, or a promoted replica can roll the lease row
+  back to an earlier holder (`deploy/README.md`, High availability).
 - `[database] max_connections` / `E6IRC_DATABASE_MAX_CONNECTIONS` sizes the
   shared pool (2–200; default 1 serial worker + 4 Argon2 permits + 2 × CPU
   threads) and is logged at startup. Database settings are bootstrap-only; the
@@ -5241,13 +5357,13 @@ Layers, bottom to top:
   drift check needs the database, so `check-config` cannot make it and its
   success report says so; `recover-administrator` does not start the server
   and is unaffected. Writes use compare-and-swap revisions and a same-transaction
-  redacted audit entry; stale writers fail visibly. Several processes write the
-  row — every replica's console (several replicas may serve one database) and
-  `e6ircd rotate-secrets` — and each server holds the stored revision in
-  memory, so the table announces every committed write (migration 0090, a
-  trigger notifying `e6irc_server_settings_changed`, as 0077 does for
-  credentials) and every running server adopts a later revision it hears
-  (`settings_watch`): the snapshot the console and the maintenance loops read
+  redacted audit entry; stale writers fail visibly. The serving process is not
+  the row's only writer — `e6ircd rotate-secrets` writes it from a process of
+  its own — and the serving process holds the stored revision in memory, so
+  the table announces every committed write (migration 0090, a trigger
+  notifying `e6irc_server_settings_changed`, as 0077 does for credentials) and
+  the serving process adopts a later revision it hears (`settings_watch`):
+  the snapshot the console and the maintenance loops read
   is replaced, the core takes the settings it follows live (history retention,
   `limits.anti_spam_exit_message_time_seconds` and
   `registration.minimum_password_length`, which the web shares, through the
@@ -5341,22 +5457,26 @@ Layers, bottom to top:
   binds the replacement socket, swaps only after success, and retains the
   working listener on failure. Disabling the attach socket does not stop
   always-on networks or the web client.
-- Graceful shutdown is five bounded steps in this order: the listeners stop
+- Graceful shutdown is six bounded steps in this order: the listeners stop
   accepting; every bouncer driver is stopped concurrently and says goodbye to
   its upstream (`QUIT`, or the Matrix logout; at most 15 s for all of them, a
-  laggard is logged and the stop stands), so a graceful restart, or a
-  standby's takeover after a graceful stop, never meets its own ghost. A crash
-  says no `QUIT`: the process that takes over meets each network's ghost as a
-  433, registers under the alternative nickname, and takes the configured one
-  back when the upstream reaps the ghost or NickServ regains it (§10.3); the
-  core drains (at most 5 s, the shutdown request to its shards
+  laggard is logged and the stop stands), so the next process to serve — a
+  restart, or the standby taking over — does not meet this one's session
+  still logged in upstream. A crash says no `QUIT`: the process that takes
+  over meets each network's ghost as a 433, registers under the alternative
+  nickname, and takes the configured one back when the upstream reaps the
+  ghost or NickServ regains it (§10.3); the core drains (at most 5 s, the
+  shutdown request to its shards
   included, so a shard that no longer takes from a full queue cannot hold the
   request itself); every client connection delivers its closing `ERROR` and
   closes (at most 8 s: the closing drain and the lingering close of §7.2, all
   connections at once — every connection task, IRC plaintext or TLS, `/ws/irc`
   and attach, holds a `ConnectionTask` that shutdown waits for, since ending
   the runtime would cancel a write still in progress); the bounded PostgreSQL
-  write paths flush. Stopping the core is a drain: a shard that has seen the shutdown stops taking outside
+  write paths flush; the serving lease is given back (at most 5 s), after the
+  flush so nothing this process writes can land after a standby has taken
+  over, and announced so the standby takes over at once rather than at the
+  lease's expiry. Stopping the core is a drain: a shard that has seen the shutdown stops taking outside
   input but keeps serving the other shards until every shard has seen it and
   nothing is passing between them. Every shard is then joined; a shard that
   panicked or will not stop is ended and reported *after* the database flush,
@@ -5373,7 +5493,7 @@ Layers, bottom to top:
   five-second reply deadline, so even a live but wedged core cannot hold an
   API request forever.
 - BNC listener, observability-sampling and storage-retention changes apply
-  live, on every running server whichever wrote them. Core
+  live in the serving process, whichever process wrote them. Core
   identity/limits, IRC listeners, OIDC,
   operator, and access-policy changes are stored immediately and explicitly
   reported as restart-required; no response claims those values were applied
@@ -5427,8 +5547,8 @@ Layers, bottom to top:
   `std::env` read anywhere else in the daemon.
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
   — the bouncer drivers' stop (their goodbye and their last backlog write),
-  then the core drain, then the connection drain, then the PostgreSQL flush;
-  the guard sums the four constants, and holds the budget `deploy/README.md`
+  then the core drain, then the connection drain, then the PostgreSQL flush,
+  then the lease's release; the guard sums the five constants, and holds the budget `deploy/README.md`
   states and the one `tools/test-production-container.sh` stops the image with
   to the unit's `TimeoutStopSec`. The unit sets `StartLimitIntervalSec=0` (asserted by the same
   guard): a refused first database connection fails the daemon in
