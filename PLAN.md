@@ -1363,8 +1363,10 @@ Maintainer decisions implemented from a review of Solanum and Libera parity
 - **A bare NAMES lists every visible channel**, then the users in no channel,
   paced as a LIST is and across every shard.
 - **A young connection's QUIT comment is `Client Quit`** (Solanum's
-  `anti_spam_exit_message_time`, five minutes, as Libera). irctest's
-  `testQuit`, which quits after one second, is deselected with that reason.
+  `anti_spam_exit_message_time`, five minutes, as Libera). It is the
+  console-owned `limits.anti_spam_exit_message_time_seconds` (0 to 3600,
+  applied without a restart); irctest runs e6ircd with it at 0, as Solanum's
+  controller runs Solanum, so its `testQuit` runs in the green list.
 
 The same review found, and this change fixes, each with a test that failed
 before:
@@ -1410,7 +1412,10 @@ change fixes, each with a test that failed before (DESIGN §10):
 - **Replay misattributed**: it started at the current nick. The ring keeps the
   session state at its oldest entry, and an attach is reconciled to it before
   the replay and to the current state after (maintainer decision); the attach
-  layer's numerics follow the client's current nick.
+  layer's numerics follow the client's current nick. A backlog restored from
+  storage after a restart still started at the current nick; each stored line
+  now records the own nick it was said under (migration 0096), and the
+  restored ring's head starts from it.
 - **A client attached before the registration burst never learned the
   network's ISUPPORT**: the welcome is built from the attach snapshot, and the
   burst's end is told to each attachment as a `005` of what changed.

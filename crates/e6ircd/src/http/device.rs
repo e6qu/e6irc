@@ -1372,6 +1372,7 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
         max_connections_per_ip: _,
         command_burst: _,
         command_rate: _,
+        anti_spam_exit_message_time_seconds: _,
         trusted_proxies: _,
         auth_rate_burst: _,
         api_rate_burst: _,
@@ -1702,12 +1703,11 @@ pub(super) async fn admin_patch_configuration(
     .await
     {
         Ok(snapshot) => {
-            // History retention is live: what the core and the bouncer serve
-            // from memory stops at the new bound now, not when storage
-            // maintenance next runs.
-            state
-                .core_tx
-                .set_history_retention_days(snapshot.settings.storage.history_retention_days);
+            // History retention and the QUIT-comment delay are live: what the
+            // core and the bouncer serve from memory stops at the new bound
+            // now, not when storage maintenance next runs, and the next QUIT
+            // is judged by the new delay.
+            state.core_tx.adopt_live_settings(&snapshot.settings);
             admin_json(ConfigurationPatchResponse {
                 revision: snapshot.revision,
                 restart_required,

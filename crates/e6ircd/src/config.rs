@@ -469,6 +469,14 @@ pub struct LimitsConfig {
     /// `command_burst` (Solanum's `client_flood_message_num`).
     #[serde(default = "default_command_rate")]
     pub command_rate: usize,
+    /// How old, in seconds, a connection must be before the comment of its
+    /// `QUIT` is shown (Solanum's `anti_spam_exit_message_time`): a younger
+    /// non-operator connection leaves as `Client Quit`, so connecting only to
+    /// quit with a message cannot spam every channel it joined. `0` shows every
+    /// comment; at most [`MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS`]. Applied
+    /// live: the core reads it at each `QUIT`.
+    #[serde(default = "default_anti_spam_exit_message_time_seconds")]
+    pub anti_spam_exit_message_time_seconds: u64,
     /// CIDRs of trusted reverse proxies (e.g. the load balancer). When a
     /// request's socket peer matches one of these, its client IP is taken
     /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsed
@@ -637,6 +645,20 @@ pub const DEFAULT_COMMAND_RATE: usize = 20;
 /// Upper bound on both flood knobs; the console offers the same range.
 pub const MAX_COMMAND_FLOOD_TOKENS: usize = 10_000;
 
+/// Solanum's reference configuration and Libera run
+/// `anti_spam_exit_message_time` at five minutes.
+pub const DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS: u64 = 5 * 60;
+/// Upper bound on `limits.anti_spam_exit_message_time_seconds`, twelve times
+/// Libera's: the setting hides what a connection says as it leaves, and a
+/// window of more than an hour stops deterring a spammer — who needs only to
+/// stay that long once — while hiding the parting words of every ordinary
+/// short session. The console offers the same range.
+pub const MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS: u64 = 60 * 60;
+
+const fn default_anti_spam_exit_message_time_seconds() -> u64 {
+    DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS
+}
+
 const fn default_command_burst() -> usize {
     DEFAULT_COMMAND_BURST
 }
@@ -659,6 +681,7 @@ impl Default for LimitsConfig {
             max_connections_per_ip: None,
             command_burst: DEFAULT_COMMAND_BURST,
             command_rate: DEFAULT_COMMAND_RATE,
+            anti_spam_exit_message_time_seconds: DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS,
             trusted_proxies: Vec::new(),
             auth_rate_burst: AuthRateBurst::default(),
             api_rate_burst: DEFAULT_API_RATE_BURST,
@@ -737,9 +760,11 @@ impl ManagedConfig {
     ///
     /// The one definition of which settings apply live, so the answer an
     /// administrator is given cannot drift from what the process does: the BNC
-    /// attach listener is rebound in place, and the observability sampler and
-    /// storage maintenance each re-read their settings every cycle. Everything
-    /// else is read once, at start. (Storage used to be missing here, so a
+    /// attach listener is rebound in place, the observability sampler and
+    /// storage maintenance each re-read their settings every cycle, and the
+    /// core reads `limits.anti_spam_exit_message_time_seconds` at each `QUIT`
+    /// ([`crate::core::CoreIngress::adopt_live_settings`]). Everything else is
+    /// read once, at start. (Storage used to be missing here, so a
     /// retention-only change was reported as needing a restart it did not.)
     pub fn requires_restart_to_reach(&self, next: &Self) -> bool {
         let mut reached_live = self.clone();
@@ -747,6 +772,8 @@ impl ManagedConfig {
         reached_live.bnc_tls = next.bnc_tls.clone();
         reached_live.observability = next.observability.clone();
         reached_live.storage = next.storage.clone();
+        reached_live.limits.anti_spam_exit_message_time_seconds =
+            next.limits.anti_spam_exit_message_time_seconds;
         reached_live != *next
     }
 
@@ -2545,6 +2572,14 @@ impl Config {
         {
             return Err(ConfigError::Invalid(error));
         }
+        if self.limits.anti_spam_exit_message_time_seconds > MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS
+        {
+            return Err(ConfigError::Invalid(format!(
+                "limits.anti_spam_exit_message_time_seconds must be at most \
+                 {MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS} (it is {}); 0 shows every QUIT comment",
+                self.limits.anti_spam_exit_message_time_seconds
+            )));
+        }
         if self.limits.auth_rate_burst == AuthRateBurst::PerMinute(0) {
             return Err(ConfigError::Invalid(
                 "limits.auth_rate_burst must be nonzero (0 refuses every login); \"off\" turns \
@@ -2937,6 +2972,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The context of a console save on a server with no HTTP listener, no
+    /// internal upstreams allowed and no release revision.
+    fn standalone_context() -> BootstrapContext {
+        BootstrapContext {
+            http_listener: None,
+            hsts_include_subdomains: false,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            application_release_revision: None,
+        }
+    }
 
     #[test]
     fn debug_output_never_carries_a_secret() {
@@ -4339,6 +4385,54 @@ mod tests {
         )
     }
 
+    /// `limits.anti_spam_exit_message_time_seconds` is Libera's five minutes
+    /// when unstated, `0` switches it off, and a value past the bound is
+    /// refused by name at start and on a console save alike.
+    #[test]
+    fn the_anti_spam_exit_message_time_defaults_to_libera_and_is_bounded() {
+        let unstated = with_limits("", false).expect("valid");
+        assert_eq!(unstated.limits.anti_spam_exit_message_time_seconds, 300);
+        let off = with_limits("anti_spam_exit_message_time_seconds = 0", false).expect("valid");
+        assert_eq!(off.limits.anti_spam_exit_message_time_seconds, 0);
+        let longest = with_limits(
+            &format!(
+                "anti_spam_exit_message_time_seconds = {MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS}"
+            ),
+            false,
+        )
+        .expect("the bound itself is valid");
+        let error = with_limits(
+            &format!(
+                "anti_spam_exit_message_time_seconds = {}",
+                MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS + 1
+            ),
+            false,
+        )
+        .expect_err("past the bound")
+        .to_string();
+        assert!(
+            error.contains("limits.anti_spam_exit_message_time_seconds must be at most 3600"),
+            "{error}"
+        );
+        let error = with_limits("anti_spam_exit_message_time_seconds = -1", false)
+            .expect_err("negative")
+            .to_string();
+        assert!(
+            error.contains("anti_spam_exit_message_time_seconds"),
+            "{error}"
+        );
+        let mut managed = ManagedConfig::from_config(&longest, None).expect("managed");
+        managed.limits.anti_spam_exit_message_time_seconds += 1;
+        let refusal = managed
+            .validate(standalone_context())
+            .expect_err("the console save is refused too")
+            .to_string();
+        assert!(
+            refusal.contains("anti_spam_exit_message_time_seconds"),
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn the_sasl_requirement_is_parsed_and_covers_what_it_names() {
         let everyone = with_limits("require_sasl = true", true).expect("valid");
@@ -4467,12 +4561,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
         let round_trip: ManagedConfig = serde_json::from_value(json).expect("deserializes");
         assert_eq!(round_trip, console);
         round_trip
-            .validate(BootstrapContext {
-                http_listener: None,
-                hsts_include_subdomains: false,
-                internal_upstreams: crate::egress::InternalUpstreams::Refuse,
-                application_release_revision: None,
-            })
+            .validate(standalone_context())
             .expect("the console may save it");
     }
 
@@ -4785,12 +4874,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
         );
         let managed = ManagedConfig::from_config(&config, None).expect("managed");
         let refusal = managed
-            .validate(BootstrapContext {
-                http_listener: None,
-                hsts_include_subdomains: false,
-                internal_upstreams: crate::egress::InternalUpstreams::Refuse,
-                application_release_revision: None,
-            })
+            .validate(standalone_context())
             .expect_err("the console save is refused too")
             .to_string();
         assert!(refusal.contains("motd line 2"), "{refusal}");
@@ -4833,12 +4917,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
         );
         let managed = ManagedConfig::from_config(&config, None).expect("managed");
         let refusal = managed
-            .validate(BootstrapContext {
-                http_listener: None,
-                hsts_include_subdomains: false,
-                internal_upstreams: crate::egress::InternalUpstreams::Refuse,
-                application_release_revision: None,
-            })
+            .validate(standalone_context())
             .expect_err("the console save is refused too")
             .to_string();
         assert!(refusal.contains("motd must take at most"), "{refusal}");
@@ -4859,6 +4938,11 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
                  {MOTD_LINE_REPLY_OVERHEAD} more"
             ),
             format!("name=\"buffer_cap\" min=\"1\" max=\"{MAX_NETWORK_BUFFER_CAP}\""),
+            format!(
+                "min=\"0\" max=\"{MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS}\" \
+                 name=\"anti_spam_exit_message_time_seconds\" \
+                 placeholder=\"{DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS}\""
+            ),
         ] {
             assert!(form.contains(&control), "the form lacks {control}");
         }
@@ -4910,12 +4994,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             cert_path: directory.join("cert.pem"),
             key_path: directory.join("key.pem"),
         };
-        let context = BootstrapContext {
-            http_listener: None,
-            hsts_include_subdomains: false,
-            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
-            application_release_revision: None,
-        };
+        let context = standalone_context();
         let mut managed = ManagedConfig::from_config(&listening_config(), None).expect("managed");
         managed.listeners.push(ListenerConfig {
             addr: "127.0.0.1:6697".parse().unwrap(),
@@ -5277,12 +5356,7 @@ account_claim = "preferred_username"
 
         let mut managed = ManagedConfig::from_config(&listening_config(), None).expect("managed");
         managed.bnc_addr = Some("0.0.0.0:6697".parse().unwrap());
-        let bootstrap = BootstrapContext {
-            http_listener: None,
-            hsts_include_subdomains: false,
-            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
-            application_release_revision: None,
-        };
+        let bootstrap = standalone_context();
         let error = managed
             .validate(bootstrap.clone())
             .expect_err("the console save is refused too")
@@ -5340,6 +5414,10 @@ account_claim = "preferred_username"
         let mut listener = current.clone();
         listener.bnc_addr = Some("127.0.0.1:6699".parse().unwrap());
         assert!(!current.requires_restart_to_reach(&listener));
+        // The core reads it at each QUIT.
+        let mut quit_comments = current.clone();
+        quit_comments.limits.anti_spam_exit_message_time_seconds = 0;
+        assert!(!current.requires_restart_to_reach(&quit_comments));
 
         // Read once, at start.
         let mut renamed = retention.clone();

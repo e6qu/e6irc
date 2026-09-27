@@ -8652,7 +8652,9 @@ pub async fn open_bnc_buffer(
 /// Append one upstream line to a network's persisted buffer, extracting the
 /// conversation target for CHATHISTORY queries: classified and keyed by the
 /// network's own naming rules (`names`), with its name kept as the network
-/// spelled it.
+/// spelled it. `own_nick` is the session's own nick when the line was said
+/// (`None` before the session had one), recorded with the line so a restore
+/// can start its replay under it (migration 0096).
 pub async fn persist_bnc_line(
     pool: &PgPool,
     buffer: &BncBuffer,
@@ -8666,8 +8668,9 @@ pub async fn persist_bnc_line(
     let sent_at = bnc_line_sent_at(line);
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at,
-                                 target_display, target_casemapping)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                 target_display, target_casemapping, own_nick,
+                                 own_nick_recorded)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)",
     )
     .bind(&buffer.key.owner)
     .bind(&buffer.key.network)
@@ -8678,6 +8681,7 @@ pub async fn persist_bnc_line(
     .bind(sent_at)
     .bind(display)
     .bind(names.casemapping().isupport_token())
+    .bind(own_nick)
     .execute(pool)
     .await
     .map_err(query_error)?;
@@ -8888,29 +8892,75 @@ pub async fn recent_bnc_lines(
     Ok(recent_bnc_backlog(pool, owner, network, limit)
         .await?
         .into_iter()
-        .map(|(line, _)| line)
+        .map(|stored| stored.line)
         .collect())
 }
 
-/// [`recent_bnc_lines`], each with the time it was stored under (its `time`
-/// tag, or its arrival), for a ring restored from storage.
+/// The session's own nick as a stored backlog line recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredOwnNick {
+    /// Stored before migration 0096, which recorded none.
+    NotRecorded,
+    /// Said before the session had a nick: the bouncer's own notices before
+    /// the upstream welcomed it.
+    NoNick,
+    /// Said while the session's own nick was this.
+    Nick(String),
+}
+
+/// One stored backlog line, for a ring restored from storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBacklogLine {
+    pub line: String,
+    /// The time it was stored under: its `time` tag, or its arrival.
+    pub stored_at: String,
+    pub own_nick: StoredOwnNick,
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredBacklogRow {
+    line: String,
+    stored_at: String,
+    own_nick: Option<String>,
+    own_nick_recorded: bool,
+}
+
+impl From<StoredBacklogRow> for StoredBacklogLine {
+    fn from(row: StoredBacklogRow) -> Self {
+        // The table's constraint holds a nick only on a row that recorded one.
+        let own_nick = match (row.own_nick_recorded, row.own_nick) {
+            (false, _) => StoredOwnNick::NotRecorded,
+            (true, None) => StoredOwnNick::NoNick,
+            (true, Some(nick)) => StoredOwnNick::Nick(nick),
+        };
+        Self {
+            line: row.line,
+            stored_at: row.stored_at,
+            own_nick,
+        }
+    }
+}
+
+/// [`recent_bnc_lines`], each with the time it was stored under and the
+/// session's own nick when it was said, for a ring restored from storage.
 pub async fn recent_bnc_backlog(
     pool: &PgPool,
     owner: &str,
     network: &str,
     limit: i64,
-) -> Result<Vec<(String, String)>, DbError> {
+) -> Result<Vec<StoredBacklogLine>, DbError> {
     let key = BncBufferKey::new(owner, network);
     // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
     // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
     // backward and filters out every other buffer's newer lines, so a quiet
     // buffer's replay cost grew with everyone else's traffic. A row from
     // before `sent_at` existed has its arrival.
-    sqlx::query_as(
+    let rows: Vec<StoredBacklogRow> = sqlx::query_as(
         "SELECT line,
                 coalesce(sent_at,
                          to_char(created_at AT TIME ZONE 'UTC',
-                                 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))
+                                 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) AS stored_at,
+                own_nick, own_nick_recorded
          FROM bnc_buffer
          WHERE id = ANY(ARRAY(
              SELECT id FROM bnc_buffer
@@ -8923,7 +8973,8 @@ pub async fn recent_bnc_backlog(
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    Ok(rows.into_iter().map(StoredBacklogLine::from).collect())
 }
 
 // ---- BNC CHATHISTORY queries ---------------------------------------------

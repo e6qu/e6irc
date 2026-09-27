@@ -3429,6 +3429,94 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
     assert_eq!(count, db::BNC_READ_MARKER_LIMIT);
 }
 
+/// A stored backlog line keeps the session's own nick as it was when the line
+/// was said (migration 0096), so a restore can start its replay under it: no
+/// nick before the upstream welcomed the session, and rows stored before the
+/// column existed read as recording nothing. The table refuses a nick on a row
+/// that says it recorded none, and a nick that is not one line.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stored_backlog_line_keeps_the_own_nick_it_was_said_under() {
+    use db::StoredOwnNick::{Nick, NoNick, NotRecorded};
+    let pool = db::connect_and_migrate(&support::test_db("bnc_backlog_own_nick").await)
+        .await
+        .expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("alice"),
+        "libera",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    for (own_nick, line) in [
+        (None, ":*bnc* NOTICE * :connecting"),
+        (Some("alice"), ":peer!u@h PRIVMSG alice :hello"),
+        (Some("alice"), ":alice!u@h NICK :bob"),
+        (Some("bob"), ":peer!u@h PRIVMSG bob :again"),
+    ] {
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            own_nick,
+            line,
+            &e6irc_client::NetworkNames::default(),
+        )
+        .await
+        .expect("persist");
+    }
+    let own_nicks = async || {
+        db::recent_bnc_backlog(&pool, "alice", "libera", 10)
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|stored| (stored.line, stored.own_nick))
+            .collect::<Vec<_>>()
+    };
+    let recorded = [
+        (
+            ":peer!u@h PRIVMSG alice :hello".to_string(),
+            Nick("alice".into()),
+        ),
+        (":alice!u@h NICK :bob".to_string(), Nick("alice".into())),
+        (
+            ":peer!u@h PRIVMSG bob :again".to_string(),
+            Nick("bob".into()),
+        ),
+    ];
+    let mut expected = vec![(":*bnc* NOTICE * :connecting".to_string(), NoNick)];
+    expected.extend(recorded.iter().cloned());
+    assert_eq!(own_nicks().await, expected);
+    // A row as a build before migration 0096 left it.
+    sqlx::query("UPDATE bnc_buffer SET own_nick_recorded = false WHERE own_nick IS NULL")
+        .execute(&pool)
+        .await
+        .expect("age a row");
+    expected[0].1 = NotRecorded;
+    assert_eq!(own_nicks().await, expected);
+    for (update, constraint) in [
+        (
+            "UPDATE bnc_buffer SET own_nick_recorded = false WHERE own_nick = 'bob'",
+            "bnc_buffer_own_nick_recorded",
+        ),
+        (
+            "UPDATE bnc_buffer SET own_nick = E'bob\\r\\nQUIT' WHERE own_nick = 'bob'",
+            "bnc_buffer_own_nick_one_line",
+        ),
+        (
+            "UPDATE bnc_buffer SET own_nick = '' WHERE own_nick = 'bob'",
+            "bnc_buffer_own_nick_one_line",
+        ),
+    ] {
+        let error = sqlx::query(update)
+            .execute(&pool)
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains(constraint), "{update}: {error}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_history_page_counts_only_lines_the_client_can_receive() {

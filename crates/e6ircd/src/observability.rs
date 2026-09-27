@@ -967,14 +967,7 @@ pub(crate) async fn run_storage_maintenance(
     settings: std::sync::Arc<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>,
     core: crate::core::CoreIngress,
 ) {
-    core.set_history_retention_days(
-        settings
-            .read()
-            .await
-            .settings
-            .storage
-            .history_retention_days,
-    );
+    core.adopt_live_settings(&settings.read().await.settings);
     let mut ticker = tokio::time::interval(Duration::from_secs(300));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval`'s first tick is immediate. Consume it so startup never races
@@ -1003,7 +996,7 @@ pub(crate) async fn run_storage_maintenance(
         telemetry.record_database_request(started.elapsed());
         let retention = {
             let snapshot = settings.read().await;
-            core.set_history_retention_days(snapshot.settings.storage.history_retention_days);
+            core.adopt_live_settings(&snapshot.settings);
             crate::db::StorageRetention {
                 history_days: snapshot.settings.storage.history_retention_days,
                 audit_days: snapshot.settings.storage.audit_retention_days,

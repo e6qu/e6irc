@@ -1405,6 +1405,12 @@
                               "minimum": 1,
                               "type": "integer"
                             },
+                            "anti_spam_exit_message_time_seconds": {
+                              "description": "How long a connection must have been open before its QUIT comment is shown (Solanum's anti_spam_exit_message_time); a younger non-operator connection leaves as \"Client Quit\". 0 shows every comment. Applied without a restart.",
+                              "maximum": 3600,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
                             "api_rate_burst": {
                               "minimum": 1,
                               "type": "integer"
@@ -1935,6 +1941,12 @@
                         "properties": {
                           "administrator_api_rate_burst": {
                             "minimum": 1,
+                            "type": "integer"
+                          },
+                          "anti_spam_exit_message_time_seconds": {
+                            "description": "How long a connection must have been open before its QUIT comment is shown (Solanum's anti_spam_exit_message_time); a younger non-operator connection leaves as \"Client Quit\". 0 shows every comment. Applied without a restart.",
+                            "maximum": 3600,
+                            "minimum": 0,
                             "type": "integer"
                           },
                           "api_rate_burst": {

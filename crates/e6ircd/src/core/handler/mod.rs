@@ -941,22 +941,21 @@ fn quit_reason(comment: Option<&str>, nick: &str) -> String {
     }
 }
 
-/// How old a connection must be before its QUIT comment is shown: Solanum's
-/// `anti_spam_exit_message_time`, at the five minutes its reference
-/// configuration and Libera run. A younger connection leaves as
-/// `Client Quit` (`m_quit`), so connecting only to quit with a message
-/// cannot spam every channel it joined; an operator's comment always shows.
-pub(crate) const ANTI_SPAM_EXIT_MESSAGE_TIME_MS: u64 = 5 * 60 * 1000;
-
+/// A connection younger than `limits.anti_spam_exit_message_time_seconds`
+/// (Solanum's `anti_spam_exit_message_time`) leaves as `Client Quit`
+/// (`m_quit`), so connecting only to quit with a message cannot spam every
+/// channel it joined; an operator's comment always shows.
 fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let session = &state.sessions[&conn];
     let nick = session.nick().unwrap_or("*").to_string();
     let age = (state.config.mono_clock)().saturating_sub(session.opened_at);
-    let reason = if session.oper.is_none() && age.as_millis() < ANTI_SPAM_EXIT_MESSAGE_TIME_MS {
-        "Client Quit".to_string()
-    } else {
-        quit_reason(p.first().copied(), &nick)
-    };
+    let age = std::time::Duration::from_millis(age.as_millis());
+    let reason =
+        if session.oper.is_none() && state.anti_spam_exit_message_time.hides_comment_at(age) {
+            "Client Quit".to_string()
+        } else {
+            quit_reason(p.first().copied(), &nick)
+        };
     state.close_with_error(conn, &reason);
 }
 

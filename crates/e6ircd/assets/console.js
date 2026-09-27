@@ -1110,6 +1110,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return value;
   };
 
+  // A count or duration for which zero is meaningful (it switches something
+  // off), so an empty field is refused rather than read as zero.
+  const wholeNumber = (fields, name, label) => {
+    const value = fieldValue(fields, name);
+    const number = Number(value);
+    if (!value || !Number.isSafeInteger(number) || number < 0) {
+      throw new Error(`${label} must be a whole number, 0 or more.`);
+    }
+    return number;
+  };
+
   const optionalPositiveInteger = (fields, name, label) => {
     const value = fieldValue(fields, name);
     return value ? positiveInteger({ get: () => value }, name, label) : null;
@@ -1182,6 +1193,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
           command_burst: positiveInteger(fields, "command_burst", "Command burst"),
           command_rate: positiveInteger(fields, "command_rate", "Command rate"),
+          anti_spam_exit_message_time_seconds: wholeNumber(fields, "anti_spam_exit_message_time_seconds", "Quit message delay"),
           trusted_proxies: splitValues(String(fields.get("trusted_proxies") || ""), "\n"),
           require_sasl: fields.has("require_sasl"),
           require_sasl_from: splitValues(String(fields.get("require_sasl_from") || ""), "\n"),
@@ -1545,7 +1557,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
     for (const name of ["nicklen", "sendq_bytes", "core_queue", "core_workers", "max_hot_channels", "max_history_ring_bytes", "max_hot_history_bytes"]) configurationValue(form, name, settings[name]);
-    for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
+    for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "anti_spam_exit_message_time_seconds", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "require_sasl", settings.limits.require_sasl);
     configurationValue(form, "require_sasl_from", apiCollection(settings.limits, "require_sasl_from", "configuration").join("\n"));

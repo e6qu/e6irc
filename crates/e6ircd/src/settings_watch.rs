@@ -70,8 +70,9 @@ pub(crate) async fn run(
 
 /// Read the stored row and make it this process's live settings when it is a
 /// later revision than the one held, and apply what a console save applies
-/// live: the history retention the core and the bouncer serve memory to, and
-/// the attach listener. The attach listener is brought to what
+/// live: what the core follows ([`crate::core::CoreIngress::adopt_live_settings`]:
+/// the history retention it and the bouncer serve memory to, and the
+/// QUIT-comment delay), and the attach listener. The attach listener is brought to what
 /// the held revision says every time, not only when the revision moves: a
 /// save here that found its revision stale reloaded the snapshot itself
 /// (`crate::db::save_managed_config_over`) without touching the listener, and
@@ -95,7 +96,7 @@ async fn adopt_stored(
             return;
         }
     }
-    core.set_history_retention_days(current.settings.storage.history_retention_days);
+    core.adopt_live_settings(&current.settings);
     if let Some(listener) = bnc_listener
         && let Err(UnboundBncListener { wanted, error }) =
             follow_bnc_listener(listener, &current).await
