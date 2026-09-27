@@ -17,6 +17,9 @@ mod deadline;
 #[path = "support/membership.rs"]
 mod membership;
 use membership::{wait_joined, whois_until};
+#[path = "support/scripted.rs"]
+mod scripted;
+use scripted::ScriptedTask;
 
 /// `line` without the `time` tag the bouncer stamps on every line it takes in
 /// that carries none of its own.
@@ -203,7 +206,7 @@ async fn driver_registers_relays_and_buffers() {
         "backlog must keep server-time: {got}"
     );
 
-    // ...and it's in the detached buffer for later playback
+    // ...and it's in the detached buffer, to be played back on attach
     let buffer = handle.buffer_snapshot();
     assert!(
         buffer
@@ -1665,7 +1668,7 @@ async fn a_connection_test_out_of_budget_names_its_stage_and_still_quits() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
         // Registration is never answered; record whatever else arrives.
@@ -1706,7 +1709,7 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (user_tx, mut user_rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
             session.negotiate_capabilities().await;
@@ -1749,25 +1752,34 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
 fn private_upstream(
     listener: tokio::net::TcpListener,
     first_lines: tokio::sync::mpsc::Sender<String>,
-) {
-    tokio::spawn(async move {
+) -> ScriptedTask<()> {
+    ScriptedTask::spawn(async move {
+        // One script per connection; a failed one fails this one, and so the
+        // test holding it.
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
-            let mut session = fake_accept(&listener).await;
-            let first_lines = first_lines.clone();
-            tokio::spawn(async move {
-                let first = session.read_line().await;
-                first_lines.send(first.clone()).await.ok();
-                match first.as_str() {
-                    "PASS :right" => {
-                        session.complete_registration("private").await;
-                    }
-                    "CAP LS 302" => session.send(":up 464 * :Password required").await,
-                    _ => session.send(":up 464 * :Password incorrect").await,
+            tokio::select! {
+                mut session = fake_accept(&listener) => {
+                    let first_lines = first_lines.clone();
+                    sessions.spawn(async move {
+                        let first = session.read_line().await;
+                        first_lines.send(first.clone()).await.ok();
+                        match first.as_str() {
+                            "PASS :right" => {
+                                session.complete_registration("private").await;
+                            }
+                            "CAP LS 302" => session.send(":up 464 * :Password required").await,
+                            _ => session.send(":up 464 * :Password incorrect").await,
+                        }
+                        while !session.read_line().await.is_empty() {}
+                    });
                 }
-                while !session.read_line().await.is_empty() {}
-            });
+                Some(Err(error)) = sessions.join_next() => {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+            }
         }
-    });
+    })
 }
 
 /// A private server's password goes out as the first line, before `CAP LS`,
@@ -1780,7 +1792,7 @@ async fn a_server_password_is_sent_first_and_its_refusals_are_told_apart() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(64);
-    private_upstream(listener, first_tx);
+    let _upstream = private_upstream(listener, first_tx);
     let config = |server_password: Option<&str>| NetworkConfig {
         addr: addr.to_string(),
         nick: "private".parse().expect("test nickname"),
@@ -1865,7 +1877,7 @@ async fn a_connection_test_joins_nothing_and_still_quits() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("preflight").await;
         loop {
@@ -1930,7 +1942,7 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
     let addr = listener.local_addr().unwrap();
     let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(8);
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // First dial: the nickname is held. Record every NICK the driver
         // offers on this connection; it must offer exactly the configured one.
         let mut session = fake_accept(&listener).await;
@@ -2019,7 +2031,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
     let addr = listener.local_addr().unwrap();
     let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         nick_rx.recv().await;
@@ -2120,7 +2132,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
 async fn a_requested_nick_change_is_not_a_forced_rename() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         loop {
@@ -2165,10 +2177,12 @@ async fn a_requested_nick_change_is_not_a_forced_rename() {
 /// Start a driver against a scripted upstream that offers `echo-message` and
 /// answers the first `PRIVMSG` it reads with `answer` (its lines, `{line}`
 /// replaced by what it read).
-async fn echo_message_upstream(answer: &'static [&'static str]) -> NetworkHandle {
+async fn echo_message_upstream(
+    answer: &'static [&'static str],
+) -> (NetworkHandle, ScriptedTask<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session
             .complete_registration_with_echo_message("bncbot")
@@ -2182,12 +2196,13 @@ async fn echo_message_upstream(answer: &'static [&'static str]) -> NetworkHandle
             }
         }
     });
-    IrcNetwork::start(NetworkConfig {
+    let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
-    })
+    });
+    (handle, upstream)
 }
 
 /// Every event the driver emits within `window`.
@@ -2213,7 +2228,8 @@ async fn events_within(
 /// and neither the others nor the backlog.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
-    let handle = echo_message_upstream(&[":up 404 bncbot #room :Cannot send to channel"]).await;
+    let (handle, _upstream) =
+        echo_message_upstream(&[":up 404 bncbot #room :Cannot send to channel"]).await;
     let mut events = handle.subscribe();
     let mut replies = handle.route_replies(7);
     wait_connected(&handle, &mut events).await;
@@ -2252,7 +2268,7 @@ async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
 /// of that line, routed to its originator — never doubled by a synthesized one.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_echo_is_the_only_echo_and_keeps_its_originator() {
-    let handle = echo_message_upstream(&[
+    let (handle, _upstream) = echo_message_upstream(&[
         "@time=2026-09-21T10:00:00.000Z :bncbot!~bncbot@up.example PRIVMSG #room :hello",
     ])
     .await;
@@ -2302,7 +2318,7 @@ async fn an_upstream_echo_is_the_only_echo_and_keeps_its_originator() {
 /// the backlog, as the bouncer's own echo always was.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_echo_of_a_nickserv_password_is_redacted() {
-    let handle =
+    let (handle, _upstream) =
         echo_message_upstream(&[":bncbot!~bncbot@up PRIVMSG NickServ :IDENTIFY hunter2"]).await;
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
@@ -2343,7 +2359,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
     let addr = listener.local_addr().unwrap();
     let (join_tx, mut join_rx) = tokio::sync::mpsc::channel(8);
     let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // First session: register, confirm the autojoin, confirm a runtime
         // JOIN, then die on cue.
         let mut first = fake_accept(&listener).await;
@@ -2428,7 +2444,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
 async fn silent_upstream_trips_keepalive_and_reconnects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // Session 1: register, then go silent (read and discard, never
         // answer the driver's keepalive PING).
         let mut first = fake_accept(&listener).await;
@@ -2494,7 +2510,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("averyveryverylon").await;
         loop {
@@ -2568,7 +2584,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
 async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         session.send(":up CAP bncbot NEW :sasl=PLAIN").await;
@@ -2612,7 +2628,7 @@ async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
 async fn downstream_traffic_does_not_hide_a_silent_upstream() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         // Read and discard everything, the keepalive PING included.
@@ -2664,7 +2680,7 @@ async fn downstream_traffic_does_not_hide_a_silent_upstream() {
 async fn repeated_registration_rejection_parks_the_driver() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
             session.negotiate_capabilities().await;
@@ -2712,7 +2728,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
 async fn a_stopped_driver_says_quit_to_its_upstream() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move {
+    let upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         // The goodbye, or the empty line an unannounced close reads as.
@@ -2731,10 +2747,7 @@ async fn a_stopped_driver_says_quit_to_its_upstream() {
     });
     wait_lifecycle(&handle, NetworkLifecycle::Connected).await;
     handle.shutdown_and_wait().await;
-    assert_eq!(
-        upstream.await.expect("scripted upstream"),
-        "QUIT :e6irc bouncer stopping"
-    );
+    assert_eq!(upstream.finish().await, "QUIT :e6irc bouncer stopping");
 }
 
 /// Solanum withdraws the `sasl` capability while services are down. That
@@ -2748,7 +2761,7 @@ async fn a_services_outage_is_outlasted_not_parked() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         for _ in 0..OUTAGE_DIALS {
             let mut session = fake_accept(&listener).await;
             assert_eq!(session.read_line().await, "CAP LS 302");
@@ -2810,7 +2823,7 @@ async fn rejected_credentials_park_without_a_second_dial() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
             dial_tx.send(()).await.expect("test is still listening");
@@ -2858,18 +2871,28 @@ async fn rejected_credentials_park_without_a_second_dial() {
 async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    // Per dial: the driver's opening line, and everything it sent after the
+    // capability list offered no mechanism it can use, up to its hang-up. The
+    // test body judges it, not the script.
+    let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel::<(String, Vec<String>)>(8);
+    let _upstream = ScriptedTask::spawn(async move {
         loop {
             let mut session = fake_accept(&listener).await;
-            assert_eq!(session.read_line().await, "CAP LS 302");
+            let opening = session.read_line().await;
             session
                 .send(":up CAP * LS :sasl=EXTERNAL,ECDSA-NIST256P-CHALLENGE server-time")
                 .await;
-            assert_eq!(
-                session.read_line().await,
-                "",
-                "the driver must hang up without starting a credential exchange"
-            );
+            let mut after = Vec::new();
+            loop {
+                let line = session.read_line().await;
+                if line.is_empty() {
+                    break;
+                }
+                after.push(line);
+            }
+            if dial_tx.send((opening, after)).await.is_err() {
+                return;
+            }
         }
     });
     let handle = IrcNetwork::start(NetworkConfig {
@@ -2893,6 +2916,15 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
     })
     .await
     .expect("the refusal was never recorded");
+    let (opening, after) = tokio::time::timeout(deadline::HANG, dial_rx.recv())
+        .await
+        .expect("the upstream never saw a whole dial")
+        .expect("the upstream script ended");
+    assert_eq!(opening, "CAP LS 302");
+    assert!(
+        after.iter().all(|line| !line.starts_with("AUTHENTICATE")),
+        "the driver must hang up without starting a credential exchange: {after:?}"
+    );
     assert_ne!(
         snapshot.lifecycle,
         NetworkLifecycle::AuthenticationFailed,
@@ -2922,7 +2954,7 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
 async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         // Five refusals and the one dropped dial between them; the driver parks
         // after the sixth and never dials again.
         for dial in 1..=6 {
@@ -2971,7 +3003,7 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
 async fn a_refused_registration_keeps_its_reason_while_retrying() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session
             .send("ERROR :Closing Link: client (Trying to reconnect too fast.)")
@@ -3613,7 +3645,7 @@ async fn outlasted_never_parked(answer: PreWelcomeAnswer) {
             "You are banned from this server",
         ),
     };
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         for _ in 1..=6 {
             let mut session = fake_accept(&listener).await;
             match answer {
@@ -3697,7 +3729,7 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         drop_rx.recv().await;
@@ -3796,7 +3828,7 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
 async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
         loop {
@@ -3858,7 +3890,7 @@ async fn a_rejoin_of_many_channels_takes_few_join_lines() {
     let channels: Vec<String> = (0..100).map(|index| format!("#room{index:02}")).collect();
     let expected = channels.clone();
     let (lines_tx, mut lines_rx) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         let mut named = std::collections::HashSet::new();
@@ -3920,7 +3952,7 @@ async fn self_echoes_carry_the_identity_the_upstream_shows() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         loop {
@@ -3993,7 +4025,7 @@ async fn self_echoes_carry_the_identity_the_upstream_shows() {
 async fn a_server_answering_451_to_capability_discovery_connects_at_once() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         assert_eq!(session.read_line().await, "CAP LS 302");
         session.send(":up 451 * :You have not registered").await;
@@ -4270,7 +4302,7 @@ async fn a_list_reaches_only_the_client_that_asked_for_it() {
     const CHANNELS: usize = 5000;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         session.send(":peer!u@h PRIVMSG #room :before").await;
@@ -4368,7 +4400,7 @@ async fn labelled_replies_reach_the_client_whose_command_they_answer() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         let offered = "server-time message-tags account-tag echo-message batch labeled-response";
         register_offering(
@@ -4472,7 +4504,7 @@ async fn client_tags_never_reach_an_upstream_that_cannot_carry_them() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         register_offering(&mut session, "bncbot", "server-time", &["server-time"]).await;
         loop {
@@ -4529,7 +4561,7 @@ async fn a_refused_rejoin_is_not_retried_forever() {
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<(u8, String)>(32);
     let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(4);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         for session_number in 1u8.. {
             let mut session = fake_accept(&listener).await;
             session.complete_registration("bncbot").await;
@@ -4662,7 +4694,7 @@ async fn a_withdrawn_echo_message_is_followed_mid_session() {
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<String>(8);
     let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session
             .complete_registration_with_echo_message("bncbot")
@@ -4724,7 +4756,7 @@ async fn echoes_around(change: EchoChange) -> Vec<(String, u64)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         match change {
             EchoChange::WithdrawnBeforeTheEcho => {
@@ -4829,7 +4861,7 @@ async fn the_driver_paces_what_it_writes_upstream() {
     let addr = listener.local_addr().unwrap();
     let (heard_tx, mut heard_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, std::time::Instant)>();
-    tokio::spawn(async move {
+    let _upstream = ScriptedTask::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
         loop {

@@ -384,3 +384,22 @@ fn check_config_judges_the_sasl_requirement_as_start_does() {
     }
     std::fs::remove_file(&path).expect("remove the configuration");
 }
+
+/// The release jobs execute `e6ircd --version` on every target before they
+/// package it, and compare the line with the version and revision they built.
+#[test]
+fn version_states_the_package_version_and_the_build_revision() {
+    let output = e6ircd(&["--version"], &[]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "e6ircd {} (revision {})\n",
+            env!("CARGO_PKG_VERSION"),
+            e6ircd::BUILD_REVISION
+        )
+    );
+    let extra = e6ircd(&["--version", "--config", "e6irc.toml"], &[]);
+    assert_eq!(extra.status.code(), Some(2), "{}", report(&extra));
+    assert!(extra.stdout.is_empty(), "{}", report(&extra));
+}

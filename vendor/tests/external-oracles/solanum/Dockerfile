@@ -1,6 +1,11 @@
 # Solanum built from source at a pinned ref (the ircd Libera runs).
 # Provenance: https://github.com/solanum-ircd/solanum, ref below.
-FROM debian:bullseye-slim AS build
+# The base is pinned by index digest like every image here
+# (tools/check-image-pins.py); to refresh it, resolve the tag again with
+# `docker buildx imagetools inspect debian:bullseye-slim` and update both
+# stages and this date together.
+#   debian:bullseye-slim resolved 2026-09-27
+FROM debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd AS build
 # Pinned to a specific commit for a reproducible reference oracle.
 # https://github.com/solanum-ircd/solanum/commit/48db98ab2b4191ba75047a74c79a353e4f82bf5a (2026-07-15)
 ARG SOLANUM_REF=48db98ab2b4191ba75047a74c79a353e4f82bf5a
@@ -14,7 +19,7 @@ RUN git clone https://github.com/solanum-ircd/solanum /src \
     && ./configure --prefix=/opt/solanum --enable-epoll=no \
     && make -j"$(nproc)" && make install
 
-FROM debian:bullseye-slim
+FROM debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 libltdl7 && rm -rf /var/lib/apt/lists/*
 # Solanum refuses to run as root.

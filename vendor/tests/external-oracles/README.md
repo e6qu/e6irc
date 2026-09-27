@@ -5,14 +5,17 @@ scripted client sessions are played against e6ircd and against a
 reference server, and the normalized transcripts are diffed. Divergences
 fail unless whitelisted with a written reason.
 
-These are **opt-in developer tools**, not part of the build or default
-CI: e6irc is an independent implementation, and an oracle is only a
-cross-check, never a dependency.
+The differential oracles are **opt-in developer tools**, not part of the
+build or default CI: e6irc is an independent implementation, and an oracle
+is only a cross-check, never a dependency. (`conduit/` is the exception
+below: CI's `matrix-bridge` job runs it as the Matrix bridge's live target.)
 
 ## Contents
 
 - `solanum/` — Solanum (the ircd Libera.Chat runs), built from a pinned
   source commit in Docker. See `solanum/README.md` for source + license.
+- `conduit/` — the pinned Conduit Matrix homeserver the `matrix` bridge's
+  integration test runs against, in CI and locally. See `conduit/README.md`.
 - `diff_sessions.py` — the differential runner. Plays the scenarios
   against two servers (`--ours HOST:PORT --reference HOST:PORT`) and diffs
   normalized output against `diff_whitelist.toml`.

@@ -1,6 +1,7 @@
-# Conduit: a lightweight single-binary Matrix homeserver, used as the
-# live target for the `matrix` bridge's integration test. Not part of the
-# e6irc build or default CI — a developer/test oracle only.
+# Conduit: a lightweight single-binary Matrix homeserver, the live target
+# for the `matrix` bridge's integration test. CI's matrix-bridge job runs the
+# same pinned image with `docker run`, mounting this directory's conduit.toml;
+# this file starts it the same way for a developer.
 services:
   conduit:
     image: matrixconduit/matrix-conduit:v0.9.0@sha256:4ae051b1b56ee9c1292ffc87653da6078a52310f71aa4fe701c66432159997dd

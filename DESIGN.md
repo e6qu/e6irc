@@ -46,7 +46,7 @@ product outcomes and their automated evidence are mapped in
 ### Non-goals
 
 - Server-to-server federation (IRC linking). Single-server only; the internal
-  state model is not required to keep seams for later linking.
+  state model is not required to keep seams for a linking protocol.
 - Dynamic plugin loading (`dlopen`). Bridges are compiled in behind feature
   flags; the monolith stays statically linked.
 - Supporting non-vanilla Postgres or other SQL backends. PostgreSQL is the
@@ -740,6 +740,16 @@ both native clients — one parser to fuzz, one behavior everywhere.
   releases and picks the toolchain from the ref it is called by, so it is
   pinned to a commit of its `master` branch and always given the toolchain
   as its `toolchain` input. The header of ci.yml has the refresh recipe.
+- **One Rust toolchain**: `rust-toolchain.toml` pins the exact release
+  (`channel`, with clippy and rustfmt) that every developer build, every CI
+  job, the native release archives and the container image compile with.
+  Each workflow's `toolchain:` input and the Dockerfile's
+  `rust:<release>-bookworm` base name that release; CI sets
+  `RUSTUP_AUTO_INSTALL=0` and the Dockerfile checks its compiler against the
+  file with the same setting, so a mismatch fails instead of fetching a second
+  compiler. The fuzz job alone runs a pinned nightly, which cargo-fuzz's
+  sanitizer flags require. `tools/check-release-toolchain.sh` (with its
+  contract test) holds all of these to the file.
 
 ---
 
@@ -5149,8 +5159,16 @@ Layers, bottom to top:
   `rustls` in it; generating it downloads syft, so one failed attempt is
   retried once and the requirement still fails a job with no SBOM — and every
   shipped build passes `--locked`
-  (`tools/check-locked-builds.sh`); native releases build with the image's
-  pinned Rust (`tools/check-release-toolchain.sh`) and no restored cache. The
+  (`tools/check-locked-builds.sh`); native releases build with
+  `rust-toolchain.toml`'s Rust, the one the image carries
+  (`tools/check-release-toolchain.sh`), and no restored cache. Nothing is
+  released unexecuted: each architecture's candidate image is booted against
+  PostgreSQL on its own runner (`tools/test-production-container.sh`) and must
+  report the commit it was built from (`e6ircd --version`,
+  `tools/check-image-version.sh`) before it is attested or assembled, and
+  every native binary runs `--version` on its target's own runner — Windows
+  ARM and macOS included — and must name the version and commit built before
+  it is packaged (`tools/smoke-native-release.py`). The
   assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.

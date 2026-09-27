@@ -8,7 +8,12 @@
 #   gh api repos/OWNER/REPO/git/tags/SHA --jq .object.sha
 # dtolnay/rust-toolchain has no releases and chooses the toolchain from the ref
 # it is called by, so it is pinned to a commit of its `master` branch and the
-# toolchain is always passed as the `toolchain` input.
+# toolchain is always passed as the `toolchain` input: rust-toolchain.toml's
+# `channel`, the one compiler everything is built with (the fuzz-smoke job's
+# pinned nightly is the one exception, and says why). The file, not the input,
+# decides what `cargo` runs, so RUSTUP_AUTO_INSTALL=0 below turns an input that
+# drifted from it into a failed job instead of a silent second download;
+# tools/check-release-toolchain.sh holds every input to the file.
 name: CI
 
 on:
@@ -16,15 +21,18 @@ on:
     branches: [main]
   pull_request:
 
-# Service and tool images are pinned by digest like the Dockerfile's bases; to
-# refresh one, resolve its tag with `docker buildx imagetools inspect IMAGE:TAG`
-# and update the digest and this date together.
+# Service and tool images are pinned by digest like the Dockerfile's bases
+# (tools/check-image-pins.py requires a digest on every image any tracked file
+# pulls, and one digest per image everywhere); to refresh one, resolve its tag
+# with `docker buildx imagetools inspect IMAGE:TAG` and update the digest and
+# this date together.
 #   postgres:18-alpine, ghcr.io/dexidp/dex:v2.41.1,
 #   mcr.microsoft.com/playwright:v1.61.1-noble,
 #   matrixconduit/matrix-conduit:v0.9.0   resolved 2026-09-21
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  RUSTUP_AUTO_INSTALL: "0"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -38,60 +46,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: tools/check-systemd-unit.sh
-      # Every build resolves from Cargo.lock exactly, and the native release
-      # builds with the image's compiler and no restored cache.
-      - run: tools/check-locked-builds.sh
-      - run: tools/check-release-toolchain.sh
-      - run: tools/test-backup-restore.sh
-      # One script per invocation: `-n` parses only its first operand, and the
-      # rest would become that script's positional parameters, unread.
-      - name: Shell syntax
-        run: |
-          for script in tools/*.sh tools/*/*.sh vendor/tests/irctest/run.sh; do
-            case "$(head -n 1 "$script")" in
-              '#!/bin/sh'*) sh -n "$script" ;;
-              *) bash -n "$script" ;;
-            esac
-          done
-      - run: tools/test-load-qualification-arguments.sh
-      - run: tools/test-load-sweep.sh
-      - run: tools/test-qualification.sh
-      - run: tools/test-check-migration-integrity.sh
-      - run: tools/test-check-no-defer.sh
-      - run: tools/test-check-dead-pub.sh
-      - run: tools/test-check-locked-builds.sh
-      - run: tools/test-check-noops.sh
-      - run: python3 vendor/tests/irctest/test_check_skips.py
-      # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions,
-      # and current for fuzz/Cargo.toml (`cargo fuzz` has no `--locked`, and
-      # would re-resolve a stale lock without a word).
-      - run: python3 tools/check-fuzz-lock.py
-      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
-      # Every service and tool image is pinned by the one digest CI uses.
-      - run: python3 tools/check-image-pins.py
-      - name: Migration integrity
+      # Every structural guard and every guard's contract test: the one list
+      # AGENTS.md's checklist points at (tools/gate.sh names each step). The
+      # checkout is shallow, so fetch main for the guards that read what this
+      # change added; a failed fetch fails the step, because without the base
+      # those additions would go unexamined. cargo deny runs in the deny job.
+      - name: Guards and their contract tests
         run: |
           git fetch --no-tags --depth=1 origin main
-          tools/check-migration-integrity.sh FETCH_HEAD
+          tools/gate.sh --base FETCH_HEAD --skip-cargo-deny
       # embed-web (pulled in by --all-features) embeds web/dist, so build
       # the frontend first. Node is preinstalled on the runners.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
-      - run: cargo fmt --all --check
-      - run: rustfmt --edition 2024 --check crates/e6irc-qualification/tests/support/native.rs
-      # fuzz/ is outside the workspace, so neither `cargo fmt --all` nor the
-      # workspace clippy reaches its targets.
-      - run: rustfmt --edition 2024 --check fuzz/fuzz_targets/*.rs
       - run: cargo clippy --locked --workspace --all-targets --all-features
       # `--all-features` is the union, so it never compiles a feature on its
       # own. Code behind `cfg(feature = "discord")` that happens to depend on
       # something `matrix` pulls in builds there and breaks for the deployment
       # that enables one bridge, which is the normal case; and code behind
       # `cfg(not(feature = ..))` compiles only when that feature is off. The
-      # empty entry is the default build, the one most deployments ship.
+      # empty entry is the default build: no bridge and no embedded web
+      # client, what a plain `cargo build -p e6ircd` makes (the image and the
+      # native archives ship --all-features). The test job runs its unit tests.
       # (embed-web needs web/dist, built above.)
       - name: Default features and each feature on its own
         # clippy, not just check: a clippy lint that fires only in one
@@ -101,41 +79,12 @@ jobs:
           for feature in "" embed-web discord matrix slack; do
             cargo clippy --locked -p e6ircd --all-targets --features "$feature"
           done
-      # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
-      # deferred-work markers or unmessaged panics.
-      - run: tools/check-noops.sh
       # Dead-code guard: compile only the shipped artifacts (no test targets)
       # with -D warnings, so code kept alive solely by tests is caught as dead.
       - run: tools/check-dead-code.sh
-      # Dead-pub guard: the cross-crate case the compiler can't see — a `pub`
-      # item referenced only by an integration test (a separate crate), a fuzz
-      # target, or inline `#[cfg(test)]` / `#[cfg(fuzzing)]` code.
-      - run: tools/check-dead-pub.sh
-      # Copy-paste guard: fail if duplicated Rust source exceeds the ratchet.
-      - run: tools/check-duplication.sh
-      # Journey guard: every user-facing outcome carries the same complete
-      # contract and has exactly one row using the defined evidence vocabulary.
-      - run: python3 tools/check-journeys.py
-      - run: python3 tools/test-check-journeys.py
-      # Glossary guard: every abbreviation in the docs and code comments is
-      # defined in docs/terminology.md or spelled out where it is used.
-      - run: python3 tools/check-terminology.py
-      - run: python3 tools/test-check-terminology.py
-      - run: python3 tools/check-client-capabilities.py
-      # Structural server-rendered accessibility: every data table keeps an
-      # accessible caption and every navigation landmark keeps a name.
-      - run: python3 tools/check-template-accessibility.py
-      # API-first guard: console forms may not bypass the public API.
-      - run: python3 tools/check-api-first-inventory.py
-      # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
-      # file-it-for-later idiom may be added to any file. The checkout is
-      # shallow, so fetch main to diff the additions against. A failed fetch
-      # fails the step: without the base the additions go unexamined.
-      - name: No-deferral guard
-        run: |
-          git fetch --no-tags --depth=1 origin main
-          tools/check-no-defer.sh FETCH_HEAD
 
+  # tools/gate.sh's cargo deny step, run with the cargo-deny action (the lint
+  # job passes --skip-cargo-deny).
   deny:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -173,16 +122,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # --all-features includes embed-web, which embeds web/dist.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
-      # The union above never compiles a `cfg(not(feature = "embed-web"))`
-      # test (the API-only build that serves no `/`), so run the HTTP suite
-      # once more in the default build.
-      - run: cargo test --locked -p e6ircd --test http --target ${{ matrix.target }}
+      # The union above never compiles a `cfg(not(feature = ..))` test: the
+      # API-only build that serves no `/`, or a bridge kind refused by a build
+      # without its feature. So run the daemon's unit tests and the HTTP suite
+      # once more in the default build, which has none of those features.
+      - run: cargo test --locked -p e6ircd --lib --test http --target ${{ matrix.target }}
 
   # Coverage is a ratchet, not a claim that one percentage proves the product.
   # Combine the portable all-feature suite with the real PostgreSQL database
@@ -208,7 +158,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
@@ -245,7 +195,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       # Each Rust test owns a database created through this administrative URL.
@@ -327,7 +277,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - name: Start dex (mock connector)
@@ -392,7 +342,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - run: python3 tools/test-postgres-recovery.py
@@ -414,6 +364,8 @@ jobs:
       # a ready /readyz, and a clean exit on SIGTERM inside the stop budget.
       - name: Boot the built image against PostgreSQL
         run: tools/test-production-container.sh e6irc:ci
+      - name: Require the image to report the built revision
+        run: tools/check-image-version.sh e6irc:ci "${{ github.sha }}"
       # The same SBOM generator release.yml attests with; the binary is built
       # with cargo auditable, so its Rust crates must appear in it.
       # One retry for the action's syft download (see release.yml); the check
@@ -447,7 +399,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd -p e6irc-load
       - run: tools/test-load-smoke.sh
@@ -459,9 +411,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: python3 tools/test-native-release-package.py
       - run: cargo build --locked -p e6ircd -p e6irc-tui
       - run: python3 tools/test-tui-pty.py
 
@@ -472,7 +423,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -501,7 +452,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -547,7 +498,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -614,7 +565,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Start Conduit
         run: |
@@ -638,7 +589,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --locked -p e6irc-queue --release
         env:
@@ -660,19 +611,31 @@ jobs:
     # `core_dispatch` links the whole daemon (sqlx, rustls) rather than just the
     # protocol crate, so a cold cache spends most of the budget compiling.
     timeout-minutes: 30
+    # The one job not on rust-toolchain.toml's release: cargo-fuzz builds with
+    # `-Zsanitizer=address` and sancov instrumentation, which only a nightly
+    # compiler accepts. RUSTUP_TOOLCHAIN overrides the file for every step here
+    # (rust-cache's `cargo metadata` and `rustc -vV` included, which would
+    # otherwise ask for the file's release, not installed in this job).
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-07-23
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Pinned nightly: the 2026-07-24 nightly ICEs in rustc_codegen_ssa on a
-      # tokio task type under the fuzzer's AddressSanitizer+sancov instrumentation (a
-      # compiler bug, not our code). Pin to the last nightly that built the fuzz
-      # targets; bump when upstream fixes the codegen regression.
+      # Every cargo call here also names the nightly with `+`, so a step read
+      # on its own says which compiler it runs. Pinned nightly: the 2026-07-24
+      # nightly ICEs in rustc_codegen_ssa on a tokio task type under that
+      # instrumentation (a compiler bug, not our code), so this is the last
+      # nightly that built the fuzz targets; bump when upstream fixes the
+      # codegen regression. tools/check-release-toolchain.sh holds every `+`,
+      # and the job's RUSTUP_TOOLCHAIN, to this input.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
           toolchain: nightly-2026-07-23
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Built with the nightly this job installed: rust-toolchain.toml's
+      # release is not installed here, and nothing may fetch it behind our back.
+      - run: cargo +nightly-2026-07-23 install cargo-fuzz --version 0.13.2 --locked
       # `cargo fuzz` takes no `--locked`: refuse a lock that is stale for
       # fuzz/Cargo.toml before it can re-resolve.
       - run: cargo +nightly-2026-07-23 metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
@@ -704,7 +667,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Each binary is measured in the profile it ships in: the server in
       # `release`, the clients in `release-client` (release.yml).

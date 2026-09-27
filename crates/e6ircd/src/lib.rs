@@ -22,3 +22,12 @@ pub(crate) mod recency;
 pub(crate) mod sanitize;
 pub mod secret;
 pub(crate) mod settings_watch;
+
+/// The commit this binary was built from: `E6IRC_BUILD_REVISION` at compile
+/// time, which the container image and the native release archives set, or
+/// the explicit `"unknown"` for a build that did not record one. Both
+/// `e6ircd --version` and the `e6irc_build_info` metric report it.
+pub const BUILD_REVISION: &str = match option_env!("E6IRC_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};

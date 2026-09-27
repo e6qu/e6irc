@@ -7614,6 +7614,57 @@ mod tests {
         .expect("invalid driver configuration should be rejected")
     }
 
+    // A bridge kind's fields are validated in every build; a build without the
+    // bridge's feature then refuses a complete, valid network of that kind by
+    // name, and never builds a driver of another kind for it. Each test is
+    // compiled only where its refusal exists, so the default build (no bridge
+    // features) runs all three.
+
+    #[cfg(not(feature = "matrix"))]
+    #[test]
+    fn a_build_without_matrix_refuses_a_valid_matrix_network_by_name() {
+        assert_eq!(
+            driver_factory_error(
+                crate::config::NetworkKind::Matrix,
+                "https://matrix.example",
+                "@bot:matrix.example",
+                None,
+                Some("login password"),
+            ),
+            "kind=matrix but this binary was built without the `matrix` feature"
+        );
+    }
+
+    #[cfg(not(feature = "discord"))]
+    #[test]
+    fn a_build_without_discord_refuses_a_valid_discord_network_by_name() {
+        assert_eq!(
+            driver_factory_error(
+                crate::config::NetworkKind::Discord,
+                "https://discord.com/api",
+                "",
+                None,
+                Some("bot-token"),
+            ),
+            "kind=discord but this binary was built without the `discord` feature"
+        );
+    }
+
+    #[cfg(not(feature = "slack"))]
+    #[test]
+    fn a_build_without_slack_refuses_a_valid_slack_network_by_name() {
+        assert_eq!(
+            driver_factory_error(
+                crate::config::NetworkKind::Slack,
+                "https://slack.com/api",
+                "",
+                Some("xoxb-bot-token"),
+                Some("xapp-app-token"),
+            ),
+            "kind=slack but this binary was built without the `slack` feature"
+        );
+    }
+
     /// A channel key is a `JOIN` parameter of an IRC channel: a bridge's rooms
     /// and channel ids have none, and a key that is not one parameter is
     /// refused before a driver exists, never shown in the refusal.

@@ -694,7 +694,7 @@ impl Telemetry {
         out.push_str(&format!(
             "e6irc_build_info{{version=\"{}\",revision=\"{}\"}} 1\n",
             env!("CARGO_PKG_VERSION"),
-            option_env!("E6IRC_BUILD_REVISION").unwrap_or("unknown"),
+            crate::BUILD_REVISION,
         ));
         one_metric(
             &mut out,

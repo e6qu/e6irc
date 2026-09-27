@@ -9,6 +9,7 @@ use e6ircd::secret::SecretKey;
 
 const USAGE: &str = "usage:\n  \
     e6ircd [<configuration>]        run the server\n  \
+    e6ircd --version                print the version and build revision\n  \
     e6ircd check-config [<configuration>]\n  \
                                      validate configuration and exit\n  \
     e6ircd genkey                   print a new base64 master key\n  \
@@ -48,8 +49,25 @@ fn main() -> ExitCode {
         Some("recover-administrator") => recover_administrator(&args[1..]),
         Some("check-config") => check_config(&args[1..]),
         Some("healthcheck") => healthcheck(&args[1..]),
+        Some("--version") => version(&args[1..]),
         _ => run(&args),
     }
+}
+
+/// `e6ircd --version`: `e6ircd <version> (revision <commit>)` on stdout. The
+/// release jobs run it on every target's own runner before packaging, so an
+/// archive never ships a binary that was not executed there.
+fn version(args: &[String]) -> ExitCode {
+    if !args.is_empty() {
+        eprintln!("e6ircd --version takes no arguments\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    println!(
+        "e6ircd {} (revision {})",
+        env!("CARGO_PKG_VERSION"),
+        e6ircd::BUILD_REVISION
+    );
+    ExitCode::SUCCESS
 }
 
 /// The whole probe -- connect, write, read -- must finish inside this, so a

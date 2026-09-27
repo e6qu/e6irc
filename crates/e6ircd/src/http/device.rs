@@ -1178,8 +1178,9 @@ pub(super) async fn admin_stats(
 }
 
 /// Return the revisioned managed configuration without credential material.
-/// A client can use `revision` as the compare-and-swap precondition for later
-/// writes, but no OIDC, oper, or upstream secret ever crosses this boundary.
+/// A client can use `revision` as the compare-and-swap precondition of the
+/// writes that follow, but no OIDC, oper, or upstream secret ever crosses this
+/// boundary.
 pub(super) async fn admin_configuration(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
