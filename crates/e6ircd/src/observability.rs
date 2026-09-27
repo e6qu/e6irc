@@ -936,12 +936,23 @@ const MAINTENANCE_DRAIN_PAUSE: Duration = Duration::from_millis(250);
 /// expired credentials and durable history/audit data from growing forever; a
 /// tick whose batch fills keeps draining, bounded, before the next tick.
 /// Every read marker it deletes is handed to the core, whose mirror counts it.
+/// The history retention it applies here is the one the core and the bouncer
+/// apply to what they serve from memory: it is handed to them before the
+/// first sweep (the console hands them every later change as it saves one).
 pub(crate) async fn run_storage_maintenance(
     pool: sqlx::PgPool,
     telemetry: std::sync::Arc<Telemetry>,
     settings: std::sync::Arc<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>,
     core: crate::core::CoreIngress,
 ) {
+    core.set_history_retention_days(
+        settings
+            .read()
+            .await
+            .settings
+            .storage
+            .history_retention_days,
+    );
     let mut ticker = tokio::time::interval(Duration::from_secs(300));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval`'s first tick is immediate. Consume it so startup never races
@@ -970,6 +981,7 @@ pub(crate) async fn run_storage_maintenance(
         telemetry.record_database_request(started.elapsed());
         let retention = {
             let snapshot = settings.read().await;
+            core.set_history_retention_days(snapshot.settings.storage.history_retention_days);
             crate::db::StorageRetention {
                 history_days: snapshot.settings.storage.history_retention_days,
                 audit_days: snapshot.settings.storage.audit_retention_days,

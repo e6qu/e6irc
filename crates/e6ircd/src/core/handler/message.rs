@@ -195,6 +195,14 @@ impl StatusSigil {
         }
     }
 
+    /// The sigil as written before the channel name.
+    fn wire(self) -> char {
+        match self {
+            Self::OpsOnly => '@',
+            Self::Voiced => '+',
+        }
+    }
+
     /// Whether a member with modes `m` is in this sigil's audience.
     fn admits(self, m: &crate::core::state::MemberModes) -> bool {
         match self {
@@ -202,6 +210,72 @@ impl StatusSigil {
             Self::Voiced => m.op || m.voice,
         }
     }
+}
+
+/// A message target as the server names it on the wire: the channel's own name
+/// (after the STATUSMSG sigil the message was sent with), the recipient's
+/// current nick, a service's nick — never the sender's spelling of it. Solanum
+/// relays `PRIVMSG #FOO` as `PRIVMSG #foo` to a channel created as `#foo`, and
+/// CHATHISTORY replays each message under these names, so a live line and its
+/// replay are the same bytes. The relayed-line builders take only this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalTarget(String);
+
+impl CanonicalTarget {
+    /// A channel message: `name` is the channel's own, `sigil` the STATUSMSG
+    /// audience it was sent to, if any.
+    fn channel(sigil: Option<StatusSigil>, name: &str) -> Self {
+        match sigil {
+            Some(sigil) => Self(format!("{}{name}", sigil.wire())),
+            None => Self(name.to_string()),
+        }
+    }
+
+    /// A direct message to a user, by the nick they hold now.
+    fn user(nick: &str) -> Self {
+        Self(nick.to_string())
+    }
+
+    /// A replayed message's target, which history names canonically: the
+    /// channel's name, or the correspondent's or requester's current nick.
+    pub(super) fn replayed(name: &str) -> Self {
+        Self(name.to_string())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The relayed line `:{prefix} {verb} {target} :{text}` and the text it
+/// carries, trimmed on a UTF-8 char boundary to fit the 512-byte wire limit
+/// (510 before its CRLF). The source prefix is the server's addition, not the
+/// sender's, so a message the sender was allowed to send can still overflow
+/// once relayed. Trimming to fit is what keeps a strict client from discarding
+/// the line; it happens once, upstream of both delivery and history, so every
+/// observer sees the same message.
+fn relayed_line<'a>(
+    prefix: &str,
+    verb: &str,
+    target: &CanonicalTarget,
+    text: &'a str,
+) -> (String, &'a str) {
+    // ":" + prefix + " " + verb + " " + target + " :"
+    let overhead = 1 + prefix.len() + 1 + verb.len() + 1 + target.as_str().len() + 2;
+    let budget = 510usize.saturating_sub(overhead);
+    let text = e6irc_proto::message::truncate_on_char_boundary(text, budget);
+    (format!(":{prefix} {verb} {target} :{text}"), text)
+}
+
+/// The relayed TAGMSG line (its tags aside).
+pub(super) fn tagmsg_line(prefix: &str, target: &CanonicalTarget) -> String {
+    format!(":{prefix} TAGMSG {target}")
 }
 
 /// The one gate every channel message passes — PRIVMSG/NOTICE, a multiline
@@ -273,6 +347,8 @@ pub(super) enum ResolvedKind {
 
 pub(super) struct ResolvedTarget {
     pub(super) kind: ResolvedKind,
+    /// What the relayed message is addressed to.
+    pub(super) canonical: CanonicalTarget,
     /// Everyone who receives it, the sender excluded.
     pub(super) recipients: Vec<Recipient>,
 }
@@ -292,8 +368,8 @@ pub(super) fn resolve_message_target(
 ) -> Option<ResolvedTarget> {
     let prefix = state.sessions[&conn].prefix();
     // STATUSMSG: a leading @ or + restricts delivery to members with at
-    // least that status. The prefix stays in the target echoed to
-    // recipients.
+    // least that status. The sigil stays in the target relayed to
+    // recipients, before the channel's own name.
     let (status_prefix, chan_target) = StatusSigil::split(target);
     if !chan_target.starts_with('#') {
         let key = state.nick_key(target);
@@ -313,6 +389,7 @@ pub(super) fn resolve_message_target(
         }
         return Some(ResolvedTarget {
             recipients: vec![peer.recipient],
+            canonical: CanonicalTarget::user(&peer.nick),
             kind: ResolvedKind::User { peer },
         });
     }
@@ -342,23 +419,10 @@ pub(super) fn resolve_message_target(
         member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
     });
     Some(ResolvedTarget {
+        canonical: CanonicalTarget::channel(status_prefix, &chan.name),
         kind: ResolvedKind::Channel { key, status_prefix },
         recipients,
     })
-}
-
-/// Truncate `text` on a UTF-8 char boundary so the relayed line
-/// `:{prefix} {kind} {target} :{text}` fits the 512-byte wire limit (510 before
-/// its CRLF). The source prefix is the server's addition, not the sender's, so
-/// a message the sender was allowed to send can still overflow once relayed.
-/// Trimming to fit is what keeps a strict client from discarding the line; it
-/// must happen once, upstream of both delivery and history, so every observer
-/// sees the same message.
-fn fit_relayed_text<'a>(prefix: &str, kind: &str, target: &str, text: &'a str) -> &'a str {
-    // ":" + prefix + " " + kind + " " + target + " :"
-    let overhead = 1 + prefix.len() + 1 + kind.len() + 1 + target.len() + 2;
-    let budget = 510usize.saturating_sub(overhead);
-    e6irc_proto::message::truncate_on_char_boundary(text, budget)
 }
 
 pub(super) fn deliver_one_message(
@@ -374,7 +438,7 @@ pub(super) fn deliver_one_message(
     // to services is dropped without reply (spec: NOTICE never triggers
     // automatic responses).
     let target_key = state.nick_key(target);
-    if is_service_nick(target_key.as_str()) {
+    if let Some(service) = service_nick(target_key.as_str()) {
         // echo-message covers *every* message the client sends, including one
         // to a services pseudo-client — the echo is how such a client renders
         // its own outgoing line, so without it "/msg NickServ …" silently
@@ -390,8 +454,8 @@ pub(super) fn deliver_one_message(
             } else {
                 text
             };
-            let text = fit_relayed_text(&prefix, kind.wire(), target, shown);
-            let line = format!(":{prefix} {} {target} :{text}", kind.wire());
+            let (line, _) =
+                relayed_line(&prefix, kind.wire(), &CanonicalTarget::user(service), shown);
             let sender_account = state.sessions[&conn].account().map(str::to_owned);
             let sender_is_bot = state.sessions[&conn].bot;
             let (ts, msgid) = state.stamp();
@@ -446,8 +510,7 @@ pub(super) fn deliver_one_message(
     // discards or truncates the line. Trim the text to fit here, once, so live
     // recipients, the echo, and CHATHISTORY all carry the identical message
     // rather than each seeing a differently-cut or dropped copy.
-    let text = fit_relayed_text(&prefix, kind.wire(), target, text);
-    let line = format!(":{prefix} {} {target} :{text}", kind.wire());
+    let (line, text) = relayed_line(&prefix, kind.wire(), &resolved.canonical, text);
     // One stamp, one delivery description, one history entry: the channel and
     // direct-message branches record the same message — only who receives it
     // and under which history key differs, so live delivery and CHATHISTORY
@@ -529,9 +592,9 @@ pub(super) fn message_on_owner(
     let recipients = channel.recipients_where(|member, modes| {
         member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
     });
+    let canonical = CanonicalTarget::channel(status_prefix, &channel.name);
     let prefix = &actor.identity.prefix;
-    let text = fit_relayed_text(prefix, kind.wire(), &target, &message_text);
-    let line = format!(":{prefix} {} {target} :{text}", kind.wire());
+    let (line, text) = relayed_line(prefix, kind.wire(), &canonical, &message_text);
     let (ts, msgid) = state.stamp();
     let entry = crate::core::state::HistoryEntry {
         msgid,
@@ -670,12 +733,12 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     // A STATUSMSG (`@#chan`/`+#chan`) is valid for TAGMSG too (message-tags
     // spec): the same gate and op/voice subset PRIVMSG uses, so a banned or
     // quieted member can't relay TAGMSG (typing/reaction tags) it couldn't
-    // relay as text. The echoed `target` keeps the sigil, like PRIVMSG.
+    // relay as text. The relayed target keeps the sigil, like PRIVMSG.
     let Some(resolved) = resolve_message_target(state, conn, target, false, true) else {
         return;
     };
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} TAGMSG {target}");
+    let line = tagmsg_line(&prefix, &resolved.canonical);
     let (ts, msgid) = state.stamp();
     let entry = tagmsg_history_entry(
         msgid,
@@ -785,7 +848,10 @@ pub(super) fn tagmsg_on_owner(
     let recipients = tagmsg_audience(&channel.recipients_where(|member, modes| {
         member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
     }));
-    let line = format!(":{} TAGMSG {target}", actor.identity.prefix);
+    let line = tagmsg_line(
+        &actor.identity.prefix,
+        &CanonicalTarget::channel(status_prefix, &channel.name),
+    );
     let (ts, msgid) = state.stamp();
     let entry = tagmsg_history_entry(
         msgid,
@@ -1015,19 +1081,25 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             // capture across delivery so the echo goes out uncaptured with only its
             // inline label; restore it (empty) so the close still gets its own ACK.
             let close_capture = state.capture.take();
-            let (_, channel_target) = StatusSigil::split(&batch.target);
-            let owner = state.channel_owner(channel_target);
-            if !batch.lines.is_empty()
-                && channel_target.starts_with('#')
-                && !state.owns_channel(&owner)
-            {
-                state.route_multiline(crate::core::state::ChannelMultiline::new(
-                    owner,
-                    state.channel_actor(conn),
-                    batch,
-                ));
-            } else {
-                deliver_multiline(state, conn, batch);
+            // Whether the batch is a message at all is decided here, before it
+            // goes anywhere: delivery on this shard and on a channel's owner
+            // take only a completed one, so neither can deliver or store a
+            // batch with nothing to send.
+            match batch.complete() {
+                Ok(message) => {
+                    let (_, channel_target) = StatusSigil::split(message.target());
+                    let owner = state.channel_owner(channel_target);
+                    if channel_target.starts_with('#') && !state.owns_channel(&owner) {
+                        state.route_multiline(crate::core::state::ChannelMultiline::new(
+                            owner,
+                            state.channel_actor(conn),
+                            message,
+                        ));
+                    } else {
+                        deliver_multiline(state, conn, message);
+                    }
+                }
+                Err((refusal, label)) => refuse_multiline(state, conn, refusal, label),
             }
             state.capture = close_capture;
         }
@@ -1038,6 +1110,35 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             &[],
             "Batch reference must start with + or -",
         ),
+    }
+}
+
+/// Answer a closed batch that is no message at all: one with no lines is
+/// malformed like any other bad batch; one of only blank lines has no text to
+/// send — exactly what ERR_NOTEXTTOSEND refuses for a PRIVMSG, and what
+/// recipients without `draft/multiline` would be sent: nothing. Stored instead,
+/// it became a history row that replays as no line at all, so a page of N rows
+/// reached such a client as fewer than N messages and read as the end of the
+/// buffer.
+fn refuse_multiline(
+    state: &mut ServerState,
+    conn: ConnId,
+    refusal: crate::core::state::MultilineRefusal,
+    label: Option<String>,
+) {
+    match refusal {
+        crate::core::state::MultilineRefusal::Empty => {
+            multiline_batch_fail(state, conn, label, "MULTILINE_INVALID", &[], "Empty batch");
+        }
+        crate::core::state::MultilineRefusal::NoText { loud } => {
+            if loud {
+                state.numeric(conn, ERR_NOTEXTTOSEND, &[], Some("No text to send"));
+            }
+            // The opening BATCH was labeled, so that command still owes a
+            // response (the framer was told not to ACK it when the batch
+            // opened), or the client waits forever.
+            ack_multiline_label(state, conn, label.as_deref());
+        }
     }
 }
 
@@ -1055,58 +1156,24 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
 pub(super) fn deliver_multiline(
     state: &mut ServerState,
     conn: ConnId,
-    batch: crate::core::state::MultilineBatch,
+    batch: crate::core::state::CompletedMultiline,
 ) {
-    // A batch closed with no lines in it is no message at all: refused like
-    // any other malformed batch, never answered with silence.
-    if batch.lines.is_empty() {
-        return multiline_batch_fail(
-            state,
-            conn,
-            batch.label,
-            "MULTILINE_INVALID",
-            &[],
-            "Empty batch",
-        );
-    }
-    // Only blank lines: a blank line is a line break, not text, so a message
-    // made only of them has no text in it -- exactly what ERR_NOTEXTTOSEND
-    // refuses for a PRIVMSG, and what recipients without `draft/multiline`
-    // would be sent: nothing. Stored instead, it became a history row that
-    // replays as no line at all, so a page of N rows reached such a client as
-    // fewer than N messages and read as the end of the buffer.
-    if batch.lines.iter().all(|(text, _)| text.is_empty()) {
-        if batch.kind.is_some_and(crate::core::MessageKind::is_loud) {
-            state.numeric(conn, ERR_NOTEXTTOSEND, &[], Some("No text to send"));
-        }
-        // The opening BATCH was labeled, so that command still owes a response
-        // (the framer was told not to ACK it when the batch opened), or the
-        // client waits forever.
-        ack_multiline_label(state, conn, batch.label.as_deref());
-        return;
-    }
-    // A non-empty batch always carries the kind `multiline_collect` set from its
-    // first line (and enforced identical across every line). `None` here would be
-    // a collector logic bug, not client input — so surface it rather than silently
-    // defaulting to PRIVMSG (which could deliver a NOTICE batch as PRIVMSG).
-    let kind = batch
-        .kind
-        .expect("a non-empty multiline batch has a kind (set by multiline_collect)");
+    let kind = batch.kind();
     let loud = kind.is_loud();
     // Permission checks see the whole message, so a CTCP or a ban cannot be
     // slipped past them by splitting it across lines.
     let Some(resolved) = resolve_message_target(
         state,
         conn,
-        &batch.target,
-        multiline_carries_blocked_ctcp(&batch.lines),
+        batch.target(),
+        multiline_carries_blocked_ctcp(batch.lines()),
         loud,
     ) else {
         // Refused (ban, +m, vanished channel, …): the refusal numeric was just
         // sent, but the *opening* BATCH's label is still owed a response — no
         // echo copy will ever carry it. Resolve it with an ACK, mirroring the
         // guarantee multiline_fail gives the collection-time failures.
-        ack_multiline_label(state, conn, batch.label.as_deref());
+        ack_multiline_label(state, conn, batch.label());
         return;
     };
     let prefix = state.sessions[&conn].prefix();
@@ -1117,9 +1184,9 @@ pub(super) fn deliver_multiline(
     let message = MultilineMessage {
         prefix: &prefix,
         kind,
-        target: &batch.target,
-        lines: &batch.lines,
-        client_tags: &batch.client_tags,
+        target: &resolved.canonical,
+        lines: batch.lines(),
+        client_tags: batch.client_tags(),
         msgid: &msgid,
         ts,
         account: sender_account.as_deref(),
@@ -1143,7 +1210,7 @@ pub(super) fn deliver_multiline(
             batch_ref: &batch_ref,
             outer_batch: None,
             // Only the sender's own copy is the labeled response to its command.
-            label: batch.label.as_deref().filter(|_| !bypass),
+            label: batch.label().filter(|_| !bypass),
             server: &server,
         };
         for line in render_multiline(&message, &framing) {
@@ -1158,7 +1225,7 @@ pub(super) fn deliver_multiline(
     // the deferred batch). Mirrors the guarantee multiline_fail gives the failure
     // path.
     if !echo_message {
-        ack_multiline_label(state, conn, batch.label.as_deref());
+        ack_multiline_label(state, conn, batch.label());
     }
 
     // Away auto-reply, PRIVMSG only — same as the single-line path (a multiline
@@ -1226,17 +1293,16 @@ pub(super) fn multiline_on_owner(
     message: crate::core::state::ChannelMultiline,
 ) -> crate::core::state::ChannelMultilineResult {
     let (owner, actor, batch) = message.into_parts();
-    let kind = batch
-        .kind
-        .expect("completed non-empty multiline has a kind");
-    let (status, channel_target) = StatusSigil::split(&batch.target);
+    let kind = batch.kind();
+    let (status, channel_target) = StatusSigil::split(batch.target());
     let key = state.chan_key(channel_target);
     assert_eq!(owner.key(), &key, "multiline owner does not match target");
     let Some(channel) = state.channels.get(&key) else {
+        let (target, label) = batch.into_target_and_label();
         return crate::core::state::ChannelMultilineResult::NoSuchChannel {
-            target: batch.target,
+            target,
             loud: kind.is_loud(),
-            label: batch.label,
+            label,
         };
     };
     if let Some(why) = speak_refusal(
@@ -1245,27 +1311,29 @@ pub(super) fn multiline_on_owner(
         state.casemap,
         &actor.mask_subject(),
         status,
-        multiline_carries_blocked_ctcp(&batch.lines),
+        multiline_carries_blocked_ctcp(batch.lines()),
     ) {
+        let (target, label) = batch.into_target_and_label();
         return crate::core::state::ChannelMultilineResult::CannotSend {
-            target: batch.target,
+            target,
             why,
             loud: kind.is_loud(),
-            label: batch.label,
+            label,
         };
     }
     let recipients = channel.recipients_where(|member, modes| {
         member != actor.recipient.conn() && status.is_none_or(|sig| sig.admits(modes))
     });
+    let canonical = CanonicalTarget::channel(status, &channel.name);
     let (ts, msgid) = state.stamp();
     let batch_ref = state.next_msgid();
     let server = state.config.server_name.clone();
     let message = MultilineMessage {
         prefix: &actor.identity.prefix,
         kind,
-        target: &batch.target,
-        lines: &batch.lines,
-        client_tags: &batch.client_tags,
+        target: &canonical,
+        lines: batch.lines(),
+        client_tags: batch.client_tags(),
         msgid: &msgid,
         ts,
         account: actor.account.as_deref(),
@@ -1292,7 +1360,7 @@ pub(super) fn multiline_on_owner(
         }
     }
     let echo = if actor.recipient.caps().echo_message {
-        render(actor.recipient.caps(), batch.label.as_deref())
+        render(actor.recipient.caps(), batch.label())
     } else {
         Vec::new()
     };
@@ -1302,7 +1370,7 @@ pub(super) fn multiline_on_owner(
     }
     crate::core::state::ChannelMultilineResult::Delivered {
         echo,
-        label: batch.label,
+        label: batch.into_target_and_label().1,
     }
 }
 
@@ -1358,7 +1426,7 @@ fn multiline_history_entry(message: &MultilineMessage) -> crate::core::state::Hi
 pub(super) struct MultilineMessage<'a> {
     pub(super) prefix: &'a str,
     pub(super) kind: crate::core::MessageKind,
-    pub(super) target: &'a str,
+    pub(super) target: &'a CanonicalTarget,
     pub(super) lines: &'a [(String, bool)],
     /// The client-only tags the batch was opened with, as relayed.
     pub(super) client_tags: &'a str,
@@ -1755,7 +1823,7 @@ mod tests {
         let message = super::MultilineMessage {
             prefix: "alice!a@host",
             kind: crate::core::MessageKind::Privmsg,
-            target: "#m",
+            target: &super::CanonicalTarget::replayed("#m"),
             lines: &lines,
             client_tags: "",
             msgid: "id",

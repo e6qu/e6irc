@@ -22,7 +22,7 @@ pub(super) fn markread_fail(
 pub(super) fn send_current_markread(
     state: &mut ServerState,
     conn: ConnId,
-    key: &ChanKey,
+    key: &crate::core::state::MarkerTarget,
     display: &str,
 ) {
     let account = state.sessions[&conn].account().map(str::to_owned);
@@ -48,39 +48,34 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let Some(&target) = p.first() else {
+    // The parameters are parsed by the parser the bouncer's MARKREAD shares,
+    // so the two surfaces refuse a malformed request alike. The target is
+    // validated before the query/set split so the query form cannot reflect a
+    // client-sized invalid token into an overlong server line, and cannot
+    // query names the set form would reject.
+    let nicklen = state.config.nicklen;
+    let request = crate::core::history_request::parse_markread(p, |target| {
+        crate::sanitize::valid_channel_name(target) || crate::sanitize::valid_nick(target, nicklen)
+    });
+    let (target, new_ms) = match request {
+        Ok(crate::core::history_request::MarkreadRequest::Query { target }) => (target, None),
+        Ok(crate::core::history_request::MarkreadRequest::Set { target, marker }) => {
+            (target, Some(marker))
+        }
         // MARKREAD is an IRCv3 command: errors are `FAIL`, not legacy numerics.
-        markread_fail(
-            state,
-            conn,
-            "*",
-            HistoryFail::NeedMoreParams,
-            "Not enough parameters",
-        );
-        return;
+        Err((target, refusal)) => {
+            return markread_fail(state, conn, target, refusal.code, refusal.detail);
+        }
     };
-    // Both forms echo the target. Validate before the query/set split so the
-    // query form cannot reflect a client-sized invalid token into an overlong
-    // server line, and cannot query names the set form would reject.
-    if !crate::sanitize::valid_channel_name(target)
-        && !crate::sanitize::valid_nick(target, state.config.nicklen)
-    {
-        markread_fail(
-            state,
-            conn,
-            target,
-            HistoryFail::InvalidParams,
-            "Invalid target",
-        );
-        return;
-    }
     // A logged-in client's markers are account-keyed (shared across the
     // account's connections and persisted); a client that isn't logged in gets
     // per-connection markers (the connection *is* the client), kept in the
     // session and lost on disconnect. Either way MARKREAD works — the spec ties
-    // markers to the client, not strictly to an account.
+    // markers to the client, not strictly to an account. A correspondent is
+    // named by the identity their conversation is keyed by, so the marker
+    // survives their nick change as the conversation does.
     let account = state.sessions[&conn].account().map(str::to_owned);
-    let key = state.chan_key(target);
+    let key = state.marker_target(target);
     let server = state.config.server_name.clone();
     let marker_pending = account.as_ref().is_some_and(|account| {
         state.read_marker_pending(&(state.account_key(account), key.clone()))
@@ -88,7 +83,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let output_held = state.sessions[&conn].deferred_replies > 0;
 
     // Query form: MARKREAD <target>
-    let Some(&arg) = p.get(1) else {
+    let Some(new_ms) = new_ms else {
         // A query whose output is held while this target has an update pending
         // cannot precompute the old value: it could be released after the new
         // value and appear to move the marker backwards.
@@ -106,29 +101,6 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
 
-    // Set form: MARKREAD <target> timestamp=<iso>
-    let Some(ts) = arg.strip_prefix("timestamp=") else {
-        markread_fail(
-            state,
-            conn,
-            target,
-            HistoryFail::InvalidParams,
-            "Expected timestamp=",
-        );
-        return;
-    };
-    // Millisecond precision: a marker must round-trip its `.mmm` fraction, so
-    // parse to millis (not seconds) and store that.
-    let Some(new_ms) = e6irc_proto::time::parse_server_time_millis(ts) else {
-        markread_fail(
-            state,
-            conn,
-            target,
-            HistoryFail::InvalidParams,
-            "Malformed timestamp",
-        );
-        return;
-    };
     let Some(account) = account else {
         // Not logged in: session-local marker, capped, monotonic, replied only
         // to this connection (there are no sibling connections to sync).
@@ -226,8 +198,21 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.defer_captured_reply(conn);
 }
 
+/// The in-core key of the marker a database request or broadcast names by its
+/// stored `target` (a [`crate::core::state::MarkerTarget`] already).
+fn stored_marker_key(
+    state: &ServerState,
+    account: &str,
+    target: &str,
+) -> crate::core::state::MarkerKey {
+    (
+        state.account_key(account),
+        crate::core::state::MarkerTarget::stored(target.to_string()),
+    )
+}
+
 fn release_pending_marker(state: &mut ServerState, account: &str, target: &str) {
-    let key = (state.account_key(account), state.chan_key(target));
+    let key = stored_marker_key(state, account, target);
     if state.release_read_marker(&key).is_err() {
         eprintln!("core: invariant violation: read-marker DB reply without a pending reservation");
     }
@@ -243,7 +228,7 @@ pub(super) fn read_marker_stored(
     label: Option<String>,
 ) {
     release_pending_marker(state, &account, &target);
-    let marker_key = (state.account_key(&account), state.chan_key(&target));
+    let marker_key = stored_marker_key(state, &account, &target);
     let moved_forward = state
         .store_read_marker(marker_key, marker_ms)
         .is_none_or(|previous| marker_ms > previous);
@@ -285,7 +270,7 @@ pub(crate) fn apply_stored_marker(
     display: &str,
     marker_ms: e6irc_proto::time::Millis,
 ) {
-    let key = (state.account_key(account), state.chan_key(target));
+    let key = stored_marker_key(state, account, target);
     if state
         .read_marker(&key)
         .is_some_and(|current| current >= marker_ms)

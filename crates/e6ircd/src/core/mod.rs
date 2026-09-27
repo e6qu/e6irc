@@ -10,6 +10,7 @@
 
 mod banmask;
 mod handler;
+pub(crate) mod history_request;
 mod hot_history;
 pub(crate) mod line_meter;
 mod list;
@@ -43,6 +44,7 @@ use bytes::Bytes;
 #[cfg(test)]
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
+pub(crate) use state::HistoryRetention;
 use state::{
     ChanKey, ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
     ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
@@ -269,6 +271,18 @@ impl CoreIngress {
 
     pub(crate) async fn broadcast_shutdown(&self) -> Result<(), ()> {
         self.broadcast(|| Input::Shutdown).await
+    }
+
+    /// Apply history retention (`storage.history_retention_days`) to what the
+    /// core and the bouncer serve from memory, from now on: every shard and
+    /// every network reads the one cell this sets.
+    pub(crate) fn set_history_retention_days(&self, days: u64) {
+        self.directories.history_retention.set_days(days);
+    }
+
+    /// The history retention cell, for the bouncer's backlogs.
+    pub(crate) fn history_retention(&self) -> HistoryRetention {
+        self.directories.history_retention.clone()
     }
 
     pub(crate) async fn broadcast_read_markers_expired(
@@ -602,7 +616,8 @@ impl std::fmt::Display for ConnectionIdExhausted {
 impl std::error::Error for ConnectionIdExhausted {}
 
 /// One stored read marker that storage maintenance deleted: the account's
-/// display name as stored, the folded target, and the value deleted.
+/// display name as stored, the target as kept (a `MarkerTarget`), and the
+/// value deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredReadMarker {
     pub account: String,
@@ -1683,7 +1698,8 @@ pub enum DbRequest {
     SetReadMarker {
         conn: ConnId,
         account: String,
-        /// Casefolded target.
+        /// What the marker is kept under: a `MarkerTarget` (a channel's folded
+        /// name, or a correspondent's identity).
         target: String,
         /// Validated target spelling from the command, for the reply.
         display: String,
@@ -1922,6 +1938,11 @@ impl HistoryFloor {
             Self::Whole => true,
             Self::Since(since) => ts >= since,
         }
+    }
+
+    /// This floor, or `cutoff` where that is later.
+    pub(crate) fn at_least(self, cutoff: e6irc_proto::time::Millis) -> Self {
+        Self::Since(self.millis().max(cutoff))
     }
 
     /// The bound as the millisecond value the history queries compare `ts`
@@ -3535,6 +3556,126 @@ impl SessionOutput {
 
 pub(crate) struct SendqExceeded;
 
+/// Fuzzing-only access to the hot history ring and the CHATHISTORY window
+/// arithmetic over it, for the `chathistory_window` target.
+///
+/// Compiled *only* under cargo-fuzz's `--cfg fuzzing` (never in a normal build,
+/// `cargo test`, or the shipped binary), so it does not widen the crate's real
+/// public surface.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    use e6irc_proto::time::Millis;
+
+    use super::hot_history::{HotHistory, HotHistoryBounds};
+    use super::state::HistoryKey;
+
+    /// One message entering a ring: when it was stamped, whether it is a
+    /// TAGMSG, and how many bytes of client-only tags it carries.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Arrival {
+        pub ts: u64,
+        pub tagmsg: bool,
+        pub tag_bytes: u16,
+    }
+
+    /// A ring after its arrivals: `(msgid, ts)` oldest first — the msgid is
+    /// `m<arrival index>` — whether it is the whole record, and its newest
+    /// timestamp in the text scope and in the text-and-tags scope.
+    #[derive(Debug, Clone)]
+    pub struct Ring {
+        pub entries: Vec<(String, u64)>,
+        pub complete: bool,
+        pub latest_text: Option<u64>,
+        pub latest_all: Option<u64>,
+        held: Vec<super::HistoryRow>,
+    }
+
+    /// The bytes one entry of `arrival` holds in a ring.
+    pub fn footprint(arrival: Arrival) -> usize {
+        super::hot_history::footprint(&entry(0, arrival))
+    }
+
+    fn entry(index: usize, arrival: Arrival) -> super::HistoryRow {
+        super::HistoryRow {
+            msgid: format!("m{index}"),
+            ts: Millis::from_millis(arrival.ts),
+            sender_prefix: "n!u@h".into(),
+            sender_account: None,
+            kind: if arrival.tagmsg {
+                super::HistoryKind::Tagmsg
+            } else {
+                super::HistoryKind::Privmsg
+            },
+            body: String::new(),
+            sender_is_bot: false,
+            multiline: None,
+            client_tags: "t".repeat(usize::from(arrival.tag_bytes)),
+        }
+    }
+
+    /// Push `arrivals` in order into one ring bounded to `ring_bytes`.
+    pub fn ring_after(arrivals: &[Arrival], ring_bytes: usize) -> Ring {
+        let mut history = HotHistory::default();
+        let key = HistoryKey::channel_for_test("#fuzz");
+        let bounds = HotHistoryBounds {
+            rings: 1,
+            ring_bytes,
+            bytes: usize::MAX,
+        };
+        for (index, arrival) in arrivals.iter().enumerate() {
+            history.push(&key, entry(index, *arrival), true, bounds);
+        }
+        let Some(ring) = history.get(&key) else {
+            return Ring {
+                entries: Vec::new(),
+                complete: true,
+                latest_text: None,
+                latest_all: None,
+                held: Vec::new(),
+            };
+        };
+        let latest = ring.latest();
+        Ring {
+            entries: ring
+                .entries()
+                .iter()
+                .map(|entry| (entry.msgid.clone(), entry.ts.as_millis()))
+                .collect(),
+            complete: ring.complete(),
+            latest_text: latest
+                .in_scope(super::HistoryScope::Text)
+                .map(Millis::as_millis),
+            latest_all: latest
+                .in_scope(super::HistoryScope::TextAndTags)
+                .map(Millis::as_millis),
+            held: ring.entries().iter().cloned().collect(),
+        }
+    }
+
+    /// Resolve `CHATHISTORY <sub> <target> <first> [<second>] <limit>` against
+    /// `ring` as the core does: the msgids of the page and whether the ring
+    /// covered it. `None` when the request is malformed.
+    pub fn window(
+        ring: &Ring,
+        sub: &str,
+        first: &str,
+        second: &str,
+        limit: usize,
+    ) -> Option<(Vec<String>, bool)> {
+        let sub = super::history_request::ChathistorySub::parse(sub)?;
+        let (first, second) = super::history_request::parse_selectors(sub, first, second).ok()?;
+        let (page, covered) = super::handler::resolve_ring_window(
+            &ring.held,
+            ring.complete,
+            sub,
+            &first,
+            &second,
+            limit,
+        );
+        Some((page.into_iter().map(|entry| entry.msgid).collect(), covered))
+    }
+}
+
 #[cfg(test)]
 mod wire_line_tests {
     use super::{Bytes, WireLine};
@@ -4481,6 +4622,8 @@ mod ingress_tests {
         outputs: std::collections::HashMap<u64, Receiver<Output>>,
         /// Each shard's requests to the database worker (there is none).
         database: Vec<Receiver<super::DbRequest>>,
+        /// What the server outside the core hands it live: history retention.
+        ingress: CoreIngress,
     }
 
     impl Shards {
@@ -4550,6 +4693,7 @@ mod ingress_tests {
                 cores,
                 outputs: std::collections::HashMap::new(),
                 database: requests,
+                ingress,
             }
         }
 
@@ -5031,6 +5175,255 @@ mod ingress_tests {
                 Some(super::DbRequest::QueryHistory { .. })
             ),
             "the channel's owner did not ask the database"
+        );
+    }
+
+    /// Set the shards' clock to `ms` past its origin — backwards too, as a
+    /// stepped wall clock does.
+    fn set_clock_ms(ms: u64) {
+        MONO_NOW.with(|now| now.set(ms));
+    }
+
+    /// `timestamp=` of the shards' wall clock at `ms` past its origin.
+    fn at(ms: u64) -> String {
+        let wall = e6irc_proto::time::Millis::from_millis(1_000_000 + ms);
+        format!("timestamp={}", e6irc_proto::time::server_time(wall))
+    }
+
+    /// The texts of the messages a CHATHISTORY answer replayed, in order.
+    fn replayed(out: &[String]) -> Vec<String> {
+        out.iter()
+            .filter(|line| line.contains(" PRIVMSG "))
+            .map(|line| line.rsplit_once(" :").expect("a text").1.to_string())
+            .collect()
+    }
+
+    /// A batch of only blank lines to a channel another shard owns is refused
+    /// on the sender's shard, as it is to one this shard owns: it is never
+    /// routed, delivered, or stored.
+    #[test]
+    fn an_all_blank_multiline_batch_to_another_shards_channel_has_no_text_to_send() {
+        let caps = "batch draft/multiline message-tags echo-message labeled-response \
+                    draft/chathistory";
+        let mut shards = alice_and_bob(caps);
+        let there = shards.owned[1];
+        assert_ne!(shards.shard_of(2), 1, "alice's session is not the owner's");
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(2);
+        shards.drain(1);
+        shards.line(2, &format!("@label=blank BATCH +7 draft/multiline {there}"));
+        shards.line(2, &format!("@batch=7 PRIVMSG {there} :"));
+        shards.line(2, &format!("@batch=7 PRIVMSG {there} :"));
+        shards.line(2, "BATCH -7");
+        let sender = shards.drain(2);
+        assert_eq!(lines_with(&sender, " 412 ").len(), 1, "{sender:#?}");
+        assert!(
+            sender.iter().any(|line| line.contains("@label=blank")),
+            "the opening BATCH's label went unanswered: {sender:#?}"
+        );
+        assert!(lines_with(&sender, " PRIVMSG ").is_empty(), "{sender:#?}");
+        let recipient = shards.drain(1);
+        assert!(recipient.is_empty(), "{recipient:#?}");
+        shards.line(1, &format!("CHATHISTORY LATEST {there} * 10"));
+        let history = shards.drain(1);
+        assert!(replayed(&history).is_empty(), "stored: {history:#?}");
+    }
+
+    /// A wall clock stepped back leaves a message stamped earlier arriving
+    /// after one stamped later. The ring keeps them in time order, so every
+    /// window is cut where the database would cut it.
+    #[test]
+    fn a_ring_pages_by_time_when_a_stepped_clock_delivers_out_of_order() {
+        let mut shards = alice_and_bob("batch draft/chathistory server-time message-tags");
+        let there = shards.owned[1];
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        set_clock_ms(1_001);
+        shards.line(2, &format!("PRIVMSG {there} :x"));
+        set_clock_ms(1_000);
+        shards.line(2, &format!("PRIVMSG {there} :a"));
+        shards.drain(1);
+        let mut page = |request: String| {
+            shards.line(1, &format!("CHATHISTORY {request}"));
+            replayed(&shards.drain(1))
+        };
+        assert_eq!(page(format!("LATEST {there} * 10")), ["a", "x"]);
+        assert_eq!(page(format!("BEFORE {there} {} 10", at(1_001))), ["a"]);
+        assert!(page(format!("AFTER {there} {} 10", at(1_000))) == ["x"]);
+        assert_eq!(
+            page(format!("BETWEEN {there} {} {} 10", at(999), at(1_002))),
+            ["a", "x"]
+        );
+        assert_eq!(
+            page(format!("BETWEEN {there} {} {} 1", at(1_002), at(999))),
+            ["x"],
+            "newest first from the newer bound"
+        );
+        assert_eq!(page(format!("AROUND {there} {} 2", at(1_001))), ["a", "x"]);
+    }
+
+    /// A direct message stamped on the sender's shard reaches the peer's
+    /// shard after a later one the peer sent there. The peer's copy of the
+    /// conversation keeps them in time order all the same.
+    #[test]
+    fn a_conversation_entry_from_another_shard_takes_its_place_in_time() {
+        let mut shards = alice_and_bob("batch draft/chathistory server-time");
+        set_clock_ms(2_000);
+        shards.push_line(2, "PRIVMSG bob :early");
+        set_clock_ms(2_001);
+        shards.push_line(1, "PRIVMSG alice :late");
+        shards.settle();
+        shards.drain(1);
+        shards.line(1, "CHATHISTORY LATEST alice * 10");
+        assert_eq!(replayed(&shards.drain(1)), ["early", "late"]);
+        shards.line(1, &format!("CHATHISTORY BEFORE alice {} 10", at(2_001)));
+        assert_eq!(replayed(&shards.drain(1)), ["early"]);
+        shards.line(1, &format!("CHATHISTORY AFTER alice {} 10", at(2_000)));
+        assert_eq!(replayed(&shards.drain(1)), ["late"]);
+    }
+
+    /// History retention bounds what the rings serve as it bounds what the
+    /// database keeps, and a change of it applies at once, without a restart:
+    /// a message older than it is in no page and dates no TARGETS buffer.
+    #[test]
+    fn rings_do_not_serve_history_older_than_retention() {
+        let caps = "batch draft/chathistory server-time";
+        let mut shards = alice_and_bob(caps);
+        let there = shards.owned[1];
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        set_clock_ms(0);
+        shards.line(2, &format!("PRIVMSG {there} :stale"));
+        shards.line(2, "PRIVMSG bob :stale secret");
+        let day = 24 * 60 * 60 * 1000;
+        set_clock_ms(3 * day);
+        shards.line(2, &format!("PRIVMSG {there} :fresh"));
+        shards.drain(1);
+        let page = |shards: &mut Shards, request: String| {
+            shards.line(1, &format!("CHATHISTORY {request}"));
+            replayed(&shards.drain(1))
+        };
+        let latest = format!("LATEST {there} * 10");
+        assert_eq!(page(&mut shards, latest.clone()), ["stale", "fresh"]);
+
+        shards.ingress.set_history_retention_days(1);
+        assert_eq!(page(&mut shards, latest), ["fresh"]);
+        assert_eq!(
+            page(
+                &mut shards,
+                format!("BEFORE {there} {} 10", at(3 * day + 1))
+            ),
+            ["fresh"]
+        );
+        assert_eq!(
+            page(&mut shards, format!("AROUND {there} {} 10", at(0))),
+            ["fresh"]
+        );
+        assert!(page(&mut shards, "LATEST alice * 10".into()).is_empty());
+        shards.line(
+            1,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        let targets = shards.drain(1);
+        assert_eq!(
+            lines_with(&targets, "CHATHISTORY TARGETS ").len(),
+            1,
+            "only the channel has history left: {targets:#?}"
+        );
+    }
+
+    /// TARGETS names a channel another shard owns as the channel is named,
+    /// not by the folded key the database answers with.
+    #[test]
+    fn targets_names_another_shards_channel_by_its_display_name() {
+        let mut shards = Shards::with_database();
+        shards.client(2, "alice", "batch draft/chathistory server-time");
+        let channel = ["#Foo[x]", "#Bar[x]", "#Baz[x]", "#Qux[x]", "#Quux[x]"]
+            .into_iter()
+            .find(|name| shards.cores[0].state.channel_owner(name).shard() != CoreShardId(0))
+            .expect("a channel shard 1 owns");
+        assert_eq!(shards.shard_of(2), 0);
+        shards.line(2, &format!("JOIN {channel}"));
+        shards.drain(2);
+        shards.line(
+            2,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        let (batch_ref, caps, folded) = shards.database_request(0, |request| match request {
+            super::DbRequest::QueryTargets {
+                batch_ref,
+                caps,
+                channels,
+                ..
+            } => Some((batch_ref, caps, channels[0].0.clone())),
+            _ => None,
+        });
+        assert_ne!(folded, channel, "the database is asked by the folded key");
+        shards.cores[0].handle(Input::TargetsPage {
+            conn: ConnId(2),
+            batch_ref,
+            caps,
+            targets: Ok(vec![(
+                folded,
+                e6irc_proto::time::Millis::from_millis(1_000_000),
+            )]),
+            label: None,
+        });
+        shards.settle();
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, &format!("CHATHISTORY TARGETS {channel} ")).len(),
+            1,
+            "{out:#?}"
+        );
+    }
+
+    /// A message relayed by the channel's owner names the channel as the
+    /// channel is named, as the sender's own shard does (Solanum parity), and
+    /// its replay is the same line.
+    #[test]
+    fn a_message_to_another_shards_channel_names_it_canonically() {
+        let caps = "batch draft/chathistory server-time message-tags echo-message";
+        let mut shards = alice_and_bob(caps);
+        let there = shards.owned[1];
+        for conn in [1, 2] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(1);
+        shards.drain(2);
+        let shouted = there.to_ascii_uppercase();
+        shards.line(2, &format!("PRIVMSG {shouted} :hi"));
+        let live = shards.drain(1);
+        let echo = shards.drain(2);
+        let wanted = format!(" PRIVMSG {there} :hi");
+        let [live_line] = lines_with(&live, &wanted)[..] else {
+            panic!("the recipient's copy names the channel canonically: {live:#?}");
+        };
+        assert_eq!(lines_with(&echo, &wanted).len(), 1, "{echo:#?}");
+        shards.line(1, &format!("CHATHISTORY LATEST {there} * 1"));
+        let history = shards.drain(1);
+        let [replay] = lines_with(&history, &wanted)[..] else {
+            panic!("one replayed message: {history:#?}");
+        };
+        let without_batch = replay
+            .strip_prefix("@batch=")
+            .and_then(|rest| rest.split_once(';'))
+            .map(|(_, rest)| format!("@{rest}"))
+            .expect("a batch tag");
+        assert_eq!(
+            without_batch, live_line,
+            "replay is the line delivered live"
+        );
+        shards.line(2, &format!("TAGMSG {shouted}"));
+        assert_eq!(
+            lines_with(&shards.drain(1), &format!(" TAGMSG {there}")).len(),
+            1
         );
     }
 

@@ -43,6 +43,37 @@ impl ChanKey {
     }
 }
 
+/// What a read marker is kept under: a channel's casefolded name, or the
+/// *identity* of a direct-message correspondent — the one a conversation with
+/// them is keyed by (DESIGN §11.1.1): their account when they have one, so the
+/// marker follows them across a nick change the way the conversation does, and
+/// `~nick` when they have not authenticated, as the conversation is. Built by
+/// [`ServerState::marker_target`] from a name a client gave, from a channel's
+/// key, or from what the store already holds (`MarkerTarget::stored`), so a
+/// correspondent's nick can never key one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkerTarget(String);
+
+impl MarkerTarget {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A key the store holds, written from [`MarkerTarget::as_str`].
+    pub(crate) fn stored(key: String) -> Self {
+        Self(key)
+    }
+}
+
+impl From<&ChanKey> for MarkerTarget {
+    fn from(key: &ChanKey) -> Self {
+        Self(key.0.clone())
+    }
+}
+
+/// An account's read marker: whose, and on what.
+pub(crate) type MarkerKey = (AccountKey, MarkerTarget);
+
 /// Casefolded nick key; same rationale as [`ChanKey`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NickKey(String);
@@ -203,6 +234,12 @@ impl MembershipDirectory {
             channel.name.clone(),
             channel.latest_message.in_scope(scope)?,
         ))
+    }
+
+    /// A channel's display name, when it exists.
+    fn channel_name(&self, key: &ChanKey) -> Option<String> {
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        channels.get(key).map(|channel| channel.name.clone())
     }
 
     /// When a channel's current incarnation was created.
@@ -1233,6 +1270,39 @@ pub(crate) struct CoreDirectories {
     pub(crate) nick_registrations: NickRegistrationDirectory,
     /// Which connections their readers let past the line meter.
     pub(crate) flood_exemptions: crate::core::line_meter::FloodExemptions,
+    /// How long history is kept.
+    pub(crate) history_retention: HistoryRetention,
+}
+
+/// How long history is kept (`storage.history_retention_days`), for what is
+/// served from memory: the core's rings and the bouncer's backlogs. Storage
+/// maintenance deletes what is older from the database; a ring or a backlog
+/// holding it would otherwise go on serving it. One cell, shared by every
+/// shard and every bouncer network and set live when the setting changes, so
+/// no reader can hold a stale copy of it. Zero days — the value before any is
+/// set, and with no database, which is then the whole record — is no cutoff.
+#[derive(Clone, Default)]
+pub(crate) struct HistoryRetention(Arc<std::sync::atomic::AtomicU64>);
+
+impl HistoryRetention {
+    pub(crate) fn set_days(&self, days: u64) {
+        self.0.store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The oldest time still kept at `now`, or `None` when history does not
+    /// age out.
+    pub(crate) fn cutoff(
+        &self,
+        now: e6irc_proto::time::Millis,
+    ) -> Option<e6irc_proto::time::Millis> {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            days => Some(now.saturating_sub(e6irc_proto::time::Millis::from_millis(
+                days.saturating_mul(DAY_MS),
+            ))),
+        }
+    }
 }
 
 /// A validated command-flood bucket shape: `burst` tokens at most, refilling
@@ -1775,7 +1845,7 @@ pub(crate) struct Session {
     /// map on IDENTIFY/SASL: it was unattributable when set, and carrying it over
     /// would write a persisted marker the client never asked to associate with the
     /// account (same reason the DM-history identity key is not back-filled).
-    pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
+    pub anon_read_markers: HashMap<MarkerTarget, e6irc_proto::time::Millis>,
     /// Whether this connection's reader is told it is exempt from the line
     /// meter ([`crate::core::line_meter`]): what `oper` was when it was last
     /// published there.
@@ -3374,11 +3444,11 @@ pub enum SpeakRefusal {
 pub struct ChannelMultiline {
     owner: ChannelOwner,
     actor: ChannelActor,
-    batch: MultilineBatch,
+    batch: CompletedMultiline,
 }
 
 impl ChannelMultiline {
-    pub(crate) fn new(owner: ChannelOwner, actor: ChannelActor, batch: MultilineBatch) -> Self {
+    pub(crate) fn new(owner: ChannelOwner, actor: ChannelActor, batch: CompletedMultiline) -> Self {
         Self {
             owner,
             actor,
@@ -3392,7 +3462,7 @@ impl ChannelMultiline {
     pub(crate) fn actor(&self) -> &ChannelActor {
         &self.actor
     }
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, MultilineBatch) {
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, CompletedMultiline) {
         (self.owner, self.actor, self.batch)
     }
 }
@@ -3651,7 +3721,7 @@ impl HistoryKey {
         self.0.starts_with('#').then(|| ChanKey(self.0.clone()))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn channel_for_test(name: &str) -> Self {
         HistoryKey(name.to_string())
     }
@@ -3693,6 +3763,84 @@ pub(crate) struct MultilineBatch {
     /// PRIVMSG or NOTICE, taken from the first line; the batch is one message,
     /// so it cannot change kind partway through.
     pub kind: Option<crate::core::MessageKind>,
+}
+
+/// Why a closed [`MultilineBatch`] is no message at all.
+#[derive(Debug)]
+pub(crate) enum MultilineRefusal {
+    /// No line was sent in it: a malformed batch (`FAIL BATCH MULTILINE_INVALID`).
+    Empty,
+    /// Only blank lines: a blank line is a line break, not text, so the batch
+    /// has no text to send — what ERR_NOTEXTTOSEND refuses for a PRIVMSG.
+    /// `loud` is false for a NOTICE, which is refused silently.
+    NoText { loud: bool },
+}
+
+impl MultilineBatch {
+    /// Close the batch into the one message it carries, or say why it carries
+    /// none. The refusal travels with the label of the BATCH that opened it,
+    /// which is still owed an answer.
+    pub(crate) fn complete(self) -> Result<CompletedMultiline, (MultilineRefusal, Option<String>)> {
+        let Some(kind) = self.kind.filter(|_| !self.lines.is_empty()) else {
+            return Err((MultilineRefusal::Empty, self.label));
+        };
+        if self.lines.iter().all(|(text, _)| text.is_empty()) {
+            let loud = kind.is_loud();
+            return Err((MultilineRefusal::NoText { loud }, self.label));
+        }
+        Ok(CompletedMultiline {
+            target: self.target,
+            client_tags: self.client_tags,
+            label: self.label,
+            lines: self.lines,
+            kind,
+        })
+    }
+}
+
+/// A closed multiline batch that is a message: at least one line, at least one
+/// of them with text, and one kind. Only [`MultilineBatch::complete`] builds
+/// one, and delivery — on the sender's shard or on the channel's owner — takes
+/// nothing else, so a batch with nothing to send cannot be delivered or stored
+/// on either.
+#[derive(Debug)]
+pub(crate) struct CompletedMultiline {
+    target: String,
+    client_tags: String,
+    label: Option<String>,
+    lines: Vec<(String, bool)>,
+    kind: crate::core::MessageKind,
+}
+
+impl CompletedMultiline {
+    /// The target, as the client spelled it.
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Client-only tags from the opening BATCH.
+    pub(crate) fn client_tags(&self) -> &str {
+        &self.client_tags
+    }
+
+    /// The opening BATCH's labeled-response label.
+    pub(crate) fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// The lines, `(text, concatenate-with-previous)`, in the order sent.
+    pub(crate) fn lines(&self) -> &[(String, bool)] {
+        &self.lines
+    }
+
+    pub(crate) fn kind(&self) -> crate::core::MessageKind {
+        self.kind
+    }
+
+    /// The target and the label, for a refusal that answers the batch.
+    pub(crate) fn into_target_and_label(self) -> (String, Option<String>) {
+        (self.target, self.label)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4337,6 +4485,8 @@ pub(crate) struct ServerState {
     /// The line meter's exemptions, which this shard publishes for its own
     /// sessions ([`Self::sync_flood_exemption`]).
     flood_exemptions: crate::core::line_meter::FloodExemptions,
+    /// How long history is kept, shared with every shard and the bouncer.
+    history_retention: HistoryRetention,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
@@ -4370,11 +4520,11 @@ pub(crate) struct ServerState {
     /// methods (`store_read_marker`, `reserve_read_marker`,
     /// `release_read_marker`, `preload_read_markers`) so
     /// `read_marker_slots` can never drift from the maps.
-    read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
+    read_markers: HashMap<MarkerKey, e6irc_proto::time::Millis>,
     /// Number of database writes in flight for each account/target. A target
     /// is reserved here before its first durable write completes, so pipelined
     /// MARKREAD commands cannot evade the per-account distinct-target cap.
-    pending_read_markers: HashMap<(AccountKey, ChanKey), usize>,
+    pending_read_markers: HashMap<MarkerKey, usize>,
     /// Distinct targets each account holds a marker for, confirmed or
     /// pending — the operand of the per-account MARKREAD cap. Kept at every
     /// write so a MARKREAD costs a lookup, not a scan of every account's
@@ -5404,6 +5554,7 @@ impl ServerState {
             whowas: directories.whowas,
             census: directories.census,
             flood_exemptions: directories.flood_exemptions,
+            history_retention: directories.history_retention,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,
@@ -5636,21 +5787,18 @@ impl ServerState {
     }
 
     /// The confirmed read marker for `key`, if any.
-    pub(crate) fn read_marker(
-        &self,
-        key: &(AccountKey, ChanKey),
-    ) -> Option<e6irc_proto::time::Millis> {
+    pub(crate) fn read_marker(&self, key: &MarkerKey) -> Option<e6irc_proto::time::Millis> {
         self.read_markers.get(key).copied()
     }
 
     /// Whether a database write for `key` is in flight.
-    pub(crate) fn read_marker_pending(&self, key: &(AccountKey, ChanKey)) -> bool {
+    pub(crate) fn read_marker_pending(&self, key: &MarkerKey) -> bool {
         self.pending_read_markers.contains_key(key)
     }
 
     /// Whether `key` holds one of its account's marker slots: confirmed, or
     /// reserved by a write in flight.
-    pub(crate) fn read_marker_slot_held(&self, key: &(AccountKey, ChanKey)) -> bool {
+    pub(crate) fn read_marker_slot_held(&self, key: &MarkerKey) -> bool {
         self.read_markers.contains_key(key) || self.pending_read_markers.contains_key(key)
     }
 
@@ -5680,7 +5828,7 @@ impl ServerState {
     /// reported as already current so no caller fans it out.
     pub(crate) fn store_read_marker(
         &mut self,
-        key: (AccountKey, ChanKey),
+        key: MarkerKey,
         marker_ms: e6irc_proto::time::Millis,
     ) -> Option<e6irc_proto::time::Millis> {
         if self.account_deleted(&key.0) {
@@ -5695,7 +5843,7 @@ impl ServerState {
     }
 
     /// Reserve `key` for a database write now in flight.
-    pub(crate) fn reserve_read_marker(&mut self, key: (AccountKey, ChanKey)) {
+    pub(crate) fn reserve_read_marker(&mut self, key: MarkerKey) {
         let held = self.read_marker_slot_held(&key);
         *self.pending_read_markers.entry(key.clone()).or_default() += 1;
         if !held {
@@ -5707,7 +5855,7 @@ impl ServerState {
     /// reserved — a reply without a request, which the caller reports.
     pub(crate) fn release_read_marker(
         &mut self,
-        key: &(AccountKey, ChanKey),
+        key: &MarkerKey,
     ) -> Result<(), ReadMarkerNotReserved> {
         match self.pending_read_markers.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
@@ -5885,8 +6033,8 @@ impl ServerState {
     /// Seed the read-marker mirror from persisted `(account, target, millis)`
     /// rows at boot. The dump returns the display-cased account name, so it is
     /// folded here into an `AccountKey` — matching the key MARKREAD builds at
-    /// runtime. The stored target is already the casefolded `ChanKey` string (it
-    /// was written from `ChanKey::as_str`), so it is wrapped directly.
+    /// runtime. The stored target is already a [`MarkerTarget`] (it was written
+    /// from `MarkerTarget::as_str`), so it is wrapped directly.
     pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.read_markers.clear();
         // The slot count is rebuilt from what remains (writes still in flight)
@@ -5902,7 +6050,7 @@ impl ServerState {
         }
         for (account, target, ms) in rows {
             let account = self.account_key(&account);
-            self.store_read_marker((account, ChanKey(target)), ms);
+            self.store_read_marker((account, MarkerTarget(target)), ms);
         }
     }
 
@@ -5914,7 +6062,7 @@ impl ServerState {
         for marker in markers {
             let key = (
                 self.account_key(&marker.account),
-                ChanKey(marker.target.clone()),
+                MarkerTarget(marker.target.clone()),
             );
             let std::collections::hash_map::Entry::Occupied(entry) = self.read_markers.entry(key)
             else {
@@ -5967,7 +6115,7 @@ impl ServerState {
     fn forget_account_read_markers(&mut self, account: &str) {
         let account = self.account_key(account);
         self.deleted_accounts.insert(account.clone());
-        let forgotten: Vec<(AccountKey, ChanKey)> = self
+        let forgotten: Vec<MarkerKey> = self
             .read_markers
             .keys()
             .filter(|(holder, _)| *holder == account)
@@ -6127,12 +6275,23 @@ impl ServerState {
         self.memberships.channel_activity(key, scope)
     }
 
+    /// Channel `key`'s display name, wherever it lives: this shard's own
+    /// channel, or the record its owner published. `None` when no such
+    /// channel exists.
+    pub(crate) fn channel_display_name(&self, key: &ChanKey) -> Option<String> {
+        match self.channels.get(key) {
+            Some(channel) => Some(channel.name.clone()),
+            None => self.memberships.channel_name(key),
+        }
+    }
+
     /// The oldest history of channel `key` that `account` may read, or `None`
     /// when no such channel exists: the founder and access list of a
     /// registered channel keep its whole record (the rule REST applies), and
     /// everyone else sees only the current incarnation, created when the
     /// channel last came into being. The owner's live channel answers when
-    /// this shard owns it, the published record when another shard does.
+    /// this shard owns it, the published record when another shard does. Nor
+    /// does anyone read past history retention ([`Self::retained`]).
     pub(crate) fn channel_history_floor(
         &self,
         key: &ChanKey,
@@ -6149,11 +6308,28 @@ impl ServerState {
                     .access_flags(key, &self.account_key(account))
                     .is_some()
         });
-        Some(if keeps_whole_record {
+        Some(self.retained(if keeps_whole_record {
             crate::core::HistoryFloor::Whole
         } else {
             crate::core::HistoryFloor::Since(created_at)
-        })
+        }))
+    }
+
+    /// The oldest history of a conversation its participant may read: the
+    /// whole of it, up to history retention.
+    pub(crate) fn conversation_history_floor(&self) -> crate::core::HistoryFloor {
+        self.retained(crate::core::HistoryFloor::Whole)
+    }
+
+    /// `floor`, raised to what history retention still keeps: storage
+    /// maintenance deletes older rows, and a ring still holding them must not
+    /// serve them either. The one place a history floor meets retention, so
+    /// every read the core answers — ring, database, TARGETS — stops at it.
+    fn retained(&self, floor: crate::core::HistoryFloor) -> crate::core::HistoryFloor {
+        match self.history_retention.cutoff((self.config.clock)()) {
+            Some(cutoff) => floor.at_least(cutoff),
+            None => floor,
+        }
     }
 
     /// The ring under `key` gained or lost entries. When it is a channel's,
@@ -6261,12 +6437,22 @@ impl ServerState {
 
     /// The identity behind a nick. An online nick resolves through its session
     /// (so an unauthenticated user resolves to their unclaimable `~` identity);
-    /// an offline one is taken to be an account name, which is what lets a
-    /// conversation with a registered user be read while they are away.
+    /// an offline one is taken to be an account's — the account it is grouped
+    /// to, or the account of that name — which is what lets a conversation with
+    /// a registered user be read while they are away, by any of their nicks.
     pub fn nick_identity(&self, nick: &str) -> String {
         match self.registered_user(&self.nick_key(nick)) {
             Some(user) => user.identity(self.casemap),
-            None => self.casemap.casefold(nick),
+            None => self.resolve_account_key(nick).as_str().to_string(),
+        }
+    }
+
+    /// What `target`'s read marker is kept under (see [`MarkerTarget`]): a
+    /// channel by its folded name, anyone else by their identity.
+    pub(crate) fn marker_target(&self, target: &str) -> MarkerTarget {
+        match self.chan_key_if_channel(target) {
+            Some(key) => MarkerTarget::from(&key),
+            None => MarkerTarget(self.nick_identity(target)),
         }
     }
 
@@ -7893,8 +8079,8 @@ mod session_store_tests {
                 .collect::<HashSet<_>>()
                 .len()
         }
-        fn key(state: &ServerState, account: &str, target: &str) -> (AccountKey, ChanKey) {
-            (state.account_key(account), state.chan_key(target))
+        fn key(state: &ServerState, account: &str, target: &str) -> MarkerKey {
+            (state.account_key(account), state.marker_target(target))
         }
         let ms = |n: u64| e6irc_proto::time::Millis::from_millis(n);
         let mut state = state();

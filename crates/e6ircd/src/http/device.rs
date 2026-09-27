@@ -1540,6 +1540,12 @@ pub(super) async fn admin_patch_configuration(
     .await
     {
         Ok(snapshot) => {
+            // History retention is live: what the core and the bouncer serve
+            // from memory stops at the new bound now, not when storage
+            // maintenance next runs.
+            state
+                .core_tx
+                .set_history_retention_days(snapshot.settings.storage.history_retention_days);
             *current = snapshot.clone();
             admin_json(ConfigurationPatchResponse {
                 revision: snapshot.revision,

@@ -4,122 +4,9 @@ use super::*;
 
 // ---- CHATHISTORY (draft/chathistory, hot ring) --------------------------
 
-/// Most messages one CHATHISTORY request may return. The single source for
-/// both the request validation below and the `CHATHISTORY=` ISUPPORT token, so
-/// what is advertised can never drift from what is enforced.
-pub(super) const CHATHISTORY_MAX: usize = 500;
-
-/// A CHATHISTORY message-reference selector, parsed *once* from the wire token.
-///
-/// This is the "parse, don't validate" boundary for CHATHISTORY windowing
-/// (DESIGN §2): the only way to obtain a `Selector` is [`Selector::parse`], which
-/// rejects an unknown reference type (→ INVALID_MSGREFTYPE) and a malformed
-/// `timestamp=` value (→ INVALID_PARAMS) up front. Every downstream site —
-/// ring resolution, the DB pivot, the covered-by-ring test — then consumes the
-/// typed value, so a `timestamp=` can never be re-parsed (it carries its
-/// [`Millis`](e6irc_proto::time::Millis) already) and a malformed one can never
-/// silently default to epoch 0, which the old string-threaded `selector_bound`
-/// did behind a comment-enforced "already validated" invariant.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Selector {
-    /// The open bound `*` — a real selector only for LATEST.
-    Star,
-    /// `msgid=<id>`: an exact message reference.
-    Msgid(String),
-    /// `timestamp=<t>`: a server-time bound, already parsed to milliseconds.
-    Timestamp(e6irc_proto::time::Millis),
-}
-
-/// Why a wire token is not a usable [`Selector`]; maps to the FAIL the client
-/// gets — the two distinct CHATHISTORY error codes for a bad reference.
-pub(super) enum SelectorError {
-    /// Not one of `*` / `msgid=` / `timestamp=` (→ INVALID_MSGREFTYPE).
-    UnknownRefType,
-    /// A `timestamp=` whose value is not a valid server-time (→ INVALID_PARAMS).
-    MalformedTimestamp,
-    /// A `msgid=` without a value, or whose value cannot be reused as an IRC
-    /// command parameter (→ INVALID_PARAMS).
-    MalformedMessageId,
-}
-
-impl Selector {
-    /// The message id this selector names, if it names one.
-    fn msgid(&self) -> Option<&str> {
-        match self {
-            Selector::Msgid(msgid) => Some(msgid),
-            Selector::Timestamp(_) | Selector::Star => None,
-        }
-    }
-
-    /// Parse a wire selector token. The single classification point for
-    /// `*` / `msgid=` / `timestamp=`; a malformed timestamp is a hard error
-    /// here rather than a silently-defaulted bound later.
-    pub(super) fn parse(sel: &str) -> Result<Self, SelectorError> {
-        if sel == "*" {
-            Ok(Selector::Star)
-        } else if let Some(id) = sel.strip_prefix("msgid=") {
-            e6irc_proto::message::valid_message_id(id)
-                .then(|| Selector::Msgid(id.to_string()))
-                .ok_or(SelectorError::MalformedMessageId)
-        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
-            e6irc_proto::time::parse_server_time_millis(ts)
-                .map(Selector::Timestamp)
-                .ok_or(SelectorError::MalformedTimestamp)
-        } else {
-            Err(SelectorError::UnknownRefType)
-        }
-    }
-
-    /// Whether this is the open bound `*`.
-    pub(super) fn is_star(&self) -> bool {
-        matches!(self, Selector::Star)
-    }
-}
-
-/// A CHATHISTORY subcommand, parsed once from the wire token. Threading this
-/// typed value (rather than re-matching the `&str` in two places) means the ring
-/// resolver and the DB query builder can no longer enumerate the subcommands
-/// differently — the exact ring-vs-DB divergence a prior sweep had to fix for a
-/// `msgid=` pivot (see `BetweenSelectors`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ChathistorySub {
-    Latest,
-    Before,
-    After,
-    Around,
-    Between,
-}
-
-impl ChathistorySub {
-    /// Parse a subcommand token (case-insensitive). `None` is an unknown
-    /// subcommand (→ UNKNOWN_COMMAND).
-    pub(super) fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_uppercase().as_str() {
-            "LATEST" => Some(Self::Latest),
-            "BEFORE" => Some(Self::Before),
-            "AFTER" => Some(Self::After),
-            "AROUND" => Some(Self::Around),
-            "BETWEEN" => Some(Self::Between),
-            _ => None,
-        }
-    }
-
-    /// The canonical spelling, as a failure names the subcommand it refuses.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Latest => "LATEST",
-            Self::Before => "BEFORE",
-            Self::After => "AFTER",
-            Self::Around => "AROUND",
-            Self::Between => "BETWEEN",
-        }
-    }
-
-    /// BETWEEN takes two selectors then the limit; the others take one.
-    pub(super) fn takes_two_selectors(self) -> bool {
-        matches!(self, Self::Between)
-    }
-}
+pub(crate) use crate::core::history_request::CHATHISTORY_MAX;
+pub(super) use crate::core::history_request::{ChathistorySub, Selector};
+use crate::core::history_request::{Refusal, parse_limit, parse_selectors, parse_targets};
 
 /// Emit a draft/chathistory `FAIL`. `context` carries the spec's positional
 /// params for the code — the subcommand, and for target errors the target —
@@ -133,6 +20,11 @@ pub(super) fn chathistory_fail(
 ) {
     let line = code.line(&state.config.server_name, "CHATHISTORY", context, detail);
     state.send(conn, &line);
+}
+
+/// [`chathistory_fail`] for a request the shared parser refused.
+fn chathistory_refuse(state: &mut ServerState, conn: ConnId, refusal: Refusal, context: &[&str]) {
+    chathistory_fail(state, conn, refusal.code, context, refusal.detail);
 }
 
 /// Serve history from the channel's hot ring, falling back to PostgreSQL
@@ -184,9 +76,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         chathistory_fail(state, conn, code, &[sub], detail);
         return;
     };
-    // BETWEEN takes two selectors then the limit; the others take one.
-    let is_between = parsed_sub.takes_two_selectors();
-    let expected_params = if is_between { 5 } else { 4 };
+    let expected_params = parsed_sub.parameter_count();
     let Some(&target) = p.get(1).filter(|_| p.len() >= expected_params) else {
         chathistory_fail(
             state,
@@ -260,101 +150,34 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         // unauthenticated party lives in the ring alone and is never asked of
         // the database (see `record_history`).
         let stored = !me.starts_with('~') && !peer.starts_with('~');
-        (key, stored, crate::core::HistoryFloor::Whole)
+        (key, stored, state.conversation_history_floor())
     };
     // The subcommand was parsed once, above, into a typed value: the ring
     // resolver and the DB query builder both consume it, so they can no longer
     // enumerate the subcommands differently. Too few parameters were refused
-    // there; too many are INVALID_PARAMS.
+    // there; too many are INVALID_PARAMS. The selectors and the limit are
+    // parsed by the parser the bouncer's CHATHISTORY shares, so the two
+    // surfaces refuse a malformed request alike.
     if p.len() != expected_params {
-        chathistory_fail(
+        return chathistory_refuse(
             state,
             conn,
-            HistoryFail::InvalidParams,
+            parsed_sub.too_many_parameters(),
             &[sub, target],
-            if is_between {
-                "Expected exactly <target> <selector> <selector> <limit>"
-            } else {
-                "Expected exactly <target> <selector> <limit>"
-            },
         );
-        return;
     }
-    let sel1_raw = p.get(2).copied().unwrap_or("*");
-    let sel2_raw = p.get(3).copied().unwrap_or("*");
-    // Parse each selector *once* (parse, don't validate). The parsed `Selector`
-    // carries an already-resolved `timestamp=` value, so no downstream site
-    // re-parses it or silently defaults a malformed one to epoch 0 (the trap the
-    // old string-threaded `selector_bound` guarded only with a comment). Error
-    // priority is preserved: unknown reference type (INVALID_MSGREFTYPE) first,
-    // then `*` misuse, then a malformed supported reference value (both
-    // INVALID_PARAMS).
-    let r1 = Selector::parse(sel1_raw);
-    let r2 = if is_between {
-        Selector::parse(sel2_raw)
+    let second = if parsed_sub.takes_two_selectors() {
+        p[3]
     } else {
-        Ok(Selector::Star)
+        "*"
     };
-    if matches!(r1, Err(SelectorError::UnknownRefType))
-        || matches!(r2, Err(SelectorError::UnknownRefType))
-    {
-        chathistory_fail(
-            state,
-            conn,
-            HistoryFail::InvalidMsgRefType,
-            &[sub, target],
-            "Unknown message reference type",
-        );
-        return;
-    }
-    // `*` is the open bound, meaningful *only* for LATEST. For BEFORE/AFTER/
-    // AROUND — and for either bound of BETWEEN — it is not a real selector, and
-    // accepting it yields the wrong window: an empty batch for the one-selector
-    // forms, or a full unbounded scan for BETWEEN. Reject it as INVALID_PARAMS.
-    let star_misused = match parsed_sub {
-        ChathistorySub::Latest => false,
-        ChathistorySub::Between => {
-            matches!(r1, Ok(Selector::Star)) || matches!(r2, Ok(Selector::Star))
-        }
-        _ => matches!(r1, Ok(Selector::Star)),
+    let (selector, selector2) = match parse_selectors(parsed_sub, p[2], second) {
+        Ok(selectors) => selectors,
+        Err(refusal) => return chathistory_refuse(state, conn, refusal, &[sub, target]),
     };
-    if star_misused {
-        chathistory_fail(
-            state,
-            conn,
-            HistoryFail::InvalidParams,
-            &[sub, target],
-            "* is only a valid selector for LATEST",
-        );
-        return;
-    }
-    // Anything still an error is a malformed supported reference value.
-    let (Ok(selector), Ok(selector2)) = (r1, r2) else {
-        chathistory_fail(
-            state,
-            conn,
-            HistoryFail::InvalidParams,
-            &[sub, target],
-            "Malformed message reference selector",
-        );
-        return;
-    };
-    // The limit must be a positive integer — never silently default it.
-    let limit: usize = match p
-        .get(if is_between { 4 } else { 3 })
-        .map(|l| l.parse::<usize>())
-    {
-        Some(Ok(n)) if n > 0 && n <= CHATHISTORY_MAX => n,
-        _ => {
-            chathistory_fail(
-                state,
-                conn,
-                HistoryFail::InvalidParams,
-                &[sub, target],
-                "limit must be between 1 and 500",
-            );
-            return;
-        }
+    let limit = match parse_limit(p[expected_params - 1]) {
+        Ok(limit) => limit,
+        Err(refusal) => return chathistory_refuse(state, conn, refusal, &[sub, target]),
     };
     let (mut history, complete) = state.history_ring(&hist_key);
     // Cut to what this reader may see and can be sent, before the window is
@@ -582,49 +405,9 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     let Some(caps) = state.reply_caps(conn) else {
         return;
     };
-    if p.len() != 4 {
-        let code = if p.len() < 4 {
-            HistoryFail::NeedMoreParams
-        } else {
-            HistoryFail::InvalidParams
-        };
-        chathistory_fail(
-            state,
-            conn,
-            code,
-            &["TARGETS"],
-            "Expected exactly two timestamp= bounds and a limit",
-        );
-        return;
-    }
-    let parse = |i: usize| {
-        p.get(i)
-            .and_then(|s| s.strip_prefix("timestamp="))
-            .and_then(e6irc_proto::time::parse_server_time_millis)
-    };
-    let (Some(a), Some(b)) = (parse(1), parse(2)) else {
-        chathistory_fail(
-            state,
-            conn,
-            HistoryFail::InvalidParams,
-            &["TARGETS"],
-            "Expected two timestamp= bounds",
-        );
-        return;
-    };
-    let (min_ts, max_ts) = if a <= b { (a, b) } else { (b, a) };
-    let limit = match p[3].parse::<usize>() {
-        Ok(limit) if limit > 0 && limit <= CHATHISTORY_MAX => limit,
-        _ => {
-            chathistory_fail(
-                state,
-                conn,
-                HistoryFail::InvalidParams,
-                &["TARGETS"],
-                "limit must be between 1 and 500",
-            );
-            return;
-        }
+    let (min_ts, max_ts, limit) = match parse_targets(p) {
+        Ok(window) => (window.after, window.before, window.limit),
+        Err(refusal) => return chathistory_refuse(state, conn, refusal, &["TARGETS"]),
     };
 
     // Visible targets are the channels the requester is on, plus every
@@ -643,12 +426,14 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
 
     // A buffer qualifies on its *latest* entry falling inside the window,
     // not on merely containing one: newer activity means the client has
-    // already moved past it.
+    // already moved past it. A conversation whose latest entry history
+    // retention no longer keeps has nothing left to read.
+    let conversation_floor = state.conversation_history_floor();
     let latest_in_window = |state: &ServerState,
                             key: &crate::core::state::HistoryKey|
      -> Option<e6irc_proto::time::Millis> {
         let latest = state.history.get(key)?.latest().in_scope(scope)?;
-        (latest > min_ts && latest < max_ts).then_some(latest)
+        (latest > min_ts && latest < max_ts && conversation_floor.admits(latest)).then_some(latest)
     };
     // Conversations: every hot conversation listing the requester as a
     // participant, from the store's identity index. The correspondent is the other participant
@@ -705,11 +490,13 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     // shard; its owner publishes when it last saw a message, and that is what
     // is read here — for a channel this shard owns too, so the answer cannot
     // depend on where the channel lives.
-    targets.extend(
-        keys.iter()
-            .filter_map(|key| state.channel_activity(key, scope))
-            .filter(|(_, latest)| *latest > min_ts && *latest < max_ts),
-    );
+    // Each channel is bounded as a single-target read of it would be.
+    let account = state.sessions[&conn].account().map(str::to_owned);
+    targets.extend(keys.iter().filter_map(|key| {
+        let floor = state.channel_history_floor(key, account.as_deref())?;
+        let (name, latest) = state.channel_activity(key, scope)?;
+        (latest > min_ts && latest < max_ts && floor.admits(latest)).then_some((name, latest))
+    }));
     targets.append(&mut conversations);
     // Oldest activity first; a limit therefore keeps the oldest buffers.
     targets.sort_by_key(|t| t.1);
@@ -801,15 +588,15 @@ pub(crate) fn targets_page(
         state.send(conn, &open);
     }
     for (target, ts) in targets {
-        // A channel target: prefer its live display name. Anything else is a DM
-        // correspondent stored as an *identity* (`~nick` or a folded account) —
-        // resolve it to the display nick here, the one conversion site for both
-        // the in-memory and DB paths, so a client never receives a `~`-prefixed
-        // non-target. (identity_nick passes a channel name through unchanged, so
-        // an evicted channel still emits its own name.)
-        let key = state.chan_key(&target);
-        let display = match state.channels.get(&key) {
-            Some(c) => c.name.clone(),
+        // A channel target — the database names it by its folded key — is
+        // named as the channel is, from whichever shard owns it. Anything else
+        // is a DM correspondent stored as an *identity* (`~nick` or a folded
+        // account) — resolved to the display nick here, the one conversion
+        // site for both the in-memory and DB paths, so a client never receives
+        // a `~`-prefixed non-target. A channel emptied while the answer was on
+        // its way has no name left but its key, which still names it.
+        let display = match state.chan_key_if_channel(&target) {
+            Some(key) => state.channel_display_name(&key).unwrap_or(target),
             None => state.identity_nick(&target),
         };
         let time = e6irc_proto::time::server_time(ts);
@@ -844,7 +631,7 @@ pub(crate) fn targets_page(
 /// carried bugs (paging direction, off-by-one at the bounds, same-second
 /// ordering) — kept pure so a unit test and the `chathistory_window` differential
 /// fuzz can pin it against a specification without a database or a live ring.
-pub(super) fn resolve_ring_window(
+pub(crate) fn resolve_ring_window(
     history: &[crate::core::state::HistoryEntry],
     complete: bool,
     sub: ChathistorySub,
@@ -938,21 +725,34 @@ pub(super) fn resolve_ring_window(
             None => miss(selector),
         },
         ChathistorySub::Between => {
+            // Where each pivot sits in the `(ts, id)` order the database orders
+            // them by: a message at its own place, a timestamp before every
+            // message stamped with it. Counting the entries before each would
+            // tie two pivots that both precede the ring, and could take the
+            // newer for the older.
+            let place = |sel: &Selector| match sel {
+                Selector::Msgid(msgid) => history
+                    .iter()
+                    .position(|e| e.msgid == *msgid)
+                    .map(|p| (history[p].ts, p + 1)),
+                Selector::Timestamp(t) => Some((*t, 0)),
+                Selector::Star => None,
+            };
             // Both endpoints must resolve in the ring; otherwise the DB does.
-            match (upper_end(selector), upper_end(selector2)) {
-                (Some(u1), Some(u2)) => {
-                    // Order the pivots by how many entries precede each: the
-                    // smaller `upper_end` is the older bound. The window walks
-                    // *from* the first selector *toward* the second, so the
-                    // `limit` cuts from the first's end — newest-first when the
-                    // first selector is the newer bound.
-                    let newest_first = u1 > u2;
-                    let older_sel = if u1 <= u2 { selector } else { selector2 };
-                    // Lower bound: strictly after the older pivot. Upper bound:
-                    // strictly before the newer pivot (= the larger upper_end).
-                    match lower_start(older_sel) {
-                        Some(start) => {
-                            let end = u1.max(u2);
+            match (place(selector), place(selector2)) {
+                (Some(first), Some(second)) => {
+                    // The window walks *from* the first selector *toward* the
+                    // second, so the `limit` cuts from the first's end —
+                    // newest-first when the first selector is the newer bound.
+                    let newest_first = first > second;
+                    let (older, newer) = if newest_first {
+                        (selector2, selector)
+                    } else {
+                        (selector, selector2)
+                    };
+                    // Strictly after the older pivot, strictly before the newer.
+                    match (lower_start(older), upper_end(newer)) {
+                        (Some(start), Some(end)) => {
                             let covered = complete || start > 0;
                             let rows = if newest_first {
                                 keep_newest(start, end)
@@ -961,7 +761,7 @@ pub(super) fn resolve_ring_window(
                             };
                             (rows, covered)
                         }
-                        None => (Vec::new(), complete),
+                        _ => (Vec::new(), complete),
                     }
                 }
                 // An endpoint missing from the ring: only the DB can resolve it.
@@ -1108,7 +908,7 @@ pub(crate) fn history_page(
         // or the correspondent), so its target — and thus the space left for the
         // body — can differ from delivery. Tags don't count toward the 512
         // limit, so the head measured here is only the non-tag part.
-        let target = MiddleParam::echo(target).as_str();
+        let target = super::message::CanonicalTarget::replayed(MiddleParam::echo(target).as_str());
         let kind = match row.kind {
             crate::core::HistoryKind::Privmsg => crate::core::MessageKind::Privmsg,
             crate::core::HistoryKind::Notice => crate::core::MessageKind::Notice,
@@ -1131,9 +931,9 @@ pub(crate) fn history_page(
                 state.send(
                     conn,
                     &format!(
-                        "{}:{} TAGMSG {target}",
+                        "{}{}",
                         super::message::tag_prefix(&tags),
-                        row.sender_prefix
+                        super::message::tagmsg_line(&row.sender_prefix, &target)
                     ),
                 );
                 continue;
@@ -1157,7 +957,7 @@ pub(crate) fn history_page(
         let message = super::message::MultilineMessage {
             prefix: &row.sender_prefix,
             kind,
-            target,
+            target: &target,
             lines,
             client_tags: &row.client_tags,
             msgid: &row.msgid,
@@ -1197,6 +997,7 @@ pub(crate) fn history_page(
 mod window_tests {
     use super::{ChathistorySub, Selector, resolve_ring_window};
     use crate::core::HistoryKind;
+    use crate::core::history_request::parse_selectors;
     use crate::core::state::HistoryEntry;
     use e6irc_proto::time::Millis;
 
@@ -1214,8 +1015,15 @@ mod window_tests {
         limit: usize,
     ) -> Option<(Vec<HistoryEntry>, bool)> {
         let sub = ChathistorySub::parse(sub)?;
-        let s1 = Selector::parse(sel).ok()?;
-        let s2 = Selector::parse(sel2).ok()?;
+        // The shared parser refuses `*` outside LATEST; the window arithmetic
+        // is specified for it anyway, so it is built here directly.
+        let parse = |raw: &str| match raw {
+            "*" => Some(Selector::Star),
+            raw => parse_selectors(ChathistorySub::Latest, raw, "*")
+                .ok()
+                .map(|(selector, _)| selector),
+        };
+        let (s1, s2) = (parse(sel)?, parse(sel2)?);
         Some(resolve_ring_window(history, complete, sub, &s1, &s2, limit))
     }
 
@@ -1270,6 +1078,18 @@ mod window_tests {
             } else if let Some(ts) = sel.strip_prefix("timestamp=") {
                 let t = e6irc_proto::time::parse_server_time_millis(ts)?;
                 Some(history.iter().filter(|e| e.ts < t).count())
+            } else {
+                None
+            }
+        };
+        // A pivot's place in the `(ts, id)` order: a message's own, a
+        // timestamp's before every message stamped with it.
+        let place = |sel: &str| -> Option<(Millis, usize)> {
+            if let Some(m) = sel.strip_prefix("msgid=") {
+                let p = history.iter().position(|e| e.msgid == m)?;
+                Some((history[p].ts, p + 1))
+            } else if let Some(ts) = sel.strip_prefix("timestamp=") {
+                Some((e6irc_proto::time::parse_server_time_millis(ts)?, 0))
             } else {
                 None
             }
@@ -1329,13 +1149,16 @@ mod window_tests {
                 }
                 None => miss(selector),
             },
-            "BETWEEN" => match (older_count(selector), older_count(selector2)) {
-                (Some(u1), Some(u2)) => {
-                    let newest_first = u1 > u2;
-                    let older_sel = if u1 <= u2 { selector } else { selector2 };
-                    match after_start(older_sel) {
-                        Some(start) => {
-                            let end = u1.max(u2);
+            "BETWEEN" => match (place(selector), place(selector2)) {
+                (Some(k1), Some(k2)) => {
+                    let newest_first = k1 > k2;
+                    let (older_sel, newer_sel) = if newest_first {
+                        (selector2, selector)
+                    } else {
+                        (selector, selector2)
+                    };
+                    match (after_start(older_sel), older_count(newer_sel)) {
+                        (Some(start), Some(end)) => {
                             let (s, e) = if newest_first {
                                 keep_newest(start, end)
                             } else {
@@ -1343,7 +1166,7 @@ mod window_tests {
                             };
                             (ids(s, e), complete || start > 0)
                         }
-                        None => (Vec::new(), complete),
+                        _ => (Vec::new(), complete),
                     }
                 }
                 _ => (Vec::new(), complete),

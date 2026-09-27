@@ -3953,7 +3953,8 @@ impl RingEntry {
 pub(crate) const BACKLOG_BYTES_PER_LINE: usize = e6irc_proto::message::MAX_LINE_LEN;
 
 /// Bounded ring of recent upstream lines, for playback on attach: at most
-/// `cap` positions and `byte_cap` bytes of lines, the oldest going first.
+/// `cap` positions and `byte_cap` bytes of lines, the oldest going first, and
+/// none older than history retention keeps.
 pub struct Buffer {
     entries: std::collections::VecDeque<RingEntry>,
     cap: usize,
@@ -3967,6 +3968,9 @@ pub struct Buffer {
     /// lines `preload_front` restores from storage — older than anything
     /// pushed, at most `cap` of them — take positions that stay positive.
     next_seq: u64,
+    /// How long history is kept: storage maintenance deletes older lines from
+    /// `bnc_buffer`, and this ring neither keeps nor replays them either.
+    retention: crate::core::HistoryRetention,
 }
 
 impl Buffer {
@@ -3984,6 +3988,31 @@ impl Buffer {
             bytes: 0,
             epoch,
             next_seq: cap as u64 + 1,
+            retention: crate::core::HistoryRetention::default(),
+        }
+    }
+
+    /// The oldest time history retention keeps now, if it keeps any less
+    /// than everything.
+    fn cutoff(&self) -> Option<e6irc_proto::time::Millis> {
+        self.retention.cutoff(epoch_millis())
+    }
+
+    /// Whether `line` is kept under `cutoff`: its `time` (every retained line
+    /// carries one, see [`ingest`]) is no older. Read only when there is a
+    /// cutoff, so a ring with none parses nothing.
+    fn keeps(line: &BufferedLine, cutoff: Option<e6irc_proto::time::Millis>) -> bool {
+        cutoff.is_none_or(|cutoff| line_time(&line.line).is_none_or(|time| time >= cutoff))
+    }
+
+    /// Drop the lines at the front that history retention no longer keeps.
+    fn evict_expired(&mut self) {
+        let cutoff = self.cutoff();
+        while let Some(RingEntry::Line(line)) = self.entries.front() {
+            if Self::keeps(line, cutoff) {
+                break;
+            }
+            self.evict_oldest();
         }
     }
 
@@ -4010,6 +4039,7 @@ impl Buffer {
     /// entries go while the lines held pass `byte_cap` — never this one, so a
     /// ring always holds its newest line.
     fn push(&mut self, line: String) -> u64 {
+        self.evict_expired();
         let seq = self.next_position();
         self.bytes += line.len();
         self.entries
@@ -4026,8 +4056,13 @@ impl Buffer {
         self.entries.push_back(RingEntry::Session { seq, snapshot });
     }
 
+    /// The lines held that history retention still keeps.
     fn lines(&self) -> impl Iterator<Item = &BufferedLine> {
-        self.entries.iter().filter_map(RingEntry::line)
+        let cutoff = self.cutoff();
+        self.entries
+            .iter()
+            .filter_map(RingEntry::line)
+            .filter(move |line| Self::keeps(line, cutoff))
     }
 
     /// The position of the newest line (or of the ring's start, when empty):
@@ -4073,8 +4108,10 @@ impl Buffer {
             .map_or(0, |cursor| cursor.seq + 1);
         let mut lines = Vec::new();
         let mut boundaries = Vec::new();
+        let cutoff = self.cutoff();
         for entry in self.entries.iter().filter(|entry| entry.seq() >= from) {
             match entry {
+                RingEntry::Line(line) if !Self::keeps(line, cutoff) => {}
                 RingEntry::Line(line) => lines.push(line.clone()),
                 RingEntry::Session { snapshot, .. } => {
                     boundaries.push((lines.len(), snapshot.clone()));
@@ -4226,6 +4263,16 @@ pub(crate) fn bnc_notice(target: &str, text: &str) -> String {
 fn ingest(line: String) -> String {
     let now = e6irc_proto::time::server_time(epoch_millis());
     stamp_time(crate::sanitize::upstream_line(line), &now)
+}
+
+/// The time `line`'s `time` tag names, if it carries a valid one.
+fn line_time(line: &str) -> Option<e6irc_proto::time::Millis> {
+    e6irc_proto::message::Message::parse(line)
+        .ok()?
+        .tag("time")?
+        .value
+        .as_deref()
+        .and_then(e6irc_proto::time::parse_server_time_millis)
 }
 
 /// `line` with `time` as its `time` tag, unless it carries a valid one.
@@ -4581,6 +4628,12 @@ impl NetworkHandle {
     pub fn next_attachment_id(&self) -> u64 {
         self.attach_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Apply history retention to this network's backlog: what it keeps and
+    /// replays stops at the bound `retention` names, live as it changes.
+    pub(crate) fn set_history_retention(&self, retention: crate::core::HistoryRetention) {
+        self.buffer.lock().expect("buffer poisoned").retention = retention;
     }
 
     /// A copy of the current detached buffer (for attach playback).
@@ -9319,6 +9372,41 @@ mod tests {
             z.push(format!("line{i}"));
         }
         assert!(z.snapshot().len() <= 1, "cap 0 must not grow without bound");
+    }
+
+    /// History retention bounds the backlog as it bounds `bnc_buffer`: a line
+    /// older than it is neither replayed nor kept, and a change of it applies
+    /// at once to a ring already holding lines.
+    #[test]
+    fn a_backlog_does_not_replay_lines_older_than_history_retention() {
+        let retention = crate::core::HistoryRetention::default();
+        let mut ring = Buffer::new(8);
+        ring.retention = retention.clone();
+        let day = 24 * 60 * 60 * 1000;
+        let at = |ago: u64| {
+            e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(
+                epoch_millis().as_millis() - ago,
+            ))
+        };
+        ring.push(format!("@time={} :a!a@h PRIVMSG #c :stale", at(3 * day)));
+        ring.push(format!("@time={} :a!a@h PRIVMSG #c :fresh", at(day / 2)));
+        let texts = |lines: Vec<String>| -> Vec<String> {
+            lines
+                .iter()
+                .map(|line| line.rsplit_once(" :").expect("text").1.to_string())
+                .collect()
+        };
+        assert_eq!(texts(ring.snapshot()), ["stale", "fresh"], "no cutoff set");
+        retention.set_days(1);
+        assert_eq!(texts(ring.snapshot()), ["fresh"]);
+        let replay = ring.replay_after(None);
+        assert_eq!(
+            texts(replay.lines.iter().map(|line| line.line.clone()).collect()),
+            ["fresh"]
+        );
+        // The next line in evicts what retention no longer keeps.
+        ring.push(format!("@time={} :a!a@h PRIVMSG #c :newest", at(0)));
+        assert_eq!(ring.entries.len(), 2, "the stale line was evicted");
     }
 
     fn replayed(replay: &Replay) -> Vec<String> {

@@ -1,4 +1,4 @@
-//! The hot history store: one newest-last ring per channel or direct-message
+//! The hot history store: one time-ordered ring per channel or direct-message
 //! conversation, each bounded in entries and in bytes, under one
 //! least-recently-active cap on rings and one on the bytes of them all.
 //!
@@ -9,8 +9,8 @@
 //!   list of keys on every message);
 //! - which conversations an identity takes part in comes from `conversations`
 //!   (not a split of every key on every disconnect or CHATHISTORY TARGETS);
-//! - a ring's newest timestamp, in each [`HistoryScope`], comes from a running
-//!   window maximum (not a pass over its entries each time a channel is
+//! - a ring's newest timestamp, in each [`HistoryScope`], is kept as entries
+//!   come and go (not a pass over its entries each time a channel is
 //!   published or CHATHISTORY TARGETS asks);
 //! - the bytes a ring, and the store, hold are running sums kept as entries
 //!   come and go (not a recount on every message).
@@ -50,16 +50,35 @@ pub(crate) fn footprint(entry: &HistoryEntry) -> usize {
         + entry.client_tags.len()
 }
 
-/// One target's newest-last hot history.
+/// One target's hot history, sorted by `(ts, arrival)`: oldest first, and
+/// entries sharing a millisecond in the order they arrived.
+///
+/// Arrival order alone is not time order. A conversation's entry from the
+/// peer's shard, or a wall clock stepped backwards, arrives after an entry
+/// stamped later — and every reader of the ring pages by time: CHATHISTORY
+/// finds a `timestamp=` bound by position, splits at a `msgid=` pivot by
+/// position, and falls through to PostgreSQL, which orders by `(ts, id)`, at
+/// the ring's front. So the order is an invariant of [`HistoryRing::push`]
+/// rather than something each reader re-establishes. Within one millisecond,
+/// arrival order is the database's order too wherever one shard both fills the
+/// ring and persists what enters it (a channel, on its owner; a conversation
+/// entry, on the sender's shard): it queues the rows in the order they enter
+/// the ring, and the database numbers them (`id`) in the order they are queued.
+///
+/// What the ring holds is always the newest part of everything it has been
+/// given, in that order, with nothing missing inside it: a page the ring
+/// answers is the page the database would. An entry stamped before one the ring
+/// has already shed is not taken in — held, it would sit past a hole where the
+/// shed ones were, and a page across it would silently skip them.
 pub(crate) struct HistoryRing {
     entries: VecDeque<HistoryEntry>,
     /// True while the ring holds *every* message this target has ever seen
     /// (never overflowed, never evicted). When false, older history lives
     /// only in Postgres and CHATHISTORY must fall back.
     complete: bool,
-    /// Position of `entries.front()` in the sequence of entries this ring has
-    /// held since it was last rebuilt; `entries[i]` is at `first + i`.
-    first: u64,
+    /// The timestamp of the newest entry the ring has shed, if any: an entry
+    /// stamped before it is older than the part of the history the ring holds.
+    shed_through: Option<Millis>,
     /// The newest timestamp of the entries held, in every scope.
     maxima: ScopedMaxima,
     /// The [`footprint`] of the entries held.
@@ -86,67 +105,69 @@ impl Latest {
     }
 }
 
-/// The sliding-window maximum of some of a ring's timestamps: `(position,
-/// ts)` with strictly decreasing `ts`, front the newest timestamp still held.
-/// Timestamps come from wall clocks (and from other shards'), so arrival
-/// order is not timestamp order and the back entry is not the newest.
+/// The newest timestamp among the entries of one [`HistoryScope`], over a
+/// ring sorted oldest-first. The ring sheds only its front — its oldest entry
+/// — so the newest entry of a scope leaves only with the last entry of that
+/// scope, and a count of them is all it takes to know when.
 #[derive(Default)]
-struct WindowMax(VecDeque<(u64, Millis)>);
+struct ScopeNewest {
+    /// Entries of this scope held.
+    held: usize,
+    newest: Option<Millis>,
+}
 
-impl WindowMax {
-    fn newest(&self) -> Option<Millis> {
-        self.0.front().map(|&(_, ts)| ts)
+impl ScopeNewest {
+    fn push(&mut self, ts: Millis) {
+        self.held += 1;
+        self.newest = self.newest.max(Some(ts));
     }
 
-    fn push(&mut self, at: u64, ts: Millis) {
-        while self.0.back().is_some_and(|&(_, newer)| newer <= ts) {
-            self.0.pop_back();
-        }
-        self.0.push_back((at, ts));
-    }
-
-    /// The entry at position `at` left the front of the ring.
-    fn expire(&mut self, at: u64) {
-        if self.0.front().is_some_and(|&(front, _)| front == at) {
-            self.0.pop_front();
+    /// The ring's oldest entry, one of this scope's, left it.
+    fn expire_oldest(&mut self) {
+        self.held -= 1;
+        if self.held == 0 {
+            self.newest = None;
         }
     }
 }
 
-/// One [`WindowMax`] per [`HistoryScope`], each over the entries that scope
+/// One [`ScopeNewest`] per [`HistoryScope`], each over the entries that scope
 /// admits, so every scope's newest entry is a constant-time read.
 #[derive(Default)]
 struct ScopedMaxima {
-    text: WindowMax,
-    text_and_tags: WindowMax,
+    text: ScopeNewest,
+    text_and_tags: ScopeNewest,
 }
 
 impl ScopedMaxima {
-    fn scopes(&mut self) -> [(HistoryScope, &mut WindowMax); 2] {
+    fn scopes(&mut self) -> [(HistoryScope, &mut ScopeNewest); 2] {
         [
             (HistoryScope::Text, &mut self.text),
             (HistoryScope::TextAndTags, &mut self.text_and_tags),
         ]
     }
 
-    fn push(&mut self, at: u64, entry: &HistoryEntry) {
-        for (scope, maxima) in self.scopes() {
+    fn push(&mut self, entry: &HistoryEntry) {
+        for (scope, newest) in self.scopes() {
             if scope.admits(entry.kind) {
-                maxima.push(at, entry.ts);
+                newest.push(entry.ts);
             }
         }
     }
 
-    fn expire(&mut self, at: u64) {
-        for (_, maxima) in self.scopes() {
-            maxima.expire(at);
+    /// `oldest`, the ring's front entry, left it.
+    fn expire_oldest(&mut self, oldest: &HistoryEntry) {
+        for (scope, newest) in self.scopes() {
+            if scope.admits(oldest.kind) {
+                newest.expire_oldest();
+            }
         }
     }
 
     fn latest(&self) -> Latest {
         Latest {
-            text: self.text.newest(),
-            text_and_tags: self.text_and_tags.newest(),
+            text: self.text.newest,
+            text_and_tags: self.text_and_tags.newest,
         }
     }
 }
@@ -156,7 +177,7 @@ impl HistoryRing {
         Self {
             entries: VecDeque::new(),
             complete,
-            first: 0,
+            shed_through: None,
             maxima: ScopedMaxima::default(),
             bytes: 0,
         }
@@ -176,14 +197,25 @@ impl HistoryRing {
         self.maxima.latest()
     }
 
-    /// Append `entry`, then drop the oldest entries while the ring holds more
-    /// than [`HISTORY_RING_CAP`] of them or more than `budget` bytes — never
-    /// the entry just appended, so a ring always holds its newest line.
+    /// Insert `entry` in `(ts, arrival)` order, then drop the oldest entries
+    /// while the ring holds more than [`HISTORY_RING_CAP`] of them or more than
+    /// `budget` bytes — never the newest, so a ring always holds its newest
+    /// line. The place is found searching back from the newest end: an entry
+    /// stamped no earlier than the newest held — nearly every one — goes at
+    /// the back after a single comparison. An entry older than what the ring
+    /// has already shed is shed with it, at once.
     fn push(&mut self, entry: HistoryEntry, budget: usize) {
-        let at = self.first + self.entries.len() as u64;
-        self.maxima.push(at, &entry);
+        if self.shed_through.is_some_and(|shed| entry.ts < shed) {
+            return;
+        }
+        let at = self
+            .entries
+            .iter()
+            .rposition(|held| held.ts <= entry.ts)
+            .map_or(0, |before| before + 1);
+        self.maxima.push(&entry);
         self.bytes += footprint(&entry);
-        self.entries.push_back(entry);
+        self.entries.insert(at, entry);
         while self.entries.len() > HISTORY_RING_CAP
             || (self.bytes > budget && self.entries.len() > 1)
         {
@@ -192,15 +224,16 @@ impl HistoryRing {
                 .pop_front()
                 .expect("a ring over its bounds holds entries");
             self.bytes -= footprint(&oldest);
-            self.maxima.expire(self.first);
-            self.first += 1;
+            self.maxima.expire_oldest(&oldest);
+            self.shed_through = Some(oldest.ts);
             self.complete = false;
         }
     }
 
     /// Keep only the entries `keep` admits. A rare, whole-ring operation (an
-    /// account's erasure), so the window maximum and the byte count are simply
-    /// rebuilt; the ring only shrinks, so no bound can be newly exceeded.
+    /// account's erasure), so the newest-per-scope and the byte count are
+    /// simply rebuilt; the ring only shrinks, so no bound can be newly
+    /// exceeded, and what remains is still in order.
     fn retain(&mut self, keep: impl FnMut(&HistoryEntry) -> bool) -> bool {
         let before = self.entries.len();
         self.entries.retain(keep);
@@ -208,11 +241,12 @@ impl HistoryRing {
             return false;
         }
         let entries = std::mem::take(&mut self.entries);
-        let complete = self.complete;
-        *self = Self::new(complete);
+        let shed_through = self.shed_through;
+        *self = Self::new(self.complete);
         for entry in entries {
             self.push(entry, usize::MAX);
         }
+        self.shed_through = shed_through;
         true
     }
 }
@@ -398,6 +432,13 @@ impl HotHistory {
             "the store's byte count"
         );
         for (key, ring) in &self.rings {
+            assert!(
+                ring.entries
+                    .iter()
+                    .zip(ring.entries.iter().skip(1))
+                    .all(|(older, newer)| older.ts <= newer.ts),
+                "{key:?} is out of time order"
+            );
             for scope in [HistoryScope::Text, HistoryScope::TextAndTags] {
                 assert_eq!(
                     ring.latest().in_scope(scope),
@@ -563,6 +604,52 @@ mod tests {
             history.assert_consistent();
         }
         assert!(!history.get(&key).expect("ring").complete());
+    }
+
+    /// An entry stamped before ones already held — a conversation's line from
+    /// the peer's shard, a wall clock stepped back — takes its place in time,
+    /// entries of one millisecond stay in arrival order, and the ring sheds
+    /// the oldest by time, which is not the one that arrived first.
+    #[test]
+    fn late_arrivals_take_their_place_in_time() {
+        let mut history = HotHistory::default();
+        let key = HistoryKey::channel_for_test("#c");
+        let named = |ts: u64, id: &str| HistoryEntry {
+            msgid: id.into(),
+            ..entry(ts, None)
+        };
+        for (ts, id) in [
+            (1001, "x"),
+            (1000, "a"),
+            (1001, "y"),
+            (999, "z"),
+            (1000, "b"),
+        ] {
+            history.push(&key, named(ts, id), true, rings(8));
+            history.assert_consistent();
+        }
+        let ids = |history: &HotHistory| -> Vec<String> {
+            let ring = history.get(&key).expect("ring");
+            ring.entries().iter().map(|e| e.msgid.clone()).collect()
+        };
+        assert_eq!(ids(&history), ["z", "a", "b", "x", "y"]);
+        // Over its byte budget the ring sheds its oldest by time.
+        let budget = 4 * footprint(&named(0, "z"));
+        let bounds = HotHistoryBounds {
+            ring_bytes: budget,
+            ..rings(8)
+        };
+        history.push(&key, named(998, "w"), true, bounds);
+        history.assert_consistent();
+        assert_eq!(ids(&history), ["a", "b", "x", "y"]);
+        assert!(!history.get(&key).expect("ring").complete());
+        // With room again, an entry older than what the ring shed is still not
+        // taken in: it would sit before a hole where `z` was.
+        history.push(&key, named(998, "late"), true, rings(8));
+        history.assert_consistent();
+        assert_eq!(ids(&history), ["a", "b", "x", "y"]);
+        history.push(&key, named(1000, "c"), true, rings(8));
+        assert_eq!(ids(&history), ["a", "b", "c", "x", "y"]);
     }
 
     /// A reader without `message-tags` dates a ring by its newest text entry,

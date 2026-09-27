@@ -194,7 +194,9 @@ exists; remove the environment secret after successful initialization.
 The same page owns live history and audit retention (30 and 365 days by
 default). History retention bounds both the server's own channel history
 (`messages`) and every network's bouncer history (`bnc_buffer`, direct
-messages included). A supervised worker applies those limits in bounded
+messages included), and what either serves from memory — the core's history
+rings and each network's in-memory backlog — from the moment it is saved. A
+supervised worker applies those limits to the database in bounded
 batches every five minutes — up to 21 batches in one tick when a backlog has
 built up — and also removes expired browser sessions, personal access tokens,
 device grants, consumed logout tokens, and monitoring samples past their

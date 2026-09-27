@@ -16,7 +16,7 @@
 //! the position-specific rules remain. **Upstream** bytes (bridge relays) have
 //! not, so [`upstream_line`] neutralizes those first. Generated-field length
 //! bounding and wire-limit fitting are a separate concern and live with delivery
-//! (`truncate_chars`, `fit_trailing`, `fit_relayed_text`) over
+//! (`truncate_chars`, `fit_trailing`, `relayed_line`) over
 //! `e6irc_proto::message::truncate_on_char_boundary`.
 
 /// Validate a username for the `nick!user@host` source prefix, cut to at most
