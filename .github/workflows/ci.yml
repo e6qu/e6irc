@@ -8,7 +8,12 @@
 #   gh api repos/OWNER/REPO/git/tags/SHA --jq .object.sha
 # dtolnay/rust-toolchain has no releases and chooses the toolchain from the ref
 # it is called by, so it is pinned to a commit of its `master` branch and the
-# toolchain is always passed as the `toolchain` input.
+# toolchain is always passed as the `toolchain` input: rust-toolchain.toml's
+# `channel`, the one compiler everything is built with (the fuzz-smoke job's
+# pinned nightly is the one exception, and says why). The file, not the input,
+# decides what `cargo` runs, so RUSTUP_AUTO_INSTALL=0 below turns an input that
+# drifted from it into a failed job instead of a silent second download;
+# tools/check-release-toolchain.sh holds every input to the file.
 name: CI
 
 on:
@@ -25,6 +30,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  RUSTUP_AUTO_INSTALL: "0"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -38,7 +44,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: tools/check-systemd-unit.sh
@@ -169,7 +175,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # --all-features includes embed-web, which embeds web/dist.
@@ -204,7 +210,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
@@ -241,7 +247,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       # Each Rust test owns a database created through this administrative URL.
@@ -323,7 +329,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - name: Start dex (mock connector)
@@ -388,7 +394,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - run: python3 tools/test-postgres-recovery.py
@@ -443,7 +449,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd -p e6irc-load
       - run: tools/test-load-smoke.sh
@@ -455,7 +461,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: python3 tools/test-native-release-package.py
       - run: cargo build --locked -p e6ircd -p e6irc-tui
@@ -468,7 +474,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -497,7 +503,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -543,7 +549,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -610,7 +616,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Start Conduit
         run: |
@@ -634,7 +640,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --locked -p e6irc-queue --release
         env:
@@ -658,17 +664,24 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Pinned nightly: the 2026-07-24 nightly ICEs in rustc_codegen_ssa on a
-      # tokio task type under the fuzzer's ASAN+sancov instrumentation (a
-      # compiler bug, not our code). Pin to the last nightly that built the fuzz
-      # targets; bump when upstream fixes the codegen regression.
+      # The one job not on rust-toolchain.toml's release: cargo-fuzz builds
+      # with `-Zsanitizer=address` and sancov instrumentation, which only a
+      # nightly compiler accepts, so every cargo call here names this nightly
+      # with `+` (which overrides the file). Pinned nightly: the 2026-07-24
+      # nightly ICEs in rustc_codegen_ssa on a tokio task type under that
+      # instrumentation (a compiler bug, not our code), so this is the last
+      # nightly that built the fuzz targets; bump when upstream fixes the
+      # codegen regression. tools/check-release-toolchain.sh holds every `+`
+      # here to this input.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
           toolchain: nightly-2026-07-23
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Built with the nightly this job installed: rust-toolchain.toml's
+      # release is not installed here, and nothing may fetch it behind our back.
+      - run: cargo +nightly-2026-07-23 install cargo-fuzz --version 0.13.2 --locked
       # `cargo fuzz` takes no `--locked`: refuse a lock that is stale for
       # fuzz/Cargo.toml before it can re-resolve.
       - run: cargo +nightly-2026-07-23 metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
@@ -700,7 +713,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Each binary is measured in the profile it ships in: the server in
       # `release`, the clients in `release-client` (release.yml).

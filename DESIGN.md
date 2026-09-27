@@ -735,6 +735,16 @@ both native clients — one parser to fuzz, one behavior everywhere.
   releases and picks the toolchain from the ref it is called by, so it is
   pinned to a commit of its `master` branch and always given the toolchain
   as its `toolchain` input. The header of ci.yml has the refresh recipe.
+- **One Rust toolchain**: `rust-toolchain.toml` pins the exact release
+  (`channel`, with clippy and rustfmt) that every developer build, every CI
+  job, the native release archives and the container image compile with.
+  Each workflow's `toolchain:` input and the Dockerfile's
+  `rust:<release>-bookworm` base name that release; CI sets
+  `RUSTUP_AUTO_INSTALL=0` and the Dockerfile checks its compiler against the
+  file with the same setting, so a mismatch fails instead of fetching a second
+  compiler. The fuzz job alone runs a pinned nightly, which cargo-fuzz's
+  sanitizer flags require. `tools/check-release-toolchain.sh` (with its
+  contract test) holds all of these to the file.
 
 ---
 
@@ -5134,8 +5144,9 @@ Layers, bottom to top:
   `rustls` in it; generating it downloads syft, so one failed attempt is
   retried once and the requirement still fails a job with no SBOM — and every
   shipped build passes `--locked`
-  (`tools/check-locked-builds.sh`); native releases build with the image's
-  pinned Rust (`tools/check-release-toolchain.sh`) and no restored cache. The
+  (`tools/check-locked-builds.sh`); native releases build with
+  `rust-toolchain.toml`'s Rust, the one the image carries
+  (`tools/check-release-toolchain.sh`), and no restored cache. The
   assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.

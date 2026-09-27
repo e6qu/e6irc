@@ -13,7 +13,8 @@
 # `docker buildx imagetools inspect IMAGE:TAG` and update the digest and the
 # date beside it in the same change.
 #   node:24-bookworm-slim resolved 2026-08-09
-#   rust:1-bookworm       resolved 2026-09-20 (Rust 1.98.1)
+#   rust:1.98.1-bookworm  resolved 2026-09-20 (the same index digest as
+#                         rust:1-bookworm that day)
 #   gcr.io/distroless/cc-debian12:nonroot resolved 2026-09-20
 FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS web-build
 WORKDIR /src/web
@@ -23,8 +24,19 @@ RUN pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm build
 
-FROM rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build
+# The build image's tag names rust-toolchain.toml's release, and
+# tools/check-release-toolchain.sh holds the two equal. The file is copied in
+# first and checked against the compiler the image really carries, and rustup
+# may not fetch another one: a base whose Rust differs from the file fails here
+# instead of downloading the file's release over the digest-pinned one.
+FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build
 WORKDIR /src
+ENV RUSTUP_AUTO_INSTALL=0
+COPY rust-toolchain.toml ./
+RUN channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+ && image_rust="$(cd / && rustc --version | cut -d ' ' -f 2)" \
+ && { [ -n "$channel" ] && [ "$image_rust" = "$channel" ] \
+      || { echo "rust-toolchain.toml names Rust '$channel' but the build image carries $image_rust" >&2; exit 1; }; }
 # The running binary reports this as e6irc_build_info's revision label; the
 # build arg keeps the image's provenance honest without baking the whole
 # repository state into the runtime stage. It has no default: an image whose

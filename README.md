@@ -67,7 +67,7 @@ surface. See the [client capability matrix](docs/client-capabilities.md).
 ## Build & run
 
 ```sh
-# Server (needs a recent stable Rust toolchain)
+# Server (rustup installs the Rust release rust-toolchain.toml pins)
 cargo build --locked --release -p e6ircd
 ./target/release/e6ircd --config e6ircd.toml
 

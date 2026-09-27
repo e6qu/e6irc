@@ -40,6 +40,9 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/e6qu/e6irc
+  # The toolchain installed below must be rust-toolchain.toml's; never let
+  # rustup fetch a different one behind the build (see ci.yml's header).
+  RUSTUP_AUTO_INSTALL: "0"
 
 jobs:
   metadata:
@@ -301,9 +304,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # A release is built from a clean slate with the compiler the image uses:
       # no restored build cache (a cache is written by whatever ran before, so a
-      # poisoned or stale artifact would ship), and the toolchain the Dockerfile's
-      # pinned `rust:1-bookworm` digest carries, not whatever `stable` is today.
-      # tools/check-release-toolchain.sh keeps the two versions equal.
+      # poisoned or stale artifact would ship), and rust-toolchain.toml's
+      # release, which the Dockerfile's pinned `rust:<version>-bookworm` base
+      # carries too, not whatever `stable` is today.
+      # tools/check-release-toolchain.sh keeps all three equal.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
           toolchain: 1.98.1

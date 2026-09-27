@@ -32,6 +32,10 @@ on:
 permissions:
   contents: read
 
+# The toolchain installed below must be rust-toolchain.toml's (see ci.yml).
+env:
+  RUSTUP_AUTO_INSTALL: "0"
+
 jobs:
   qualify:
     name: ${{ inputs.campaign }} qualification
@@ -55,7 +59,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: stable
+          toolchain: 1.98.1
 
       - name: Build qualification runner
         run: cargo build --locked --release -p e6irc-qualification
