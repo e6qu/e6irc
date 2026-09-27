@@ -144,6 +144,20 @@ impl BridgedSenders {
         shown
     }
 
+    /// How the account `id` is shown now, if it is: for a post that names its
+    /// account but not the account's name (a Slack bot's edit), which is no
+    /// reason to rename it.
+    #[cfg(feature = "slack")]
+    pub(crate) fn known(&mut self, id: &str) -> Option<SelfIdentity> {
+        if id == self.own_id {
+            return Some(self.own.clone());
+        }
+        let (_, shown) = self.shown.get(id)?;
+        let shown = shown.clone();
+        self.recency.touch(&id.to_string());
+        Some(shown)
+    }
+
     /// `base` if no one holds it, else the first free `base|N`.
     fn free_nick(&self, base: &str) -> String {
         let own = fold(&self.own.nick);

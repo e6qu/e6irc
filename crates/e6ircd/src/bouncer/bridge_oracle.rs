@@ -42,6 +42,9 @@ pub struct Options {
     pub fail_first_user_lookup: bool,
     /// How long a Slack `users.info` takes to answer.
     pub user_lookup_delay: Duration,
+    /// Every Slack `users.info` is answered `429` with a thirty-second
+    /// `Retry-After`.
+    pub rate_limit_user_lookups: bool,
 }
 
 #[derive(Debug)]
@@ -751,6 +754,17 @@ async fn slack_channel(
         }
         "CARCHIVED" => "is_archived",
         "CNOTIN" => "not_in_channel",
+        // The app was not granted `channels:read`.
+        "CSCOPE" => "missing_scope",
+        // An error status, whatever its body says: a proxy's error page, a
+        // Slack outage.
+        "C503" => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({ "ok": true, "channel": { "name": "general" } })),
+            )
+                .into_response();
+        }
         _ => "channel_not_found",
     };
     axum::Json(json!({ "ok": false, "error": error })).into_response()
@@ -768,6 +782,14 @@ async fn slack_user(
     tokio::time::sleep(state.options.user_lookup_delay).await;
     if !slack_authorized(&state, &headers) {
         return slack_refused();
+    }
+    if state.options.rate_limit_user_lookups {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", "30")],
+            axum::Json(json!({ "ok": false, "error": "ratelimited" })),
+        )
+            .into_response();
     }
     if state.options.fail_first_user_lookup
         && !state.user_lookup_failed.swap(true, Ordering::SeqCst)

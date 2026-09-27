@@ -19,10 +19,41 @@ const INTENTS: u64 = e6irc_proto::provider::DISCORD_GATEWAY_INTENTS;
 pub struct DiscordConfig {
     pub token: String,
     pub api_base: String,
-    pub channels: Vec<String>,
+    pub channels: Vec<DiscordChannelId>,
     pub buffer_cap: usize,
     /// The server's policy on an API base inside its own network.
     pub internal_upstreams: crate::egress::InternalUpstreams,
+}
+
+/// A configured Discord channel: a snowflake, parsed where the driver is
+/// built. A typo (a channel name, a pasted URL) used to reach the channel
+/// lookup as a path segment and come back a 404 on the refusal schedule; it is
+/// refused with the configuration instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordChannelId(String);
+
+impl DiscordChannelId {
+    /// `raw` as a channel id: decimal digits naming a nonzero 64-bit number,
+    /// as Discord writes one (no sign, no leading zero).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let canonical = !raw.is_empty()
+            && raw.bytes().all(|byte| byte.is_ascii_digit())
+            && !raw.starts_with('0')
+            && raw.parse::<u64>().is_ok();
+        if canonical {
+            Ok(Self(raw.to_string()))
+        } else {
+            Err(format!(
+                "{:?} is not a Discord channel id (a snowflake: the channel's number, as \
+                 \"Copy Channel ID\" gives it)",
+                e6irc_client::bounded_diagnostic(raw)
+            ))
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 pub struct DiscordDriver {
@@ -84,6 +115,10 @@ struct Shared {
     config: DiscordConfig,
     resume: std::sync::Mutex<Option<ResumeState>>,
     deliveries: super::CarriedDeliveries,
+    /// The threads of the bridged channels, by thread id: the gateway session
+    /// learns them (`GUILD_CREATE`, `THREAD_*`), and a resumed one does not
+    /// hear them again, so they are the driver's like the session is.
+    threads: std::sync::Mutex<ThreadParents>,
 }
 
 impl Shared {
@@ -92,7 +127,25 @@ impl Shared {
             config,
             resume: std::sync::Mutex::new(None),
             deliveries: super::CarriedDeliveries::new("Discord"),
+            threads: std::sync::Mutex::new(ThreadParents::default()),
         }
+    }
+
+    /// The bridged channel a message in `channel_id` is shown in: the channel
+    /// itself, or the channel a thread belongs to.
+    fn bridged_channel<'a>(
+        &self,
+        id_to_channel: &'a std::collections::HashMap<String, String>,
+        channel_id: &str,
+    ) -> Option<&'a String> {
+        id_to_channel.get(channel_id).or_else(|| {
+            let parent = self
+                .threads
+                .lock()
+                .expect("discord threads")
+                .parent(channel_id)?;
+            id_to_channel.get(&parent)
+        })
     }
 
     fn resume_state(&self) -> Option<ResumeState> {
@@ -121,6 +174,62 @@ impl Shared {
                 "discord: gateway session cannot be resumed ({why}); the next one identifies"
             );
         }
+    }
+}
+
+/// Threads of bridged channels remembered at once. Past it the table is
+/// cleared (and said in the log): the threads the gateway announces from then
+/// on are learned again, the older ones read as unbridged until they are.
+const MAX_THREADS: usize = 4096;
+
+/// Which bridged channel each known thread belongs to. A thread reply is a
+/// message in the thread's own channel, which no configuration names; the
+/// bridge shows it in the parent's bridged channel, as a line like any other
+/// (the same policy on every bridge: a Slack thread reply or a Matrix
+/// `m.thread` event is a line in its channel too).
+#[derive(Default)]
+struct ThreadParents {
+    parents: std::collections::HashMap<String, String>,
+}
+
+impl ThreadParents {
+    fn parent(&self, thread: &str) -> Option<String> {
+        self.parents.get(thread).cloned()
+    }
+
+    fn remember(&mut self, thread: String, parent: String) {
+        if !self.parents.contains_key(&thread) && self.parents.len() >= MAX_THREADS {
+            eprintln!("discord: {MAX_THREADS} bridged threads known; the thread table was cleared");
+            self.parents.clear();
+        }
+        self.parents.insert(thread, parent);
+    }
+
+    fn forget(&mut self, thread: &str) {
+        self.parents.remove(thread);
+    }
+}
+
+/// Edits already relayed, by message id and the edit's timestamp: an embed
+/// unfolding in an edited message sends its `MESSAGE_UPDATE` again, unchanged.
+const RECENT_EDITS: usize = 1024;
+
+#[derive(Default)]
+struct RecentEdits {
+    order: std::collections::VecDeque<(String, String)>,
+}
+
+impl RecentEdits {
+    /// Whether this edit is new; remembers it either way.
+    fn first_time(&mut self, edit: &(String, String)) -> bool {
+        if self.order.contains(edit) {
+            return false;
+        }
+        if self.order.len() >= RECENT_EDITS {
+            self.order.pop_front();
+        }
+        self.order.push_back(edit.clone());
+        true
     }
 }
 
@@ -207,6 +316,8 @@ struct OpenedGateway {
     >,
     hb_interval: u64,
     last_seq: Option<u64>,
+    /// Whether this connection RESUMEd a kept session (else it IDENTIFYed).
+    resumed: bool,
 }
 
 async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionOutcome {
@@ -231,15 +342,23 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
         mut read,
         hb_interval,
         mut last_seq,
+        resumed,
     } = match opened {
         Ok(opened) => opened,
         Err(outcome) => return outcome,
     };
     let config = &shared.config;
     let identity = senders.own().clone();
-    if let Err(outcome) = ends.begin_bridge_session(&identity, id_to_channel.values()) {
+    let start = if resumed {
+        super::SessionStart::Resumed
+    } else {
+        super::SessionStart::Fresh
+    };
+    if let Err(outcome) = ends.begin_bridge_session(&identity, id_to_channel.values(), start) {
         return outcome;
     }
+    let mut edits = RecentEdits::default();
+    let pacer = ends.pacer();
 
     let mut heartbeat = tokio::time::interval(Duration::from_millis(hb_interval));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -275,6 +394,12 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                     Ok(None) => continue,
                     Err(outcome) => return outcome,
                 };
+                // Only a frame without a readable envelope ends the session.
+                // A dispatch whose data cannot be read is still counted —
+                // its sequence number is the envelope's — so a RESUME never
+                // replays it, and it is said (below) rather than ending the
+                // session: ended, the session resumed into the same frame and
+                // failed on it forever.
                 let frame = match parse_frame(&text) {
                     Ok(frame) => frame,
                     Err(e) => {
@@ -316,16 +441,44 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                         if message.author_id == me.id {
                             continue;
                         }
-                        if let Some(channel) = id_to_channel.get(&message.channel_id) {
-                            for line in message.lines(channel, &id_to_channel, &mut senders) {
-                                ends.emit_line(line);
+                        if message.edit.as_ref().is_some_and(|edit| !edits.first_time(edit)) {
+                            continue;
+                        }
+                        if let Some(channel) = shared.bridged_channel(&id_to_channel, &message.channel_id) {
+                            let lines = message.lines(channel, &id_to_channel, &mut senders);
+                            ends.relay_bridged(lines).await;
+                        }
+                    }
+                    Event::Threads(threads) => {
+                        let mut known = shared.threads.lock().expect("discord threads");
+                        for (thread, parent) in threads {
+                            if id_to_channel.contains_key(&parent) {
+                                known.remember(thread, parent);
                             }
+                        }
+                    }
+                    Event::ThreadGone(thread) => {
+                        shared.threads.lock().expect("discord threads").forget(&thread);
+                    }
+                    Event::Malformed { event, channel, error } => {
+                        eprintln!("discord: a {event} dispatch could not be read: {error}");
+                        let shown = channel.and_then(|channel| {
+                            shared.bridged_channel(&id_to_channel, &channel)
+                        });
+                        if let Some(shown) = shown {
+                            ends.relay_bridged(super::BridgedLines::notice(
+                                super::unrelayed_notice("discord", shown, MALFORMED, None),
+                            ))
+                            .await;
                         }
                     }
                     Event::Hello(_) | Event::Ignore => {}
                 }
             }
-            report = shared.deliveries.next_report() => report(ends),
+            report = async {
+                pacer.wait().await;
+                shared.deliveries.next_report().await
+            } => report(ends),
             cmd = ends.next_command() => {
                 let deliver = {
                     let (http, base, token) = (http.clone(), base.clone(), config.token.clone());
@@ -361,9 +514,14 @@ async fn open_gateway(shared: &Shared) -> Result<OpenedGateway, super::SessionOu
     )?;
     let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
 
+    let channel_ids: Vec<String> = config
+        .channels
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect();
     let (id_to_channel, channel_to_id) = super::resolve_bridge_channels(
         "discord",
-        &config.channels,
+        &channel_ids,
         |id| {
             let http = &http;
             let base = &base;
@@ -477,6 +635,7 @@ async fn open_gateway(shared: &Shared) -> Result<OpenedGateway, super::SessionOu
         read,
         hb_interval,
         last_seq,
+        resumed: resume.is_some(),
     })
 }
 
@@ -492,7 +651,19 @@ enum Event {
         resume_url: String,
     },
     Resumed,
+    /// A `MESSAGE_CREATE`, or a `MESSAGE_UPDATE` that edited the text.
     Message(DiscordMessage),
+    /// Threads and the channel each belongs to (`GUILD_CREATE`'s active
+    /// threads, `THREAD_CREATE`/`THREAD_UPDATE`, `THREAD_LIST_SYNC`).
+    Threads(Vec<(String, String)>),
+    /// `THREAD_DELETE`.
+    ThreadGone(String),
+    /// A dispatch whose data could not be read, and the channel it names.
+    Malformed {
+        event: String,
+        channel: Option<String>,
+        error: String,
+    },
     HeartbeatRequest,
     Ack,
     /// Op 7: the gateway wants this connection replaced (and resumed).
@@ -519,6 +690,9 @@ struct DiscordMessage {
     /// What the message is called when it carries nothing the bridge can
     /// show (a sticker, an embed, a system message).
     unrelayable: String,
+    /// For an edit, the message's id and the edit's timestamp: it is shown as
+    /// `* <new text>`, as every bridge shows an edit.
+    edit: Option<(String, String)>,
 }
 
 impl DiscordMessage {
@@ -544,7 +718,7 @@ impl DiscordMessage {
         channel: &str,
         channels: &std::collections::HashMap<String, String>,
         senders: &mut super::BridgedSenders,
-    ) -> Vec<String> {
+    ) -> super::BridgedLines {
         let who = senders.identity(super::ProviderAccount {
             id: &self.author_id,
             name: &self.author,
@@ -552,13 +726,19 @@ impl DiscordMessage {
             host: "discord",
         });
         match self.body(channels) {
-            Some(body) => super::render_bridged(&who, channel, &super::Inbound::message(&body)),
-            None => vec![super::unrelayed_notice(
+            Some(body) => {
+                let body = match self.edit {
+                    Some(_) => format!("* {body}"),
+                    None => body,
+                };
+                super::render_bridged(&who, channel, &super::Inbound::message(&body))
+            }
+            None => super::BridgedLines::notice(super::unrelayed_notice(
                 "discord",
                 channel,
                 &self.unrelayable,
                 Some(&who.nick),
-            )],
+            )),
         }
     }
 }
@@ -704,6 +884,10 @@ fn encode_gateway<T: serde::Serialize>(value: &T) -> Result<Ws, String> {
         .map_err(|error| format!("gateway JSON: {error}"))
 }
 
+/// What a dispatch the bridge cannot read is called in its notice.
+const MALFORMED: &str = "malformed";
+
+/// A gateway frame's envelope: all that is read before its data.
 #[derive(serde::Deserialize)]
 struct GatewayFrame {
     op: u64,
@@ -711,11 +895,6 @@ struct GatewayFrame {
     s: Option<u64>,
     #[serde(default)]
     t: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct GatewayPayload<T> {
-    d: T,
 }
 
 #[derive(serde::Deserialize)]
@@ -762,6 +941,23 @@ impl MessageData {
     }
 }
 
+/// A `MESSAGE_UPDATE`: an edit carries the new `content` and an
+/// `edited_timestamp`; an update without them (an embed unfolding, a pin) is
+/// no edit anyone made.
+#[derive(serde::Deserialize)]
+struct UpdateData {
+    id: String,
+    channel_id: String,
+    #[serde(default)]
+    author: Option<DiscordUser>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    edited_timestamp: Option<String>,
+    #[serde(default)]
+    mentions: Vec<DiscordUser>,
+}
+
 #[derive(serde::Deserialize)]
 struct DiscordUser {
     id: String,
@@ -773,18 +969,56 @@ struct MessageAttachment {
     url: String,
 }
 
-fn decode_data<T: serde::de::DeserializeOwned>(text: &str, event: &str) -> Result<T, String> {
-    serde_json::from_str::<GatewayPayload<T>>(text)
-        .map(|payload| payload.d)
-        .map_err(|e| format!("{event} data: {e}"))
+/// A thread, as the gateway announces one: its id and its parent channel.
+#[derive(serde::Deserialize)]
+struct ThreadChannel {
+    id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
+/// `GUILD_CREATE` and `THREAD_LIST_SYNC` both list threads under `threads`.
+#[derive(serde::Deserialize)]
+struct ThreadList {
+    #[serde(default)]
+    threads: Vec<ThreadChannel>,
+}
+
+#[derive(serde::Deserialize)]
+struct ThreadDeleted {
+    id: String,
+}
+
+fn thread_parents(threads: Vec<ThreadChannel>) -> Vec<(String, String)> {
+    threads
+        .into_iter()
+        .filter_map(|thread| Some((thread.id, thread.parent_id?)))
+        .collect()
+}
+
+fn mention_names(mentions: Vec<DiscordUser>) -> std::collections::HashMap<String, String> {
+    mentions
+        .into_iter()
+        .map(|user| (user.id, user.username))
+        .collect()
+}
+
+/// One gateway frame. The envelope (`op`, `s`, `t`) is read first, and only a
+/// frame without one is an error: the socket is not speaking the gateway
+/// protocol. Each dispatch's data is read on its own, and data that cannot be
+/// read is [`Event::Malformed`] under the envelope's sequence number — never
+/// an error that ends the session before the number is counted, which made a
+/// RESUME replay the same frame into the same failure forever (and a bad READY
+/// spent an IDENTIFY on every attempt).
 fn parse_frame(text: &str) -> Result<Frame, String> {
-    let frame: GatewayFrame =
+    use serde::Deserialize;
+    let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("gateway JSON: {e}"))?;
+    let frame = GatewayFrame::deserialize(&value).map_err(|e| format!("gateway frame: {e}"))?;
+    let data = value.get("d").unwrap_or(&serde_json::Value::Null);
     let event = match frame.op {
         10 => {
-            let hello: HelloData = decode_data(text, "HELLO")?;
+            let hello = HelloData::deserialize(data).map_err(|e| format!("HELLO data: {e}"))?;
             if hello.heartbeat_interval == 0 {
                 return Err("HELLO heartbeat_interval was zero".to_string());
             }
@@ -792,55 +1026,13 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
         }
         1 => Event::HeartbeatRequest,
         7 => Event::Reconnect,
-        9 => {
-            let resumable: bool = decode_data(text, "INVALID_SESSION")?;
-            Event::InvalidSession { resumable }
-        }
+        // The session is gone either way; only a `true` says it may be
+        // resumed, so anything else is taken as `false`.
+        9 => Event::InvalidSession {
+            resumable: data.as_bool() == Some(true),
+        },
         11 => Event::Ack,
-        0 => {
-            let name = frame
-                .t
-                .as_deref()
-                .ok_or("dispatch frame had no event name")?;
-            if frame.s.is_none() {
-                return Err(format!("{name} dispatch had no sequence number"));
-            }
-            match name {
-                "READY" => {
-                    let ready: ReadyData = decode_data(text, "READY")?;
-                    if ready.session_id.is_empty() {
-                        return Err("READY without a session id".to_string());
-                    }
-                    Event::Ready {
-                        session_id: ready.session_id,
-                        resume_url: ready.resume_gateway_url,
-                    }
-                }
-                "RESUMED" => Event::Resumed,
-                "MESSAGE_CREATE" => {
-                    let message: MessageData = decode_data(text, "MESSAGE_CREATE")?;
-                    let unrelayable = message.unrelayable();
-                    Event::Message(DiscordMessage {
-                        channel_id: message.channel_id,
-                        author_id: message.author.id,
-                        author: message.author.username,
-                        content: message.content,
-                        attachments: message
-                            .attachments
-                            .into_iter()
-                            .map(|attachment| attachment.url)
-                            .collect(),
-                        mentions: message
-                            .mentions
-                            .into_iter()
-                            .map(|user| (user.id, user.username))
-                            .collect(),
-                        unrelayable,
-                    })
-                }
-                _ => Event::Ignore,
-            }
-        }
+        0 => dispatch(frame.t.as_deref(), frame.s, data),
         _ => Event::Ignore,
     };
     Ok(Frame {
@@ -849,13 +1041,101 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
     })
 }
 
+/// The event one dispatch (op 0) carries.
+fn dispatch(name: Option<&str>, seq: Option<u64>, data: &serde_json::Value) -> Event {
+    use serde::Deserialize;
+    let name = name.unwrap_or("unnamed");
+    let malformed = |error: String| Event::Malformed {
+        event: e6irc_client::bounded_diagnostic(name),
+        channel: data
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        error,
+    };
+    if seq.is_none() {
+        return malformed("the dispatch had no sequence number".into());
+    }
+    let read = |error: serde_json::Error| malformed(error.to_string());
+    match name {
+        "READY" => match ReadyData::deserialize(data) {
+            Ok(ready) if !ready.session_id.is_empty() => Event::Ready {
+                session_id: ready.session_id,
+                resume_url: ready.resume_gateway_url,
+            },
+            Ok(_) => malformed("READY without a session id".into()),
+            Err(error) => read(error),
+        },
+        "RESUMED" => Event::Resumed,
+        "MESSAGE_CREATE" => match MessageData::deserialize(data) {
+            Ok(message) => {
+                let unrelayable = message.unrelayable();
+                Event::Message(DiscordMessage {
+                    channel_id: message.channel_id,
+                    author_id: message.author.id,
+                    author: message.author.username,
+                    content: message.content,
+                    attachments: message
+                        .attachments
+                        .into_iter()
+                        .map(|attachment| attachment.url)
+                        .collect(),
+                    mentions: mention_names(message.mentions),
+                    unrelayable,
+                    edit: None,
+                })
+            }
+            Err(error) => read(error),
+        },
+        "MESSAGE_UPDATE" => match UpdateData::deserialize(data) {
+            Ok(UpdateData {
+                id,
+                channel_id,
+                author,
+                content: Some(content),
+                edited_timestamp: Some(edited),
+                mentions,
+            }) => match author {
+                Some(author) => Event::Message(DiscordMessage {
+                    channel_id,
+                    author_id: author.id,
+                    author: author.username,
+                    content,
+                    attachments: Vec::new(),
+                    mentions: mention_names(mentions),
+                    unrelayable: "edited".into(),
+                    edit: Some((id, edited)),
+                }),
+                None => malformed("an edit without its author".into()),
+            },
+            Ok(_) => Event::Ignore,
+            Err(error) => read(error),
+        },
+        "GUILD_CREATE" | "THREAD_LIST_SYNC" => match ThreadList::deserialize(data) {
+            Ok(list) => Event::Threads(thread_parents(list.threads)),
+            Err(error) => read(error),
+        },
+        "THREAD_CREATE" | "THREAD_UPDATE" => match ThreadChannel::deserialize(data) {
+            Ok(thread) => Event::Threads(thread_parents(vec![thread])),
+            Err(error) => read(error),
+        },
+        "THREAD_DELETE" => match ThreadDeleted::deserialize(data) {
+            Ok(thread) => Event::ThreadGone(thread.id),
+            Err(error) => read(error),
+        },
+        _ => Event::Ignore,
+    }
+}
+
 async fn gateway_url(http: &super::BridgeHttp, base: &str) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct GatewayResponse {
         url: String,
     }
 
-    let response: GatewayResponse = super::bridge_send(http.get(&format!("{base}/gateway"))?)
+    let response: GatewayResponse = http
+        .get(&format!("{base}/gateway"))?
+        .send()
         .await?
         .bounded_json()
         .await?;
@@ -945,6 +1225,52 @@ async fn fetch_channel_name(
     }
 }
 
+/// IRC text as Discord shows it: literally. Discord reads Markdown in a
+/// message — `*`, `_`, `~`, `` ` ``, `|` and `\` anywhere, `[` opening a
+/// masked link, `<` a mention, emoji or timestamp tag, and at the start of the
+/// text a heading (`#`), subtext (`-#`), block quote (`>`) or list item (`-`,
+/// `+`, `1.`) — so each is escaped with a backslash, which Discord shows as
+/// nothing but the character. A URL is left whole: an escape inside it would
+/// become part of the link. An IRC `/me`'s italics wrap the escaped text, so an
+/// underscore in it no longer ends them early.
+fn escape_markdown(text: &str) -> String {
+    const ANYWHERE: &[char] = &['\\', '*', '_', '~', '`', '|', '<', '[', ']'];
+    const LINE_START: &[char] = &['#', '>', '-', '+'];
+    let mut out = String::with_capacity(text.len() + 8);
+    let indent = text.len() - text.trim_start().len();
+    out.push_str(&text[..indent]);
+    let mut rest = &text[indent..];
+    if rest.starts_with(LINE_START) {
+        out.push('\\');
+    } else {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with('.') {
+            out.push_str(&rest[..digits]);
+            out.push_str("\\.");
+            rest = &rest[digits + 1..];
+        }
+    }
+    let mut previous: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        let url = (rest.starts_with("https://") || rest.starts_with("http://"))
+            && !previous.is_some_and(char::is_alphanumeric);
+        if url {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            out.push_str(&rest[..end]);
+            previous = rest[..end].chars().next_back();
+            rest = &rest[end..];
+            continue;
+        }
+        if ANYWHERE.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+        previous = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 async fn send_message(
     http: &super::BridgeHttp,
     base: &str,
@@ -969,10 +1295,10 @@ async fn send_message(
         .post(&format!("{base}/channels/{channel_id}/messages"))?
         .header("Authorization", format!("Bot {token}"))
         .json(&MessageRequest {
-            content: text.italic_markdown(str::to_string),
+            content: text.italic_markdown(escape_markdown),
             allowed_mentions: AllowedMentions { parse: [] },
         });
-    super::bridge_send(req).await?;
+    req.send().await?;
     Ok(())
 }
 
@@ -1129,7 +1455,13 @@ mod tests {
                 Event::InvalidSession { resumable } if resumable == expected
             ));
         }
-        assert!(parse_frame(r#"{"op":9}"#).is_err());
+        // Op 9 ends the session whatever its data says; only `true` resumes.
+        for frame in [r#"{"op":9}"#, r#"{"op":9,"d":"yes"}"#] {
+            assert!(matches!(
+                parse_frame(frame).expect("invalid session").event,
+                Event::InvalidSession { resumable: false }
+            ));
+        }
         assert!(matches!(
             parse_frame(r#"{"op":0,"s":4,"t":"RESUMED","d":{}}"#)
                 .expect("resumed")
@@ -1139,19 +1471,60 @@ mod tests {
         assert!(parse_frame("not json").is_err());
     }
 
+    /// Data a dispatch cannot be read with is never given defaults — and is
+    /// never a session error either: the frame keeps its sequence number, so
+    /// the session counts it and a RESUME does not replay it. Ending the
+    /// session on it resumed into the same frame, forever; a READY like it
+    /// spent an IDENTIFY on every attempt. Only a frame with no envelope, or a
+    /// HELLO the connection cannot run on, is an error.
     #[test]
-    fn rejects_malformed_known_frames_instead_of_defaulting_fields() {
+    fn a_dispatch_that_cannot_be_read_is_malformed_under_its_sequence_number() {
         assert!(parse_frame(r#"{"op":10,"d":{}}"#).is_err());
         assert!(parse_frame(r#"{"op":10,"d":{"heartbeat_interval":0}}"#).is_err());
-        assert!(parse_frame(r#"{"op":0,"t":"READY","d":{"user":{"id":"999"}}}"#).is_err());
+        assert!(parse_frame(r#"{"d":{}}"#).is_err(), "no op: no envelope");
+        assert!(parse_frame(r#"{"op":0,"s":"seven"}"#).is_err());
+        let malformed = |frame: &str| match parse_frame(frame).expect("an envelope") {
+            Frame {
+                seq,
+                event: Event::Malformed { event, channel, .. },
+            } => (seq, event, channel),
+            _ => panic!("{frame} was not malformed"),
+        };
+        assert_eq!(
+            malformed(r#"{"op":0,"t":"READY","d":{"user":{"id":"999"}}}"#),
+            (None, "READY".to_string(), None)
+        );
         // A READY without the session it opened cannot be resumed later.
-        assert!(parse_frame(r#"{"op":0,"s":1,"t":"READY","d":{"user":{"id":"999"}}}"#).is_err());
-        assert!(
-            parse_frame(
+        assert_eq!(
+            malformed(r#"{"op":0,"s":1,"t":"READY","d":{"user":{"id":"999"}}}"#),
+            (Some(1), "READY".to_string(), None)
+        );
+        assert_eq!(
+            malformed(
                 r#"{"op":0,"s":8,"t":"MESSAGE_CREATE","d":{"channel_id":"42","content":"hi",
-               "author":{"id":"7"}}}"#
+                   "author":{"id":"7"}}}"#
+            ),
+            (
+                Some(8),
+                "MESSAGE_CREATE".to_string(),
+                Some("42".to_string())
             )
-            .is_err()
+        );
+        assert_eq!(
+            malformed(r#"{"op":0,"s":9,"t":"MESSAGE_CREATE","d":"not a message"}"#),
+            (Some(9), "MESSAGE_CREATE".to_string(), None)
+        );
+        // An edit without its author cannot be shown as anyone's.
+        assert_eq!(
+            malformed(
+                r#"{"op":0,"s":10,"t":"MESSAGE_UPDATE","d":{"id":"5","channel_id":"42",
+                   "content":"x","edited_timestamp":"2026-01-01T00:00:00Z"}}"#
+            ),
+            (
+                Some(10),
+                "MESSAGE_UPDATE".to_string(),
+                Some("42".to_string())
+            )
         );
     }
 
@@ -1173,7 +1546,9 @@ mod tests {
                 }),
                 "#general",
                 &crate::bouncer::Inbound::message("hi there")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":alice!7@discord PRIVMSG #general :hi there"]
         );
         // The map is keyed by the *folded* channel name (as the driver inserts).
@@ -1258,6 +1633,97 @@ mod tests {
         );
     }
 
+    /// What an IRC user types is what Discord shows: every Markdown mark is
+    /// escaped, anywhere or at the start where it only counts there, and a
+    /// URL is left whole so it still links.
+    #[test]
+    fn outbound_text_reads_literally_on_discord() {
+        for (irc, posted) in [
+            ("plain words, no marks.", "plain words, no marks."),
+            (
+                "*a* _b_ ~~c~~ `d` ||e|| \\f",
+                "\\*a\\* \\_b\\_ \\~\\~c\\~\\~ \\`d\\` \\|\\|e\\|\\| \\\\f",
+            ),
+            ("# heading", "\\# heading"),
+            ("-# subtext", "\\-# subtext"),
+            ("> quote", "\\> quote"),
+            ("- item", "\\- item"),
+            ("+ item", "\\+ item"),
+            ("12. item", "12\\. item"),
+            ("  # indented", "  \\# indented"),
+            ("a - b > c # d", "a - b > c # d"),
+            ("[x](https://evil.example)", "\\[x\\](https://evil.example)"),
+            ("<@123> <t:1:R>", "\\<@123> \\<t:1:R>"),
+            (
+                "see https://x.example/a_b*c_ and _this_",
+                "see https://x.example/a_b*c_ and \\_this\\_",
+            ),
+            ("nohttps://x_y", "nohttps://x\\_y"),
+        ] {
+            assert_eq!(escape_markdown(irc), posted, "{irc:?}");
+        }
+        assert_eq!(
+            crate::bouncer::BridgeText::Action("uses my_var".into())
+                .italic_markdown(escape_markdown),
+            "_uses my\\_var_"
+        );
+    }
+
+    /// A configured channel is a snowflake; anything else is refused where
+    /// the driver is built, not looked up as a path segment and retried.
+    #[test]
+    fn a_configured_channel_must_be_a_snowflake() {
+        assert_eq!(
+            DiscordChannelId::parse("1234567890123456789").map(|id| id.as_str().to_string()),
+            Ok("1234567890123456789".to_string())
+        );
+        for bad in [
+            "",
+            "general",
+            "#general",
+            "+42",
+            "042",
+            "0",
+            "42 ",
+            "99999999999999999999999",
+            "https://discord.com/channels/1/2",
+        ] {
+            assert!(DiscordChannelId::parse(bad).is_err(), "{bad:?}");
+        }
+        let error = crate::bouncer::build_driver(crate::bouncer::DriverSpec {
+            kind: crate::config::NetworkKind::Discord,
+            owner: Some("owner".into()),
+            name: "discord".into(),
+            addr: String::new(),
+            tls: true,
+            nick: String::new(),
+            username: None,
+            realname: String::new(),
+            autojoin: vec![
+                crate::bouncer::AutojoinEntry {
+                    channel: "42".into(),
+                    key: None,
+                },
+                crate::bouncer::AutojoinEntry {
+                    channel: "general".into(),
+                    key: None,
+                },
+            ],
+            buffer_cap: 16,
+            sasl_account: None,
+            sasl_password: Some("token".into()),
+            server_password: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            first_dial: crate::bouncer::FirstDial::Immediate,
+        })
+        .err()
+        .expect("a channel name is not a channel id");
+        assert!(
+            error.contains("\"general\" is not a Discord channel id"),
+            "{error}"
+        );
+    }
+
     /// The channel lookup is the first request that carries the token, so it
     /// is where a revoked token is first refused. Reading that 401 as a
     /// transient request failure re-sent the dead token forever, although the
@@ -1272,7 +1738,7 @@ mod tests {
         let config = DiscordConfig {
             token: "revoked-token".into(),
             api_base: oracle.api_base.clone(),
-            channels: vec!["42".into()],
+            channels: vec![DiscordChannelId::parse("42").expect("a snowflake")],
             internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
         };
@@ -1297,7 +1763,7 @@ mod tests {
             DiscordConfig {
                 token: "discord-token".into(),
                 api_base: oracle.api_base.clone(),
-                channels: vec!["42".into()],
+                channels: vec![DiscordChannelId::parse("42").expect("a snowflake")],
                 internal_upstreams: crate::egress::InternalUpstreams::Allow,
                 buffer_cap: 10,
             }
@@ -1607,6 +2073,16 @@ mod tests {
                     "PRIVMSG #general :\u{2}bold\u{2} \u{3}4,2red\u{3} @everyone",
                     "bold red @everyone",
                 ),
+                // IRC text reads literally: no Markdown, no heading, and a
+                // `/me` stays italic whatever underscores it holds.
+                (
+                    "PRIVMSG #general :# not *bold* or ||hidden||",
+                    "\\# not \\*bold\\* or \\|\\|hidden\\|\\|",
+                ),
+                (
+                    "PRIVMSG #general :\u{1}ACTION renames snake_case_name\u{1}",
+                    "_renames snake\\_case\\_name_",
+                ),
             ] {
                 assert_eq!(handle.send(line), crate::bouncer::SendOutcome::Sent);
                 loop {
@@ -1753,7 +2229,7 @@ mod tests {
             ] {
                 let oracle = manual(Options::default()).await;
                 let config = DiscordConfig {
-                    channels: vec![channel.into()],
+                    channels: vec![DiscordChannelId::parse(channel).expect("a snowflake")],
                     ..config(&oracle)
                 };
                 let (_handle, mut ends) = NetworkHandle::channels(10);
@@ -1827,6 +2303,209 @@ mod tests {
             );
         }
 
+        /// Every `DriverEvent::Line` until one contains `until`, without the
+        /// time tag; panics after three seconds.
+        async fn lines_until(
+            events: &mut tokio::sync::broadcast::Receiver<DriverEvent>,
+            until: &str,
+        ) -> Vec<String> {
+            let mut lines = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Ok(DriverEvent::Line(line)) = events.recv().await {
+                        let line = crate::bouncer::without_tag(&line.line, "time");
+                        let done = line.contains(until);
+                        lines.push(line);
+                        if done {
+                            return;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no line containing {until:?} in {lines:?}"));
+            lines
+        }
+
+        /// The next connection the driver opens is `connection`.
+        async fn reconnected(oracle: &mut Oracle, connection: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                loop {
+                    if let Some(OracleEvent::Connected(n)) = oracle.events.recv().await
+                        && n == connection
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the driver never reconnected");
+        }
+
+        /// A dispatch the bridge cannot read is said in its channel when that
+        /// channel is bridged (only logged when it is not), the session goes
+        /// on, and its sequence number is counted — the RESUME after a drop
+        /// asks for what came after it. Ending the session on it resumed into
+        /// the same frame, and failed on it, forever.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unreadable_dispatch_is_said_counted_and_passed() {
+            let mut oracle = manual(Options::default()).await;
+            let handle = Box::new(DiscordDriver::new(config(&oracle))).start();
+            let mut events = handle.subscribe();
+            identify(&mut oracle, 0, 60_000).await;
+            let unreadable = |seq: u64, channel: &str| {
+                json!({ "op": 0, "s": seq, "t": "MESSAGE_CREATE",
+                        "d": { "channel_id": channel, "content": "no author" } })
+            };
+            oracle.send(0, unreadable(2, "42"));
+            oracle.send(0, unreadable(3, "99"));
+            oracle.send(0, discord_message_frame(4, "after the bad ones"));
+            let lines = lines_until(&mut events, "after the bad ones").await;
+            let notices: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.contains("malformed"))
+                .collect();
+            assert_eq!(
+                notices,
+                [
+                    ":*bnc* NOTICE #general :discord: a malformed message from an unknown sender \
+                  was not relayed"
+                ],
+                "{lines:?}"
+            );
+            oracle.close(0, 4000);
+            reconnected(&mut oracle, 1).await;
+            oracle.send(1, discord_hello_frame(60_000));
+            let (_, frame) = oracle.next_frame("RESUME").await;
+            assert_eq!(frame["op"], 6, "{frame}");
+            assert_eq!(frame["d"]["seq"], 4, "{frame}");
+            handle.shutdown_and_wait().await;
+        }
+
+        /// A READY the bridge cannot read leaves no session to resume, but the
+        /// connection works: it is relayed on, and not identified again. A
+        /// session that ended on it spent an IDENTIFY on every attempt, and
+        /// Discord resets a token past a thousand a day.
+        #[tokio::test]
+        async fn an_unreadable_ready_does_not_spend_another_identify() {
+            let mut oracle = manual(Options::default()).await;
+            let (handle, session) = spawn_session(&oracle);
+            let mut events = handle.subscribe();
+            assert!(matches!(
+                oracle.next("connection").await,
+                OracleEvent::Connected(0)
+            ));
+            oracle.send(0, discord_hello_frame(60_000));
+            let (_, frame) = oracle.next_frame("IDENTIFY").await;
+            assert_eq!(frame["op"], 2);
+            oracle.send(
+                0,
+                json!({ "op": 0, "s": 1, "t": "READY", "d": { "user": { "id": "bot" } } }),
+            );
+            oracle.send(0, discord_message_frame(2, "still relayed"));
+            line_containing(&mut events, "still relayed").await;
+            assert!(!session.is_finished(), "the session ended on the READY");
+            while let Ok(event) = oracle.events.try_recv() {
+                if let OracleEvent::ClientFrame(_, text) = event {
+                    assert!(!text.contains("\"op\":2"), "identified again: {text}");
+                }
+            }
+        }
+
+        /// Discord's RESUME refused (op 9 `d:false`): the next connection
+        /// identifies afresh, and what was said in between is not coming —
+        /// each bridged channel is told so.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_refused_resume_is_announced_as_a_gap() {
+            let mut oracle = manual(Options::default()).await;
+            let handle = Box::new(DiscordDriver::new(config(&oracle))).start();
+            let mut events = handle.subscribe();
+            identify(&mut oracle, 0, 60_000).await;
+            line_containing(&mut events, "component connected").await;
+            oracle.close(0, 4000);
+            reconnected(&mut oracle, 1).await;
+            oracle.send(1, discord_hello_frame(60_000));
+            let (_, frame) = oracle.next_frame("RESUME").await;
+            assert_eq!(frame["op"], 6, "{frame}");
+            oracle.send(1, json!({ "op": 9, "d": false }));
+            reconnected(&mut oracle, 2).await;
+            oracle.send(2, discord_hello_frame(60_000));
+            let (_, frame) = oracle.next_frame("IDENTIFY").await;
+            assert_eq!(frame["op"], 2, "{frame}");
+            oracle.send(2, discord_ready_frame(&oracle));
+            let lines = lines_until(&mut events, "without resuming").await;
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some(
+                    ":*bnc* NOTICE #general :the bridge reconnected without resuming where it \
+                     stopped; messages sent while it was disconnected may not have been relayed"
+                ),
+                "{lines:?}"
+            );
+            handle.shutdown_and_wait().await;
+        }
+
+        /// One policy on every bridge: a thread reply is a line in its parent
+        /// channel, and an edit is `* <new text>`. A thread's messages used to
+        /// be dropped (the thread is a channel of its own, which no
+        /// configuration names) and edits ignored. An update that is no edit
+        /// (an embed unfolding) says nothing, and one edit is said once.
+        #[tokio::test]
+        async fn thread_replies_and_edits_are_lines_in_the_bridged_channel() {
+            let mut oracle = manual(Options::default()).await;
+            let (handle, _session) = spawn_session(&oracle);
+            let mut events = handle.subscribe();
+            identify(&mut oracle, 0, 60_000).await;
+            let alice = json!({ "id": "user", "username": "alice" });
+            let in_channel = |seq: u64, channel: &str, content: &str| {
+                json!({ "op": 0, "s": seq, "t": "MESSAGE_CREATE",
+                        "d": { "channel_id": channel, "content": content, "author": alice } })
+            };
+            let update = |seq: u64, content: &str, edited: Option<&str>| {
+                json!({ "op": 0, "s": seq, "t": "MESSAGE_UPDATE",
+                        "d": { "id": "500", "channel_id": "42", "content": content,
+                               "edited_timestamp": edited, "author": alice } })
+            };
+            oracle.send(
+                0,
+                json!({ "op": 0, "s": 2, "t": "GUILD_CREATE", "d": { "id": "1", "threads": [
+                    { "id": "77", "parent_id": "42" }, { "id": "88", "parent_id": "999" } ] } }),
+            );
+            oracle.send(0, in_channel(3, "77", "in an old thread"));
+            oracle.send(
+                0,
+                json!({ "op": 0, "s": 4, "t": "THREAD_CREATE",
+                        "d": { "id": "78", "parent_id": "42" } }),
+            );
+            oracle.send(0, in_channel(5, "78", "in a new thread"));
+            oracle.send(0, in_channel(6, "88", "in another channel's thread"));
+            oracle.send(0, update(7, "fixed", Some("2026-09-27T10:00:00+00:00")));
+            oracle.send(0, update(8, "fixed", Some("2026-09-27T10:00:00+00:00")));
+            oracle.send(0, update(9, "unfolded", None));
+            oracle.send(
+                0,
+                json!({ "op": 0, "s": 10, "t": "THREAD_DELETE", "d": { "id": "78" } }),
+            );
+            oracle.send(0, in_channel(11, "78", "in a deleted thread"));
+            oracle.send(0, in_channel(12, "42", "the end"));
+            let lines = lines_until(&mut events, "the end").await;
+            let relayed: Vec<&str> = lines
+                .iter()
+                .filter(|line| line.contains(" PRIVMSG "))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                relayed,
+                [
+                    ":alice!user@discord PRIVMSG #general :in an old thread",
+                    ":alice!user@discord PRIVMSG #general :in a new thread",
+                    ":alice!user@discord PRIVMSG #general :* fixed",
+                    ":alice!user@discord PRIVMSG #general :the end",
+                ],
+                "{lines:?}"
+            );
+        }
+
         /// Remote text never reaches an IRC client as a CTCP request.
         #[tokio::test]
         async fn inbound_control_bytes_are_dropped() {
@@ -1855,7 +2534,7 @@ mod tests {
         let config = Shared::new(DiscordConfig {
             token: "discord-token".into(),
             api_base: oracle.api_base.clone(),
-            channels: vec!["42".into()],
+            channels: vec![DiscordChannelId::parse("42").expect("a snowflake")],
             internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
         });

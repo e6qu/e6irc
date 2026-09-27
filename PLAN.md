@@ -1121,6 +1121,50 @@ Maintainer decisions implemented from a review of resource bounds (DESIGN
   Excess Flood. The allowance keeps Solanum's shape (40, then 20 a second) and
   its operator exemption.
 
+A review of the bridges found, and this change fixes, each with a test that
+failed before (DESIGN §10.5):
+
+- **One remote message could detach every attached client.** A message was
+  one IRC line per newline, unbounded, published in a tight loop into a
+  broadcast of 1024: two thousand newlines overflowed it, every attached
+  client was detached as too slow, the backlog writer recorded a gap, and
+  blank lines went out as empty `PRIVMSG`s. A message is now at most 16 lines
+  and a counted notice, blank lines are left out, and a burst (a resumed
+  Matrix sync, a Discord RESUME's replay) waits for the subscribers.
+- **One unreadable Discord dispatch ended every session.** A `MESSAGE_CREATE`
+  that did not decode ended the session before its sequence number was
+  counted, so each RESUME replayed it into the same failure; a bad READY spent
+  an IDENTIFY on every attempt. The envelope is read first, each dispatch on
+  its own, and an unreadable one is a "malformed" notice in its channel.
+- **A lost position was never announced.** A Matrix kick forgot the whole sync
+  position, and a refused Discord RESUME started afresh, so what every other
+  channel said meanwhile was skipped without a word. Every bridge now says so
+  in each channel, once, when a session cannot resume; a Matrix kick drops
+  only that room from the position and rejoins it.
+- **Slack configuration errors were retried forever.** Only the token codes
+  parked; `missing_scope`, `not_allowed_token_type`, `invalid_arguments` and
+  the like reconnected on the transient schedule. Slack errors are a typed
+  classification now, and what only the owner can fix parks at once. A
+  Discord channel id is parsed as a snowflake with the configuration.
+- **Slack skipped the shared status check.** Its Web API calls decoded the body
+  of a 3xx or 5xx as the answer and ignored a 429's wait, so failed name
+  lookups hammered a rate-limited Slack. Every bridge request is a
+  `BridgeRequest` whose only send reads the status.
+- **A Slack bot was renamed by its own edits**, to its id and back, and a bot's
+  message could look up nine mentions where eight were meant.
+
+Maintainer decisions implemented for the bridges:
+
+- **Discord text reads literally.** Outbound text is escaped for Discord's
+  Markdown, so IRC text is not rendered as headings, quotes, lists, spoilers
+  or masked links, and a `/me` stays italic whatever underscores it holds.
+- **One policy for threads and edits.** A thread reply is a line in its
+  parent's bridged channel and an edit is `* <new text>` on every bridge;
+  Discord dropped thread messages and ignored edits, and Matrix read an edit
+  only from its fallback body.
+- **Matrix keeps its long poll.** A client's line is delivered while `/sync`
+  waits, instead of cancelling and reissuing it per line.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
