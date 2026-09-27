@@ -216,10 +216,7 @@ pub(crate) fn session_action(
             close_killed(state, conn, &comment, &killer, &killer_prefix);
         }
         crate::core::state::SessionAction::Ghost { by } => {
-            let server = state.config.server_name.clone();
-            let reason = format!("GHOST command used by {by}");
-            state.send(conn, &format!("ERROR :Closing Link: {server} ({reason})"));
-            state.close(conn, &reason);
+            state.close_with_error(conn, &format!("GHOST command used by {by}"));
         }
         crate::core::state::SessionAction::Regain { nick, by, by_mask } => {
             super::services::regain_nick_from(state, conn, nick, by, &by_mask);
@@ -317,24 +314,15 @@ fn close_killed(
         return;
     };
     let reason = format!("Killed ({killer} ({comment}))");
-    let server = state.config.server_name.clone();
     // Snotice every other oper (the victim, if an oper, is about to be closed).
     notify_opers(
         state,
         Some(victim),
         &format!("Received KILL message for {target} from {killer}: {comment}"),
     );
-    // The reason is echoed inside this ERROR wrapper, whose overhead can push a
-    // maximal KILL comment past the wire limit — fit it like the QUIT path does,
-    // or the victim's framing discards the whole close notice (and the debug wire
-    // check would abort the core worker on an oper-typed line). The trailing `)`
-    // is part of the head's cost: include it before fitting, re-append after.
     let kill = fitted_line(format!(":{source} KILL {target} :"), comment);
     state.send(victim, &kill);
-    let head = format!("ERROR :Closing Link: {server} (");
-    let fitted = fit_trailing(&format!("{head})"), &reason);
-    state.send(victim, &format!("{head}{fitted})"));
-    state.close(victim, &reason);
+    state.close_with_error(victim, &reason);
 }
 
 /// The database queue would not take an audit row.
@@ -796,12 +784,7 @@ fn apply_server_ban_hot(state: &mut ServerState, ban: ServerBan) {
     // a `public|private` reason.
     let reason = crate::core::state::public_ban_reason(&ban.reason);
     for victim in victims {
-        // A stored reason is bounded where a ban is set, but a row written by
-        // an older build or by hand is not: fit it like the KILL close.
-        let head = format!("ERROR :Closing Link: ({label}d: ");
-        let fitted = fit_trailing(&format!("{head})"), reason);
-        state.send(victim, &format!("{head}{fitted})"));
-        state.close(victim, &format!("{label}d: {reason}"));
+        state.close_with_error(victim, &format!("{label}d: {reason}"));
     }
 }
 

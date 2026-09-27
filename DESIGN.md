@@ -296,6 +296,29 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `MemberModes::sigils` — the one renderer of a member's rank sigils,
     honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
     copy that ignored the capability.
+  - `ChannelName` — a channel name the server will create is parsed once, by
+    one rule (`sanitize::ChannelName::parse`: `#`, at most `CHANNELLEN` bytes,
+    no space, `,`, `:`, C0 control, DEL or U+00A0), where a name enters: JOIN
+    (on the sender's shard, before the channel's owner is asked, which takes
+    only a `ChannelName`), a bridged channel, a read marker's target. A
+    boolean validator was re-checked at each and let the formatting controls
+    through, so `#lib\x0fera` could be created and shown as `#libera`.
+  - `closing_link` — every disconnection's `ERROR :Closing Link: <host>
+    (<reason>)` is built by one function that fits the reason to the wire, and
+    the core closes a session with it through `ServerState::close_with_error`.
+    A dozen hand-built copies had four shapes, and one did not fit its reason:
+    a long ban reason stored by an older build made an over-long line at
+    registration, a panic of the shared worker in a debug build.
+  - `IdleSince` and `Session::last_received` — idle time and liveness are two
+    clocks. Idle (WHOIS 317, WHOX `l`) moves only with a PRIVMSG, as Solanum's
+    `localClient->last`; liveness moves with every line and drives the
+    reaper's PING. One clock moved by every command made a bot that polled
+    `ISON` look present forever.
+  - `Presence` — a presence query (WHOIS, WHO, ISON, USERHOST, MONITOR,
+    INVITE) finds a nick in the user directory or as a services pseudo-client
+    from one function (`handler::services::presence`), so NickServ and
+    ChanServ answer every such query alike from one record each; before, each
+    command asked only the user directory and called them absent.
   - `render_multiline` — one renderer for a multiline message's delivered
     forms, used by local delivery, the channel owner and CHATHISTORY replay,
     so the three cannot frame, tag or fit it differently.
@@ -889,7 +912,12 @@ strip = "symbols"
   worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
   Other traffic keeps flowing beside the rows, and a labeled one stays one
   labeled batch across its turns. A second `LIST` aborts the first (`/LIST
-  aborted`), so a connection paces at most one.
+  aborted`), so a connection paces at most one. A bare `NAMES` — every
+  channel the asker may see, with the members it may see, then the users in
+  no channel, as Solanum's `names_global` — is the same sweep with a
+  `353` row per channel (`ChannelSweep::Names`), paced beside a LIST in its
+  own slot (`Session::channel_names`) and ending `366 * :End of /NAMES list`;
+  a second one while it is answering gets `263 RPL_TRYAGAIN` and its `366`.
 - A `LIST` keeps a cursor, not a copy of the channel list (`core/list.rs`,
   as Solanum's SAFELIST keeps its place in the channel hash). Its reply opens
   at once; each channel shard is then asked, turn by turn, for the next page
@@ -915,7 +943,8 @@ strip = "symbols"
   that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
   channel's `WHO` is paced on the asker's shard, from the rows its owner sent
   back. What is being paced lives on the session (`Session::channel_list`,
-  `Session::paced_who`), so it cannot outlive the connection: a remote
+  `Session::channel_names`, `Session::paced_who`), so it cannot outlive the
+  connection: a remote
   channel's WHO rows or LIST rows that arrive after the asker closed find no
   session and are dropped with it, where a paced reply once queued for a
   closed connection aborted the worker.
@@ -996,7 +1025,25 @@ strip = "symbols"
   to clone its member list a hundred times). A list mode named more than once
   in one MODE is dumped once. `TOPIC <channel>` with one parameter is a query
   however it is framed (`TOPIC :#c` used to clear the topic). Every echo of
-  client text, PONG included, is fitted to the 512-byte wire limit.
+  client text, PONG included, is fitted to the 512-byte wire limit. A JOIN of
+  a name no channel may have (`ChannelName`, §2: over `CHANNELLEN`, only the
+  `#`, or a space, `,`, `:`, control character or U+00A0 in it) is
+  `479 ERR_BADCHANNAME`, checked before the `#` as Solanum's `m_join` does
+  (Solanum refuses its fake-channel characters so under
+  `disable_fake_channels`, which Libera sets); a name without the `#` is 403.
+  A channel registered under such a name by an older build is named at
+  startup, since no one can join it (drop it from the administrators' channel
+  directory or its owner's console).
+- Every disconnection ends with one line, Solanum's `ERROR :Closing Link:
+  <host> (<reason>)`, its reason fitted to the wire (`sanitize::closing_link`).
+- Nick changes are throttled as Solanum's `anti_nick_flood` does at the
+  values its reference configuration and Libera run (`max_nick_changes = 5`,
+  `max_nick_time = 20 seconds`): a sixth change within twenty seconds of the
+  last is `438 ERR_NICKTOOFAST` (`<nick> <new> :Nick change too fast. Please
+  wait 20 seconds.`) until twenty seconds pass without an attempt; a refused
+  attempt counts, a nick someone else holds does not, and operators are
+  exempt. Named constants (`MAX_NICK_CHANGES`, `MAX_NICK_TIME_MS`), as the
+  knock delays are.
 - Registration pipeline: `CAP LS 302` → (SASL) → NICK/USER → welcome burst
   (001–005 with ISUPPORT, LUSERS, MOTD).
 - SASL-required mode, globally (`limits.require_sasl = true`) or for clients
@@ -1371,7 +1418,11 @@ subset's exact behavior.
   Solanum's `knock_delay` / `knock_delay_channel`). RPL_KNOCK goes to every
   member of a `+g` channel, to the operators otherwise, in Solanum's shape:
   `710 <channel> <channel> <nick!user@host> :has asked for an invite.` `QUIT` with no comment
-  leaves as `Quit: <nick>`, `QUIT :` with an empty reason. PART of a channel
+  leaves as `Quit: <nick>`, `QUIT :` with an empty reason; a connection younger
+  than Solanum's `anti_spam_exit_message_time` — five minutes, as Solanum's
+  reference configuration and Libera run it (`ANTI_SPAM_EXIT_MESSAGE_TIME_MS`,
+  a named constant like the knock delays) — leaves as `Client Quit` whatever
+  it said, unless it is an operator. PART of a channel
   that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
   cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
@@ -1452,7 +1503,14 @@ subset's exact behavior.
   A pseudo-client speaks as `<Service>!<Service>@services.<server>` — its
   notices and every channel mode ChanServ sets (a mode lock's correction,
   `OP`/`VOICE` and their inverses, an access holder's op or voice on join)
-  alike, from one helper (`ServerState::service_prefix`).
+  alike, from one helper (`ServerState::service_prefix`). It is present, as
+  that record with Atheme's real name for it ("Nickname Services", "Channel
+  Services"), to every presence query, as Libera's services are to Solanum:
+  WHOIS answers 311, 312, `313 :is a Network Service` and 318 (no channels, no
+  idle time — Solanum's `m_whois` for a service), WHO of its nick shows its
+  row, and ISON, USERHOST and MONITOR find it online. An INVITE for one is
+  answered 341 once the channel checks pass, as Solanum answers the INVITE it
+  relays to services, and goes no further (a service joins no channel).
   - NickServ: `REGISTER`, `IDENTIFY`, `LOGOUT`; `GROUP`/`UNGROUP` add the
     current nick to the identified account or remove a grouped one (an account
     holds at most five nicks, its name included — Atheme's `maxnicks`; a nick
@@ -1562,6 +1620,35 @@ Concretely:
   no `displayed_usercount` floor hides small channels from a bare `LIST`, and
   no global `pace_wait` answers a busy moment with `RPL_LOAD2HI`.
 - NickServ/ChanServ surface per §7.6.
+- Presence and query surfaces answer as Solanum's do:
+  - WHOIS idle time (317) and WHOX `l` count from the user's last PRIVMSG —
+    to a channel or a user, itself included — as Solanum's `m_message` sets
+    `localClient->last`; a NOTICE, a TAGMSG or any other command leaves it
+    running (`IdleSince`, §2). WHOIS 312 carries the server's description,
+    the text LINKS shows, not the network name.
+  - WHOIS looks up the first nick of a list (`WHOIS a,b` is `a`); `WHOIS :`
+    and `WHOWAS :` are 431 and `PING :` is 409. A server argument — WHOIS's
+    first of two, VERSION's, TIME's, MOTD's, ADMIN's, or the first of LINKS's
+    two — is resolved as `hunt_server` resolves one: this server's name, a
+    mask matching it, or anyone's nick is answered here, and anything else is
+    `402 ERR_NOSUCHSERVER`. `LINKS <mask>` lists the servers matching the mask.
+  - A WHO mask is matched against the nick, username, host, server and
+    realname (`who_global`); a mask that is a nick written out in full shows
+    that user alone, even when invisible, beside the first channel (in name
+    order) the asker shares with them or, unless they are invisible, that is
+    not secret, with their rank there (`m_who`), `*` when there is none. The
+    second parameter reads as Solanum reads it: `o` in front for operators
+    only, and the WHOX selector after a `%` anywhere; a WHOX token longer than
+    three characters is answered as `0`.
+  - MONITOR skips a target that is not a nick (Solanum's `clean_nick`), so a
+    `#chan` or a spaced name takes no slot and never reaches 731/732.
+  - INVITE names the invitee by their own nick, carried from the sender's
+    shard (`ChannelInvitee`), and follows 341 with 301 when they are away.
+  - WHOWAS keeps at most `WHOWAS_PER_NICK` (20) records of one nick within its
+    `WHOWAS_CAP` (1,000), so a user reconnecting under one nick replaces its
+    own oldest rather than pushing out everyone else's. Solanum bounds only
+    the whole history; twenty is what its `m_whowas` answers a remote WHOWAS
+    with.
 - **Relayed messages name their target canonically**, as Solanum's do: a
   PRIVMSG, NOTICE, TAGMSG or multiline batch to `#FOO` reaches members (and the
   sender's echo) addressed to the channel's own name, `#foo`, with any

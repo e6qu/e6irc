@@ -98,6 +98,7 @@ pub(super) fn cmd_message(
         }
         return;
     }
+    note_spoken(state, conn, kind);
     for (delivered, target) in ordered.into_iter().enumerate() {
         if delivered >= TARGMAX {
             if loud {
@@ -111,6 +112,19 @@ pub(super) fn cmd_message(
             break;
         }
         deliver_one_message(state, conn, &target, text, kind, &client_tags, loud);
+    }
+}
+
+/// A PRIVMSG is what moves its sender's idle clock ([`IdleSince`]): Solanum's
+/// `msg_channel`, `msg_channel_flags` and `msg_client` (`m_message.c`) set
+/// `localClient->last` for a PRIVMSG — "idle time shouldn't be reset by
+/// notices or tagmsg" — to a channel or a user, the sender itself included.
+///
+/// [`IdleSince`]: crate::core::state::IdleSince
+fn note_spoken(state: &mut ServerState, conn: ConnId, kind: crate::core::MessageKind) {
+    if kind == crate::core::MessageKind::Privmsg {
+        let now = (state.config.mono_clock)();
+        state.sessions[&conn].idle_since.set(now);
     }
 }
 
@@ -1087,6 +1101,7 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             // batch with nothing to send.
             match batch.complete() {
                 Ok(message) => {
+                    note_spoken(state, conn, message.kind());
                     let (_, channel_target) = StatusSigil::split(message.target());
                     let owner = state.channel_owner(channel_target);
                     if channel_target.starts_with('#') && !state.owns_channel(&owner) {

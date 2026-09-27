@@ -154,7 +154,7 @@ where
             Err(error) => return Err(classify_lookup_error(id, error)),
         };
         let channel = format!("#{name}");
-        if !crate::sanitize::valid_channel_name(&channel) {
+        if crate::sanitize::ChannelName::parse(&channel).is_err() {
             eprintln!(
                 "{provider}: channel {id} has an unsafe name {name:?}; refusing to bridge it"
             );

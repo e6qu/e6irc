@@ -1347,6 +1347,46 @@ Maintainer decisions implemented from the last sweep (DESIGN §8, §11, §18):
   binds straight to the reloaded revision** (`follow_bnc_listener`, shared with
   the settings watcher).
 
+Maintainer decisions implemented from a review of Solanum and Libera parity
+(DESIGN §7.2, §7.6, §7.7):
+
+- **NickServ and ChanServ are present to presence queries** — WHOIS, WHO,
+  ISON, USERHOST, MONITOR and INVITE — from one record per service.
+- **Nick changes are throttled** at Solanum's `anti_nick_flood` values as
+  Libera runs them (five per twenty seconds, 438), operators exempt; and one
+  nick keeps at most twenty WHOWAS records.
+- **A bare NAMES lists every visible channel**, then the users in no channel,
+  paced as a LIST is and across every shard.
+- **A young connection's QUIT comment is `Client Quit`** (Solanum's
+  `anti_spam_exit_message_time`, five minutes, as Libera). irctest's
+  `testQuit`, which quits after one second, is deselected with that reason.
+
+The same review found, and this change fixes, each with a test that failed
+before:
+
+- **A channel name could hide a formatting control**: `JOIN #lib\x0fera`
+  created a channel shown as `#libera`. Channel names are parsed once
+  (`ChannelName`) and a look-alike or over-long one is 479, as Solanum's
+  `disable_fake_channels` refuses one.
+- **Any command reset WHOIS idle time**; only a PRIVMSG does now, and the
+  reaper keeps its own liveness clock.
+- **INVITE named the invitee as the inviter typed it** and never said they
+  were away; it uses their own nick and follows 341 with 301.
+- **Empty, listed and server targets**: `WHOIS :`, `WHOWAS :` and `PING :`
+  were answered as a missing nick or not at all, `WHOIS a,b` looked up
+  `a,b`, and a server argument to WHOIS, VERSION, TIME, MOTD, ADMIN or LINKS
+  was ignored; they are 431, 409, the first nick, and 402 or answered here.
+- **WHO** matched a mask against nick and host only, and showed `*` for a
+  nick's channel; it matches username, server and realname too and shows a
+  channel the asker may see. Its `o` flag and WHOX selector parse as
+  Solanum's do, and the help says so.
+- **MONITOR stored targets that could never be nicks**, including a spaced one
+  that broke its 731/732 lists.
+- **Closing lines had four shapes**, and a long stored ban reason made an
+  over-long one at registration; one function builds and fits them all.
+- WHOIS 312 carried the network name where Solanum puts the server's
+  description; MODE's help left out `+R`; `MAXLIST`'s comment said per list.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

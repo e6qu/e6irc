@@ -1065,12 +1065,9 @@ where
         Ok(Ok(Registered::Closed)) => return Ok(()),
         Ok(Err(e)) => return Err(e),
         Err(_) => {
-            write
-                .write_all(
-                    format!(":{server_name} ERROR :Closing Link: BNC registration timed out\r\n")
-                        .as_bytes(),
-                )
-                .await?;
+            let goodbye =
+                crate::sanitize::closing_link(&peer.to_string(), "BNC registration timed out");
+            write.write_all(format!("{goodbye}\r\n").as_bytes()).await?;
             write.flush().await?;
             return Ok(());
         }
@@ -1537,13 +1534,12 @@ where
                                         sasl_network = selected;
                                     }
                                     PlainVerification::AttemptsExhausted => {
+                                        let goodbye = crate::sanitize::closing_link(
+                                            &peer.to_string(),
+                                            "Too many authentication attempts",
+                                        );
                                         write
-                                            .write_all(
-                                                format!(
-                                                    ":{server_name} ERROR :Closing Link: too many authentication attempts\r\n"
-                                                )
-                                                .as_bytes(),
-                                            )
+                                            .write_all(format!("{goodbye}\r\n").as_bytes())
                                             .await?;
                                         return Ok(Registered::Closed);
                                     }
