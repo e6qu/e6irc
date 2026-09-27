@@ -34,7 +34,7 @@ async fn upstream() -> std::net::SocketAddr {
 
 /// A bouncer whose account `alice` owns one network, `up`, on `upstream`.
 async fn bouncer(
-    url: String,
+    url: e6ircd::db::DatabaseUrl,
     upstream: std::net::SocketAddr,
     public_url: Option<&str>,
 ) -> std::net::SocketAddr {
@@ -327,7 +327,9 @@ async fn upgrade_status(http: std::net::SocketAddr, headers: &[(&'static str, St
 
 /// A fresh database holding `alice` and one browser session, as the database
 /// URL and the session's `Cookie` header.
-async fn database_with_session(database: &str) -> (String, (&'static str, String)) {
+async fn database_with_session(
+    database: &str,
+) -> (e6ircd::db::DatabaseUrl, (&'static str, String)) {
     let url = support::test_db(database).await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await

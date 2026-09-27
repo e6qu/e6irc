@@ -110,6 +110,10 @@ pub fn bnc_secret_context(owner: &str) -> Vec<u8> {
 
 /// Default backlog buffer capacity for a runtime-created (DB-backed) network.
 const DB_NETWORK_BUFFER_CAP: usize = 1000;
+const _: () = assert!(
+    DB_NETWORK_BUFFER_CAP <= crate::config::MAX_NETWORK_BUFFER_CAP,
+    "a stored network's buffer must fit what storage keeps, or a restart restores less"
+);
 
 /// The one credential-field shape accepted by config, HTTP, stored-row driver
 /// construction, and runtime edits.
@@ -4924,6 +4928,11 @@ impl NetworkHandle {
     }
 
     /// Subscribe to the driver's event stream (one receiver per attach).
+    /// The most lines the replay buffer holds: the network's `buffer_cap`.
+    pub(crate) fn buffer_capacity(&self) -> usize {
+        self.buffer.lock().expect("buffer poisoned").cap
+    }
+
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<DriverEvent> {
         self.events.subscribe()
     }

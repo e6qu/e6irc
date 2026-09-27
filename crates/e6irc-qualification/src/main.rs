@@ -910,7 +910,7 @@ fn verify_scale_result(
     if report
         .get("format_version")
         .and_then(serde_json::Value::as_u64)
-        != Some(2)
+        != Some(3)
     {
         return Err("scale result.json has an unsupported format version".into());
     }
@@ -941,6 +941,45 @@ fn verify_scale_result(
             return Err(format!(
                 "scale result.json workload {name} does not match evidence"
             ));
+        }
+    }
+    // The shard count is the one workload figure the load harness does not
+    // choose: the server does. The harness read it from the server
+    // (`server_core_shards`), and both it and the claim must be the recorded
+    // one, or the evidence would describe a server nobody measured.
+    let core_workers = evidence
+        .workload
+        .0
+        .get("core_workers")
+        .ok_or("scale evidence omits workload core_workers")?
+        .0
+        .parse::<u64>()
+        .map_err(|_| "scale workload core_workers must be an integer")?;
+    if request
+        .get("core_workers")
+        .and_then(serde_json::Value::as_u64)
+        != Some(core_workers)
+    {
+        return Err("scale result.json workload core_workers does not match evidence".into());
+    }
+    // A failed run may have failed before it could ask; a completed one asked.
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("completed") {
+        match report
+            .get("server_core_shards")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(observed) if observed == core_workers => {}
+            Some(observed) => {
+                return Err(format!(
+                    "scale result.json observed {observed} core shard(s) on the server, but the \
+                     evidence records core_workers={core_workers}"
+                ));
+            }
+            None => {
+                return Err(
+                    "scale result.json does not say how many core shards the server ran".into(),
+                );
+            }
         }
     }
     let thresholds = request
@@ -1311,11 +1350,12 @@ mod tests {
         let host_path = directory.join("host.txt");
         fs::write(&host_path, "controlled host\n").expect("write host provenance");
         let host_sha256 = sha256_file(&host_path).expect("hash host provenance");
-        let result = |target: &str| {
+        let result_with_shards = |target: &str, shards: u64| {
             format!(
-                r#"{{"status":"completed","report":{{"format_version":2,"request":{{"addr":"{target}","clients":2,"channels":1,"burst":3,"host_provenance_sha256":"{host_sha256}","thresholds":{{"minimum_connect_rate":1.0,"minimum_fanout_rate":2.0,"maximum_p99_ms":3.0,"maximum_server_rss_per_connection_bytes":4}}}},"outcome":"passed"}}}}"#
+                r#"{{"status":"completed","report":{{"format_version":3,"request":{{"addr":"{target}","clients":2,"channels":1,"burst":3,"host_provenance_sha256":"{host_sha256}","core_workers":1,"senders_are_operators":false,"server_command_burst":40,"thresholds":{{"minimum_connect_rate":1.0,"minimum_fanout_rate":2.0,"maximum_p99_ms":3.0,"maximum_server_rss_per_connection_bytes":4}}}},"server_core_shards":{shards},"outcome":"passed"}}}}"#
             )
         };
+        let result = |target: &str| result_with_shards(target, 1);
         let result_path = directory.join("result.json");
         fs::write(&result_path, result("127.0.0.1:6667")).expect("write result");
         let mut evidence = QualificationEvidence {
@@ -1368,6 +1408,22 @@ mod tests {
             .expect("artifacts")
             .verify_files(&evidence_path, &evidence)
             .expect("verify raw evidence");
+
+        // The server ran another number of core shards than the evidence
+        // records: the qualification describes a server nobody measured.
+        fs::write(&result_path, result_with_shards("127.0.0.1:6667", 4)).expect("rewrite result");
+        evidence.scale_artifacts =
+            Some(ScaleArtifacts::capture(&evidence_path).expect("recapture raw"));
+        let mismatch = evidence
+            .scale_artifacts
+            .as_ref()
+            .expect("artifacts")
+            .verify_files(&evidence_path, &evidence)
+            .expect_err("the observed shard count is checked");
+        assert!(mismatch.contains("observed 4 core shard(s)"), "{mismatch}");
+        fs::write(&result_path, result("127.0.0.1:6667")).expect("restore result");
+        evidence.scale_artifacts =
+            Some(ScaleArtifacts::capture(&evidence_path).expect("recapture raw"));
 
         fs::write(&result_path, result("127.0.0.1:6668")).expect("rewrite result");
         assert!(

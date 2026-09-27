@@ -981,7 +981,13 @@ strip = "symbols"
   held only where an operator had turned it on. `"off"` turns it off (a
   deployment whose reverse proxy throttles these routes itself); `0` is
   refused, and a stored `null` from before (the old unset) is migrated to the
-  default (0088).
+  default (0088). Behind a reverse proxy every request comes from the proxy's
+  address, so without `limits.trusted_proxies` every user shares one budget;
+  start warns once when that is certain — the throttle on, no trusted proxy,
+  and the HTTP listener bound only to loopback, so every client is on this
+  host (`Config::shared_authentication_budget`). A listener bound wider may or
+  may not sit behind a proxy, which start cannot see; the deployment guide's
+  upgrade notes say what to set.
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with
@@ -1742,7 +1748,12 @@ Principal tables (columns abridged):
   in-memory backlog is held to the same rate: `buffer_cap` lines and
   `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), oldest first,
   its newest line always kept, on every push and when a stored backlog is
-  restored. Rows older than `storage.history_retention_days`
+  restored. A start restores a network's whole `buffer_cap` from this table:
+  `buffer_cap` is bounded by what the table keeps (`MAX_NETWORK_BUFFER_CAP`,
+  the constant `BNC_BUFFER_CAP` is), so the replay the setting promises
+  survives a restart. It used to accept 100,000 while the table kept 5,000 and
+  a start restored 1,000, so anything above that held only until the next
+  restart; migration 0091 brought a stored `buffer_cap` above 5,000 to 5,000. Rows older than `storage.history_retention_days`
   are deleted by storage maintenance in bounded batches (index
   `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
   bouncer history, direct messages included, not only the server's own. Read
@@ -4537,7 +4548,9 @@ The snapshot is the sole source for:
   application observation protected by a deployment-owned
   `E6IRC_MONITORING_TOKEN`. The process retains only its SHA-256 digest, checks
   the bearer in constant time, and publishes the same real fixed-cardinality
-  IRC, BNC, queue, error, and uptime counters. It omits `cost_estimate` because
+  IRC, BNC, queue, error, and uptime counters, and `core.shards`, the number of
+  core shards the process built (what a load qualification checks its claimed
+  `core_workers` against). It omits `cost_estimate` because
   the application is not itself a priced resource; inventing one would violate
   provenance;
 - `/console/logs` and `/api/v1/admin/logs`, administrator-only live views of
@@ -4675,7 +4688,15 @@ Layers, bottom to top:
    resident set and rejects incremental growth above 1 MiB per requested
    connection; controlled hosts can supply a stricter bytes/connection
    ceiling. Recorded manual baselines reach 2,000 clients; production
-   performance thresholds and the 100k run are not qualified.
+   performance thresholds and the 100k run are not qualified. A burst whose
+   lines and fence exceed the server's command burst (`limits.command_burst`)
+   is refused unless the senders oper up (`--oper-name`, the password from the
+   environment; operators are exempt from the flood limiter), since past it the
+   run times the limiter, not fan-out. The core-shard count a run claims
+   (`--core-workers`) is checked against the server's own, read from its
+   monitoring observation (`core.shards`); a mismatch rejects the run, and
+   `e6irc-qualification verify` refuses scale evidence whose result does not
+   show the recorded `core_workers`.
 
 ---
 
@@ -4692,6 +4713,27 @@ Layers, bottom to top:
   shared pool (2–200; default 1 serial worker + 4 Argon2 permits + 2 × CPU
   threads) and is logged at startup. Database settings are bootstrap-only; the
   console does not edit them.
+- `[database] url` / `E6IRC_DATABASE_URL` is parsed once, when the
+  configuration is read, into a `DatabaseUrl` that states the whole
+  connection. Its query keys are a closed set (`db::url::QUERY_KEYS`: `host`,
+  `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`,
+  `sslkey` with their hyphenated spellings, `application_name`, `options` as
+  `-c name=value` settings, `statement-cache-capacity`); any other key, a
+  misspelt `sslmode` value, or a field stated twice is refused naming what is
+  wrong and nothing the URL holds. sqlx used to drop an unknown key with a log
+  line (`ssl_mode=verify-full` connected with `prefer`: no certificate
+  verification) and filled every field a URL left out from libpq's environment
+  and `~/.pgpass`. The options are now built field by field without a password
+  file, and because sqlx's only constructor still reads libpq's variables for
+  fields it cannot unset, a database-backed configuration refuses to load
+  while `PGHOST`, `PGSSLMODE`, `PGPASSWORD` or any other of them is set, naming
+  each (a stray `PGSSLMODE=disable` turned TLS off). `hostaddr` and
+  `connect_timeout` are refused: sqlx cannot honour them as libpq does.
+  `tools/postgres-url-environment.py` accepts exactly the same keys (a source
+  test compares the lists), refuses the same duplicates, and removes every
+  inherited libpq variable before its client runs, so a backup connects where
+  the daemon does. The URL's shown form (`Debug`, `Display`) never carries the
+  password.
 - A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
   secrets-key source, HTTP bind, immutable release revision, and either
   initial administrator grants (imported on the first start, console-owned
@@ -4715,7 +4757,14 @@ Layers, bottom to top:
   its authority, a rotated `E6IRC_OIDC_CLIENT_SECRET` was never used. The
   operator resolves it by removing the setting from the bootstrap (the stored
   value then applies), aligning it with the stored value, or changing it in the
-  console first. A setting the bootstrap does not state is never a conflict: a
+  console first. That includes the three every server needs: a
+  database-backed document may leave out `server_name`, `network_name` and
+  `[[listeners]]` (and `E6IRC_SERVER_NAME` may be unset), which then take the
+  stored revision's values (`Config::left_to_stored_settings`); a first start
+  with none stored refuses naming each it leaves out, and a document without
+  `[database]` must state them. File mode used to require all three, so a name
+  changed in the console could only be copied back into the file. A setting
+  the bootstrap does not state is never a conflict: a
   file's absent key, or an environment variable left unset whose default the
   environment reader fills in (`E6IRC_NETWORK_NAME`, `E6IRC_IRC_ADDR`,
   `E6IRC_SECURE_COOKIES`; `EnvironmentDocument::defaulted`). A configuration
@@ -4727,7 +4776,20 @@ Layers, bottom to top:
   drift check needs the database, so `check-config` cannot make it and its
   success report says so; `recover-administrator` does not start the server
   and is unaffected. Writes use compare-and-swap revisions and a same-transaction
-  redacted audit entry; stale writers fail visibly. The write takes the scalar
+  redacted audit entry; stale writers fail visibly. Several processes write the
+  row — every replica's console (several replicas may serve one database) and
+  `e6ircd rotate-secrets` — and each server holds the stored revision in
+  memory, so the table announces every committed write (migration 0090, a
+  trigger notifying `e6irc_server_settings_changed`, as 0077 does for
+  credentials) and every running server adopts a later revision it hears
+  (`settings_watch`): the snapshot the console and the maintenance loops read
+  is replaced and the BNC attach listener is brought to what it says — exactly
+  what a console save in that process applies, and nothing restart-only. A
+  save that still finds its revision stale reloads the stored row before it
+  answers (`db::save_managed_config_over`), so the conflict it reports is one
+  the administrator can read and a retry from it commits; the snapshot used to
+  stay stale and refuse every later save until a restart. A lost listening
+  connection is re-established and the row read again. The write takes the scalar
   settings only: the collections that hold secrets (OIDC providers, operators,
   server-level networks) are kept from the current revision and changed through
   their own endpoints. They may nevertheless be *sent back exactly as read* --
@@ -4766,11 +4828,24 @@ Layers, bottom to top:
   ≤ 64, `core_queue` ≤ 1,048,576, 17,406 ≤ `sendq_bytes` ≤ 33,554,432,
   `max_hot_channels` ≤ 1,048,576, `max_history_ring_bytes` ≤ 65,536,000,
   `max_hot_history_bytes` ≤ 68,719,476,736 and at least
-  `max_history_ring_bytes`, a network's `buffer_cap` ≤ 100,000. `usize::MAX`
+  `max_history_ring_bytes`, a network's `buffer_cap` ≤ 5,000 (what the stored
+  backlog keeps, §8, so a restart restores all of it). `usize::MAX`
   workers used to validate. `sendq` counted lines until migration 0088 renamed
   it `sendq_bytes` (a stored count became that many 512-byte lines); a
   configuration file that still states `sendq` is refused by name rather than
-  read as a byte count a five-hundredth of what it meant.
+  read as a byte count a five-hundredth of what it meant. Texts a reply
+  carries whole are bounded by the reply's room at the longest server name (64
+  bytes) and nickname (64): `description`, `RPL_LINKS`' server information, at
+  most 242 bytes, and each `motd` line, an `RPL_MOTD`, at most 372 — as the
+  names themselves are, since `numeric_line` clips what does not fit without a
+  word. The console's form and the OpenAPI schema state the same bounds.
+  "Every console save" includes what start reads beside the document: a save
+  is judged against the running process's own bootstrap values — its HTTP
+  listener, its `application_release_revision` (which a `shauth` provider
+  requires; the save used a made-up one, so a provider saved and the next
+  start refused it) — and every certificate the settings name (`listeners[].tls`,
+  `bnc_tls`) is read and matched as start and `check-config` read them
+  (`certificate::load_configured`).
 - The BNC registry exists whenever PostgreSQL does, independently of the raw
   attach listener. Its listener is runtime-managed: enabling or rebinding first
   binds the replacement socket, swaps only after success, and retains the
@@ -4803,7 +4878,8 @@ Layers, bottom to top:
   and makes the process exit non-zero. HTTP-to-core control requests have a
   five-second reply deadline, so even a live but wedged core cannot hold an
   API request forever.
-- BNC listener and observability-sampling changes apply live. Core
+- BNC listener, observability-sampling and storage-retention changes apply
+  live, on every running server whichever wrote them. Core
   identity/limits, IRC listeners, OIDC,
   operator, and access-policy changes are stored immediately and explicitly
   reported as restart-required; no response claims those values were applied

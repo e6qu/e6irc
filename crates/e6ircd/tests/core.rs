@@ -1487,6 +1487,53 @@ fn motd_and_lusers_commands() {
     assert!(has_numeric(&out, "251") && has_numeric(&out, "255"));
 }
 
+/// The longest description and motd line the configuration admits arrive
+/// whole at the longest server name and nickname, and one byte more would not:
+/// the bounds are the replies' own room, so neither text is ever clipped by
+/// the numeric's wire fit.
+#[test]
+fn the_longest_admitted_description_and_motd_line_arrive_whole() {
+    use e6ircd::config::{
+        MAX_DESCRIPTION_LEN, MAX_MOTD_LINE_LEN, MAX_NICKLEN, MAX_SERVER_NAME_LEN,
+    };
+    let server_name = format!(
+        "{}.example",
+        "s".repeat(MAX_SERVER_NAME_LEN - ".example".len())
+    );
+    let description = "d".repeat(MAX_DESCRIPTION_LEN);
+    let motd = "m".repeat(MAX_MOTD_LINE_LEN);
+    let mut s = TestServer::configured(
+        false,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.server_name = server_name.clone();
+            config.nicklen = MAX_NICKLEN;
+            config.description = description.clone();
+            config.motd = vec![motd.clone()];
+        },
+    );
+    let nick = format!("n{}", "x".repeat(MAX_NICKLEN - 1));
+    let c = s.register(1, &nick);
+    s.drain(c);
+    for (command, numeric, text) in [("LINKS", "364", &description), ("MOTD", "372", &motd)] {
+        s.line(c, command);
+        let reply = s
+            .drain(c)
+            .into_iter()
+            .find(|line| line.split(' ').nth(1) == Some(numeric))
+            .unwrap_or_else(|| panic!("{command} answers {numeric}"));
+        assert!(
+            reply.ends_with(text.as_str()),
+            "{command} was clipped: {reply}"
+        );
+        assert_eq!(
+            reply.len(),
+            e6irc_proto::message::MAX_LINE_LEN - 2,
+            "{command}'s reply fills the line exactly, so one byte more would be clipped"
+        );
+    }
+}
+
 // ---- IRCv3 capability negotiation ---------------------------------------
 
 #[test]

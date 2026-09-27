@@ -366,6 +366,7 @@ impl AppState {
             http_listener: self.http_bind,
             hsts_include_subdomains: self.hsts_include_subdomains,
             internal_upstreams: self.internal_upstreams,
+            application_release_revision: self.application_release_revision.clone(),
         }
     }
 

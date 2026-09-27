@@ -287,9 +287,6 @@ impl Slot {
     }
 }
 
-/// How many recent lines to restore into a network's buffer at start.
-const PRELOAD_LIMIT: i64 = 1000;
-
 impl Registry {
     /// The server's policy on upstreams inside its own network.
     pub fn internal_upstreams(&self) -> crate::egress::InternalUpstreams {
@@ -806,7 +803,11 @@ fn spawn_persistence(
     // fast enough for that window to be real.
     let events = handle.subscribe();
     let task = tokio::spawn(async move {
-        match crate::db::recent_bnc_backlog(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
+        // The whole buffer the network is configured to replay: its
+        // `buffer_cap` is bounded by what storage keeps
+        // (`config::MAX_NETWORK_BUFFER_CAP`), so a restart restores it all.
+        let restore = i64::try_from(handle.buffer_capacity()).unwrap_or(i64::MAX);
+        match crate::db::recent_bnc_backlog(&pool, &owner_key, &network, restore).await {
             Ok(lines) => handle.preload_front(lines),
             Err(e) => {
                 handle.record_error(super::NetworkFailure::BacklogStorageFailed);
@@ -1651,12 +1652,19 @@ where
     })
 }
 
+/// Whether `selector` is `<nick>` or `<nick>/<network>` in the attach
+/// grammar. The nickname is held to the longest any e6irc admits
+/// ([`crate::config::MAX_NICKLEN`]):
+/// the network it names — the in-process one, whose `nicklen` may be that
+/// long, or an upstream with its own — judges it further.
 fn attach_selector_ok(selector: &str) -> bool {
+    const LONGEST: usize = crate::config::MAX_NICKLEN;
     match selector.split_once('/') {
         Some((nick, network)) => {
-            crate::sanitize::valid_nick(nick, 30) && crate::sanitize::valid_network_name(network)
+            crate::sanitize::valid_nick(nick, LONGEST)
+                && crate::sanitize::valid_network_name(network)
         }
-        None => crate::sanitize::valid_nick(selector, 30),
+        None => crate::sanitize::valid_nick(selector, LONGEST),
     }
 }
 
@@ -2181,6 +2189,21 @@ mod handshake_tests {
         assert!(!attach_selector_ok("alice/"));
         assert!(!attach_selector_ok("alice/bad/name"));
         assert!(!attach_selector_ok(&format!("alice/{}", "x".repeat(65))));
+    }
+
+    /// The nickname in a selector is held to the longest nickname any e6irc
+    /// admits — the most a server's `nicklen` can be —
+    /// not to a literal 30, which turned away a 40-byte nickname the
+    /// server itself would have accepted.
+    #[test]
+    fn a_selector_admits_every_nickname_length_the_server_does() {
+        let longest = format!("n{}", "x".repeat(crate::config::MAX_NICKLEN - 1));
+        assert!(attach_selector_ok(&longest));
+        assert!(attach_selector_ok(&format!("{longest}/libera")));
+        assert!(attach_selector_ok(&"a".repeat(40)));
+        let longer = format!("{longest}x");
+        assert!(!attach_selector_ok(&longer));
+        assert!(!attach_selector_ok(&format!("{longer}/libera")));
     }
 
     /// A refused nick or unknown command is echoed as one middle parameter:

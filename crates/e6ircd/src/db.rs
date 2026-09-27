@@ -19,10 +19,15 @@ use e6irc_queue::Receiver;
 
 mod credential_change;
 mod secret_rotation;
+mod settings_change;
+mod url;
 pub use credential_change::{
     CredentialChange, CredentialChangeListener, RevocableCredential, credential_remaining,
 };
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
+pub(crate) use settings_change::{SettingsChange, SettingsChangeListener};
+pub(crate) use url::LIBPQ_ENVIRONMENT;
+pub use url::{DatabaseUrl, DatabaseUrlError};
 
 /// Migrations are compiled into the binary; startup refuses to run on
 /// checksum drift (sqlx's default) rather than guessing.
@@ -352,10 +357,10 @@ impl TryFrom<u32> for DatabasePoolSize {
 /// must see. This fails at once with that reason, and the bound keeps an
 /// unroutable address from hanging startup on the operating system's connect
 /// timeout.
-async fn connect_directly(url: &str) -> Result<sqlx::PgConnection, DbError> {
+async fn connect_directly(url: &DatabaseUrl) -> Result<sqlx::PgConnection, DbError> {
     tokio::time::timeout(
         DATABASE_ACQUIRE_TIMEOUT,
-        <sqlx::PgConnection as sqlx::Connection>::connect(url),
+        <sqlx::PgConnection as sqlx::Connection>::connect_with(&url.connect_options()),
     )
     .await
     .map_err(|_| {
@@ -365,6 +370,28 @@ async fn connect_directly(url: &str) -> Result<sqlx::PgConnection, DbError> {
         )))
     })?
     .map_err(DbError::Connect)
+}
+
+/// A listener for `NOTIFY` on a connection of its own, not one of the shared
+/// pool's, which it would hold for the process lifetime. It is what
+/// `PgListener::connect` builds — a one-connection pool that only
+/// re-establishes the connection — made from the parsed URL's options.
+pub(crate) async fn notification_listener(
+    url: &DatabaseUrl,
+) -> Result<sqlx::postgres::PgListener, DbError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .max_lifetime(None)
+        .idle_timeout(None)
+        .connect_with(url.connect_options())
+        .await
+        .map_err(DbError::Connect)?;
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .map_err(DbError::Connect)?;
+    // The pool is this listener's alone; nothing closes it but the listener.
+    listener.ignore_pool_close_event(true);
+    Ok(listener)
 }
 
 /// Whether a migration failed because a statement waited out
@@ -393,7 +420,10 @@ fn migration_waited_on_a_lock(error: &sqlx::migrate::MigrateError) -> bool {
 /// connection with a doubling pause, [`MIGRATION_LOCK_ATTEMPTS`] times in all.
 /// Every other migration failure is a fact about the schema and is returned at
 /// once.
-pub async fn run_migrations(url: &str, migrator: &sqlx::migrate::Migrator) -> Result<(), DbError> {
+pub async fn run_migrations(
+    url: &DatabaseUrl,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), DbError> {
     let mut pause = Duration::from_secs(1);
     for attempt in 1..=MIGRATION_LOCK_ATTEMPTS {
         let mut connection = connect_directly(url).await?;
@@ -436,11 +466,14 @@ pub async fn run_migrations(url: &str, migrator: &sqlx::migrate::Migrator) -> Re
 /// (`recover-administrator`, secret rotation), which opens connections only as
 /// it uses them. The daemon opens its pool through
 /// [`connect_and_migrate_with_retry`], at its configured size.
-pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
+pub async fn connect_and_migrate(url: &DatabaseUrl) -> Result<PgPool, DbError> {
     connect_and_migrate_sized(url, DatabasePoolSize::for_this_host()).await
 }
 
-async fn connect_and_migrate_sized(url: &str, size: DatabasePoolSize) -> Result<PgPool, DbError> {
+async fn connect_and_migrate_sized(
+    url: &DatabaseUrl,
+    size: DatabasePoolSize,
+) -> Result<PgPool, DbError> {
     run_migrations(url, &MIGRATOR).await?;
     // Every caller shares this pool, including HTTP handlers and the database
     // worker. A dependency interruption must therefore produce a bounded,
@@ -468,7 +501,7 @@ async fn connect_and_migrate_sized(url: &str, size: DatabasePoolSize) -> Result<
                 Ok(())
             })
         })
-        .connect(url)
+        .connect_with(url.connect_options())
         .await
         .map_err(DbError::Connect)
 }
@@ -523,7 +556,7 @@ pub struct StartupDatabaseAttempt<'a> {
 /// are retried: a migration failure is a fact about the schema that waiting
 /// cannot change, and is returned at once.
 pub async fn connect_and_migrate_with_retry(
-    url: &str,
+    url: &DatabaseUrl,
     wait: StartupDatabaseWait,
     size: DatabasePoolSize,
     mut report: impl FnMut(StartupDatabaseAttempt<'_>),
@@ -1157,8 +1190,18 @@ pub async fn load_or_initialize_managed_config(
 }
 
 pub async fn load_managed_config(pool: &PgPool) -> Result<ManagedConfigSnapshot, DbError> {
+    stored_managed_config(pool)
+        .await?
+        .ok_or_else(|| DbError::InvalidServerSettings("settings row is missing".into()))
+}
+
+/// The stored settings revision, or `None` before the first start has
+/// imported one.
+pub async fn stored_managed_config(
+    pool: &PgPool,
+) -> Result<Option<ManagedConfigSnapshot>, DbError> {
     use sqlx::Row;
-    let row = sqlx::query(
+    let Some(row) = sqlx::query(
         "SELECT revision, settings, updated_by,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS \"UTC\"') AS updated_at
          FROM server_settings WHERE singleton",
@@ -1166,13 +1209,15 @@ pub async fn load_managed_config(pool: &PgPool) -> Result<ManagedConfigSnapshot,
     .fetch_optional(pool)
     .await
     .map_err(query_error)?
-    .ok_or_else(|| DbError::InvalidServerSettings("settings row is missing".into()))?;
-    Ok(ManagedConfigSnapshot {
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ManagedConfigSnapshot {
         revision: row.get("revision"),
         settings: decode_managed_settings(row.get("settings"))?,
         updated_by: row.get("updated_by"),
         updated_at: row.get("updated_at"),
-    })
+    }))
 }
 
 /// Store a complete typed settings revision and its redacted audit description
@@ -1220,6 +1265,43 @@ pub async fn save_managed_config(
         updated_by: actor.name().to_string(),
         updated_at,
     })
+}
+
+/// [`save_managed_config`] over the revision `current` holds, keeping `current`
+/// what is stored: the new revision when the save commits, and the stored row
+/// when another writer (a replica's console, `e6ircd rotate-secrets`) got there
+/// first. Without the reload a stale snapshot stayed stale, and every later
+/// save from it failed the same way until the process restarted; with it, the
+/// [`DbError::StaleServerSettings`] this returns is true of a revision the
+/// administrator can now read, and a retry from it works. What the stored
+/// revision changes live (the BNC attach listener) is applied by
+/// `crate::settings_watch`, which hears the other writer's commit.
+pub async fn save_managed_config_over(
+    pool: &PgPool,
+    current: &mut ManagedConfigSnapshot,
+    settings: &crate::config::ManagedConfig,
+    actor: &AuditPrincipal,
+    audit_detail: &str,
+) -> Result<ManagedConfigSnapshot, DbError> {
+    match save_managed_config(pool, current.revision, settings, actor, audit_detail).await {
+        Ok(saved) => {
+            *current = saved.clone();
+            Ok(saved)
+        }
+        Err(DbError::StaleServerSettings) => {
+            match load_managed_config(pool).await {
+                Ok(stored) if stored.revision > current.revision => *current = stored,
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "managed configuration: a save found revision {} stale and the stored \
+                     revision could not be read: {error}",
+                    current.revision
+                ),
+            }
+            Err(DbError::StaleServerSettings)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn insert_primary_password(
@@ -8367,9 +8449,11 @@ pub async fn delete_bnc_network(
     Ok(true)
 }
 
-/// Rows to retain per (owner, network) in `bnc_buffer`. Only the newest are
-/// ever replayed (see `PRELOAD_LIMIT`); the rest are dead weight.
-const BNC_BUFFER_CAP: i64 = 5000;
+/// Rows to retain per (owner, network) in `bnc_buffer`: the largest
+/// `buffer_cap` a network may have ([`crate::config::MAX_NETWORK_BUFFER_CAP`]),
+/// so a start can restore any network's whole replay buffer, and CHATHISTORY
+/// reaches that far back for every network whatever its buffer holds.
+const BNC_BUFFER_CAP: i64 = crate::config::MAX_NETWORK_BUFFER_CAP as i64;
 
 /// Bytes of lines to retain per (owner, network) in `bnc_buffer`: the row cap
 /// at [`crate::bouncer::BACKLOG_BYTES_PER_LINE`] a line, the rate the

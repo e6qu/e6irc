@@ -13,7 +13,10 @@ fn cli_sasl_database_name() -> String {
 /// the environment is an administrative connection, not shared test storage:
 /// other integration binaries deliberately leave real managed configuration
 /// in it while proving restart and secret-sealing behavior.
-async fn prepare_cli_sasl_database(admin_url: &str, database_name: &str) -> String {
+async fn prepare_cli_sasl_database(
+    admin_url: &str,
+    database_name: &str,
+) -> e6ircd::db::DatabaseUrl {
     let pool = sqlx::PgPool::connect(admin_url)
         .await
         .expect("connect to the administrative database");
@@ -31,7 +34,9 @@ async fn prepare_cli_sasl_database(admin_url: &str, database_name: &str) -> Stri
 
     let mut url = reqwest::Url::parse(admin_url).expect("database URL");
     url.set_path(database_name);
-    url.to_string()
+    url.as_str()
+        .parse()
+        .expect("E6IRC_TEST_DATABASE_URL is a URL e6ircd accepts")
 }
 
 async fn drop_cli_sasl_database(admin_url: &str, database_name: &str) {

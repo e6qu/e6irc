@@ -1693,9 +1693,9 @@ pub(super) async fn admin_patch_configuration(
         restart_required,
         &current.settings.changed_fields(&settings),
     );
-    match crate::db::save_managed_config(
+    match crate::db::save_managed_config_over(
         pool_of(&state),
-        current.revision,
+        &mut current,
         &settings,
         &crate::db::AuditPrincipal::account(&actor),
         &detail,
@@ -1709,7 +1709,6 @@ pub(super) async fn admin_patch_configuration(
             state
                 .core_tx
                 .set_history_retention_days(snapshot.settings.storage.history_retention_days);
-            *current = snapshot.clone();
             admin_json(ConfigurationPatchResponse {
                 revision: snapshot.revision,
                 restart_required,
@@ -2203,22 +2202,19 @@ async fn mutate_managed_configuration(
             Some(&error.to_string()),
         );
     }
-    match crate::db::save_managed_config(
+    match crate::db::save_managed_config_over(
         pool_of(state),
-        revision,
+        &mut current,
         &settings,
         &crate::db::AuditPrincipal::account(actor),
         &format!("{detail}; restart required"),
     )
     .await
     {
-        Ok(snapshot) => {
-            *current = snapshot.clone();
-            admin_json(RevisionMessageResponse {
-                revision: snapshot.revision,
-                message: detail,
-            })
-        }
+        Ok(snapshot) => admin_json(RevisionMessageResponse {
+            revision: snapshot.revision,
+            message: detail,
+        }),
         Err(error) => managed_configuration_save_refused(error),
     }
 }

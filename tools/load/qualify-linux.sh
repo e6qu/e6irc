@@ -40,6 +40,30 @@ validate_qualification_arguments "$clients" "$channels" "$burst" || {
   exit 2
 }
 target_port="$(target_port "$addr")" || { echo "ADDR must be host:port or [ipv6]:port" >&2; exit 2; }
+# The core shards the server runs are read from the server itself, not taken
+# from CORE_WORKERS: a stored console revision can differ from any file.
+monitoring_url="${E6IRC_QUALIFICATION_MONITORING_URL:-}"
+monitoring_url "$monitoring_url" || {
+  echo "E6IRC_QUALIFICATION_MONITORING_URL must be the server's http://HOST:PORT, where the load harness reads the core shards it runs" >&2
+  exit 2
+}
+[[ -n "${E6IRC_MONITORING_TOKEN:-}" ]] || {
+  echo "E6IRC_MONITORING_TOKEN must be the server's monitoring token" >&2
+  exit 2
+}
+# Past the server's command burst the flood limiter meters each sender, and the
+# run would time the limiter rather than fan-out; IRC operators are exempt.
+oper_arguments=()
+if [[ -n "${E6IRC_QUALIFICATION_OPER_NAME:-}" ]]; then
+  [[ -n "${E6IRC_LOAD_OPER_PASSWORD:-}" ]] || {
+    echo "E6IRC_QUALIFICATION_OPER_NAME needs E6IRC_LOAD_OPER_PASSWORD, the operator's password" >&2
+    exit 2
+  }
+  oper_arguments=(--oper-name "$E6IRC_QUALIFICATION_OPER_NAME")
+elif ! burst_within_command_burst "$burst"; then
+  echo "a burst of $burst exceeds the server's command burst ($E6IRC_LOAD_DEFAULT_COMMAND_BURST lines, its fence line included): set E6IRC_QUALIFICATION_OPER_NAME and E6IRC_LOAD_OPER_PASSWORD so the senders oper up, or lower BURST" >&2
+  exit 2
+fi
 [[ -r "/proc/$server_pid/limits" ]] || { echo "cannot inspect server PID $server_pid" >&2; exit 2; }
 server_executable="$(readlink -f "/proc/$server_pid/exe")"
 [[ "$(basename "$server_executable")" == e6ircd ]] || { echo "PID $server_pid is not e6ircd" >&2; exit 2; }
@@ -101,6 +125,7 @@ memory_total="$(grep -m 1 '^MemTotal:' /proc/meminfo)"
   printf 'load_nofile=%s\nserver_nofile=%s\nrequired_fds=%s\n' "$load_nofile" "$server_nofile" "$required_fds"
   printf 'ephemeral_port_range=%s %s\nephemeral_port_capacity=%s\nsomaxconn=%s\n' "$port_low" "$port_high" "$port_capacity" "$somaxconn"
   printf 'addr=%s\ncore_workers=%s\nclients=%s\nchannels=%s\nburst=%s\n' "$addr" "$core_workers" "$clients" "$channels" "$burst"
+  printf 'monitoring_url=%s\nsenders_are_operators=%s\n' "$monitoring_url" "$([[ ${#oper_arguments[@]} -gt 0 ]] && echo true || echo false)"
   printf 'minimum_connect_rate=%s\nminimum_fanout_rate=%s\nmaximum_p99_ms=%s\nmaximum_rss_per_connection=%s\n' \
     "$minimum_connect_rate" "$minimum_fanout_rate" "$maximum_p99_ms" "$maximum_rss_per_connection"
 } > "$host"
@@ -128,6 +153,9 @@ set +e
     --clients "$clients" \
     --channels "$channels" \
     --burst "$burst" \
+    --core-workers "$core_workers" \
+    --monitoring-url "$monitoring_url" \
+    "${oper_arguments[@]}" \
     --minimum-connect-rate "$minimum_connect_rate" \
     --minimum-fanout-rate "$minimum_fanout_rate" \
     --maximum-p99-ms "$maximum_p99_ms" \

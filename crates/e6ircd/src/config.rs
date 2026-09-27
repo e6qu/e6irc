@@ -50,9 +50,35 @@ pub const MAX_HISTORY_RING_BYTES: usize = 128 * DEFAULT_HISTORY_RING_BYTES;
 pub const DEFAULT_HOT_HISTORY_BYTES: usize = 512 << 20;
 /// Most bytes every hot history ring together may hold (128× the default).
 pub const MAX_HOT_HISTORY_BYTES: usize = 128 * DEFAULT_HOT_HISTORY_BYTES;
-/// Most lines one configured network keeps in memory for replay (100× the
-/// default). Every attach copies the whole buffer.
-pub const MAX_NETWORK_BUFFER_CAP: usize = 100_000;
+/// Most lines one network keeps in memory for replay (`buffer_cap`), and the
+/// lines its stored backlog keeps (`crate::db::BNC_BUFFER_CAP` is this bound).
+/// A start restores a network's whole `buffer_cap` from that backlog, so the
+/// replay the setting promises survives a restart: a `buffer_cap` above what
+/// storage keeps used to be honoured only until then.
+pub const MAX_NETWORK_BUFFER_CAP: usize = 5_000;
+/// Longest `server_name`, in bytes. It is the source of every numeric, so it
+/// is in the fixed head of every reply; a hostname fits well within it.
+pub const MAX_SERVER_NAME_LEN: usize = 64;
+/// Longest `nicklen` a server may advertise. A nickname rides every relayed
+/// line's source prefix and is the target of every numeric.
+pub const MAX_NICKLEN: usize = 64;
+/// Longest `network_name`, in bytes: the ISUPPORT `NETWORK=` token.
+pub const MAX_NETWORK_NAME_LEN: usize = 64;
+/// Bytes of a numeric reply before its first parameter at the longest
+/// `server_name` and nickname: `:<server> <code> <nick>`. Every numeric is
+/// fitted to the wire by `numeric_line`, which clips what does not fit; a
+/// configured text that has to arrive whole is bounded against this instead.
+const MAX_NUMERIC_HEAD_LEN: usize = 1 + MAX_SERVER_NAME_LEN + 1 + 3 + 1 + MAX_NICKLEN;
+/// What a line may carry before its CRLF.
+const WIRE_LINE_BUDGET: usize = e6irc_proto::message::MAX_LINE_LEN - 2;
+/// Longest `motd` line, in bytes: what fits a `RPL_MOTD` (`<head> :- <line>`)
+/// at the longest server name and nickname, so no client is sent a clipped
+/// one.
+pub const MAX_MOTD_LINE_LEN: usize = WIRE_LINE_BUDGET - MAX_NUMERIC_HEAD_LEN - " :- ".len();
+/// Longest `description`, in bytes: what fits a `RPL_LINKS` (`<head> <server>
+/// <server> :0 <description>`) at the longest server name and nickname.
+pub const MAX_DESCRIPTION_LEN: usize =
+    WIRE_LINE_BUDGET - MAX_NUMERIC_HEAD_LEN - 2 * (1 + MAX_SERVER_NAME_LEN) - " :0 ".len();
 /// Longest account name, in bytes: an IRC nickname the account store admits.
 /// `http.admin_accounts` entries and administrator-created accounts are held
 /// to it at their respective ingresses.
@@ -158,7 +184,13 @@ fn default_max_hot_history_bytes() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The IRC server name. A database-backed document may leave it out when
+    /// the console stores it ([`Self::left_to_stored_settings`]).
+    #[serde(default)]
     pub server_name: String,
+    /// The IRC network name; like `server_name`, it may be left to the stored
+    /// settings.
+    #[serde(default)]
     pub network_name: String,
     /// Human-readable description of *this server* (RPL_LINKS `<server info>`).
     /// Distinct from `network_name`, which names the network this server
@@ -261,6 +293,27 @@ pub struct Config {
     /// not. Not a key of the document itself.
     #[serde(skip)]
     pub stated: StatedSettings,
+    /// The console-owned settings every server needs that the document
+    /// leaves out ([`LEFT_TO_STORED_SETTINGS`]): each takes the stored
+    /// revision's value at start. Allowed only beside a `[database]`, and a
+    /// first start with no stored settings to take them from is refused naming
+    /// them (`net::start`). Removing a console-owned setting from the
+    /// bootstrap is how an operator hands it to the console, so these three
+    /// may be removed like any other.
+    #[serde(skip)]
+    pub left_to_stored_settings: Vec<&'static str>,
+}
+
+/// The settings a server cannot run without that the console owns, and so
+/// that a database-backed document may leave to the stored revision.
+pub const LEFT_TO_STORED_SETTINGS: [&str; 3] = ["server_name", "network_name", "listeners"];
+
+/// The keys of [`LEFT_TO_STORED_SETTINGS`] `document` does not state.
+fn left_out_of(document: &toml::Table) -> Vec<&'static str> {
+    LEFT_TO_STORED_SETTINGS
+        .into_iter()
+        .filter(|key| !document.contains_key(*key))
+        .collect()
 }
 
 /// The keys a configuration document states, as opposed to leaving them to a
@@ -753,6 +806,8 @@ impl ManagedConfig {
     }
 
     pub fn apply_to(&self, config: &mut Config) {
+        // Each of them is set from this revision below.
+        config.left_to_stored_settings.clear();
         config.server_name.clone_from(&self.server_name);
         config.network_name.clone_from(&self.network_name);
         config.description.clone_from(&self.description);
@@ -782,15 +837,22 @@ impl ManagedConfig {
         }
     }
 
-    /// Validate through the startup parser's one configuration choke point.
-    /// Bootstrap prerequisites are supplied with inert, valid values solely so
-    /// this operational subset can be checked without reimplementing its
-    /// invariants in an HTTP handler; the bootstrap values these settings are
-    /// judged against are the running process's own ([`BootstrapContext`]).
+    /// Validate through the startup parser's one configuration choke point,
+    /// and read every certificate the settings name as start reads them. The
+    /// bootstrap values these settings are judged against are the running
+    /// process's own ([`BootstrapContext`]): its HTTP listener, its release
+    /// revision (which a `shauth` provider requires), its upstream policy. Only
+    /// the database URL is an inert stand-in: the console cannot change it,
+    /// and nothing here connects. A revision this accepts is one the next
+    /// start accepts too; judged against a made-up release revision, a
+    /// `shauth` provider saved and the next start refused it, and a listener's
+    /// certificate paths were first read by that start.
     pub fn validate(&self, bootstrap: BootstrapContext) -> Result<(), ConfigError> {
         let mut config = Config {
             database: Some(DatabaseConfig {
-                url: "postgresql://control-plane-validation".into(),
+                url: "postgresql://control-plane-validation"
+                    .parse()
+                    .expect("a literal database URL"),
                 startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
                 max_connections: None,
             }),
@@ -804,11 +866,16 @@ impl ManagedConfig {
                 hsts_include_subdomains: bootstrap.hsts_include_subdomains,
             }),
             internal_upstreams: bootstrap.internal_upstreams,
-            application_release_revision: Some("0123456789ab".into()),
+            application_release_revision: bootstrap.application_release_revision,
             ..Config::default()
         };
         self.apply_to(&mut config);
-        config.validate()
+        config.validate()?;
+        crate::certificate::load_configured(&config).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "a configured TLS certificate cannot be used: {error}"
+            ))
+        })
     }
 }
 
@@ -987,7 +1054,7 @@ fn reduce_secrets_to_equality(left: &mut ManagedConfig, right: &mut ManagedConfi
 /// The bootstrap values a managed-settings revision is judged against. They
 /// come from the file or environment the process started with — the console
 /// cannot change them — yet a managed value is valid only together with them.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BootstrapContext {
     /// The address the running HTTP listener was configured with, so a
     /// listener or bouncer address edited in the console is checked against
@@ -999,6 +1066,9 @@ pub struct BootstrapContext {
     /// The policy that decides whether a network may name an upstream inside
     /// this host's own network.
     pub internal_upstreams: crate::egress::InternalUpstreams,
+    /// `application_release_revision`, which the `shauth` provider requires to
+    /// be an immutable revision — and the providers are managed settings.
+    pub application_release_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1679,7 +1749,7 @@ pub enum TokenEndpointAuthMethod {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
-    pub url: String,
+    pub url: crate::db::DatabaseUrl,
     /// How long startup keeps retrying the first connection (doubling backoff,
     /// capped at 30 s, one line per attempt) before the process exits
     /// non-zero. `0` makes one attempt. A database that comes up after this
@@ -1803,13 +1873,13 @@ impl std::fmt::Debug for OidcProviderConfig {
 impl std::fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
-            url: _,
+            url,
             startup_wait_seconds,
             max_connections,
         } = self;
-        // The URL carries the database password.
+        // The URL shows everything but its password (`DatabaseUrl`'s `Debug`).
         f.debug_struct("DatabaseConfig")
-            .field("url", &REDACTED)
+            .field("url", url)
             .field("startup_wait_seconds", startup_wait_seconds)
             .field("max_connections", max_connections)
             .finish()
@@ -1852,6 +1922,7 @@ impl Default for Config {
             observability: ObservabilityConfig::default(),
             storage: StorageConfig::default(),
             stated: StatedSettings::Everything,
+            left_to_stored_settings: Vec::new(),
         }
     }
 }
@@ -1925,6 +1996,7 @@ impl Config {
         let mut config: Self = toml::from_str(&text).map_err(ConfigError::Parse)?;
         let document: toml::Table = toml::from_str(&text).map_err(ConfigError::Parse)?;
         config.stated = StatedSettings::of_document(&document, &[]);
+        config.left_to_stored_settings = left_out_of(&document);
         Self::checked(config)
     }
 
@@ -1935,8 +2007,10 @@ impl Config {
     /// statement, so they are not held to the stored console settings.
     pub fn from_table(table: toml::Table, defaulted: &[&str]) -> Result<Self, ConfigError> {
         let stated = StatedSettings::of_document(&table, defaulted);
+        let left_to_stored_settings = left_out_of(&table);
         let mut config: Self = table.try_into().map_err(ConfigError::Parse)?;
         config.stated = stated;
+        config.left_to_stored_settings = left_to_stored_settings;
         Self::checked(config)
     }
 
@@ -1947,9 +2021,44 @@ impl Config {
     /// enough, and a sealed client secret that opens to nothing is never empty.
     fn checked(mut config: Self) -> Result<Self, ConfigError> {
         config.validate()?;
+        config.refuse_libpq_environment(&crate::environment_config::process_environment)?;
         config.resolve_secrets()?;
         config.validate_secrets()?;
         Ok(config)
+    }
+
+    /// Refuse a database-backed configuration while one of libpq's
+    /// environment variables is set. sqlx fills every field the URL leaves
+    /// out from them (`crate::db::DatabaseUrl`), so `PGSSLMODE=disable` left
+    /// in a service's environment would turn TLS off and `PGHOST` would
+    /// redirect the connection — each without a word. The URL is the whole
+    /// description of the connection; the refusal names every variable set
+    /// and none of their values.
+    fn refuse_libpq_environment(
+        &self,
+        environment: &impl Fn(&str) -> crate::environment_config::Lookup,
+    ) -> Result<(), ConfigError> {
+        if self.database.is_none() {
+            return Ok(());
+        }
+        let set: Vec<&str> = crate::db::LIBPQ_ENVIRONMENT
+            .into_iter()
+            .filter(|variable| {
+                !matches!(
+                    crate::environment_config::optional(environment, variable),
+                    Ok(None)
+                )
+            })
+            .collect();
+        if set.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "{} set in the environment: e6ircd connects with what database.url states and \
+             nothing else, so state the connection there and unset {}",
+            set.join(", "),
+            if set.len() == 1 { "it" } else { "them" }
+        )))
     }
 
     /// Resolve the primary and rotation fallback keys from `[secrets]` or the
@@ -1959,6 +2068,31 @@ impl Config {
     /// than one being silently ignored.
     pub fn secret_keyring(&self) -> Result<Option<crate::secret::SecretKeyring>, ConfigError> {
         self.secret_keyring_from(EnvironmentSecretKeys::from_process()?)
+    }
+
+    /// Why every client would share one HTTP authentication budget, when this
+    /// configuration makes that certain: the throttle is on (the default since
+    /// 0088), no `limits.trusted_proxies` is set, and the HTTP listener binds
+    /// only a loopback address — so every request arrives from this host, which
+    /// in a deployment is a reverse proxy, and twenty sign-ins a minute is the
+    /// budget of all of them together. A listener bound wider may or may not
+    /// sit behind a proxy, which nothing here can see; the upgrade notes say
+    /// what to set then.
+    pub(crate) fn shared_authentication_budget(&self) -> Option<String> {
+        let http = self.http.as_ref()?;
+        let burst = self.limits.auth_rate_burst.burst()?;
+        if !self.limits.trusted_proxies.is_empty() || !http.addr.ip().to_canonical().is_loopback() {
+            return None;
+        }
+        Some(format!(
+            "the HTTP authentication throttle (limits.auth_rate_burst, {burst} a minute per \
+             address) is on and the HTTP listener binds only {}, so every request comes from \
+             this host: behind a reverse proxy every user shares one budget. Set \
+             limits.trusted_proxies to the proxy's address so each client is counted by the \
+             address it forwards, or set limits.auth_rate_burst = \"off\" if the proxy throttles \
+             these routes itself",
+            http.addr.ip()
+        ))
     }
 
     fn secret_keyring_from(
@@ -2164,7 +2298,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.listeners.is_empty() {
+        if !self.left_to_stored_settings.is_empty() && self.database.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "{} required: only a configuration with [database] may leave {} to the \
+                 settings the console stores",
+                self.left_to_stored_settings.join(", "),
+                if self.left_to_stored_settings.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
+            )));
+        }
+        if self.listeners.is_empty() && !self.left_to_stored_settings.contains(&"listeners") {
             return Err(ConfigError::Invalid(
                 "at least one [[listeners]] required".into(),
             ));
@@ -2196,11 +2342,13 @@ impl Config {
         // would otherwise ride onto the wire.) The `network_name` guard below
         // rejects control chars for the same reason; server_name is the more
         // sensitive field and must be at least as strict.
-        if self.server_name.is_empty()
-            || !self
-                .server_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        let left_to_stored = |key: &str| self.left_to_stored_settings.contains(&key);
+        if !left_to_stored("server_name")
+            && (self.server_name.is_empty()
+                || !self
+                    .server_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
         {
             return Err(ConfigError::Invalid(
                 "server_name must be a hostname (ASCII letters, digits, '.', '-')".into(),
@@ -2209,18 +2357,19 @@ impl Config {
         // server_name is in the fixed head of every numeric; an unbounded value
         // inflates every line's overhead and is the largest lever for pushing a
         // reply past the 512-byte wire limit. A hostname fits well within 64.
-        if self.server_name.len() > 64 {
-            return Err(ConfigError::Invalid(
-                "server_name must be at most 64 bytes".into(),
-            ));
+        if self.server_name.len() > MAX_SERVER_NAME_LEN {
+            return Err(ConfigError::Invalid(format!(
+                "server_name must be at most {MAX_SERVER_NAME_LEN} bytes"
+            )));
         }
         // network_name becomes the ISUPPORT `NETWORK=` token, a space-delimited
         // 005 middle param — a space (or control char) would split it into two
         // malformed tokens. Reject at load rather than emit a broken numeric.
-        if self.network_name.is_empty()
-            || self
-                .network_name
-                .contains(|c: char| c == ' ' || c.is_control())
+        if !left_to_stored("network_name")
+            && (self.network_name.is_empty()
+                || self
+                    .network_name
+                    .contains(|c: char| c == ' ' || c.is_control()))
         {
             return Err(ConfigError::Invalid(
                 "network_name must be a single token (no spaces or control characters)".into(),
@@ -2228,10 +2377,34 @@ impl Config {
         }
         // NETWORK= is a 005 middle; `numeric` would silently clip an over-long
         // value rather than advertise it faithfully. Bound it at load instead.
-        if self.network_name.len() > 64 {
-            return Err(ConfigError::Invalid(
-                "network_name must be at most 64 bytes".into(),
-            ));
+        if self.network_name.len() > MAX_NETWORK_NAME_LEN {
+            return Err(ConfigError::Invalid(format!(
+                "network_name must be at most {MAX_NETWORK_NAME_LEN} bytes"
+            )));
+        }
+        // The description is RPL_LINKS' `<server info>` and each motd line an
+        // RPL_MOTD's text: `numeric_line` would clip an over-long one on the
+        // wire without a word, so each is bounded here, against the longest
+        // server name and nickname, like the names above.
+        if self.description.len() > MAX_DESCRIPTION_LEN {
+            return Err(ConfigError::Invalid(format!(
+                "description must be at most {MAX_DESCRIPTION_LEN} bytes (it is {}): longer \
+                 would be cut short in the RPL_LINKS reply that carries it",
+                self.description.len()
+            )));
+        }
+        if let Some((index, line)) = self
+            .motd
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.len() > MAX_MOTD_LINE_LEN)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "motd line {} must be at most {MAX_MOTD_LINE_LEN} bytes (it is {}): longer would \
+                 be cut short in the RPL_MOTD reply that carries it",
+                index + 1,
+                line.len()
+            )));
         }
         if self.nicklen == 0
             || self.core_queue == 0
@@ -2281,10 +2454,10 @@ impl Config {
         // unbounded nick can blow past the 512-byte wire limit (the same reason
         // server_name/network_name are capped at 64) and inflates per-nick
         // memory. Bound it like the other identifiers.
-        if self.nicklen > 64 {
-            return Err(ConfigError::Invalid(
-                "nicklen must be at most 64 (it rides every relayed line's prefix)".into(),
-            ));
+        if self.nicklen > MAX_NICKLEN {
+            return Err(ConfigError::Invalid(format!(
+                "nicklen must be at most {MAX_NICKLEN} (it rides every relayed line's prefix)"
+            )));
         }
         if self.nicklen < MIN_NICKLEN {
             return Err(ConfigError::Invalid(format!(
@@ -2772,6 +2945,36 @@ mod tests {
         );
     }
 
+    /// A libpq variable set beside a database-backed configuration is refused
+    /// by name — sqlx would otherwise read it into every connection the URL
+    /// leaves a field of unstated — and one set without a database is none of
+    /// the configuration's business.
+    #[test]
+    fn a_libpq_variable_in_the_environment_is_refused_by_name() {
+        let environment = |variable: &str| -> crate::environment_config::Lookup {
+            Ok(match variable {
+                "PGSSLMODE" => Some("disable".into()),
+                "PGHOST" => Some("elsewhere.example".into()),
+                "PGPASSWORD" => Some(String::new()),
+                _ => None,
+            })
+        };
+        let mut config = listening_config();
+        assert!(config.refuse_libpq_environment(&environment).is_ok());
+        config.database = db();
+        let refusal = config
+            .refuse_libpq_environment(&environment)
+            .expect_err("PGSSLMODE and PGHOST are refused")
+            .to_string();
+        assert!(refusal.contains("PGHOST, PGSSLMODE set"), "{refusal}");
+        assert!(
+            !refusal.contains("PGPASSWORD"),
+            "set-but-empty is unset: {refusal}"
+        );
+        assert!(!refusal.contains("disable") && !refusal.contains("elsewhere"));
+        assert!(config.refuse_libpq_environment(&|_: &str| Ok(None)).is_ok());
+    }
+
     fn listening_config() -> Config {
         Config {
             listeners: vec![listener()],
@@ -2815,7 +3018,7 @@ mod tests {
 
         config.listeners = vec![listener_on("127.0.0.1:6667")];
         config.database = Some(DatabaseConfig {
-            url: "postgres://localhost/e6irc".into(),
+            url: "postgres://localhost/e6irc".parse().expect("database URL"),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         });
@@ -3146,6 +3349,124 @@ mod tests {
         assert!(error.contains("buffer_cap"), "{error}");
     }
 
+    /// The start-up warning names the one shape in which every client surely
+    /// shares the authentication budget — throttle on, no trusted proxy, HTTP
+    /// bound to loopback only — and is silent otherwise.
+    #[test]
+    fn a_loopback_http_listener_without_trusted_proxies_is_warned_about() {
+        let mut config = listening_config();
+        assert_eq!(config.shared_authentication_budget(), None, "no HTTP");
+        config.http = Some(HttpConfig {
+            addr: "127.0.0.1:8080".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: false,
+        });
+        let warning = config
+            .shared_authentication_budget()
+            .expect("behind a proxy every user shares one budget");
+        assert!(warning.contains("limits.trusted_proxies"), "{warning}");
+        assert!(warning.contains("\"off\""), "{warning}");
+        if let Some(http) = &mut config.http {
+            http.addr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        }
+        assert!(
+            config.shared_authentication_budget().is_some(),
+            "mapped loopback"
+        );
+
+        let mut trusted = config.clone();
+        trusted.limits.trusted_proxies = vec!["127.0.0.1/32".parse().unwrap()];
+        assert_eq!(trusted.shared_authentication_budget(), None);
+        let mut off = config.clone();
+        off.limits.auth_rate_burst = AuthRateBurst::Off;
+        assert_eq!(off.shared_authentication_budget(), None);
+        let mut wide = config;
+        if let Some(http) = &mut wide.http {
+            http.addr = "0.0.0.0:8080".parse().unwrap();
+        }
+        assert_eq!(
+            wide.shared_authentication_budget(),
+            None,
+            "a listener bound wider may or may not be behind a proxy"
+        );
+    }
+
+    /// A database-backed document may leave the server's names and listeners
+    /// to the stored settings; one without a database has nothing to take them
+    /// from, and is refused naming each it leaves out.
+    #[test]
+    fn only_a_database_backed_document_may_leave_the_names_to_the_console() {
+        let mut with_database: Config =
+            toml::from_str("[database]\nurl = \"postgres://localhost/x\"\n").expect("parses");
+        let document: toml::Table =
+            toml::from_str("[database]\nurl = \"postgres://localhost/x\"\n").expect("table");
+        with_database.left_to_stored_settings = left_out_of(&document);
+        assert_eq!(
+            with_database.left_to_stored_settings,
+            LEFT_TO_STORED_SETTINGS
+        );
+        with_database
+            .validate()
+            .expect("left to the stored settings");
+
+        let refusal = Config::from_table(
+            toml::from_str("[[listeners]]\naddr = \"127.0.0.1:0\"\n").expect("table"),
+            &[],
+        )
+        .expect_err("no database to take them from")
+        .to_string();
+        assert!(
+            refusal.contains(
+                "server_name, network_name required: only a configuration with \
+                 [database] may leave them"
+            ),
+            "{refusal}"
+        );
+        // A document that states them is held to their rules as before.
+        let refusal = Config::from_table(
+            toml::from_str(
+                "server_name = \"\"\nnetwork_name = \"n\"\n\
+                 [database]\nurl = \"postgres://localhost/x\"\n",
+            )
+            .expect("table"),
+            &[],
+        )
+        .expect_err("an empty server name is stated, not left out")
+        .to_string();
+        assert!(
+            refusal.contains("server_name must be a hostname"),
+            "{refusal}"
+        );
+    }
+
+    /// `buffer_cap` is bounded by what the stored backlog keeps, so the replay
+    /// it configures survives a restart; the bound is one constant both use.
+    #[test]
+    fn network_buffer_cap_is_bounded_by_what_storage_keeps() {
+        let document = |cap: usize| {
+            format!(
+                "server_name = \"irc.x.example\"\nnetwork_name = \"XNet\"\n\
+                 [[listeners]]\naddr = \"127.0.0.1:0\"\n\
+                 [database]\nurl = \"postgres://localhost/x\"\n\
+                 [[network]]\nname = \"libera\"\nkind = \"irc\"\n\
+                 addr = \"irc.libera.chat:6697\"\ntls = true\nnick = \"n\"\n\
+                 username = \"ident\"\nrealname = \"n\"\nautojoin = []\nbuffer_cap = {cap}\n"
+            )
+        };
+        let config: Config = toml::from_str(&document(MAX_NETWORK_BUFFER_CAP)).expect("parses");
+        config.validate().expect("at the bound");
+        let refusal = toml::from_str::<Config>(&document(MAX_NETWORK_BUFFER_CAP + 1))
+            .map_err(|error| error.to_string())
+            .and_then(|config| config.validate().map_err(|error| error.to_string()))
+            .expect_err("above the bound");
+        assert!(
+            refusal.contains("buffer_cap must be at most 5000"),
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn network_connection_intent_is_required() {
         let config = r#"
@@ -3323,7 +3644,7 @@ mod tests {
     fn a_static_network_refuses_credentials_without_tls() {
         let mut config = listening_config();
         config.database = Some(DatabaseConfig {
-            url: "postgres://localhost/e6irc".into(),
+            url: "postgres://localhost/e6irc".parse().expect("database URL"),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         });
@@ -3624,7 +3945,7 @@ mod tests {
 
     fn db() -> Option<DatabaseConfig> {
         Some(DatabaseConfig {
-            url: "postgres://localhost/x".into(),
+            url: "postgres://localhost/x".parse().expect("database URL"),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         })
@@ -3886,7 +4207,7 @@ mod tests {
         let with = |startup_wait_seconds: u64| Config {
             listeners: vec![listener()],
             database: Some(DatabaseConfig {
-                url: "postgres://localhost/e6irc".into(),
+                url: "postgres://localhost/e6irc".parse().expect("database URL"),
                 startup_wait_seconds,
                 max_connections: None,
             }),
@@ -4103,6 +4424,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
                 http_listener: None,
                 hsts_include_subdomains: false,
                 internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+                application_release_revision: None,
             })
             .expect("the console may save it");
     }
@@ -4372,7 +4694,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
                 hsts_include_subdomains: false,
             }),
             database: Some(DatabaseConfig {
-                url: "postgres://db.example/e6irc".into(),
+                url: "postgres://db.example/e6irc".parse().expect("database URL"),
                 startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
                 max_connections: None,
             }),
@@ -4390,6 +4712,141 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             application_release_revision: Some("0123456789ab".into()),
             ..Config::default()
         }
+    }
+
+    /// A description or motd line longer than its reply's room is refused at
+    /// load and at a console save, which share this validation; it used to be
+    /// accepted and clipped on the wire.
+    #[test]
+    fn texts_longer_than_their_reply_are_refused() {
+        let mut config = listening_config();
+        config.description = "d".repeat(MAX_DESCRIPTION_LEN);
+        config.motd = vec!["fine".into(), "m".repeat(MAX_MOTD_LINE_LEN)];
+        config.validate().expect("at the bounds");
+        config.description.push('d');
+        let refusal = config.validate().expect_err("description").to_string();
+        assert!(
+            refusal.contains("description must be at most 242 bytes"),
+            "{refusal}"
+        );
+        config.description.pop();
+        config.motd[1].push('m');
+        let refusal = config.validate().expect_err("motd").to_string();
+        assert!(
+            refusal.contains("motd line 2 must be at most 372 bytes"),
+            "{refusal}"
+        );
+        let managed = ManagedConfig::from_config(&config, None).expect("managed");
+        let refusal = managed
+            .validate(BootstrapContext {
+                http_listener: None,
+                hsts_include_subdomains: false,
+                internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+                application_release_revision: None,
+            })
+            .expect_err("the console save is refused too")
+            .to_string();
+        assert!(refusal.contains("motd line 2"), "{refusal}");
+    }
+
+    /// The console's form states the same bounds the validation holds a save
+    /// to, so it does not offer a value the save refuses.
+    #[test]
+    fn the_console_form_states_the_configured_bounds() {
+        let form = include_str!("../templates/console_configuration.html");
+        for control in [
+            format!("name=\"server_name\" maxlength=\"{MAX_SERVER_NAME_LEN}\""),
+            format!("name=\"network_name\" maxlength=\"{MAX_NETWORK_NAME_LEN}\""),
+            format!("name=\"description\" maxlength=\"{MAX_DESCRIPTION_LEN}\""),
+            format!("each at most {MAX_MOTD_LINE_LEN} bytes"),
+            format!("name=\"buffer_cap\" min=\"1\" max=\"{MAX_NETWORK_BUFFER_CAP}\""),
+        ] {
+            assert!(form.contains(&control), "the form lacks {control}");
+        }
+    }
+
+    /// A console save is judged against the running process's own release
+    /// revision, as the next start is. It used to be judged against a made-up
+    /// valid one, so a `shauth` provider saved on a deployment without an
+    /// immutable revision and the next start refused the stored settings.
+    #[test]
+    fn a_console_save_is_judged_against_the_process_release_revision() {
+        let stated = oidc_config(
+            "shauth",
+            "https://auth.example",
+            Some("https://auth.example/oauth2/sessions/logout"),
+        );
+        let key = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
+        let managed = ManagedConfig::from_config(&stated, Some(&key)).expect("managed");
+        let context = |revision: Option<&str>| BootstrapContext {
+            http_listener: None,
+            hsts_include_subdomains: false,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            application_release_revision: revision.map(str::to_string),
+        };
+        for revision in [None, Some("main")] {
+            let refusal = managed
+                .validate(context(revision))
+                .expect_err("start would refuse it")
+                .to_string();
+            assert!(
+                refusal.contains("application_release_revision"),
+                "{refusal}"
+            );
+        }
+        managed
+            .validate(context(Some("0123456789ab")))
+            .expect("start accepts it");
+    }
+
+    /// A listener certificate edited in the console is read at the save, as
+    /// start reads it: a path that does not load is refused then, not when the
+    /// next start fails.
+    #[test]
+    fn a_console_save_reads_the_listener_certificates() {
+        let directory =
+            std::env::temp_dir().join(format!("e6irc-console-certificate-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let files = TlsConfig {
+            cert_path: directory.join("cert.pem"),
+            key_path: directory.join("key.pem"),
+        };
+        let context = BootstrapContext {
+            http_listener: None,
+            hsts_include_subdomains: false,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            application_release_revision: None,
+        };
+        let mut managed = ManagedConfig::from_config(&listening_config(), None).expect("managed");
+        managed.listeners.push(ListenerConfig {
+            addr: "127.0.0.1:6697".parse().unwrap(),
+            tls: Some(files.clone()),
+            websocket: false,
+        });
+        let refusal = managed
+            .validate(context.clone())
+            .expect_err("missing certificate files")
+            .to_string();
+        assert!(refusal.contains("TLS certificate"), "{refusal}");
+        assert!(refusal.contains("cert.pem"), "{refusal}");
+        crate::certificate::write_self_signed(&files);
+        managed
+            .validate(context.clone())
+            .expect("a certificate that loads");
+        let other = TlsConfig {
+            cert_path: directory.join("other-cert.pem"),
+            key_path: directory.join("other-key.pem"),
+        };
+        crate::certificate::write_self_signed(&other);
+        managed.listeners[1].tls = Some(TlsConfig {
+            cert_path: files.cert_path.clone(),
+            key_path: other.key_path.clone(),
+        });
+        assert!(
+            managed.validate(context).is_err(),
+            "a key that does not match its certificate is refused"
+        );
+        std::fs::remove_dir_all(directory).expect("remove the scratch directory");
     }
 
     #[test]
@@ -4681,7 +5138,7 @@ account_claim = "preferred_username"
     fn a_cleartext_attach_listener_is_refused_off_loopback() {
         let mut config = listening_config();
         config.database = Some(DatabaseConfig {
-            url: "postgres://localhost/e6irc".into(),
+            url: "postgres://localhost/e6irc".parse().expect("database URL"),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         });
@@ -4725,17 +5182,24 @@ account_claim = "preferred_username"
             http_listener: None,
             hsts_include_subdomains: false,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            application_release_revision: None,
         };
         let error = managed
-            .validate(bootstrap)
+            .validate(bootstrap.clone())
             .expect_err("the console save is refused too")
             .to_string();
         assert!(error.contains("bnc_tls"), "{error}");
-        managed.bnc_tls = Some(TlsConfig {
-            cert_path: "/etc/e6irc/cert.pem".into(),
-            key_path: "/etc/e6irc/key.pem".into(),
-        });
+        let directory =
+            std::env::temp_dir().join(format!("e6irc-console-bnc-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let files = TlsConfig {
+            cert_path: directory.join("cert.pem"),
+            key_path: directory.join("key.pem"),
+        };
+        crate::certificate::write_self_signed(&files);
+        managed.bnc_tls = Some(files);
         managed.validate(bootstrap).expect("with a certificate");
+        std::fs::remove_dir_all(directory).expect("remove the scratch directory");
     }
 
     /// Widening a header that is never sent would be a setting that does
@@ -4744,7 +5208,7 @@ account_claim = "preferred_username"
     fn hsts_subdomains_needs_an_https_public_origin() {
         let mut config = listening_config();
         config.database = Some(DatabaseConfig {
-            url: "postgres://localhost/e6irc".into(),
+            url: "postgres://localhost/e6irc".parse().expect("database URL"),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         });

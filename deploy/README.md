@@ -111,8 +111,10 @@ neither a core file nor a same-user debugger may read them.
 A `[[listeners]]` entry with `tls` and the BNC attach listener's certificate
 (`[bnc].tls`, or the console's BNC TLS paths) are read from their PEM files at
 start and again whenever they change: every 60 seconds the daemon compares
-the files' identities (modification and status-change times, length, inode)
-with those it read, and it reloads at once on `SIGHUP`
+each file's modification time and a SHA-256 digest of its contents with those
+it read — the digest decides, so a rewrite that keeps the modification time
+(`cp -p`, `rsync -t`, an unpacked archive) is still a change — and it reloads
+at once on `SIGHUP`
 (`systemctl kill -s HUP e6ircd`). A renewal hook therefore needs no restart.
 The `SIGHUP` handler is installed before the database wait, so a renewal hook
 that fires while the daemon is still starting cannot kill it.
@@ -181,7 +183,8 @@ them. A variable that still states a console-owned setting must agree with the
 stored value: if it differs, the container fails to start and names each such
 setting (`http.admin_accounts`, `oidc[0].client_secret`) without printing
 either value. Resolve it by unsetting the variable (the stored value applies;
-`E6IRC_SERVER_NAME` and `E6IRC_PUBLIC_URL` are required, so align those),
+`E6IRC_PUBLIC_URL` is required, so align that one; an unset `E6IRC_SERVER_NAME`
+takes the stored name, and only a first start, with nothing stored, needs it),
 setting it to the stored value, or changing the setting in the console first.
 So removing a name from `E6IRC_ADMIN_ACCOUNTS` or rotating
 `E6IRC_OIDC_CLIENT_SECRET` is done in the console (then the variable is
@@ -210,9 +213,9 @@ configured, the next start seals and imports them atomically.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `E6IRC_SERVER_NAME` | yes | IRC server name, e.g. `e6irc.dev.e6qu.dev` |
+| `E6IRC_SERVER_NAME` | on the first start | IRC server name, e.g. `e6irc.dev.e6qu.dev`; unset afterwards, the name the console stores applies |
 | `E6IRC_PUBLIC_URL` | yes | External base URL; OIDC redirect + post-logout base |
-| `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant) |
+| `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant). Its query keys are a closed set — `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey` (or their hyphenated spellings), `application_name`, `options` (`-c name=value` settings), `statement-cache-capacity` — and any other key, a misspelt `sslmode` value or a field stated twice is refused at start; the container must not set libpq variables (`PGHOST`, `PGSSLMODE`, `PGPASSWORD`, ...), which are refused by name: the URL alone describes the connection |
 | `APPLICATION_RELEASE_REVISION` | yes | The deployed revision, shown on the console's configuration page and on the authenticated identity page Shauth's browser validator reads. With the `shauth` provider configured it must be 12–64 lowercase hexadecimal digits or `sha256:` plus 64 of them; the image tag's short SHA qualifies |
 | `E6IRC_SECRET_KEY` | for credential storage (secret) | Base64 32-byte primary key; new managed and account-network credentials are sealed with it |
 | `E6IRC_PREVIOUS_SECRET_KEYS` | only during rotation (secret) | Comma-separated old keys accepted for reads until `e6ircd rotate-secrets` commits |
@@ -254,6 +257,9 @@ The command re-seals managed configuration and every account-network
 credential in one PostgreSQL transaction and writes a redacted audit record.
 It exits nonzero and rolls the whole transaction back if any value cannot be
 proven readable. After success, remove `E6IRC_PREVIOUS_SECRET_KEYS` and restart.
+The re-seal writes a new settings revision; every running server (and every
+replica) hears it and adopts it at once, so the console keeps saving without a
+restart.
 
 ### Recover a lost administrator login
 
@@ -275,6 +281,41 @@ is refused and nothing is changed. A running e6ircd honours the authority at
 once — it reads an account's authority on every request — so sign in and change
 the password.
 
+## Upgrade notes
+
+Read these before deploying a release that includes the change named.
+
+- **The HTTP authentication throttle is on (migration 0088).** A stored
+  `limits.auth_rate_burst` of `null` used to mean off; it now takes the
+  default, twenty requests a minute per client address, on the routes that
+  sign people in. Behind a reverse proxy every request comes from the proxy's
+  address, so unless `limits.trusted_proxies` (a console-owned limit, at
+  `/console/configuration`) names the proxy, every user shares one budget of
+  twenty a minute.
+  Set `trusted_proxies` to the proxy's address or range so each client is
+  counted by the address the proxy forwards, or set `auth_rate_burst` to
+  `"off"` if the proxy throttles those routes itself. When the HTTP listener
+  binds only a loopback address and no trusted proxy is set, start logs a
+  warning saying so; a listener bound wider (`0.0.0.0:8080` in the container)
+  cannot tell, so check the setting.
+- **The database URL is read strictly.** A query key outside the closed set
+  in the table above (`ssl_mode`, `connect_timeout`, `hostaddr`, ...), a
+  misspelt `sslmode` value, or a field stated twice now refuses start by name;
+  such a key used to be dropped, and a dropped `sslmode` meant no certificate
+  verification. libpq variables (`PGSSLMODE`, `PGHOST`, `PGPASSWORD`, ...) in
+  the daemon's environment are refused too — state everything in the URL.
+- **A server network's `buffer_cap` is at most 5,000 (migration 0091).** That
+  is what the stored backlog keeps, and a start now restores a network's whole
+  buffer. A stored value above it is brought to 5,000 (more never survived a
+  restart); a configuration file stating more is refused at start.
+- **A configuration file may leave out `server_name`, `network_name` and
+  `[[listeners]]`** once the console stores them, and `E6IRC_SERVER_NAME` may be
+  unset; the stored values apply. A first start with nothing stored refuses,
+  naming each.
+- **`motd` lines and `description` are bounded** (372 and 242 bytes: what their
+  replies carry whole). A longer one is refused at start and at a console
+  save instead of being cut short on the wire.
+
 ## Stop timeout
 
 On SIGTERM the daemon stops accepting work, tells every bouncer network's
@@ -292,7 +333,8 @@ shutdown that was still flushing cleanly.
 
 Any host that runs an OCI image can run e6irc. It has to provide:
 
-- **The environment** in the table above. Four variables are required; secrets
+- **The environment** in the table above. Three variables are required, and
+  `E6IRC_SERVER_NAME` for the first start; secrets
   (`E6IRC_DATABASE_URL`, `E6IRC_SECRET_KEY`, `E6IRC_PREVIOUS_SECRET_KEYS`,
   `E6IRC_OIDC_CLIENT_SECRET`, `E6IRC_BOOTSTRAP_TOKEN`, `E6IRC_MONITORING_TOKEN`)
   belong in the host's secret store, not in the image

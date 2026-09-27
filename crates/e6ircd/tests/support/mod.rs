@@ -39,7 +39,16 @@ fn prepared() -> &'static Mutex<std::collections::HashMap<String, ThreadId>> {
 ///
 /// Callers still run their schema migrations through `db::connect_and_migrate`;
 /// this only hands out an empty database to run them against.
-pub async fn test_db(test: &str) -> String {
+pub async fn test_db(test: &str) -> e6ircd::db::DatabaseUrl {
+    test_db_text(test)
+        .await
+        .parse()
+        .expect("E6IRC_TEST_DATABASE_URL is a URL e6ircd accepts")
+}
+
+/// [`test_db`] as the URL's text, for a test that rewrites it (to route the
+/// connection through a proxy, say) before parsing it.
+pub async fn test_db_text(test: &str) -> String {
     let admin = admin_url();
     let name = database_name(test);
     let me = std::thread::current().id();
@@ -78,7 +87,10 @@ fn database_name(test: &str) -> String {
 }
 
 async fn create(admin: &str, name: &str) {
-    let pool = sqlx::PgPool::connect(admin)
+    let admin: e6ircd::db::DatabaseUrl = admin
+        .parse()
+        .expect("E6IRC_TEST_DATABASE_URL is a URL e6ircd accepts");
+    let pool = sqlx::PgPool::connect_with(admin.connect_options())
         .await
         .expect("connect to the administrative database");
     // Dropped first so a run starts from an empty database even if a previous

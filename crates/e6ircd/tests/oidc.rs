@@ -11,7 +11,11 @@ mod support;
 /// A server whose only login is the dex mock connector, whose one user is
 /// `kilgore@kilgore.trout` — so the account claim (the email's local part)
 /// names the account `kilgore`.
-fn dex_login_config(db_url: String, dex_url: String, http_addr: std::net::SocketAddr) -> Config {
+fn dex_login_config(
+    db_url: e6ircd::db::DatabaseUrl,
+    dex_url: String,
+    http_addr: std::net::SocketAddr,
+) -> Config {
     Config {
         server_name: "irc.oidc.example".into(),
         network_name: "OidcNet".into(),

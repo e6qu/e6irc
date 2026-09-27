@@ -1311,6 +1311,22 @@ Maintainer decisions implemented from the same review:
   bounds count characters, as the contract's `maxLength` does; the audit
   `actor` and `target` filters fold against account principals.
 
+Maintainer decisions implemented from a review of configuration, storage and
+qualification (DESIGN §8, §17, §18):
+
+- **Several replicas against one database are supported.** The stored settings
+  revision reaches every running server when another process commits one (a
+  replica's console, `rotate-secrets`), through the table's own announcement;
+  a save that still finds its revision stale reloads it, so the console never
+  wedges on a revision it cannot see.
+- **The load harness measures fan-out, not the flood limiter.** A burst past
+  the server's command burst is refused unless the senders oper up, and
+  `qualify-linux.sh` passes the operator or refuses; the claimed core-shard
+  count is checked against the server's own.
+- **The authentication throttle stays on for upgrades (0088)**, with an
+  upgrade note on `trusted_proxies` and a start-up warning when a loopback-only
+  HTTP listener without trusted proxies makes every user share one budget.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
