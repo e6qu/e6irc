@@ -351,6 +351,37 @@ impl CoreIngress {
         .await
     }
 
+    /// Tell every shard that the revocation listener was re-connected, and
+    /// wait until each has refused the verdicts of the credential checks
+    /// queued before: only then may the listener re-read what live sessions
+    /// hold, since a verdict that lands before the refusal is among them and
+    /// one that lands after is refused. Bounded like [`Self::admin_reply`].
+    pub(crate) async fn refuse_verdicts_in_flight(&self) -> Result<(), String> {
+        const SHARD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut answers = Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            let (done, answered) = tokio::sync::oneshot::channel();
+            if shard
+                .push(Input::RefuseVerdictsInFlight { done })
+                .await
+                .is_err()
+            {
+                return Err("core worker unavailable".into());
+            }
+            answers.push(answered);
+        }
+        for answered in answers {
+            match tokio::time::timeout(SHARD_REPLY_TIMEOUT, answered).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_closed)) => return Err("core worker dropped the request".into()),
+                Err(_elapsed) => {
+                    return Err("core worker did not answer within 5 seconds".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Put one administrative request to the core and wait for its answer,
     /// for at most five seconds: a control-plane caller must not hang on a
     /// wedged core.
@@ -458,7 +489,8 @@ impl Input {
             Input::Tick { .. }
             | Input::Shutdown
             | Input::ReadMarkersExpired { .. }
-            | Input::AccountDeleted { .. } => {
+            | Input::AccountDeleted { .. }
+            | Input::RefuseVerdictsInFlight { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
             }
             Input::ServerBanResult { requester, .. } => match requester {
@@ -900,6 +932,12 @@ pub enum Input {
     AccountDeleted {
         account: String,
         successions: Vec<crate::db::ChannelSuccession>,
+    },
+    /// The revocation listener was re-connected: refuse the verdict of every
+    /// credential check queued before now, then say so on `done`
+    /// ([`state::ServerState::refuse_verdicts_in_flight`]).
+    RefuseVerdictsInFlight {
+        done: tokio::sync::oneshot::Sender<()>,
     },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply {
@@ -2394,6 +2432,10 @@ pub enum DbReply {
         /// The credential that verified, which the session keeps: revoking it
         /// ends the session.
         credential: crate::identity::CredentialId,
+        /// How much longer the credential authorizes, by the store's clock:
+        /// exactly a personal access token's expiry, at which the session
+        /// ends. `None` for a password, which does not expire.
+        expires_in: Option<std::time::Duration>,
         origin: CredentialOrigin,
     },
     PasswordRejected {
@@ -3432,10 +3474,17 @@ impl Core {
             Input::PaceReplies => {}
             Input::Tick { now } => {
                 handler::reap_idle(&mut self.state, now);
+                self.state.expire_logins(now);
                 handler::services::enforce_nick_protection(&mut self.state, now);
                 handler::oper::expire_server_bans(&mut self.state);
             }
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
+            Input::RefuseVerdictsInFlight { done } => {
+                self.state.refuse_verdicts_in_flight();
+                // The listener waits for every shard; one that stopped
+                // waiting has given up on all of them.
+                let _ = done.send(());
+            }
             Input::AccountDeleted {
                 account,
                 successions,
@@ -4182,11 +4231,13 @@ mod ingress_tests {
             session.conn(),
             "Alice".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         second.state.set_account(
             ConnId(9),
             "alice".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         check(&first, &second);
         assert_eq!(indexed(&first, "alice"), vec![session.conn()]);
@@ -4617,6 +4668,7 @@ mod ingress_tests {
             alice,
             "founder".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         first.handle(Input::Line {
             conn: alice,
@@ -5273,6 +5325,7 @@ mod ingress_tests {
             ConnId(4),
             "carol".into(),
             crate::identity::CredentialId::AccountPassword,
+            None,
         );
         shards.settle();
         shards.line(4, "PRIVMSG NickServ :GHOST carol");
@@ -5838,6 +5891,7 @@ mod ingress_tests {
             reply: super::DbReply::PasswordVerified {
                 account: account.into(),
                 credential,
+                expires_in: None,
                 origin: super::CredentialOrigin::NickServIdentify,
             },
         });
@@ -5887,6 +5941,139 @@ mod ingress_tests {
             shards.ingress.password_policy().minimum_chars(),
             1,
             "the web and the REST API read the same cell"
+        );
+    }
+
+    /// Answer `conn`'s queued NickServ IDENTIFY with `reply`.
+    fn verdict_on(shards: &mut Shards, conn: u64, reply: super::DbReply) {
+        let shard = shards.shard_of(conn);
+        shards.cores[shard].handle(Input::DbReply {
+            conn: ConnId(conn),
+            reply,
+        });
+        shards.settle();
+    }
+
+    /// Queue a NickServ IDENTIFY for `conn`, its verdict still to come.
+    fn identify_queued(shards: &mut Shards, conn: u64) {
+        shards.line(conn, "PRIVMSG NickServ :IDENTIFY alice secret");
+        let shard = shards.shard_of(conn);
+        shards.database_request(shard, |request| {
+            matches!(request, super::DbRequest::VerifyPassword { .. }).then_some(())
+        });
+    }
+
+    /// A session a personal access token signed in ends when the token
+    /// expires, by the store's reckoning of how long it had left, and says
+    /// why; one the account password signed in stays.
+    #[test]
+    fn a_session_a_token_signed_in_ends_when_the_token_expires() {
+        use crate::identity::{CredentialId, IssuedCredential};
+        set_clock_ms(0);
+        let mut shards = Shards::with_database();
+        shards.client(1, "alice1", "");
+        shards.client(2, "alice2", "");
+        identify_queued(&mut shards, 1);
+        verdict_on(
+            &mut shards,
+            1,
+            super::DbReply::PasswordVerified {
+                account: "alice".into(),
+                credential: CredentialId::Issued(IssuedCredential::ApiToken(5)),
+                expires_in: Some(std::time::Duration::from_secs(30)),
+                origin: super::CredentialOrigin::NickServIdentify,
+            },
+        );
+        identify_on(&mut shards, 2, "alice");
+        shards.drain(1);
+        let tick = |shards: &mut Shards| {
+            let now = thread_mono_clock();
+            for core in &mut shards.cores {
+                core.handle(Input::Tick { now });
+            }
+            shards.settle();
+        };
+        Shards::advance_clock(29);
+        tick(&mut shards);
+        assert!(
+            !shards.drain(1).iter().any(|line| line.starts_with("ERROR")),
+            "the token has a second left"
+        );
+        Shards::advance_clock(1);
+        tick(&mut shards);
+        assert!(
+            shards.drain(1).iter().any(|line| {
+                line.starts_with("ERROR :Closing Link")
+                    && line.contains("Personal access token expired")
+            }),
+            "the session ends with its token"
+        );
+        shards.line(2, "PING :here");
+        assert!(shards.drain(2).iter().any(|line| line.contains(" PONG ")));
+    }
+
+    /// The window a lost revocation listener leaves: a credential check read
+    /// the store before the credential was revoked, the revocation was
+    /// announced while nothing listened, and the verdict lands after the
+    /// listener's re-connection re-checked what the live sessions hold —
+    /// which did not include this one yet. The re-connection refuses every
+    /// verdict queued before it on every shard first, so this one is refused
+    /// (and its client told to try again), while a verdict that landed before
+    /// the refusal is held by a live session, among what the listener
+    /// re-checks. A check queued after it logs in.
+    #[test]
+    fn a_verdict_read_before_a_listener_re_check_is_refused() {
+        use crate::identity::{CredentialId, IssuedCredential};
+        const REVOKED: IssuedCredential = IssuedCredential::AppPassword(3);
+        const LANDED_FIRST: IssuedCredential = IssuedCredential::AppPassword(4);
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "raced"), (2, "early")] {
+            shards.client(conn, nick, "");
+            identify_queued(&mut shards, conn);
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        let verified = |credential| super::DbReply::PasswordVerified {
+            account: "alice".into(),
+            credential: CredentialId::Issued(credential),
+            expires_in: None,
+            origin: super::CredentialOrigin::NickServIdentify,
+        };
+        // This verdict lands before the re-connection: its session is live
+        // when the listener reads what live sessions hold.
+        verdict_on(&mut shards, 2, verified(LANDED_FIRST));
+        assert_eq!(shards.ingress.signed_in_credentials(), vec![LANDED_FIRST]);
+
+        let mut refused = Vec::new();
+        for core in &mut shards.cores {
+            let (done, answered) = tokio::sync::oneshot::channel();
+            core.handle(Input::RefuseVerdictsInFlight { done });
+            refused.push(answered);
+        }
+        for mut answered in refused {
+            assert_eq!(answered.try_recv(), Ok(()), "every shard answers");
+        }
+
+        verdict_on(&mut shards, 1, verified(REVOKED));
+        let told = shards.drain(1);
+        assert!(
+            told.iter()
+                .any(|line| line.contains("re-checked") && line.contains("try again")),
+            "{told:#?}"
+        );
+        assert_eq!(
+            shards.ingress.signed_in_credentials(),
+            vec![LANDED_FIRST],
+            "the stale verdict signed nothing in"
+        );
+        // A check queued now read the store after the re-connection.
+        identify_queued(&mut shards, 1);
+        verdict_on(&mut shards, 1, verified(IssuedCredential::AppPassword(9)));
+        assert!(
+            shards
+                .drain(1)
+                .iter()
+                .any(|line| line.contains("You are now identified")),
+            "a check queued after the re-check logs in"
         );
     }
 
@@ -6033,6 +6220,7 @@ mod ingress_tests {
             reply: super::DbReply::PasswordVerified {
                 account: "alice".into(),
                 credential: crate::identity::CredentialId::AccountPassword,
+                expires_in: None,
                 origin: super::CredentialOrigin::NickServIdentify,
             },
         });

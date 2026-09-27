@@ -31,6 +31,17 @@ fn sasl_unavailable(state: &mut ServerState, conn: ConnId) {
     );
 }
 
+/// What a client whose verdict was read before a revocation re-check is told.
+const RECHECKED: &str =
+    "Credentials were re-checked while yours were being verified; please try again";
+
+/// SASL refused because the verdict predates a revocation re-check: a 904,
+/// which the client may retry at once.
+fn sasl_rechecked(state: &mut ServerState, conn: ConnId) {
+    state.sessions.get_mut(&conn).expect("checked").sasl = crate::core::state::SaslState::Idle;
+    state.numeric(conn, ERR_SASLFAIL, &[], Some(RECHECKED));
+}
+
 /// Why a credential verification did not log the session in.
 #[derive(Clone, Copy)]
 enum Denial {
@@ -41,6 +52,10 @@ enum Denial {
     Throttled(crate::db::LoginRetryAfter),
     /// The store could not answer.
     Unavailable,
+    /// The store answered before the revocation listener re-checked what it
+    /// had missed ([`crate::core::state::StaleVerdict::Rechecked`]); trying
+    /// again reads the store after that.
+    Rechecked,
 }
 
 /// SASL refused because the account name's attempt window is spent: the same
@@ -70,6 +85,7 @@ fn verify_denied(
                 Denial::Rejected => sasl_fail(state, conn),
                 Denial::Throttled(retry_after) => sasl_throttled(state, conn, retry_after),
                 Denial::Unavailable => sasl_unavailable(state, conn),
+                Denial::Rechecked => sasl_rechecked(state, conn),
             });
         }
         crate::core::CredentialOrigin::NickServIdentify => {
@@ -81,6 +97,7 @@ fn verify_denied(
                     "Services are temporarily unavailable. Try again later.".to_string()
                 }
                 Denial::Throttled(retry_after) => retry_after.explanation(),
+                Denial::Rechecked => RECHECKED.to_string(),
                 Denial::Rejected => {
                     let nick = state.sessions[&conn]
                         .nick()
@@ -432,22 +449,35 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     // A password change, or the revocation of the app password or token
     // checked, is the same, for a check queued before it: the verdict speaks
     // for a credential that no longer stands.
+    // A verdict read before the revocation listener re-checked what it
+    // missed while disconnected is refused too, and may be retried.
     if let crate::core::DbReply::PasswordVerified {
         account,
         credential,
         origin,
+        ..
     } = &reply
-        && (state.is_account_suspended(account)
-            || state.credentials_ended_since(conn, account, *credential))
     {
-        verify_denied(state, conn, *origin, sasl_label, Denial::Rejected);
-        return;
+        let denial = if state.is_account_suspended(account) {
+            Some(Denial::Rejected)
+        } else {
+            match state.stale_verdict(conn, account, *credential) {
+                Some(crate::core::state::StaleVerdict::CredentialEnded) => Some(Denial::Rejected),
+                Some(crate::core::state::StaleVerdict::Rechecked) => Some(Denial::Rechecked),
+                None => None,
+            }
+        };
+        if let Some(denial) = denial {
+            verify_denied(state, conn, *origin, sasl_label, denial);
+            return;
+        }
     }
     match reply {
         // Route credential verdicts by request origin.
         crate::core::DbReply::PasswordVerified {
             account,
             credential,
+            expires_in,
             origin: crate::core::CredentialOrigin::Sasl,
         } => {
             if state.sessions[&conn].sasl != SaslState::Verifying {
@@ -458,7 +488,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             sasl_verdict(state, conn, sasl_label, move |state| {
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
                 // RPL_LOGGEDIN comes from `set_account`, the one login path.
-                state.set_account(conn, logged_in, credential);
+                state.set_account(conn, logged_in, credential, expires_in);
                 state.numeric(
                     conn,
                     RPL_SASLSUCCESS,
@@ -476,6 +506,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         crate::core::DbReply::PasswordVerified {
             account,
             credential,
+            expires_in,
             origin: crate::core::CredentialOrigin::NickServIdentify,
         } => {
             let Some(label) = take_identify_label(state, conn) else {
@@ -487,7 +518,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             // output like a real server.
             let account_for_notice = account.clone();
             state.emit_labeled_unheld(conn, label, move |state| {
-                state.set_account(conn, account_for_notice.clone(), credential);
+                state.set_account(conn, account_for_notice.clone(), credential, expires_in);
                 state.service_notice(
                     conn,
                     "NickServ",
@@ -549,6 +580,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                         conn,
                         account.clone(),
                         crate::identity::CredentialId::AccountPassword,
+                        None,
                     );
                     state.service_notice(
                         conn,
@@ -565,6 +597,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                             conn,
                             account.clone(),
                             crate::identity::CredentialId::AccountPassword,
+                            None,
                         );
                         state.send(
                             conn,

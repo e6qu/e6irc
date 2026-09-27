@@ -436,6 +436,14 @@ impl AccountAuthorityWatcher {
     /// Apply what every account asks of this server after announcements were
     /// missed, then end what every credential revoked meanwhile signed in.
     async fn resynchronize(&self) -> Result<(), String> {
+        // A credential check read while nothing listened may have verified a
+        // credential revoked meanwhile, and its verdict may land after the
+        // re-read below. So every check under way is refused first — its
+        // client may try again — on the attach listener and on every core
+        // shard, and only then is anything re-read: a verdict that landed
+        // before is among what is re-read, one that lands after is refused.
+        self.registry.account_revocations().refuse_in_flight();
+        self.core_tx.refuse_verdicts_in_flight().await?;
         let this = self.clone_handles();
         self.registry
             .mutate(move |lane| async move {

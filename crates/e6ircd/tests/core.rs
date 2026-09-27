@@ -337,6 +337,7 @@ fn identify_with(
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
             credential,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -1762,6 +1763,7 @@ fn sasl_abort_then_reauth_does_not_cross_wire_the_stale_verify() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2152,6 +2154,7 @@ fn sasl_plain_success_flow() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2199,6 +2202,7 @@ fn sasl_login(s: &mut TestServer, conn: ConnId, account: &str) {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3375,6 +3379,7 @@ fn overlapping_identify_is_refused_not_silently_dropped() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3405,6 +3410,7 @@ fn nickserv_identify_flow() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3445,6 +3451,7 @@ fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "eve".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3460,6 +3467,7 @@ fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3515,6 +3523,7 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3780,6 +3789,7 @@ fn labeled_identify_verdict_carries_the_label() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3950,6 +3960,7 @@ fn chanserv_register_flow() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4176,6 +4187,7 @@ fn chanserv_flags_rejects_an_unknown_flag() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4260,6 +4272,7 @@ fn chanserv_register_requires_op() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4424,6 +4437,7 @@ fn whox_full_fields_with_account() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5579,6 +5593,7 @@ fn account_notify_and_tag() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5634,6 +5649,7 @@ fn account_tag_on_mode_and_kick_but_not_server_lines() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5681,6 +5697,7 @@ fn account_notify_fires_on_post_registration_sasl() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -10186,6 +10203,7 @@ fn an_identify_in_flight_at_the_deadline_defers_the_rename() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14351,6 +14369,7 @@ fn account_tag_value_is_escaped() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "a\\b".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14716,6 +14735,7 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14781,6 +14801,7 @@ fn sasl_authenticated_unregistered(s: &mut TestServer, id: u64, account: &str) -
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -14869,6 +14890,7 @@ fn a_password_change_ends_the_accounts_sessions_and_its_in_flight_verdicts() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14943,6 +14965,7 @@ fn revoking_an_app_password_ends_exactly_the_sessions_it_signed_in() {
     let verdict = |credential| e6ircd::core::DbReply::PasswordVerified {
         account: "Alice".into(),
         credential: CredentialId::Issued(credential),
+        expires_in: None,
         origin: e6ircd::core::CredentialOrigin::NickServIdentify,
     };
     server.core.handle(Input::DbReply {
@@ -14982,6 +15005,7 @@ fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -17316,6 +17340,7 @@ fn labeled_identify_with_echo_keeps_the_echo_in_its_response() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -17343,6 +17368,7 @@ fn every_login_path_sends_900_and_logout_sends_901() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -17391,6 +17417,7 @@ fn sasl_success_sends_900_exactly_once() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -17416,6 +17443,7 @@ fn labeled_authenticate_is_answered_by_its_verdict() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -17468,6 +17496,7 @@ fn authenticate_during_verification_ends_the_attempt_once() {
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
