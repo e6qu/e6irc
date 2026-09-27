@@ -75,6 +75,16 @@ const WIRE_LINE_BUDGET: usize = e6irc_proto::message::MAX_LINE_LEN - 2;
 /// at the longest server name and nickname, so no client is sent a clipped
 /// one.
 pub const MAX_MOTD_LINE_LEN: usize = WIRE_LINE_BUDGET - MAX_NUMERIC_HEAD_LEN - " :- ".len();
+/// Most `motd` lines. A new client is sent the whole MOTD at registration,
+/// before it has read a byte, beside the rest of the registration burst
+/// (welcome, ISUPPORT, LUSERS, user modes), so all of it must fit the smallest
+/// SendQ a connection can have or a long MOTD kills every slow reader for
+/// SendQ. Every one of those replies is a numeric of at most
+/// [`e6irc_proto::message::MAX_LINE_LEN`] bytes (numerics carry no tags): the
+/// MOTD's replies — its lines between `RPL_MOTDSTART` and `RPL_ENDOFMOTD` —
+/// take at most half of [`MIN_SENDQ_BYTES`] at the longest line, and the rest
+/// of the burst, a score of mostly short numerics, has the other half.
+pub const MAX_MOTD_LINES: usize = MIN_SENDQ_BYTES / 2 / e6irc_proto::message::MAX_LINE_LEN - 2;
 /// Longest `description`, in bytes: what fits a `RPL_LINKS` (`<head> <server>
 /// <server> :0 <description>`) at the longest server name and nickname.
 pub const MAX_DESCRIPTION_LEN: usize =
@@ -298,8 +308,9 @@ pub struct Config {
     /// revision's value at start. Allowed only beside a `[database]`, and a
     /// first start with no stored settings to take them from is refused naming
     /// them (`net::start`). Removing a console-owned setting from the
-    /// bootstrap is how an operator hands it to the console, so these three
-    /// may be removed like any other.
+    /// bootstrap is how an operator hands it to the console, so these may be
+    /// removed like any other; so may `http.public_url`
+    /// ([`LEFT_TO_STORED_PUBLIC_URL`]).
     #[serde(skip)]
     pub left_to_stored_settings: Vec<&'static str>,
 }
@@ -308,11 +319,30 @@ pub struct Config {
 /// that a database-backed document may leave to the stored revision.
 pub const LEFT_TO_STORED_SETTINGS: [&str; 3] = ["server_name", "network_name", "listeners"];
 
-/// The keys of [`LEFT_TO_STORED_SETTINGS`] `document` does not state.
+/// The public URL, which a database-backed document with an `[http]` listener
+/// leaves to the stored revision by not stating it, as it does the names in
+/// [`LEFT_TO_STORED_SETTINGS`]. A server can run without one — the features
+/// that build an absolute link (OpenID Connect, device login, invitations)
+/// then refuse, each saying so, and a WebSocket upgrade is held to its `Host`
+/// — but a first start does not take that from an omission: the console's
+/// first revision is imported from the document, and a public URL an operator
+/// forgot would be stored as none. Without a database there is no stored
+/// revision, and leaving it out is running without one, as before.
+pub const LEFT_TO_STORED_PUBLIC_URL: &str = "http.public_url";
+
+/// The keys of [`LEFT_TO_STORED_SETTINGS`] `document` does not state, and
+/// [`LEFT_TO_STORED_PUBLIC_URL`] when a database-backed document's `[http]`
+/// does not state it.
 fn left_out_of(document: &toml::Table) -> Vec<&'static str> {
+    let public_url_left = document.contains_key("database")
+        && document
+            .get("http")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|http| !http.contains_key("public_url"));
     LEFT_TO_STORED_SETTINGS
         .into_iter()
         .filter(|key| !document.contains_key(*key))
+        .chain(public_url_left.then_some(LEFT_TO_STORED_PUBLIC_URL))
         .collect()
 }
 
@@ -2358,6 +2388,14 @@ impl Config {
                 self.description.len()
             )));
         }
+        if self.motd.len() > MAX_MOTD_LINES {
+            return Err(ConfigError::Invalid(format!(
+                "motd must be at most {MAX_MOTD_LINES} lines (it is {}): a new client is sent the \
+                 whole MOTD at registration, and a longer one need not fit the smallest SendQ \
+                 ({MIN_SENDQ_BYTES} bytes) beside the rest of that burst",
+                self.motd.len()
+            )));
+        }
         if let Some((index, line)) = self
             .motd
             .iter()
@@ -2748,6 +2786,7 @@ impl Config {
         // header that is never sent would be a setting that does nothing.
         if let Some(h) = &self.http
             && h.hsts_include_subdomains
+            && !left_to_stored(LEFT_TO_STORED_PUBLIC_URL)
             && !h
                 .public_url
                 .as_deref()
@@ -3373,6 +3412,38 @@ mod tests {
         assert!(
             refusal.contains("server_name must be a hostname"),
             "{refusal}"
+        );
+    }
+
+    /// A database-backed document whose `[http]` omits `public_url` leaves it
+    /// to the stored settings, as the environment's unset `E6IRC_PUBLIC_URL`
+    /// does; without a database, omitting it is running without one.
+    #[test]
+    fn a_database_backed_http_listener_may_leave_its_public_url_to_the_console() {
+        let names = "server_name = \"irc.x.example\"\nnetwork_name = \"XNet\"\n\
+                     [[listeners]]\naddr = \"127.0.0.1:0\"\n";
+        let http = "[http]\naddr = \"127.0.0.1:0\"\n";
+        let database = "[database]\nurl = \"postgres://localhost/x\"\n";
+        let load = |document: String| {
+            Config::from_table(toml::from_str(&document).expect("table"), &[]).expect("valid")
+        };
+        assert_eq!(
+            load(format!("{names}{http}{database}")).left_to_stored_settings,
+            [LEFT_TO_STORED_PUBLIC_URL]
+        );
+        let stated = load(format!(
+            "{names}{http}public_url = \"https://x.example\"\n{database}"
+        ));
+        assert!(stated.left_to_stored_settings.is_empty());
+        assert!(
+            load(format!("{names}{http}"))
+                .left_to_stored_settings
+                .is_empty()
+        );
+        assert!(
+            load(format!("{names}{database}"))
+                .left_to_stored_settings
+                .is_empty()
         );
     }
 
@@ -4684,6 +4755,34 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
         assert!(refusal.contains("motd line 2"), "{refusal}");
     }
 
+    /// A MOTD of more lines than the smallest SendQ holds at registration is
+    /// refused at load and at a console save; it used to be accepted however
+    /// long, and a slow reader's registration burst overran its SendQ.
+    #[test]
+    fn a_motd_longer_than_the_smallest_sendq_holds_is_refused() {
+        assert_eq!(MAX_MOTD_LINES, 14);
+        let mut config = listening_config();
+        config.motd = vec!["m".repeat(MAX_MOTD_LINE_LEN); MAX_MOTD_LINES];
+        config.validate().expect("at the bound");
+        config.motd.push("m".into());
+        let refusal = config.validate().expect_err("one line more").to_string();
+        assert!(
+            refusal.contains("motd must be at most 14 lines (it is 15)"),
+            "{refusal}"
+        );
+        let managed = ManagedConfig::from_config(&config, None).expect("managed");
+        let refusal = managed
+            .validate(BootstrapContext {
+                http_listener: None,
+                hsts_include_subdomains: false,
+                internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+                application_release_revision: None,
+            })
+            .expect_err("the console save is refused too")
+            .to_string();
+        assert!(refusal.contains("motd must be at most"), "{refusal}");
+    }
+
     /// The console's form states the same bounds the validation holds a save
     /// to, so it does not offer a value the save refuses.
     #[test]
@@ -4694,6 +4793,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             format!("name=\"network_name\" maxlength=\"{MAX_NETWORK_NAME_LEN}\""),
             format!("name=\"description\" maxlength=\"{MAX_DESCRIPTION_LEN}\""),
             format!("each at most {MAX_MOTD_LINE_LEN} bytes"),
+            format!("at most {MAX_MOTD_LINES} lines"),
             format!("name=\"buffer_cap\" min=\"1\" max=\"{MAX_NETWORK_BUFFER_CAP}\""),
         ] {
             assert!(form.contains(&control), "the form lacks {control}");

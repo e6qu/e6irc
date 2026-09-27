@@ -4328,7 +4328,7 @@ async fn query_history_around_and_between() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn between_selectors_resolve_pivots_in_the_db() {
-    // The DB path resolves each BETWEEN pivot's (ts, id) itself, so a msgid pivot
+    // The DB path resolves each BETWEEN pivot's (ts, msgid) itself, so a msgid pivot
     // that has scrolled out of the ring is still paged correctly — where the old
     // ring-only resolution lost a mixed msgid bound or inverted a reversed-order
     // two-msgid range to empty.
@@ -4412,8 +4412,8 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     .await
     .expect("connect");
     // Five messages that all share the SAME whole second. Timestamp-only
-    // paging cannot separate them; composite `(ts, id)` paging must, ordering
-    // them by the monotonically-increasing insertion id.
+    // paging cannot separate them; composite `(ts, msgid)` paging must,
+    // ordering them by their msgids.
     for tag in ["a", "b", "c", "d", "e"] {
         sqlx::query(
             "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
@@ -4439,7 +4439,7 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     assert_eq!(
         before.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
         vec!["a", "b"],
-        "BEFORE must page by (ts,id), not skip the whole second"
+        "BEFORE must page by (ts, msgid), not skip the whole second"
     );
 
     // AFTER msgid=c → the same-second messages inserted after c.
@@ -10186,6 +10186,341 @@ async fn a_stored_buffer_cap_above_storage_is_brought_within_it_by_0091() {
             ("large", e6ircd::config::MAX_NETWORK_BUFFER_CAP),
             ("small", 1000)
         ]
+    );
+}
+
+/// Two shards persist their own lines of one conversation, so the database
+/// receives a millisecond's rows in no order the ring could share. Every page
+/// is cut in `(ts, msgid)` order compared byte by byte — the ring's order —
+/// whatever order the rows arrived in and whatever the column's collation: on
+/// a UTF-8 database the column is given one that orders `a1` before `B1`,
+/// which bytes do not.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_millisecond_pages_in_msgid_order_whatever_shard_stored_it_first() {
+    use e6ircd::core::{HistoryQuery, SelectorBound};
+    let pool = db::connect_and_migrate(
+        &support::test_db("a_millisecond_pages_in_msgid_order_whatever_shard").await,
+    )
+    .await
+    .expect("connect");
+    // An ICU collation needs a UTF-8 database, which CI's is; a cluster
+    // initialized in the C locale (SQL_ASCII) compares bytes whatever the
+    // column says, and there the arrival order alone tells the orders apart.
+    let encoding: String = sqlx::query_scalar(
+        "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("database encoding");
+    if encoding == "UTF8" {
+        sqlx::query(r#"ALTER TABLE messages ALTER COLUMN msgid TYPE text COLLATE "und-x-icu""#)
+            .execute(&pool)
+            .await
+            .expect("a collation that is not a byte comparison");
+    }
+    // The order the rows reach the database in: neither the byte order nor
+    // the collation's.
+    for msgid in ["a1", "B2", "B1"] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, 'alice!bob', 'x!x@h', NULL, 'privmsg', $1,
+                     to_timestamp(5000::double precision / 1000))",
+        )
+        .bind(msgid)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+    let page = |rows: Vec<e6ircd::core::HistoryRow>| -> Vec<String> {
+        rows.into_iter().map(|row| row.msgid).collect()
+    };
+    let msgid = |m: &str| m.to_string();
+    let at = e6irc_proto::time::Millis::from_millis(5000);
+    let target = "alice!bob";
+    assert_eq!(
+        page(hist(&pool, target, HistoryQuery::Latest { limit: 10 }).await),
+        ["B1", "B2", "a1"]
+    );
+    assert_eq!(
+        page(hist(&pool, target, HistoryQuery::Latest { limit: 2 }).await),
+        ["B2", "a1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::BeforeMsgid {
+                    msgid: msgid("a1"),
+                    limit: 10
+                }
+            )
+            .await
+        ),
+        ["B1", "B2"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::AfterMsgid {
+                    msgid: msgid("B1"),
+                    limit: 10
+                }
+            )
+            .await
+        ),
+        ["B2", "a1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::LatestAfterMsgid {
+                    msgid: msgid("B1"),
+                    limit: 1
+                }
+            )
+            .await
+        ),
+        ["a1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::AroundMsgid {
+                    msgid: msgid("B2"),
+                    limit: 2
+                }
+            )
+            .await
+        ),
+        ["B1", "B2"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                HistoryQuery::Around {
+                    around_ts: at,
+                    limit: 2
+                }
+            )
+            .await
+        ),
+        ["B1"]
+    );
+    // BETWEEN: two msgids, and a msgid against a timestamp either way round.
+    let before = SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(4999));
+    let between =
+        |first: SelectorBound, second: SelectorBound, limit| HistoryQuery::BetweenSelectors {
+            first,
+            second,
+            limit,
+        };
+    let id = |m: &str| SelectorBound::Msgid(m.to_string());
+    assert_eq!(
+        page(hist(&pool, target, between(id("a1"), id("B1"), 10)).await),
+        ["B2"]
+    );
+    assert_eq!(
+        page(hist(&pool, target, between(before.clone(), id("a1"), 10)).await),
+        ["B1", "B2"]
+    );
+    assert_eq!(
+        page(hist(&pool, target, between(id("B2"), before.clone(), 10)).await),
+        ["B1"]
+    );
+    assert_eq!(
+        page(
+            hist(
+                &pool,
+                target,
+                between(
+                    id("B1"),
+                    SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(5001)),
+                    1
+                )
+            )
+            .await
+        ),
+        ["B2"]
+    );
+}
+
+/// A concurrent index build that failed leaves its index behind invalid, and
+/// sqlx records the migration only once its statement succeeds — so the next
+/// start ran it again and failed on the leftover name for good. The leftover
+/// is dropped before migrating, and the build runs again.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_interrupted_concurrent_index_build_is_retried() {
+    let url = support::test_db("an_interrupted_concurrent_index_build_is_retried").await;
+    let directory = std::env::temp_dir().join(format!(
+        "e6irc-concurrent-migration-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("migration directory");
+    std::fs::write(
+        directory.join("0001_rows.sql"),
+        "CREATE TABLE concurrent_rows (value INT);\nINSERT INTO concurrent_rows VALUES (1), (1);\n",
+    )
+    .expect("table migration");
+    std::fs::write(
+        directory.join("0002_unique.sql"),
+        "-- no-transaction\n-- One value per row.\n\
+         CREATE UNIQUE INDEX CONCURRENTLY concurrent_rows_value_idx ON concurrent_rows (value);\n",
+    )
+    .expect("index migration");
+    let migrator = sqlx::migrate::Migrator::new(directory.as_path())
+        .await
+        .expect("migrator");
+    // The duplicate makes the build fail after it created the index.
+    let failed = db::run_migrations(&url, &migrator).await;
+    assert!(failed.is_err(), "{failed:?}");
+    let pool = plain_pool(&url).await.expect("connect");
+    let leftover: Option<bool> = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('concurrent_rows_value_idx')",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("index state");
+    assert_eq!(
+        leftover,
+        Some(false),
+        "the failed build leaves an invalid index"
+    );
+    sqlx::query(
+        "DELETE FROM concurrent_rows WHERE ctid <> (SELECT min(ctid) FROM concurrent_rows)",
+    )
+    .execute(&pool)
+    .await
+    .expect("fix the data");
+    db::run_migrations(&url, &migrator)
+        .await
+        .expect("the build is retried from scratch");
+    std::fs::remove_dir_all(&directory).expect("clean up");
+    let valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('concurrent_rows_value_idx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("index state");
+    assert!(valid);
+}
+
+/// A conversation's read marker stored under the correspondent's nick, before
+/// markers were kept by identity, is moved by 0094 to the key it is now looked
+/// up under: a grouped nick's to its account, a nick registered to no one to
+/// `~nick`. Two markers landing on one key keep the newer position; channels,
+/// account names and `~` identities stay; and running the move again changes
+/// nothing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn stored_conversation_markers_are_moved_to_identities_by_0094() {
+    let pool = plain_pool(&support::test_db("stored_conversation_markers_are_moved_by_0094").await)
+        .await
+        .expect("connect");
+    MIGRATIONS.run_to(93, &pool).await.expect("through 0093");
+    for account in ["alice", "Bob"] {
+        db::create_account_with_contact(&pool, account, "pw", None)
+            .await
+            .expect("account");
+    }
+    assert!(matches!(
+        db::group_nick(&pool, "Bob", "Bobby").await.expect("group"),
+        db::NickGroupOutcome::Grouped
+    ));
+    let rows: [(&str, i64); 8] = [
+        ("#chan", 1_000),
+        ("bob", 2_000),
+        // The grouped nick's marker is the newer of the two for the account.
+        ("bobby", 3_000),
+        ("carol", 4_000),
+        // Written since markers were kept by identity: newer than `carol`.
+        ("~carol", 5_000),
+        ("dave", 7_000),
+        ("~dave", 6_000),
+        ("~erin", 8_000),
+    ];
+    for (target, millis) in rows {
+        sqlx::query(
+            "INSERT INTO read_markers (account_id, target, marker_ts)
+             SELECT id, $1, to_timestamp($2::double precision / 1000)
+             FROM accounts WHERE name_folded = 'alice'",
+        )
+        .bind(target)
+        .bind(millis)
+        .execute(&pool)
+        .await
+        .expect("marker");
+    }
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let expected = [
+        ("#chan", "1970-01-01T00:00:01.000Z"),
+        ("bob", "1970-01-01T00:00:03.000Z"),
+        ("~carol", "1970-01-01T00:00:05.000Z"),
+        ("~dave", "1970-01-01T00:00:07.000Z"),
+        ("~erin", "1970-01-01T00:00:08.000Z"),
+    ]
+    .map(|(target, at)| (target.to_string(), at.to_string()));
+    assert_eq!(
+        db::list_read_markers(&pool, "alice")
+            .await
+            .expect("markers"),
+        expected
+    );
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0094_markers_by_identity_motd_lines_history_index.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("the move runs again");
+    assert_eq!(
+        db::list_read_markers(&pool, "alice")
+            .await
+            .expect("markers"),
+        expected,
+        "a second run changes nothing"
+    );
+}
+
+/// A stored MOTD longer than the smallest SendQ holds at registration is
+/// brought to that bound by 0094, keeping its first lines, so the next start
+/// does not refuse the stored settings.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stored_motd_above_the_line_bound_is_brought_within_it_by_0094() {
+    let pool = plain_pool(&support::test_db("a_stored_motd_above_the_line_bound_0094").await)
+        .await
+        .expect("connect");
+    MIGRATIONS.run_to(93, &pool).await.expect("through 0093");
+    let bootstrap =
+        e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
+    db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    let stored: Vec<String> = (1..=40).map(|line| format!("line {line}")).collect();
+    sqlx::query("UPDATE server_settings SET settings = jsonb_set(settings, '{motd}', $1)")
+        .bind(sqlx::types::Json(&stored))
+        .execute(&pool)
+        .await
+        .expect("store a MOTD the old bound admitted");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let loaded = db::load_managed_config(&pool).await.expect("loads");
+    assert_eq!(
+        loaded.settings.motd,
+        stored[..e6ircd::config::MAX_MOTD_LINES].to_vec()
     );
 }
 

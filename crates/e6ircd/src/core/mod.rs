@@ -2237,6 +2237,32 @@ impl HistoryRow {
             None => std::borrow::Cow::Borrowed(&self.body),
         }
     }
+
+    /// Where this entry sits in its buffer's history: its millisecond, then its
+    /// msgid compared byte by byte. The one total order of a buffer, which
+    /// every shard computes identically from the message alone — the hot ring
+    /// keeps its entries in it and the database pages by it
+    /// (`ORDER BY ts, msgid COLLATE "C"`, migration 0093), so two lines
+    /// stamped in one millisecond on different shards sit in the same order in
+    /// both, whichever shard persisted each. A byte comparison is what the
+    /// `"C"` collation is; any other collation would order the same ids
+    /// differently in the database than here.
+    pub(crate) fn place(&self) -> HistoryPlace<'_> {
+        HistoryPlace {
+            ts: self.ts,
+            msgid: Some(&self.msgid),
+        }
+    }
+}
+
+/// A position in a buffer's `(ts, msgid)` order ([`HistoryRow::place`]). A
+/// `timestamp=` bound has no msgid and sits before every message stamped in
+/// its millisecond: `None` orders before any id, as a SQL row comparison
+/// against a NULL id reduces to one on the time alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HistoryPlace<'a> {
+    pub(crate) ts: e6irc_proto::time::Millis,
+    pub(crate) msgid: Option<&'a str>,
 }
 
 /// Capability state that determines the wire shape of a CHATHISTORY reply.
@@ -3601,20 +3627,25 @@ pub mod fuzz {
     use super::hot_history::{HotHistory, HotHistoryBounds};
     use super::state::HistoryKey;
 
-    /// One message entering a ring: when it was stamped, whether it is a
-    /// TAGMSG, and how many bytes of client-only tags it carries.
+    /// One message entering a ring: when it was stamped, on which shard,
+    /// whether it is a TAGMSG, and how many bytes of client-only tags it
+    /// carries.
     #[derive(Debug, Clone, Copy)]
     pub struct Arrival {
         pub ts: u64,
+        pub shard: u8,
         pub tagmsg: bool,
         pub tag_bytes: u16,
     }
 
-    /// A ring after its arrivals: `(msgid, ts)` oldest first — the msgid is
-    /// `m<arrival index>` — whether it is the whole record, and its newest
-    /// timestamp in the text scope and in the text-and-tags scope.
+    /// A ring after its arrivals: `(msgid, ts)` oldest first, whether it is
+    /// the whole record, and its newest timestamp in the text scope and in the
+    /// text-and-tags scope. `msgids[i]` is the msgid the `i`th arrival was
+    /// stamped with by its shard's real msgid source, so a millisecond's
+    /// entries from several shards order as they do in production.
     #[derive(Debug, Clone)]
     pub struct Ring {
+        pub msgids: Vec<String>,
         pub entries: Vec<(String, u64)>,
         pub complete: bool,
         pub latest_text: Option<u64>,
@@ -3622,14 +3653,17 @@ pub mod fuzz {
         held: Vec<super::HistoryRow>,
     }
 
-    /// The bytes one entry of `arrival` holds in a ring.
+    /// The bytes one entry of `arrival` holds in a ring, with a msgid of
+    /// the length every stamped one has at that time.
     pub fn footprint(arrival: Arrival) -> usize {
-        super::hot_history::footprint(&entry(0, arrival))
+        let msgid = super::state::MsgidSource::with_boot(super::CoreShardId(0), 0)
+            .next(Millis::from_millis(arrival.ts));
+        super::hot_history::footprint(&entry(msgid, arrival))
     }
 
-    fn entry(index: usize, arrival: Arrival) -> super::HistoryRow {
+    fn entry(msgid: String, arrival: Arrival) -> super::HistoryRow {
         super::HistoryRow {
-            msgid: format!("m{index}"),
+            msgid,
             ts: Millis::from_millis(arrival.ts),
             sender_prefix: "n!u@h".into(),
             sender_account: None,
@@ -3654,11 +3688,29 @@ pub mod fuzz {
             ring_bytes,
             bytes: usize::MAX,
         };
-        for (index, arrival) in arrivals.iter().enumerate() {
-            history.push(&key, entry(index, *arrival), true, bounds);
+        // One source per shard, as each core shard has; the boot value is
+        // fixed so that a shard's ids have one length.
+        let mut sources = std::collections::HashMap::new();
+        let msgids: Vec<String> = arrivals
+            .iter()
+            .map(|arrival| {
+                sources
+                    .entry(arrival.shard)
+                    .or_insert_with(|| {
+                        super::state::MsgidSource::with_boot(
+                            super::CoreShardId(usize::from(arrival.shard)),
+                            0x0123_4567_89ab_cdef,
+                        )
+                    })
+                    .next(Millis::from_millis(arrival.ts))
+            })
+            .collect();
+        for (msgid, arrival) in msgids.iter().zip(arrivals) {
+            history.push(&key, entry(msgid.clone(), *arrival), true, bounds);
         }
         let Some(ring) = history.get(&key) else {
             return Ring {
+                msgids,
                 entries: Vec::new(),
                 complete: true,
                 latest_text: None,
@@ -3668,6 +3720,7 @@ pub mod fuzz {
         };
         let latest = ring.latest();
         Ring {
+            msgids,
             entries: ring
                 .entries()
                 .iter()

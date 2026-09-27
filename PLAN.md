@@ -1327,6 +1327,26 @@ qualification (DESIGN §8, §17, §18):
   upgrade note on `trusted_proxies` and a start-up warning when a loopback-only
   HTTP listener without trusted proxies makes every user share one budget.
 
+Maintainer decisions implemented from the last sweep (DESIGN §8, §11, §18):
+
+- **History has one total order, `(ts, msgid)`**, byte-compared in the ring
+  and `COLLATE "C"` in the database (index built concurrently, 0093), so a
+  millisecond's lines persisted by different shards page identically from
+  both; msgid counters are fixed-width so one shard's ids ascend as stamped.
+  An interrupted concurrent index build is dropped and rebuilt on the next
+  attempt.
+- **Read markers stored under a nick follow the identity key (0094):** a
+  grouped nick's to its account, an unregistered nick's to `~nick`, the newer
+  of two kept.
+- **The MOTD is at most 14 lines**, what half the smallest SendQ holds at the
+  longest line; 0094 kept the first 14 of a longer stored MOTD.
+- **`E6IRC_PUBLIC_URL` may be unset**, like a database-backed file's omitted
+  `[http].public_url`: the stored value applies, and a first start with none
+  stored refuses naming `http.public_url`.
+- **A settings save that moved the BNC listener and found its revision stale
+  binds straight to the reloaded revision** (`follow_bnc_listener`, shared with
+  the settings watcher).
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

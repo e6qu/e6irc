@@ -9,10 +9,12 @@
 //! goes through exactly the parser and validation a configuration file does,
 //! so the two ingresses cannot disagree about what a valid configuration is.
 //!
-//! Required:  `E6IRC_PUBLIC_URL`  `E6IRC_DATABASE_URL`
-//!            `APPLICATION_RELEASE_REVISION`
+//! Required:  `E6IRC_DATABASE_URL`  `APPLICATION_RELEASE_REVISION`
 //! Optional:  `E6IRC_SERVER_NAME` (unset: the stored settings' value; the first
 //!              start, with none stored yet, needs it)
+//!            `E6IRC_PUBLIC_URL` (unset: the stored settings' value, as for a
+//!              file's `[http]` without `public_url`; the first start, with
+//!              none stored yet, needs it)
 //!            `E6IRC_NETWORK_NAME` (default `e6qu`)
 //!            `E6IRC_HTTP_ADDR` (default `0.0.0.0:8080`)
 //!            `E6IRC_IRC_ADDR` (default `127.0.0.1:6667`: IRC is reached over
@@ -284,10 +286,11 @@ pub fn configuration_table(
 
     let mut http = Table::new();
     http.insert("addr".into(), Value::String(http_addr(environment.0)?));
-    http.insert(
-        "public_url".into(),
-        environment.required("E6IRC_PUBLIC_URL", None)?,
-    );
+    // Unset, like `server_name`: the stored settings' public URL applies, and
+    // the first start needs it stated (`crate::config::LEFT_TO_STORED_PUBLIC_URL`).
+    if let Some(public_url) = environment.optional("E6IRC_PUBLIC_URL")? {
+        http.insert("public_url".into(), Value::String(public_url));
+    }
     let secure_cookies = match environment.optional("E6IRC_SECURE_COOKIES")?.as_deref() {
         None => {
             defaulted.push("http.secure_cookies");
@@ -549,11 +552,7 @@ mod tests {
 
     #[test]
     fn each_required_variable_is_refused_by_name_when_absent_or_empty() {
-        for required in [
-            "E6IRC_PUBLIC_URL",
-            "E6IRC_DATABASE_URL",
-            "APPLICATION_RELEASE_REVISION",
-        ] {
+        for required in ["E6IRC_DATABASE_URL", "APPLICATION_RELEASE_REVISION"] {
             let absent: Vec<_> = minimal()
                 .into_iter()
                 .filter(|(name, _)| *name != required)
@@ -589,6 +588,46 @@ mod tests {
             );
         }
         assert!(config(&minimal()).left_to_stored_settings.is_empty());
+    }
+
+    /// An unset `E6IRC_PUBLIC_URL` leaves the public URL to the settings the
+    /// console stores, as a database-backed file whose `[http]` omits
+    /// `public_url` does. It used to be required, so a public URL changed in
+    /// the console had to be copied into the environment before the next start.
+    #[test]
+    fn an_unset_public_url_is_left_to_the_stored_settings() {
+        for unset in [
+            minimal()
+                .into_iter()
+                .filter(|(name, _)| *name != "E6IRC_PUBLIC_URL")
+                .collect::<Vec<_>>(),
+            with(minimal(), &[("E6IRC_PUBLIC_URL", "")]),
+        ] {
+            let document = table(&unset).expect("the document");
+            assert!(
+                !document["http"]
+                    .as_table()
+                    .expect("http")
+                    .contains_key("public_url")
+            );
+            let config = config(&unset);
+            assert_eq!(
+                config.left_to_stored_settings,
+                [crate::config::LEFT_TO_STORED_PUBLIC_URL],
+                "the start takes it from the stored revision"
+            );
+            assert_eq!(config.http.expect("http").public_url, None);
+        }
+        // HSTS asks for an https origin; one left to the stored settings is
+        // judged once they are applied, at start.
+        let hsts = with(
+            minimal()
+                .into_iter()
+                .filter(|(name, _)| *name != "E6IRC_PUBLIC_URL")
+                .collect(),
+            &[("E6IRC_HSTS_INCLUDE_SUBDOMAINS", "true")],
+        );
+        assert!(config(&hsts).http.expect("http").hsts_include_subdomains);
     }
 
     #[test]

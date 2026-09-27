@@ -1619,7 +1619,16 @@ five-second lock-acquisition deadline and a 60-second
 `idle_in_transaction_session_timeout` on every pooled connection. Migrations
 run on a dedicated connection with no statement deadline and a ten-second lock
 deadline, retried up to six times with a stderr line per attempt, so a long
-migration is not cancelled by the pool's bound. Dependency
+migration is not cancelled by the pool's bound. An index built on a table a
+live server writes is built `CONCURRENTLY`, so writers are not blocked for
+the build; such a migration runs outside a transaction (`-- no-transaction`)
+and is exactly that one statement (a unit test holds every such file to it).
+A concurrent build that fails — a lock wait past the deadline, a lost
+connection — leaves its index behind invalid and the migration unrecorded, so
+before each attempt the runner, holding the migrator's lock (a build in
+progress is invalid too), drops the invalid index a pending concurrent
+build left (`drop_interrupted_index_builds`) and the build runs again, where
+the retry used to fail on the leftover name for good. Dependency
 loss, pool exhaustion, a wedged query, or a contended lock therefore becomes a
 typed database failure instead of parking an HTTP or worker caller indefinitely.
 
@@ -1680,7 +1689,9 @@ Principal tables (columns abridged):
   per-account lookups, since the primary key leads with `channel_id`.
 - `messages` — append-only history log; columns (id, msgid, target,
   sender_prefix, sender_account, kind, body, ts, dm_peers), indexed
-  `(target, ts, id)` (migration 0027) and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
+  `(target, ts, msgid COLLATE "C")` — the order CHATHISTORY pages in (§11.3),
+  built concurrently by migration 0093; 0094 dropped the `(target, ts, id)`
+  index of 0027 it supersedes — and `(ts, id)` (retention's batches); `messages_sender_account_idx` (migration 0063) together with
   the direct-message peers index makes the account-message predicate (account
   deletion and export) a BitmapOr of two index scans. Migration 0064 dropped the
   unused BRIN on `ts`. The live storage policy retains 1–3650 days
@@ -3395,7 +3406,9 @@ Design constraints recorded now:
   or twice-read clock makes messages unorderable or replays them bearing a
   different time than they were delivered with. A msgid is
   `<ms>-<shard>-<boot>-<counter>`: the shard that stamped it, a random value
-  drawn once per process, and that shard's counter. The `messages` table keys
+  drawn once per process, and that shard's counter, as sixteen hex digits so
+  that one shard's ids of one millisecond sort in the order it stamped them
+  (history is ordered by `(ts, msgid)`, §11.3). The `messages` table keys
   on the msgid and keeps the first of two rows sharing one, so ids that two
   shards (each counting from zero) or a restart under a stepped-back clock
   could repeat would silently lose history; naming the shard and the boot makes
@@ -3430,7 +3443,9 @@ Design constraints recorded now:
   the account it is grouped to, or else the account of that name, so a
   conversation with a registered user is found by any of their nicks while they
   are away. A read marker on a conversation is kept under the same identity
-  (§8, `read_markers`). Two successive
+  (§8, `read_markers`); migration 0094 moved the markers stored under a
+  correspondent's nick before that — a grouped nick's to its account, a nick
+  registered to no one to `~nick`, two landing on one key keeping the newer. Two successive
   *unauthenticated* holders of a nick derive the same `~nick` — there is
   nothing stronger to key on. A conversation with an unauthenticated party is
   therefore never written to the database and never read from it: it lives
@@ -3596,26 +3611,34 @@ Design constraints recorded now:
   each ring keeps its newest timestamp in each `HistoryScope` (a count of the
   entries the scope admits beside their newest time, since the ring only ever
   sheds its oldest), which a channel's owner publishes for TARGETS on every
-  shard. A ring is sorted by `(ts, arrival)`, an invariant of its insert rather
-  than something each reader re-establishes: entries do not arrive in time
-  order (a conversation's line from the peer's shard, a wall clock stepped
-  back), while every reader pages by time — a `timestamp=` bound and a `msgid=`
-  pivot are found by position, and the database the ring falls back to orders
-  by `(ts, id)`. The place is found searching back from the newest end, one
-  comparison for an entry in order. `time=` is still stamped once (§11.1): a
-  late entry takes its place in time rather than a new time. Within one
-  millisecond, arrival order is the database's `id` order wherever one shard
-  both fills a ring and persists what enters it — a channel on its owner, a
-  conversation line on its sender's shard — since it queues rows in the order
-  they enter the ring. The ring holds the newest part of everything it was
-  given with nothing missing inside it: an entry stamped before one the ring
-  has already shed is not taken in (the database holds it), since held it
-  would sit before a hole, and a page across that hole would skip what was
-  shed. A BETWEEN orders its two pivots by that same `(ts, id)` place — a
-  timestamp before every message stamped with it — as the database does. The
-  `chathistory_window` fuzz target pushes arbitrary out-of-order arrivals
-  through a ring and checks every window it claims to cover against a model of
-  the database holding them all.
+  shard. A ring is sorted by `(ts, msgid)`, the msgid compared byte by byte
+  (`HistoryRow::place`), an invariant of its insert rather than something each
+  reader re-establishes: entries do not arrive in time order (a conversation's
+  line from the peer's shard, a wall clock stepped back), while every reader
+  pages by time — a `timestamp=` bound and a `msgid=` pivot are found by
+  position — and the database the ring falls back to pages by the same key,
+  `ORDER BY ts, msgid COLLATE "C"` (`"C"` is the byte comparison; the
+  database's default collation would order the same ids otherwise). The key is
+  the message's own, so every shard computes it identically: each shard
+  persists its own lines of a conversation, and the database's `id` — the
+  order rows reached it — could put a millisecond's line from the peer's shard
+  and a local one in one order while the ring held them in the other. Within
+  one shard a millisecond's msgids ascend in the order they were stamped (the
+  counter is written at a fixed width, §11.1), so there the order is also the
+  order of live delivery. The place is found searching back from the newest
+  end, one comparison for an entry in order. `time=` is still stamped once
+  (§11.1): a late entry takes its place in time rather than a new time. The
+  ring holds the newest part of everything it was given with nothing missing
+  inside it: an entry placed before one the ring has already shed is not taken
+  in (the database holds it), since held it would sit before a hole, and a
+  page across that hole would skip what was shed. A BETWEEN orders its two
+  pivots by that same `(ts, msgid)` place — a timestamp before every message
+  stamped with it, which the database spells as a NULL msgid (`(ts, m) > (T,
+  NULL)` is `ts > T`) — as the database does. The `chathistory_window` fuzz
+  target pushes arbitrary out-of-order arrivals, stamped by several shards'
+  real msgid sources so one millisecond holds lines of more than one, through
+  a ring and checks every window it claims to cover against a model of the
+  database holding them all in `(ts, msgid)` order.
   **History retention applies to memory too.** `storage.history_retention_days`
   bounds what storage maintenance keeps in `messages` and `bnc_buffer`; every
   read the core answers takes a floor raised to it (`HistoryFloor`, applied
@@ -4767,7 +4790,19 @@ Layers, bottom to top:
   stored revision's values (`Config::left_to_stored_settings`); a first start
   with none stored refuses naming each it leaves out, and a document without
   `[database]` must state them. File mode used to require all three, so a name
-  changed in the console could only be copied back into the file. A setting
+  changed in the console could only be copied back into the file. The public
+  URL follows the same rule in both ingresses: a database-backed document
+  whose `[http]` omits `public_url`, like an unset `E6IRC_PUBLIC_URL`, takes
+  the stored revision's (`LEFT_TO_STORED_PUBLIC_URL`), and a first start with
+  none stored refuses naming `http.public_url` rather than import an
+  omission as "no public URL". The environment used to require it outright,
+  so a URL changed in the console had to be copied back into the container's
+  environment. A server may still run without one — a document without
+  `[database]` that omits it, or a stored revision the console cleared — and
+  that stays loud where it matters: OpenID Connect refuses to be configured,
+  device login and account invitations refuse naming the setting, and a
+  WebSocket upgrade's `Origin` is held to its `Host` with a refusal that says
+  to configure the public URL behind a proxy. A setting
   the bootstrap does not state is never a conflict: a
   file's absent key, or an environment variable left unset whose default the
   environment reader fills in (`E6IRC_NETWORK_NAME`, `E6IRC_IRC_ADDR`,
@@ -4792,7 +4827,12 @@ Layers, bottom to top:
   save that still finds its revision stale reloads the stored row before it
   answers (`db::save_managed_config_over`), so the conflict it reports is one
   the administrator can read and a retry from it commits; the snapshot used to
-  stay stale and refuse every later save until a restart. A lost listening
+  stay stale and refuse every later save until a restart. A save that had
+  already moved the attach listener and then fails brings it to the revision
+  now held — the reloaded one when it was stale — through the watcher's own
+  `settings_watch::follow_bnc_listener`; it used to put the listener back where
+  the stale revision had it, until the watcher's next announcement moved it
+  again. A lost listening
   connection is re-established and the row read again. The write takes the scalar
   settings only: the collections that hold secrets (OIDC providers, operators,
   server-level networks) are kept from the current revision and changed through
@@ -4842,7 +4882,15 @@ Layers, bottom to top:
   bytes) and nickname (64): `description`, `RPL_LINKS`' server information, at
   most 242 bytes, and each `motd` line, an `RPL_MOTD`, at most 372 — as the
   names themselves are, since `numeric_line` clips what does not fit without a
-  word. The console's form and the OpenAPI schema state the same bounds.
+  word. The MOTD is bounded in lines too, at most 14 (`MAX_MOTD_LINES`): a new
+  client is sent all of it at registration before it has read anything, and
+  its replies (a line each, framed by `RPL_MOTDSTART` and `RPL_ENDOFMOTD`, at
+  most 512 bytes apiece since numerics carry no tags) take at most half of the
+  smallest SendQ, 17,406 bytes, leaving the other half to the rest of the
+  burst; a MOTD of any length used to be accepted, and filled a slow reader's
+  SendQ at registration. Migration 0094 kept the first 14 lines of a stored
+  MOTD longer than that. The console's form and the OpenAPI schema state the
+  same bounds.
   "Every console save" includes what start reads beside the document: a save
   is judged against the running process's own bootstrap values — its HTTP
   listener, its `application_release_revision` (which a `shauth` provider

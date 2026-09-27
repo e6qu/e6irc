@@ -6,13 +6,15 @@
 //! Messages reach a ring out of time order — a conversation's entry from the
 //! peer's shard, a wall clock stepped back — and the ring sheds its oldest
 //! under an entry cap and a byte budget. The ring is kept sorted by
-//! `(ts, arrival)`, which is the database's `(ts, id)` order for the rows one
-//! shard both keeps and persists, so a page the ring answers must be the page
-//! the database would.
+//! `(ts, msgid)`, the msgid compared byte by byte, which is the database's
+//! `(ts, msgid COLLATE "C")` order however the rows reached it — each shard
+//! persists its own lines of a conversation — so a page the ring answers must
+//! be the page the database would.
 //!
 //! This is a **differential** fuzz. Arbitrary arrivals (timestamps in any
-//! order, TAGMSGs, client tags of any size) are pushed into a ring with an
-//! arbitrary byte budget. The ring must hold, in `(ts, arrival)` order, the
+//! order, stamped by any of several shards so a millisecond holds lines from
+//! more than one, TAGMSGs, client tags of any size) are pushed into a ring
+//! with an arbitrary byte budget. The ring must hold, in `(ts, msgid)` order, the
 //! newest part of everything it was given with nothing missing inside it, its
 //! newest line always among it, and its newest timestamp per scope equal to a
 //! recount. Then arbitrary CHATHISTORY windows are resolved against it; every
@@ -23,15 +25,16 @@ use e6ircd::core::fuzz::{Arrival, footprint, ring_after, window};
 use libfuzzer_sys::fuzz_target;
 
 /// A model of the `messages` table for one target: every arrival, as
-/// `(ts, arrival index)`, in `(ts, id)` order.
-struct Database(Vec<(u64, usize)>);
+/// `(ts, msgid, arrival index)`, in `(ts, msgid)` order with the msgid
+/// compared byte by byte (`COLLATE "C"`).
+struct Database(Vec<(u64, String, usize)>);
 
 impl Database {
     /// Rows strictly before a selector's position (an upper-exclusive bound).
     fn before(&self, selector: &Selector) -> Option<usize> {
         Some(match *selector {
-            Selector::Msgid(index) => self.0.iter().position(|&(_, i)| i == index)?,
-            Selector::Timestamp(t) => self.0.iter().filter(|&&(ts, _)| ts < t).count(),
+            Selector::Msgid(index) => self.0.iter().position(|&(_, _, i)| i == index)?,
+            Selector::Timestamp(t) => self.0.iter().filter(|&&(ts, _, _)| ts < t).count(),
         })
     }
 
@@ -39,21 +42,21 @@ impl Database {
     /// bound).
     fn after(&self, selector: &Selector) -> Option<usize> {
         Some(match *selector {
-            Selector::Msgid(index) => self.0.iter().position(|&(_, i)| i == index)? + 1,
-            Selector::Timestamp(t) => self.0.iter().filter(|&&(ts, _)| ts <= t).count(),
+            Selector::Msgid(index) => self.0.iter().position(|&(_, _, i)| i == index)? + 1,
+            Selector::Timestamp(t) => self.0.iter().filter(|&&(ts, _, _)| ts <= t).count(),
         })
     }
 
-    /// A selector's place in the `(ts, id)` order: a row's own (ids start at
-    /// one), a timestamp's before every row stamped with it.
-    fn place(&self, selector: &Selector) -> Option<(u64, usize)> {
+    /// A selector's place in the `(ts, msgid)` order: a row's own, a
+    /// timestamp's before every row stamped with it (a NULL msgid).
+    fn place(&self, selector: &Selector) -> Option<(u64, Option<&str>)> {
         match *selector {
             Selector::Msgid(index) => self
                 .0
                 .iter()
-                .find(|&&(_, i)| i == index)
-                .map(|&(ts, i)| (ts, i + 1)),
-            Selector::Timestamp(t) => Some((t, 0)),
+                .find(|&&(_, _, i)| i == index)
+                .map(|(ts, msgid, _)| (*ts, Some(msgid.as_str()))),
+            Selector::Timestamp(t) => Some((t, None)),
         }
     }
 
@@ -62,7 +65,7 @@ impl Database {
         let from = from.min(to);
         self.0[from..to]
             .iter()
-            .map(|&(_, i)| format!("m{i}"))
+            .map(|(_, msgid, _)| msgid.clone())
             .collect()
     }
 
@@ -129,9 +132,9 @@ enum Selector {
 }
 
 impl Selector {
-    fn wire(self) -> String {
+    fn wire(self, msgids: &[String]) -> String {
         match self {
-            Selector::Msgid(index) => format!("msgid=m{index}"),
+            Selector::Msgid(index) => format!("msgid={}", msgids[index]),
             Selector::Timestamp(ms) => format!(
                 "timestamp={}",
                 e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(ms))
@@ -158,12 +161,16 @@ impl Input<'_> {
 fuzz_target!(|data: &[u8]| {
     let mut input = Input(data);
     let count = usize::from(input.byte() % 64);
-    // Timestamps from a narrow range, so they collide and interleave.
+    // Timestamps from a narrow range, so they collide and interleave; the
+    // byte's high bits pick the shard that stamped it, so a millisecond holds
+    // lines of several shards, which arrive in no order their msgids share.
     let arrivals: Vec<Arrival> = (0..count)
         .map(|_| {
             let shape = input.byte();
+            let stamp = input.byte();
             Arrival {
-                ts: 1_000 + u64::from(input.byte() % 32),
+                ts: 1_000 + u64::from(stamp % 32),
+                shard: stamp >> 5,
                 tagmsg: shape & 1 != 0,
                 tag_bytes: u16::from(shape >> 1) * 8,
             }
@@ -171,17 +178,19 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     // A budget of a few ordinary entries, so shedding is common.
     let unit = footprint(Arrival {
-        ts: 0,
+        ts: 1_000,
+        shard: 0,
         tagmsg: false,
         tag_bytes: 0,
     });
     let budget = unit * (1 + usize::from(input.byte() % 16));
     let ring = ring_after(&arrivals, budget);
 
-    let mut database: Vec<(u64, usize)> = arrivals
+    let mut database: Vec<(u64, String, usize)> = arrivals
         .iter()
+        .zip(&ring.msgids)
         .enumerate()
-        .map(|(index, arrival)| (arrival.ts, index))
+        .map(|(index, (arrival, msgid))| (arrival.ts, msgid.clone(), index))
         .collect();
     database.sort();
     let database = Database(database);
@@ -190,21 +199,25 @@ fuzz_target!(|data: &[u8]| {
     let held = ring.entries.len();
     let suffix: Vec<(String, u64)> = database.0[database.0.len() - held..]
         .iter()
-        .map(|&(ts, index)| (format!("m{index}"), ts))
+        .map(|(ts, msgid, _)| (msgid.clone(), *ts))
         .collect();
     assert_eq!(
         ring.entries, suffix,
         "the ring is not the newest part of the record"
     );
     assert_eq!(ring.complete, held == database.0.len());
-    if let Some(&(_, newest)) = database.0.last() {
-        assert!(held > 0, "the ring lost its newest line (m{newest})");
+    if let Some((_, newest, _)) = database.0.last() {
+        assert!(held > 0, "the ring lost its newest line ({newest})");
     }
     let recount = |text_only: bool| {
         ring.entries
             .iter()
             .filter(|(id, _)| {
-                let index: usize = id[1..].parse().expect("an arrival index");
+                let index = ring
+                    .msgids
+                    .iter()
+                    .position(|msgid| msgid == id)
+                    .expect("an arrival's msgid");
                 !(text_only && arrivals[index].tagmsg)
             })
             .map(|&(_, ts)| ts)
@@ -214,6 +227,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(ring.latest_all, recount(false));
 
     // Windows the ring covers are the database's windows.
+    let msgids = &ring.msgids;
     for _ in 0..8 {
         let shape = input.byte();
         let sub = match shape % 6 {
@@ -236,11 +250,11 @@ fuzz_target!(|data: &[u8]| {
         let limit = 1 + usize::from(shape >> 3) % 8;
         let (name, first_wire, second_wire) = match sub {
             Sub::LatestStar => ("LATEST", "*".to_string(), "*".to_string()),
-            Sub::Latest => ("LATEST", first.wire(), "*".to_string()),
-            Sub::Before => ("BEFORE", first.wire(), "*".to_string()),
-            Sub::After => ("AFTER", first.wire(), "*".to_string()),
-            Sub::Around => ("AROUND", first.wire(), "*".to_string()),
-            Sub::Between => ("BETWEEN", first.wire(), second.wire()),
+            Sub::Latest => ("LATEST", first.wire(msgids), "*".to_string()),
+            Sub::Before => ("BEFORE", first.wire(msgids), "*".to_string()),
+            Sub::After => ("AFTER", first.wire(msgids), "*".to_string()),
+            Sub::Around => ("AROUND", first.wire(msgids), "*".to_string()),
+            Sub::Between => ("BETWEEN", first.wire(msgids), second.wire(msgids)),
         };
         let Some((page, covered)) = window(&ring, name, &first_wire, &second_wire, limit) else {
             panic!("a well-formed request was refused: {name} {first_wire} {second_wire}");

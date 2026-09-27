@@ -96,31 +96,53 @@ async fn adopt_stored(
         }
     }
     core.set_history_retention_days(current.settings.storage.history_retention_days);
-    if let Some(listener) = bnc_listener {
-        follow_bnc_listener(listener, &current).await;
+    if let Some(listener) = bnc_listener
+        && let Err(UnboundBncListener { wanted, error }) =
+            follow_bnc_listener(listener, &current).await
+    {
+        eprintln!(
+            "managed configuration: revision {} moves the BNC attach listener to {wanted}, \
+             which could not be bound: {error}; the previous listener stays",
+            current.revision
+        );
     }
 }
 
+/// A revision's attach listener that could not be bound: where it was wanted,
+/// and why not. The listener that was serving is still serving.
+#[derive(Debug)]
+pub(crate) struct UnboundBncListener {
+    pub(crate) wanted: std::net::SocketAddr,
+    pub(crate) error: std::io::Error,
+}
+
 /// Bind, rebind or stop the attach listener so it serves what `current`
-/// states. A replacement that cannot bind leaves the working listener in
-/// place (`BncListenerController::enable`) and is reported, as a console save
-/// that could not bind is.
-async fn follow_bnc_listener(listener: &BncListenerController, current: &ManagedConfigSnapshot) {
+/// states: the one way the listener is brought to a stored revision, whether
+/// another writer's revision is adopted here or a console save here found its
+/// own revision stale and reloaded the stored one. A replacement that cannot
+/// bind leaves the working listener in place (`BncListenerController::enable`)
+/// and is returned for the caller to report in its own terms.
+pub(crate) async fn follow_bnc_listener(
+    listener: &BncListenerController,
+    current: &ManagedConfigSnapshot,
+) -> Result<(), UnboundBncListener> {
     let wanted = current.settings.bnc();
     let serving = listener.status().await.map(|(configured, _)| configured);
     if serving == wanted {
-        return;
+        return Ok(());
     }
     match &wanted {
-        Some(bnc) => {
-            if let Err(error) = listener.enable(bnc).await {
-                eprintln!(
-                    "managed configuration: revision {} moves the BNC attach listener to {}, \
-                     which could not be bound: {error}; the previous listener stays",
-                    current.revision, bnc.addr
-                );
-            }
+        Some(bnc) => listener
+            .enable(bnc)
+            .await
+            .map(|_| ())
+            .map_err(|error| UnboundBncListener {
+                wanted: bnc.addr,
+                error,
+            }),
+        None => {
+            listener.stop().await;
+            Ok(())
         }
-        None => listener.stop().await,
     }
 }

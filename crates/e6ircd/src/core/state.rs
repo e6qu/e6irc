@@ -1633,10 +1633,13 @@ impl EventLine {
 /// shared by two messages — two shards counting from zero in the same
 /// millisecond, or a restart whose clock stepped back — silently loses the
 /// second from history. The id is opaque to every reader (CHATHISTORY pivots,
-/// the bouncer, clients all compare it whole); the leading millisecond only
-/// keeps ids roughly time-ordered for a human reading them.
+/// the bouncer, clients all compare it whole) — except for order: history is
+/// ordered by `(ts, msgid)` compared byte by byte
+/// ([`crate::core::HistoryRow::place`]), and the counter is written at a fixed
+/// width so that within one millisecond one shard's ids ascend in the order it
+/// stamped them, which is the order it delivered them live.
 #[derive(Debug)]
-struct MsgidSource {
+pub(crate) struct MsgidSource {
     /// `{shard}-{boot}-`, fixed for the process.
     stem: String,
     counter: u64,
@@ -1652,16 +1655,16 @@ impl MsgidSource {
         Self::with_boot(shard, u64::from_le_bytes(boot))
     }
 
-    fn with_boot(shard: CoreShardId, boot: u64) -> Self {
+    pub(crate) fn with_boot(shard: CoreShardId, boot: u64) -> Self {
         Self {
             stem: format!("{}-{boot:016x}-", shard.0),
             counter: 0,
         }
     }
 
-    fn next(&mut self, now: e6irc_proto::time::Millis) -> String {
+    pub(crate) fn next(&mut self, now: e6irc_proto::time::Millis) -> String {
         self.counter += 1;
-        format!("{}-{}{}", now.as_millis(), self.stem, self.counter)
+        format!("{}-{}{:016x}", now.as_millis(), self.stem, self.counter)
     }
 }
 
@@ -8012,6 +8015,11 @@ mod session_store_tests {
         ];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        // One shard's ids of one millisecond ascend in the order stamped, past
+        // any number of digits: history orders a millisecond by msgid.
+        let mut counting = MsgidSource::with_boot(CoreShardId(0), 7);
+        let stamped: Vec<String> = (0..20).map(|_| counting.next(now)).collect();
+        assert!(stamped.is_sorted(), "{stamped:?}");
         // Tag-safe: no character that needs escaping in a tag value.
         assert!(
             ids.iter()

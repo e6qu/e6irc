@@ -1534,6 +1534,51 @@ fn the_longest_admitted_description_and_motd_line_arrive_whole() {
     }
 }
 
+/// The longest MOTD the configuration admits — every line at its longest, at
+/// the longest server name and nickname — reaches a client that has not read a
+/// byte whole, with the rest of its registration burst, within the smallest
+/// SendQ a connection can have, and with room to spare.
+#[test]
+fn the_longest_admitted_motd_fits_the_smallest_sendq_at_registration() {
+    use e6ircd::config::{
+        MAX_MOTD_LINE_LEN, MAX_MOTD_LINES, MAX_NICKLEN, MAX_SERVER_NAME_LEN, MIN_SENDQ_BYTES,
+    };
+    let server_name = format!(
+        "{}.example",
+        "s".repeat(MAX_SERVER_NAME_LEN - ".example".len())
+    );
+    let mut s = TestServer::configured(
+        false,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.server_name = server_name.clone();
+            config.nicklen = MAX_NICKLEN;
+            config.sendq_bytes = MIN_SENDQ_BYTES;
+            config.motd = vec!["m".repeat(MAX_MOTD_LINE_LEN); MAX_MOTD_LINES];
+        },
+    );
+    let nick = format!("n{}", "x".repeat(MAX_NICKLEN - 1));
+    let c = s.connect_from(
+        1,
+        &format!("{}.example", "h".repeat(60)),
+        e6ircd::core::ConnectionTransport::Tcp,
+    );
+    s.line(c, &format!("NICK {nick}"));
+    s.line(c, &format!("USER {nick} 0 * :{}", "r".repeat(200)));
+    let burst = s.drain(c);
+    let motd = burst
+        .iter()
+        .filter(|line| line.split(' ').nth(1) == Some("372"))
+        .count();
+    assert_eq!(motd, MAX_MOTD_LINES, "{burst:#?}");
+    assert!(has_numeric(&burst, "376"), "{burst:#?}");
+    let bytes: usize = burst.iter().map(|line| line.len() + 2).sum();
+    assert!(
+        bytes <= MIN_SENDQ_BYTES * 3 / 4,
+        "the burst is {bytes} bytes of a {MIN_SENDQ_BYTES}-byte SendQ"
+    );
+}
+
 // ---- IRCv3 capability negotiation ---------------------------------------
 
 #[test]
