@@ -206,7 +206,7 @@ rings and each network's in-memory backlog — from the moment it is saved. A
 supervised worker applies those limits to the database in bounded
 batches every five minutes — up to 21 batches in one tick when a backlog has
 built up — and also removes expired browser sessions, personal access tokens,
-device grants, consumed logout tokens, and monitoring samples past their
+device grants, consumed logout tokens, spent sign-in flows, and monitoring samples past their
 retention; operators should alert on its fixed-category database errors rather
 than scheduling a second cleanup job.
 

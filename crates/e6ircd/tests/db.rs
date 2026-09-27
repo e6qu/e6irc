@@ -8895,6 +8895,15 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("logout tokens");
     sqlx::query(
+        "INSERT INTO oidc_spent_flows (state_digest, expires_at)
+         VALUES
+           (sha256('old-flow'::bytea), now() - interval '1 second'),
+           (sha256('new-flow'::bytea), now() + interval '10 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("spent flows");
+    sqlx::query(
         "INSERT INTO account_invitations
             (token_hash, account_name, name_folded, created_by, created_at, expires_at)
          VALUES
@@ -8975,6 +8984,7 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     assert_eq!(report.api_tokens, 1);
     assert_eq!(report.device_grants, 1);
     assert_eq!(report.logout_tokens, 1);
+    assert_eq!(report.spent_oidc_flows, 1);
     assert_eq!(report.account_invitations, 1);
     assert_eq!(report.observability_samples, 1);
     // One from each marker table: the counter covers both.
@@ -8989,7 +8999,7 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
         [("Alice", "#old")]
     );
     assert!(!report.saturated);
-    let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT count(*) FROM messages),
            (SELECT count(*) FROM bnc_buffer),
@@ -8998,6 +9008,7 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
            (SELECT count(*) FROM api_tokens),
            (SELECT count(*) FROM device_grants),
            (SELECT count(*) FROM oidc_logout_tokens),
+           (SELECT count(*) FROM oidc_spent_flows),
            (SELECT count(*) FROM account_invitations),
            (SELECT count(*) FROM observability_samples)",
     )
@@ -9008,7 +9019,7 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     // ACCOUNT_CREATE, written by her self-registration above.
     assert_eq!(
         counts,
-        (1, 1, 2, 1, 1, 1, 1, 0, 1),
+        (1, 1, 2, 1, 1, 1, 1, 1, 0, 1),
         "every collection retained only its live/recent row"
     );
     let remaining: String = sqlx::query_scalar("SELECT line FROM bnc_buffer")
@@ -14040,4 +14051,58 @@ async fn account_authority_changes_are_counted_and_announced() {
         .expect("deleted");
     let deleted = announced().await;
     assert_eq!((deleted.id, deleted.folded.as_str()), (id, "alice"));
+}
+
+/// An OpenID Connect flow is answered once across every process sharing the
+/// database: of callbacks racing for one flow exactly one spends it, and a
+/// later one -- a kept copy of the cookie, on a restarted process or a
+/// standby -- is refused. The state is stored only as its digest.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_oidc_flow_is_spent_once_atomically() {
+    let url = support::test_db("an_oidc_flow_is_spent_once_atomically").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        + 600;
+    let racers: Vec<_> = (0..8)
+        .map(|_| {
+            let pool = pool.clone();
+            tokio::spawn(async move { db::spend_oidc_flow(&pool, "state-1", expires_at).await })
+        })
+        .collect();
+    let mut spent = 0;
+    for racer in racers {
+        if racer.await.expect("racer").expect("spend") {
+            spent += 1;
+        }
+    }
+    assert_eq!(spent, 1, "exactly one callback answers the flow");
+
+    // Another process: a fresh pool on the same database.
+    let restarted = db::connect_and_migrate(&url).await.expect("reconnect");
+    assert!(
+        !db::spend_oidc_flow(&restarted, "state-1", expires_at)
+            .await
+            .expect("spend"),
+        "a kept copy is refused after a restart"
+    );
+    assert!(
+        db::spend_oidc_flow(&restarted, "state-2", expires_at)
+            .await
+            .expect("spend"),
+        "another flow is its own"
+    );
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT state_digest FROM oidc_spent_flows")
+        .fetch_all(&pool)
+        .await
+        .expect("stored digests");
+    assert_eq!(stored.len(), 2);
+    assert!(
+        stored
+            .iter()
+            .all(|digest| digest.len() == 32 && digest != b"state-1")
+    );
 }

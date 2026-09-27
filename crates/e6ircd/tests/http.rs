@@ -11572,6 +11572,117 @@ async fn a_provider_without_a_token_endpoint_is_a_bad_gateway() {
     assert!(body.contains("OIDC provider unavailable"), "{body}");
 }
 
+/// Begin a sign-in at `path` on `http`: the flow cookie (`name=value`) and the
+/// OAuth `state` the provider is sent.
+async fn begin_oidc_flow(http: std::net::SocketAddr, path: &str) -> (String, String) {
+    let (status, headers, body) = request(http, &get(path)).await;
+    assert_eq!(status, 307, "{headers}\n{body}");
+    let cookie = response_header(&headers, "set-cookie")
+        .and_then(|value| value.split(';').next())
+        .expect("flow cookie")
+        .to_string();
+    let state = response_header(&headers, "location")
+        .expect("location")
+        .split(['?', '&'])
+        .find_map(|parameter| parameter.strip_prefix("state="))
+        .expect("state parameter")
+        .to_string();
+    (cookie, state)
+}
+
+/// The provider `corp`'s callback with `query`, presenting `cookie`.
+fn oidc_callback(query: &str, cookie: &str) -> String {
+    format!(
+        "GET /api/v1/auth/oidc/corp/callback?{query} HTTP/1.1\r\nHost: t\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// A sign-in in progress survives a restart or a standby's takeover, and is
+/// still answered once. Two processes share one database and one master key:
+/// a flow begun on one completes its callback on the other (the flow key is
+/// derived from the master key), and a kept copy of a flow cookie the first
+/// already answered is refused by the second (the spent record is in
+/// PostgreSQL), before either presents the client secret again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_oidc_flow_survives_a_restart_and_is_still_answered_once() {
+    let url = support::test_db("oidc_flow_survives_a_restart").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("oidc-flow-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let provider = discovery_only_identity_provider(true).await;
+    let process = || {
+        let mut config = test_config();
+        config.limits.auth_rate_burst = e6ircd::config::AuthRateBurst::Off;
+        config.http.as_mut().expect("http").public_url = Some("http://e6irc.example".into());
+        config.database = Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        });
+        config.secrets = Some(SecretsConfig {
+            key_file: key_path.clone(),
+            previous_key_files: Vec::new(),
+        });
+        config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
+            name: "corp".into(),
+            issuer_url: format!("http://{provider}"),
+            client_id: "e6irc".into(),
+            client_secret: "x".repeat(32),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: None,
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+        }];
+        config.internal_upstreams = e6ircd::egress::InternalUpstreams::Allow;
+        config
+    };
+    let first = net::start(process())
+        .await
+        .expect("start the first process")
+        .http_addr
+        .expect("http");
+    wait_http_ready(first).await;
+
+    // Answered on the first process: the code exchange is reached (this
+    // provider cannot complete one), so the flow is spent.
+    let (kept, state) = begin_oidc_flow(first, "/api/v1/auth/oidc/corp/start").await;
+    let answered = oidc_callback(&format!("code=c&state={state}"), &kept);
+    let (status, _, body) = request(first, &answered).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("Code exchange failed"), "{body}");
+
+    // A second process: the restarted one, or the standby that took over.
+    let second = net::start(process())
+        .await
+        .expect("start the second process")
+        .http_addr
+        .expect("http");
+    wait_http_ready(second).await;
+    let (status, headers, body) = request(second, &answered).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("Login state already used"), "{body}");
+    assert!(
+        response_header(&headers, "set-cookie").is_some_and(|cookie| cookie.contains("Max-Age=0")),
+        "the replayed cookie is cleared: {headers}"
+    );
+
+    // A flow begun before the restart completes after it.
+    let (cookie, state) = begin_oidc_flow(first, "/api/v1/auth/oidc/corp/start").await;
+    let (status, _, body) = request(
+        second,
+        &oidc_callback(&format!("code=c&state={state}"), &cookie),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert!(
+        body.contains("Code exchange failed"),
+        "the other process opened the flow and reached the exchange: {body}"
+    );
+}
+
 /// An in-flight OpenID Connect login is carried by the browser, sealed into its
 /// state cookie; the server holds nothing per flow. So no number of anonymous
 /// starts crowds out a real login, only the browser that began a flow can
@@ -11602,26 +11713,8 @@ async fn oidc_login_state_is_sealed_into_the_browser() {
         .http_addr
         .expect("http");
 
-    async fn begin(http: std::net::SocketAddr, path: &str) -> (String, String) {
-        let (status, headers, body) = request(http, &get(path)).await;
-        assert_eq!(status, 307, "{headers}\n{body}");
-        let cookie = response_header(&headers, "set-cookie")
-            .and_then(|value| value.split(';').next())
-            .expect("flow cookie")
-            .to_string();
-        let state = response_header(&headers, "location")
-            .expect("location")
-            .split(['?', '&'])
-            .find_map(|parameter| parameter.strip_prefix("state="))
-            .expect("state parameter")
-            .to_string();
-        (cookie, state)
-    }
-    fn callback(query: &str, cookie: &str) -> String {
-        format!(
-            "GET /api/v1/auth/oidc/corp/callback?{query} HTTP/1.1\r\nHost: t\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
-        )
-    }
+    let begin = begin_oidc_flow;
+    let callback = oidc_callback;
     let spent = Some("e6irc_oidc_state=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
 
     // Well past the 4096 flows the server once held before refusing every

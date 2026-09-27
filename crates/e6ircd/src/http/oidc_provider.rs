@@ -322,48 +322,6 @@ pub(super) async fn refresh(
     fetch_and_cache(key).await
 }
 
-/// Authorization flows whose callback has been answered, by their `state`.
-///
-/// A flow cookie is cleared by the callback that spends it, but a client that
-/// keeps a copy could present it again until it expires, and each
-/// presentation would make this server call the provider's token endpoint
-/// with its client secret. Remembering the spent `state` until the flow would
-/// have expired makes a flow answerable once. The set is bounded: past
-/// [`MAX_SPENT_FLOWS`] the flow closest to its own expiry is forgotten first,
-/// so no volume of logins can exhaust it or refuse a real one.
-#[derive(Default)]
-pub(crate) struct SpentFlows {
-    spent: std::sync::Mutex<HashMap<String, u64>>,
-}
-
-const MAX_SPENT_FLOWS: usize = 65_536;
-
-impl SpentFlows {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record `state` as spent until `expires_at` (Unix seconds). `false` when
-    /// it already was: the flow has been answered.
-    pub(super) fn spend(&self, state: &str, expires_at: u64, now: u64) -> bool {
-        let mut spent = self.spent.lock().expect("spent flows");
-        spent.retain(|_, expiry| *expiry > now);
-        if spent.contains_key(state) {
-            return false;
-        }
-        if spent.len() >= MAX_SPENT_FLOWS
-            && let Some(soonest) = spent
-                .iter()
-                .min_by_key(|(_, expiry)| **expiry)
-                .map(|(state, _)| state.clone())
-        {
-            spent.remove(&soonest);
-        }
-        spent.insert(state.to_string(), expires_at);
-        true
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -627,20 +585,5 @@ pub(super) mod tests {
             1,
             "a failure is remembered, not fetched again per request"
         );
-    }
-
-    #[test]
-    fn a_flow_is_answered_once_and_the_record_stays_bounded() {
-        let spent = SpentFlows::new();
-        assert!(spent.spend("state-1", 1_000, 100));
-        assert!(!spent.spend("state-1", 1_000, 200), "a replay is refused");
-        assert!(
-            spent.spend("state-1", 2_000, 1_000),
-            "an expired record is forgotten"
-        );
-        for index in 0..MAX_SPENT_FLOWS + 10 {
-            assert!(spent.spend(&format!("flow-{index}"), 5_000 + index as u64, 1_001));
-        }
-        assert!(spent.spent.lock().expect("spent").len() <= MAX_SPENT_FLOWS);
     }
 }

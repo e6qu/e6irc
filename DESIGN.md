@@ -1991,8 +1991,8 @@ secrets are not selected at all.
 A supervised five-minute storage-maintenance worker applies the live
 UI-managed `[storage]` policy independently of monitoring. Each collection —
 expired message-history rows, audit events, browser sessions, personal access
-tokens, device grants, consumed OpenID Connect logout tokens, and
-expired/revoked/consumed account invitations — is its own statement and
+tokens, device grants, consumed OpenID Connect logout tokens, spent OpenID
+Connect sign-in flows, and expired/revoked/consumed account invitations — is its own statement and
 transaction, deleting at most 10,000 rows named by primary key
 (`= ANY(ARRAY(… ORDER BY … LIMIT))`). A failing collection is reported by table
 after the others commit, so one refused delete cannot roll back another.
@@ -2216,23 +2216,30 @@ provider-verified email claim.
 - An in-flight OIDC authorization is held by the browser, not the server:
   `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
   verifier, nonce, ten-minute expiry, link target, and silent flag into the
-  `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under a
-  per-startup key and a flow-specific associated-data context. The key is not
-  derived from the master key, as the CSRF key is: the record of spent flows
-  below is held in memory, and a flow that survived a restart would outlive
-  that record. The callback admits only the
+  `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under keys
+  derived from the master secret key (HKDF-SHA256, an info string of its
+  own, previous keys still opening during a rotation, like the CSRF key) and
+  a flow-specific associated-data context, so a sign-in begun before a
+  restart or a standby's takeover (§18) completes after it. A deployment with
+  no master key seals under a key of the process's own, and startup says
+  once, with the CSRF key, that open forms and sign-ins in progress do not
+  survive a restart. The callback admits only the
   sealed flow whose `state` equals the returned one (constant-time), for that
   provider, before its expiry. An anonymous flood of starts therefore holds no
   server capacity a real login needs — the earlier bounded in-memory table
   refused every login with a 503 once 4096 anonymous starts filled it.
-  Replay is bounded twice: the authorization code is single-use at the
-  provider and bound to the flow's PKCE verifier, and every callback that
-  proves the binding clears the cookie *and* records the flow's `state` as
-  spent until the flow would have expired, so a kept copy of the cookie is
-  refused rather than making this server call the token endpoint with its
-  client secret again. The record is bounded (65,536 flows; past that, the one
-  closest to its own expiry is forgotten first), so no volume of logins can
-  fill it or refuse a real one, and a restart ends every flow. The callback
+  A flow is answered once: the authorization code is single-use at the
+  provider and bound to the flow's PKCE verifier, every callback that proves
+  the binding clears the cookie, and before the token endpoint is called the
+  code exchange records the flow as spent in PostgreSQL (`oidc_spent_flows`,
+  the SHA-256 of its `state` until the flow would have expired, one
+  `INSERT … ON CONFLICT DO NOTHING` that refuses when it inserted nothing).
+  Every process shares that record, so a kept copy of the cookie is refused
+  by this process, a restarted one, or a standby, rather than making any of
+  them call the token endpoint with the client secret again; storage
+  maintenance deletes the expired rows (§8). The record used to be in
+  memory, which a restart emptied — acceptable only while a restart also
+  ended every flow. The callback
   spends the per-address authentication budget like the start. A refused
   callback leaves the cookie alone, so an attacker who learns a victim's
   `state` cannot burn the victim's login.
