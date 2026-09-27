@@ -42,11 +42,19 @@ FLAGS = frozenset(
 )
 
 
+# This guard's contract test writes unpinned references on purpose.
+EXEMPT = frozenset({b"tools/test-check-image-pins.py"})
+
+
 def tracked_files(root: Path) -> list[Path]:
     names = subprocess.run(
         ["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True
     ).stdout.split(b"\0")
-    return [root / name.decode() for name in names if name and not name.endswith(b".md")]
+    return [
+        root / name.decode()
+        for name in names
+        if name and not name.endswith(b".md") and name not in EXEMPT
+    ]
 
 
 def is_dockerfile(path: Path) -> bool:

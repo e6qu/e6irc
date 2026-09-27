@@ -8,9 +8,10 @@
 #   - every `toolchain:` input in .github/workflows names the channel, except
 #     CI's `fuzz-smoke` job, which needs a pinned `nightly-YYYY-MM-DD` for
 #     cargo-fuzz's sanitizer flags, and whose every `cargo +…` names that
-#     nightly;
-#   - no workflow runs `cargo +<toolchain>` outside `fuzz-smoke`, or asks for a
-#     floating `stable`/`beta`/`nightly`;
+#     nightly, as does the job's RUSTUP_TOOLCHAIN (which rust-cache's own
+#     cargo and rustc calls need);
+#   - no workflow runs `cargo +<toolchain>` or sets RUSTUP_TOOLCHAIN outside
+#     `fuzz-smoke`, or asks for a floating `stable`/`beta`/`nightly`;
 #   - the native release jobs restore no build cache.
 # Portable to bash 3.2.
 set -euo pipefail
@@ -45,11 +46,13 @@ else
 fi
 
 # FILE<TAB>JOB<TAB>LINE for every line of each workflow, JOB being the job the
-# line sits in (empty outside `jobs:`).
+# line sits in (`-` outside `jobs:`; a tab is
+# whitespace to `read`, so an empty field would collapse into the next).
 workflow_lines() {
   awk '
-    /^jobs:/ { in_jobs = 1; job = ""; next }
-    /^[^ #]/ { in_jobs = 0; job = "" }
+    FNR == 1 { job = "-"; in_jobs = 0 }
+    /^jobs:/ { in_jobs = 1; job = "-"; next }
+    /^[^ #]/ { in_jobs = 0; job = "-" }
     in_jobs && /^  [A-Za-z0-9_-]+:[ ]*$/ { job = $1; sub(/:$/, "", job) }
     { print FILENAME "\t" job "\t" $0 }
   ' .github/workflows/*.yml
@@ -57,12 +60,30 @@ workflow_lines() {
 
 fuzz_nightly=""
 fuzz_pluses=""
+fuzz_rustup=""
 while IFS=$'\t' read -r file job line; do
+  # A comment configures nothing.
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  case "$trimmed" in '#'*) continue ;; esac
+  in_fuzz=0
+  if [ "$job" = fuzz-smoke ] && [ "$file" = .github/workflows/ci.yml ]; then
+    in_fuzz=1
+  fi
+  case "$line" in
+    *'RUSTUP_TOOLCHAIN:'*)
+      value="$(printf '%s\n' "$line" | sed -n 's/^ *RUSTUP_TOOLCHAIN: *\([^ #]*\).*$/\1/p')"
+      if [ "$in_fuzz" -eq 1 ]; then
+        fuzz_rustup="$value"
+      else
+        problem "$file job ${job:-?}: RUSTUP_TOOLCHAIN '$value' overrides rust-toolchain.toml"
+      fi
+      ;;
+  esac
   case "$line" in
     *'toolchain:'*)
       value="$(printf '%s\n' "$line" | sed -n 's/^ *toolchain: *\([^ #]*\).*$/\1/p')"
       [ -n "$value" ] || continue
-      if [ "$job" = fuzz-smoke ] && [ "$file" = .github/workflows/ci.yml ]; then
+      if [ "$in_fuzz" -eq 1 ]; then
         if printf '%s\n' "$value" | grep -Eq '^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
           fuzz_nightly="$value"
         else
@@ -76,7 +97,7 @@ while IFS=$'\t' read -r file job line; do
   case "$line" in
     *'cargo +'*)
       plus="$(printf '%s\n' "$line" | sed -n 's/.*cargo +\([^ ]*\).*/\1/p')"
-      if [ "$job" != fuzz-smoke ] || [ "$file" != .github/workflows/ci.yml ]; then
+      if [ "$in_fuzz" -eq 0 ]; then
         problem "$file job ${job:-?}: 'cargo +$plus' bypasses rust-toolchain.toml"
       else
         fuzz_pluses="$fuzz_pluses $plus"
@@ -91,6 +112,10 @@ else
   for plus in $fuzz_pluses; do
     [ "$plus" = "$fuzz_nightly" ] || problem "ci.yml job fuzz-smoke: 'cargo +$plus' is not the job's toolchain $fuzz_nightly"
   done
+  # Without it, a step that runs cargo or rustc without `+` (rust-cache does)
+  # asks for rust-toolchain.toml's release, which that job does not install.
+  [ "$fuzz_rustup" = "$fuzz_nightly" ] ||
+    problem "ci.yml job fuzz-smoke: RUSTUP_TOOLCHAIN '${fuzz_rustup:-unset}' is not the job's toolchain $fuzz_nightly"
 fi
 
 if grep -Eq '^ *(toolchain: *|rustup (default|override set) +)(stable|beta|nightly)( |$)' .github/workflows/*.yml; then

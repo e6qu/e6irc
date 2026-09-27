@@ -153,10 +153,12 @@ Engineering conventions live in `AGENTS.md` (the boy-scout rule and
 scope law) and `DESIGN.md` §2 (the quality laws: no silent no-ops, no
 silent fallbacks, provenance required, make bug classes unrepresentable).
 Before you stop, the tree must be green. The complete gate list — builds in
-every feature configuration, tests, clippy, formatting, `cargo deny`, and the
-no-op, dead-code, dead-public, duplication, and no-deferral guards — is the
-"Practical checklist before you stop" in `AGENTS.md`; it is kept there only, so
-that it cannot drift from a second copy. The product-level traceability
+every feature configuration, tests, clippy, the dead-code build, and
+`tools/gate.sh` (formatting, `cargo deny`, and every structural guard with its
+contract test: no-op, dead-public, duplication, no-deferral, and the rest) — is
+the "Practical checklist before you stop" in `AGENTS.md`; it is kept there
+only, and the guards are listed in `tools/gate.sh` only, which CI's `lint` job
+runs too, so neither can drift from a second copy. The product-level traceability
 contract is checked by `tools/check-journeys.py`.
 
 ## License

@@ -179,27 +179,24 @@ mistake, before a single line changes.
       with the bridges, and no narrower set compiles them); PG/feature-gated
       suites run where the environment allows.
 - [ ] `cargo clippy --locked --workspace --all-targets` clean with
-      `--all-features` and in each feature config; `cargo fmt --all --check`
-      clean.
-- [ ] `cargo deny check` clean.
-- [ ] `tools/check-noops.sh` clean (no deferred-work markers or unmessaged
-      panics in shipped source).
+      `--all-features` and in each feature config.
+- [ ] `tools/gate.sh` clean: every structural guard and every guard's
+      contract test — formatting (fuzz targets included), `cargo deny` for the
+      workspace and `fuzz/`, the no-op, dead-public, duplication and
+      no-deferral guards (`BUGS.md` empty, no new "surfaced, not done"-style
+      note in any file — see the No-Deferral Rule above), migration integrity,
+      image pins, the one Rust toolchain, and the rest. The list lives in that
+      script only, and CI's `lint` job runs the same script, so the two cannot
+      drift. It measures additions against `origin/main`; pass `--base REV`
+      for another base. Each guard's own comment says what it holds; the
+      duplication ratchet is fixed by extracting shared logic, never by
+      raising the threshold.
 - [ ] `tools/check-dead-code.sh` clean (no code kept alive only by tests —
       it builds the shipped artifacts with `cfg(test)` off).
-- [ ] `tools/check-dead-pub.sh` clean (no fully-`pub` item referenced only by
-      tests: an integration test, a fuzz target, or inline `#[cfg(test)]` /
-      `#[cfg(fuzzing)]` code, which it blanks out before counting — the
-      compiler's dead-code lint sees none of them for a `pub` item. A
-      same-named definition elsewhere is not a use).
-- [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
-      fix is to extract shared logic, never to raise the threshold).
 - [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check --locked
-      --manifest-path fuzz/Cargo.toml --bins` (stable is enough; CI's
-      `fuzz-smoke` builds them on nightly, and a struct gaining a field breaks
-      every target that builds it field by field).
-- [ ] `tools/check-no-defer.sh` clean (no deferral vehicle in use — see the
-      No-Deferral Rule above: `BUGS.md` empty, no new "surfaced, not
-      done"-style note added to any file).
+      --manifest-path fuzz/Cargo.toml --bins` (rust-toolchain.toml's release is
+      enough; CI's `fuzz-smoke` builds them on nightly, and a struct gaining a
+      field breaks every target that builds it field by field).
 - [ ] Anything you moved/renamed: all references updated.
 - [ ] Anything broken you noticed on the way: **fixed**, or escalated to the
       human as an explicit decision — never filed away for later.

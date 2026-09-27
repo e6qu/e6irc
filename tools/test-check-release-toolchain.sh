@@ -68,6 +68,12 @@ replace_first "$repo/.github/workflows/ci.yml" 'fuzz run' '            cargo +ni
 expect_fail "a cargo + in fuzz-smoke that is not the job's nightly"
 replace_first "$repo/.github/workflows/ci.yml" 'cargo build --locked -p e6ircd -p e6irc-load' '      - run: cargo +nightly build --locked -p e6ircd -p e6irc-load'
 expect_fail 'cargo + outside fuzz-smoke'
+replace_first "$repo/.github/workflows/ci.yml" 'RUSTUP_TOOLCHAIN: nightly-' '      RUSTUP_TOOLCHAIN: nightly-2000-01-01'
+expect_fail "fuzz-smoke's RUSTUP_TOOLCHAIN not its nightly"
+replace_first "$repo/.github/workflows/ci.yml" 'RUSTUP_TOOLCHAIN: nightly-' ''
+expect_fail "fuzz-smoke without RUSTUP_TOOLCHAIN"
+replace_first "$repo/.github/workflows/ci.yml" 'CARGO_TERM_COLOR: always' '  RUSTUP_TOOLCHAIN: stable'
+expect_fail 'RUSTUP_TOOLCHAIN overriding the file workflow-wide'
 replace_first "$repo/Dockerfile" 'FROM rust:' 'FROM rust:1.0.0-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build'
 expect_fail 'the Dockerfile on another release'
 replace_first "$repo/Dockerfile" 'FROM rust:' 'FROM rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build'

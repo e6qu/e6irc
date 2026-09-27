@@ -7,7 +7,8 @@
 #
 # The one exception is CI's `fuzz-smoke` job: cargo-fuzz instruments with
 # `-Zsanitizer`, which only a nightly compiler accepts, so that job names its
-# pinned nightly explicitly (`cargo +nightly-…`), which overrides this file.
+# pinned nightly explicitly (its RUSTUP_TOOLCHAIN and `cargo +nightly-…`),
+# which overrides this file.
 #
 # To move to a new Rust release, change `channel` here, the `toolchain:` inputs
 # in .github/workflows, and the Dockerfile's `rust:<version>-bookworm` base (tag
