@@ -67,6 +67,21 @@ impl From<crate::bouncer::ConfiguredNetworkHeld> for NetworkMutationError {
     }
 }
 
+/// A start the registry refused: the configuration holds the key, or the
+/// process is shutting down and starts nothing more.
+impl From<crate::bouncer::RegistryRefusal> for NetworkMutationError {
+    fn from(refusal: crate::bouncer::RegistryRefusal) -> Self {
+        match refusal {
+            crate::bouncer::RegistryRefusal::ConfiguredNetworkHeld(held) => held.into(),
+            crate::bouncer::RegistryRefusal::Closed(closed) => network_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server shutting down",
+                Some(&closed.to_string()),
+            ),
+        }
+    }
+}
+
 /// Refuse to create `(account, name)` when the server configuration defines
 /// that network — running now, or saved to start at the next restart — so an
 /// account's network can never share a key with the operator's.
@@ -1903,7 +1918,7 @@ impl<'a> ActiveOwnerLane<'a> {
         &self,
         name: &str,
         driver: Box<dyn crate::bouncer::NetworkDriver>,
-    ) -> Result<(), crate::bouncer::ConfiguredNetworkHeld> {
+    ) -> Result<(), crate::bouncer::RegistryRefusal> {
         self.lane.replace(Some(self.owner), name, driver).await
     }
 
@@ -1912,7 +1927,7 @@ impl<'a> ActiveOwnerLane<'a> {
         &self,
         name: &str,
         driver: Box<dyn crate::bouncer::NetworkDriver>,
-    ) -> Result<(), crate::bouncer::ConfiguredNetworkHeld> {
+    ) -> Result<(), crate::bouncer::RegistryRefusal> {
         self.lane
             .ensure_running(Some(self.owner), name, driver)
             .await

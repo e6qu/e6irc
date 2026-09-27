@@ -4700,6 +4700,183 @@ async fn a_withdrawn_echo_message_is_followed_mid_session() {
     assert!(echo.0.ends_with(" PRIVMSG #room :hello"), "{echo:?}");
 }
 
+/// How a scripted upstream settles `echo-message` around one message the
+/// driver writes while the setting is changing.
+#[derive(Clone, Copy)]
+enum EchoChange {
+    /// Offered mid-session (`CAP NEW`); the driver's request is acknowledged
+    /// only after the message arrives, and the upstream then echoes it.
+    OfferedThenAcknowledged,
+    /// Offered mid-session; the request is refused after the message arrives.
+    OfferedThenRefused,
+    /// Enabled at registration, withdrawn (`CAP DEL`) after the message
+    /// arrives and before any echo of it.
+    WithdrawnBeforeTheEcho,
+}
+
+/// The echoes the driver publishes for one `PRIVMSG #room :hello` from
+/// attachment 7, written while `change` is under way.
+async fn echoes_around(change: EchoChange) -> Vec<(String, u64)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        match change {
+            EchoChange::WithdrawnBeforeTheEcho => {
+                session
+                    .complete_registration_with_echo_message("bncbot")
+                    .await;
+            }
+            EchoChange::OfferedThenAcknowledged | EchoChange::OfferedThenRefused => {
+                session.complete_registration("bncbot").await;
+                session.send(":up CAP bncbot NEW :echo-message").await;
+                assert_eq!(next_command(&mut session).await, "CAP REQ :echo-message");
+            }
+        }
+        ready_tx.send(()).await.unwrap();
+        let line = next_command(&mut session).await;
+        assert_eq!(line, "PRIVMSG #room :hello");
+        match change {
+            EchoChange::OfferedThenAcknowledged => {
+                session.send(":up CAP bncbot ACK :echo-message").await;
+                session
+                    .send(":bncbot!~bncbot@up.example PRIVMSG #room :hello")
+                    .await;
+            }
+            EchoChange::OfferedThenRefused => {
+                session.send(":up CAP bncbot NAK :echo-message").await;
+            }
+            EchoChange::WithdrawnBeforeTheEcho => {
+                session.send(":up CAP bncbot DEL :echo-message").await;
+            }
+        }
+        loop {
+            next_command(&mut session).await;
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    tokio::time::timeout(deadline::HANG, ready_rx.recv())
+        .await
+        .expect("the upstream is ready")
+        .expect("ready");
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG #room :hello"),
+        SendOutcome::Sent
+    );
+    events_within(&mut events, std::time::Duration::from_secs(2))
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            DriverEvent::Echo {
+                line: e6ircd::bouncer::BufferedLine { line, .. },
+                origin,
+            } => Some((line, origin)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A line written after the driver asked for `echo-message` and before the
+/// upstream's verdict is echoed exactly once, whatever the verdict (§10.1):
+/// by the upstream when it acknowledges — the driver used to synthesize one
+/// too, so the line was echoed twice — and by the driver when it refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_written_while_echo_message_is_requested_is_echoed_once() {
+    let acknowledged = echoes_around(EchoChange::OfferedThenAcknowledged).await;
+    assert_eq!(acknowledged.len(), 1, "{acknowledged:?}");
+    assert_eq!(acknowledged[0].1, 7);
+    assert!(
+        acknowledged[0]
+            .0
+            .ends_with(":bncbot!~bncbot@up.example PRIVMSG #room :hello"),
+        "the upstream's own echo: {acknowledged:?}"
+    );
+    let refused = echoes_around(EchoChange::OfferedThenRefused).await;
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].1, 7);
+    assert!(
+        refused[0].0.ends_with(" PRIVMSG #room :hello"),
+        "{refused:?}"
+    );
+}
+
+/// A line the upstream had not echoed when it withdrew `echo-message` will
+/// never be echoed by it: the driver echoes it instead, once. It used to get
+/// no echo at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_awaiting_its_echo_when_echo_message_is_withdrawn_is_echoed_once() {
+    let echoes = echoes_around(EchoChange::WithdrawnBeforeTheEcho).await;
+    assert_eq!(echoes.len(), 1, "{echoes:?}");
+    assert_eq!(echoes[0].1, 7);
+    assert!(echoes[0].0.ends_with(" PRIVMSG #room :hello"), "{echoes:?}");
+}
+
+/// Every line the driver writes upstream is paced to the upstream's flood
+/// allowance: a burst of commands from attached clients reaches it at no more
+/// than the allowance — five at once, then two a second — however fast they
+/// are queued, where it used to be written as fast as it was queued and
+/// answered with "Excess Flood".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_driver_paces_what_it_writes_upstream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, std::time::Instant)>();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        loop {
+            let line = session.read_line().await;
+            if line == "CAP END" {
+                continue;
+            }
+            if let Some(token) = line.strip_prefix("PING :e6bnc-route-") {
+                session
+                    .send(&format!(":up PONG up :e6bnc-route-{token}"))
+                    .await;
+            }
+            if heard_tx.send((line, std::time::Instant::now())).is_err() {
+                return;
+            }
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let queued = std::time::Instant::now();
+    for n in 0..40 {
+        assert_eq!(
+            handle.send_from(7, &format!("TOPIC #room{n}")),
+            SendOutcome::Sent
+        );
+    }
+    let window = std::time::Duration::from_millis(2600);
+    let mut heard = Vec::new();
+    let _ = tokio::time::timeout(window, async {
+        while let Some(line) = heard_rx.recv().await {
+            heard.push(line);
+        }
+    })
+    .await;
+    // Within any span, at most the burst plus what the rate regains.
+    for (index, (_, at)) in heard.iter().enumerate() {
+        let since = at.duration_since(queued).as_secs_f64();
+        let allowed = 5 + (since * 2.0).ceil() as usize;
+        assert!(
+            index < allowed,
+            "line {} arrived {since:.2}s after the burst was queued: {heard:?}",
+            index + 1
+        );
+    }
+    assert!(
+        heard.len() >= 5,
+        "the burst itself is not held back: {heard:?}"
+    );
+}
+
 /// A raw client has no cursor; its account's read markers are its position.
 /// Each conversation is replayed from where the account stopped reading it —
 /// a message at or before the marker is not replayed, and the client is told
