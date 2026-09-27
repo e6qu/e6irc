@@ -454,6 +454,18 @@ impl AccountAuthorityWatcher {
 }
 
 impl crate::db::Follower for AccountAuthorityWatcher {
+    /// A credential check read while nothing listened may have verified a
+    /// credential revoked meanwhile, and its verdict may land after the
+    /// re-read that follows. So every check under way is refused first — its
+    /// client may try again — on the attach listener and on every core shard,
+    /// and only then is anything re-read: a verdict that landed before is
+    /// among what is re-read, one that lands after is refused. This covers
+    /// the account re-read and the issued credentials' alike.
+    async fn reconnected(&mut self, _generation: u64) -> Result<(), String> {
+        self.registry.account_revocations().refuse_in_flight();
+        self.core_tx.refuse_verdicts_in_flight().await
+    }
+
     async fn on_change(&mut self, announcement: crate::db::Announcement) -> Result<(), String> {
         match CredentialChange::of(announcement) {
             CredentialChange::Account(announced) => self.follow(announced).await,

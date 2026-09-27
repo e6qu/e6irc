@@ -32,6 +32,11 @@ pub enum Revocation {
     Account,
     /// The app password the attachment signed in with was revoked.
     Credential(IssuedCredential),
+    /// The revocation listener was re-connected while the credential was
+    /// checked: what it missed is re-checked, and a check read before that
+    /// is refused ([`AccountRevocations::refuse_in_flight`]). It ends no
+    /// live attachment; the client may sign in again at once.
+    Rechecked,
 }
 
 impl Revocation {
@@ -44,6 +49,7 @@ impl Revocation {
             Self::Credential(credential) => {
                 format!("the {} you signed in with was revoked", credential.kind())
             }
+            Self::Rechecked => RECHECKED.to_string(),
         };
         format!(":*bnc* NOTICE * :{why}; detaching\r\n")
     }
@@ -58,15 +64,23 @@ impl std::fmt::Display for Revocation {
             Self::Credential(credential) => {
                 write!(f, "the {credential} it signed in with was revoked")
             }
+            Self::Rechecked => f.write_str(RECHECKED),
         }
     }
 }
+
+/// Why a check read before a revocation re-check is refused.
+const RECHECKED: &str =
+    "credentials were re-checked while yours were being verified; please sign in again";
 
 /// What a revocation names: the leases it ends, and the ones it refuses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Revoked {
     Account(String),
     Credential(IssuedCredential),
+    /// Every credential checked before the listener re-checked what it
+    /// missed.
+    Every,
 }
 
 impl Revoked {
@@ -74,6 +88,7 @@ impl Revoked {
         match self {
             Self::Account(_) => Revocation::Account,
             Self::Credential(credential) => Revocation::Credential(*credential),
+            Self::Every => Revocation::Rechecked,
         }
     }
 }
@@ -177,7 +192,10 @@ pub struct AccountRevoked(pub Revocation);
 
 impl std::fmt::Display for AccountRevoked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} while it signed in", self.0)
+        match self.0 {
+            Revocation::Rechecked => write!(f, "{}", self.0),
+            revocation => write!(f, "{revocation} while it signed in"),
+        }
     }
 }
 
@@ -258,6 +276,9 @@ impl AccountRevocations {
         {
             return Err(AccountRevoked(Revocation::Credential(issued)));
         }
+        if revoked_since(&Revoked::Every) {
+            return Err(AccountRevoked(Revocation::Rechecked));
+        }
         let id = state.next_lease;
         state.next_lease += 1;
         let (ended_tx, ended) = watch::channel(None);
@@ -302,6 +323,17 @@ impl AccountRevocations {
             .revoke(Revoked::Credential(credential), |_, lease| {
                 lease.credential == signed_in
             })
+    }
+
+    /// The revocation listener was re-connected: refuse the lease of every
+    /// credential check under way, as it may have read a credential revoked
+    /// while nothing listened. Run before the listener re-reads what the live
+    /// attachments hold, so a check's lease is either among them or refused.
+    pub fn refuse_in_flight(&self) {
+        self.state
+            .lock()
+            .expect("account revocations lock")
+            .revoke(Revoked::Every, |_, _| false);
     }
 
     /// Every issued credential a live attachment signed in with.
@@ -468,6 +500,32 @@ mod tests {
                 .is_ok()
         );
         assert!(revocations.lease(password, "alice", PASSWORD).is_ok());
+    }
+
+    /// A lost revocation listener refuses, on re-connecting, the lease of
+    /// every credential check under way, whatever it checked — it may have
+    /// read a credential revoked while nothing listened — and ends no
+    /// attachment; a check started after it is leased.
+    #[tokio::test]
+    async fn a_listener_re_check_refuses_the_leases_of_checks_under_way() {
+        let revocations = AccountRevocations::new();
+        let mut attached = revocations
+            .lease(revocations.ticket(), "alice", CredentialId::Issued(APP_A))
+            .expect("lease");
+        let under_way = revocations.ticket();
+        revocations.refuse_in_flight();
+        let refused = revocations
+            .lease(under_way, "alice", CredentialId::Issued(APP_B))
+            .err()
+            .expect("refused");
+        assert_eq!(refused, AccountRevoked(Revocation::Rechecked));
+        assert!(refused.to_string().contains("please sign in again"));
+        assert_eq!(ends_soon(&mut attached).await, None, "nothing live ends");
+        assert!(
+            revocations
+                .lease(revocations.ticket(), "alice", CredentialId::Issued(APP_B))
+                .is_ok()
+        );
     }
 
     #[tokio::test]

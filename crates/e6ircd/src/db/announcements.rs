@@ -53,11 +53,17 @@ pub(crate) trait Follower: Send {
 
     /// The listening connection is now its `generation`th: 0 for one the
     /// caller connected, then one more for each connection made again (a new
-    /// one, or one `PgListener` re-established by itself). Called before the
-    /// [`Announcement::Resynchronize`] that follows each reconnection, so a
-    /// follower can tell what it read under an earlier connection from what
-    /// it reads under this one.
-    fn reconnected(&mut self, _generation: u64) {}
+    /// one, or one `PgListener` re-established by itself). Awaited before the
+    /// [`Announcement::Resynchronize`] that follows each reconnection: what a
+    /// follower must settle before it re-reads what it missed — work read
+    /// while nothing listened, whose result could land after the re-read —
+    /// it settles here. An error is said, and the connection is made again.
+    fn reconnected(
+        &mut self,
+        _generation: u64,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Follow `channel` for the life of the process, handing each announcement to
@@ -86,9 +92,7 @@ pub(crate) async fn follow_announcements(
                 let reconnected = match Announcements::connect(&url, channel).await {
                     Ok(connected) => {
                         generation += 1;
-                        follower.reconnected(generation);
-                        follower
-                            .on_change(Announcement::Resynchronize)
+                        resynchronize(&mut follower, generation)
                             .await
                             .map(|()| connected)
                             .map_err(|error| {
@@ -111,13 +115,11 @@ pub(crate) async fn follow_announcements(
         retry = RETRY_MIN;
         loop {
             let followed = match connected.next().await {
-                Ok(announcement) => {
-                    if announcement == Announcement::Resynchronize {
-                        generation += 1;
-                        follower.reconnected(generation);
-                    }
-                    follower.on_change(announcement).await
+                Ok(Announcement::Resynchronize) => {
+                    generation += 1;
+                    resynchronize(&mut follower, generation).await
                 }
+                Ok(announcement) => follower.on_change(announcement).await,
                 Err(error) => Err(format!("listener lost: {error}")),
             };
             if let Err(error) = followed {
@@ -130,6 +132,13 @@ pub(crate) async fn follow_announcements(
     }
 }
 
+/// A reconnection, as every follower is told of it: first what it settles
+/// before re-reading ([`Follower::reconnected`]), then the re-read.
+async fn resynchronize(follower: &mut impl Follower, generation: u64) -> Result<(), String> {
+    follower.reconnected(generation).await?;
+    follower.on_change(Announcement::Resynchronize).await
+}
+
 /// The channel migration 0090's trigger announces each committed settings
 /// revision on.
 pub(crate) const SETTINGS_CHANGED_CHANNEL: &str = "e6irc_server_settings_changed";
@@ -139,3 +148,48 @@ pub(crate) const CREDENTIAL_CHANGED_CHANNEL: &str = "e6irc_credential_changed";
 /// The channel migration 0098's trigger announces each change of the serving
 /// lease's holder on, a release included.
 pub(crate) const SERVING_LEASE_CHANNEL: &str = "e6irc_serving_lease";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records what it is told, and refuses to settle when told to.
+    #[derive(Default)]
+    struct Recording {
+        seen: Vec<String>,
+        refuse_to_settle: bool,
+    }
+
+    impl Follower for Recording {
+        async fn on_change(&mut self, announcement: Announcement) -> Result<(), String> {
+            self.seen.push(format!("{announcement:?}"));
+            Ok(())
+        }
+
+        async fn reconnected(&mut self, generation: u64) -> Result<(), String> {
+            self.seen.push(format!("reconnected {generation}"));
+            if self.refuse_to_settle {
+                Err("could not settle".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reconnection_settles_before_it_re_reads_and_not_at_all_if_it_cannot() {
+        let mut follower = Recording::default();
+        resynchronize(&mut follower, 3).await.expect("settled");
+        assert_eq!(follower.seen, ["reconnected 3", "Resynchronize"]);
+
+        let mut refusing = Recording {
+            refuse_to_settle: true,
+            ..Recording::default()
+        };
+        assert_eq!(
+            resynchronize(&mut refusing, 4).await,
+            Err("could not settle".to_owned())
+        );
+        assert_eq!(refusing.seen, ["reconnected 4"], "nothing is re-read");
+    }
+}
