@@ -2980,14 +2980,49 @@ async fn bnc_networks_crud() {
     )
     .await
     .expect("disable matrix");
-    let inventory = db::list_bnc_network_inventory(&pool)
+    // The administrator inventory pages by a stable (owner, name) cursor: a
+    // page of two plus the row that says another follows, then the rest.
+    let page_size = db::BncNetworkInventoryPageSize::new(2).expect("page size");
+    let inventory = db::bnc_network_inventory_page(&pool, None, page_size)
         .await
         .expect("admin inventory");
-    assert_eq!(inventory.len(), 3);
+    assert_eq!(
+        inventory
+            .iter()
+            .map(|row| (row.owner.as_str(), row.network.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("alice", "hq"), ("alice", "libera"), ("bob", "libera")]
+    );
     assert!(
         inventory.iter().any(|row| {
             row.owner == "alice" && row.network.name == "hq" && !row.network.enabled
         })
+    );
+    let after = db::BncInventoryKey::parse_cursor(&inventory[1].key.cursor())
+        .expect("a cursor round-trips");
+    let rest = db::bnc_network_inventory_page(&pool, Some(&after), page_size)
+        .await
+        .expect("next page");
+    assert_eq!(
+        rest.iter()
+            .map(|row| (row.owner.as_str(), row.network.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("bob", "libera")]
+    );
+    // A configuration-defined network sorts before a stored one of the same
+    // key, so a page that ended on it still yields the stored row after it;
+    // one that ended on the stored row does not repeat it.
+    let configured = db::BncInventoryKey::new(Some("BOB"), "Libera", false);
+    let after_configured = db::bnc_network_inventory_page(&pool, Some(&configured), page_size)
+        .await
+        .expect("after a configured key");
+    assert_eq!(after_configured.len(), 1);
+    let stored = db::BncInventoryKey::new(Some("bob"), "libera", true);
+    assert!(
+        db::bnc_network_inventory_page(&pool, Some(&stored), page_size)
+            .await
+            .expect("after the last row")
+            .is_empty()
     );
     db::delete_bnc_network(
         &pool,
@@ -4990,9 +5025,14 @@ async fn a_sealed_server_password_round_trips_through_every_network_query() {
         .await
         .expect("get")
         .expect("network");
-    let inventory = db::list_bnc_network_inventory(&pool)
-        .await
-        .expect("inventory");
+    let inventory = db::bnc_network_inventory_page(
+        &pool,
+        None,
+        db::BncNetworkInventoryPageSize::new(db::BncNetworkInventoryPageSize::MAX)
+            .expect("page size"),
+    )
+    .await
+    .expect("inventory");
     let startable = db::list_startable_bnc_networks(&pool)
         .await
         .expect("startable");

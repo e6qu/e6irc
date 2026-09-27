@@ -585,9 +585,7 @@ pub(super) async fn ws_ui(
         return refusal.into();
     }
     let composer = ComposerAuthority::from(&credential);
-    let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
+    let registry = super::registry_of(&state);
     // The UI only lists the account's own networks, so resolve the owned network
     // directly — never fall through to a shared network of the same name.
     let Some(handle) = registry.get_owned(&account, &params.network) else {

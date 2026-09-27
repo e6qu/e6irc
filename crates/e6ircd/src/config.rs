@@ -1327,17 +1327,7 @@ impl NetworkEntry {
                         "kind=irc requires both sasl_account and sasl_password, or neither".into(),
                     );
                 }
-                if self
-                    .realname
-                    .as_deref()
-                    .is_none_or(|realname| realname.trim().is_empty())
-                {
-                    return Err("kind=irc requires a non-blank realname".into());
-                }
-                if self.nick.trim().is_empty() {
-                    return Err("kind=irc requires a non-blank nick".into());
-                }
-                self.require_username()?;
+                self.upstream_identity()?;
                 if !crate::bouncer::validate_irc_upstream_addr(&self.addr) {
                     return Err(
                         "kind=irc requires addr as host:port with a nonzero numeric port".into(),
@@ -1345,17 +1335,7 @@ impl NetworkEntry {
                 }
             }
             NetworkKind::Local => {
-                if self
-                    .realname
-                    .as_deref()
-                    .is_none_or(|realname| realname.trim().is_empty())
-                {
-                    return Err("kind=local requires a non-blank realname".into());
-                }
-                if self.nick.trim().is_empty() {
-                    return Err("kind=local requires a non-blank nick".into());
-                }
-                self.require_username()?;
+                self.upstream_identity()?;
             }
             NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => {
                 if !self.tls {
@@ -1441,20 +1421,42 @@ impl NetworkEntry {
         Ok(())
     }
 
-    /// An `irc` or `local` network states its `USER` name, in the one grammar
-    /// the driver will accept ([`crate::bouncer::UpstreamUsername`]).
-    fn require_username(&self) -> Result<(), String> {
+    /// The identity the `irc` or `local` driver built from this entry presents,
+    /// parsed by the one parser that builds the driver
+    /// ([`crate::bouncer::UpstreamIdentity::parse`]): validating an entry and
+    /// starting it cannot disagree about its nick, user name, real name or
+    /// channels. A configured network's autojoin names channels only, so an
+    /// entry is one channel and `#ops key` is refused as a channel name.
+    pub(crate) fn upstream_identity(&self) -> Result<crate::bouncer::UpstreamIdentity, String> {
+        let kind = self.kind.as_db_str();
         let username = self.username.as_deref().ok_or_else(|| {
             format!(
-                "kind={} requires username (the IRC user name sent in USER; it is never \
-                 derived from the nick)",
-                self.kind.as_db_str()
+                "kind={kind} requires username (the IRC user name sent in USER; it is never \
+                 derived from the nick)"
             )
         })?;
-        username
-            .parse::<crate::bouncer::UpstreamUsername>()
-            .map(|_| ())
-            .map_err(|error| format!("kind={} has invalid {error}", self.kind.as_db_str()))
+        let realname = self
+            .realname
+            .as_deref()
+            .ok_or_else(|| format!("kind={kind} requires realname"))?;
+        crate::bouncer::UpstreamIdentity::parse(
+            &self.nick,
+            username,
+            realname,
+            &self.autojoin_entries(),
+        )
+        .map_err(|error| format!("kind={kind} has invalid {error}"))
+    }
+
+    /// The autojoin list as the driver takes it. A server-level network's
+    /// autojoin is public configuration (the administrator API returns it), so
+    /// it names channels only: an entry with a key in it is refused by the
+    /// channel grammar rather than read as a key nobody could keep secret.
+    pub(crate) fn autojoin_entries(&self) -> Vec<crate::bouncer::AutojoinEntry> {
+        self.autojoin
+            .iter()
+            .map(|channel| crate::bouncer::AutojoinEntry::unkeyed(channel.as_str()))
+            .collect()
     }
 }
 
@@ -2641,8 +2643,7 @@ impl Config {
         // The registry is available with a database even when the raw BNC
         // listener is disabled, because the web client and console use it too.
         // Requiring the listener here made "enable BNC from the console"
-        // structurally impossible and caused the active-looking network form to
-        // fail with "Bouncer not enabled".
+        // structurally impossible and made the active-looking network form fail.
         if !self.networks.is_empty() && self.database.is_none() {
             return Err(ConfigError::Invalid(
                 "[[network]] entries require [database] for authenticated access".into(),

@@ -2714,6 +2714,7 @@ async fn openapi_spec_is_served() {
             "enabled",
             "connected",
             "runtime",
+            "configured",
         ])
     );
     assert_eq!(
@@ -6376,6 +6377,50 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
         "{filtered_body}"
     );
     assert_eq!(filtered["audit"][0]["detail"], "abuse");
+
+    // An account principal is recorded folded, so the actor filter folds as
+    // the account directory's name filter does; an operator principal (the
+    // concurrent row above) is matched as spelled, and never by a folded
+    // spelling of an account's name.
+    let folded = "/api/v1/admin/audit?actor=ALICE&action=KLINE&target=second%40host";
+    let (status, _, folded_body) = request(http, &cookie_get(folded, &alice_session)).await;
+    assert_eq!(status, 200, "{folded_body}");
+    let folded: serde_json::Value = serde_json::from_str(&folded_body).expect("folded JSON");
+    assert_eq!(
+        folded["audit"].as_array().map(Vec::len),
+        Some(1),
+        "{folded_body}"
+    );
+    let operator = "/api/v1/admin/audit?actor=ALICE&action=OPER";
+    let (status, _, operator_body) = request(http, &cookie_get(operator, &alice_session)).await;
+    assert_eq!(status, 200, "{operator_body}");
+    let operator: serde_json::Value = serde_json::from_str(&operator_body).expect("operator JSON");
+    assert!(
+        operator["audit"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .all(|entry| entry["detail"] != "concurrent"),
+        "an operator principal matched a folded account spelling: {operator_body}"
+    );
+    // A blank filter is a 400, not "no filter" (which returned every row).
+    for blank in ["actor=", "target=%20%20", "action=%20KLINE"] {
+        let path = format!("/api/v1/admin/audit?{blank}");
+        let (status, _, body) = request(http, &cookie_get(&path, &alice_session)).await;
+        assert_eq!(status, 400, "{blank}: {body}");
+        assert!(body.contains("Invalid audit filter"), "{body}");
+    }
+    // The console's filter form submits its unfilled fields empty; the page
+    // reads those as not given.
+    let (status, _, form_page) = request(
+        http,
+        &cookie_get(
+            "/console/audit?actor=&action=CONFIG&target=",
+            &alice_session,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{form_page}");
 
     let (status, _, page) = request(http, &cookie_get("/console/audit", &alice_session)).await;
     assert_eq!(status, 200, "{page}");
@@ -11405,4 +11450,331 @@ fn seeded_target(action: &str, target: &str) -> e6ircd::db::AuditPrincipal {
         "OPER" => e6ircd::db::AuditPrincipal::operator(target),
         _ => e6ircd::db::AuditPrincipal::account(target),
     }
+}
+
+/// `GET` an API path with a bearer token; the status and the JSON body.
+async fn get_json(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+) -> (u16, serde_json::Value, String) {
+    let (status, _, body) = request(
+        addr,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    (status, value, body)
+}
+
+/// A bearer-authenticated JSON request of any method.
+async fn send_json(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> (u16, String) {
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _head, body) = request(addr, &req).await;
+    (status, body)
+}
+
+/// A network the server configuration defines for an account is the
+/// operator's: the account sees it (marked `configured`) in its own list and
+/// can read it, but every account-level create, edit, enable/disable and
+/// delete under its key is a 409 that leaves it running — a create used to
+/// supersede it, and an edit or delete of a same-named stored row stopped it.
+/// The administrator inventory lists it too, and pages the whole fleet by a
+/// stable cursor. The managed-network API refuses what the next start could
+/// not build, naming the field, and a configured name an account already
+/// stores.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn configured_networks_are_the_operators_and_the_inventory_pages_them() {
+    use e6ircd::config::{NetworkEntry, NetworkKind};
+    let url = support::test_db("configured_networks_are_the_operators").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("configured-networks-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    for account in ["alice", "bob"] {
+        e6ircd::db::create_account_with_contact(&pool, account, "pw", None)
+            .await
+            .expect("account");
+    }
+    let alice = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("alice token");
+    let bob = issue_api_token(&pool, "bob", "test")
+        .await
+        .expect("bob token");
+    drop(pool);
+
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
+    let configured = |owner: Option<&str>, name: &str, nick: &str| NetworkEntry {
+        kind: NetworkKind::Irc,
+        name: name.into(),
+        owner: owner.map(str::to_string),
+        addr: up.to_string(),
+        tls: false,
+        nick: nick.into(),
+        username: Some(nick.into()),
+        realname: Some("Configured".into()),
+        autojoin: vec![],
+        buffer_cap: 16,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    };
+    let config = Config {
+        server_name: "irc.configured.example".into(),
+        network_name: "ConfiguredNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path,
+            previous_key_files: Vec::new(),
+        }),
+        networks: vec![
+            configured(Some("alice"), "OpsNet", "opsbot"),
+            configured(None, "lobby", "lobbybot"),
+        ],
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+
+    // Bob stores two networks of his own.
+    for name in ["bnet", "anet"] {
+        let (status, body) = post_json(
+            http,
+            "/api/v1/me/networks",
+            &bob,
+            &format!(
+                r#"{{"kind":"irc","name":"{name}","addr":"{up}","tls":false,"nick":"bob{name}","username":"bob","realname":"Bob","autojoin":[]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    // Alice's configured network is hers to see, and not hers to change.
+    let (status, list, body) = get_json(http, "/api/v1/me/networks", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    let networks = list["networks"].as_array().expect("networks");
+    assert_eq!(networks.len(), 1, "{body}");
+    assert_eq!(networks[0]["name"], "OpsNet");
+    assert_eq!(networks[0]["configured"], true);
+    assert_eq!(networks[0]["enabled"], true);
+    assert!(networks[0]["runtime"].is_object(), "{body}");
+    let (status, one, body) = get_json(http, "/api/v1/me/networks/opsnet", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(one["configured"], true, "{body}");
+    let (status, _, body) = get_json(http, "/api/v1/me/networks/opsnet/buffer", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _, body) = get_json(http, "/api/v1/me/networks/opsnet/operations", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, bobs, _) = get_json(http, "/api/v1/me/networks", &bob).await;
+    assert!(
+        bobs["networks"]
+            .as_array()
+            .expect("networks")
+            .iter()
+            .all(|network| network["configured"] == false),
+        "{bobs}"
+    );
+
+    let refused = |status: u16, body: &str| {
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("server configuration"), "{body}");
+    };
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &alice,
+        &format!(
+            r#"{{"kind":"irc","name":"opsnet","addr":"{up}","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}}"#
+        ),
+    )
+    .await;
+    refused(status, &body);
+    let replacement = format!(
+        r#"{{"addr":"{up}","tls":false,"nick":"hijack","username":"alice","realname":"Alice","autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"#
+    );
+    let (status, body) = send_json(
+        http,
+        "PUT",
+        "/api/v1/me/networks/OpsNet",
+        &alice,
+        &replacement,
+    )
+    .await;
+    refused(status, &body);
+    let (status, body) = patch_json(
+        http,
+        "/api/v1/me/networks/opsnet",
+        &alice,
+        r#"{"enabled":false}"#,
+    )
+    .await;
+    refused(status, &body);
+    let (status, body) = send_json(http, "DELETE", "/api/v1/me/networks/opsnet", &alice, "").await;
+    refused(status, &body);
+    let (status, body) = patch_json(
+        http,
+        "/api/v1/admin/networks/alice/opsnet",
+        &alice,
+        r#"{"enabled":false}"#,
+    )
+    .await;
+    refused(status, &body);
+    let (_, still, body) = get_json(http, "/api/v1/me/networks/opsnet", &alice).await;
+    assert_eq!(still["nick"], "opsbot", "{body}");
+    assert_eq!(still["enabled"], true, "{body}");
+    assert_ne!(still["runtime"]["state"], serde_json::Value::Null, "{body}");
+
+    // The fleet inventory: shared first, then by owner and name, one page of
+    // two at a time, every network once.
+    let mut seen = Vec::new();
+    let mut path = "/api/v1/admin/networks?limit=2".to_string();
+    loop {
+        let (status, page, body) = get_json(http, &path, &alice).await;
+        assert_eq!(status, 200, "{body}");
+        let networks = page["networks"].as_array().expect("networks");
+        assert!(networks.len() <= 2, "{body}");
+        for network in networks {
+            seen.push((
+                network["owner"].as_str().expect("owner").to_string(),
+                network["name"].as_str().expect("name").to_string(),
+                network["configured"] == true || network["shared"] == true,
+            ));
+        }
+        match page["next_after"].as_str() {
+            Some(cursor) => {
+                path = format!(
+                    "/api/v1/admin/networks?limit=2&after={}",
+                    cursor.replace('/', "%2F")
+                );
+            }
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            ("shared".to_string(), "lobby".to_string(), true),
+            ("alice".to_string(), "OpsNet".to_string(), true),
+            ("bob".to_string(), "anet".to_string(), false),
+            ("bob".to_string(), "bnet".to_string(), false),
+        ]
+    );
+    let (status, _, body) = get_json(http, "/api/v1/admin/networks?after=bob%2Fanet", &alice).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("after"), "{body}");
+
+    // The managed-network API: what the next start could not build is refused
+    // naming the field, and a configured network cannot take a stored name.
+    let (_, configuration, _) = get_json(http, "/api/v1/admin/configuration", &alice).await;
+    let revision = configuration["revision"].as_i64().expect("revision");
+    for (field, value) in [
+        ("nick", r#""alice smith""#),
+        ("autojoin", r##"["#ops key"]"##),
+        ("autojoin", r#"["ops"]"#),
+        ("realname", r#""Al\rice""#),
+    ] {
+        let mut network = serde_json::json!({
+            "revision": revision, "kind": "irc", "name": "managed", "owner": null,
+            "addr": up.to_string(), "tls": false, "nick": "managed", "username": "managed",
+            "realname": "Managed", "autojoin": [], "buffer_cap": 16
+        });
+        network[field] = serde_json::from_str(value).expect("value");
+        let (status, body) = post_json(
+            http,
+            "/api/v1/admin/configuration/networks",
+            &alice,
+            &network.to_string(),
+        )
+        .await;
+        assert_eq!(status, 400, "{field}={value}: {body}");
+        assert!(body.contains(field), "{field}={value}: {body}");
+    }
+    let (status, body) = post_json(
+        http,
+        "/api/v1/admin/configuration/networks",
+        &alice,
+        &serde_json::json!({
+            "revision": revision, "kind": "irc", "name": "BNET", "owner": "Bob",
+            "addr": up.to_string(), "tls": false, "nick": "managed", "username": "managed",
+            "realname": "Managed", "autojoin": [], "buffer_cap": 16
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("already has a network named"), "{body}");
+
+    // The SASL login is sent as given everywhere: surrounding whitespace is
+    // refused by create, the connection test, and an edit alike.
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &bob,
+        &format!(
+            r#"{{"kind":"irc","name":"sasl","addr":"{up}","tls":true,"nick":"bobsasl","username":"bob","realname":"Bob","autojoin":[],"sasl_account":" bob","sasl_password":"pw"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sasl_account"), "{body}");
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/network-preflight",
+        &bob,
+        &format!(
+            r#"{{"addr":"{up}","tls":true,"nick":"bobprobe","username":"bob","realname":"Bob","sasl_account":"bob ","sasl_password":"pw"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sasl_account"), "{body}");
+    let (status, body) = send_json(
+        http,
+        "PUT",
+        "/api/v1/me/networks/anet",
+        &bob,
+        &format!(
+            r#"{{"addr":"{up}","tls":true,"nick":"bobanet","username":"bob","realname":"Bob","autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"set","account":" bob","password":"pw"}},"server_password":{{"action":"keep"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sasl_account"), "{body}");
 }

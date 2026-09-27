@@ -101,9 +101,9 @@ test("storage denial is explicit on read and write", () => {
 
 test("network projection preserves the closed API state", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
-  const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
+  const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null, configured: false };
   assert.deepEqual(networksFrom({ networks: [offline] }), [
-    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, failureCode: null, failureDetail: null, runtime: null },
+    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, configured: false, state: null, failureCode: null, failureDetail: null, runtime: null },
   ]);
   assert.deepEqual(
     networksFrom({ networks: [{ ...offline, connected: false, runtime: {
@@ -116,6 +116,7 @@ test("network projection preserves the closed API state", () => {
       nick: "alice",
       enabled: true,
       connected: false,
+      configured: false,
       state: "registration_failed",
       failureCode: "registration_rejected",
       failureDetail: "Closing Link: (SASL access only)",

@@ -6024,14 +6024,22 @@ pub async fn query_audit_log(
     if let Some(before_id) = filter.before_id {
         query.push(" AND id < ").push_bind(before_id);
     }
-    if let Some(actor) = filter.actor {
-        query.push(" AND actor = ").push_bind(actor);
+    // An account principal is stored folded ([`AuditPrincipal::account`]), so
+    // the filter is folded to meet it, as the account directory's name filter
+    // is; every other principal (an operator, a nick, a channel, a mask) is
+    // stored as spelled and matched as spelled.
+    for (column, value) in [("actor", filter.actor), ("target", filter.target)] {
+        if let Some(value) = value {
+            query
+                .push(format!(" AND (({column}_kind = 'account' AND {column} = "))
+                .push_bind(CaseMapping::Rfc1459.casefold(value))
+                .push(format!(") OR ({column}_kind <> 'account' AND {column} = "))
+                .push_bind(value.to_owned())
+                .push("))");
+        }
     }
     if let Some(action) = filter.action {
         query.push(" AND action = ").push_bind(action);
-    }
-    if let Some(target) = filter.target {
-        query.push(" AND target = ").push_bind(target);
     }
     query
         .push(" ORDER BY id DESC LIMIT ")
@@ -7823,27 +7831,105 @@ pub async fn list_bnc_networks(
 /// One stored BNC network paired with its display owner for admin inventory.
 pub struct OwnedBncNetworkRow {
     pub owner: String,
+    /// Where the row sorts in the inventory, and the cursor that follows it.
+    pub key: BncInventoryKey,
     pub network: BncNetworkRow,
 }
 
-/// Every account-owned network, ordered by owner and name. This is consumed
-/// only behind the HTTP administrator gate.
-pub async fn list_bnc_network_inventory(pool: &PgPool) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
+bounded_page_size!(
+    BncNetworkInventoryPageSize,
+    "A non-zero administrator network-inventory page size capped at the public API maximum."
+);
+
+/// Where one network sorts in the administrator inventory, which is also the
+/// cursor that selects the networks after it: by folded owner (a shared
+/// network's is empty, so shared networks come first), then folded name, and
+/// a configuration-defined network before a stored one of the same key. The
+/// order is bytewise in PostgreSQL (`COLLATE "C"`) as in Rust, so a page ends
+/// where the next begins whatever the database's collation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BncInventoryKey {
+    owner: String,
+    name: String,
+    stored: bool,
+}
+
+impl BncInventoryKey {
+    /// The key of a network whose owner (`None` when shared) and name are
+    /// spelled any way: both are folded here, as the registry folds them.
+    pub fn new(owner: Option<&str>, name: &str, stored: bool) -> Self {
+        let fold = |value: &str| CaseMapping::Rfc1459.casefold(value);
+        Self {
+            owner: owner.map(fold).unwrap_or_default(),
+            name: fold(name),
+            stored,
+        }
+    }
+
+    /// The cursor text: `owner/name/stored` or `owner/name/configured`, the
+    /// owner empty for a shared network.
+    pub fn cursor(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.owner,
+            self.name,
+            if self.stored { "stored" } else { "configured" }
+        )
+    }
+
+    /// Parse a cursor [`BncInventoryKey::cursor`] wrote; anything else is
+    /// `None`. A folded key is its own fold, so a spelling that is not one is
+    /// refused rather than read as a different position.
+    pub fn parse_cursor(value: &str) -> Option<Self> {
+        let mut parts = value.rsplitn(3, '/');
+        let stored = match parts.next()? {
+            "stored" => true,
+            "configured" => false,
+            _ => return None,
+        };
+        let name = parts.next()?;
+        let owner = parts.next()?;
+        let key = Self::new((!owner.is_empty()).then_some(owner), name, stored);
+        (crate::sanitize::valid_network_name(name) && key.owner == owner && key.name == name)
+            .then_some(key)
+    }
+}
+
+/// One page of account-owned networks after `after`, in [`BncInventoryKey`]
+/// order: at most `page_size + 1` rows, the extra one telling the caller a
+/// next page exists. Consumed only behind the HTTP administrator gate.
+pub async fn bnc_network_inventory_page(
+    pool: &PgPool,
+    after: Option<&BncInventoryKey>,
+    page_size: BncNetworkInventoryPageSize,
+) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
     use sqlx::Row;
     let rows = sqlx::query(concat!(
-        "SELECT a.name AS owner, ",
+        "SELECT a.name AS owner, a.name_folded AS owner_key, ",
         bnc_network_columns!(),
         " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         ORDER BY a.name_folded, lower(n.name)"
+         WHERE $1::text IS NULL
+            OR (a.name_folded COLLATE \"C\", lower(n.name) COLLATE \"C\")
+                 > ($1 COLLATE \"C\", $2 COLLATE \"C\")
+            OR (a.name_folded = $1 AND lower(n.name) = $2 AND NOT $3)
+         ORDER BY a.name_folded COLLATE \"C\", lower(n.name) COLLATE \"C\"
+         LIMIT $4"
     ))
+    .bind(after.map(|key| key.owner.as_str()))
+    .bind(after.map(|key| key.name.as_str()))
+    .bind(after.is_some_and(|key| key.stored))
+    .bind((page_size.value() + 1) as i64)
     .fetch_all(pool)
     .await
     .map_err(query_error)?;
     rows.iter()
         .map(|row| {
+            let network = bnc_row(row)?;
+            let owner_key: String = row.get("owner_key");
             Ok(OwnedBncNetworkRow {
                 owner: row.get("owner"),
-                network: bnc_row(row)?,
+                key: BncInventoryKey::new(Some(&owner_key), &network.name, true),
+                network,
             })
         })
         .collect()
@@ -10258,6 +10344,42 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
         "app password revoked",
     )
     .await
+}
+
+#[cfg(test)]
+mod inventory_cursor_tests {
+    use super::BncInventoryKey;
+
+    /// The administrator inventory's cursor is the sort key, written and read
+    /// back exactly: shared networks first, a configured network before a
+    /// stored one of the same key, and a spelling that is not a folded key —
+    /// or not a key at all — refused rather than read as another position.
+    #[test]
+    fn inventory_cursor_round_trips_orders_and_refuses_other_text() {
+        let shared = BncInventoryKey::new(None, "Libera", false);
+        let configured = BncInventoryKey::new(Some("Alice"), "Libera", false);
+        let stored = BncInventoryKey::new(Some("alice"), "libera", true);
+        assert!(shared < configured && configured < stored);
+        for key in [&shared, &configured, &stored] {
+            assert_eq!(
+                BncInventoryKey::parse_cursor(&key.cursor()).as_ref(),
+                Some(key)
+            );
+        }
+        assert_eq!(stored.cursor(), "alice/libera/stored");
+        assert_eq!(shared.cursor(), "/libera/configured");
+        for refused in [
+            "",
+            "alice/libera",
+            "alice/libera/running",
+            "Alice/libera/stored",
+            "alice/Libera/stored",
+            "alice/../stored",
+            "alice//stored",
+        ] {
+            assert_eq!(BncInventoryKey::parse_cursor(refused), None, "{refused}");
+        }
+    }
 }
 
 #[cfg(test)]

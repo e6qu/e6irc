@@ -54,6 +54,42 @@ fn network_error(
     NetworkMutationError::new(status, title, detail)
 }
 
+/// An account-level mutation met a network the server's configuration defines
+/// for the account: the operator owns it, so it is refused rather than
+/// replaced, stopped or shadowed.
+impl From<crate::bouncer::ConfiguredNetworkHeld> for NetworkMutationError {
+    fn from(held: crate::bouncer::ConfiguredNetworkHeld) -> Self {
+        network_error(
+            StatusCode::CONFLICT,
+            "Network defined by the server configuration",
+            Some(&held.to_string()),
+        )
+    }
+}
+
+/// Refuse to create `(account, name)` when the server configuration defines
+/// that network — running now, or saved to start at the next restart — so an
+/// account's network can never share a key with the operator's.
+async fn refuse_configured_network_name(
+    state: &AppState,
+    lane: &crate::bouncer::MutationLane,
+    account: &str,
+    name: &str,
+) -> Result<(), NetworkMutationError> {
+    let fold = |value: &str| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(value);
+    let saved = match &state.managed_config {
+        Some(config) => config.read().await.settings.networks.iter().any(|network| {
+            network.owner.as_deref().map(fold) == Some(fold(account))
+                && fold(&network.name) == fold(name)
+        }),
+        None => false,
+    };
+    if saved || lane.holds_configured(Some(account), name) {
+        return Err(crate::bouncer::ConfiguredNetworkHeld.into());
+    }
+    Ok(())
+}
+
 /// Record a command about to be sent to a network's upstream on the owner's
 /// behalf. The command is not a database mutation, so there is no transaction
 /// to share: the record is written first, and a command that cannot be
@@ -487,6 +523,9 @@ pub(super) struct NetworkResponse {
     enabled: bool,
     connected: Option<bool>,
     runtime: Option<NetworkRuntimeResponse>,
+    /// Whether the server configuration defines this network: the operator's,
+    /// read-only through the account API.
+    configured: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -541,22 +580,6 @@ enum AdminNetworkKind {
         runtime: NetworkRuntimeResponse,
         shared: bool,
     },
-}
-
-impl AdminNetworkResponse {
-    pub(super) fn owner(&self) -> &str {
-        match &self.kind {
-            AdminNetworkKind::Owned { owner, .. } => owner,
-            AdminNetworkKind::Shared { owner, .. } => owner,
-        }
-    }
-
-    pub(super) fn name(&self) -> &str {
-        match &self.kind {
-            AdminNetworkKind::Owned { network, .. } => &network.name,
-            AdminNetworkKind::Shared { name, .. } => name,
-        }
-    }
 }
 
 pub(super) fn owned_admin_network_response(
@@ -624,34 +647,61 @@ pub(super) fn network_response(
         enabled: network.enabled,
         connected: runtime.map(|r| r.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
         runtime: runtime.map(runtime_response),
+        configured: false,
     }
 }
 
-/// The account's own networks (metadata only — never the secret).
+/// A network the server configuration defines for an account, in the owner
+/// view's shape: always enabled (only the operator can stop it), credentials as
+/// presence booleans, and `configured` so a client offers no edit.
+pub(super) fn configured_network_response(
+    network: &crate::bouncer::ConfiguredNetwork,
+    runtime: &crate::bouncer::NetworkRuntimeSnapshot,
+) -> NetworkResponse {
+    NetworkResponse {
+        name: network.name.clone(),
+        kind: network.kind.as_db_str(),
+        addr: network.addr.clone(),
+        tls: network.tls,
+        nick: network.nick.clone(),
+        username: network.username.clone(),
+        realname: network.realname.clone(),
+        autojoin: network.autojoin.clone(),
+        autojoin_keyed: Vec::new(),
+        sasl_account: network.sasl_account.clone(),
+        has_sasl_account: network.has_sasl_account,
+        has_sasl_password: network.has_sasl_password,
+        has_server_password: network.has_server_password,
+        enabled: true,
+        connected: Some(runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
+        runtime: Some(runtime_response(runtime)),
+        configured: true,
+    }
+}
+
+/// The account's own networks (metadata only — never the secret): its stored
+/// networks, then those the server configuration defines for it.
 pub(super) async fn list_networks(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
 ) -> Response {
-    // A read of "my networks" with no bouncer is an empty collection, not an
-    // error: returning 200 `{networks:[]}` lets the web client's network picker
-    // render cleanly (a 404 here shows up as a failed resource load in the
-    // browser console). The mutation endpoints still 404 when the bouncer is off.
-    let Some(registry) = &state.bnc_registry else {
-        return json_no_store(NetworkListResponse {
-            networks: Vec::new(),
-        });
-    };
+    let registry = registry_of(&state);
     let pool = pool_of(&state);
     match crate::db::list_bnc_networks(pool, &account).await {
         Ok(rows) => {
-            let networks: Vec<NetworkResponse> = rows
+            let mut networks: Vec<NetworkResponse> = rows
                 .into_iter()
                 .map(|n| {
-                    let handle = registry.get_owned(&account, &n.name);
+                    let handle = registry.get_stored(&account, &n.name);
                     let runtime = handle.as_ref().map(|handle| handle.runtime_snapshot());
                     network_response(n, runtime.as_ref())
                 })
                 .collect();
+            networks.extend(registry.configured_owned(&account).into_iter().map(
+                |(configured, handle)| {
+                    configured_network_response(&configured, &handle.runtime_snapshot())
+                },
+            ));
             json_no_store(NetworkListResponse { networks })
         }
         Err(e) => {
@@ -672,10 +722,19 @@ pub(super) async fn get_network(
     Authenticated(account, _): Authenticated,
     PathParams(name): PathParams<String>,
 ) -> Response {
+    let registry = registry_of(&state);
     let pool = pool_of(&state);
     let network = match crate::db::get_bnc_network(pool, &account, &name).await {
         Ok(Some(network)) => network,
-        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+        Ok(None) => {
+            return match registry.get_configured_owned(&account, &name) {
+                Some((configured, handle)) => json_no_store(configured_network_response(
+                    &configured,
+                    &handle.runtime_snapshot(),
+                )),
+                None => problem(StatusCode::NOT_FOUND, "No such network", None),
+            };
+        }
         Err(e) => {
             eprintln!("http: network read failed: {e}");
             return problem(
@@ -685,10 +744,7 @@ pub(super) async fn get_network(
             );
         }
     };
-    let handle = state
-        .bnc_registry
-        .as_ref()
-        .and_then(|registry| registry.get_owned(&account, &name));
+    let handle = registry.get_stored(&account, &name);
     let runtime = handle.as_ref().map(|handle| handle.runtime_snapshot());
     json_no_store(network_response(network, runtime.as_ref()))
 }
@@ -700,9 +756,7 @@ pub(super) async fn create_network(
     Authenticated(account, _): Authenticated,
     JsonBody(req): JsonBody<CreateNetwork>,
 ) -> Response {
-    let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
+    let registry = registry_of(&state);
     let req = NetworkCreation::from(req);
 
     match create_network_core(&state, registry, &account, &req).await {
@@ -744,9 +798,7 @@ async fn refuse_test_of_a_running_network(
     account: &str,
     req: &PreflightNetwork,
 ) -> Result<(), NetworkMutationError> {
-    let Some(registry) = state.bnc_registry.as_ref() else {
-        return Ok(());
-    };
+    let registry = registry_of(state);
     let rows = crate::db::list_bnc_networks(pool_of(state), account)
         .await
         .map_err(|error| {
@@ -758,23 +810,42 @@ async fn refuse_test_of_a_running_network(
             )
         })?;
     let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
-    let running = rows.iter().find(|row| {
-        row.kind == crate::config::NetworkKind::Irc
-            && row.addr.eq_ignore_ascii_case(&req.addr)
-            && casemap.eq(&row.nick, &req.nick)
-            && registry.get_owned(account, &row.name).is_some()
-    });
-    match running {
-        Some(row) => Err(network_error(
+    let holds_the_nick = |kind: crate::config::NetworkKind, addr: &str, nick: &str| {
+        kind == crate::config::NetworkKind::Irc
+            && addr.eq_ignore_ascii_case(&req.addr)
+            && casemap.eq(nick, &req.nick)
+    };
+    if let Some(row) = rows.iter().find(|row| {
+        holds_the_nick(row.kind, &row.addr, &row.nick)
+            && registry.get_stored(account, &row.name).is_some()
+    }) {
+        return Err(network_error(
             StatusCode::CONFLICT,
             "Network is running",
             Some(&format!(
                 "network '{}' is running; disable it to test its settings",
                 row.name
             )),
-        )),
-        None => Ok(()),
+        ));
     }
+    // A network the server configuration defines for the account holds the
+    // nickname just the same, and only the operator can stop it.
+    if let Some((configured, _)) = registry
+        .configured_owned(account)
+        .into_iter()
+        .find(|(configured, _)| holds_the_nick(configured.kind, &configured.addr, &configured.nick))
+    {
+        return Err(network_error(
+            StatusCode::CONFLICT,
+            "Network is running",
+            Some(&format!(
+                "network '{}', defined by the server configuration, is running with this \
+                 upstream and nickname",
+                configured.name
+            )),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn preflight_network_core(
@@ -796,13 +867,16 @@ pub(super) async fn preflight_network_core(
         req.server_password.is_some(),
         internal_upstreams,
     )?;
-    if let Some(account) = req.sasl_account.as_deref() {
-        validate_credential_field(account, 255).map_err(|e| e.with_field("sasl_account"))?;
-    }
+    let sasl_account = req
+        .sasl_account
+        .as_deref()
+        .map(parse_sasl_account)
+        .transpose()?;
     if let Some(password) = req.sasl_password.as_deref() {
-        validate_credential_field(password, 512).map_err(|e| e.with_field("sasl_password"))?;
+        validate_credential_field(password, MAX_UPSTREAM_PASSWORD_LEN)
+            .map_err(|e| e.with_field("sasl_password"))?;
     }
-    if req.sasl_account.is_some() != req.sasl_password.is_some() {
+    if sasl_account.is_some() != req.sasl_password.is_some() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Incomplete upstream SASL",
@@ -822,7 +896,9 @@ pub(super) async fn preflight_network_core(
             .expect("the preflight request's realname was supplied and parsed"),
         autojoin: identity.autojoin,
         buffer_cap: 1,
-        sasl: req.sasl_account.zip(req.sasl_password),
+        sasl: sasl_account
+            .map(crate::bouncer::UpstreamSaslAccount::into_string)
+            .zip(req.sasl_password),
         server_password,
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
@@ -873,11 +949,7 @@ pub(super) async fn network_account_command(
             Some("NickServ registration applies only to IRC networks"),
         );
     }
-    let Some(handle) = state
-        .bnc_registry
-        .as_ref()
-        .and_then(|registry| registry.get_owned(&account, &network.name))
-    else {
+    let Some(handle) = registry_of(&state).get_stored(&account, &network.name) else {
         return problem(
             StatusCode::CONFLICT,
             "IRC network is not running",
@@ -1004,6 +1076,19 @@ pub(super) fn network_name_ok(name: &str) -> bool {
     crate::sanitize::valid_network_name(name)
 }
 
+/// Longest upstream address (`host:port`, or a bridge's API base) a network
+/// may state, in bytes. The OpenAPI network-field schema reads it.
+pub(super) const MAX_UPSTREAM_ADDR_LEN: usize = 255;
+
+/// Longest SASL password — or bridge password or token — a network may state,
+/// in bytes. The OpenAPI network-field schema reads it.
+pub(super) const MAX_UPSTREAM_PASSWORD_LEN: usize = 512;
+
+/// Longest account field a network may state, in bytes: an IRC SASL login
+/// ([`crate::bouncer::UpstreamSaslAccount`]) or a Slack bot token. The OpenAPI
+/// network-field schema reads it.
+pub(super) const MAX_UPSTREAM_ACCOUNT_LEN: usize = crate::bouncer::UpstreamSaslAccount::MAX_BYTES;
+
 /// Bounds/injection/SSRF checks on the connection/identity fields, shared by
 /// create (all kinds) and edit. Length-bounds `addr`/`nick`/`realname`/
 /// `autojoin`, rejects CR/LF/NUL in them (a line-injection primitive into the
@@ -1016,22 +1101,44 @@ pub(super) fn check_upstream_bounds(
     autojoin: &[crate::bouncer::AutojoinEntry],
     internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<(), NetworkMutationError> {
-    let overlong = if addr.len() > 255 {
-        Some(("addr", "addr is limited to 255 bytes"))
-    } else if nick.len() > 64 {
-        Some(("nick", "nick is limited to 64 bytes"))
-    } else if realname.is_some_and(|r| r.len() > 128) {
-        Some(("realname", "realname is limited to 128 bytes"))
-    } else if autojoin.len() > crate::bouncer::AutojoinEntry::MAX_CONFIGURED
-        || autojoin.iter().any(|entry| entry.channel.len() > 64)
+    use crate::bouncer::{AutojoinEntry, UpstreamChannel, UpstreamNick, UpstreamRealname};
+    let overlong = if addr.len() > MAX_UPSTREAM_ADDR_LEN {
+        Some((
+            "addr",
+            format!("addr is limited to {MAX_UPSTREAM_ADDR_LEN} bytes"),
+        ))
+    } else if nick.len() > UpstreamNick::MAX_BYTES {
+        Some((
+            "nick",
+            format!("nick is limited to {} bytes", UpstreamNick::MAX_BYTES),
+        ))
+    } else if realname.is_some_and(|r| r.len() > UpstreamRealname::MAX_BYTES) {
+        Some((
+            "realname",
+            format!(
+                "realname is limited to {} bytes",
+                UpstreamRealname::MAX_BYTES
+            ),
+        ))
+    } else if autojoin.len() > AutojoinEntry::MAX_CONFIGURED
+        || autojoin
+            .iter()
+            .any(|entry| entry.channel.len() > UpstreamChannel::MAX_BYTES)
     {
-        Some(("autojoin", "autojoin is limited to 64 channels of 64 bytes"))
+        Some((
+            "autojoin",
+            format!(
+                "autojoin is limited to {} channels of {} bytes",
+                AutojoinEntry::MAX_CONFIGURED,
+                UpstreamChannel::MAX_BYTES
+            ),
+        ))
     } else {
         None
     };
     if let Some((field, detail)) = overlong {
         return Err(
-            network_error(StatusCode::BAD_REQUEST, "Field too long", Some(detail))
+            network_error(StatusCode::BAD_REQUEST, "Field too long", Some(&detail))
                 .with_field(field),
         );
     }
@@ -1167,13 +1274,19 @@ pub(super) fn validate_irc_upstream(
     })
 }
 
-/// Resolve one owner-scoped row for an API mutation.
+/// Resolve one owner-scoped row for an API mutation. A network the server
+/// configuration defines under the same key is the operator's, and every
+/// account-level mutation of it is refused here, before anything changes.
 async fn editable_network(
     state: &AppState,
+    lane: &crate::bouncer::MutationLane,
     account: &str,
     name: &str,
     operation: &str,
 ) -> Result<crate::db::BncNetworkRow, NetworkMutationError> {
+    if lane.holds_configured(Some(account), name) {
+        return Err(crate::bouncer::ConfiguredNetworkHeld.into());
+    }
     let row = match crate::db::get_bnc_network(pool_of(state), account, name).await {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -1270,6 +1383,23 @@ fn apply_server_password(
             .with_field("server_password"))
         }
     }
+}
+
+/// The IRC SASL account a create, edit or connection test states, parsed by
+/// the one grammar all three share ([`crate::bouncer::UpstreamSaslAccount`]).
+fn parse_sasl_account(
+    account: &str,
+) -> Result<crate::bouncer::UpstreamSaslAccount, NetworkMutationError> {
+    account
+        .parse()
+        .map_err(|error: crate::bouncer::UpstreamIdentityError| {
+            network_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid upstream credentials",
+                Some(&error.to_string()),
+            )
+            .with_field(error.field())
+        })
 }
 
 fn validate_credential_field(value: &str, maximum: usize) -> Result<(), NetworkMutationError> {
@@ -1443,6 +1573,14 @@ fn apply_autojoin_keys(
             .find(|stored| same_channel(&stored.channel, channel))
             .and_then(|stored| stored.key_sealed.clone())
     };
+    // Each kept channel is one autojoin entry, so no more can be named than
+    // autojoin may hold.
+    if keys.keep.len() > crate::bouncer::AutojoinEntry::MAX_CONFIGURED {
+        return Err(refused(&format!(
+            "autojoin_keys.keep names at most {} channels",
+            crate::bouncer::AutojoinEntry::MAX_CONFIGURED
+        )));
+    }
     for kept in &keys.keep {
         match autojoin
             .iter()
@@ -1518,7 +1656,6 @@ fn apply_network_credentials(
             Some("replace bridge credentials or keep the stored values"),
         )),
         (NetworkKind::Irc, NetworkCredentialUpdate::Set { account, password }) => {
-            let account = account.map(str::trim).filter(|value| !value.is_empty());
             let Some(account) = account else {
                 return Err(network_error(
                     StatusCode::BAD_REQUEST,
@@ -1526,10 +1663,9 @@ fn apply_network_credentials(
                     Some("enter a SASL account or explicitly remove the stored credentials"),
                 ));
             };
-            validate_credential_field(account, 255)?;
-            row.sasl_account = Some(account.to_string());
+            row.sasl_account = Some(parse_sasl_account(account)?.into_string());
             if let Some(password) = password {
-                validate_credential_field(password, 512)?;
+                validate_credential_field(password, MAX_UPSTREAM_PASSWORD_LEN)?;
                 row.sasl_password_sealed = Some(seal_network_secret(state, owner, password)?);
             } else if row.sasl_password_sealed.is_none() {
                 return Err(network_error(
@@ -1558,7 +1694,7 @@ fn apply_network_credentials(
                     Some("provide a replacement password/token or keep the stored value"),
                 ));
             };
-            validate_credential_field(password, 512)?;
+            validate_credential_field(password, MAX_UPSTREAM_PASSWORD_LEN)?;
             row.sasl_account = None;
             row.sasl_password_sealed = Some(seal_network_secret(state, owner, password)?);
             Ok(())
@@ -1572,7 +1708,7 @@ fn apply_network_credentials(
                 ));
             }
             if let Some(account) = account {
-                validate_credential_field(account, 255)?;
+                validate_credential_field(account, MAX_UPSTREAM_ACCOUNT_LEN)?;
                 row.sasl_account = Some(seal_network_secret(state, owner, account)?);
             } else if row.sasl_account.is_none() {
                 return Err(network_error(
@@ -1582,7 +1718,7 @@ fn apply_network_credentials(
                 ));
             }
             if let Some(password) = password {
-                validate_credential_field(password, 512)?;
+                validate_credential_field(password, MAX_UPSTREAM_PASSWORD_LEN)?;
                 row.sasl_password_sealed = Some(seal_network_secret(state, owner, password)?);
             } else if row.sasl_password_sealed.is_none() {
                 return Err(network_error(
@@ -1763,15 +1899,24 @@ impl<'a> ActiveOwnerLane<'a> {
     }
 
     /// Stop any predecessor, then start `driver` (create and edit).
-    async fn supersede(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
-        self.lane.replace(Some(self.owner), name, driver).await;
+    async fn supersede(
+        &self,
+        name: &str,
+        driver: Box<dyn crate::bouncer::NetworkDriver>,
+    ) -> Result<(), crate::bouncer::ConfiguredNetworkHeld> {
+        self.lane.replace(Some(self.owner), name, driver).await
     }
 
     /// Start `driver` unless a working one is already registered (enable).
-    async fn ensure_running(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
+    async fn ensure_running(
+        &self,
+        name: &str,
+        driver: Box<dyn crate::bouncer::NetworkDriver>,
+    ) -> Result<(), crate::bouncer::ConfiguredNetworkHeld> {
         self.lane
             .ensure_running(Some(self.owner), name, driver)
-            .await;
+            .await
+            .map(|_started| ())
     }
 }
 
@@ -1821,7 +1966,7 @@ async fn update_network_in_lane(
     );
     let lane = ActiveOwnerLane::enter(state, lane, account).await?;
     let pool = pool_of(state);
-    let mut row = editable_network(state, account, name, "update").await?;
+    let mut row = editable_network(state, lane.lane, account, name, "update").await?;
     let before = row.clone();
     if row.kind == crate::config::NetworkKind::Irc && realname.is_none() {
         return Err(network_error(
@@ -1901,7 +2046,7 @@ async fn update_network_in_lane(
         "update failed",
     )?;
     if let Some(driver) = driver {
-        lane.supersede(name, driver).await;
+        lane.supersede(name, driver).await?;
     }
     Ok(())
 }
@@ -2158,6 +2303,7 @@ async fn create_network_in_lane(
         )
         .with_field("name"));
     }
+    refuse_configured_network_name(state, lane, account, &req.name).await?;
     use crate::config::NetworkKind;
     let kind = req.kind;
     // A bridge kind can only run on a binary built with its feature, and `local`
@@ -2210,11 +2356,20 @@ async fn create_network_in_lane(
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
     // sealed-secret size cap) are checked here rather than in the shared helper.
+    // An IRC account is a login name, parsed as the edit and the connection
+    // test parse it; Slack's account field is its bot token, a secret checked
+    // only for what could not travel.
     if let Some(account) = req.sasl_account.as_deref() {
-        validate_credential_field(account, 255).map_err(|e| e.with_field("sasl_account"))?;
+        if kind == NetworkKind::Irc {
+            parse_sasl_account(account)?;
+        } else {
+            validate_credential_field(account, MAX_UPSTREAM_ACCOUNT_LEN)
+                .map_err(|e| e.with_field("sasl_account"))?;
+        }
     }
     if let Some(password) = req.sasl_password.as_deref() {
-        validate_credential_field(password, 512).map_err(|e| e.with_field("sasl_password"))?;
+        validate_credential_field(password, MAX_UPSTREAM_PASSWORD_LEN)
+            .map_err(|e| e.with_field("sasl_password"))?;
     }
     // For IRC the SASL pair is both-or-neither (account = login name, password =
     // secret). Bridges don't follow that rule — their required fields are checked
@@ -2322,7 +2477,7 @@ async fn create_network_in_lane(
         server_password_sealed: sealed_server_password,
         enabled: true,
     };
-    let pool = state.pool.as_ref().expect("caller checked the pool");
+    let pool = state.pool().expect("caller checked the pool");
     // The per-account network cap is enforced atomically inside
     // `create_bnc_network` (count + insert in one locked transaction), so
     // there is no racy list-then-insert here — two concurrent creates can't both
@@ -2364,9 +2519,10 @@ async fn create_network_in_lane(
             ));
         }
     }
-    // The row was just inserted under the uniqueness constraint, so anything
-    // already registered under this key has no durable definition: supersede it.
-    lane.supersede(&req.name, driver).await;
+    // The row was just inserted under the uniqueness constraint, and a
+    // configured network under this key was refused above on the same lane, so
+    // anything still registered here has no durable definition: supersede it.
+    lane.supersede(&req.name, driver).await?;
     Ok(())
 }
 
@@ -2422,14 +2578,18 @@ pub(super) async fn network_buffer(
     PathParams(name): PathParams<String>,
     QueryParams(params): QueryParams<BufferQuery>,
 ) -> Response {
-    if state.bnc_registry.is_none() {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    }
     let pool = pool_of(&state);
-    // The network must belong to the caller — no cross-account reads.
-    match crate::db::get_bnc_network(pool, &account, &name).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+    let registry = registry_of(&state);
+    // The network must belong to the caller — no cross-account reads: its
+    // stored row, or a network the server configuration defines for it. The
+    // running driver read is that network's own, never the other kind's under
+    // the same name.
+    let handle = match crate::db::get_bnc_network(pool, &account, &name).await {
+        Ok(Some(_)) => registry.get_stored(&account, &name),
+        Ok(None) => match registry.get_configured_owned(&account, &name) {
+            Some((_, handle)) => Some(handle),
+            None => return problem(StatusCode::NOT_FOUND, "No such network", None),
+        },
         Err(e) => {
             eprintln!("http: network buffer lookup failed: {e}");
             return problem(
@@ -2438,7 +2598,7 @@ pub(super) async fn network_buffer(
                 None,
             );
         }
-    }
+    };
     let limit = match bounded_query_limit(params.limit, DEFAULT_BUFFER_READ_LIMIT, 1000, "buffer") {
         Ok(limit) => limit,
         Err(response) => return response.into(),
@@ -2459,10 +2619,6 @@ pub(super) async fn network_buffer(
             );
         }
     };
-    let handle = state
-        .bnc_registry
-        .as_ref()
-        .and_then(|registry| registry.get_owned(&account, &name));
     if let Some(handle) = handle {
         let lines = match through {
             None => handle.buffer_snapshot(),
@@ -2575,9 +2731,7 @@ pub(super) async fn update_network(
     PathParams(name): PathParams<String>,
     JsonBody(req): JsonBody<UpdateNetwork>,
 ) -> Response {
-    let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
+    let registry = registry_of(&state);
     if let Err(error) = update_network_core(&state, registry, &account, &name, req).await {
         return error.into_response();
     }
@@ -2636,16 +2790,16 @@ async fn set_network_enabled_in_lane(
     };
     let stored_name = if enabled {
         let owner_lane = ActiveOwnerLane::enter(state, lane, account).await?;
-        let row = editable_network(state, account, name, "enable").await?;
+        let row = editable_network(state, lane, account, name, "enable").await?;
         let driver = stored_network_driver(state, account, &row)?;
         require_network_updated(
             crate::db::set_bnc_network_enabled(pool, account, name, true, audit).await,
             "enable failed",
         )?;
-        owner_lane.ensure_running(&row.name, driver).await;
+        owner_lane.ensure_running(&row.name, driver).await?;
         row.name
     } else {
-        let row = editable_network(state, account, name, "disable").await?;
+        let row = editable_network(state, lane, account, name, "disable").await?;
         require_network_updated(
             crate::db::set_bnc_network_enabled(pool, account, name, false, audit).await,
             "disable failed",
@@ -2655,7 +2809,7 @@ async fn set_network_enabled_in_lane(
             &row.name,
             crate::bouncer::UnwrittenLines::Store,
         )
-        .await;
+        .await?;
         row.name
     };
     Ok(stored_name)
@@ -2690,12 +2844,12 @@ async fn delete_network_in_lane(
     account: &str,
     name: &str,
 ) -> Result<(), NetworkMutationError> {
-    let row = editable_network(state, account, name, "delete").await?;
+    let row = editable_network(state, registry, account, name, "delete").await?;
     // Built before anything stops, so a restart after a refused delete does
     // not depend on anything that could change meanwhile. A running network
     // whose row no longer builds (a rotated master key) can still be deleted;
     // it is said here that a refused delete would leave it stopped.
-    let running = registry.get_owned(account, &row.name).is_some();
+    let running = registry.get_stored(account, &row.name).is_some();
     let restart = if running {
         match stored_network_driver(state, account, &row) {
             Ok(driver) => Some(driver),
@@ -2718,7 +2872,7 @@ async fn delete_network_in_lane(
             &row.name,
             crate::bouncer::UnwrittenLines::Discard,
         )
-        .await;
+        .await?;
     let deleted = crate::db::delete_bnc_network(
         pool_of(state),
         account,
@@ -2733,8 +2887,12 @@ async fn delete_network_in_lane(
     // and a network with no row must not run.
     if deleted.is_err()
         && let Some(driver) = restart
+        && let Err(held) = registry.replace(Some(account), &row.name, driver).await
     {
-        registry.replace(Some(account), &row.name, driver).await;
+        eprintln!(
+            "http: network {account}/{} not restarted after a refused delete: {held}",
+            row.name
+        );
     }
     require_network_updated(deleted, "delete failed")
 }
@@ -2747,9 +2905,7 @@ pub(super) async fn patch_network(
     PathParams(name): PathParams<String>,
     JsonBody(req): JsonBody<PatchNetwork>,
 ) -> Response {
-    let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
+    let registry = registry_of(&state);
     match set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await {
         Ok(name) => axum::Json(NetworkEnabledResponse {
             name,
@@ -2774,9 +2930,7 @@ pub(super) async fn patch_admin_network(
     PathParams((owner, name)): PathParams<(String, String)>,
     JsonBody(req): JsonBody<AdminNetworkPatch>,
 ) -> Response {
-    let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
+    let registry = registry_of(&state);
     match set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await {
         Ok(name) => json_no_store(AdminNetworkEnabledResponse {
             owner,
@@ -2793,9 +2947,7 @@ pub(super) async fn delete_network(
     Authenticated(account, _): Authenticated,
     PathParams(name): PathParams<String>,
 ) -> Response {
-    let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
+    let registry = registry_of(&state);
     match delete_network_core(&state, registry, &account, &name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),

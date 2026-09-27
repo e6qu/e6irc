@@ -287,7 +287,9 @@ monitoring; live runtime diagnosis remains tied to the registry.
 
 1. The network list reads `GET /api/v1/me/networks` and shows
    enabled/disabled, connecting/connected/disconnected, driver kind, upstream,
-   attached clients, and error count.
+   attached clients, and error count. A network the server configuration
+   defines for the account is listed too (`configured: true`), with no
+   enable, edit, or remove control: it is the operator's.
 2. **Inspect** shows configuration without returning the stored secret.
 3. **Operations** refreshes the live snapshot: attempt/success/disconnect
    timestamps, the scheduled time of the next reconnect attempt while the
