@@ -1170,7 +1170,7 @@ fn operations() -> serde_json::Value {
             "/readyz": {
                 "get": { "summary": "Core and PostgreSQL readiness probe", "responses": {
                     "200": { "description": "this process serves (role \"serving\") and all configured dependencies are ready" },
-                    "503": { "description": "the core heartbeat is stale or PostgreSQL is unavailable, or this process is a standby (role \"standby\", naming the serving lease's holder)" } } }
+                    "503": { "description": "the core heartbeat is stale, PostgreSQL is unavailable, or the serving lease is unconfirmed (lease \"unconfirmed\": no renewal reached the database within the fence; the process keeps its clients and resumes when one does), or this process is a standby (role \"standby\", naming the serving lease's holder)" } } }
             },
             "/api/v1/monitoring/observation": {
                 "get": {

@@ -41,6 +41,12 @@ FRESH_DATABASE = "e6irc_recovery_fresh"
 # there reaches it only by honoring the port in the database URL.
 POSTGRES_CONTAINER_PORT = 5544
 TIMEOUT = 30.0
+# The serving lease's fence (`serving_lease::FENCE_AFTER`): with no renewal
+# confirmed for this long the daemon stops using the database but keeps its
+# clients. The outage below outlasts it, so the recovery covers the fenced
+# holder resuming, not only a short interruption.
+LEASE_FENCE_SECONDS = 10.0
+OUTAGE_SECONDS = 14.0
 # The foreign keys that tie account-owned rows to their owners (a bouncer
 # backlog line to its network, an approved device grant to its account). A
 # restore that dropped one would leave rows that outlive what they belong to.
@@ -231,6 +237,23 @@ def wait_for_http(origin: str, path: str, expected_status: int) -> tuple[bytes, 
     )
 
 
+def wait_for_readiness(origin: str, accept) -> tuple[bytes, float]:
+    """Poll `/readyz` until `accept` takes its JSON body, whatever the status."""
+    deadline = time.monotonic() + TIMEOUT
+    last: object = None
+    started = time.monotonic()
+    while time.monotonic() < deadline:
+        try:
+            _, body = http_request(origin, "/readyz")
+            last = json.loads(body)
+            if accept(last):
+                return body, time.monotonic() - started
+        except (OSError, urllib.error.URLError, ValueError) as error:
+            last = error
+        time.sleep(0.1)
+    raise TimeoutError(f"/readyz never reported the awaited state; last: {last!r}")
+
+
 class IrcClient:
     def __init__(self, port: int, nick: str) -> None:
         self.nick = nick
@@ -344,6 +367,7 @@ def main() -> None:
                     "role": "serving",
                     "core": "ready",
                     "database": "ready",
+                    "lease": "held",
                 }, ready
 
                 migration_count = int(
@@ -373,7 +397,11 @@ def main() -> None:
                     "pre-interruption channel message",
                 )
 
+                # The last renewal confirmed before the stop started at most
+                # one renewal interval (3 s) before it.
+                stopping = time.monotonic()
                 docker("stop", "--time", "5", container)
+                stopped = time.monotonic()
                 unavailable_body, readiness_latency = wait_for_http(
                     origin, "/readyz", 503
                 )
@@ -409,10 +437,40 @@ def main() -> None:
                     f"{device_failure_latency:.2f}s while PostgreSQL was down"
                 )
 
+                # Held down past the lease's fence: no renewal is confirmed,
+                # so `/readyz` reports the lease unconfirmed, and the daemon
+                # keeps running and keeps its clients.
+                fenced_body, _ = wait_for_readiness(
+                    origin, lambda body: body.get("lease") == "unconfirmed"
+                )
+                fenced = json.loads(fenced_body)
+                assert fenced["ready"] is False, fenced
+                assert fenced["database"] == "unavailable", fenced
+                assert time.monotonic() - stopping >= LEASE_FENCE_SECONDS - 3.0, (
+                    "the fence fell too early",
+                    time.monotonic() - stopping,
+                )
+                remaining = OUTAGE_SECONDS - (time.monotonic() - stopped)
+                if remaining > 0:
+                    time.sleep(remaining)
+                assert time.monotonic() - stopped > LEASE_FENCE_SECONDS, (
+                    "the outage must outlast the fence"
+                )
+                assert server.poll() is None, "daemon exited when its lease was fenced"
+                assert http_request(origin, "/healthz")[0] == 200
+                alice.send("PRIVMSG #recovery :fenced but serving")
+                bob.wait_line(
+                    lambda line: " PRIVMSG #recovery :fenced but serving" in line,
+                    "channel message while the lease is fenced",
+                )
+
                 docker("start", container)
                 wait_for_postgres(container)
                 recovered_body, _ = wait_for_http(origin, "/readyz", 200)
-                assert json.loads(recovered_body)["database"] == "ready"
+                recovered = json.loads(recovered_body)
+                assert recovered["database"] == "ready", recovered
+                assert recovered["lease"] == "held", recovered
+                assert server.poll() is None, "daemon exited on recovery"
 
                 status, body = http_request(
                     origin,

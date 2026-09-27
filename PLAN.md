@@ -1507,6 +1507,10 @@ Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
 - **Fencing is enforced by PostgreSQL too**: every pool connection passes
   `serving_lease_register_backend`, and a takeover ends the previous holder's
   recorded connections, so its queued writes fail and none lands.
+- **A fenced holder holds on through an outage unless actually taken over**:
+  past the fence it keeps its clients and hot state, answers `/readyz` 503
+  (`lease: unconfirmed`) and keeps renewing; a renewal that finds the lease
+  still its own resumes it, one that finds another holder drains and exits.
 - **Only the holder migrates**; a standby older than the schema refuses at
   boot; `rotate-secrets` and `recover-administrator` never migrate under a
   serving process and refuse an older schema with "upgrade the serving process

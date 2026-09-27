@@ -1216,9 +1216,11 @@ async fn serve(
     // Accept-loop tasks, collected so shutdown can stop admitting connections.
     let mut listeners: Vec<tokio::task::AbortHandle> = Vec::new();
 
-    // A lease that ends while serving — taken over, or fenced for want of a
-    // confirmed renewal — ends the serving: the same bounded drain as a
-    // signal, and a non-zero exit.
+    // A lease that ends while serving — a renewal found it taken over, at
+    // once or when the database answered again after a fence — ends the
+    // serving: the same bounded drain as a signal, and a non-zero exit. A
+    // fence alone (no renewal confirmed) keeps serving clients from hot state
+    // without the database (`serving_lease::renew`).
     if let Some(lease) = lease.as_ref() {
         telemetry.observe_serving_lease(lease.status());
         let ended = lease.end_watch();
