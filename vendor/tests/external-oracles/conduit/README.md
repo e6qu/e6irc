@@ -2,12 +2,15 @@
 
 A lightweight single-binary [Matrix] homeserver, used as the live target
 for the `matrix` bridge's integration test (`crates/e6ircd/tests/matrix.rs`).
-Not part of the e6irc build or default CI.
+Not part of the e6irc build; CI's `matrix-bridge` job runs this same image
+with this directory's `conduit.toml`.
 
 ## Provenance
 
 - **Source / image:** `matrixconduit/matrix-conduit:v0.9.0`
-  (https://gitlab.com/famedly/conduit), pinned by tag.
+  (https://gitlab.com/famedly/conduit), pinned by index digest — the one
+  digest `docker-compose.yml` and ci.yml both name
+  (`tools/check-image-pins.py` holds them to it).
 - **License:** Apache-2.0 (Conduit). Run as a separate container; not
   linked into or distributed with e6irc.
 

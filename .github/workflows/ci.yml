@@ -21,9 +21,11 @@ on:
     branches: [main]
   pull_request:
 
-# Service and tool images are pinned by digest like the Dockerfile's bases; to
-# refresh one, resolve its tag with `docker buildx imagetools inspect IMAGE:TAG`
-# and update the digest and this date together.
+# Service and tool images are pinned by digest like the Dockerfile's bases
+# (tools/check-image-pins.py requires a digest on every image any tracked file
+# pulls, and one digest per image everywhere); to refresh one, resolve its tag
+# with `docker buildx imagetools inspect IMAGE:TAG` and update the digest and
+# this date together.
 #   postgres:18-alpine, ghcr.io/dexidp/dex:v2.41.1,
 #   mcr.microsoft.com/playwright:v1.61.1-noble,
 #   matrixconduit/matrix-conduit:v0.9.0   resolved 2026-09-21
