@@ -75,16 +75,50 @@ const WIRE_LINE_BUDGET: usize = e6irc_proto::message::MAX_LINE_LEN - 2;
 /// at the longest server name and nickname, so no client is sent a clipped
 /// one.
 pub const MAX_MOTD_LINE_LEN: usize = WIRE_LINE_BUDGET - MAX_NUMERIC_HEAD_LEN - " :- ".len();
-/// Most `motd` lines. A new client is sent the whole MOTD at registration,
-/// before it has read a byte, beside the rest of the registration burst
-/// (welcome, ISUPPORT, LUSERS, user modes), so all of it must fit the smallest
-/// SendQ a connection can have or a long MOTD kills every slow reader for
-/// SendQ. Every one of those replies is a numeric of at most
-/// [`e6irc_proto::message::MAX_LINE_LEN`] bytes (numerics carry no tags): the
-/// MOTD's replies — its lines between `RPL_MOTDSTART` and `RPL_ENDOFMOTD` —
-/// take at most half of [`MIN_SENDQ_BYTES`] at the longest line, and the rest
-/// of the burst, a score of mostly short numerics, has the other half.
-pub const MAX_MOTD_LINES: usize = MIN_SENDQ_BYTES / 2 / e6irc_proto::message::MAX_LINE_LEN - 2;
+/// Most bytes the whole MOTD may take as a new client is sent it at
+/// registration — its `RPL_MOTD` lines between `RPL_MOTDSTART` and
+/// `RPL_ENDOFMOTD`, at the longest server name and nickname ([`motd_reply_bytes`]).
+/// The client is sent it before it has read a byte, beside the rest of the
+/// registration burst (welcome, ISUPPORT, LUSERS, user modes), so all of it
+/// must fit the smallest SendQ a connection can have or a long MOTD kills
+/// every slow reader for SendQ: the MOTD has half of [`MIN_SENDQ_BYTES`], and
+/// the rest of the burst, a score of mostly short numerics, the other half.
+/// Bounded in bytes rather than lines, since bytes are what the SendQ holds: a
+/// MOTD of short lines may have many more of them than one of long lines.
+pub const MAX_MOTD_BYTES: usize = MIN_SENDQ_BYTES / 2;
+/// `RPL_MOTDSTART`'s text after the server name (`- <server> Message of the day - `).
+pub(crate) const MOTD_START_SUFFIX: &str = " Message of the day - ";
+/// `RPL_ENDOFMOTD`'s text.
+pub(crate) const MOTD_END_TEXT: &str = "End of /MOTD command.";
+/// What a numeric reply spends besides its trailing text, at the longest
+/// server name and nickname: `<head> :` and the CRLF.
+const NUMERIC_REPLY_OVERHEAD: usize = MAX_NUMERIC_HEAD_LEN + " :".len() + 2;
+/// What one `motd` line's `RPL_MOTD` spends besides the line itself, at the
+/// longest server name and nickname: its reply's overhead and the `- ` before
+/// the line.
+pub const MOTD_LINE_REPLY_OVERHEAD: usize = NUMERIC_REPLY_OVERHEAD + "- ".len();
+/// `RPL_MOTDSTART` and `RPL_ENDOFMOTD` together, at the longest server name
+/// and nickname.
+const MOTD_FRAME_BYTES: usize = 2 * NUMERIC_REPLY_OVERHEAD
+    + "- ".len()
+    + MAX_SERVER_NAME_LEN
+    + MOTD_START_SUFFIX.len()
+    + MOTD_END_TEXT.len();
+/// What the `motd` lines may take together, each counting its length and
+/// [`MOTD_LINE_REPLY_OVERHEAD`]: [`MAX_MOTD_BYTES`] less the frame around them.
+pub const MAX_MOTD_LINES_BYTES: usize = MAX_MOTD_BYTES - MOTD_FRAME_BYTES;
+
+/// The bytes `motd` takes as a new client is sent it, at the longest server
+/// name and nickname: every line's `RPL_MOTD`, `RPL_MOTDSTART` and
+/// `RPL_ENDOFMOTD`. An empty MOTD is one `ERR_NOMOTD` instead, well within
+/// any bound.
+pub fn motd_reply_bytes(motd: &[String]) -> usize {
+    MOTD_FRAME_BYTES
+        + motd
+            .iter()
+            .map(|line| line.len() + MOTD_LINE_REPLY_OVERHEAD)
+            .sum::<usize>()
+}
 /// Longest `description`, in bytes: what fits a `RPL_LINKS` (`<head> <server>
 /// <server> :0 <description>`) at the longest server name and nickname.
 pub const MAX_DESCRIPTION_LEN: usize =
@@ -2388,12 +2422,14 @@ impl Config {
                 self.description.len()
             )));
         }
-        if self.motd.len() > MAX_MOTD_LINES {
+        let motd_bytes = motd_reply_bytes(&self.motd);
+        if motd_bytes > MAX_MOTD_BYTES {
             return Err(ConfigError::Invalid(format!(
-                "motd must be at most {MAX_MOTD_LINES} lines (it is {}): a new client is sent the \
-                 whole MOTD at registration, and a longer one need not fit the smallest SendQ \
-                 ({MIN_SENDQ_BYTES} bytes) beside the rest of that burst",
-                self.motd.len()
+                "motd must take at most {MAX_MOTD_BYTES} bytes as sent at registration (it takes \
+                 {motd_bytes}: its lines together at most {MAX_MOTD_LINES_BYTES} bytes, each \
+                 counting {MOTD_LINE_REPLY_OVERHEAD} more for its reply): a new client is sent the \
+                 whole MOTD before it reads anything, and a longer one need not fit the smallest \
+                 SendQ ({MIN_SENDQ_BYTES} bytes) beside the rest of that burst"
             )));
         }
         if let Some((index, line)) = self
@@ -4760,14 +4796,34 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
     /// long, and a slow reader's registration burst overran its SendQ.
     #[test]
     fn a_motd_longer_than_the_smallest_sendq_holds_is_refused() {
-        assert_eq!(MAX_MOTD_LINES, 14);
+        assert_eq!(
+            (
+                MAX_MOTD_BYTES,
+                MAX_MOTD_LINES_BYTES,
+                MOTD_LINE_REPLY_OVERHEAD
+            ),
+            (8_703, 8_318, 140)
+        );
         let mut config = listening_config();
-        config.motd = vec!["m".repeat(MAX_MOTD_LINE_LEN); MAX_MOTD_LINES];
+        // Bytes, not lines: many short lines fit where few long ones would.
+        let short = 8_318 / (1 + MOTD_LINE_REPLY_OVERHEAD);
+        config.motd = vec!["m".into(); short];
+        config.validate().expect("many short lines");
+        assert!(short > 14, "{short}");
+        // Long lines to the byte, then one byte more.
+        let long = MAX_MOTD_LINE_LEN + MOTD_LINE_REPLY_OVERHEAD;
+        let mut motd = vec!["m".repeat(MAX_MOTD_LINE_LEN); 15];
+        motd.push("m".repeat(MAX_MOTD_LINES_BYTES - 15 * long - 2 * MOTD_LINE_REPLY_OVERHEAD));
+        motd.push(String::new());
+        assert_eq!(motd_reply_bytes(&motd), MAX_MOTD_BYTES);
+        config.motd = motd;
         config.validate().expect("at the bound");
-        config.motd.push("m".into());
-        let refusal = config.validate().expect_err("one line more").to_string();
+        config.motd.last_mut().expect("a line").push('m');
+        let refusal = config.validate().expect_err("one byte more").to_string();
         assert!(
-            refusal.contains("motd must be at most 14 lines (it is 15)"),
+            refusal.contains(
+                "motd must take at most 8703 bytes as sent at registration (it takes 8704"
+            ),
             "{refusal}"
         );
         let managed = ManagedConfig::from_config(&config, None).expect("managed");
@@ -4780,7 +4836,7 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             })
             .expect_err("the console save is refused too")
             .to_string();
-        assert!(refusal.contains("motd must be at most"), "{refusal}");
+        assert!(refusal.contains("motd must take at most"), "{refusal}");
     }
 
     /// The console's form states the same bounds the validation holds a save
@@ -4793,7 +4849,10 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
             format!("name=\"network_name\" maxlength=\"{MAX_NETWORK_NAME_LEN}\""),
             format!("name=\"description\" maxlength=\"{MAX_DESCRIPTION_LEN}\""),
             format!("each at most {MAX_MOTD_LINE_LEN} bytes"),
-            format!("at most {MAX_MOTD_LINES} lines"),
+            format!(
+                "together at most {MAX_MOTD_LINES_BYTES} bytes, each line counting \
+                 {MOTD_LINE_REPLY_OVERHEAD} more"
+            ),
             format!("name=\"buffer_cap\" min=\"1\" max=\"{MAX_NETWORK_BUFFER_CAP}\""),
         ] {
             assert!(form.contains(&control), "the form lacks {control}");

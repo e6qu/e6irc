@@ -2789,12 +2789,12 @@ pub(super) fn send_motd(state: &mut ServerState, conn: ConnId) {
         conn,
         RPL_MOTDSTART,
         &[],
-        Some(&format!("- {server} Message of the day - ")),
+        Some(&format!("- {server}{}", crate::config::MOTD_START_SUFFIX)),
     );
     for line in state.config.motd.clone() {
         state.numeric(conn, RPL_MOTD, &[], Some(&format!("- {line}")));
     }
-    state.numeric(conn, RPL_ENDOFMOTD, &[], Some("End of /MOTD command."));
+    state.numeric(conn, RPL_ENDOFMOTD, &[], Some(crate::config::MOTD_END_TEXT));
 }
 
 #[cfg(test)]

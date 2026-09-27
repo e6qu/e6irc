@@ -1338,8 +1338,11 @@ Maintainer decisions implemented from the last sweep (DESIGN §8, §11, §18):
 - **Read markers stored under a nick follow the identity key (0094):** a
   grouped nick's to its account, an unregistered nick's to `~nick`, the newer
   of two kept.
-- **The MOTD is at most 14 lines**, what half the smallest SendQ holds at the
-  longest line; 0094 kept the first 14 of a longer stored MOTD.
+- **The MOTD is bounded in bytes as sent** (`MAX_MOTD_BYTES`, half the
+  smallest SendQ, counted at the longest server name and nickname) as well as
+  per line. Migration clamps of stored values (0091's `buffer_cap`, 0094's
+  MOTD) are revisions of their own with a `CONFIG` audit entry carrying the
+  previous value in full.
 - **`E6IRC_PUBLIC_URL` may be unset**, like a database-backed file's omitted
   `[http].public_url`: the stored value applies, and a first start with none
   stored refuses naming `http.public_url`.

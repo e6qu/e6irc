@@ -307,7 +307,9 @@ Read these before deploying a release that includes the change named.
 - **A server network's `buffer_cap` is at most 5,000 (migration 0091).** That
   is what the stored backlog keeps, and a start now restores a network's whole
   buffer. A stored value above it is brought to 5,000 (more never survived a
-  restart); a configuration file stating more is refused at start.
+  restart), as a new settings revision whose `CONFIG` audit entry records each
+  network's previous value; a configuration file stating more is refused at
+  start.
 - **A configuration file may leave out `server_name`, `network_name` and
   `[[listeners]]`** once the console stores them, and `E6IRC_SERVER_NAME` may be
   unset; the stored values apply. A first start with nothing stored refuses,
@@ -320,10 +322,13 @@ Read these before deploying a release that includes the change named.
 - **`motd` lines and `description` are bounded** (372 and 242 bytes: what their
   replies carry whole). A longer one is refused at start and at a console
   save instead of being cut short on the wire.
-- **The MOTD is at most 14 lines (migration 0094).** A new client is sent all
-  of it at registration; 14 lines at the longest is what half the smallest
-  SendQ holds beside the rest of that burst. A stored MOTD above it keeps its
-  first 14 lines; a configuration file stating more is refused at start.
+- **The whole MOTD is bounded in bytes (migration 0094).** A new client is
+  sent all of it at registration, so it may take at most 8,703 bytes as sent —
+  half the smallest SendQ: its lines together at most 8,318 bytes, each line
+  counting 140 more for its reply. A stored MOTD above it keeps the longest run
+  of its first lines that fits, as a new settings revision whose `CONFIG`
+  audit entry records the previous MOTD in full; a configuration file stating
+  more is refused at start.
 - **History pages in `(time, msgid)` order (migrations 0093 and 0094).** 0093
   builds its index concurrently, outside a transaction, so writers to
   `messages` are not blocked; on a large table it takes a while. A start

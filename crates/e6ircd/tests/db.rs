@@ -10187,6 +10187,30 @@ async fn a_stored_buffer_cap_above_storage_is_brought_within_it_by_0091() {
             ("small", 1000)
         ]
     );
+    // Not in silence: a revision of its own, audited with the old value.
+    assert_eq!(loaded.updated_by, "migration:0091");
+    assert_eq!(
+        migration_audit(&pool, "migration:0091").await,
+        [format!(
+            "revision {}; networks buffer_cap brought to 5000 (what storage keeps) by migration \
+             0091; previous buffer_cap by network: {{\"large\": 20000}}",
+            loaded.revision
+        )]
+    );
+}
+
+/// The `CONFIG` audit details `actor` (a migration) recorded.
+async fn migration_audit(pool: &sqlx::PgPool, actor: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT detail FROM audit_log
+         WHERE actor = $1 AND actor_kind = 'host' AND action = 'CONFIG'
+           AND target = 'server' AND target_kind = 'server'
+         ORDER BY id",
+    )
+    .bind(actor)
+    .fetch_all(pool)
+    .await
+    .expect("audit rows")
 }
 
 /// Two shards persist their own lines of one conversation, so the database
@@ -10481,7 +10505,7 @@ async fn stored_conversation_markers_are_moved_to_identities_by_0094() {
         expected
     );
     sqlx::raw_sql(include_str!(
-        "../../../migrations/0094_markers_by_identity_motd_lines_history_index.sql"
+        "../../../migrations/0094_markers_by_identity_motd_bytes_history_index.sql"
     ))
     .execute(&pool)
     .await
@@ -10495,13 +10519,16 @@ async fn stored_conversation_markers_are_moved_to_identities_by_0094() {
     );
 }
 
-/// A stored MOTD longer than the smallest SendQ holds at registration is
-/// brought to that bound by 0094, keeping its first lines, so the next start
-/// does not refuse the stored settings.
+/// A stored MOTD that takes more bytes than half the smallest SendQ as sent at
+/// registration is brought within that bound by 0094, keeping the longest run
+/// of its first lines that fits, so the next start does not refuse the stored
+/// settings — and records it: a revision of its own and a `CONFIG` audit entry
+/// carrying the previous MOTD in full. A MOTD within the bound is untouched.
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn a_stored_motd_above_the_line_bound_is_brought_within_it_by_0094() {
-    let pool = plain_pool(&support::test_db("a_stored_motd_above_the_line_bound_0094").await)
+async fn a_stored_motd_above_the_byte_bound_is_brought_within_it_by_0094() {
+    use e6ircd::config::{MAX_MOTD_BYTES, motd_reply_bytes};
+    let pool = plain_pool(&support::test_db("a_stored_motd_above_the_byte_bound_0094").await)
         .await
         .expect("connect");
     MIGRATIONS.run_to(93, &pool).await.expect("through 0093");
@@ -10510,7 +10537,9 @@ async fn a_stored_motd_above_the_line_bound_is_brought_within_it_by_0094() {
     db::load_or_initialize_managed_config(&pool, &bootstrap)
         .await
         .expect("initialize");
-    let stored: Vec<String> = (1..=40).map(|line| format!("line {line}")).collect();
+    let stored: Vec<String> = (1..=40)
+        .map(|line| format!("line {line} {}", "m".repeat(300)))
+        .collect();
     sqlx::query("UPDATE server_settings SET settings = jsonb_set(settings, '{motd}', $1)")
         .bind(sqlx::types::Json(&stored))
         .execute(&pool)
@@ -10518,10 +10547,42 @@ async fn a_stored_motd_above_the_line_bound_is_brought_within_it_by_0094() {
         .expect("store a MOTD the old bound admitted");
     MIGRATIONS.run(&pool).await.expect("migrate to latest");
     let loaded = db::load_managed_config(&pool).await.expect("loads");
-    assert_eq!(
-        loaded.settings.motd,
-        stored[..e6ircd::config::MAX_MOTD_LINES].to_vec()
+    let kept = loaded.settings.motd.len();
+    assert_eq!(loaded.settings.motd, stored[..kept].to_vec());
+    // The clamp is the Rust bound's: what it kept fits, one line more would not.
+    assert!(motd_reply_bytes(&loaded.settings.motd) <= MAX_MOTD_BYTES);
+    assert!(
+        motd_reply_bytes(&stored[..=kept]) > MAX_MOTD_BYTES,
+        "{kept}"
     );
+    assert_eq!(loaded.updated_by, "migration:0094");
+    let previous = serde_json::to_string(&stored).expect("json");
+    let detail = migration_audit(&pool, "migration:0094").await;
+    assert_eq!(detail.len(), 1, "{detail:?}");
+    assert!(
+        detail[0].starts_with(&format!(
+            "revision {}; motd cut to its first {kept} of 40 lines by migration 0094",
+            loaded.revision
+        )),
+        "{detail:?}"
+    );
+    let recorded = detail[0]
+        .split_once("previous motd: ")
+        .map(|(_, motd)| serde_json::from_str::<Vec<String>>(motd).expect("the previous motd"))
+        .expect("the previous motd is recorded");
+    assert_eq!(recorded, stored, "{previous}");
+
+    // Within the bound, the MOTD and the revision are left alone.
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0094_markers_by_identity_motd_bytes_history_index.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("the migration runs again");
+    let again = db::load_managed_config(&pool).await.expect("loads");
+    assert_eq!(again.revision, loaded.revision);
+    assert_eq!(again.settings.motd, loaded.settings.motd);
+    assert_eq!(migration_audit(&pool, "migration:0094").await.len(), 1);
 }
 
 /// A settings row saved while `limits.command_burst` was optional stores it as
