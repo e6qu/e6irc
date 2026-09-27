@@ -2851,7 +2851,9 @@ notice, the drop's diagnostic, never a relayed line) and reconnects. Like the
 `irc` driver it shares `JoinedChannels`: the next session rejoins the
 configured autojoin plus every channel the core had confirmed, with the keys
 learned for them, so a KILL no longer drops the channels joined at runtime; a
-channel the core refuses to rejoin is dropped from the intent with a notice.
+channel the core refuses to rejoin is dropped from the intent with a notice,
+and a rename no attached client asked for (services enforcing a nick) is
+announced as `renamed_by_upstream`, as the `irc` driver announces one.
 
 ### 10.3 `irc` driver — external networks (ZNC/soju-style)
 

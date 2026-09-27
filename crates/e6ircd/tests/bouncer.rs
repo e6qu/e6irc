@@ -1178,10 +1178,14 @@ async fn a_restart_restores_the_whole_configured_buffer() {
     )
     .await;
     let pool = observer_pool(&url).await;
+    // Stored an hour ago, well within history retention: a fixed date aged
+    // out of the retention window as the calendar passed it, and the test
+    // then replayed nothing.
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
          SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :restored ' || n,
-                '2026-01-01T00:00:00.000Z'
+                to_char((now() - interval '1 hour') AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(STORED)
