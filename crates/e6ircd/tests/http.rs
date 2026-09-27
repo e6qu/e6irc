@@ -10218,6 +10218,101 @@ async fn a_settings_revision_written_elsewhere_reaches_every_running_server() {
     .await;
 }
 
+/// `registration.minimum_password_length` is eight until the console changes
+/// it, and a change applies at once to the web and the REST API — the account
+/// forms render it, and an administrator's account creation is held to it —
+/// without a restart.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_password_minimum_is_a_live_console_setting() {
+    let url = support::test_db("the_password_minimum_is_a_live_console_setting").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "root password", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("root"),
+        None,
+    )
+    .await
+    .expect("session");
+    let running = start_with_database(&url, &["root"]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    let page = async |path: &str| {
+        let (status, _, page) = request(
+            http,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: t\r\n\
+                 Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        page
+    };
+    let csrf = csrf_from_html(&page("/console/configuration").await).to_string();
+    let create = async |account: &str| {
+        let body = serde_json::json!({
+            "account": account,
+            "password": "sesame",
+            "contact_email": null,
+            "administrator": false,
+        })
+        .to_string();
+        let (status, _, body) = request(
+            http,
+            &format!(
+                "POST /api/v1/admin/accounts HTTP/1.1\r\nHost: t\r\n\
+                 Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        (status, body)
+    };
+
+    let (status, body) = create("carol").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("at least 8 characters"), "{body}");
+    assert!(page("/console/accounts").await.contains("minlength=\"8\""));
+    assert!(
+        page("/console/account")
+            .await
+            .contains("data-minimum-password-length=\"8\"")
+    );
+
+    let current = configuration_of(http, &session).await;
+    let mut settings = current["settings"].clone();
+    settings["registration"]["minimum_password_length"] = serde_json::json!(1);
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"restart_required\":false"), "{body}");
+    let (status, body) = create("carol").await;
+    assert_eq!(status, 201, "{body}");
+    assert!(page("/console/accounts").await.contains("minlength=\"1\""));
+    assert_eq!(
+        e6ircd::db::verify_credentials(&pool, "carol", "sesame")
+            .await
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
+        Some(e6ircd::db::VerifiedAccount::established("carol"))
+    );
+
+    settings["registration"]["minimum_password_length"] = serde_json::json!(0);
+    let current = configuration_of(http, &session).await;
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("minimum_password_length"), "{body}");
+}
+
 /// A save that moves the attach listener and then finds its revision stale
 /// leaves the listener where the stored revision it reloaded says, at once. It
 /// used to put the listener back where the stale revision had it, and only the

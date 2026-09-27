@@ -1331,6 +1331,9 @@ pub(crate) struct CoreDirectories {
     pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
     /// The issued credentials live sessions signed in with.
     pub(crate) signed_in_credentials: SignedInCredentials,
+    /// The rule for a password being set, shared with the web and the REST
+    /// API.
+    pub(crate) password_policy: crate::identity::PasswordPolicy,
 }
 
 /// A session's login: the account, and the credential that signed it in.
@@ -4738,6 +4741,9 @@ pub(crate) struct ServerState {
     /// How old a connection must be before its QUIT comment is shown, shared
     /// with every shard.
     pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
+    /// The rule `REGISTER` and NickServ `REGISTER` hold a new password to,
+    /// shared with every shard, the web and the REST API.
+    pub(crate) password_policy: crate::identity::PasswordPolicy,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
@@ -5854,6 +5860,7 @@ impl ServerState {
             flood_exemptions: directories.flood_exemptions,
             history_retention: directories.history_retention,
             anti_spam_exit_message_time: directories.anti_spam_exit_message_time,
+            password_policy: directories.password_policy,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,

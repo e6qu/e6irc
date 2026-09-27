@@ -610,9 +610,10 @@ pub(super) async fn change_password(
         .current_password
         .as_deref()
         .and_then(presented_password_error)
-        .or_else(|| new_password_error(&req.new_password))
+        .map(str::to_owned)
+        .or_else(|| new_password_error(&state.core_tx.password_policy(), &req.new_password))
     {
-        return problem(StatusCode::BAD_REQUEST, "Invalid password", Some(detail));
+        return problem(StatusCode::BAD_REQUEST, "Invalid password", Some(&detail));
     }
     let result = match req.current_password {
         Some(current) => {

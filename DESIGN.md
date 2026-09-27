@@ -288,11 +288,14 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asynchronous answer — held (`emit_deferred_labeled`) or not
     (`emit_labeled_unheld`) — is gathered with what the command answered on the
     spot into the one labeled response.
-  - `NewPassword` — a password an account may be given (8 characters to 512 bytes) is parsed
-    once; account creation takes only this type, and the REST/web validators
-    call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
-    cannot store a password another surface refuses to verify (an empty one
-    was storable through `REGISTER` and could then never be logged in to).
+  - `NewPassword` — a password an account may be given (the configured
+    minimum, 8 characters unless stated, to 512 bytes) is parsed once, by the
+    one `PasswordPolicy` every surface shares; account creation takes only
+    this type, and the REST/web validators call the same parser, so IRC
+    `REGISTER`, NickServ `REGISTER` and the web cannot store a password
+    another surface refuses to verify (an empty one was storable through
+    `REGISTER` and could then never be logged in to), nor hold one to a
+    different minimum.
   - `MemberModes::sigils` — the one renderer of a member's rank sigils,
     honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
     copy that ignored the capability.
@@ -2135,10 +2138,17 @@ the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge — including the password rule
-(`NewPassword`: at least 8 characters, the NIST SP 800-63B floor, and at most
-512 bytes, which the web forms and REST API apply too, NickServ `REGISTER` and a
-password change included; a password set before the floor still verifies):
-`REGISTER`
+(`NewPassword`: at least `registration.minimum_password_length` characters and
+at most 512 bytes, which the web forms and REST API apply too, NickServ
+`REGISTER` and a password change included; a password set before the floor
+still verifies). The minimum is console-owned: 8 unless stated, the NIST SP
+800-63B floor; at least 1, since the empty password no login surface accepts;
+at most 128, a quarter of the 512-byte bound, so a password that meets it fits
+in every script, a character being at most four UTF-8 bytes. Every surface
+reads it from one `PasswordPolicy` cell, which a console save or another
+writer's revision sets live (`CoreIngress::adopt_live_settings`), and the web
+forms render it as their `minlength`. irctest runs e6ircd at 1, as the services
+it drives elsewhere accept its short passwords. `REGISTER`
 refuses a shorter password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
 one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
 account after with `NEED_NICK`; the capability's advertised value states
@@ -5189,9 +5199,10 @@ Layers, bottom to top:
   trigger notifying `e6irc_server_settings_changed`, as 0077 does for
   credentials) and every running server adopts a later revision it hears
   (`settings_watch`): the snapshot the console and the maintenance loops read
-  is replaced, the core takes the settings it follows live (history retention
-  and `limits.anti_spam_exit_message_time_seconds`, through the one
-  `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
+  is replaced, the core takes the settings it follows live (history retention,
+  `limits.anti_spam_exit_message_time_seconds` and
+  `registration.minimum_password_length`, which the web shares, through the
+  one `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
   what it says — exactly what a console save in that process applies, and
   nothing restart-only. A
   save that still finds its revision stale reloads the stored row before it

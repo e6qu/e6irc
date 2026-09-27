@@ -3194,7 +3194,9 @@ fn nickserv_register_creates_account() {
             conn: alice,
             name: "alice".into(),
             contact_email: None,
-            password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("hunter22")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -3235,7 +3237,8 @@ fn account_registration_persists_only_valid_normalized_contact_email() {
                 e6ircd::identity::ContactEmail::parse("Alice+IRC@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("correct-horse-battery")
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("correct-horse-battery")
                 .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::RegisterCommand,
         }]
@@ -3298,7 +3301,9 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
                 e6ircd::identity::ContactEmail::parse("Alice@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("hunter22")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -9564,7 +9569,9 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
                 conn: alice,
                 name: "alice".into(),
                 contact_email: None,
-                password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
+                password: e6ircd::identity::PasswordPolicy::default()
+                    .new_password("hunter22")
+                    .expect("valid password"),
                 origin: e6ircd::core::AccountOrigin::RegisterCommand,
             }],
             "REGISTER {arg} must register the caller's own nick"

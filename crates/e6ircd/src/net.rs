@@ -912,6 +912,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // Followed live from here on (`CoreIngress::adopt_live_settings`).
     core_tx
         .set_anti_spam_exit_message_time_seconds(config.limits.anti_spam_exit_message_time_seconds);
+    core_tx
+        .password_policy()
+        .set_minimum_chars(config.registration.minimum_password_length);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,

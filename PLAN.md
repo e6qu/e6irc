@@ -1468,8 +1468,10 @@ Maintainer decisions implemented from the same review:
   it in flight is refused. Before, they stayed open for as long as they lived.
 - **The design's SASL OAUTHBEARER row described OIDC JWT validation** the
   server does not do; it names the personal access token it verifies.
-- **New passwords are at least 8 characters** (NIST SP 800-63B); existing
-  passwords still verify.
+- **New passwords are at least 8 characters** (NIST SP 800-63B) unless the
+  console-owned `registration.minimum_password_length` (1–128, applied live)
+  says otherwise; existing passwords still verify. irctest runs at 1, so its
+  services suite's short passwords register unmodified.
 - **Device authorization speaks RFC 8628 as written**: form bodies with a
   bound `client_id`, per-code polling pace with `slow_down`, and RFC 6749
   error and token responses; `e6irc login` speaks it.

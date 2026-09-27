@@ -289,16 +289,28 @@ impl CoreIngress {
     }
 
     /// Apply what of a stored settings revision the core follows live: the
-    /// history retention and the QUIT-comment delay. The one way a revision
-    /// reaches the running core, whether a console save here or another
-    /// writer's revision adopted here, so no path can apply one without the
-    /// other ([`crate::config::ManagedConfig::requires_restart_to_reach`]
-    /// names the same settings).
+    /// history retention, the QUIT-comment delay and the password minimum. The
+    /// one way a revision reaches the running core, whether a console save
+    /// here or another writer's revision adopted here, so no path can apply one
+    /// without the others
+    /// ([`crate::config::ManagedConfig::requires_restart_to_reach`] names the
+    /// same settings).
     pub(crate) fn adopt_live_settings(&self, settings: &crate::config::ManagedConfig) {
         self.set_history_retention_days(settings.storage.history_retention_days);
         self.set_anti_spam_exit_message_time_seconds(
             settings.limits.anti_spam_exit_message_time_seconds,
         );
+        self.directories
+            .password_policy
+            .set_minimum_chars(settings.registration.minimum_password_length);
+    }
+
+    /// The rule for a password being set, which the core holds `REGISTER`
+    /// and NickServ `REGISTER` to and the web and the REST API read too: one
+    /// cell, so a change of `registration.minimum_password_length` reaches
+    /// every surface at once.
+    pub(crate) fn password_policy(&self) -> crate::identity::PasswordPolicy {
+        self.directories.password_policy.clone()
     }
 
     /// Every app password and personal access token a live IRC session, on
@@ -5831,6 +5843,51 @@ mod ingress_tests {
         });
         shards.settle();
         shards.drain(conn);
+    }
+
+    /// `registration.minimum_password_length` is eight until it is set, and a
+    /// change of it applies to the next `REGISTER` and NickServ `REGISTER` on
+    /// every shard, without a restart: at one, irctest's "sesame" is a
+    /// password an account may be given.
+    #[test]
+    fn the_password_minimum_is_followed_live_on_every_shard() {
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+            shards.client(conn, nick, "draft/account-registration");
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        shards.line(1, "REGISTER * * sesame");
+        assert!(
+            shards
+                .drain(1)
+                .iter()
+                .any(|line| line.contains("FAIL REGISTER WEAK_PASSWORD")
+                    && line.contains("at least 8 characters")),
+            "eight characters unless configured"
+        );
+
+        let mut settings =
+            crate::config::ManagedConfig::from_config(&crate::config::Config::default(), None)
+                .expect("managed");
+        settings.registration.minimum_password_length = 1;
+        shards.ingress.adopt_live_settings(&settings);
+        for (conn, command) in [
+            (2, "REGISTER * * sesame"),
+            (3, "PRIVMSG NickServ :REGISTER sesame"),
+        ] {
+            shards.line(conn, command);
+            let shard = shards.shard_of(conn);
+            let password = shards.database_request(shard, |request| match request {
+                super::DbRequest::CreateAccount { password, .. } => Some(password),
+                _ => None,
+            });
+            assert_eq!(&*password, "sesame", "{command}");
+        }
+        assert_eq!(
+            shards.ingress.password_policy().minimum_chars(),
+            1,
+            "the web and the REST API read the same cell"
+        );
     }
 
     /// A revoked app password's sessions end on every shard, whichever shard
