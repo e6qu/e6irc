@@ -117,7 +117,11 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
             &attach_handle,
             Default::default(),
             "attacher",
-            "attacher",
+            e6ircd::bouncer::Greeting {
+                server_name: "bnc.test",
+                network: "net",
+                requested_nick: "attacher",
+            },
             e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await;
@@ -210,7 +214,11 @@ async fn two_clients_attach_to_one_always_on_network() {
                 &h,
                 Default::default(),
                 "attacher",
-                "attacher",
+                e6ircd::bouncer::Greeting {
+                    server_name: "bnc.test",
+                    network: "net",
+                    requested_nick: "attacher",
+                },
                 e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
             )
             .await;
@@ -276,7 +284,11 @@ async fn lagged_attach_is_not_left_open_with_stale_session_state() {
             &attach_handle,
             Default::default(),
             "attacher",
-            "attacher",
+            e6ircd::bouncer::Greeting {
+                server_name: "bnc.test",
+                network: "net",
+                requested_nick: "attacher",
+            },
             e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await
@@ -331,7 +343,11 @@ fn attach_client(
             &attach_handle,
             caps,
             "attacher",
-            "attacher",
+            e6ircd::bouncer::Greeting {
+                server_name: "bnc.test",
+                network: "net",
+                requested_nick: "attacher",
+            },
             e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await;
@@ -496,7 +512,7 @@ async fn attached_client_quit_ends_the_attachment_and_never_reaches_the_driver()
     let (handle, mut ends) = NetworkHandle::channels(8);
     let handle = std::sync::Arc::new(handle);
     let (mut reader, mut writer, task) = attach_client(&handle, Default::default());
-    read_until(&mut reader, "upstream disconnected").await;
+    read_until(&mut reader, "upstream connecting").await;
 
     writer.write_all(b"QUIT :leaving\r\n").await.unwrap();
     tokio::time::timeout(deadline::HANG, task)
@@ -534,7 +550,7 @@ async fn attached_client_ping_is_answered_locally_and_pong_is_consumed() {
     let (handle, mut ends) = NetworkHandle::channels(8);
     let handle = std::sync::Arc::new(handle);
     let (mut reader, mut writer, _task) = attach_client(&handle, Default::default());
-    read_until(&mut reader, "upstream disconnected").await;
+    read_until(&mut reader, "upstream connecting").await;
 
     writer
         .write_all(b"PING :lag 1234\r\nPONG :unsolicited\r\nPRIVMSG #room :marker\r\n")
@@ -567,7 +583,11 @@ async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays(
                 &handle,
                 Default::default(),
                 "attacher",
-                "attacher",
+                e6ircd::bouncer::Greeting {
+                    server_name: "bnc.test",
+                    network: "net",
+                    requested_nick: "attacher",
+                },
                 interval,
             )
             .await
@@ -582,7 +602,7 @@ async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays(
     let (mut live_reader, mut live_writer, live) = attach_with_liveness(&handle);
     let answering = tokio::spawn(async move {
         loop {
-            let ping = read_until(&mut live_reader, "PING").await;
+            let ping = read_until(&mut live_reader, ":*bnc* PING").await;
             let token = ping.trim_end().rsplit(':').next().unwrap_or_default();
             if live_writer
                 .write_all(format!("PONG :{token}\r\n").as_bytes())
@@ -594,7 +614,7 @@ async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays(
         }
     });
 
-    let ping = read_until(&mut silent_reader, "PING").await;
+    let ping = read_until(&mut silent_reader, ":*bnc* PING").await;
     assert!(ping.starts_with(":*bnc* PING "), "{ping}");
     let end = tokio::time::timeout(deadline::HANG, silent)
         .await

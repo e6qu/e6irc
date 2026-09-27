@@ -415,17 +415,6 @@ pub async fn verify_attached_client(
     })
     .await
     .expect("the bridge never began its session");
-    let (nick, burst) = super::serve::welcome("e6irc.test", "team", &handle, "alice".into());
-    assert_eq!(
-        nick, BOT_NAME,
-        "welcomed under the requested nick, not the account's"
-    );
-    assert!(
-        burst[0].starts_with(&format!(":e6irc.test 001 {BOT_NAME} :")),
-        "{}",
-        burst[0]
-    );
-
     let (client, server) = tokio::io::duplex(64 * 1024);
     let attached = tokio::spawn(async move {
         let end = super::attach(
@@ -437,7 +426,11 @@ pub async fn verify_attached_client(
                 ..super::AttachCaps::default()
             },
             "alice",
-            &nick,
+            super::Greeting {
+                server_name: "e6irc.test",
+                network: "team",
+                requested_nick: "alice",
+            },
             super::ATTACH_LIVENESS_INTERVAL,
         )
         .await;
@@ -466,6 +459,15 @@ pub async fn verify_attached_client(
         .expect("attach went silent")
     };
 
+    let welcome = next().await;
+    assert!(
+        welcome.starts_with(&format!(":e6irc.test 001 {BOT_NAME} :")),
+        "welcomed under the account's nick, not the one requested: {welcome}"
+    );
+    while !next()
+        .await
+        .starts_with(&format!(":e6irc.test 422 {BOT_NAME} "))
+    {}
     let own = format!("{BOT_NAME}!~bnc@e6irc");
     assert_eq!(next().await, format!(":{own} JOIN #general"));
     assert_eq!(

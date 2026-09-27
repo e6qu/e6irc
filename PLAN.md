@@ -1387,6 +1387,39 @@ before:
 - WHOIS 312 carried the network name where Solanum puts the server's
   description; MODE's help left out `+R`; `MAXLIST`'s comment said per list.
 
+A review of the bouncer's drivers, registry and attach path found, and this
+change fixes, each with a test that failed before (DESIGN §10):
+
+- **The local driver relayed the core's `ERROR :Closing Link`** (a KILL, a
+  GHOST or REGAIN, a K- or D-line) to every attached client and into the
+  backlog. Both drivers now read every line through one control-line function
+  (`PING`, `CAP`, keepalive `PONG`, `ERROR`); `ERROR` is a notice and the
+  drop's diagnostic. The local driver also rejoins the channels joined at
+  runtime after such a drop, sharing the `irc` driver's `JoinedChannels`.
+- **Attach reconciliation flooded the upstream and the shared queue**: two
+  questions per channel whose JOIN had aged out. Every line the `irc` driver
+  writes is now paced (5 at once, then 2 a second, Solanum's allowance); the
+  session follows each channel's topic and members, so an attach and a
+  browser's `NAMES` are answered from them, and at most two channels' lists
+  are asked for per attach; a full command queue is told live, never retained.
+- **Replay misattributed**: it started at the current nick. The ring keeps the
+  session state at its oldest entry, and an attach is reconciled to it before
+  the replay and to the current state after (maintainer decision); the attach
+  layer's numerics follow the client's current nick.
+- **A client attached before the registration burst never learned the
+  network's ISUPPORT**: the welcome is built from the attach snapshot, and the
+  burst's end is told to each attachment as a `005` of what changed.
+- **Shutdown raced an in-flight replace**, which then started a driver into
+  the emptied registry; shutdown now takes the mutation lane and closes the
+  registry. Drivers are prepared, then launched after persistence subscribes.
+- **Echoes around a `CAP NEW`/`DEL echo-message` were doubled or lost**, and a
+  refused capability was re-requested on every `CAP` line.
+- **Status**: the up-front attach status says why a network is down, a new
+  failure reason within one outage is retained once, and an owned network
+  without a driver says whether it is disabled, being reconfigured, or failed
+  to start and why. The persistence task files a line under the nick it was
+  said under.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

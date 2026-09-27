@@ -828,7 +828,17 @@ async fn account_suspension_in_lane(
                 .await
             {
                 Ok(_) => started_networks += 1,
-                Err(crate::bouncer::ConfiguredNetworkHeld) => held.push(name),
+                Err(crate::bouncer::RegistryRefusal::ConfiguredNetworkHeld(_)) => held.push(name),
+                Err(crate::bouncer::RegistryRefusal::Closed(closed)) => {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "Reactivated {}, but started only {started_networks} owned \
+                             network(s): {closed}",
+                            change.name
+                        ),
+                    ));
+                }
             }
         }
         let held = if held.is_empty() {

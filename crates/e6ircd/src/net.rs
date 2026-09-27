@@ -975,12 +975,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                         // A configuration-file network may already hold this
                         // key. The operator's own entry wins; say so rather
                         // than abort the boot or run two upstream sessions.
-                        if let Err(error) = reg.add(
-                            Some(&owner),
-                            &row.name,
-                            crate::bouncer::NetworkDefinition::Stored,
-                            driver,
-                        ) {
+                        if let Err(error) = reg
+                            .start_stored(owner.clone(), row.name.clone(), driver)
+                            .await
+                        {
                             telemetry.record_error(ErrorKind::Bouncer);
                             eprintln!("bnc: skipping stored network: {error}");
                         }
@@ -991,6 +989,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                             "bnc: not starting network {owner}/{} at boot: {e}",
                             row.name
                         );
+                        // Its owner is told why when they attach, rather than
+                        // that an enabled network is disabled.
+                        reg.record_unstartable(&owner, &row.name, e);
                     }
                 }
             }
