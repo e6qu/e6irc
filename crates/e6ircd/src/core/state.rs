@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::numerics::{
-    ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL, ERR_USERNOTINCHANNEL,
-    RPL_LOGGEDIN, RPL_LOGGEDOUT,
+    ERR_BADCHANNAME, ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL,
+    ERR_USERNOTINCHANNEL, RPL_LOGGEDIN, RPL_LOGGEDOUT,
 };
 use e6irc_queue::Sender;
 
@@ -246,6 +246,45 @@ impl MembershipDirectory {
     fn channel_created_at(&self, key: &ChanKey) -> Option<e6irc_proto::time::Millis> {
         let channels = self.channels.lock().expect("membership directory poisoned");
         channels.get(key).map(|channel| channel.created_at)
+    }
+
+    /// The channel a WHO of `target` by nick shows `requester`, with
+    /// `target`'s rank sigils there — Solanum's `m_who`: the first of
+    /// `target`'s channels (here, in key order) that `requester` is in too,
+    /// or, unless `target` is invisible, that is not secret. `None` when there
+    /// is none, and WHO shows `*`.
+    pub(crate) fn who_channel(
+        &self,
+        target: ConnId,
+        requester: ConnId,
+        target_invisible: bool,
+        multi_prefix: bool,
+    ) -> Option<(String, &'static str)> {
+        let by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        let shared = by_conn.get(&requester);
+        let mut keys: Vec<&ChanKey> = by_conn.get(&target).into_iter().flatten().collect();
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        keys.into_iter().find_map(|key| {
+            let channel = channels.get(key)?;
+            let member = shared.is_some_and(|shared| shared.contains(key));
+            (member || (!target_invisible && !channel.secret)).then(|| {
+                let sigil = channel
+                    .ranks
+                    .get(&target)
+                    .map_or("", |modes| modes.sigils(multi_prefix));
+                (channel.name.clone(), sigil)
+            })
+        })
+    }
+
+    /// Whether `conn` is in any channel, on any shard.
+    fn in_any_channel(&self, conn: ConnId) -> bool {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .get(&conn)
+            .is_some_and(|channels| !channels.is_empty())
     }
 
     /// `target`'s channels as WHOIS shows them to `requester`: rank sigils (all
@@ -959,7 +998,7 @@ pub(crate) struct PublicUser {
     /// Umode +Z: the connection is TLS end to end ([`Session::secure`]).
     pub(crate) secure: bool,
     pub(crate) signon: e6irc_proto::time::Millis,
-    pub(crate) last_active: LastActive,
+    pub(crate) idle_since: IdleSince,
 }
 
 impl PublicUser {
@@ -980,7 +1019,7 @@ impl PublicUser {
             registered_only: session.registered_only,
             secure: session.secure(),
             signon: session.signon,
-            last_active: session.last_active.clone(),
+            idle_since: session.idle_since.clone(),
         }
     }
 
@@ -1043,7 +1082,7 @@ impl PublicUser {
             away: self.away.is_some(),
             oper: self.oper,
             bot: self.bot,
-            last_active: self.last_active.clone(),
+            idle_since: self.idle_since.clone(),
         }
     }
 }
@@ -1228,27 +1267,43 @@ pub(crate) struct Census {
 }
 
 /// The server-wide WHOWAS ring: a nick may be asked about from any shard.
+/// It holds at most [`WHOWAS_CAP`] records, and at most [`WHOWAS_PER_NICK`] of
+/// any one nick, so a user reconnecting under one nick over and over keeps
+/// only its newest few rather than pushing every other nick's out.
 #[derive(Clone, Default)]
 pub(crate) struct WhowasDirectory {
-    newest_first: Arc<Mutex<std::collections::VecDeque<WhowasEntry>>>,
+    newest_first: Arc<Mutex<std::collections::VecDeque<(NickKey, WhowasEntry)>>>,
 }
 
 impl WhowasDirectory {
-    fn record(&self, entry: WhowasEntry) {
+    fn record(&self, key: NickKey, entry: WhowasEntry) {
         let mut ring = self.newest_first.lock().expect("whowas directory poisoned");
-        if ring.len() == WHOWAS_CAP {
-            ring.pop_back();
+        let oldest_kept = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (held, _))| *held == key)
+            .map(|(index, _)| index)
+            .nth(WHOWAS_PER_NICK - 1);
+        match oldest_kept {
+            Some(index) => {
+                ring.remove(index);
+            }
+            None if ring.len() == WHOWAS_CAP => {
+                ring.pop_back();
+            }
+            None => {}
         }
-        ring.push_front(entry);
+        ring.push_front((key, entry));
     }
 
     /// Up to `limit` records of `key`, newest first.
-    pub(crate) fn of(&self, casemap: CaseMapping, key: &NickKey, limit: usize) -> Vec<WhowasEntry> {
+    pub(crate) fn of(&self, key: &NickKey, limit: usize) -> Vec<WhowasEntry> {
         self.newest_first
             .lock()
             .expect("whowas directory poisoned")
             .iter()
-            .filter(|entry| casemap.casefold(&entry.nick) == key.as_str())
+            .filter(|(held, _)| held == key)
+            .map(|(_, entry)| entry)
             .take(limit)
             .cloned()
             .collect()
@@ -1824,6 +1879,8 @@ pub(crate) struct Session {
     /// When this session's last KNOCK was delivered, on the monotonic clock: a
     /// user may knock once per `KNOCK_DELAY` (Solanum's `knock_delay`).
     pub last_knock: Option<e6irc_proto::time::MonoMillis>,
+    /// This session's recent nick changes, for Solanum's `anti_nick_flood`.
+    pub nick_changes: NickChangeThrottle,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
@@ -1832,6 +1889,8 @@ pub(crate) struct Session {
     /// channels and the rows of the pages not yet sent. On the session, so a
     /// LIST cannot be paced to a connection that is gone.
     pub(crate) channel_list: Option<crate::core::list::ChannelListCursor>,
+    /// This connection's bare NAMES still answering, paced like a LIST.
+    pub(crate) channel_names: Option<crate::core::list::ChannelListCursor>,
     /// This connection's WHO replies too long to queue at once, still going
     /// out as its send queue drains. On the session for the same reason.
     pub(crate) paced_who: Option<crate::core::paced::PacedReplies>,
@@ -1850,10 +1909,14 @@ pub(crate) struct Session {
     /// meter ([`crate::core::line_meter`]): what `oper` was when it was last
     /// published there.
     flood_exempt: bool,
-    /// Monotonic millisecond of the last non-keepalive command — the elapsed
-    /// idle duration since it (WHOIS idle / WHOX `l`) and the reaper's idle-ping
-    /// cadence both read it. (WHOIS *signon*, a real timestamp, is `signon`.)
-    pub last_active: LastActive,
+    /// When the user last spoke, for "seconds idle" (see [`IdleSince`]).
+    /// (WHOIS *signon*, a real timestamp, is `signon`.)
+    pub idle_since: IdleSince,
+    /// Monotonic millisecond the last line of any kind arrived — a PING or
+    /// PONG included: the reaper's liveness clock, which pings a connection
+    /// that has sent nothing for a while. Separate from [`Self::idle_since`],
+    /// which only speaking moves.
+    pub last_received: e6irc_proto::time::MonoMillis,
     pub signon: e6irc_proto::time::Millis,
     /// Monotonic millisecond the connection opened, for the registration
     /// deadline (an unregistered connection that never completes is reaped).
@@ -2384,18 +2447,53 @@ pub(crate) struct MemberIdentity {
     pub(crate) invisible: bool,
 }
 
-/// When a session last did something, on the monotonic clock: the one value
-/// behind every "seconds idle" answer.
-///
-/// It is a shared handle, not a copied timestamp, because it changes with
-/// every line a client sends. The session writes it; whoever answers about the
-/// user — this shard's WHOIS, another shard's WHO for a channel it owns — reads
-/// the same value. Copying it into each channel's member record instead meant
-/// one update per channel per line.
-#[derive(Debug, Clone)]
-pub(crate) struct LastActive(Arc<std::sync::atomic::AtomicU64>);
+/// Solanum's `anti_nick_flood`, with the `max_nick_changes` and
+/// `max_nick_time` its reference configuration (and Libera) runs: a user who
+/// has changed nick [`MAX_NICK_CHANGES`] times, each within
+/// [`MAX_NICK_TIME_MS`] of the one before, is refused the next with
+/// `ERR_NICKTOOFAST` (438) until that long passes without an attempt — a
+/// refused attempt counts too, as in `change_local_nick`. Operators are
+/// exempt. Every nick change is announced to each of the user's channel peers
+/// and its watchers, so without it one client could flood them all.
+#[derive(Debug, Default)]
+pub struct NickChangeThrottle {
+    count: u32,
+    last: Option<e6irc_proto::time::MonoMillis>,
+}
 
-impl LastActive {
+pub(crate) const MAX_NICK_CHANGES: u32 = 5;
+pub(crate) const MAX_NICK_TIME_MS: u64 = 20_000;
+
+impl NickChangeThrottle {
+    /// Count a nick change attempted at `now`; whether it is one too many.
+    pub(crate) fn too_fast(&mut self, now: e6irc_proto::time::MonoMillis) -> bool {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_sub(last).as_millis() > MAX_NICK_TIME_MS)
+        {
+            self.count = 0;
+        }
+        self.last = Some(now);
+        self.count = self.count.saturating_add(1);
+        self.count > MAX_NICK_CHANGES
+    }
+}
+
+/// When a user last spoke, on the monotonic clock: the one value behind every
+/// "seconds idle" answer (WHOIS 317, WHOX `l`, the administrators' connection
+/// list). Solanum's `localClient->last`: set at registration and by a PRIVMSG
+/// (`m_message.c` — never a NOTICE or TAGMSG, nor any other command), so idle
+/// time is time since the user last said something, not since its client last
+/// sent a line. Liveness is the other clock, [`Session::last_received`].
+///
+/// It is a shared handle, not a copied timestamp: the session writes it;
+/// whoever answers about the user — this shard's WHOIS, another shard's WHO
+/// for a channel it owns — reads the same value. Copying it into each
+/// channel's member record instead meant one update per channel per message.
+#[derive(Debug, Clone)]
+pub(crate) struct IdleSince(Arc<std::sync::atomic::AtomicU64>);
+
+impl IdleSince {
     pub(crate) fn new(at: e6irc_proto::time::MonoMillis) -> Self {
         Self(Arc::new(std::sync::atomic::AtomicU64::new(at.as_millis())))
     }
@@ -2423,12 +2521,12 @@ pub(crate) struct ChannelMemberProfile {
     pub(crate) away: bool,
     pub(crate) oper: bool,
     pub(crate) bot: bool,
-    pub(crate) last_active: LastActive,
+    pub(crate) idle_since: IdleSince,
 }
 
 impl ChannelMemberProfile {
     #[cfg(test)]
-    fn derived(identity: &MemberIdentity, last_active: e6irc_proto::time::MonoMillis) -> Self {
+    fn derived(identity: &MemberIdentity, idle_since: e6irc_proto::time::MonoMillis) -> Self {
         let (_, user_host) = identity
             .prefix
             .split_once('!')
@@ -2443,7 +2541,7 @@ impl ChannelMemberProfile {
             away: false,
             oper: false,
             bot: false,
-            last_active: LastActive::new(last_active),
+            idle_since: IdleSince::new(idle_since),
         }
     }
 }
@@ -2538,7 +2636,6 @@ pub struct ChannelJoinSuccess {
 
 #[derive(Debug, Clone)]
 pub enum ChannelJoinFailure {
-    NoSuchChannel { name: String },
     InviteOnly { name: String },
     Banned { name: String },
     BadKey { name: String },
@@ -2847,7 +2944,7 @@ pub struct ChannelListRequest {
     id: ChannelListRequestId,
     session: SessionOwner,
     shard: CoreShardId,
-    filter: Arc<crate::core::list::ListFilter>,
+    sweep: crate::core::list::ChannelSweep,
     after: Option<ChanKey>,
     limit: NonZeroUsize,
 }
@@ -2868,8 +2965,8 @@ impl ChannelListRequest {
         self.shard
     }
 
-    pub(crate) fn filter(&self) -> &crate::core::list::ListFilter {
-        &self.filter
+    pub(crate) fn sweep(&self) -> &crate::core::list::ChannelSweep {
+        &self.sweep
     }
 
     pub(crate) fn after(&self) -> Option<&ChanKey> {
@@ -2886,8 +2983,17 @@ impl ChannelListRequest {
 pub struct ChannelListRow {
     pub(crate) key: ChanKey,
     pub(crate) name: String,
-    pub(crate) members: usize,
-    pub(crate) topic: String,
+    pub(crate) body: ChannelRowBody,
+}
+
+/// What a sweep shows of one channel.
+#[derive(Debug, Clone)]
+pub enum ChannelRowBody {
+    /// A LIST row: the member count and the topic.
+    List { members: usize, topic: String },
+    /// A NAMES row: whether the channel is secret (its 353 symbol), and the
+    /// members the requester may see, each as it reads a name.
+    Names { secret: bool, names: Vec<String> },
 }
 
 /// One page of a LIST, from the shard it was asked of.
@@ -2909,26 +3015,43 @@ pub struct ChannelModeChange {
     pub(crate) arguments: Vec<String>,
 }
 
+/// Who an INVITE names, as the sender's shard found them: where they are, and
+/// the nick and away message they had there — so the channel's owner names
+/// the invitee by their own nick, not the spelling the inviter typed (Solanum's
+/// `target_p->name`), and the inviter hears the away message after 341.
 #[derive(Debug, Clone)]
 pub struct ChannelInvitee {
-    owner: SessionOwner,
-    requested_nick: String,
+    target: InviteeTarget,
+    nick: String,
+    away: Option<String>,
+}
+
+/// Where an invitee is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InviteeTarget {
+    /// A user's session, on whichever shard it lives.
+    Session(SessionOwner),
+    /// A services pseudo-client, which joins no channel: the invitation is
+    /// answered as Solanum answers one to a service, and goes no further.
+    Service,
 }
 
 impl ChannelInvitee {
-    pub(crate) fn new(owner: SessionOwner, requested_nick: String) -> Self {
-        Self {
-            owner,
-            requested_nick,
-        }
+    pub(crate) fn new(target: InviteeTarget, nick: String, away: Option<String>) -> Self {
+        Self { target, nick, away }
     }
 
-    pub(crate) fn owner(&self) -> SessionOwner {
-        self.owner
+    pub(crate) fn target(&self) -> InviteeTarget {
+        self.target
     }
 
-    pub(crate) fn requested_nick(&self) -> &str {
-        &self.requested_nick
+    /// The invitee's own nick, however the inviter spelled it.
+    pub(crate) fn nick(&self) -> &str {
+        &self.nick
+    }
+
+    pub(crate) fn away(&self) -> Option<&str> {
+        self.away.as_deref()
     }
 }
 
@@ -3040,12 +3163,28 @@ pub enum ChannelKnockResult {
 
 #[derive(Debug)]
 pub enum ChannelInviteResult {
-    Invited { invitee: String, channel: String },
-    NoSuchChannel { target: String },
-    Hidden { target: String, proof: Hidden },
-    NotOnChannel { target: String },
-    NotOperator { target: String },
-    UserOnChannel { invitee: String, channel: String },
+    Invited {
+        invitee: String,
+        away: Option<String>,
+        channel: String,
+    },
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+        proof: Hidden,
+    },
+    NotOnChannel {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    UserOnChannel {
+        invitee: String,
+        channel: String,
+    },
 }
 
 /// The member status a ChanServ OP, DEOP, VOICE or DEVOICE changes.
@@ -4143,11 +4282,11 @@ impl Channel {
         recipient: Recipient,
         identity: MemberIdentity,
         modes: MemberModes,
-        last_active: e6irc_proto::time::MonoMillis,
+        idle_since: e6irc_proto::time::MonoMillis,
     ) {
         self.add_member_with_profile(
             recipient,
-            ChannelMemberProfile::derived(&identity, last_active),
+            ChannelMemberProfile::derived(&identity, idle_since),
             identity,
             modes,
         );
@@ -4608,7 +4747,8 @@ pub(crate) struct ServerState {
     channel_list_id: u64,
     /// The connections with a LIST or WHO reply being paced out: which
     /// sessions the pacing turn visits. The paced output itself lives on the
-    /// session ([`Session::channel_list`], [`Session::paced_who`]), so it
+    /// session ([`Session::channel_list`], [`Session::channel_names`],
+    /// [`Session::paced_who`]), so it
     /// cannot outlive the connection it answers.
     pub(crate) pacing: HashSet<ConnId>,
 }
@@ -4702,6 +4842,11 @@ pub(crate) struct WhowasEntry {
 
 pub(crate) const WHOWAS_CAP: usize = 1000;
 
+/// The most WHOWAS records one nick keeps. Solanum bounds only the whole
+/// history (`whowas_length`), so one nick's reconnects could fill it; twenty
+/// is as many as Solanum answers a remote WHOWAS with (`m_whowas`).
+pub(crate) const WHOWAS_PER_NICK: usize = 20;
+
 impl ServerState {
     pub fn local_recipient(&self, conn: ConnId) -> Recipient {
         Recipient::new(
@@ -4730,7 +4875,7 @@ impl ServerState {
             away: session.away.is_some(),
             oper: session.oper.is_some(),
             bot: session.bot,
-            last_active: session.last_active.clone(),
+            idle_since: session.idle_since.clone(),
         }
     }
 
@@ -4773,7 +4918,7 @@ impl ServerState {
         &mut self,
         owner: ChannelOwner,
         actor: ChannelActor,
-        name: String,
+        name: crate::sanitize::ChannelName,
         join_key: Option<String>,
         label: Option<String>,
     ) {
@@ -4890,11 +5035,11 @@ impl ServerState {
     /// Begin `conn`'s LIST, whose reply is already open (inside `batch` when
     /// labeled): a cursor at the start of every channel shard. The connection
     /// has no LIST in progress.
-    pub fn start_channel_list(
+    pub(crate) fn start_channel_list(
         &mut self,
         conn: ConnId,
         batch: Option<String>,
-        filter: crate::core::list::ListFilter,
+        sweep: crate::core::list::ChannelSweep,
     ) {
         let id = ChannelListRequestId(self.channel_list_id);
         self.channel_list_id = self
@@ -4906,12 +5051,17 @@ impl ServerState {
             .sessions
             .output_mut(&conn)
             .expect("a LIST is started by the session sending it");
-        let previous = session
-            .channel_list
-            .replace(crate::core::list::ChannelListCursor::new(
-                id, filter, batch, shards,
-            ));
-        assert!(previous.is_none(), "a connection has one LIST in progress");
+        let slot = match sweep {
+            crate::core::list::ChannelSweep::List(_) => &mut session.channel_list,
+            crate::core::list::ChannelSweep::Names { .. } => &mut session.channel_names,
+        };
+        let previous = slot.replace(crate::core::list::ChannelListCursor::new(
+            id, sweep, batch, shards,
+        ));
+        assert!(
+            previous.is_none(),
+            "a connection has one LIST and one NAMES in progress"
+        );
     }
 
     /// Ask channel shard `shard` for the next page of `conn`'s LIST: at most
@@ -4928,7 +5078,7 @@ impl ServerState {
             id: cursor.id,
             session: SessionOwner::new(conn, self.shard),
             shard: CoreShardId::new(shard),
-            filter: Arc::clone(&cursor.filter),
+            sweep: cursor.sweep.clone(),
             after,
             limit,
         };
@@ -4957,10 +5107,9 @@ impl ServerState {
         let Some(session) = self.sessions.output_mut(&result.session.conn()) else {
             return false;
         };
-        let Some(cursor) = session
-            .channel_list
-            .as_mut()
-            .filter(|cursor| cursor.id == result.id)
+        let Some(cursor) = [&mut session.channel_list, &mut session.channel_names]
+            .into_iter()
+            .find_map(|slot| slot.as_mut().filter(|cursor| cursor.id == result.id))
         else {
             return false;
         };
@@ -5701,7 +5850,7 @@ impl ServerState {
             realname: realname.to_string(),
             signoff: (self.config.clock)(),
         };
-        self.whowas.record(entry);
+        self.whowas.record(self.nick_key(nick), entry);
     }
 
     /// Add this event's change in this shard's connections and channels to
@@ -6341,6 +6490,23 @@ impl ServerState {
     }
 
     /// `target`'s channels as WHOIS shows them to `requester`.
+    /// See [`MembershipDirectory::who_channel`].
+    pub(crate) fn who_channel(
+        &self,
+        target: ConnId,
+        requester: ConnId,
+        target_invisible: bool,
+        multi_prefix: bool,
+    ) -> Option<(String, &'static str)> {
+        self.memberships
+            .who_channel(target, requester, target_invisible, multi_prefix)
+    }
+
+    /// Whether `conn` is in any channel, whichever shard owns it.
+    pub(crate) fn in_any_channel(&self, conn: ConnId) -> bool {
+        self.memberships.in_any_channel(conn)
+    }
+
     pub(crate) fn whois_channels(&self, target: ConnId, requester: ConnId) -> Vec<String> {
         let multi_prefix = self
             .sessions
@@ -6523,9 +6689,11 @@ impl ServerState {
                 pending_joins: HashMap::new(),
                 part_on_join: HashMap::new(),
                 last_knock: None,
+                nick_changes: NickChangeThrottle::default(),
                 monitoring: HashMap::new(),
                 multiline: None,
                 channel_list: None,
+                channel_names: None,
                 paced_who: None,
                 label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
@@ -6535,10 +6703,12 @@ impl ServerState {
                 // from a real early reading (the mono epoch IS process start), so
                 // the first `now - 0 = uptime` read would misbehave in the first
                 // moments of uptime — the class that flood-killed fresh clients a
-                // sweep ago. Both are re-stamped before they gate anything
-                // (`last_active` at registration, `last_ping_sent` when a PING is
-                // actually sent), so open-time is a correct, sentinel-free floor.
-                last_active: LastActive::new(opened_at),
+                // sweep ago. Each is re-stamped before it gates anything
+                // (`idle_since` at registration, `last_received` by every line,
+                // `last_ping_sent` when a PING is actually sent), so open-time
+                // is a correct, sentinel-free floor.
+                idle_since: IdleSince::new(opened_at),
+                last_received: opened_at,
                 signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,
                 awaiting_pong: false,
@@ -7057,6 +7227,17 @@ impl ServerState {
         );
     }
 
+    /// `ERR_BADCHANNAME (<chan>) :Illegal channel name` — a `#` name the
+    /// server will not create ([`crate::sanitize::ChannelName`]).
+    pub(crate) fn err_badchanname(&mut self, conn: ConnId, chan: &str) {
+        self.numeric(
+            conn,
+            ERR_BADCHANNAME,
+            &[Middle::echo(chan)],
+            Some("Illegal channel name"),
+        );
+    }
+
     /// `ERR_NOTONCHANNEL (<chan>) :You're not on that channel`.
     pub(crate) fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
         self.numeric(
@@ -7108,16 +7289,31 @@ impl ServerState {
         items: &[String],
         sep: char,
     ) {
+        for line in self.numeric_list_lines(conn, code, middle, items, sep) {
+            self.send(conn, &line);
+        }
+    }
+
+    /// The lines [`Self::numeric_list`] sends, formatted rather than sent —
+    /// for a reply paced out later.
+    pub(crate) fn numeric_list_lines(
+        &self,
+        conn: ConnId,
+        code: u16,
+        middle: &[Middle<'_>],
+        items: &[String],
+        sep: char,
+    ) -> Vec<String> {
         let budget = e6irc_proto::message::MAX_LINE_LEN
             .saturating_sub(
                 self.numeric_head_len(conn, code, middle) + 2, /* CRLF */
             )
             .max(1);
-
+        let mut lines = Vec::new();
         let mut line = String::new();
         for item in items {
             if !line.is_empty() && line.len() + 1 + item.len() > budget {
-                self.numeric(conn, code, middle, Some(&line));
+                lines.push(self.numeric_line(conn, code, middle, Some(&line)));
                 line.clear();
             }
             if !line.is_empty() {
@@ -7126,8 +7322,9 @@ impl ServerState {
             line.push_str(item);
         }
         if !line.is_empty() {
-            self.numeric(conn, code, middle, Some(&line));
+            lines.push(self.numeric_line(conn, code, middle, Some(&line)));
         }
+        lines
     }
 
     /// Stamp a new event: a single clock read yielding both the wall-clock
@@ -7272,24 +7469,19 @@ impl ServerState {
     /// task then drains its queue — flushing this ERROR — before shutting the
     /// socket down.
     pub fn broadcast_shutdown(&mut self, reason: &str) {
-        let line = format!(
-            "ERROR :Closing Link: {} ({reason})",
-            self.config.server_name
-        );
-        let bytes = Bytes::from(format!("{line}\r\n"));
         // The sessions stay until this worker stops — it still serves the
         // other shards while they drain — but for their clients this is the
         // last line (see `SessionOutput`).
         for session in self.sessions.closing_sessions_mut() {
+            let line = crate::sanitize::closing_link(&session.host, reason);
+            let bytes = Bytes::from(format!("{line}\r\n"));
             session.deferred_replies = 0;
             for held in std::mem::take(&mut session.held) {
                 // A queue too full for it is a connection already lost, as for
                 // the goodbye itself.
                 drop(session.output.write(WireLine::sanitized(held)));
             }
-            session
-                .output
-                .write_goodbye(WireLine::sanitized(bytes.clone()));
+            session.output.write_goodbye(WireLine::sanitized(bytes));
         }
     }
 
@@ -7298,7 +7490,12 @@ impl ServerState {
     /// and for the channel modes ChanServ sets (a mode lock, OP/VOICE, access
     /// on join), so a client sees one ChanServ however it acted.
     pub(crate) fn service_prefix(&self, service: &str) -> String {
-        format!("{service}!{service}@services.{}", self.config.server_name)
+        format!("{service}!{service}@{}", self.services_host())
+    }
+
+    /// The host every services pseudo-client shows, `services.<server>`.
+    pub(crate) fn services_host(&self) -> String {
+        format!("services.{}", self.config.server_name)
     }
 
     /// A notice from a services pseudo-client (NickServ, ChanServ).
@@ -7329,19 +7526,26 @@ impl ServerState {
         {
             return false;
         }
-        let host = session.host.clone();
         self.numeric(
             conn,
             e6irc_proto::numerics::ERR_YOUREBANNEDCREEP,
             &[],
             Some("You need to identify via SASL to use this server"),
         );
-        self.send(
-            conn,
-            &format!("ERROR :Closing Link: {host} (SASL access only)"),
-        );
-        self.close(conn, "SASL access only");
+        self.close_with_error(conn, "SASL access only");
         true
+    }
+
+    /// Close `conn` for `reason`, after telling it why with the one closing
+    /// line every disconnection sends ([`crate::sanitize::closing_link`]).
+    pub(crate) fn close_with_error(&mut self, conn: ConnId, reason: &str) {
+        let host = self
+            .sessions
+            .get(&conn)
+            .map(|session| session.host.clone())
+            .unwrap_or_default();
+        self.send(conn, &crate::sanitize::closing_link(&host, reason));
+        self.close(conn, reason);
     }
 
     /// Tell `conn`'s reader whether its lines are metered: an IRC operator's
@@ -7366,7 +7570,10 @@ impl ServerState {
     pub(crate) fn close_for_sendq(&mut self, conn: ConnId) {
         const REASON: &str = "SendQ exceeded";
         if let Some(session) = self.sessions.output_mut(&conn) {
-            let goodbye = format!("ERROR :Closing Link: {} ({REASON})\r\n", session.host);
+            let goodbye = format!(
+                "{}\r\n",
+                crate::sanitize::closing_link(&session.host, REASON)
+            );
             session
                 .output
                 .discard_backlog_for_goodbye(WireLine::sanitized(Bytes::from(goodbye)));

@@ -587,7 +587,7 @@ async fn open(shared: &Shared, rooms: Rooms) -> Result<Session, super::ConnectFa
             continue;
         }
         let channel = alias_to_channel(alias);
-        if !crate::sanitize::valid_channel_name(&channel) {
+        if crate::sanitize::ChannelName::parse(&channel).is_err() {
             return Err(unmappable(format!(
                 "room alias {alias} maps to an unsafe IRC channel name"
             )));

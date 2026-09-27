@@ -661,7 +661,7 @@ pub enum Input {
     ChannelJoin {
         owner: ChannelOwner,
         actor: ChannelActor,
-        name: String,
+        name: crate::sanitize::ChannelName,
         join_key: Option<String>,
         label: Option<String>,
     },
@@ -4838,7 +4838,7 @@ mod ingress_tests {
     }
 
     /// Idle time is the session's own clock, read where it is asked about. A
-    /// line must not cost one member update per channel the sender is in.
+    /// message must not cost one member update per channel the sender is in.
     #[test]
     fn activity_is_not_fanned_out_to_every_channel_and_a_remote_who_still_sees_idle() {
         let mut shards = Shards::new();
@@ -4850,7 +4850,7 @@ mod ingress_tests {
         Shards::advance_clock(60);
         shards.cores[0].handle(Input::Line {
             conn: ConnId(2),
-            line: b"VERSION".to_vec(),
+            line: b"PRIVMSG alice :a note to self".to_vec(),
         });
         assert!(
             shards.cores[0].take_effects().is_empty(),
@@ -4862,7 +4862,7 @@ mod ingress_tests {
         let out = shards.drain(1);
         assert!(
             out.iter().any(|line| line.ends_with(" alice 30")),
-            "the channel's owner must report alice idle since her last line: {out:#?}"
+            "the channel's owner must report alice idle since her last message: {out:#?}"
         );
     }
 
@@ -4945,6 +4945,59 @@ mod ingress_tests {
                 "connection {conn} sees only its own half: {out:#?}"
             );
         }
+    }
+
+    /// A bare NAMES lists the channels every shard owns — the answer does not
+    /// depend on which shard owns a channel or holds the requester — and then
+    /// the users in no channel, wherever their sessions live.
+    #[test]
+    fn a_bare_names_lists_the_channels_of_every_shard() {
+        let mut shards = alice_and_bob("");
+        shards.client(4, "carol", "");
+        let [here, there] = shards.owned;
+        shards.line(1, &format!("JOIN {here},{there}"));
+        shards.drain(2);
+        shards.line(2, "NAMES");
+        let out = shards.drain(2);
+        let mut expected = vec![
+            format!(":irc.test 353 alice = {here} :@bob"),
+            format!(":irc.test 353 alice = {there} :@bob"),
+        ];
+        expected.sort();
+        expected.push(":irc.test 353 alice * * :alice carol".to_string());
+        expected.push(":irc.test 366 alice * :End of /NAMES list".to_string());
+        assert_eq!(out, expected);
+    }
+
+    /// An INVITE to a channel another shard owns names the invitee by the nick
+    /// the sender's shard found them under, not as the inviter typed it, and
+    /// WHO of a nick shows the channel it shares with them there.
+    #[test]
+    fn invite_and_who_name_a_user_canonically_across_shards() {
+        let mut shards = alice_and_bob("");
+        let there = shards.owned[1];
+        assert_ne!(shards.shard_of(2), 1, "alice is not on the owner's shard");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.drain(2);
+        shards.line(2, &format!("INVITE BOB {there}"));
+        assert_eq!(
+            shards.drain(2),
+            [format!(":irc.test 341 alice bob {there}")]
+        );
+        assert_eq!(
+            shards.drain(1),
+            [format!(":alice!alice@host.test INVITE bob :{there}")]
+        );
+        shards.line(1, &format!("JOIN {there}"));
+        shards.drain(2);
+        shards.line(2, "WHO bob %cn");
+        assert_eq!(
+            shards.drain(2),
+            [
+                format!(":irc.test 354 alice {there} bob"),
+                ":irc.test 315 alice bob :End of /WHO list".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -5945,7 +5998,7 @@ mod ingress_tests {
         let out = shards.drain(1);
         assert_eq!(
             out,
-            ["ERROR :Closing Link: irc.test (Server shutting down)"],
+            ["ERROR :Closing Link: host.test (Server shutting down)"],
             "the closing ERROR must be the last thing the connection is sent"
         );
     }
@@ -6672,7 +6725,7 @@ mod ingress_tests {
                     away: false,
                     oper: false,
                     bot: false,
-                    last_active: crate::core::state::LastActive::new(mono_clock()),
+                    idle_since: crate::core::state::IdleSince::new(mono_clock()),
                 },
             },
             target.into(),

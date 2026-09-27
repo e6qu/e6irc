@@ -55,7 +55,8 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // query names the set form would reject.
     let nicklen = state.config.nicklen;
     let request = crate::core::history_request::parse_markread(p, |target| {
-        crate::sanitize::valid_channel_name(target) || crate::sanitize::valid_nick(target, nicklen)
+        crate::sanitize::ChannelName::parse(target).is_ok()
+            || crate::sanitize::valid_nick(target, nicklen)
     });
     let (target, new_ms) = match request {
         Ok(crate::core::history_request::MarkreadRequest::Query { target }) => (target, None),

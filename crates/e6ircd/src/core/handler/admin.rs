@@ -588,7 +588,7 @@ pub(crate) fn connection_list_entries(
                 oper: session.oper.is_some(),
                 transport: session.transport,
                 connected_at: session.signon,
-                idle_seconds: now.saturating_sub(session.last_active.get()).as_secs(),
+                idle_seconds: now.saturating_sub(session.idle_since.get()).as_secs(),
                 channels,
             }
         })

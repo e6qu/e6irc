@@ -1351,6 +1351,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                  IRCv3 REGISTER and invitations refuse the name)"
             );
         }
+        for name in unjoinable_registered_channels(&founders) {
+            eprintln!(
+                "e6ircd: registered channel {name:?} has a name JOIN refuses (a control \
+                 character, a space-like character or over CHANNELLEN), so nobody can join it; \
+                 drop it with DELETE /api/v1/admin/channels/{{name}} or from its owner's console"
+            );
+        }
         for core in &mut cores {
             core.preload_founders(founders.clone());
             core.preload_successors(successors.clone());
@@ -1476,6 +1483,17 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             connections,
         },
     })
+}
+
+/// The registered channels (`(name_folded, founder)` rows) whose names JOIN
+/// refuses: registered while an older build still let such a name be created,
+/// they can never become live again, so startup names each for its operator.
+fn unjoinable_registered_channels(founders: &[(String, String)]) -> Vec<&str> {
+    founders
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| crate::sanitize::ChannelName::parse(name).is_err())
+        .collect()
 }
 
 /// Bind a listening socket as `tokio::net::TcpListener::bind` does (address
@@ -2373,6 +2391,22 @@ where
 mod tests {
     use super::*;
     use crate::certificate::ReloadingCertificate;
+
+    /// A channel registered under a name the channel-name rule now refuses
+    /// (a formatting control, say) is named at startup rather than preloaded
+    /// silently as a registration no one can use.
+    #[test]
+    fn registered_channels_join_refuses_are_named_at_startup() {
+        let founders = vec![
+            ("#libera".to_string(), "alice".to_string()),
+            ("#lib\x0fera".to_string(), "mallory".to_string()),
+            ("#a\u{a0}b".to_string(), "mallory".to_string()),
+        ];
+        assert_eq!(
+            unjoinable_registered_channels(&founders),
+            ["#lib\x0fera", "#a\u{a0}b"]
+        );
+    }
     use crate::config::TlsConfig;
     use crate::core::Input;
     use e6irc_queue::Sender;

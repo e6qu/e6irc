@@ -113,6 +113,8 @@ numerics! {
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
+    // Solanum's `anti_nick_flood`: too many nick changes too quickly.
+    ERR_NICKTOOFAST = 438,
     // Solanum: a member banned or quieted in a channel cannot change nick.
     ERR_BANNICKCHANGE = 435,
     ERR_USERNOTINCHANNEL = 441,
@@ -131,6 +133,7 @@ numerics! {
     ERR_BANNEDFROMCHAN = 474,
     ERR_BADCHANNELKEY = 475,
     ERR_BANLISTFULL = 478,
+    ERR_BADCHANNAME = 479,
     ERR_NOPRIVILEGES = 481,
     ERR_CHANOPRIVSNEEDED = 482,
     // Solanum (bahamut's ERR_NONONREG): a message refused by the target's +R.
