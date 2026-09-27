@@ -279,6 +279,21 @@ impl TestServer {
         conn
     }
 
+    /// All queued output lines for a connection exactly as sent, CRLF
+    /// included — for a test that counts bytes, which [`Self::drain`]'s
+    /// trimming would change.
+    fn drain_wire(&mut self, conn: ConnId) -> Vec<String> {
+        let rx = &mut self
+            .conns
+            .iter_mut()
+            .find(|(c, _)| *c == conn)
+            .expect("conn")
+            .1;
+        std::iter::from_fn(|| rx.try_pop())
+            .map(|env| String::from_utf8(env.payload.0.to_vec()).expect("utf8"))
+            .collect()
+    }
+
     /// All queued output lines for a connection, CRLF stripped.
     fn drain(&mut self, conn: ConnId) -> Vec<String> {
         let rx = &mut self
@@ -1536,49 +1551,72 @@ fn the_longest_admitted_description_and_motd_line_arrive_whole() {
     }
 }
 
-/// The longest MOTD the configuration admits — every line at its longest, at
-/// the longest server name and nickname — reaches a client that has not read a
-/// byte whole, with the rest of its registration burst, within the smallest
-/// SendQ a connection can have, and with room to spare.
+/// The largest MOTD the configuration admits — long lines or many short ones,
+/// at the longest server name and nickname — takes exactly the bytes the
+/// bound counts (`motd_reply_bytes`, half the smallest SendQ), and reaches a
+/// client that has not read a byte whole, with the rest of its registration
+/// burst, within the smallest SendQ a connection can have.
 #[test]
-fn the_longest_admitted_motd_fits_the_smallest_sendq_at_registration() {
+fn the_largest_admitted_motd_fits_the_smallest_sendq_at_registration() {
     use e6ircd::config::{
-        MAX_MOTD_LINE_LEN, MAX_MOTD_LINES, MAX_NICKLEN, MAX_SERVER_NAME_LEN, MIN_SENDQ_BYTES,
+        MAX_MOTD_BYTES, MAX_MOTD_LINE_LEN, MAX_MOTD_LINES_BYTES, MAX_NICKLEN, MAX_SERVER_NAME_LEN,
+        MIN_SENDQ_BYTES, MOTD_LINE_REPLY_OVERHEAD, motd_reply_bytes,
     };
     let server_name = format!(
         "{}.example",
         "s".repeat(MAX_SERVER_NAME_LEN - ".example".len())
     );
-    let mut s = TestServer::configured(
-        false,
-        || Millis::from_millis(1_000_000_000),
-        |config| {
-            config.server_name = server_name.clone();
-            config.nicklen = MAX_NICKLEN;
-            config.sendq_bytes = MIN_SENDQ_BYTES;
-            config.motd = vec!["m".repeat(MAX_MOTD_LINE_LEN); MAX_MOTD_LINES];
-        },
-    );
-    let nick = format!("n{}", "x".repeat(MAX_NICKLEN - 1));
-    let c = s.connect_from(
-        1,
-        &format!("{}.example", "h".repeat(60)),
-        e6ircd::core::ConnectionTransport::Tcp,
-    );
-    s.line(c, &format!("NICK {nick}"));
-    s.line(c, &format!("USER {nick} 0 * :{}", "r".repeat(200)));
-    let burst = s.drain(c);
-    let motd = burst
-        .iter()
-        .filter(|line| line.split(' ').nth(1) == Some("372"))
-        .count();
-    assert_eq!(motd, MAX_MOTD_LINES, "{burst:#?}");
-    assert!(has_numeric(&burst, "376"), "{burst:#?}");
-    let bytes: usize = burst.iter().map(|line| line.len() + 2).sum();
-    assert!(
-        bytes <= MIN_SENDQ_BYTES * 3 / 4,
-        "the burst is {bytes} bytes of a {MIN_SENDQ_BYTES}-byte SendQ"
-    );
+    let long = MAX_MOTD_LINE_LEN + MOTD_LINE_REPLY_OVERHEAD;
+    let mut long_lines = vec!["m".repeat(MAX_MOTD_LINE_LEN); 15];
+    long_lines.push("m".repeat(MAX_MOTD_LINES_BYTES - 15 * long - 2 * MOTD_LINE_REPLY_OVERHEAD));
+    long_lines.push(String::new());
+    let short = 1 + MOTD_LINE_REPLY_OVERHEAD;
+    let mut short_lines = vec!["m".to_string(); MAX_MOTD_LINES_BYTES / short];
+    short_lines.push("m".repeat(MAX_MOTD_LINES_BYTES % short - MOTD_LINE_REPLY_OVERHEAD));
+    for motd in [long_lines, short_lines] {
+        assert_eq!(motd_reply_bytes(&motd), MAX_MOTD_BYTES);
+        let lines = motd.len();
+        let mut s = TestServer::configured(
+            false,
+            || Millis::from_millis(1_000_000_000),
+            |config| {
+                config.server_name = server_name.clone();
+                config.nicklen = MAX_NICKLEN;
+                config.sendq_bytes = MIN_SENDQ_BYTES;
+                config.motd = motd;
+            },
+        );
+        let nick = format!("n{}", "x".repeat(MAX_NICKLEN - 1));
+        let c = s.connect_from(
+            1,
+            &format!("{}.example", "h".repeat(60)),
+            e6ircd::core::ConnectionTransport::Tcp,
+        );
+        s.line(c, &format!("NICK {nick}"));
+        s.line(c, &format!("USER {nick} 0 * :{}", "r".repeat(200)));
+        let burst = s.drain_wire(c);
+        let numeric = |line: &String| line.split(' ').nth(1).map(str::to_owned);
+        let motd_bytes: usize = burst
+            .iter()
+            .filter(|line| matches!(numeric(line).as_deref(), Some("375" | "372" | "376")))
+            .map(String::len)
+            .sum();
+        assert_eq!(
+            burst
+                .iter()
+                .filter(|line| numeric(line).as_deref() == Some("372"))
+                .count(),
+            lines,
+            "{burst:#?}"
+        );
+        assert_eq!(motd_bytes, MAX_MOTD_BYTES, "the bound counts what is sent");
+        let bytes: usize = burst.iter().map(String::len).sum();
+        assert!(
+            bytes - motd_bytes <= MIN_SENDQ_BYTES / 2,
+            "the rest of the burst is {} bytes",
+            bytes - motd_bytes
+        );
+    }
 }
 
 // ---- IRCv3 capability negotiation ---------------------------------------

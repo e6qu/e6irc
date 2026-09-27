@@ -1851,7 +1851,8 @@ Principal tables (columns abridged):
   the constant `BNC_BUFFER_CAP` is), so the replay the setting promises
   survives a restart. It used to accept 100,000 while the table kept 5,000 and
   a start restored 1,000, so anything above that held only until the next
-  restart; migration 0091 brought a stored `buffer_cap` above 5,000 to 5,000. Rows older than `storage.history_retention_days`
+  restart; migration 0091 brought a stored `buffer_cap` above 5,000 to 5,000,
+  auditing each previous value (§18). Rows older than `storage.history_retention_days`
   are deleted by storage maintenance in bounded batches (index
   `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
   bouncer history, direct messages included, not only the server's own. Read
@@ -5061,15 +5062,23 @@ Layers, bottom to top:
   bytes) and nickname (64): `description`, `RPL_LINKS`' server information, at
   most 242 bytes, and each `motd` line, an `RPL_MOTD`, at most 372 — as the
   names themselves are, since `numeric_line` clips what does not fit without a
-  word. The MOTD is bounded in lines too, at most 14 (`MAX_MOTD_LINES`): a new
-  client is sent all of it at registration before it has read anything, and
-  its replies (a line each, framed by `RPL_MOTDSTART` and `RPL_ENDOFMOTD`, at
-  most 512 bytes apiece since numerics carry no tags) take at most half of the
-  smallest SendQ, 17,406 bytes, leaving the other half to the rest of the
-  burst; a MOTD of any length used to be accepted, and filled a slow reader's
-  SendQ at registration. Migration 0094 kept the first 14 lines of a stored
-  MOTD longer than that. The console's form and the OpenAPI schema state the
-  same bounds.
+  word. The whole MOTD is bounded too, in the bytes it takes as sent: a new
+  client is sent all of it at registration before it has read anything, so its
+  replies — a line each, framed by `RPL_MOTDSTART` and `RPL_ENDOFMOTD`, counted
+  at the longest server name and nickname (numerics carry no tags;
+  `config::motd_reply_bytes`) — take at most half of the smallest SendQ,
+  8,703 of 17,406 bytes (`MAX_MOTD_BYTES`), leaving the other half to the rest
+  of the burst: the lines together at most 8,318 bytes, each counting 140 more
+  for its reply. Bytes, not lines, are what the SendQ holds, so many short
+  lines fit where a few long ones do. A MOTD of any length used to be accepted,
+  and filled a slow reader's SendQ at registration. The console's form states
+  the bound; the OpenAPI schema states the per-line one and describes the
+  total, which JSON Schema cannot express, and the server's check decides.
+  A stored value an upgrade's new bound refuses is clamped by its migration so
+  the upgrade still starts — a network's `buffer_cap` by 0091, a MOTD by 0094
+  (the longest run of its first lines that fits) — and never in silence: each
+  clamp is a revision of its own (`updated_by` names the migration) with a
+  `CONFIG` audit entry whose detail carries the previous value in full.
   "Every console save" includes what start reads beside the document: a save
   is judged against the running process's own bootstrap values — its HTTP
   listener, its `application_release_revision` (which a `shauth` provider

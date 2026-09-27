@@ -41,23 +41,54 @@ GROUP BY account_id, identity_target
 ON CONFLICT (account_id, target)
 DO UPDATE SET marker_ts = greatest(read_markers.marker_ts, EXCLUDED.marker_ts);
 
--- 2. The MOTD is bounded to 14 lines (`MAX_MOTD_LINES`): a new client is sent
--- all of it at registration, and more need not fit the smallest SendQ beside
--- the rest of that burst. It used to be bounded only per line. A stored MOTD
--- above the bound keeps its first 14 lines rather than being left for the next
--- start to refuse; running this again changes nothing.
-UPDATE server_settings
-SET settings = jsonb_set(
-    settings,
-    '{motd}',
-    (
-        SELECT jsonb_agg(line ORDER BY position)
-        FROM jsonb_array_elements(settings -> 'motd') WITH ORDINALITY AS entry(line, position)
-        WHERE position <= 14
-    )
+-- 2. The MOTD is bounded in bytes as a new client is sent it at registration
+-- (`MAX_MOTD_BYTES`, 8,703: half the smallest SendQ, the other half left to
+-- the rest of that burst). Its lines together may take 8,318 bytes
+-- (`MAX_MOTD_LINES_BYTES`), each counting 140 more for its reply
+-- (`MOTD_LINE_REPLY_OVERHEAD`); the Rust constants are the authority, and the
+-- migration test checks this clamp against them. It used to be bounded only
+-- per line. A stored MOTD above the bound keeps the longest run of its first
+-- lines that fits, rather than being left for the next start to refuse — and
+-- not in silence: the change is a revision of its own with a `CONFIG` audit
+-- entry, as a console save is, whose detail carries the previous MOTD in
+-- full, so nothing is lost. Running this again changes nothing.
+WITH lines AS (
+    SELECT entry.line,
+           entry.position,
+           sum(octet_length(entry.line #>> '{}') + 140) OVER (ORDER BY entry.position) AS through
+    FROM server_settings,
+         jsonb_array_elements(settings -> 'motd') WITH ORDINALITY AS entry(line, position)
+    WHERE jsonb_typeof(settings -> 'motd') = 'array'
+),
+over AS (
+    SELECT settings -> 'motd' AS previous,
+           (SELECT coalesce(
+                       jsonb_agg(line ORDER BY position) FILTER (WHERE through <= 8318),
+                       '[]'::jsonb)
+            FROM lines) AS kept
+    FROM server_settings
+    WHERE (SELECT max(through) FROM lines) > 8318
+),
+changed AS (
+    UPDATE server_settings
+    SET settings = jsonb_set(settings, '{motd}', (SELECT kept FROM over)),
+        revision = revision + 1,
+        updated_by = 'migration:0094',
+        updated_at = now()
+    WHERE EXISTS (SELECT 1 FROM over)
+    RETURNING revision
 )
-WHERE jsonb_typeof(settings -> 'motd') = 'array'
-  AND jsonb_array_length(settings -> 'motd') > 14;
+INSERT INTO audit_log (actor, actor_kind, action, target, target_kind, detail)
+SELECT 'migration:0094', 'host', 'CONFIG', 'server', 'server',
+       format(
+           'revision %s; motd cut to its first %s of %s lines by migration 0094: it took '
+           'more than 8703 bytes as sent at registration (half the smallest SendQ); '
+           'previous motd: %s',
+           changed.revision,
+           jsonb_array_length(over.kept),
+           jsonb_array_length(over.previous),
+           over.previous::text)
+FROM changed, over;
 
 -- 3. CHATHISTORY pages by `(ts, msgid COLLATE "C")` and migration 0093 built
 -- the index for it; `(target, ts, id)` served the `(ts, id)` order it
