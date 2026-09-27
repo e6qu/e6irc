@@ -280,6 +280,7 @@ async fn verify_password_roundtrip() {
         DbReply::PasswordVerified {
             account: "Alice".into(),
             credential: e6ircd::identity::CredentialId::AccountPassword,
+            expires_in: None,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         }
     );
@@ -13861,6 +13862,24 @@ async fn a_sign_in_names_its_credential_and_its_revocation_is_announced() {
     else {
         panic!("a token signs in as itself: {:?}", signed_in.credential);
     };
+    // The sign-in carries how long the token has left, by the store's clock:
+    // its session ends then. A password does not expire.
+    let lifetime = std::time::Duration::from_secs(
+        u64::from(e6ircd::identity::ApiTokenLifetimeDays::DEFAULT.value()) * 86_400,
+    );
+    let left = signed_in.expires_in.expect("a token expires");
+    assert!(
+        left <= lifetime && left > lifetime - std::time::Duration::from_secs(60),
+        "{left:?}"
+    );
+    assert_eq!(
+        db::verify_credentials(&pool, "alice", "first password")
+            .await
+            .expect("verify")
+            .expect("verified")
+            .expires_in,
+        None
+    );
 
     let every = [first, second, token];
     let stored = async || {

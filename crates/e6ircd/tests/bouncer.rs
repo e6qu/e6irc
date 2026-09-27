@@ -5600,3 +5600,68 @@ async fn a_credential_revoked_out_of_process_ends_exactly_what_it_signed_in() {
             .is_err()
     );
 }
+
+/// An IRC session a personal access token signed in ends when the token
+/// expires — the instant the store says it does, as a chat socket's does —
+/// not when storage maintenance later deletes the row; the session is told
+/// why.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_session_a_token_signed_in_ends_when_the_token_expires() {
+    let url = bnc_account_db(
+        "a_session_a_token_signed_in_ends_when_the_token_expires",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let token = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc client",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Irc])
+            .expect("scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("token");
+    // No lifetime shorter than a day can be issued; this one is nearly over.
+    sqlx::query("UPDATE api_tokens SET expires_at = now() + interval '3 seconds'")
+        .execute(&pool)
+        .await
+        .expect("a token about to expire");
+    let up = upstream().await;
+    let server = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
+    let mut session = e6irc_client::Connection::connect(&server.addrs[0].to_string())
+        .await
+        .expect("connect");
+    session
+        .register_oauthbearer(
+            &e6irc_client::Identity {
+                nick: "alice",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            &token,
+        )
+        .await
+        .expect("token login");
+    let mut with_password = irc_alice_as(server.addrs[0], "alice2", "s3cr3t-password").await;
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter()
+            .any(|text| text.contains("Personal access token expired")),
+        "{said:#?}"
+    );
+    let still_stored: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(still_stored, 1, "maintenance has not pruned it: expiry did");
+    assert!(still_open(&mut with_password).await);
+}

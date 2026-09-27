@@ -6873,6 +6873,7 @@ impl VerifyOutcome {
             Self::Verified(signed_in) => DbReply::PasswordVerified {
                 account: signed_in.account.into_name(),
                 credential: signed_in.credential,
+                expires_in: signed_in.expires_in,
                 origin,
             },
             Self::Rejected => DbReply::PasswordRejected { origin },
@@ -7675,6 +7676,10 @@ impl std::ops::Deref for VerifiedAccount {
 pub struct VerifiedSignIn {
     pub account: VerifiedAccount,
     pub credential: crate::identity::CredentialId,
+    /// How much longer the credential authorizes, by PostgreSQL's clock — the
+    /// one its expiry was written against: a personal access token's
+    /// remaining lifetime, `None` for a password, which does not expire.
+    pub expires_in: Option<std::time::Duration>,
 }
 
 /// Verify an account password or app password.
@@ -7739,6 +7744,7 @@ async fn verify_any_credential(
     Ok(Some(VerifiedSignIn {
         account: VerifiedAccount(display_name),
         credential,
+        expires_in: None,
     }))
 }
 
@@ -10610,8 +10616,10 @@ pub async fn api_token_account(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<VerifiedSignIn>, DbError> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT a.name, t.id FROM api_tokens t
+    let row: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT a.name, t.id,
+                (EXTRACT(EPOCH FROM (t.expires_at - now())) * 1000)::BIGINT
+         FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
            AND t.expires_at > now()
@@ -10623,11 +10631,14 @@ pub async fn api_token_account(
     .fetch_optional(pool)
     .await
     .map_err(query_error)?;
-    Ok(row.map(|(name, id)| VerifiedSignIn {
+    Ok(row.map(|(name, id, remaining_ms)| VerifiedSignIn {
         account: VerifiedAccount(name),
         credential: crate::identity::CredentialId::Issued(
             crate::identity::IssuedCredential::ApiToken(id),
         ),
+        expires_in: Some(std::time::Duration::from_millis(
+            remaining_ms.max(0).unsigned_abs(),
+        )),
     }))
 }
 

@@ -580,6 +580,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     so revoking an app password or a personal access token ends exactly what
     it opened. Neither recorded it, and a revoked credential's sessions and
     attachments stayed open for as long as they lived (§9.1).
+  - `RefuseVerdictsInFlight` — a re-connected revocation listener refuses
+    every credential check in flight, on every shard and at the attach
+    listener, before it re-reads what it missed, so no verdict read while
+    nothing listened can open a session after the re-read, for an account's
+    authority or an issued credential alike (§9.1).
   - `AuthorityLedger` — a change of an account's authority is applied on
     every server serving the database, each exactly once: the accounts row
     counts each change (`authority_generation`, migration 0095), the server
@@ -2537,6 +2542,28 @@ the credentials its live sessions signed in with; after the listener's
 connection is lost it asks which of those and of the attachments' are still
 stored and ends what the others signed in.
 
+A session a personal access token signed in also ends when the token expires,
+at the instant the store's clock says — the one a `/ws/ui` socket ends at —
+not when storage maintenance later prunes the row: the verification carries
+how long the token has left (`VerifiedSignIn::expires_in`), the session's login
+holds the deadline, and the core's one-second tick closes it with
+`ERROR :Closing Link: … (Personal access token expired)`.
+
+A lost listener leaves a window neither the announcements nor the re-read
+close by themselves: a credential check that read the store before a
+revocation committed, while nothing listened, can land its verdict after the
+re-connected listener has re-read what live sessions and attachments hold —
+which it was not yet among. So a re-connected listener, before it re-reads
+anything, has every core shard refuse the verdict of each check queued before
+(`RefuseVerdictsInFlight`, the credential epoch's `EndedSignIns::Every`), and
+waits until each has, and has the attach listener refuse the lease of each
+check under way (`AccountRevocations::refuse_in_flight`). A verdict that landed
+first is held by a live session and so re-read; one that lands after is
+refused with a 904 or NickServ notice saying the credentials were re-checked
+and to try again, and a refused attachment is told to sign in again. This
+holds for the account-authority re-read below as for issued credentials: both
+run behind the one refusal.
+
 Several servers may serve one database, and each of them ends the account's
 sessions and attachments, whichever server committed the change
 (`account_authority`). The accounts row counts every change of an account's
@@ -2557,7 +2584,7 @@ never applies its own change twice — which would end the sessions opened with
 the new password. The ledger's baseline is read at boot before the server
 reads which accounts are suspended, and every account is read again after the
 listener's connection is lost, since what was announced in between was not
-heard.
+heard — behind the refusal of every check in flight, above.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and

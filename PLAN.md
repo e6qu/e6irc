@@ -1466,6 +1466,13 @@ Maintainer decisions implemented from the same review:
   revocation by id, whichever process deletes it, and the server closes that
   credential's sessions (`App password revoked`) and attachments; a check of
   it in flight is refused. Before, they stayed open for as long as they lived.
+  A session a token signed in ends at the token's expiry, as `/ws/ui` does,
+  not when maintenance prunes it.
+- **A verdict read while the revocation listener was disconnected** could
+  open a session for a credential revoked meanwhile, after the re-connected
+  listener's re-read. The re-connection now first refuses every check in
+  flight on every core shard and at the attach listener (the client retries),
+  for account authority and issued credentials alike.
 - **The design's SASL OAUTHBEARER row described OIDC JWT validation** the
   server does not do; it names the personal access token it verifies.
 - **New passwords are at least 8 characters** (NIST SP 800-63B) unless the
