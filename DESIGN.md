@@ -148,6 +148,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `BridgedSenders` — a bridged sender's IRC identity comes from one
     per-session directory keyed by the provider's account id, which never
     hands the owner's nick to anyone else (§10.5).
+  - `BridgeRequest` — the only request a bridge can build, and its only send
+    reads the status: a 3xx, 429 or 5xx can no longer reach a body decoder as
+    an answer (the Slack Web API calls did that) (§10.5).
+  - `BridgedLines` — what one bridged message is shown as is at most
+    `MAX_BRIDGED_LINES` lines and a counted notice, so no remote message can
+    overflow a network's event broadcast by itself (§10.5).
   - `CredentialAttemptBudget` — IRC registration, services, OPER, and BNC attach
     consume the same closed per-connection authentication budget. Valid and
     malformed completed SASL payloads spend a slot, exhaustion is permanent,
@@ -3035,7 +3041,10 @@ unless the configured API base is itself a loopback `http://` under
 `internal_upstreams = "allow"`. Every bridge HTTP request is built through
 `BridgeHttp`, which judges the parsed URL host against the egress rule before
 the HTTP client sees it (IP-literal hosts never reach the vetting resolver),
-and any 3xx answer is a failed request, never a delivery. Bridge REST bases are
+and what it builds is a `BridgeRequest`, whose only send reads the status
+first: any 3xx answer is a failed request, never a delivery, a 429 is a rate
+limit with its wait, and no other non-success status reaches a body decoder.
+Bridge REST bases are
 HTTPS too: `validate_bridge_base` and `BridgeHttp::request` admit `http://`
 only for a loopback test oracle under `internal_upstreams = "allow"`, where
 Matrix passwords, access tokens and bot tokens used to be able to travel in
@@ -3071,7 +3080,17 @@ Design constraints recorded now:
   configuration close 4010–4014, Slack `link_disabled`, an encrypted Matrix
   room); what the upstream may clear on its own takes the refusal schedule and
   then parks (a room join refused before an invitation arrives, a channel name
-  the provider side can rename). The diagnostic is e6irc's own sentence naming
+  the provider side can rename). Slack answers most refusals `200 ok:false`,
+  so its error is a `SlackError` decoded once where the answer is read: the
+  token codes are `AuthRejected`; the codes only the owner clears
+  (`missing_scope`, `not_allowed_token_type`, `invalid_arguments` and the
+  like) are `GatewayConfigurationRefused`, parked at once; a rate limit waits
+  what it asks (`SessionOutcome::DroppedFor`); the rest, unknown codes
+  included, is retried. (Only the token codes used to stop the retries.) A
+  Discord channel in the configuration is a `DiscordChannelId`, a snowflake
+  parsed where the driver is built, so a typo is refused with the
+  configuration instead of looked up and retried. The diagnostic is e6irc's
+  own sentence naming
   the room or channel; provider response text is deliberately never carried.
   What a refusal of a credentialed request means depends on what it asked
   about (`CredentialRequest`): a login or the bot's own account
@@ -3111,19 +3130,26 @@ Design constraints recorded now:
   session: the device, and so the id scope, outlives sessions and processes,
   and a repeated id is silently deduplicated by the homeserver. The sync
   position is kept beside the login too: `since` and the joined rooms survive
-  a reconnect (cleared with the login, on a configuration refusal, or when the
+  a reconnect (cleared with the login, when a room turns encrypted, or when the
   homeserver refuses a resumed sync), so an outage's messages are delivered or
   a `limited` timeline announces the gap; a 429 on `/sync` waits the requested
-  time and re-asks from the same position instead of reconnecting. A bridged
+  time and re-asks from the same position instead of reconnecting. The long
+  poll is the session's to keep: a client line is delivered while it waits,
+  instead of cancelling and reissuing a twenty-second `/sync` per line. A
+  bridged
   room with `m.room.encryption` state (checked after each join) or an
   encrypted event mid-session is `ConfigurationRejected(room_encrypted)`: the
   bridge holds no device keys and would otherwise relay nothing, silently.
   The sync's `rooms.leave` is read too: a bridged room the account was kicked
   or banned from (or left from another client) has what was said before the
-  leave relayed, then a notice in its channel, the position forgotten, and
-  the session ended as `ConfigurationRejected(channel_join_refused)` on the
-  refusal schedule — the next session joins afresh, a kick clears, and a ban
-  answers the join with a 403 until the network parks. Reading only `join`
+  leave relayed, then a notice in its channel, that room alone dropped
+  from the kept position, and the session ended as
+  `ConfigurationRejected(channel_join_refused)` on the refusal schedule — the
+  next session rejoins that room and resumes the others from where they
+  were, a kick clears, and a ban answers the join with a 403 until the
+  network parks. (The whole position used to be forgotten, and the next
+  session's initial sync skipped every other room's messages.) Reading only
+  `join`
   kept syncing a room the bridge would never hear again. Every message the
   bridge sends carries `"m.mentions": {}`: without it clients fall back to
   the body-matching push rules, and an IRC line saying `@room` paged the
@@ -3159,7 +3185,20 @@ Design constraints recorded now:
   silent skip. 4004 is `AuthRejected`; 4010–4014 are
   configuration refusals that park at once with a code-specific diagnostic
   (4014 names the Message Content intent). Posts send
-  `allowed_mentions: {parse: []}`, so an IRC line can never page a guild.
+  `allowed_mentions: {parse: []}`, so an IRC line can never page a guild, and
+  their text is escaped for Discord's Markdown (as Slack's is for its markup):
+  a backslash, `*`, `_`, `~`, a backtick, `|`, `<`, `[` and `]` anywhere, and a
+  heading, subtext, block quote or list marker at the start, each with a
+  backslash — a URL is left whole — so IRC
+  text reads literally and a `/me`'s italics survive an underscore. A
+  gateway frame's envelope (`op`, `s`, `t`) is read first, and only a frame
+  without one ends the session; each dispatch's data is read on its own, and
+  one that cannot be read is counted under its sequence number and said as one
+  "malformed" not-relayed notice when its channel is bridged (logged
+  otherwise) — the rule Matrix and Slack follow. Decoded as a whole, one bad
+  `MESSAGE_CREATE` ended the session before its number was counted, so every
+  RESUME replayed it into the same failure, and a bad READY spent an IDENTIFY
+  on every attempt.
 - Slack reads `disconnect.reason`: `warning` and `refresh_requested` open the
   next socket inside the session while the retiring one is still read and
   acked (no failure recorded); `link_disabled` is a configuration refusal.
@@ -3172,7 +3211,12 @@ Design constraints recorded now:
   Matrix follows for timeline events. Deliveries and name lookups run in
   bounded serial queues beside the socket (driver-owned, above), a
   re-delivered envelope id is acked and not relayed twice, and the socket is
-  pinged every 30 s. Outbound text
+  pinged every 30 s. Every Web API call reads the HTTP status before the body
+  (a 503 with `{"ok": true}` used to be taken as the answer), and a
+  `users.info` answered 429 is not asked again until its wait is over (a
+  failed lookup is not cached, so every message asked a rate-limited Slack
+  again). A message's mentions are looked up at most eight, counted apart
+  from its sender. Outbound text
   escapes `& < >` (which also neutralises `<!channel>`); inbound entities and
   markup are decoded (`<@U…>` to `@name`, `<#C…|n>` to `#n`, links to
   `label (url)`). Message subtypes are a whitelist (file shares, thread
@@ -3181,6 +3225,38 @@ Design constraints recorded now:
   produces a bounded notice. A failed name lookup is not cached. The
   display-name cache is bounded at 4096 upstream ids; overflow clears it,
   counted and logged.
+- One policy for threads and edits on every bridge: a thread reply is a line
+  in its parent's bridged channel, and an edit is `* <new text>`. Slack's
+  thread replies are message events in their channel and `message_changed`
+  is the edit; Matrix's `m.thread` events are timeline events of their room
+  and an `m.replace` is shown from its `m.new_content`; Discord's thread is a
+  channel of its own, mapped to its parent from the gateway (`GUILD_CREATE`'s
+  active threads, `THREAD_CREATE`/`THREAD_UPDATE`/`THREAD_LIST_SYNC`,
+  `THREAD_DELETE`; kept with the driver like its gateway session, bounded at
+  4096 threads), and a `MESSAGE_UPDATE` with new content and an
+  `edited_timestamp` is the edit (an embed unfolding is none, and one edit is
+  said once). A Slack bot's edit names only its id, so the bot keeps the nick
+  it is shown under instead of being renamed to its id and back.
+- What one remote message becomes on IRC is bounded: each line of it is an IRC
+  line (split to the line limit), blank lines are left out, and past
+  `MAX_BRIDGED_LINES` (16) the rest is counted in a `*bnc*` notice instead of
+  shown (`render_bridged` returns `BridgedLines`). A burst is paced: a driver
+  relays each message once the network's event broadcast is below half its
+  capacity (`BridgePacer`: each Matrix timeline event, each Discord message,
+  each Slack message done with its name lookups, each carried delivery's
+  report), waiting at most two seconds per stall — a subscriber that reads
+  nothing for that long is stuck, and is left to be detached as too slow. A
+  message of two thousand newlines, or a resumed Matrix sync of hundreds of
+  events relayed in one loop, used to overflow the broadcast: every attached
+  client was detached as too slow, and the backlog writer recorded a gap.
+- A bridge session starts either where the previous one stopped
+  (`SessionStart::Resumed`: a Matrix `since`, a Discord RESUME) or from now
+  (`Fresh`: a Matrix initial sync, a Discord IDENTIFY, any Slack socket —
+  Socket Mode keeps no position). A `Fresh` session after an earlier one says
+  in every bridged channel, once, that messages sent while the bridge was
+  disconnected may not have been relayed — in `begin_bridge_session`, for every
+  provider, whatever made the position go (a refused Matrix position or token,
+  a refused RESUME, close 4007/4009).
 - Who a bridged line is from is decided by one per-session directory,
   `BridgedSenders`, keyed by the provider's own stable account id (the full
   Matrix user id, the Slack user or bot id, the Discord user id) — never by a

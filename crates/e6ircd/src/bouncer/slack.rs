@@ -109,8 +109,8 @@ impl Shared {
                             ends.record_error(super::NetworkFailure::UpstreamRequestFailed);
                         }
                     }
-                    for line in lines {
-                        ends.emit_line(line);
+                    if let Some(lines) = lines {
+                        ends.emit_bridged(lines);
                     }
                 })
             }
@@ -118,30 +118,28 @@ impl Shared {
     }
 
     /// The IRC lines for one finished inbound item, in its bridged channel.
-    fn render(&self, inbound: &Inbound) -> Vec<String> {
+    fn render(&self, inbound: &Inbound) -> Option<super::BridgedLines> {
         let mut view = self.view.lock().expect("slack view");
         let view = view
             .as_mut()
             .expect("a message is queued only by a session, which set the view first");
         match inbound {
             Inbound::Message(resolved) => {
-                let Some(channel) = view.channels.get(&resolved.message.channel) else {
-                    return Vec::new();
-                };
+                let channel = view.channels.get(&resolved.message.channel)?;
                 let names = self.names.lock().expect("slack name cache");
-                render_message(
+                Some(render_message(
                     &resolved.message,
                     channel,
                     &names,
                     &view.channels,
                     &mut view.senders,
-                )
+                ))
             }
-            Inbound::Malformed { channel } => view
-                .channels
-                .get(channel)
-                .map(|shown| vec![super::unrelayed_notice("slack", shown, MALFORMED, None)])
-                .unwrap_or_default(),
+            Inbound::Malformed { channel } => view.channels.get(channel).map(|shown| {
+                super::BridgedLines::notice(super::unrelayed_notice(
+                    "slack", shown, MALFORMED, None,
+                ))
+            }),
         }
     }
 }
@@ -240,7 +238,7 @@ fn open_next(config: &SlackConfig, http: &super::BridgeHttp, base: &str) -> Open
     Box::pin(async move {
         let url = open_socket(&http, &base, &app_token)
             .await
-            .map_err(|error| slack_failure("apps.connections.open failed", &error))?;
+            .map_err(|error| error.into_outcome("apps.connections.open"))?;
         super::bridge_ws_open(&url, "slack", "socket", &base, policy).await
     })
 }
@@ -290,7 +288,12 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     let senders = super::BridgedSenders::new(slack_account(&identity.user_id, &identity.user));
     let echo_identity = senders.own().clone();
     let mut sockets = vec![Socket::new(first)];
-    if let Err(outcome) = ends.begin_bridge_session(&echo_identity, id_to_channel.values()) {
+    // Socket Mode keeps no position to resume from: every session starts now.
+    if let Err(outcome) = ends.begin_bridge_session(
+        &echo_identity,
+        id_to_channel.values(),
+        super::SessionStart::Fresh,
+    ) {
         return outcome;
     }
     *shared.view.lock().expect("slack view") = Some(View {
@@ -299,6 +302,9 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     });
 
     let mut opening: Option<Opening> = None;
+    // Acknowledged messages can finish their name lookups together (256 of
+    // them wait at most); each is relayed once the subscribers have room.
+    let pacer = ends.pacer();
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -445,7 +451,10 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                     }
                 }
             }
-            report = shared.next_report() => report(ends),
+            report = async {
+                pacer.wait().await;
+                shared.next_report().await
+            } => report(ends),
             cmd = ends.next_command() => {
                 let deliver = {
                     let (http, base, token) = (http.clone(), base.clone(), config.bot_token.clone());
@@ -486,7 +495,7 @@ async fn connect(config: &SlackConfig) -> Result<Connected, super::SessionOutcom
     let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
     let identity: Identity = slack_call(&http, &base, &config.bot_token, "auth.test")
         .await
-        .map_err(|error| slack_failure("auth.test failed", &error))?;
+        .map_err(|error| error.into_outcome("auth.test"))?;
     let (id_to_channel, channel_to_id) = super::resolve_bridge_channels(
         "slack",
         &config.channels,
@@ -537,15 +546,20 @@ async fn queue_inbound(
 /// channel Slack says does not exist, that the bot is not in, or that is
 /// archived is an answer about the configuration — a mapping refusal naming
 /// the channel, on the refusal schedule, since joining or unarchiving it
-/// upstream clears it — not a transport failure retried forever.
-fn channel_lookup_failure(id: &str, error: String) -> super::SessionOutcome {
-    let diagnostic = match error.as_str() {
-        "channel_not_found" => format!("Slack has no channel {id}, or the bot cannot see it"),
-        "not_in_channel" => format!("the bot is not a member of Slack channel {id}"),
-        "is_archived" => format!("Slack channel {id} is archived"),
-        _ => return slack_failure(&format!("channel {id} lookup failed"), &error),
+/// upstream clears it — not a transport failure retried forever. Any other
+/// failure means what it means for every call ([`SlackError::into_outcome`]).
+fn channel_lookup_failure(id: &str, error: SlackError) -> super::SessionOutcome {
+    let diagnostic = match error {
+        SlackError::Channel(ChannelRefusal::NotFound) => {
+            format!("Slack has no channel {id}, or the bot cannot see it")
+        }
+        SlackError::Channel(ChannelRefusal::NotInChannel) => {
+            format!("the bot is not a member of Slack channel {id}")
+        }
+        SlackError::Channel(ChannelRefusal::Archived) => format!("Slack channel {id} is archived"),
+        error => return error.into_outcome(&format!("the lookup of channel {id}")),
     };
-    eprintln!("slack: {diagnostic} ({error})");
+    eprintln!("slack: {diagnostic}");
     super::SessionOutcome::ConfigurationRejected(super::ConfigurationRefusal::new(
         super::NetworkFailure::ChannelMappingFailed,
         &diagnostic,
@@ -559,11 +573,34 @@ struct Resolved {
     failures: Vec<(String, String)>,
 }
 
-/// Look up the display names `message` needs that the cache lacks: its
-/// sender's, and those of up to [`MAX_MENTION_LOOKUPS`] mentioned users. A
-/// name is remembered only when the lookup succeeds; a failure leaves the id
-/// to be shown as itself this once and looked up again next time — caching
-/// the id as the name hid the sender for the rest of the session.
+/// Whose names `message` needs: its sender's, then up to
+/// [`MAX_MENTION_LOOKUPS`] distinct mentioned users. The mentions are counted
+/// on their own: counted together with the sender, a bot's message (which has
+/// no sender to look up) was allowed one more.
+fn wanted_names(message: &SlackMessage) -> Vec<String> {
+    let mut wanted = Vec::new();
+    if let Sender::User(user) = &message.sender {
+        wanted.push(user.clone());
+    }
+    let mut mentions = 0;
+    for user in mentioned_users(message.content.text()) {
+        if mentions == MAX_MENTION_LOOKUPS {
+            break;
+        }
+        if !wanted.contains(&user) {
+            wanted.push(user);
+            mentions += 1;
+        }
+    }
+    wanted
+}
+
+/// Look up the display names `message` needs ([`wanted_names`]) that the
+/// cache lacks. A name is remembered only when the lookup succeeds; a failure
+/// leaves the id to be shown as itself this once and looked up again next
+/// time — caching the id as the name hid the sender for the rest of the
+/// session. A `429` is remembered instead: until its wait is over no lookup is
+/// made, since each uncached failure used to ask a rate-limited Slack again.
 async fn resolve_names(
     http: super::BridgeHttp,
     base: String,
@@ -571,23 +608,32 @@ async fn resolve_names(
     names: Arc<Mutex<UserNames>>,
     message: SlackMessage,
 ) -> Resolved {
-    let mut wanted: Vec<String> = Vec::new();
-    if let Sender::User(user) = &message.sender {
-        wanted.push(user.clone());
-    }
-    for user in mentioned_users(message.content.text()) {
-        if !wanted.contains(&user) && wanted.len() <= MAX_MENTION_LOOKUPS {
-            wanted.push(user);
-        }
-    }
     let mut failures = Vec::new();
-    for user in wanted {
-        if names.lock().expect("slack name cache").get(&user).is_some() {
-            continue;
+    for user in wanted_names(&message) {
+        {
+            let names = names.lock().expect("slack name cache");
+            if names.get(&user).is_some() {
+                continue;
+            }
+            if let Some(left) = names.rate_limited_for(tokio::time::Instant::now()) {
+                failures.push((
+                    user,
+                    format!("not looked up: users.info is rate-limited for {left:?} more"),
+                ));
+                continue;
+            }
         }
         match fetch_user_name(&http, &base, &bot_token, &user).await {
             Ok(name) => names.lock().expect("slack name cache").remember(user, name),
-            Err(error) => failures.push((user, error)),
+            Err(error) => {
+                if let SlackError::RateLimited(wait) = error {
+                    names
+                        .lock()
+                        .expect("slack name cache")
+                        .rate_limited_until(tokio::time::Instant::now() + wait);
+                }
+                failures.push((user, error.to_string()));
+            }
         }
     }
     Resolved { message, failures }
@@ -600,13 +646,22 @@ fn render_message(
     names: &UserNames,
     channels: &HashMap<String, String>,
     senders: &mut super::BridgedSenders,
-) -> Vec<String> {
+) -> super::BridgedLines {
     let who = match &message.sender {
         Sender::User(user) => senders.identity(slack_account(
             user,
             names.get(user).map_or(user.as_str(), String::as_str),
         )),
-        Sender::Bot { bot_id, name } => senders.identity(slack_account(bot_id, name)),
+        Sender::Bot {
+            bot_id,
+            name: Some(name),
+        } => senders.identity(slack_account(bot_id, name)),
+        // An edit, or a subtype, names no bot name: the bot keeps the nick it
+        // is already shown under. Taken as its name, the id renamed the bot
+        // for every edit it made, and back on its next message.
+        Sender::Bot { bot_id, name: None } => senders
+            .known(bot_id)
+            .unwrap_or_else(|| senders.identity(slack_account(bot_id, bot_id))),
     };
     let decode = |text: &str| decode_markup(text, names, channels);
     let inbound = match &message.content {
@@ -614,12 +669,12 @@ fn render_message(
         Content::Action(text) => super::Inbound::new(super::InboundKind::Action, &decode(text)),
         Content::Edited(text) => super::Inbound::message(&format!("* {}", decode(text))),
         Content::Unrelayed(subtype) => {
-            return vec![super::unrelayed_notice(
+            return super::BridgedLines::notice(super::unrelayed_notice(
                 "slack",
                 channel,
                 subtype,
                 Some(&who.nick),
-            )];
+            ));
         }
     };
     super::render_bridged(&who, channel, &inbound)
@@ -792,10 +847,11 @@ impl RecentEnvelopes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Sender {
     User(String),
-    /// A bot's post (`bot_message`): its `bot_id` and the name it posts as.
+    /// A bot's post: its `bot_id`, and the name it posts as when the event
+    /// names one (`bot_message`); an edit or another subtype names none.
     Bot {
         bot_id: String,
-        name: String,
+        name: Option<String>,
     },
 }
 
@@ -843,11 +899,25 @@ struct UserNames {
     names: HashMap<String, String>,
     /// How many times the full cache was cleared, for the log line.
     clears: u64,
+    /// When a `users.info` answered `429`, the moment its wait is over.
+    rate_limited_until: Option<tokio::time::Instant>,
 }
 
 impl UserNames {
     fn get(&self, user: &str) -> Option<&String> {
         self.names.get(user)
+    }
+
+    /// Slack asked for no more lookups until `until`.
+    fn rate_limited_until(&mut self, until: tokio::time::Instant) {
+        self.rate_limited_until = Some(until);
+    }
+
+    /// How much longer lookups wait on a `429`, `None` when they may be made.
+    fn rate_limited_for(&self, now: tokio::time::Instant) -> Option<Duration> {
+        self.rate_limited_until
+            .filter(|until| *until > now)
+            .map(|until| until - now)
     }
 
     fn remember(&mut self, user: String, name: String) {
@@ -1139,7 +1209,7 @@ fn parse_message_event(event: SlackEvent) -> Result<Option<SlackMessage>, String
                 (Some(user), _) => Sender::User(user),
                 (None, Some(bot_id)) => Sender::Bot {
                     bot_id: bot_id.clone(),
-                    name: bot_id.clone(),
+                    name: None,
                 },
                 (None, None) => return Err("message_changed event had no author".into()),
             };
@@ -1147,10 +1217,7 @@ fn parse_message_event(event: SlackEvent) -> Result<Option<SlackMessage>, String
         }
         Some("bot_message") => {
             let bot_id = event.bot_id.ok_or("bot_message event had no bot_id")?;
-            let name = event
-                .username
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| bot_id.clone());
+            let name = event.username.filter(|name| !name.is_empty());
             (
                 Sender::Bot {
                     bot_id: bot_id.clone(),
@@ -1165,11 +1232,11 @@ fn parse_message_event(event: SlackEvent) -> Result<Option<SlackMessage>, String
                 (Some(user), _) => Sender::User(user),
                 (None, Some(bot_id)) => Sender::Bot {
                     bot_id: bot_id.clone(),
-                    name: bot_id.clone(),
+                    name: None,
                 },
                 (None, None) => Sender::Bot {
                     bot_id: String::new(),
-                    name: "slack".into(),
+                    name: Some("slack".into()),
                 },
             };
             (sender, Content::Unrelayed(other.to_string()), event.bot_id)
@@ -1223,42 +1290,192 @@ fn false_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D
 }
 
 impl<T> SlackResponse<T> {
-    fn into_result(self) -> Result<T, String> {
+    fn into_result(self) -> Result<T, SlackError> {
         match self {
             Self::Success(response) => Ok(response.value),
-            Self::Failure(response) => {
-                Err(response.error.unwrap_or_else(|| "slack api error".into()))
+            Self::Failure(response) => Err(SlackError::from_code(response.error.as_deref())),
+        }
+    }
+}
+
+/// Why a Slack Web API call failed, decoded once, where its response is read.
+/// Slack answers most refusals `200 {"ok": false, "error": "<code>"}`, and
+/// what a retry can do about one depends on the code: a server-side hiccup
+/// clears by itself, while a revoked token, a missing scope or the wrong kind
+/// of token is answered the same way on every attempt until the owner changes
+/// the app. Only the token codes used to park the network; every other code
+/// reconnected on the transient schedule forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlackError {
+    /// The token itself was refused: the credentials, parked at once.
+    Auth(&'static str),
+    /// The app or its token cannot make this call, whatever is retried: a
+    /// scope it was not granted, the wrong kind of token for the method, a
+    /// request Slack reads as malformed. Only the owner can change it.
+    OwnerMustFix(&'static str),
+    /// An answer about the channel the call named.
+    Channel(ChannelRefusal),
+    /// Slack asked for this long before the next call.
+    RateLimited(Duration),
+    /// What a retry may clear: a transport failure, an HTTP error status, a
+    /// body that is not Slack's envelope, Slack's own server errors, and any
+    /// code this bridge does not know (logged by name).
+    Retryable(String),
+}
+
+/// What `conversations.info` can say about a configured channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelRefusal {
+    NotFound,
+    NotInChannel,
+    Archived,
+}
+
+/// Slack error codes that refuse the token itself.
+const AUTH_ERRORS: &[&str] = &[
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "invalid_token",
+    "no_permission",
+    "org_login_required",
+    "ekm_access_denied",
+];
+
+/// Slack error codes only a change to the app or its token clears.
+const OWNER_MUST_FIX_ERRORS: &[&str] = &[
+    "missing_scope",
+    "not_allowed_token_type",
+    "invalid_arguments",
+    "invalid_arg_name",
+    "invalid_array_arg",
+    "invalid_charset",
+    "invalid_form_data",
+    "invalid_post_type",
+    "missing_post_type",
+    "method_deprecated",
+    "deprecated_endpoint",
+    "access_denied",
+    "team_access_not_granted",
+    "two_factor_setup_required",
+    "enterprise_is_restricted",
+    "restricted_action",
+];
+
+impl SlackError {
+    /// The error `code` of an `ok: false` answer.
+    fn from_code(code: Option<&str>) -> Self {
+        let Some(code) = code else {
+            return Self::Retryable("Slack answered ok=false without an error code".into());
+        };
+        let known = |table: &[&'static str]| table.iter().copied().find(|known| *known == code);
+        if let Some(code) = known(AUTH_ERRORS) {
+            return Self::Auth(code);
+        }
+        if let Some(code) = known(OWNER_MUST_FIX_ERRORS) {
+            return Self::OwnerMustFix(code);
+        }
+        match code {
+            "channel_not_found" => Self::Channel(ChannelRefusal::NotFound),
+            "not_in_channel" => Self::Channel(ChannelRefusal::NotInChannel),
+            "is_archived" => Self::Channel(ChannelRefusal::Archived),
+            "ratelimited" => Self::RateLimited(super::RATE_LIMIT_UNSTATED_WAIT),
+            other => Self::Retryable(format!(
+                "Slack answered {}",
+                e6irc_client::bounded_diagnostic(other)
+            )),
+        }
+    }
+
+    /// What this failure of the call `what` ends a session with.
+    fn into_outcome(self, what: &str) -> super::SessionOutcome {
+        use super::{NetworkFailure, SessionOutcome};
+        match self {
+            Self::Auth(code) => {
+                eprintln!("slack: {what}: {code} (auth rejected; will stop retrying)");
+                SessionOutcome::AuthRejected(None)
+            }
+            Self::OwnerMustFix(code) => {
+                let diagnostic = format!(
+                    "Slack refused {what} with {code}: the app or its token must be changed \
+                     (a scope, the token type, or the request)"
+                );
+                eprintln!("slack: {diagnostic}");
+                SessionOutcome::ConfigurationRejected(super::ConfigurationRefusal::new(
+                    NetworkFailure::GatewayConfigurationRefused,
+                    &diagnostic,
+                ))
+            }
+            Self::RateLimited(wait) => {
+                eprintln!("slack: {what}: rate-limited; waiting {wait:?} before the next attempt");
+                SessionOutcome::DroppedFor {
+                    failure: NetworkFailure::UpstreamRequestFailed,
+                    at_least: wait,
+                }
+            }
+            error @ (Self::Channel(_) | Self::Retryable(_)) => {
+                eprintln!("slack: {what} failed: {error}");
+                SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
             }
         }
     }
 }
 
-async fn decode_slack_response<T: DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T, String> {
-    response
+impl std::fmt::Display for SlackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auth(code) | Self::OwnerMustFix(code) => write!(f, "Slack answered {code}"),
+            Self::Channel(ChannelRefusal::NotFound) => {
+                f.write_str("Slack answered channel_not_found")
+            }
+            Self::Channel(ChannelRefusal::NotInChannel) => {
+                f.write_str("Slack answered not_in_channel")
+            }
+            Self::Channel(ChannelRefusal::Archived) => f.write_str("Slack answered is_archived"),
+            Self::RateLimited(wait) => write!(f, "Slack rate-limited the call ({wait:?})"),
+            Self::Retryable(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl From<super::BridgeFailure> for SlackError {
+    fn from(failure: super::BridgeFailure) -> Self {
+        match failure {
+            super::BridgeFailure::RateLimited(wait) => Self::RateLimited(wait),
+            failure @ (super::BridgeFailure::Status(_) | super::BridgeFailure::Failed(_)) => {
+                Self::Retryable(failure.to_string())
+            }
+        }
+    }
+}
+
+impl From<String> for SlackError {
+    fn from(detail: String) -> Self {
+        Self::Retryable(detail)
+    }
+}
+
+impl From<SlackError> for super::BridgeFailure {
+    fn from(error: SlackError) -> Self {
+        match error {
+            SlackError::RateLimited(wait) => Self::RateLimited(wait),
+            error => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+/// Send one Web API call and decode Slack's envelope: the one path every call
+/// takes, so the HTTP status is read ([`super::BridgeRequest::send`]) before
+/// the body, and the body's `ok: false` becomes a [`SlackError`].
+async fn slack_send<T: DeserializeOwned>(request: super::BridgeRequest) -> Result<T, SlackError> {
+    request
+        .send()
+        .await?
         .bounded_json::<SlackResponse<T>>()
         .await?
         .into_result()
-}
-
-fn slack_failure(context: &str, err: &str) -> super::SessionOutcome {
-    const AUTH_ERRORS: &[&str] = &[
-        "invalid_auth",
-        "not_authed",
-        "account_inactive",
-        "token_revoked",
-        "token_expired",
-        "invalid_token",
-        "no_permission",
-    ];
-    if AUTH_ERRORS.contains(&err) {
-        eprintln!("slack: {context}: {err} (auth rejected; will stop retrying)");
-        super::SessionOutcome::AuthRejected(None)
-    } else {
-        eprintln!("slack: {context}: {err}");
-        super::SessionOutcome::Dropped(super::NetworkFailure::UpstreamRequestFailed)
-    }
 }
 
 /// A Web API method called with `POST` and the bot token, decoded.
@@ -1267,13 +1484,10 @@ async fn slack_call<T: DeserializeOwned>(
     base: &str,
     token: &str,
     method: &str,
-) -> Result<T, String> {
-    decode_slack_response(
-        super::bridge_send(
-            http.post(&format!("{base}/{method}"))?
-                .header("Authorization", format!("Bearer {token}")),
-        )
-        .await?,
+) -> Result<T, SlackError> {
+    slack_send(
+        http.post(&format!("{base}/{method}"))?
+            .header("Authorization", format!("Bearer {token}")),
     )
     .await
 }
@@ -1282,21 +1496,15 @@ async fn open_socket(
     http: &super::BridgeHttp,
     base: &str,
     app_token: &str,
-) -> Result<String, String> {
+) -> Result<String, SlackError> {
     #[derive(serde::Deserialize)]
     struct SocketOpen {
         url: String,
     }
 
-    decode_slack_response::<SocketOpen>(
-        http.post(&format!("{base}/apps.connections.open"))?
-            .header("Authorization", format!("Bearer {app_token}"))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?,
-    )
-    .await
-    .map(|response| response.url)
+    slack_call::<SocketOpen>(http, base, app_token, "apps.connections.open")
+        .await
+        .map(|response| response.url)
 }
 
 async fn fetch_channel_name(
@@ -1304,7 +1512,7 @@ async fn fetch_channel_name(
     base: &str,
     bot_token: &str,
     id: &str,
-) -> Result<String, String> {
+) -> Result<String, SlackError> {
     #[derive(serde::Deserialize)]
     struct ChannelInfo {
         channel: SlackChannel,
@@ -1323,7 +1531,9 @@ async fn fetch_channel_name(
     )
     .await?;
     if response.channel.name.is_empty() {
-        Err(format!("conversations.info for {id} had an empty name"))
+        Err(SlackError::Retryable(format!(
+            "conversations.info for {id} had an empty name"
+        )))
     } else {
         Ok(response.channel.name)
     }
@@ -1335,14 +1545,11 @@ async fn slack_get_json<T: DeserializeOwned>(
     token: &str,
     method: &str,
     query: &[(&str, &str)],
-) -> Result<T, String> {
-    decode_slack_response(
+) -> Result<T, SlackError> {
+    slack_send(
         http.get(&format!("{base}/{method}"))?
             .header("Authorization", format!("Bearer {token}"))
-            .query(query)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?,
+            .query(query),
     )
     .await
 }
@@ -1352,7 +1559,7 @@ async fn fetch_user_name(
     base: &str,
     bot_token: &str,
     id: &str,
-) -> Result<String, String> {
+) -> Result<String, SlackError> {
     #[derive(serde::Deserialize)]
     struct UserInfo {
         user: SlackUser,
@@ -1382,7 +1589,7 @@ async fn fetch_user_name(
     .into_iter()
     .flatten()
     .find(|name| !name.is_empty())
-    .ok_or_else(|| format!("users.info for {id} had no name"))
+    .ok_or_else(|| SlackError::Retryable(format!("users.info for {id} had no name")))
 }
 
 async fn post_message(
@@ -1408,7 +1615,7 @@ async fn post_message(
     #[derive(serde::Deserialize)]
     struct Accepted {}
 
-    decode_slack_response::<Accepted>(super::bridge_send(req).await?).await?;
+    slack_send::<Accepted>(req).await?;
     Ok(())
 }
 
@@ -1493,7 +1700,7 @@ mod tests {
             m.sender,
             Sender::Bot {
                 bot_id: "B9".into(),
-                name: "deploybot".into()
+                name: Some("deploybot".into())
             }
         );
         assert_eq!(m.bot_id.as_deref(), Some("B9"));
@@ -1681,7 +1888,132 @@ mod tests {
             "error": "not_authed"
         }))
         .expect("failure response");
-        assert_eq!(parsed.into_result(), Err("not_authed".to_string()));
+        assert_eq!(parsed.into_result(), Err(SlackError::Auth("not_authed")));
+    }
+
+    /// A Slack error is classified once, where the answer is read: the token
+    /// codes are refused credentials, the codes only the owner can clear
+    /// (a scope, the token type, a request Slack reads as malformed) park the
+    /// network at once, a rate limit waits what it asks, and the rest is
+    /// retried. Only the token codes used to stop the retries; a missing
+    /// scope reconnected forever.
+    #[test]
+    fn slack_errors_are_classified_where_they_are_read() {
+        use crate::bouncer::{NetworkFailure, SessionOutcome};
+        use e6irc_client::RefusalRetry;
+        assert_eq!(
+            SlackError::from_code(Some("token_revoked")),
+            SlackError::Auth("token_revoked")
+        );
+        for code in [
+            "missing_scope",
+            "not_allowed_token_type",
+            "invalid_arguments",
+        ] {
+            assert_eq!(
+                SlackError::from_code(Some(code)),
+                SlackError::OwnerMustFix(code)
+            );
+            match SlackError::from_code(Some(code)).into_outcome("auth.test") {
+                SessionOutcome::ConfigurationRejected(refusal) => {
+                    assert_eq!(
+                        refusal.failure(),
+                        NetworkFailure::GatewayConfigurationRefused
+                    );
+                    assert_eq!(refusal.retry_policy(), RefusalRetry::ParkNow);
+                    assert!(refusal.diagnostic().contains(code), "{refusal:?}");
+                }
+                _ => panic!("{code} was retried"),
+            }
+        }
+        assert_eq!(
+            SlackError::from_code(Some("channel_not_found")),
+            SlackError::Channel(ChannelRefusal::NotFound)
+        );
+        assert!(matches!(
+            SlackError::from_code(Some("ratelimited")),
+            SlackError::RateLimited(_)
+        ));
+        for retryable in [Some("fatal_error"), Some("some_new_code"), None] {
+            assert!(
+                matches!(SlackError::from_code(retryable), SlackError::Retryable(_)),
+                "{retryable:?}"
+            );
+            assert!(matches!(
+                SlackError::from_code(retryable).into_outcome("auth.test"),
+                SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
+            ));
+        }
+        assert!(matches!(
+            SlackError::RateLimited(Duration::from_secs(7)).into_outcome("auth.test"),
+            SessionOutcome::DroppedFor { at_least, .. } if at_least == Duration::from_secs(7)
+        ));
+    }
+
+    /// A message's sender is looked up, and then at most
+    /// `MAX_MENTION_LOOKUPS` of its mentions, counted on their own: a bot's
+    /// message, with no sender to look up, used to be allowed one more.
+    #[test]
+    fn mention_lookups_are_counted_apart_from_the_sender() {
+        let mentions: String = (0..20).map(|index| format!("<@M{index}> ")).collect();
+        let mut message = SlackMessage {
+            channel: "C1".into(),
+            sender: Sender::Bot {
+                bot_id: "B1".into(),
+                name: Some("bot".into()),
+            },
+            bot_id: Some("B1".into()),
+            content: Content::Message(mentions),
+        };
+        assert_eq!(wanted_names(&message).len(), MAX_MENTION_LOOKUPS);
+        message.sender = Sender::User("U1".into());
+        let wanted = wanted_names(&message);
+        assert_eq!(wanted.len(), MAX_MENTION_LOOKUPS + 1);
+        assert_eq!(wanted[0], "U1");
+    }
+
+    /// An edit names a bot by its id alone. Taken as its name, the id renamed
+    /// the bot for its edit and back again on its next message; the bot keeps
+    /// the nick it is shown under.
+    #[test]
+    fn a_bot_keeps_its_nick_through_its_edits() {
+        let names = UserNames::default();
+        let channels = HashMap::from([("C1".to_string(), "#general".to_string())]);
+        let mut senders = crate::bouncer::BridgedSenders::new(slack_account("U0", "e6ircbot"));
+        let render = |raw: serde_json::Value, senders: &mut crate::bouncer::BridgedSenders| {
+            render_message(
+                &message_of(event(raw)),
+                "#general",
+                &names,
+                &channels,
+                senders,
+            )
+            .into_iter()
+            .collect::<Vec<_>>()
+        };
+        let posted = serde_json::json!({ "type": "message", "subtype": "bot_message",
+            "channel": "C1", "bot_id": "B9", "username": "deploybot", "text": "deployed" });
+        let edited = serde_json::json!({ "type": "message", "subtype": "message_changed",
+            "channel": "C1", "message": { "bot_id": "B9", "text": "deployed twice" },
+            "previous_message": { "bot_id": "B9", "text": "deployed" } });
+        assert_eq!(
+            render(posted.clone(), &mut senders),
+            [":deploybot!B9@slack PRIVMSG #general :deployed"]
+        );
+        assert_eq!(
+            render(edited.clone(), &mut senders),
+            [":deploybot!B9@slack PRIVMSG #general :* deployed twice"]
+        );
+        assert_eq!(
+            render(posted, &mut senders),
+            [":deploybot!B9@slack PRIVMSG #general :deployed"]
+        );
+        // A bot not yet shown is named by its id until it names itself.
+        let mut fresh = crate::bouncer::BridgedSenders::new(slack_account("U0", "e6ircbot"));
+        assert_eq!(
+            render(edited, &mut fresh),
+            [":B9!B9@slack PRIVMSG #general :* deployed twice"]
+        );
     }
 
     #[test]
@@ -1692,7 +2024,9 @@ mod tests {
                     .identity(slack_account("U1", "U1")),
                 "#general",
                 &crate::bouncer::Inbound::message("hi")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":U1!U1@slack PRIVMSG #general :hi"]
         );
         let mut map = HashMap::new();
@@ -2008,6 +2342,81 @@ mod tests {
                 line(&mut b.events).await.ends_with(":three"),
                 "the re-sent envelope was relayed a second time"
             );
+        }
+
+        /// A `users.info` answered `429` is not asked again until its wait is
+        /// over: a failed lookup is not cached, so every message asked a
+        /// rate-limited Slack again — and the `429` itself used to go unread,
+        /// its JSON body taken for an ordinary refusal.
+        #[tokio::test]
+        async fn a_rate_limited_name_lookup_waits_before_the_next_one() {
+            let mut b = bridge(Options {
+                rate_limit_user_lookups: true,
+                ..Options::default()
+            })
+            .await;
+            b.oracle
+                .send(0, slack_envelope("env-1", slack_message("one")));
+            assert_eq!(
+                line(&mut b.events).await,
+                ":U1!U1@slack PRIVMSG #general :one"
+            );
+            b.oracle.send(
+                0,
+                slack_envelope(
+                    "env-2",
+                    json!({ "type": "message", "channel": "C1", "user": "U2", "text": "two" }),
+                ),
+            );
+            assert_eq!(
+                line(&mut b.events).await,
+                ":U2!U2@slack PRIVMSG #general :two"
+            );
+            let mut lookups = Vec::new();
+            while let Ok(event) = b.oracle.events.try_recv() {
+                if let OracleEvent::UserLookup(user) = event {
+                    lookups.push(user);
+                }
+            }
+            assert_eq!(lookups, ["U1"], "a rate-limited Slack was asked again");
+        }
+
+        /// An error status is a failed call whatever its body says: a 503
+        /// carrying `{"ok": true, …}` used to be read as the answer.
+        #[tokio::test]
+        async fn an_error_status_is_a_failed_call_whatever_its_body_says() {
+            let oracle = manual(Options::default()).await;
+            let shared = Shared::new(config(&oracle, &["C503"]));
+            let (_handle, mut ends) = NetworkHandle::channels(8);
+            assert!(matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    session_once(&shared, &mut ends)
+                )
+                .await
+                .expect("the 503 was read as an answer, and the session began"),
+                SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
+            ));
+        }
+
+        /// A scope the app was not granted is answered the same way on every
+        /// attempt: the network parks at once instead of reconnecting forever.
+        #[tokio::test]
+        async fn a_missing_scope_parks_instead_of_retrying() {
+            let oracle = manual(Options::default()).await;
+            let shared = Shared::new(config(&oracle, &["CSCOPE"]));
+            let (_handle, mut ends) = NetworkHandle::channels(8);
+            match session_once(&shared, &mut ends).await {
+                SessionOutcome::ConfigurationRejected(refusal) => {
+                    assert_eq!(refusal.retry_policy(), e6irc_client::RefusalRetry::ParkNow);
+                    assert!(
+                        refusal.diagnostic().contains("missing_scope")
+                            && refusal.diagnostic().contains("CSCOPE"),
+                        "{refusal:?}"
+                    );
+                }
+                _ => panic!("a missing scope was retried"),
+            }
         }
 
         /// A failed name lookup is not remembered as the name.

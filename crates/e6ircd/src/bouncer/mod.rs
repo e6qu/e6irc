@@ -433,10 +433,15 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
             let token = required_secret(sasl_password, "a bot token", 512)?;
             #[cfg(feature = "discord")]
             {
+                let channels = bridged()
+                    .iter()
+                    .map(|channel| discord::DiscordChannelId::parse(channel))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("kind=discord has an invalid channel: {error}"))?;
                 Ok(Box::new(DiscordDriver::new(DiscordConfig {
                     token,
                     api_base: addr,
-                    channels: bridged(),
+                    channels,
                     buffer_cap,
                     internal_upstreams,
                 })))
@@ -730,9 +735,9 @@ pub(crate) enum SessionOutcome {
     ReconnectRequested,
     /// [`Self::Dropped`], and the upstream named how long the next attempt
     /// must wait at the least (Discord's op 9: a fresh IDENTIFY only after a
-    /// random one to five seconds). The runner waits the longer of that and
-    /// its own backoff.
-    #[cfg(feature = "discord")]
+    /// random one to five seconds; a Slack Web API call answered `429` with
+    /// its wait). The runner waits the longer of that and its own backoff.
+    #[cfg(any(feature = "discord", feature = "slack"))]
     DroppedFor {
         failure: NetworkFailure,
         at_least: std::time::Duration,
@@ -1063,12 +1068,18 @@ async fn idle_until<C>(
 ) -> bool {
     let mut stop = std::pin::pin!(ends.stop_signal());
     let mut until = std::pin::pin!(until);
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    let pacer = ends.pacer();
     loop {
         tokio::select! {
             biased;
             () = &mut stop => return false,
             () = &mut until => return true,
-            report = carried.next() => report(ends),
+            report = async {
+                #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+                pacer.wait().await;
+                carried.next().await
+            } => report(ends),
         }
     }
 }
@@ -1174,7 +1185,7 @@ pub(crate) async fn run_with_backoff_carrying<C>(
                 return;
             }
             SessionOutcome::Dropped(failure) => (failure, None, std::time::Duration::ZERO),
-            #[cfg(feature = "discord")]
+            #[cfg(any(feature = "discord", feature = "slack"))]
             SessionOutcome::DroppedFor { failure, at_least } => (failure, None, at_least),
             SessionOutcome::ClosedByUpstream(closed) => (
                 NetworkFailure::ConnectionLost,
@@ -1542,7 +1553,12 @@ where
 {
     let failed = |id: String, failure: BridgeFailure| match failure {
         BridgeFailure::RateLimited(retry_after) => DeliveryOutcome::RateLimited { id, retry_after },
-        BridgeFailure::Failed(detail) => DeliveryOutcome::Failed { id, detail },
+        failure @ (BridgeFailure::Status(_) | BridgeFailure::Failed(_)) => {
+            DeliveryOutcome::Failed {
+                id,
+                detail: failure.to_string(),
+            }
+        }
     };
     match deliver(id.clone(), text.clone()).await {
         Ok(()) => DeliveryOutcome::Delivered(echo),
@@ -1714,11 +1730,15 @@ where
     Fut: Future<Output = CarriedReport>,
 {
     let mut work = std::pin::pin!(work);
+    let pacer = ends.pacer();
     loop {
         tokio::select! {
             biased;
             out = &mut work => return out,
-            report = next() => report(ends),
+            report = async {
+                pacer.wait().await;
+                next().await
+            } => report(ends),
         }
     }
 }
@@ -1791,7 +1811,9 @@ impl CarriedDeliveries {
 /// connector dials the literal directly. So the `reqwest::Client` is private,
 /// and every request starts in [`BridgeHttp::request`], which judges the URL's
 /// host against the same policy before the client sees it. There is no other
-/// way to build a bridge request, so no caller can forget the literal check.
+/// way to build a bridge request, so no caller can forget the literal check —
+/// and what it builds is a [`BridgeRequest`], whose only send reads the
+/// status, so no caller can forget that either.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Clone)]
 pub(crate) struct BridgeHttp {
@@ -1828,7 +1850,7 @@ impl BridgeHttp {
         &self,
         method: reqwest::Method,
         url: &str,
-    ) -> Result<reqwest::RequestBuilder, String> {
+    ) -> Result<BridgeRequest, String> {
         let url = reqwest::Url::parse(url).map_err(|e| format!("bridge request URL: {e}"))?;
         if let Some(refusal) = self.internal_upstreams.refusal_for_url(&url) {
             return Err(refusal.reason().to_string());
@@ -1841,22 +1863,74 @@ impl BridgeHttp {
                     .into(),
             );
         }
-        Ok(self.client.request(method, url))
+        Ok(BridgeRequest(self.client.request(method, url)))
     }
 
-    pub(crate) fn get(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+    pub(crate) fn get(&self, url: &str) -> Result<BridgeRequest, String> {
         self.request(reqwest::Method::GET, url)
     }
 
-    pub(crate) fn post(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+    pub(crate) fn post(&self, url: &str) -> Result<BridgeRequest, String> {
         self.request(reqwest::Method::POST, url)
     }
 
     /// Only the Matrix bridge sends with PUT (the transaction id is in the
     /// path); the `lint` job builds each bridge alone with `-Dwarnings`.
     #[cfg(feature = "matrix")]
-    pub(crate) fn put(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+    pub(crate) fn put(&self, url: &str) -> Result<BridgeRequest, String> {
         self.request(reqwest::Method::PUT, url)
+    }
+}
+
+/// A bridge request being built. Its one send, [`BridgeRequest::send`], reads
+/// the status before anything else sees the response: a bare
+/// `reqwest::RequestBuilder::send` returns `Ok` for a 3xx, a 429 or a 5xx just
+/// as for a 200, and a caller that went on to decode the body accepted a
+/// redirect's or an error page's JSON and ignored a rate limit's wait. The
+/// Slack Web API calls did exactly that until this type left no other way to
+/// send.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug)]
+#[must_use = "a bridge request does nothing until it is sent"]
+pub(crate) struct BridgeRequest(reqwest::RequestBuilder);
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl BridgeRequest {
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    pub(crate) fn header(self, name: &'static str, value: String) -> Self {
+        Self(self.0.header(name, value))
+    }
+
+    #[cfg(feature = "matrix")]
+    pub(crate) fn bearer_auth(self, token: &str) -> Self {
+        Self(self.0.bearer_auth(token))
+    }
+
+    pub(crate) fn json<T: serde::Serialize + ?Sized>(self, body: &T) -> Self {
+        Self(self.0.json(body))
+    }
+
+    #[cfg(any(feature = "matrix", feature = "slack"))]
+    pub(crate) fn query<T: serde::Serialize + ?Sized>(self, query: &T) -> Self {
+        Self(self.0.query(query))
+    }
+
+    /// Send the request; anything but a success status is a failure. A 3xx is
+    /// one too: the client never follows it (an upstream cannot re-target a
+    /// request at an internal address), and a message "sent" with a 302 was
+    /// never posted. A `429` is [`BridgeFailure::RateLimited`] with the wait it
+    /// asks for; any other status is [`BridgeFailure::Status`], for a caller
+    /// that gives statuses a meaning (a refused token, a room it may not join).
+    pub(crate) async fn send(self) -> Result<reqwest::Response, BridgeFailure> {
+        let response = self.0.send().await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(BridgeFailure::RateLimited(rate_limit_wait(response).await));
+        }
+        if !status.is_success() {
+            return Err(BridgeFailure::Status(status));
+        }
+        Ok(response)
     }
 }
 
@@ -2282,6 +2356,9 @@ pub(crate) enum BridgeFailure {
     /// the message, and a sync loop can pause instead of reconnecting — the
     /// reconnect re-did every join, the very writes being limited.
     RateLimited(std::time::Duration),
+    /// The upstream answered with this status, which is neither a success
+    /// nor a `429` (a 3xx included: a bridge never follows one).
+    Status(reqwest::StatusCode),
     /// Anything else, in e6irc's own words (never the provider's body).
     Failed(String),
 }
@@ -2291,6 +2368,11 @@ impl std::fmt::Display for BridgeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RateLimited(wait) => write!(f, "upstream rate limit; retry after {wait:?}"),
+            Self::Status(status) if status.is_redirection() => write!(
+                f,
+                "upstream answered HTTP {status}; a bridge never follows a redirect"
+            ),
+            Self::Status(status) => write!(f, "upstream answered HTTP {status}"),
             Self::Failed(detail) => f.write_str(detail),
         }
     }
@@ -2357,50 +2439,6 @@ async fn rate_limit_wait(response: reqwest::Response) -> std::time::Duration {
         .min(RATE_LIMIT_WAIT_CEILING)
 }
 
-/// Send an outbound bridge HTTP request and reject any non-2xx response. Every
-/// reverse-direction (IRC→upstream) send whose failure is signalled by HTTP
-/// status funnels through here so the raw `reqwest::Response` never reaches
-/// delivery-outcome logic: a bare `.send()` returns `Ok(Response)` for a 403 /
-/// 429 / 5xx just as for a 200, and treating that as delivered is a silent drop
-/// (DESIGN §2). Routing through this makes "send, ignore the status, report
-/// success" unwritable. (Slack signals failure in the 200 body via `ok:false`,
-/// an application-level check its `check_ok` still performs on top of this.)
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) async fn bridge_send(
-    req: reqwest::RequestBuilder,
-) -> Result<reqwest::Response, BridgeFailure> {
-    bridge_response_status(req.send().await.map_err(|e| e.to_string())?).await
-}
-
-/// A bridge response that is not a success is a failed request. A 3xx is
-/// named as such: the client never follows one (an upstream cannot re-target
-/// a request at an internal address), and `error_for_status` alone let it
-/// through — a message "sent" with a 302 was reported delivered and never
-/// posted. A `429` is [`BridgeFailure::RateLimited`] with the wait it asks for.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) async fn bridge_response_status(
-    response: reqwest::Response,
-) -> Result<reqwest::Response, BridgeFailure> {
-    let status = response.status();
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(BridgeFailure::RateLimited(rate_limit_wait(response).await));
-    }
-    if status.is_redirection() {
-        return Err(BridgeFailure::Failed(format!(
-            "upstream answered HTTP {status}; a bridge never follows a redirect"
-        )));
-    }
-    let response = response.error_for_status().map_err(|e| e.to_string())?;
-    if response.status().is_success() {
-        Ok(response)
-    } else {
-        Err(BridgeFailure::Failed(format!(
-            "upstream answered HTTP {}",
-            response.status()
-        )))
-    }
-}
-
 /// What a request that presents the network's credentials asks about, which
 /// decides what a refusal of it means (see [`bridge_send_credentials`]).
 #[cfg(any(feature = "matrix", feature = "discord"))]
@@ -2418,26 +2456,30 @@ pub(crate) enum CredentialRequest<'a> {
     DiscordChannel(&'a str),
 }
 
-/// [`bridge_send`] for a request that presents the network's credentials,
-/// classified by what it asks about. Written once so every bridge reads the
-/// same statuses the same way — the Discord channel lookup used to call a
-/// refused token a transient failure while the gateway's refusal of the same
-/// token parked the network, and then called a channel the bot could not see
-/// a refused token.
+/// [`BridgeRequest::send`] for a request that presents the network's
+/// credentials, classified by what it asks about. Written once so every bridge
+/// reads the same statuses the same way — the Discord channel lookup used to
+/// call a refused token a transient failure while the gateway's refusal of the
+/// same token parked the network, and then called a channel the bot could not
+/// see a refused token.
 #[cfg(any(feature = "matrix", feature = "discord"))]
 pub(crate) async fn bridge_send_credentials(
-    req: reqwest::RequestBuilder,
+    req: BridgeRequest,
     request: CredentialRequest<'_>,
 ) -> Result<reqwest::Response, ConnectFail> {
     use reqwest::StatusCode;
-    let response = req.send().await.map_err(|e| e.to_string())?;
-    let status = response.status();
-    bridge_response_status(response)
-        .await
-        .map_err(|failure| match request {
+    req.send().await.map_err(|failure| {
+        let status = match &failure {
+            BridgeFailure::Status(status) => Some(*status),
+            BridgeFailure::RateLimited(_) | BridgeFailure::Failed(_) => None,
+        };
+        match request {
             CredentialRequest::Identity(what) => {
                 let detail = format!("{what} rejected: {failure}");
-                if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                if matches!(
+                    status,
+                    Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                ) {
                     ConnectFail::Auth(detail)
                 } else {
                     ConnectFail::Transient(detail)
@@ -2452,20 +2494,21 @@ pub(crate) async fn bridge_send_credentials(
                     ))
                 };
                 match status {
-                    StatusCode::UNAUTHORIZED => {
+                    Some(StatusCode::UNAUTHORIZED) => {
                         ConnectFail::Auth(format!("channel {id} lookup rejected: {failure}"))
                     }
-                    StatusCode::FORBIDDEN => unmappable(format!(
+                    Some(StatusCode::FORBIDDEN) => unmappable(format!(
                         "the bot cannot see Discord channel {id} (HTTP 403): it is not in that \
                          channel's server, or may not view the channel"
                     )),
-                    StatusCode::NOT_FOUND => {
+                    Some(StatusCode::NOT_FOUND) => {
                         unmappable(format!("Discord has no channel {id} (HTTP 404)"))
                     }
                     _ => ConnectFail::Transient(format!("channel {id} lookup failed: {failure}")),
                 }
             }
-        })
+        }
+    })
 }
 
 /// A WebSocket bridge's whole downstream arm: route the client's command to its
@@ -4388,31 +4431,92 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
     format!(":*bnc* NOTICE * :not delivered to {platform}: {reason}")
 }
 
-/// Render a bridged message as one or more IRC lines — `PRIVMSG`, a CTCP
-/// `ACTION`, or a `NOTICE`, as the [`Inbound`] says: the sender is shown as
-/// `who` (from the session's [`BridgedSenders`]) and the body is split to fit
-/// the line limit.
+/// The most IRC lines one bridged message is shown in. Remote text is free
+/// form and long — a Matrix event runs to 64 KiB, a Slack message to 40,000
+/// characters, a Discord one to 4,000, and each newline in it is a line of its
+/// own — while every line lands on each attached client and in the backlog. A
+/// message of two thousand newlines used to overflow the network's event
+/// broadcast by itself: every attached client was detached as too slow and
+/// the backlog lost the lines. Sixteen lines of up to ~450 bytes each is some
+/// 7 KB — a long paste still reads, and one message is a small part of what
+/// the broadcast holds ([`BRIDGE_PACING_HIGH_WATER`] is 512 lines).
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+pub(crate) const MAX_BRIDGED_LINES: usize = 16;
+
+/// The IRC lines one bridged message is shown as: at most
+/// [`MAX_BRIDGED_LINES`] of it, then — when there was more — one `*bnc*`
+/// notice saying how many lines were not shown. Built only by
+/// [`render_bridged`] and [`BridgedLines::notice`], so what a driver relays for
+/// one message is bounded by construction.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+#[derive(Debug)]
+pub(crate) struct BridgedLines(Vec<String>);
+
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+impl BridgedLines {
+    /// A message shown as one notice (one the bridge cannot show, say).
+    pub(crate) fn notice(line: String) -> Self {
+        Self(vec![line])
+    }
+}
+
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+impl IntoIterator for BridgedLines {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// `line` cut into pieces of at most `budget` bytes, on character boundaries;
+/// a character wider than the budget is a piece of its own.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+fn pieces_within(line: &str, budget: usize) -> impl Iterator<Item = &str> {
+    let mut rest = line;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut cut = budget.min(rest.len());
+        while cut > 0 && !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == 0 {
+            cut = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
+        }
+        let (piece, after) = rest.split_at(cut);
+        rest = after;
+        Some(piece)
+    })
+}
+
+/// Render a bridged message as IRC lines — `PRIVMSG`, a CTCP `ACTION`, or a
+/// `NOTICE`, as the [`Inbound`] says: the sender is shown as `who` (from the
+/// session's [`BridgedSenders`]).
 ///
-/// The body is free-form remote text of arbitrary length — Slack alone allows
-/// 40,000 characters — while an IRC line is [`MAX_LINE_LEN`] bytes including
-/// its CRLF. Emitting one over-long line does not merely bend the protocol: the
+/// Each line of the body is a line on IRC: they are line breaks in the source
+/// medium, and [`crate::sanitize::upstream_line`] flattens a newline to a space
+/// further down, which would turn a multi-line message into one run-on line. A
+/// blank line is left out — IRC has no empty message to show it as, and a run
+/// of them only spent the bound below. A line longer than an IRC line
+/// ([`e6irc_proto::message::MAX_LINE_LEN`] bytes with its CRLF) is split: the
 /// receiving client's framing discards an over-long line *whole*, so the
-/// message vanishes with nothing said. It is split instead, because a bridged
-/// message must not disappear for being long. Each piece of an action is its
-/// own complete `ACTION`.
+/// message would vanish with nothing said. Each piece of an action is its own
+/// complete `ACTION`.
 ///
-/// Embedded newlines split too. They are line breaks in the source medium, and
-/// [`crate::sanitize::upstream_line`] flattens them to spaces further down, which would
-/// turn a multi-line message into one run-on line.
-///
-/// An empty body still yields one line: a message was sent, and saying nothing
-/// about it would be the silent drop this exists to prevent.
+/// At most [`MAX_BRIDGED_LINES`] lines are shown; the rest of a longer message
+/// is counted in a `*bnc*` notice after them, never cut off silently. A
+/// message with nothing to show still yields one (empty) line: a message was
+/// sent, and saying nothing about it would be the silent drop this exists to
+/// prevent.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn render_bridged(
     who: &irc_driver::SelfIdentity,
     channel: &str,
     message: &Inbound,
-) -> Vec<String> {
+) -> BridgedLines {
     use e6irc_proto::message::MAX_LINE_LEN;
     let (command, open, close) = match message.kind {
         InboundKind::Message => ("PRIVMSG", "", ""),
@@ -4433,31 +4537,31 @@ pub(crate) fn render_bridged(
     let budget = (MAX_LINE_LEN - 2)
         .saturating_sub(prefix.len() + close.len())
         .max(1);
-
-    let mut out = Vec::new();
-    for piece in message.body.split('\n') {
-        let mut rest = piece;
-        loop {
-            if rest.len() <= budget {
-                out.push(format!("{prefix}{rest}{close}"));
-                break;
-            }
-            // Split on a character boundary — `budget` is a byte count, and
-            // slicing into the middle of a multi-byte character panics.
-            let mut cut = budget;
-            while cut > 0 && !rest.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            // A single character wider than the budget: take it whole rather
-            // than emit an empty line forever.
-            if cut == 0 {
-                cut = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
-            }
-            out.push(format!("{prefix}{}{close}", &rest[..cut]));
-            rest = &rest[cut..];
-        }
+    let mut pieces = message
+        .body
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .flat_map(|line| pieces_within(line, budget));
+    let mut lines: Vec<String> = pieces
+        .by_ref()
+        .take(MAX_BRIDGED_LINES)
+        .map(|piece| format!("{prefix}{piece}{close}"))
+        .collect();
+    if lines.is_empty() {
+        lines.push(format!("{prefix}{close}"));
     }
-    out
+    let hidden = pieces.count();
+    if hidden > 0 {
+        lines.push(bnc_notice(
+            channel,
+            &format!(
+                "… {hidden} more lines of {}'s message not shown (a bridged message is shown \
+                 in at most {MAX_BRIDGED_LINES})",
+                who.nick
+            ),
+        ));
+    }
+    BridgedLines(lines)
 }
 
 /// A `*bnc*` NOTICE to `channel` saying a message from `sender` of a kind the
@@ -4492,6 +4596,32 @@ pub(crate) fn unrelayed_notice(
         &format!("{platform}: a {what} message from {sender} was not relayed"),
     )
 }
+
+/// Events a network's broadcast holds for its slowest live subscriber (an
+/// attached client, the backlog writer). One that falls further behind has
+/// missed lines: a client is detached as too slow, and the backlog writer
+/// records a gap.
+const DRIVER_EVENT_CAPACITY: usize = 1024;
+
+/// The fill past which a bridge waits for its subscribers before relaying the
+/// next message ([`DriverEnds::relay_bridged`]): half the capacity, so one
+/// message — at most [`MAX_BRIDGED_LINES`] lines and a notice — always fits in
+/// the other half.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+const BRIDGE_PACING_HIGH_WATER: usize = DRIVER_EVENT_CAPACITY / 2;
+
+/// How long one pacing wait lasts before the lines go out regardless. A
+/// subscriber that reads nothing for this long is stuck, not slow: waiting on
+/// it would hold every other subscriber (and, for Discord, the heartbeat)
+/// behind it, while letting it fall behind detaches it as too slow — the
+/// ordinary answer to a stuck client.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+const BRIDGE_PACING_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a pacing wait looks at the fill again. A broadcast says nothing
+/// when a subscriber reads, so the wait polls.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+const BRIDGE_PACING_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Outcome of a non-blocking send to a network's shared upstream command queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4845,7 +4975,7 @@ impl NetworkHandle {
         buffer_cap: usize,
         authority: SessionAuthority,
     ) -> (NetworkHandle, DriverEnds) {
-        let (events, _) = tokio::sync::broadcast::channel(1024);
+        let (events, _) = tokio::sync::broadcast::channel(DRIVER_EVENT_CAPACITY);
         // Bounded, not unbounded: the driver drains one command per loop
         // iteration, and during a reconnect wait (up to ~30s of backoff) it
         // doesn't drain at all — an unbounded queue would let an attached client's
@@ -4895,6 +5025,8 @@ impl NetworkHandle {
             rejection_retry_floor: REJECTION_RETRY_FLOOR,
             first_dial_delay: std::time::Duration::ZERO,
             buffered_status: std::sync::Mutex::new(None),
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            bridge: BridgeRelayState::default(),
         };
         (handle, ends)
     }
@@ -5045,6 +5177,85 @@ pub struct DriverEnds {
     first_dial_delay: std::time::Duration,
     /// The connection state whose notice last entered the backlog.
     buffered_status: std::sync::Mutex<Option<DriverConnectionStatus>>,
+    /// What a bridge remembers across its sessions about how it relays.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    bridge: BridgeRelayState,
+}
+
+/// What a bridge's [`DriverEnds`] remembers across sessions about relaying.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Default)]
+struct BridgeRelayState {
+    /// A session of this bridge has begun before: one that begins
+    /// [`SessionStart::Fresh`] after it has lost what was said in between.
+    begun: std::sync::atomic::AtomicBool,
+    /// A pacing wait ran out of patience and the lines went out anyway (see
+    /// [`BridgePacer`]); cleared once the subscribers catch up.
+    overrun: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Waits, before a bridge relays its next message, until the network's
+/// subscribers have room for it. A driver that relays a burst — a resumed
+/// Matrix sync's hundreds of events, a Discord RESUME's replay, Slack's
+/// acknowledged messages finishing their name lookups together — outran them
+/// when it published in a tight loop: the broadcast overflowed, every attached
+/// client was detached as too slow, and the backlog writer lost lines. Past
+/// [`BRIDGE_PACING_HIGH_WATER`] it waits for them, at most
+/// [`BRIDGE_PACING_PATIENCE`] per stall.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Clone)]
+pub(crate) struct BridgePacer {
+    events: tokio::sync::broadcast::Sender<DriverEvent>,
+    overrun: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    runtime: std::sync::Arc<NetworkRuntime>,
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl BridgePacer {
+    /// Wait until the broadcast is below [`BRIDGE_PACING_HIGH_WATER`]. A
+    /// subscriber still behind after [`BRIDGE_PACING_PATIENCE`] is stuck: the
+    /// wait gives up, and until the fill drops again (the stuck subscriber
+    /// detached as too slow, or caught up) no further wait is made — each one
+    /// would only hold the rest behind it again.
+    pub(crate) async fn wait(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.events.len() < BRIDGE_PACING_HIGH_WATER {
+            self.overrun.store(false, Relaxed);
+            return;
+        }
+        if self.overrun.load(Relaxed) {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + BRIDGE_PACING_PATIENCE;
+        while self.events.len() >= BRIDGE_PACING_HIGH_WATER {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!(
+                    "bnc: {} has a subscriber that read nothing for {BRIDGE_PACING_PATIENCE:?}; \
+                     relaying without waiting for it",
+                    self.runtime.label()
+                );
+                self.overrun.store(true, Relaxed);
+                return;
+            }
+            tokio::time::sleep(BRIDGE_PACING_POLL).await;
+        }
+    }
+}
+
+/// Where a bridge session starts reading its provider (see
+/// [`DriverEnds::begin_bridge_session`]).
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionStart {
+    /// Where the previous session stopped: a Matrix sync from its `since`, a
+    /// Discord RESUME. What was said meanwhile is delivered, or the provider
+    /// says how much was cut (a `limited` Matrix timeline).
+    #[cfg(any(feature = "matrix", feature = "discord"))]
+    Resumed,
+    /// From now: a Matrix initial sync (which only establishes a position), a
+    /// Discord IDENTIFY, a Slack socket (Socket Mode keeps no position; what
+    /// Slack re-sends is at its discretion).
+    Fresh,
 }
 
 impl Drop for DriverEnds {
@@ -5146,11 +5357,18 @@ impl DriverEnds {
     /// A channel a client could not be told it is in, or more of them than
     /// [`MAX_TRACKED_CHANNELS`], is a configuration the bridge cannot serve,
     /// and nothing is begun.
+    ///
+    /// A session that begins [`SessionStart::Fresh`] after an earlier one had
+    /// begun could not pick up where that one stopped (a Matrix position the
+    /// homeserver refused, a Discord RESUME refused, any Slack reconnect), so
+    /// what was said in between is not coming. Each bridged channel is told,
+    /// once, here — for every provider, whatever made the position go.
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
     pub(crate) fn begin_bridge_session<'a>(
         &self,
         identity: &irc_driver::SelfIdentity,
         channels: impl IntoIterator<Item = &'a String>,
+        start: SessionStart,
     ) -> Result<(), SessionOutcome> {
         let refused = |detail: &str| {
             SessionOutcome::ConfigurationRejected(ConfigurationRefusal::new(
@@ -5160,7 +5378,8 @@ impl DriverEnds {
         };
         let names = bridge_names();
         let mut bridged = std::collections::HashMap::new();
-        for channel in channels {
+        let channels: Vec<&String> = channels.into_iter().collect();
+        for &channel in &channels {
             let Some(confirmed) = upstream_identity::ConfirmedChannel::parse(channel, &names)
             else {
                 return Err(refused(&format!(
@@ -5185,7 +5404,49 @@ impl DriverEnds {
             self.publish_session(snapshot);
         }
         self.emit(ConnectionEvent::Connected);
+        let followed_a_session = self
+            .bridge
+            .begun
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        if followed_a_session && start == SessionStart::Fresh {
+            for channel in channels {
+                self.emit_line(bnc_notice(
+                    channel,
+                    "the bridge reconnected without resuming where it stopped; messages sent \
+                     while it was disconnected may not have been relayed",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Relay one bridged message: its lines recorded and published in order,
+    /// once the live subscribers have room for them ([`BridgePacer`]).
+    #[cfg(any(feature = "matrix", feature = "discord"))]
+    pub(crate) async fn relay_bridged(&self, lines: BridgedLines) {
+        self.pacer().wait().await;
+        self.emit_bridged(lines);
+    }
+
+    /// Record and publish one bridged message's lines, in order. A driver
+    /// that relays a burst waits on its [`BridgePacer`] between messages.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    pub(crate) fn emit_bridged(&self, lines: BridgedLines) {
+        for line in lines {
+            self.emit_line(line);
+        }
+    }
+
+    /// What waits for this network's subscribers before the next bridged
+    /// message; its own handle, so a driver can wait in one `select!` arm
+    /// while another reads its commands.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    pub(crate) fn pacer(&self) -> BridgePacer {
+        BridgePacer {
+            events: self.events.clone(),
+            overrun: self.bridge.overrun.clone(),
+            runtime: self.runtime.clone(),
+        }
     }
 
     fn irc_session_snapshot(&self) -> Option<IrcSessionSnapshot> {
@@ -7735,7 +7996,10 @@ mod tests {
             crate::egress::InternalUpstreams::Allow,
         )
         .unwrap();
-        let err = bridge_send(http.get(&format!("http://127.0.0.1:{port}/")).unwrap())
+        let err = http
+            .get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .send()
             .await
             .expect_err("a redirect is not a delivered request")
             .to_string();
@@ -8081,6 +8345,7 @@ mod tests {
         let refused = ends.begin_bridge_session(
             &identity,
             [&"#ok".to_string(), &"no spaces allowed".to_string()],
+            SessionStart::Fresh,
         );
         match refused {
             Err(SessionOutcome::ConfigurationRejected(refusal)) => {
@@ -8100,8 +8365,12 @@ mod tests {
         );
 
         assert!(
-            ends.begin_bridge_session(&identity, [&"#Ok".to_string(), &"#two".to_string()])
-                .is_ok(),
+            ends.begin_bridge_session(
+                &identity,
+                [&"#Ok".to_string(), &"#two".to_string()],
+                SessionStart::Fresh
+            )
+            .is_ok(),
             "a servable configuration was refused"
         );
         let session = IrcSessionSnapshot {
@@ -8121,6 +8390,114 @@ mod tests {
         ));
         assert_eq!(handle.irc_session_snapshot(), Some(session));
         assert_eq!(handle.session_authority(), SessionAuthority::Provider);
+    }
+
+    /// A bridge session that cannot pick up where the last one stopped says
+    /// so in every bridged channel, once, whatever made the position go; the
+    /// first session, and one that resumed, have nothing to say. A Matrix
+    /// position forgotten after a kick, or a Discord RESUME refused, used to
+    /// start the next session afresh and skip what was said in between
+    /// without a word.
+    #[test]
+    #[cfg(any(feature = "matrix", feature = "discord"))]
+    fn a_session_that_cannot_resume_says_so_in_every_channel() {
+        let (handle, ends) = NetworkHandle::bridge_channels(16);
+        let mut events = handle.subscribe();
+        let identity = shown("test", "bot");
+        let one = "#one".to_string();
+        let two = "#two".to_string();
+        let gap_notices = |events: &mut tokio::sync::broadcast::Receiver<DriverEvent>| {
+            let mut notices = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let DriverEvent::Line(line) = event
+                    && line.line.contains("without resuming")
+                {
+                    notices.push(without_tag(&line.line, "time"));
+                }
+            }
+            notices
+        };
+        for (start, expected) in [
+            (SessionStart::Fresh, 0),
+            (SessionStart::Resumed, 0),
+            (SessionStart::Fresh, 2),
+            (SessionStart::Resumed, 0),
+        ] {
+            ends.begin_bridge_session(&identity, [&one, &two], start)
+                .unwrap_or_else(|_| panic!("a servable configuration was refused"));
+            let notices = gap_notices(&mut events);
+            assert_eq!(notices.len(), expected, "{start:?}: {notices:?}");
+            if expected > 0 {
+                assert_eq!(
+                    notices,
+                    [
+                        ":*bnc* NOTICE #one :the bridge reconnected without resuming where it \
+                         stopped; messages sent while it was disconnected may not have been relayed",
+                        ":*bnc* NOTICE #two :the bridge reconnected without resuming where it \
+                         stopped; messages sent while it was disconnected may not have been relayed",
+                    ]
+                );
+            }
+        }
+    }
+
+    /// One message is at most `MAX_BRIDGED_LINES` lines and a notice, however
+    /// many newlines it holds: two thousand of them overflowed the network's
+    /// broadcast by themselves, detaching every attached client. Blank lines
+    /// are not shown at all — IRC has no empty message.
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn a_message_of_many_lines_is_bounded_and_says_what_it_left_out() {
+        let lines: Vec<String> = render_bridged(
+            &shown("discord", "bob"),
+            "#c",
+            &Inbound::new(InboundKind::Message, &"a\n".repeat(2_000)),
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(lines.len(), MAX_BRIDGED_LINES + 1, "{lines:?}");
+        assert!(
+            lines[..MAX_BRIDGED_LINES]
+                .iter()
+                .all(|line| line == ":bob!bob@discord PRIVMSG #c :a")
+        );
+        assert_eq!(
+            lines[MAX_BRIDGED_LINES],
+            format!(
+                ":*bnc* NOTICE #c :… {} more lines of bob's message not shown (a bridged \
+                 message is shown in at most {MAX_BRIDGED_LINES})",
+                2_000 - MAX_BRIDGED_LINES
+            )
+        );
+
+        // Blank lines, however many, show nothing and cost nothing.
+        let lines: Vec<String> = render_bridged(
+            &shown("discord", "bob"),
+            "#c",
+            &Inbound::new(
+                InboundKind::Message,
+                &format!("one{}two\n \t \nthree\n\n", "\n".repeat(5_000)),
+            ),
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                ":bob!bob@discord PRIVMSG #c :one",
+                ":bob!bob@discord PRIVMSG #c :two",
+                ":bob!bob@discord PRIVMSG #c :three",
+            ]
+        );
+        // A message of nothing but blank lines is still one (empty) line.
+        let lines: Vec<String> = render_bridged(
+            &shown("discord", "bob"),
+            "#c",
+            &Inbound::new(InboundKind::Message, "\n\n  \n"),
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(lines, [":bob!bob@discord PRIVMSG #c :"]);
     }
 
     #[tokio::test]
@@ -8271,15 +8648,17 @@ mod tests {
     #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
     fn bridged_message_is_split_to_fit_the_line_limit() {
         use e6irc_proto::message::MAX_LINE_LEN;
-        // Slack allows 40,000 characters. Emitted as one line, the receiving
-        // client's framing discards it whole and the message is simply gone.
-        let body = "x".repeat(40_000);
+        // Emitted as one line, a long message is discarded whole by the
+        // receiving client's framing, and simply gone.
+        let body = "x".repeat(5_000);
         let lines = render_bridged(
             &shown("slack", "U1"),
             "#general",
             &Inbound::new(InboundKind::Message, &body),
-        );
-        assert!(lines.len() > 1, "a 40k body must not be one line");
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        assert!(lines.len() > 1, "a 5k body must not be one line");
         for line in &lines {
             assert!(
                 line.len() + 2 <= MAX_LINE_LEN,
@@ -8294,6 +8673,23 @@ mod tests {
             .map(|l| l.strip_prefix(prefix).expect("prefix"))
             .collect();
         assert_eq!(rejoined, body);
+
+        // Slack allows 40,000 characters: what is shown fits the line limit
+        // too, and what is not is counted.
+        let lines = render_bridged(
+            &shown("slack", "U1"),
+            "#general",
+            &Inbound::new(InboundKind::Message, &"x".repeat(40_000)),
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        assert_eq!(lines.len(), MAX_BRIDGED_LINES + 1);
+        assert!(lines.iter().all(|line| line.len() + 2 <= MAX_LINE_LEN));
+        assert!(
+            lines[MAX_BRIDGED_LINES].starts_with(":*bnc* NOTICE #general :… "),
+            "{}",
+            lines[MAX_BRIDGED_LINES]
+        );
     }
 
     /// An IRC `/me` is an action on every provider, IRC formatting never
@@ -8345,7 +8741,9 @@ mod tests {
                 &shown("slack", "U1"),
                 "#c",
                 &Inbound::new(InboundKind::Message, "\u{1}VERSION\u{1}\u{2}\t!")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":U1!U1@slack PRIVMSG #c :VERSION\t!"]
         );
         assert_eq!(
@@ -8353,7 +8751,9 @@ mod tests {
                 &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Action, "waves\u{1}")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":u!u@matrix PRIVMSG #c :\u{1}ACTION waves\u{1}"]
         );
         assert_eq!(
@@ -8361,7 +8761,9 @@ mod tests {
                 &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Notice, "a bot")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":u!u@matrix NOTICE #c :a bot"]
         );
         let long = "y".repeat(2_000);
@@ -8369,7 +8771,9 @@ mod tests {
             &shown("matrix", "u"),
             "#c",
             &Inbound::new(InboundKind::Action, &long),
-        );
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
         assert!(lines.len() > 1);
         let mut rejoined = String::new();
         for line in &lines {
@@ -8452,7 +8856,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                bridge_send(http.get(&format!("{base}/")).unwrap())
+                http.get(&format!("{base}/"))
+                    .unwrap()
+                    .send()
                     .await
                     .unwrap_err(),
                 BridgeFailure::RateLimited(expected),
@@ -8515,7 +8921,9 @@ mod tests {
             &shown("discord", "bob"),
             "#c",
             &Inbound::new(InboundKind::Message, "one\ntwo\r\nthree"),
-        );
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
         assert_eq!(
             lines,
             vec![
@@ -8537,12 +8945,14 @@ mod tests {
                 3 => '☃',
                 _ => '𝄞',
             };
-            let body: String = std::iter::repeat_n(ch, 40_000).collect();
+            let body: String = std::iter::repeat_n(ch, 1_500).collect();
             let lines = render_bridged(
                 &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Message, &body),
-            );
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
             let prefix = ":u!u@matrix PRIVMSG #c :";
             let rejoined: String = lines
                 .iter()
@@ -8562,7 +8972,9 @@ mod tests {
                 &shown("slack", "U1"),
                 "#c",
                 &Inbound::new(InboundKind::Message, "")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":U1!U1@slack PRIVMSG #c :"]
         );
     }

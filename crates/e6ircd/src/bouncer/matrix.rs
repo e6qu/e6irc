@@ -118,6 +118,20 @@ struct Rooms {
     room_to_alias: HashMap<String, String>,
 }
 
+impl Rooms {
+    /// Forget `room_id` by all three of its names.
+    fn remove(&mut self, room_id: &str) {
+        self.room_to_channel.remove(room_id);
+        self.room_to_alias.remove(room_id);
+        self.channel_to_room.retain(|_, room| room != room_id);
+    }
+
+    /// Whether the room the owner configured as `alias` is joined.
+    fn holds_alias(&self, alias: &str) -> bool {
+        self.room_to_alias.values().any(|joined| joined == alias)
+    }
+}
+
 /// Where the last session stopped reading, and the rooms it had joined: the
 /// next session continues from here instead of joining again and starting
 /// over. Starting over meant a fresh initial sync, which only establishes a
@@ -272,7 +286,7 @@ impl Shared {
                 return;
             }
         };
-        match tokio::time::timeout(LOGOUT_DEADLINE, super::bridge_send(request)).await {
+        match tokio::time::timeout(LOGOUT_DEADLINE, request.send()).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => eprintln!("matrix: logout failed: {error}"),
             Err(_) => eprintln!("matrix: logout timed out"),
@@ -303,24 +317,23 @@ const SYNC_RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_s
 async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Dropped;
     let stored = shared.position();
-    let mut session = match &stored {
-        Some(position) => match shared.login().await {
-            Ok(login) => Session::new(login, shared.base().to_string(), position.rooms.clone()),
-            Err(e) => return e.into_outcome("matrix"),
-        },
-        None => match connect(shared).await {
-            Ok(s) => s,
-            Err(e) => {
-                if matches!(e, super::ConnectFail::Configuration(_)) {
-                    shared.forget_position();
-                }
-                return e.into_outcome("matrix");
-            }
-        },
+    let rooms = stored
+        .as_ref()
+        .map_or_else(Rooms::default, |position| position.rooms.clone());
+    let mut session = match open(shared, rooms).await {
+        Ok(session) => session,
+        Err(e) => return e.into_outcome("matrix"),
     };
-    if let Err(outcome) =
-        ends.begin_bridge_session(&session.identity(), session.rooms.room_to_channel.values())
-    {
+    let start = if stored.is_some() {
+        super::SessionStart::Resumed
+    } else {
+        super::SessionStart::Fresh
+    };
+    if let Err(outcome) = ends.begin_bridge_session(
+        &session.identity(),
+        session.rooms.room_to_channel.values(),
+        start,
+    ) {
         return outcome;
     }
 
@@ -328,34 +341,39 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     // position: its timeline is discarded. A resumed session has one already.
     let mut since = stored.map(|position| position.since);
     let resumed = since.is_some();
-    // When the next sync may be sent: now, or after a rate limit's wait.
-    let mut sync_at = tokio::time::Instant::now();
+    // The long poll in flight. It is replaced only when it finishes: a client
+    // line handled meanwhile does not cancel it, which used to reissue the
+    // whole `/sync` — a request the homeserver holds for twenty seconds — for
+    // every line an attached client sent.
+    let mut pending = next_sync(&session, since.clone(), tokio::time::Instant::now());
 
     loop {
         tokio::select! {
-            result = async {
-                tokio::time::sleep_until(sync_at).await;
-                sync(&session, since.as_deref()).await
-            } => match result {
-                Ok(batch) => {
-                    let initial = since.is_none();
-                    since = Some(batch.next.clone());
-                    if !initial
-                        && let Some(outcome) = relay_batch(shared, &mut session, ends, batch)
-                    {
-                        return outcome;
+            result = &mut pending => {
+                // When the next sync may be sent: now, or after a rate limit's wait.
+                let mut sync_at = tokio::time::Instant::now();
+                match result {
+                    Ok(batch) => {
+                        let initial = since.is_none();
+                        since = Some(batch.next.clone());
+                        if !initial
+                            && let Some(outcome) = relay_batch(shared, &mut session, ends, batch).await
+                        {
+                            return outcome;
+                        }
+                        shared.store_position(since.as_deref().expect("just set"), &session.rooms);
                     }
-                    shared.store_position(since.as_deref().expect("just set"), &session.rooms);
+                    Err(RequestError::RateLimited(wait)) => {
+                        let wait = wait.min(SYNC_RATE_LIMIT_CEILING);
+                        eprintln!("matrix: sync rate-limited; asking again in {wait:?} from the same position");
+                        sync_at += wait;
+                    }
+                    Err(error) => return sync_failed(shared, resumed, error).await,
                 }
-                Err(RequestError::RateLimited(wait)) => {
-                    let wait = wait.min(SYNC_RATE_LIMIT_CEILING);
-                    eprintln!("matrix: sync rate-limited; asking again in {wait:?} from the same position");
-                    sync_at = tokio::time::Instant::now() + wait;
-                }
-                Err(error) => return sync_failed(shared, resumed, error).await,
-            },
+                pending = next_sync(&session, since.clone(), sync_at);
+            }
             cmd = ends.next_command() => match cmd {
-                Some(cmd) => handle_command(&mut session, shared, ends, &cmd).await,
+                Some(cmd) => handle_command(&session, shared, ends, &cmd).await,
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -381,14 +399,25 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
 
 /// Relay one incremental sync. `Some` ends the session: a bridged room turned
 /// out to be end-to-end encrypted, which is said in its channel once and
-/// refused like the configuration it now is.
-fn relay_batch(
+/// refused like the configuration it now is, or the account is no longer in
+/// one. Each message waits for the network's subscribers to have room
+/// ([`DriverEnds::relay_bridged`]): a sync carries up to
+/// [`SYNC_TIMELINE_LIMIT`] events for every bridged room, more than an
+/// attached client can take in one gulp.
+async fn relay_batch(
     shared: &Shared,
     session: &mut Session,
     ends: &DriverEnds,
     batch: SyncBatch,
 ) -> Option<super::SessionOutcome> {
-    for room_id in batch.truncated {
+    let SyncBatch {
+        next,
+        messages,
+        truncated,
+        encrypted,
+        left,
+    } = batch;
+    for room_id in truncated {
         // The homeserver had more than one sync carries and sent only the
         // newest. The gap is said, not hidden.
         if let Some(channel) = session.rooms.room_to_channel.get(&room_id) {
@@ -398,23 +427,20 @@ fn relay_batch(
             ));
         }
     }
-    for m in batch.messages {
+    for m in messages {
         let Some(channel) = session.rooms.room_to_channel.get(&m.room_id) else {
             continue;
         };
-        for line in m.lines(channel, &mut session.senders) {
-            ends.emit_line(line);
-        }
+        let lines = m.lines(channel, &mut session.senders);
+        ends.relay_bridged(lines).await;
     }
-    if let Some(room_id) = batch
-        .left
+    if let Some(room_id) = left
         .into_iter()
         .find(|room| session.rooms.room_to_channel.contains_key(room))
     {
-        return Some(left_room_refusal(shared, session, ends, &room_id));
+        return Some(left_room_refusal(shared, session, ends, &room_id, &next));
     }
-    let room_id = batch
-        .encrypted
+    let room_id = encrypted
         .into_iter()
         .find(|room| session.rooms.room_to_channel.contains_key(room))?;
     let channel = &session.rooms.room_to_channel[&room_id];
@@ -433,28 +459,33 @@ fn relay_batch(
 
 /// The account is no longer in a bridged room — kicked, banned, or left from
 /// another client. A session that went on syncing would never hear the room
-/// again, and say nothing about it. So it is said in the channel, the
-/// position is forgotten (the next session joins every room afresh, and a
-/// ban answers that join with a 403), and the session ends as a join refusal
-/// on the refusal schedule: a kick clears on the rejoin, an invitation clears
-/// an invite-only room, and what does neither parks the network.
+/// again, and say nothing about it. So it is said in the channel, the room is
+/// dropped from the kept position — which otherwise stands at `since`, so
+/// what the other rooms say meanwhile is still relayed when the next session
+/// resumes — and the session ends as a join refusal on the refusal schedule.
+/// The next session joins that room alone again: a kick clears on the rejoin,
+/// an invitation clears an invite-only room, and a ban answers the join with a
+/// 403 until the network parks.
 fn left_room_refusal(
     shared: &Shared,
-    session: &Session,
+    session: &mut Session,
     ends: &DriverEnds,
     room_id: &str,
+    since: &str,
 ) -> super::SessionOutcome {
     let channel = &session.rooms.room_to_channel[room_id];
     let alias = session
         .rooms
         .room_to_alias
         .get(room_id)
-        .map_or(room_id, String::as_str);
+        .map_or(room_id, String::as_str)
+        .to_string();
     ends.emit_line(format!(
         ":*bnc* NOTICE {channel} :matrix: the bridge account is no longer in this room \
          (kicked, banned, or left elsewhere); rejoining"
     ));
-    shared.forget_position();
+    session.rooms.remove(room_id);
+    shared.store_position(since, &session.rooms);
     super::ConnectFail::Configuration(super::ConfigurationRefusal::new(
         super::NetworkFailure::ChannelJoinRefused,
         &format!("the bridge account was removed from {alias} (kicked, banned, or left)"),
@@ -510,32 +541,35 @@ impl From<String> for RequestError {
     }
 }
 
-async fn send_authorized(
-    request: reqwest::RequestBuilder,
-) -> Result<reqwest::Response, RequestError> {
-    let response = request.send().await.map_err(|e| e.to_string())?;
-    let status = response.status();
-    match status {
-        reqwest::StatusCode::UNAUTHORIZED => Err(RequestError::TokenRejected),
-        reqwest::StatusCode::FORBIDDEN => Err(RequestError::Forbidden),
-        reqwest::StatusCode::NOT_FOUND => Err(RequestError::NotFound),
-        _ => super::bridge_response_status(response)
-            .await
-            .map_err(|failure| match failure {
-                super::BridgeFailure::RateLimited(wait) => RequestError::RateLimited(wait),
-                super::BridgeFailure::Failed(_) if status.is_client_error() => {
-                    RequestError::Refused(status)
-                }
-                super::BridgeFailure::Failed(detail) => RequestError::Other(detail),
-            }),
-    }
+async fn send_authorized(request: super::BridgeRequest) -> Result<reqwest::Response, RequestError> {
+    use reqwest::StatusCode;
+    request.send().await.map_err(|failure| match failure {
+        super::BridgeFailure::RateLimited(wait) => RequestError::RateLimited(wait),
+        super::BridgeFailure::Status(StatusCode::UNAUTHORIZED) => RequestError::TokenRejected,
+        super::BridgeFailure::Status(StatusCode::FORBIDDEN) => RequestError::Forbidden,
+        super::BridgeFailure::Status(StatusCode::NOT_FOUND) => RequestError::NotFound,
+        super::BridgeFailure::Status(status) if status.is_client_error() => {
+            RequestError::Refused(status)
+        }
+        failure @ (super::BridgeFailure::Status(_) | super::BridgeFailure::Failed(_)) => {
+            RequestError::Other(failure.to_string())
+        }
+    })
 }
 
+#[cfg(test)]
 async fn connect(shared: &Shared) -> Result<Session, super::ConnectFail> {
+    open(shared, Rooms::default()).await
+}
+
+/// A session of the driver's login (made now, or the one it keeps), in
+/// `rooms` — the ones a kept position already holds — and every other
+/// configured room, joined here.
+async fn open(shared: &Shared, rooms: Rooms) -> Result<Session, super::ConnectFail> {
     use super::{ConfigurationRefusal, ConnectFail, NetworkFailure};
     let config = &shared.config;
     let login = shared.login().await?;
-    let mut session = Session::new(login, shared.base().to_string(), Rooms::default());
+    let mut session = Session::new(login, shared.base().to_string(), rooms);
     let unmappable = |detail: String| {
         ConnectFail::Configuration(ConfigurationRefusal::new(
             NetworkFailure::ChannelMappingFailed,
@@ -549,6 +583,9 @@ async fn connect(shared: &Shared) -> Result<Session, super::ConnectFail> {
         ConnectFail::Transient(format!("{what}: {error}"))
     };
     for alias in &config.rooms {
+        if session.rooms.holds_alias(alias) {
+            continue;
+        }
         let channel = alias_to_channel(alias);
         if !crate::sanitize::valid_channel_name(&channel) {
             return Err(unmappable(format!(
@@ -730,7 +767,7 @@ const MALFORMED: &str = "malformed";
 
 impl Incoming {
     /// The IRC lines this message is in `channel`.
-    fn lines(&self, channel: &str, senders: &mut super::BridgedSenders) -> Vec<String> {
+    fn lines(&self, channel: &str, senders: &mut super::BridgedSenders) -> super::BridgedLines {
         match &self.content {
             IncomingContent::Relay { sender, message } => {
                 super::render_bridged(&senders.identity(matrix_account(sender)), channel, message)
@@ -739,12 +776,12 @@ impl Incoming {
                 let shown = sender
                     .as_deref()
                     .map(|sender| senders.identity(matrix_account(sender)).nick);
-                vec![super::unrelayed_notice(
+                super::BridgedLines::notice(super::unrelayed_notice(
                     "matrix",
                     channel,
                     what,
                     shown.as_deref(),
-                )]
+                ))
             }
         }
     }
@@ -837,6 +874,19 @@ struct MessageContent {
     /// `m.location`: the `geo:` URI.
     #[serde(default)]
     geo_uri: Option<String>,
+    /// What the message is to another: `m.replace` makes it an edit, whose
+    /// new text is `m.new_content`. (A thread reply, `m.thread`, is relayed
+    /// like any message, into its room's channel.)
+    #[serde(default, rename = "m.relates_to")]
+    relates_to: Option<Relation>,
+    #[serde(default, rename = "m.new_content")]
+    new_content: Option<Box<MessageContent>>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct Relation {
+    #[serde(default)]
+    rel_type: Option<String>,
 }
 
 /// One sync's worth: where to continue from, the messages, the rooms whose
@@ -884,6 +934,17 @@ fn message_content(
         sender,
         what: what.to_string(),
     };
+    // An edit is shown as its new text, `* ` first — as every bridge shows
+    // one. Without `m.new_content` its fallback body already reads that way.
+    let replaces = content
+        .relates_to
+        .as_ref()
+        .and_then(|relation| relation.rel_type.as_deref())
+        == Some("m.replace");
+    let (content, edit) = match content.new_content {
+        Some(new_content) if replaces => (*new_content, true),
+        _ => (content, false),
+    };
     let Some(msgtype) = content.msgtype else {
         if !redacted {
             eprintln!("matrix: an m.room.message in {room_id} had no msgtype");
@@ -922,6 +983,7 @@ fn message_content(
         Some(suffix) => format!("{body} <{suffix}>"),
         None => body,
     };
+    let text = if edit { format!("* {text}") } else { text };
     IncomingContent::Relay {
         sender,
         message: Inbound::new(kind, &text),
@@ -1043,28 +1105,40 @@ fn sync_filter(s: &Session, timeline_limit: u32) -> String {
     .to_string()
 }
 
-async fn sync(s: &Session, since: Option<&str>) -> Result<SyncBatch, RequestError> {
+/// One `/sync` in flight. It owns what it needs, so the session can go on
+/// handling client lines — and relaying them — while it waits.
+type PendingSync =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyncBatch, RequestError>> + Send>>;
+
+/// The next `/sync` from `since` (`None`: the initial one), sent at `at`.
+fn next_sync(s: &Session, since: Option<String>, at: tokio::time::Instant) -> PendingSync {
     let (timeout, timeline_limit) = match since {
         Some(_) => (20000, SYNC_TIMELINE_LIMIT),
         None => (0, 1),
     };
-    let mut req = s
+    let request = s
         .http
-        .get(&format!("{}/_matrix/client/v3/sync", s.base))?
-        .bearer_auth(&s.token)
-        .query(&[
-            ("timeout", timeout.to_string()),
-            ("filter", sync_filter(s, timeline_limit)),
-        ]);
-    if let Some(since) = since {
-        req = req.query(&[("since", since)]);
-    }
-    let body: SyncResponse = send_authorized(req).await?.bounded_json().await?;
-    Ok(collect_sync_messages(&s.base, body)?)
+        .get(&format!("{}/_matrix/client/v3/sync", s.base))
+        .map(|request| {
+            let request = request.bearer_auth(&s.token).query(&[
+                ("timeout", timeout.to_string()),
+                ("filter", sync_filter(s, timeline_limit)),
+            ]);
+            match &since {
+                Some(since) => request.query(&[("since", since)]),
+                None => request,
+            }
+        });
+    let base = s.base.clone();
+    Box::pin(async move {
+        tokio::time::sleep_until(at).await;
+        let body: SyncResponse = send_authorized(request?).await?.bounded_json().await?;
+        Ok(collect_sync_messages(&base, body)?)
+    })
 }
 
 async fn handle_command(
-    s: &mut Session,
+    s: &Session,
     shared: &Shared,
     ends: &super::DriverEnds,
     command: &super::ClientCommand,
@@ -1091,7 +1165,7 @@ async fn handle_command(
                 req.bearer_auth(&s.token)
                     .json(&MatrixMessageRequest::new(&text))
             });
-            async move { super::bridge_send(req?).await.map(|_| ()) }
+            async move { req?.send().await.map(|_| ()) }
         },
     )
     .await;
@@ -1141,6 +1215,9 @@ mod tests {
         sent_transactions: Vec<String>,
         /// The body of every message sent, in order.
         sent_messages: Vec<serde_json::Value>,
+        /// An incremental sync with nothing scripted is held, as a real long
+        /// poll is, instead of answered 502.
+        hold_syncs: bool,
     }
 
     impl Homeserver {
@@ -1210,18 +1287,22 @@ mod tests {
                         |State(server): State<Homeserver>,
                          Query(query): Query<HashMap<String, String>>| async move {
                             let incremental = query.contains_key("since");
-                            let mut state = server.0.lock().unwrap();
-                            state.sync_queries.push(query);
-                            if !incremental {
-                                return (
-                                    StatusCode::OK,
-                                    axum::Json(serde_json::json!({ "next_batch": "s1" })),
-                                );
+                            let (scripted, hold) = {
+                                let mut state = server.0.lock().unwrap();
+                                state.sync_queries.push(query);
+                                if !incremental {
+                                    return (
+                                        StatusCode::OK,
+                                        axum::Json(serde_json::json!({ "next_batch": "s1" })),
+                                    );
+                                }
+                                (state.sync_script.pop_front(), state.hold_syncs)
+                            };
+                            if scripted.is_none() && hold {
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                             }
-                            let (status, body) = state
-                                .sync_script
-                                .pop_front()
-                                .unwrap_or((502, serde_json::json!({})));
+                            let (status, body) =
+                                scripted.unwrap_or((502, serde_json::json!({})));
                             (StatusCode::from_u16(status).unwrap(), axum::Json(body))
                         },
                     ),
@@ -1455,6 +1536,156 @@ mod tests {
         assert_eq!(notices.len(), 1, "{notices:?}");
     }
 
+    /// A homeserver that forgets a position (a 4xx to a resumed sync) makes
+    /// the next session start afresh, and that skips what was said meanwhile
+    /// in every room: each bridged channel is told, once.
+    #[tokio::test]
+    async fn a_position_the_homeserver_refused_is_announced_as_a_gap() {
+        let (server, base) = Homeserver::start().await;
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        session_once(&shared, &mut ends).await;
+        server.script([(
+            400,
+            serde_json::json!({ "errcode": "M_UNKNOWN", "error": "unknown position" }),
+        )]);
+        session_once(&shared, &mut ends).await;
+        assert!(shared.position().is_none(), "the refused position was kept");
+        assert!(
+            !lines(&mut events)
+                .iter()
+                .any(|line| line.contains("without resuming")),
+            "the first session and the resumed one lost nothing"
+        );
+        session_once(&shared, &mut ends).await;
+        let gaps: Vec<String> = lines(&mut events)
+            .into_iter()
+            .filter(|line| line.contains("without resuming"))
+            .collect();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].starts_with(":*bnc* NOTICE #room :"), "{gaps:?}");
+    }
+
+    /// A resumed sync carries up to 250 events for every bridged room, and
+    /// relayed in one tight loop it outran the network's broadcast: an
+    /// attached client fell more than its capacity behind and was detached as
+    /// too slow, and the backlog writer lost the lines. The relay waits for
+    /// its subscribers — here one reading as an attached client does — so each
+    /// line reaches them.
+    #[tokio::test]
+    async fn a_sync_larger_than_the_broadcast_reaches_a_reading_client_whole() {
+        const EVENTS: usize = 3_000;
+        let (server, base) = Homeserver::start().await;
+        let events: Vec<serde_json::Value> = (0..EVENTS)
+            .map(|index| {
+                serde_json::json!({ "type": "m.room.message", "sender": "@alice:hs.example",
+                                    "content": { "msgtype": "m.text", "body": format!("m{index}") } })
+            })
+            .collect();
+        server.script([timeline("s2", serde_json::Value::Array(events))]);
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let mut client = handle.subscribe();
+        let reader = tokio::spawn(async move {
+            let mut relayed = 0;
+            loop {
+                match client.recv().await {
+                    Ok(crate::bouncer::DriverEvent::Line(line))
+                        if line.line.contains("PRIVMSG #room :m") =>
+                    {
+                        relayed += 1;
+                        if relayed == EVENTS {
+                            return Ok(relayed);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(format!("{error} after {relayed} lines")),
+                }
+            }
+        });
+        session_once(&shared, &mut ends).await;
+        let relayed = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+            .await
+            .expect("the client never saw every line")
+            .expect("reader task");
+        assert_eq!(relayed, Ok(EVENTS));
+    }
+
+    /// The long poll is the session's to keep: a client's line is delivered
+    /// while it waits, instead of cancelling it and asking again — which
+    /// reissued a twenty-second `/sync` for every line a client sent.
+    #[tokio::test]
+    async fn outbound_lines_do_not_reissue_the_long_poll() {
+        let (server, base) = Homeserver::start().await;
+        server.0.lock().unwrap().hold_syncs = true;
+        let shared = std::sync::Arc::new(Shared::new(config(&base, &["#room:hs.example"])));
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let session = {
+            let shared = shared.clone();
+            tokio::spawn(async move { session_once(&shared, &mut ends).await })
+        };
+        let polls = || server.0.lock().unwrap().sync_queries.len();
+        let wait_for = async |what: &str, done: &dyn Fn() -> bool| {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !done() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        };
+        wait_for("the long poll never began", &|| polls() == 2).await;
+        for index in 0..5 {
+            assert_eq!(
+                handle.send(&format!("PRIVMSG #room :burst {index}")),
+                crate::bouncer::SendOutcome::Sent
+            );
+        }
+        wait_for("the burst was never delivered", &|| {
+            server.0.lock().unwrap().sent_messages.len() == 5
+        })
+        .await;
+        assert_eq!(polls(), 2, "a client line reissued the long poll");
+        handle.shutdown();
+        drop(session.await);
+    }
+
+    /// Every bridge shows an edit as `* <new text>` and a thread reply as a
+    /// line in its room's channel. Matrix reads the edit from `m.new_content`
+    /// — not from the fallback body, which only by convention starts `* `.
+    #[tokio::test]
+    async fn an_edit_is_its_new_text_and_a_thread_reply_is_a_line_in_the_channel() {
+        let (server, base) = Homeserver::start().await;
+        server.script([timeline(
+            "s2",
+            serde_json::json!([
+                { "type": "m.room.message", "sender": "@alice:hs.example",
+                  "content": { "msgtype": "m.text", "body": "fallback text",
+                               "m.new_content": { "msgtype": "m.text", "body": "fixed" },
+                               "m.relates_to": { "rel_type": "m.replace", "event_id": "$1" } } },
+                { "type": "m.room.message", "sender": "@bob:hs.example",
+                  "content": { "msgtype": "m.text", "body": "in the thread",
+                               "m.relates_to": { "rel_type": "m.thread", "event_id": "$2" } } },
+            ]),
+        )]);
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        session_once(&shared, &mut ends).await;
+        let said = lines(&mut events);
+        assert!(
+            said.iter()
+                .any(|line| line == ":alice!alice@hs.example PRIVMSG #room :* fixed"),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line == ":bob!bob@hs.example PRIVMSG #room :in the thread"),
+            "{said:?}"
+        );
+    }
+
     fn command(line: &str) -> crate::bouncer::ClientCommand {
         crate::bouncer::ClientCommand {
             origin: 5,
@@ -1471,13 +1702,13 @@ mod tests {
         let (server, base) = Homeserver::start().await;
         let shared = Shared::new(config(&base, &["#room:hs.example"]));
         let (_handle, ends) = NetworkHandle::channels(8);
-        let mut session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
+        let session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
         for line in [
             "PRIVMSG #room :\u{1}ACTION waves\u{1}",
             "PRIVMSG #room :\u{2}bold\u{2}",
             "PRIVMSG #room :@room look",
         ] {
-            handle_command(&mut session, &shared, &ends, &command(line)).await;
+            handle_command(&session, &shared, &ends, &command(line)).await;
         }
         assert_eq!(
             server.0.lock().unwrap().sent_messages,
@@ -1493,25 +1724,40 @@ mod tests {
     /// sync's `leave` section, and a bridge that read only `join` went on
     /// syncing a room it would never hear again, saying nothing. What was
     /// said before the leave is relayed; the leave is said in the channel and
-    /// ends the session as a join refusal, with the position forgotten so the
-    /// next session joins afresh.
+    /// ends the session as a join refusal. Only that room leaves the kept
+    /// position: the next session rejoins it alone and resumes the others
+    /// from where they were, so what they said meanwhile is relayed. (The
+    /// whole position used to be forgotten, and the next session's initial
+    /// sync skipped every other room's messages without a word.)
     #[tokio::test]
     async fn a_kick_or_ban_is_said_and_refused_as_a_join_not_ignored() {
         use crate::bouncer::{NetworkFailure, SessionOutcome};
         let (server, base) = Homeserver::start().await;
-        server.script([(
-            200,
-            serde_json::json!({
-                "next_batch": "s2",
-                "rooms": { "leave": { "!room:hs.example": { "timeline": { "events": [
-                    { "type": "m.room.message", "sender": "@alice:hs.example",
-                      "content": { "msgtype": "m.text", "body": "said before the kick" } },
-                    { "type": "m.room.member", "sender": "@alice:hs.example",
-                      "state_key": "@bot:hs.example", "content": { "membership": "leave" } },
-                ] } } } },
-            }),
-        )]);
-        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        server.script([
+            (
+                200,
+                serde_json::json!({
+                    "next_batch": "s2",
+                    "rooms": { "leave": { "!room:hs.example": { "timeline": { "events": [
+                        { "type": "m.room.message", "sender": "@alice:hs.example",
+                          "content": { "msgtype": "m.text", "body": "said before the kick" } },
+                        { "type": "m.room.member", "sender": "@alice:hs.example",
+                          "state_key": "@bot:hs.example", "content": { "membership": "leave" } },
+                    ] } } } },
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "next_batch": "s3",
+                    "rooms": { "join": { "!other:hs.example": { "timeline": { "events": [
+                        { "type": "m.room.message", "sender": "@alice:hs.example",
+                          "content": { "msgtype": "m.text", "body": "said meanwhile" } },
+                    ] } } } },
+                }),
+            ),
+        ]);
+        let shared = Shared::new(config(&base, &["#room:hs.example", "#other:hs.example"]));
         let (handle, mut ends) = NetworkHandle::channels(8);
         let mut events = handle.subscribe();
         let SessionOutcome::ConfigurationRejected(refusal) = session_once(&shared, &mut ends).await
@@ -1523,25 +1769,56 @@ mod tests {
             refusal.diagnostic().contains("#room:hs.example"),
             "{refusal:?}"
         );
-        let lines = lines(&mut events);
+        let said = lines(&mut events);
         assert!(
-            lines
-                .iter()
+            said.iter()
                 .any(|line| line == ":alice!alice@hs.example PRIVMSG #room :said before the kick"),
-            "{lines:?}"
+            "{said:?}"
         );
         assert_eq!(
-            lines
-                .iter()
+            said.iter()
                 .filter(|line| line.starts_with(":*bnc* NOTICE #room :")
                     && line.contains("no longer in this room"))
                 .count(),
             1,
-            "{lines:?}"
+            "{said:?}"
+        );
+        let kept = shared
+            .position()
+            .expect("the other room's position is kept");
+        assert_eq!(kept.since, "s2");
+        assert!(
+            !kept.rooms.room_to_channel.contains_key("!room:hs.example")
+                && kept.rooms.room_to_channel.contains_key("!other:hs.example"),
+            "the next session would resume a room it is not in"
+        );
+        assert_eq!(server.0.lock().unwrap().joins, 2);
+
+        session_once(&shared, &mut ends).await;
+        assert_eq!(
+            server.0.lock().unwrap().joins,
+            3,
+            "the next session rejoins the one room it left, and only that one"
+        );
+        assert_eq!(
+            server.since_values(),
+            [
+                None,
+                Some("s1".into()),
+                Some("s2".into()),
+                Some("s3".into())
+            ],
+            "the next session did not resume from the kept position"
+        );
+        let said = lines(&mut events);
+        assert!(
+            said.iter()
+                .any(|line| line == ":alice!alice@hs.example PRIVMSG #other :said meanwhile"),
+            "{said:?}"
         );
         assert!(
-            shared.position().is_none(),
-            "the next session would resume a room it is not in"
+            !said.iter().any(|line| line.contains("without resuming")),
+            "{said:?}"
         );
     }
 
@@ -1556,7 +1833,7 @@ mod tests {
         let mut events = handle.subscribe();
         let mut session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
         handle_command(
-            &mut session,
+            &session,
             &shared,
             &ends,
             &command("@+draft/reply=x PRIVMSG #ROOM,#nowhere :hello"),
@@ -1591,13 +1868,7 @@ mod tests {
         // The homeserver refuses the next send: its undelivered notice is the
         // whole answer.
         session.base = "http://127.0.0.1:9".to_string();
-        handle_command(
-            &mut session,
-            &shared,
-            &ends,
-            &command("PRIVMSG #room :lost"),
-        )
-        .await;
+        handle_command(&session, &shared, &ends, &command("PRIVMSG #room :lost")).await;
         while let Ok(event) = events.try_recv() {
             assert!(
                 !matches!(event, crate::bouncer::DriverEvent::Echo { .. }),
@@ -1736,9 +2007,9 @@ mod tests {
         let shared = Shared::new(config(&base, &["#room:hs.example"]));
         let (_handle, ends) = NetworkHandle::channels(8);
         for text in ["one", "two"] {
-            let mut session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
+            let session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
             handle_command(
-                &mut session,
+                &session,
                 &shared,
                 &ends,
                 &command(&format!("PRIVMSG #room :{text}")),
@@ -1827,7 +2098,9 @@ mod tests {
                 &senders.identity(matrix_account("@alice:localhost")),
                 "#room",
                 &super::super::Inbound::new(super::super::InboundKind::Message, "hi there")
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![":alice!alice@localhost PRIVMSG #room :hi there"]
         );
     }
@@ -1848,7 +2121,9 @@ mod tests {
             &senders.identity(matrix_account("@evil x!y@z NOTICE victim :hi:localhost")),
             "#room",
             &super::super::Inbound::new(super::super::InboundKind::Message, "body"),
-        );
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
         let prefix = line
