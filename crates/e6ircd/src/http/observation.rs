@@ -172,6 +172,14 @@ pub(super) async fn application_observation(
                     snapshot.bnc_connected,
                     "networks",
                 ),
+                // What a load qualification checks its recorded `core_workers`
+                // against: the shards running, not the ones a file named.
+                metric(
+                    "core.shards",
+                    "Core shards",
+                    state.telemetry.core_shards(),
+                    "shards",
+                ),
                 metric(
                     "queues.depth",
                     "Queued operations",

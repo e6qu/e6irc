@@ -533,6 +533,16 @@ impl Telemetry {
         );
     }
 
+    /// How many core shards declared themselves ([`Self::expect_core_shards`]):
+    /// the shards this process is running, whatever the configuration said
+    /// before the console's stored revision was applied. `0` before the first
+    /// is built.
+    pub(crate) fn core_shards(&self) -> u64 {
+        self.core_heartbeats
+            .get()
+            .map_or(0, |heartbeats| heartbeats.len() as u64)
+    }
+
     fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
@@ -1247,6 +1257,18 @@ mod tests {
         assert!(!telemetry.core_is_fresh(Duration::from_secs(45)));
         telemetry.adjust_core_gauges(0, (0, 0, 0), (0, 0, 0));
         assert!(telemetry.core_is_fresh(Duration::from_secs(45)));
+    }
+
+    /// The monitoring observation's `core.shards` is what the shards declared
+    /// when they were built — the count a load qualification checks its claim
+    /// against — and nothing before they are.
+    #[test]
+    fn the_core_shard_count_is_what_the_shards_declared() {
+        let telemetry = Telemetry::new();
+        assert_eq!(telemetry.core_shards(), 0);
+        telemetry.expect_core_shards(3);
+        telemetry.expect_core_shards(3);
+        assert_eq!(telemetry.core_shards(), 3);
     }
 
     #[test]

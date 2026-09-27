@@ -1373,6 +1373,8 @@
                           "type": "boolean"
                         },
                         "description": {
+                          "description": "The RPL_LINKS server information, at most this many bytes: what the reply has room for at the longest server name and nickname.",
+                          "maxLength": 242,
                           "type": "string"
                         },
                         "limits": {
@@ -1499,12 +1501,16 @@
                           "type": "integer"
                         },
                         "motd": {
+                          "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname.",
                           "items": {
+                            "maxLength": 372,
                             "type": "string"
                           },
                           "type": "array"
                         },
                         "network_name": {
+                          "description": "One token of at most this many bytes.",
+                          "maxLength": 64,
                           "type": "string"
                         },
                         "networks": {
@@ -1521,6 +1527,7 @@
                                 "type": "array"
                               },
                               "buffer_cap": {
+                                "maximum": 5000,
                                 "minimum": 1,
                                 "type": "integer"
                               },
@@ -1732,6 +1739,8 @@
                           "type": "integer"
                         },
                         "server_name": {
+                          "description": "A hostname of at most this many bytes.",
+                          "maxLength": 64,
                           "type": "string"
                         },
                         "storage": {
@@ -1896,6 +1905,8 @@
                         "type": "boolean"
                       },
                       "description": {
+                        "description": "The RPL_LINKS server information, at most this many bytes: what the reply has room for at the longest server name and nickname.",
+                        "maxLength": 242,
                         "type": "string"
                       },
                       "limits": {
@@ -2022,12 +2033,16 @@
                         "type": "integer"
                       },
                       "motd": {
+                        "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname.",
                         "items": {
+                          "maxLength": 372,
                           "type": "string"
                         },
                         "type": "array"
                       },
                       "network_name": {
+                        "description": "One token of at most this many bytes.",
+                        "maxLength": 64,
                         "type": "string"
                       },
                       "networks": {
@@ -2044,6 +2059,7 @@
                               "type": "array"
                             },
                             "buffer_cap": {
+                              "maximum": 5000,
                               "minimum": 1,
                               "type": "integer"
                             },
@@ -2255,6 +2271,8 @@
                         "type": "integer"
                       },
                       "server_name": {
+                        "description": "A hostname of at most this many bytes.",
+                        "maxLength": 64,
                         "type": "string"
                       },
                       "storage": {
@@ -2394,6 +2412,7 @@
                         "type": "array"
                       },
                       "buffer_cap": {
+                        "maximum": 5000,
                         "minimum": 1,
                         "type": "integer"
                       },
@@ -2478,6 +2497,7 @@
                         "type": "array"
                       },
                       "buffer_cap": {
+                        "maximum": 5000,
                         "minimum": 1,
                         "type": "integer"
                       },
@@ -2538,6 +2558,7 @@
                         "type": "array"
                       },
                       "buffer_cap": {
+                        "maximum": 5000,
                         "minimum": 1,
                         "type": "integer"
                       },
@@ -2593,6 +2614,7 @@
                         "type": "array"
                       },
                       "buffer_cap": {
+                        "maximum": 5000,
                         "minimum": 1,
                         "type": "integer"
                       },
@@ -2644,6 +2666,7 @@
                         "type": "array"
                       },
                       "buffer_cap": {
+                        "maximum": 5000,
                         "minimum": 1,
                         "type": "integer"
                       },

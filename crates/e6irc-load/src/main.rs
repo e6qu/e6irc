@@ -102,6 +102,62 @@ struct Args {
     maximum_server_rss_per_connection_bytes: Option<u64>,
     host_provenance_sha256: Option<Sha256Digest>,
     report_json: Option<PathBuf>,
+    /// The operator each sender opers up as: an IRC operator is exempt from
+    /// the server's command-flood limiter, so a burst past the server's
+    /// command burst measures fan-out rather than the limiter.
+    oper: Option<Operator>,
+    /// The server's `limits.command_burst`: the lines a connection may send
+    /// before the limiter meters it to its refill rate.
+    server_command_burst: usize,
+    /// Where the server's monitoring observation is read from, to learn how
+    /// many core shards it is running.
+    monitoring: Option<Monitoring>,
+    /// The core shards the run claims the server runs; checked against the
+    /// server's own count.
+    core_workers: Option<usize>,
+}
+
+/// e6ircd's default `limits.command_burst`: what `--server-command-burst`
+/// assumes when not told otherwise.
+const DEFAULT_SERVER_COMMAND_BURST: usize = 40;
+
+/// The variable the operator password is read from: never an argument, which
+/// the process list would show.
+const OPER_PASSWORD_VARIABLE: &str = "E6IRC_LOAD_OPER_PASSWORD";
+
+/// The variable the server's monitoring bearer is read from.
+const MONITORING_TOKEN_VARIABLE: &str = "E6IRC_MONITORING_TOKEN";
+
+#[derive(Clone)]
+struct Operator {
+    name: String,
+    password: String,
+}
+
+#[derive(Clone)]
+struct Monitoring {
+    /// `host:port` of the server's HTTP listener.
+    authority: String,
+    token: String,
+}
+
+impl Monitoring {
+    /// `http://host:port`, with the bearer from `token`. Only plain HTTP: the
+    /// qualification reads the listener on the server's own host.
+    fn parse(url: &str, token: Option<String>) -> Result<Self, String> {
+        let authority = url
+            .strip_prefix("http://")
+            .map(|rest| rest.strip_suffix('/').unwrap_or(rest))
+            .filter(|authority| !authority.is_empty() && !authority.contains(['/', '?', '#', '@']))
+            .ok_or_else(|| "--monitoring-url must be http://HOST:PORT".to_string())?;
+        let token = token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| format!("--monitoring-url needs {MONITORING_TOKEN_VARIABLE} set"))?;
+        Ok(Self {
+            authority: authority.to_owned(),
+            token,
+        })
+    }
 }
 
 impl Args {
@@ -116,10 +172,22 @@ impl Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    parse_args_from(std::env::args().skip(1))
+    parse_args_with(std::env::args().skip(1), |variable| {
+        std::env::var(variable).ok()
+    })
 }
 
+#[cfg(test)]
 fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    parse_args_with(arguments, |_| None)
+}
+
+/// The arguments, with `environment` answering for the variables that carry
+/// secrets.
+fn parse_args_with(
+    arguments: impl IntoIterator<Item = String>,
+    environment: impl Fn(&str) -> Option<String>,
+) -> Result<Args, String> {
     let mut addr = None;
     let mut clients = 100;
     let mut channels = 1;
@@ -136,7 +204,12 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
         maximum_server_rss_per_connection_bytes: None,
         host_provenance_sha256: None,
         report_json: None,
+        oper: None,
+        server_command_burst: DEFAULT_SERVER_COMMAND_BURST,
+        monitoring: None,
+        core_workers: None,
     };
+    let mut monitoring_url = None;
     let mut it = arguments.into_iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -226,13 +299,70 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
                         .ok_or_else(|| "--report-json needs a path".to_string())?,
                 ));
             }
+            "--oper-name" => {
+                let name = it
+                    .next()
+                    .filter(|name| !name.trim().is_empty())
+                    .ok_or_else(|| "--oper-name needs a value".to_string())?;
+                let password = environment(OPER_PASSWORD_VARIABLE)
+                    .filter(|password| !password.is_empty())
+                    .ok_or_else(|| format!("--oper-name needs {OPER_PASSWORD_VARIABLE} set"))?;
+                args.oper = Some(Operator { name, password });
+            }
+            "--server-command-burst" => {
+                args.server_command_burst = usize::try_from(parse_positive_u64(
+                    &it.next()
+                        .ok_or_else(|| "--server-command-burst needs a value".to_string())?,
+                    "--server-command-burst",
+                )?)
+                .map_err(|_| "--server-command-burst is too large".to_string())?;
+            }
+            "--monitoring-url" => {
+                monitoring_url = Some(
+                    it.next()
+                        .ok_or_else(|| "--monitoring-url needs a value".to_string())?,
+                );
+            }
+            "--core-workers" => {
+                args.core_workers = Some(
+                    usize::try_from(parse_positive_u64(
+                        &it.next()
+                            .ok_or_else(|| "--core-workers needs a value".to_string())?,
+                        "--core-workers",
+                    )?)
+                    .map_err(|_| "--core-workers is too large".to_string())?,
+                );
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    args.monitoring = monitoring_url
+        .map(|url| Monitoring::parse(&url, environment(MONITORING_TOKEN_VARIABLE)))
+        .transpose()?;
+    if args.core_workers.is_some() && args.monitoring.is_none() {
+        return Err(
+            "--core-workers requires --monitoring-url: the server's own count is what it is \
+             checked against"
+                .to_string(),
+        );
     }
     args.addr = addr
         .filter(|addr: &String| !addr.trim().is_empty())
         .ok_or_else(|| "--addr is required".to_string())?;
     args.workload = Workload::new(clients, channels, burst)?;
+    // Each sender sends its burst and one fence line. Past the server's command
+    // burst the flood limiter meters it to twenty lines a second, so what the
+    // run would time is the limiter, and a large burst outlasts the receive
+    // timeout; an IRC operator is exempt.
+    if args.oper.is_none() && args.workload.burst + 1 > args.server_command_burst {
+        return Err(format!(
+            "--burst {} and its fence line exceed the server's command burst of {} \
+             (--server-command-burst): the run would measure the command-flood limiter, not \
+             fan-out. Oper the senders up (--oper-name with {OPER_PASSWORD_VARIABLE}; IRC \
+             operators are exempt) or lower --burst",
+            args.workload.burst, args.server_command_burst
+        ));
+    }
     if args.maximum_server_rss_per_connection_bytes.is_some() && args.server_pid.is_none() {
         return Err("--maximum-server-rss-per-connection-bytes requires --server-pid".to_string());
     }
@@ -242,10 +372,12 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
             || args.maximum_server_rss_per_connection_bytes.is_none()
             || args.minimum_connect_rate.is_none()
             || args.minimum_fanout_rate.is_none()
-            || args.maximum_p99_ms.is_none())
+            || args.maximum_p99_ms.is_none()
+            || args.core_workers.is_none())
     {
         return Err(
-            "--host-provenance-sha256 requires --report-json, --server-pid, and all acceptance thresholds"
+            "--host-provenance-sha256 requires --report-json, --server-pid, --core-workers \
+             with --monitoring-url, and all acceptance thresholds"
                 .to_string(),
         );
     }
@@ -344,6 +476,10 @@ struct ServerRssReport {
     per_connection_bytes: u64,
 }
 
+/// The report's contract version. 3 added the server's own core-shard count
+/// and whether the senders were exempt from its flood limiter.
+const REPORT_FORMAT_VERSION: u8 = 3;
+
 #[derive(Serialize)]
 struct RunRequest {
     addr: String,
@@ -352,6 +488,11 @@ struct RunRequest {
     burst: usize,
     tls: bool,
     host_provenance_sha256: Option<Sha256Digest>,
+    /// The core shards the run claims the server runs (`--core-workers`).
+    core_workers: Option<usize>,
+    /// Whether each sender opered up, and so was exempt from the flood limiter.
+    senders_are_operators: bool,
+    server_command_burst: usize,
     thresholds: Thresholds,
 }
 
@@ -364,6 +505,9 @@ impl RunRequest {
             burst: args.workload.burst,
             tls: args.tls,
             host_provenance_sha256: args.host_provenance_sha256.clone(),
+            core_workers: args.core_workers,
+            senders_are_operators: args.oper.is_some(),
+            server_command_burst: args.server_command_burst,
             thresholds: Thresholds {
                 minimum_connect_rate: args.minimum_connect_rate,
                 minimum_fanout_rate: args.minimum_fanout_rate,
@@ -409,6 +553,9 @@ struct CompletedRunReport {
     fanout_rate: f64,
     latency: Option<LatencyReport>,
     server_rss: Option<ServerRssReport>,
+    /// The core shards the server said it runs (its monitoring observation's
+    /// `core.shards`), read before the run.
+    server_core_shards: Option<u64>,
     outcome: CompletedOutcome,
 }
 
@@ -422,7 +569,7 @@ struct FailedRunReport {
 impl FailedRunReport {
     fn new(args: &Args, error: String) -> Self {
         Self {
-            format_version: 2,
+            format_version: REPORT_FORMAT_VERSION,
             request: RunRequest::from_args(args),
             error,
         }
@@ -517,6 +664,82 @@ async fn sample_server_rss(
     Ok(peak.max(read_server_rss_bytes(pid)?))
 }
 
+/// How many core shards the server says it runs: `core.shards` in its
+/// monitoring observation. The configuration a run was given can say one thing
+/// and the console's stored revision another; this is what the process built.
+async fn observed_core_shards(monitoring: &Monitoring) -> Result<u64, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fetch = async {
+        let mut stream = tokio::net::TcpStream::connect(&monitoring.authority).await?;
+        stream
+            .write_all(
+                format!(
+                    "GET /api/v1/monitoring/observation HTTP/1.1\r\nHost: {}\r\n\
+                     Authorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                    monitoring.authority, monitoring.token
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    };
+    let response = tokio::time::timeout(Duration::from_secs(10), fetch)
+        .await
+        .map_err(|_| "the monitoring observation did not answer within 10s".to_string())?
+        .map_err(|error| format!("the monitoring observation could not be read: {error}"))?;
+    core_shards_of(&response)
+}
+
+/// `core.shards` from an HTTP response carrying a monitoring observation.
+fn core_shards_of(response: &[u8]) -> Result<u64, String> {
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or("the monitoring observation is not an HTTP response")?;
+    let head = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
+    let status = head.split_whitespace().nth(1).unwrap_or("");
+    if status != "200" {
+        return Err(format!(
+            "the monitoring observation answered {status} (is {MONITORING_TOKEN_VARIABLE} the \
+             server's monitoring token?)"
+        ));
+    }
+    let mut body = response[split + 4..].to_vec();
+    if head.contains("transfer-encoding: chunked") {
+        body = dechunked(&body).ok_or("the monitoring observation's chunked body is malformed")?;
+    }
+    let observation: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("the monitoring observation is not JSON: {error}"))?;
+    observation["resources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|resource| resource["metrics"].as_array().into_iter().flatten())
+        .find(|metric| metric["name"] == "core.shards")
+        .and_then(|metric| metric["value"].as_f64())
+        .filter(|shards| *shards >= 1.0 && shards.fract() == 0.0)
+        .map(|shards| shards as u64)
+        .ok_or_else(|| "the monitoring observation reports no core.shards".to_string())
+}
+
+/// An HTTP/1.1 chunked body, joined.
+fn dechunked(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body.windows(2).position(|window| window == b"\r\n")?;
+        let size_text = std::str::from_utf8(&body[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(body.get(..size)?);
+        body = body.get(size + 2..)?;
+    }
+}
+
 struct DeliverySet {
     seen: Vec<bool>,
 }
@@ -551,6 +774,10 @@ async fn run(args: Args) -> Result<CompletedRunReport, String> {
         args.workload.clients, args.workload.channels, args.addr, args.workload.burst
     );
 
+    let server_core_shards = match &args.monitoring {
+        Some(monitoring) => Some(observed_core_shards(monitoring).await?),
+        None => None,
+    };
     let rss_finished = Arc::new(AtomicBool::new(false));
     let rss_measurement = match args.server_pid {
         Some(pid) => match read_server_rss_bytes(pid) {
@@ -700,6 +927,18 @@ async fn run(args: Args) -> Result<CompletedRunReport, String> {
     } else {
         None
     };
+    if let Some(observed) = server_core_shards {
+        println!("server core shards: {observed}");
+    }
+    if let (Some(claimed), Some(observed)) = (args.core_workers, server_core_shards)
+        && observed != claimed as u64
+    {
+        thresholds_met = false;
+        eprintln!(
+            "core-shard check failed: the server runs {observed} core shard(s), not the \
+             {claimed} --core-workers claims"
+        );
+    }
     if let Some(minimum) = args.minimum_connect_rate
         && connect_rate < minimum
     {
@@ -729,7 +968,7 @@ async fn run(args: Args) -> Result<CompletedRunReport, String> {
         }
     }
     Ok(CompletedRunReport {
-        format_version: 2,
+        format_version: REPORT_FORMAT_VERSION,
         request: RunRequest::from_args(&args),
         successful_clients: ok,
         failed_clients: failures,
@@ -741,6 +980,7 @@ async fn run(args: Args) -> Result<CompletedRunReport, String> {
         fanout_rate,
         latency,
         server_rss,
+        server_core_shards,
         outcome: if failures == 0 && delivered == expected && thresholds_met {
             CompletedOutcome::Passed
         } else {
@@ -775,6 +1015,27 @@ async fn client(
             server_password: None,
         })
         .await?;
+        if args.is_sender(id)
+            && let Some(operator) = &args.oper
+        {
+            conn.send_line(&format!("OPER {} :{}", operator.name, operator.password))
+                .await?;
+            loop {
+                match conn.next_message().await? {
+                    Some(m) if m.command == "381" => break,
+                    // Need-more-parameters, password mismatch, no operator block.
+                    Some(m) if matches!(m.command.as_str(), "461" | "464" | "491") => {
+                        return Err(std::io::Error::other(format!(
+                            "OPER was refused ({}): the sender would stay subject to the \
+                             flood limiter",
+                            m.command
+                        )));
+                    }
+                    Some(_) => {}
+                    None => return Err(std::io::Error::other("closed before OPER completed")),
+                }
+            }
+        }
         conn.send_line(&format!("JOIN {channel}")).await?;
         // Wait for end-of-names (366) so we know the join completed.
         loop {
@@ -821,7 +1082,25 @@ async fn client(
         // this marker. A receiver validates its exact set only at the marker.
         conn.send_line(&format!("PRIVMSG {channel} :load-complete"))
             .await?;
-        return Ok(());
+        // Leave the way a client that wants its lines delivered does: QUIT,
+        // then read until the server closes. Dropping the socket with the
+        // server's lines to it still unread (receivers joining the channel)
+        // makes the kernel reset the connection, and a reset discards what the
+        // server had not yet read of the burst — the deliveries then went
+        // missing, and the run failed for want of lines it had sent.
+        conn.send_line("QUIT :load complete").await?;
+        let drained = tokio::time::timeout(Duration::from_secs(30), async {
+            while conn.next_message().await?.is_some() {}
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        return match drained {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the server did not close the sender's connection within 30s of its QUIT",
+            )),
+        };
     }
 
     // Receiver: count this channel's sender's burst until complete or a
@@ -935,7 +1214,7 @@ mod tests {
 
     fn sample_report() -> CompletedRunReport {
         CompletedRunReport {
-            format_version: 2,
+            format_version: REPORT_FORMAT_VERSION,
             request: RunRequest {
                 addr: "127.0.0.1:6667".into(),
                 clients: 64,
@@ -943,6 +1222,9 @@ mod tests {
                 burst: 4,
                 tls: false,
                 host_provenance_sha256: None,
+                core_workers: Some(2),
+                senders_are_operators: false,
+                server_command_burst: DEFAULT_SERVER_COMMAND_BURST,
                 thresholds: Thresholds {
                     minimum_connect_rate: Some(10.0),
                     minimum_fanout_rate: Some(100.0),
@@ -960,6 +1242,7 @@ mod tests {
             fanout_rate: 224.0,
             latency: None,
             server_rss: None,
+            server_core_shards: Some(2),
             outcome: CompletedOutcome::Passed,
         }
     }
@@ -981,7 +1264,7 @@ mod tests {
             ])
             .is_err()
         );
-        let parsed = args(&[
+        let qualification = [
             "--clients",
             "64",
             "--channels",
@@ -1002,8 +1285,26 @@ mod tests {
             "A3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910",
             "--report-json",
             "result.json",
-        ])
+        ];
+        assert!(
+            args(&qualification).is_err(),
+            "a qualification checks its shard count against the server's"
+        );
+        let parsed = parse_args_with(
+            ["--addr", "irc.example:6697"]
+                .into_iter()
+                .chain(qualification)
+                .chain([
+                    "--core-workers",
+                    "2",
+                    "--monitoring-url",
+                    "http://127.0.0.1:8080",
+                ])
+                .map(str::to_owned),
+            |variable| (variable == MONITORING_TOKEN_VARIABLE).then(|| "t".repeat(32)),
+        )
         .unwrap();
+        assert_eq!(parsed.core_workers, Some(2));
         assert_eq!(parsed.workload.clients, 64);
         assert_eq!(parsed.minimum_connect_rate, Some(10.0));
         assert_eq!(parsed.minimum_fanout_rate, Some(100.0));
@@ -1021,6 +1322,93 @@ mod tests {
             ))
         );
         assert!(args(&["--host-provenance-sha256", "not-a-digest"]).is_err());
+    }
+
+    /// A burst past the server's command burst measures its flood limiter —
+    /// twenty lines a second per sender — not fan-out, and a large one runs
+    /// into the receive timeout: it is refused unless the senders oper up,
+    /// which exempts them. The password comes from the environment only.
+    #[test]
+    fn a_burst_the_flood_limiter_would_meter_is_refused_unless_the_senders_are_operators() {
+        let refusal = args(&["--burst", "40"])
+            .err()
+            .expect("40 and its fence exceed 40");
+        assert!(refusal.contains("--server-command-burst"), "{refusal}");
+        assert!(refusal.contains("--oper-name"), "{refusal}");
+        assert!(args(&["--burst", "39"]).is_ok(), "39 and its fence fit");
+        assert!(args(&["--burst", "99", "--server-command-burst", "100"]).is_ok());
+
+        let with_password = |values: &[&str]| {
+            parse_args_with(
+                ["--addr", "irc.example:6697"]
+                    .into_iter()
+                    .chain(values.iter().copied())
+                    .map(str::to_owned),
+                |variable| (variable == OPER_PASSWORD_VARIABLE).then(|| "hunter2".to_owned()),
+            )
+        };
+        let opered = with_password(&["--burst", "1000", "--oper-name", "load"])
+            .expect("operators are exempt");
+        let operator = opered.oper.as_ref().expect("operator");
+        assert_eq!(
+            (operator.name.as_str(), operator.password.as_str()),
+            ("load", "hunter2")
+        );
+        assert!(RunRequest::from_args(&opered).senders_are_operators);
+        let without = args(&["--burst", "1000", "--oper-name", "load"])
+            .err()
+            .expect("no password in the environment");
+        assert!(without.contains(OPER_PASSWORD_VARIABLE), "{without}");
+    }
+
+    /// The claimed shard count is checked against the server's own, which
+    /// needs its monitoring observation.
+    #[test]
+    fn core_workers_are_checked_against_the_server_s_observation() {
+        assert!(
+            args(&["--core-workers", "4"]).is_err(),
+            "nothing to check against"
+        );
+        let with_token = |values: &[&str]| {
+            parse_args_with(
+                ["--addr", "irc.example:6697"]
+                    .into_iter()
+                    .chain(values.iter().copied())
+                    .map(str::to_owned),
+                |variable| (variable == MONITORING_TOKEN_VARIABLE).then(|| "t".repeat(32)),
+            )
+        };
+        let parsed = with_token(&[
+            "--core-workers",
+            "4",
+            "--monitoring-url",
+            "http://127.0.0.1:8080/",
+        ])
+        .expect("checked against the observation");
+        assert_eq!(
+            parsed.monitoring.expect("monitoring").authority,
+            "127.0.0.1:8080"
+        );
+        assert!(with_token(&["--monitoring-url", "https://127.0.0.1:8080"]).is_err());
+        assert!(
+            args(&["--monitoring-url", "http://127.0.0.1:8080"]).is_err(),
+            "no bearer in the environment"
+        );
+
+        let observation = r#"{"schema_version":"e6qu.monitoring/v2","resources":[{"metrics":[{"name":"uptime","value":3.0},{"name":"core.shards","value":4.0}]}]}"#;
+        let plain = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{observation}",
+            observation.len()
+        );
+        assert_eq!(core_shards_of(plain.as_bytes()), Ok(4));
+        let chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{observation}\r\n0\r\n\r\n",
+            observation.len()
+        );
+        assert_eq!(core_shards_of(chunked.as_bytes()), Ok(4));
+        let refused = core_shards_of(b"HTTP/1.1 401 Unauthorized\r\n\r\n{}").unwrap_err();
+        assert!(refused.contains("401"), "{refused}");
+        assert!(core_shards_of(b"HTTP/1.1 200 OK\r\n\r\n{\"resources\":[]}").is_err());
     }
 
     #[test]
@@ -1080,7 +1468,7 @@ mod tests {
         let json =
             serde_json::to_value(RunReport::Completed(sample_report())).expect("serialize report");
         assert_eq!(json["status"], "completed");
-        assert_eq!(json["report"]["format_version"], 2);
+        assert_eq!(json["report"]["format_version"], REPORT_FORMAT_VERSION);
         assert_eq!(json["report"]["expected_deliveries"], 224);
         assert_eq!(
             json["report"]["request"]["thresholds"]["maximum_p99_ms"],
@@ -1098,7 +1486,7 @@ mod tests {
         ));
         let json = serde_json::to_value(report).expect("serialize failed report");
         assert_eq!(json["status"], "failed");
-        assert_eq!(json["report"]["format_version"], 2);
+        assert_eq!(json["report"]["format_version"], REPORT_FORMAT_VERSION);
         assert_eq!(json["report"]["request"]["clients"], 64);
         assert!(
             json["report"]["error"]

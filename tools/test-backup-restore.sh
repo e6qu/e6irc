@@ -18,6 +18,7 @@ printf '%s\n' "$*" >>"${E6IRC_TEST_ARGUMENT_LOG:?}"
   printf 'PGHOST=%s\nPGPORT=%s\nPGUSER=%s\n' "${PGHOST-}" "${PGPORT-}" "${PGUSER-}"
   printf 'PGPASSWORD=%s\nPGDATABASE=%s\n' "${PGPASSWORD-}" "${PGDATABASE-}"
   printf 'PGSSLMODE=%s\nPGSSLROOTCERT=%s\n' "${PGSSLMODE-}" "${PGSSLROOTCERT-}"
+  printf 'PGSSLCERT=%s\nPGPASSFILE=%s\n' "${PGSSLCERT-}" "${PGPASSFILE-}"
   printf 'E6IRC_DATABASE_URL=%s\n' "${E6IRC_DATABASE_URL-}"
 } >"${E6IRC_TEST_ENVIRONMENT_LOG:?}"
 EOF
@@ -63,6 +64,8 @@ PGPASSWORD=p@ss/w:rd#1
 PGDATABASE=e6irc_restore
 PGSSLMODE=verify-full
 PGSSLROOTCERT=/etc/e6irc/database ca.pem
+PGSSLCERT=
+PGPASSFILE=/dev/null
 E6IRC_DATABASE_URL='
 assert_connection() {
   if [ "$(cat "$E6IRC_TEST_ENVIRONMENT_LOG")" != "$expected_environment" ]; then
@@ -76,6 +79,9 @@ assert_connection() {
 export PATH="$temporary/bin:$PATH"
 export E6IRC_TEST_ARGUMENT_LOG="$temporary/arguments.log"
 export E6IRC_TEST_ENVIRONMENT_LOG="$temporary/environment.log"
+# libpq variables inherited from the caller are not the URL's and must not
+# reach the client: the daemon refuses to start beside them.
+export PGSSLMODE=disable PGSSLCERT=/stray/client.pem PGHOST=elsewhere.invalid
 export E6IRC_DATABASE_URL='postgresql://backup%20user:p%40ss%2Fw%3Ard%231@db.example.invalid:6543/e6irc_restore?sslmode=verify-full&ssl-root-cert=/etc/e6irc/database%20ca.pem&statement-cache-capacity=10'
 backup="$temporary/e6irc.dump"
 "$root/tools/backup-postgres.sh" "$backup"
@@ -122,6 +128,11 @@ for unusable in \
   'postgresql://u:hunter2@db.example.invalid:hunter2/e6irc' \
   'postgresql://u:hunter2@one.invalid,two.invalid/e6irc' \
   'postgresql://u:hunter2@db.example.invalid/e6irc?options=-c+hunter2' \
+  'postgresql://u:hunter2@db.example.invalid/e6irc?hostaddr=192.0.2.1' \
+  'postgresql://u:hunter2@db.example.invalid/e6irc?connect_timeout=5' \
+  'postgresql://u:hunter2@db.example.invalid/e6irc?sslmode=require&ssl-mode=disable' \
+  'postgresql://u:hunter2@db.example.invalid/e6irc?password=hunter2' \
+  'postgresql://u:hunter2@db.example.invalid/e6irc/hunter2' \
   'postgresql://u:hunter%FF2@db.example.invalid/e6irc' \
   'mysql://u:hunter2@db.example.invalid/e6irc'; do
   if E6IRC_DATABASE_URL=$unusable \

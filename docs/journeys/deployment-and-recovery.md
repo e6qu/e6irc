@@ -300,11 +300,16 @@ A database URL the tools cannot hand to the PostgreSQL clients faithfully is
 refused before any client runs, with the reason and nothing the URL contained:
 a scheme other than `postgres://` or `postgresql://`, several hosts, a port
 outside 1–65535, a bare `#`, a bare `+` in a query value, bytes that are not
-percent-encoded UTF-8, or a query parameter the tools do not forward. Nothing is
+percent-encoded UTF-8, a field stated twice, or a query parameter outside the
+closed set the daemon itself accepts (`hostaddr` and `connect_timeout`, which
+the daemon cannot honour as libpq does, are refused by both). Nothing is
 dropped silently, so `sslmode` and the certificate parameters (in either the
 libpq or the daemon's hyphenated spelling) apply to the backup exactly as they
 do to the daemon; only `statement-cache-capacity`, which sizes a daemon cache,
-is ignored.
+is ignored. Every libpq variable inherited from the caller (`PGSSLMODE`,
+`PGHOST`, ...) is removed and no password file is read, so the URL is the whole
+description of the backup's connection, as it is of the daemon's (which refuses
+to start while one of them is set).
 Restore uses one transaction, so a failed archive application does not leave a
 half-restored schema. Keep the source database and backup unchanged, correct
 the named failure, and retry while e6ircd remains stopped.
@@ -402,7 +407,11 @@ and host process/memory/CPU telemetry is available.
 5. Use `qualify-linux.sh` for controlled Linux runs. It validates host budgets
    and stores a synced load result, host provenance, and common qualification
    evidence. A harness failure records a failed outcome; a preflight failure
-   creates no evidence.
+   creates no evidence. The core-shard count the evidence claims is checked
+   against the one the server reports (its monitoring observation's
+   `core.shards`), and a burst past the server's command burst is refused
+   unless the senders oper up, since past it the run would time the flood
+   limiter rather than fan-out.
 
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires

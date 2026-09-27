@@ -164,7 +164,7 @@ impl CredentialWatch {
     /// process. A lost connection is re-established with a bounded backoff,
     /// and every watched credential is read again once it is, because what
     /// was announced in between was not heard.
-    pub(crate) async fn run(self: Arc<Self>, url: String, pool: sqlx::PgPool) {
+    pub(crate) async fn run(self: Arc<Self>, url: crate::db::DatabaseUrl, pool: sqlx::PgPool) {
         const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
         const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
         let mut retry = RETRY_MIN;

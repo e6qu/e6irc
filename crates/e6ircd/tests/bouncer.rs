@@ -444,7 +444,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 /// Provision a fresh single-account database and return its URL. `test` is the
 /// calling test's name — a shared helper must not name the database after
 /// itself, or every test it serves would share one.
-async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
+async fn bnc_account_db(test: &str, account: &str, password: &str) -> e6ircd::db::DatabaseUrl {
     let url = support::test_db(test).await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -460,16 +460,16 @@ async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
 /// database. Not `db::connect_and_migrate`: that is the daemon's pool, whose
 /// 2 s acquire timeout is a production bound, and on a loaded test host it
 /// turned a slow poll into `count: PoolTimedOut`.
-async fn observer_pool(url: &str) -> sqlx::PgPool {
+async fn observer_pool(url: &e6ircd::db::DatabaseUrl) -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(url)
+        .connect_with(url.connect_options())
         .await
         .expect("observer pool")
 }
 
-fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
+fn bnc_config(up: std::net::SocketAddr, url: e6ircd::db::DatabaseUrl) -> Config {
     use e6ircd::config::{BncConfig, DatabaseConfig, NetworkEntry};
     Config {
         server_name: "irc.bnc.example".into(),
@@ -1162,6 +1162,79 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .await
     .expect("timeout");
     assert!(replayed, "restored backlog was not replayed on attach");
+}
+
+/// A network's whole `buffer_cap` survives a restart. A start used to restore
+/// the newest 1,000 stored lines whatever the network was configured to
+/// replay, so a larger buffer was honoured only until the next restart.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_restart_restores_the_whole_configured_buffer() {
+    const STORED: i32 = 1_500;
+    let url = bnc_account_db(
+        "a_restart_restores_the_whole_configured_buffer",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let pool = observer_pool(&url).await;
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, sent_at)
+         SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :restored ' || n,
+                '2026-01-01T00:00:00.000Z'
+         FROM generate_series(1, $1) n",
+    )
+    .bind(STORED)
+    .execute(&pool)
+    .await
+    .expect("seed the stored backlog");
+    drop(pool);
+    let up = upstream().await;
+    let mut config = bnc_config(up, url);
+    // Nothing live reaches the buffer: its content is what the start restored.
+    config.networks[0].addr = "127.0.0.1:1".into();
+    config.networks[0].buffer_cap = 2_000;
+    let running = net::start(config).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .unwrap();
+    client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("attach");
+    let replayed = tokio::time::timeout(deadline::HANG, async {
+        let mut replayed = Vec::new();
+        while let Some(message) = client.next_message().await.unwrap() {
+            if message.command != "PRIVMSG" {
+                continue;
+            }
+            let text = message.params.get(1).cloned().unwrap_or_default();
+            let last = text == format!("restored {STORED}");
+            replayed.push(text);
+            if last {
+                break;
+            }
+        }
+        replayed
+    })
+    .await
+    .expect("timeout");
+    assert_eq!(
+        replayed.len(),
+        STORED as usize,
+        "every stored line is replayed"
+    );
+    assert_eq!(replayed.first().map(String::as_str), Some("restored 1"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

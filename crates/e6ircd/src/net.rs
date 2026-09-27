@@ -616,12 +616,7 @@ pub fn check_offline(config: &Config) -> io::Result<()> {
     if serves_http(config) {
         crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
     }
-    let listener_files = config.listeners.iter().filter_map(|l| l.tls.as_ref());
-    let bnc_files = config.bnc.iter().filter_map(|bnc| bnc.tls.as_ref());
-    for files in listener_files.chain(bnc_files) {
-        crate::certificate::ReloadingCertificate::load(files)?;
-    }
-    Ok(())
+    crate::certificate::load_configured(config)
 }
 
 /// Bind listeners, spawn core workers, and start acceptors.
@@ -680,9 +675,26 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             let imported =
                 crate::config::ManagedConfig::from_config(&config, secret_key.as_deref())
                     .map_err(io::Error::other)?;
-            let mut snapshot = crate::db::load_or_initialize_managed_config(&pool, &imported)
-                .await
-                .map_err(io::Error::other)?;
+            // A document that leaves a required setting to the console can
+            // take it only from a stored revision; importing its absence as the
+            // first one would store a server with no name.
+            let mut snapshot = if config.left_to_stored_settings.is_empty() {
+                crate::db::load_or_initialize_managed_config(&pool, &imported)
+                    .await
+                    .map_err(io::Error::other)?
+            } else {
+                crate::db::stored_managed_config(&pool)
+                    .await
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "the configuration does not state {} and the database holds no \
+                             stored settings to take it from: the first start needs each \
+                             stated (the console owns them afterwards)",
+                            config.left_to_stored_settings.join(", "),
+                        ))
+                    })?
+            };
             // The console owns every setting in the stored revision. One the
             // configuration also states must agree with it: applying the
             // revision over a different stated value would ignore that value
@@ -944,6 +956,19 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             maintenance,
             critical_tx.clone(),
         ));
+        if let Some(database) = &config.database {
+            let watcher = tokio::spawn(crate::settings_watch::run(
+                database.url.clone(),
+                pool.clone(),
+                settings.clone(),
+                bnc_listener.clone(),
+            ));
+            listeners.push(supervise_listener(
+                "settings-change listener",
+                watcher,
+                critical_tx.clone(),
+            ));
+        }
     }
 
     // One shared HTTP `AppState`, built when either the HTTP server or any
@@ -963,6 +988,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             false
         };
         let trusted_proxies = config.limits.trusted_proxies.clone();
+        if let Some(warning) = config.shared_authentication_budget() {
+            eprintln!("e6ircd: warning: {warning}");
+        }
         let (public_url, secure_cookies) = match &config.http {
             Some(h) => (h.public_url.clone(), h.secure_cookies),
             None => (None, false),

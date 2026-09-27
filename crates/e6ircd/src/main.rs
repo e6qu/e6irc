@@ -189,6 +189,18 @@ fn check_config(args: &[String]) -> ExitCode {
                      agrees with the revision stored there. Start refuses, by name, any that \
                      differs."
                 );
+                if !config.left_to_stored_settings.is_empty() {
+                    eprintln!(
+                        "{CONTEXT}: it leaves {} to the settings the console stores; a first \
+                         start, with none stored yet, refuses naming {}.",
+                        config.left_to_stored_settings.join(", "),
+                        if config.left_to_stored_settings.len() == 1 {
+                            "it"
+                        } else {
+                            "them"
+                        }
+                    );
+                }
             }
             ExitCode::SUCCESS
         }
@@ -659,7 +671,7 @@ mod tests {
         assert!(failure.contains("line 2, column 16"), "{failure}");
         assert!(failure.contains("expected a string"), "{failure}");
 
-        let error = toml::from_str::<Config>("server_name = \"irc.example.test\"\n")
+        let error = toml::from_str::<Config>("[database]\nstartup_wait_seconds = 1\n")
             .expect_err("a required field is missing");
         let failure = describe_parse_error(error, None);
         assert!(failure.contains("missing field"), "{failure}");

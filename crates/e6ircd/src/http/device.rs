@@ -1530,22 +1530,19 @@ pub(super) async fn admin_patch_configuration(
         restart_required,
         &current.settings.changed_fields(&settings),
     );
-    match crate::db::save_managed_config(
+    match crate::db::save_managed_config_over(
         pool_of(&state),
-        current.revision,
+        &mut current,
         &settings,
         &crate::db::AuditPrincipal::account(&actor),
         &detail,
     )
     .await
     {
-        Ok(snapshot) => {
-            *current = snapshot.clone();
-            admin_json(ConfigurationPatchResponse {
-                revision: snapshot.revision,
-                restart_required,
-            })
-        }
+        Ok(snapshot) => admin_json(ConfigurationPatchResponse {
+            revision: snapshot.revision,
+            restart_required,
+        }),
         Err(error) => {
             if bnc_changed && let Some(listener) = &state.bnc_listener {
                 match &previous_bnc {
@@ -2013,22 +2010,19 @@ async fn mutate_managed_configuration(
             Some(&error.to_string()),
         );
     }
-    match crate::db::save_managed_config(
+    match crate::db::save_managed_config_over(
         pool_of(state),
-        revision,
+        &mut current,
         &settings,
         &crate::db::AuditPrincipal::account(actor),
         &format!("{detail}; restart required"),
     )
     .await
     {
-        Ok(snapshot) => {
-            *current = snapshot.clone();
-            admin_json(RevisionMessageResponse {
-                revision: snapshot.revision,
-                message: detail,
-            })
-        }
+        Ok(snapshot) => admin_json(RevisionMessageResponse {
+            revision: snapshot.revision,
+            message: detail,
+        }),
         Err(crate::db::DbError::StaleServerSettings) => problem(
             StatusCode::CONFLICT,
             "Configuration revision conflict",

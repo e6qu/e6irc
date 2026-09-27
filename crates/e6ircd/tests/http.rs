@@ -10,6 +10,11 @@ use tokio::net::TcpStream;
 
 mod support;
 
+/// A plain pool on `url` for the test's own queries, beside the daemon's.
+async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
+    sqlx::PgPool::connect_with(url.connect_options()).await
+}
+
 #[path = "support/deadline.rs"]
 mod deadline;
 
@@ -1647,7 +1652,7 @@ async fn bnc_network_management_lifecycle() {
     assert_eq!(status, 204, "update: {body}");
     // The audit row names the fields the edit changed (by name only) and the
     // kind; `addr` and `tls` were resubmitted unchanged and are not listed.
-    let audit_pool = sqlx::PgPool::connect(&url).await.expect("audit pool");
+    let audit_pool = plain_pool(&url).await.expect("audit pool");
     let (target, detail): (String, String) = sqlx::query_as(
         "SELECT target, detail FROM audit_log WHERE action = 'NETWORK_UPDATE' ORDER BY id DESC LIMIT 1",
     )
@@ -3795,9 +3800,7 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         .expect("sample timestamp")
         .saturating_sub(2 * 60 * 60 * 1_000);
     old_snapshot["sampled_at_ms"] = old_sampled_at.into();
-    let verification_pool = sqlx::PgPool::connect(&url)
-        .await
-        .expect("verification pool");
+    let verification_pool = plain_pool(&url).await.expect("verification pool");
     sqlx::query("INSERT INTO observability_samples (sampled_at_ms, snapshot) VALUES ($1, $2)")
         .bind(i64::try_from(old_sampled_at).unwrap())
         .bind(old_snapshot)
@@ -9647,10 +9650,13 @@ async fn admin_networks_fleet_view_and_toggle() {
 }
 
 /// A database-backed server with the HTTP listener and nothing else.
-async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running {
+async fn start_with_database(
+    url: &e6ircd::db::DatabaseUrl,
+    administrators: &[&str],
+) -> net::Running {
     let config = Config {
         database: Some(DatabaseConfig {
-            url: url.into(),
+            url: url.clone(),
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         }),
@@ -9669,6 +9675,205 @@ async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running
         ..test_config()
     };
     net::start(config).await.expect("start")
+}
+
+/// The configuration as `http` serves it, and the console's CSRF value.
+async fn configuration_of(http: std::net::SocketAddr, session: &str) -> serde_json::Value {
+    let (status, _, body) = request(
+        http,
+        &format!(
+            "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).expect("configuration JSON")
+}
+
+/// PATCH the scalar settings `settings` over `revision` on `http`.
+async fn patch_configuration(
+    http: std::net::SocketAddr,
+    session: &str,
+    csrf: &str,
+    revision: &serde_json::Value,
+    settings: &serde_json::Value,
+) -> (u16, String) {
+    let body = serde_json::json!({ "revision": revision, "settings": settings }).to_string();
+    let (status, _, body) = request(
+        http,
+        &format!(
+            "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    (status, body)
+}
+
+/// Poll `http`'s configuration until `done` holds of it.
+async fn configuration_when(
+    http: std::net::SocketAddr,
+    session: &str,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        let current = configuration_of(http, session).await;
+        if done(&current) {
+            return current;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the configuration never reached the expected state");
+}
+
+/// Several processes write the stored settings: another replica's console,
+/// and `e6ircd rotate-secrets`, which bumps the revision as it re-seals. Each
+/// running server used to hold the revision it loaded or saved last, so after
+/// any other write its console refused every save as stale until it was
+/// restarted. Now a committed revision reaches every running server (the
+/// table announces it), a server that finds its revision stale reloads it,
+/// and what the other writer changed live — here, turning the attach listener
+/// off — is applied as that writer's own process applied it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_settings_revision_written_elsewhere_reaches_every_running_server() {
+    let url = support::test_db("a_settings_revision_written_elsewhere_reaches_every").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(&pool, "root", None)
+        .await
+        .expect("session");
+    let first = start_with_database(&url, &["root"]).await;
+    let second = start_with_database(&url, &["root"]).await;
+    let (a, b) = (
+        first.http_addr.expect("first http"),
+        second.http_addr.expect("second http"),
+    );
+    wait_http_ready(a).await;
+    wait_http_ready(b).await;
+    // Each process keys its own CSRF values.
+    let csrf_of = async |http| {
+        let (status, _, page) = request(
+            http,
+            &format!(
+                "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
+                 Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        csrf_from_html(&page).to_string()
+    };
+    let (csrf, csrf_b) = (csrf_of(a).await, csrf_of(b).await);
+    let loaded = configuration_of(a, &session).await["revision"]
+        .as_i64()
+        .expect("revision");
+
+    // An out-of-band write, as `rotate-secrets` makes one.
+    sqlx::query("UPDATE server_settings SET revision = revision + 1")
+        .execute(&pool)
+        .await
+        .expect("bump the stored revision");
+    let bumped = loaded + 1;
+    for http in [a, b] {
+        configuration_when(http, &session, |current| current["revision"] == bumped).await;
+    }
+
+    // One replica's save reaches the other, which can then save over it; the
+    // attach listener the first turned off is off on the second too.
+    let current = configuration_of(a, &session).await;
+    assert!(
+        current["runtime"]["bound_bnc_addr"].is_string(),
+        "{current}"
+    );
+    let mut settings = current["settings"].clone();
+    settings["description"] = "saved on the first replica".into();
+    settings["bnc_addr"] = serde_json::Value::Null;
+    let (status, body) =
+        patch_configuration(a, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 200, "{body}");
+    let seen = configuration_when(b, &session, |current| {
+        current["revision"] == bumped + 1 && current["runtime"]["bound_bnc_addr"].is_null()
+    })
+    .await;
+    assert_eq!(
+        seen["settings"]["description"],
+        "saved on the first replica"
+    );
+    let mut settings = seen["settings"].clone();
+    settings["description"] = "saved on the second replica".into();
+    let (status, body) =
+        patch_configuration(b, &session, &csrf_b, &seen["revision"], &settings).await;
+    assert_eq!(status, 200, "{body}");
+    configuration_when(a, &session, |current| {
+        current["settings"]["description"] == "saved on the second replica"
+    })
+    .await;
+}
+
+/// Removing a console-owned setting from the bootstrap hands it to the console
+/// (DESIGN §18), and that includes the three every server needs: a file may
+/// leave out `server_name`, `network_name` and `[[listeners]]` once the
+/// database stores them, and the stored values run. A first start with none
+/// stored refuses, naming each; it used to be impossible to leave them out at
+/// all, so a name changed in the console had to be copied into the file.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
+    let text = support::test_db_text("a_bootstrap_may_leave_the_server_s_names").await;
+    let document = |names: bool| {
+        let mut document = toml::Table::new();
+        let mut database = toml::Table::new();
+        database.insert("url".into(), toml::Value::String(text.clone()));
+        document.insert("database".into(), toml::Value::Table(database));
+        let mut http = toml::Table::new();
+        http.insert("addr".into(), toml::Value::String("127.0.0.1:0".into()));
+        document.insert("http".into(), toml::Value::Table(http));
+        if names {
+            document.insert("server_name".into(), "irc.stored.example".into());
+            document.insert("network_name".into(), "StoredNet".into());
+            let mut listener = toml::Table::new();
+            listener.insert("addr".into(), toml::Value::String("127.0.0.1:0".into()));
+            document.insert(
+                "listeners".into(),
+                toml::Value::Array(vec![toml::Value::Table(listener)]),
+            );
+        }
+        Config::from_table(document, &[]).expect("the document is valid")
+    };
+    let omitting = document(false);
+    assert_eq!(
+        omitting.left_to_stored_settings,
+        ["server_name", "network_name", "listeners"]
+    );
+    let refusal = match net::start(omitting).await {
+        Ok(_) => panic!("a first start cannot take the names from nothing"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refusal.contains("does not state server_name, network_name, listeners"),
+        "{refusal}"
+    );
+    drop(net::start(document(true)).await.expect("the first start"));
+    let running = net::start(document(false))
+        .await
+        .expect("a later start takes the names from the stored settings");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    let (status, _, body) = request(http, &get("/api/v1/server")).await;
+    assert_eq!(status, 200, "{body}");
+    let server: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(server["server_name"], "irc.stored.example");
+    assert_eq!(server["network_name"], "StoredNet");
+    assert_eq!(running.addrs.len(), 1, "the stored listener is bound");
 }
 
 /// Administrator console pages spend the separate administrator budget that
@@ -9988,8 +10193,10 @@ async fn console_pages_are_cookie_only_and_report_their_refusals() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn recover_administrator_subcommand_is_honoured_by_a_running_daemon() {
-    let url =
-        support::test_db("recover_administrator_subcommand_is_honoured_by_a_running_daemon").await;
+    let url_text =
+        support::test_db_text("recover_administrator_subcommand_is_honoured_by_a_running_daemon")
+            .await;
+    let url: e6ircd::db::DatabaseUrl = url_text.parse().expect("the test database URL");
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -10015,7 +10222,7 @@ async fn recover_administrator_subcommand_is_honoured_by_a_running_daemon() {
         &config_path,
         format!(
             "server_name = \"irc.recover.example\"\nnetwork_name = \"RecoverNet\"\n\
-             [[listeners]]\naddr = \"127.0.0.1:0\"\n[database]\nurl = \"{url}\"\n"
+             [[listeners]]\naddr = \"127.0.0.1:0\"\n[database]\nurl = \"{url_text}\"\n"
         ),
     )
     .expect("write config");

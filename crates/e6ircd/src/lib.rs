@@ -21,3 +21,4 @@ pub(crate) mod peer_write;
 pub(crate) mod recency;
 pub(crate) mod sanitize;
 pub mod secret;
+pub(crate) mod settings_watch;

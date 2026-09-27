@@ -121,10 +121,8 @@ pub struct CredentialChangeListener(sqlx::postgres::PgListener);
 impl CredentialChangeListener {
     /// Connect and start listening. The listener has its own connection, not
     /// one of the shared pool's, which it would hold for the process lifetime.
-    pub async fn connect(url: &str) -> Result<Self, DbError> {
-        let mut listener = sqlx::postgres::PgListener::connect(url)
-            .await
-            .map_err(DbError::Connect)?;
+    pub async fn connect(url: &super::DatabaseUrl) -> Result<Self, DbError> {
+        let mut listener = super::notification_listener(url).await?;
         listener
             .listen(CREDENTIAL_CHANGED_CHANNEL)
             .await

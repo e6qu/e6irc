@@ -13,6 +13,13 @@ use tokio::net::TcpStream;
 
 mod support;
 
+/// A plain pool on `url` for the test's own queries: not the daemon's pool
+/// (`db::connect_and_migrate`), whose migrations a migration test must run
+/// itself.
+async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
+    sqlx::PgPool::connect_with(url.connect_options()).await
+}
+
 #[path = "support/deadline.rs"]
 mod deadline;
 
@@ -3696,7 +3703,7 @@ async fn bnc_read_markers_follow_the_networks_case_mapping() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn read_marker_display_migration_backfills_from_the_backlog() {
     let url = support::test_db("read_marker_display_migration").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(81, &pool)
         .await
@@ -3759,7 +3766,7 @@ async fn read_marker_display_migration_backfills_from_the_backlog() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn autojoin_key_migration_pairs_every_channel_with_no_key() {
     let url = support::test_db("autojoin_key_migration").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(86, &pool)
         .await
@@ -4728,7 +4735,7 @@ async fn channel_mlock_persist_and_load() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_mlock_migration_normalizes_historical_rows() {
     let url = support::test_db("channel_mlock_migration_normalizes_historical_rows").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(37, &pool)
         .await
@@ -4819,7 +4826,7 @@ fn oidc_provider(name: &str, account_claim: Option<&str>) -> serde_json::Value {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn managed_config_migration_backfills_legacy_oidc_claims() {
-    let pool = sqlx::PgPool::connect(
+    let pool = plain_pool(
         &support::test_db("managed_config_migration_backfills_legacy_oidc_claims").await,
     )
     .await
@@ -4898,11 +4905,10 @@ async fn managed_config_migration_backfills_legacy_oidc_claims() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn server_password_migration_adds_a_sealed_column_only_irc_may_fill() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("server_password_migration_adds_a_sealed_column").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("server_password_migration_adds_a_sealed_column").await)
+            .await
+            .expect("connect");
     MIGRATIONS
         .run_to(60, &pool)
         .await
@@ -5046,7 +5052,7 @@ async fn a_sealed_server_password_round_trips_through_every_network_query() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn username_migration_backfills_what_each_network_was_already_sending() {
-    let pool = sqlx::PgPool::connect(
+    let pool = plain_pool(
         &support::test_db("username_migration_backfills_what_each_network_was_sending").await,
     )
     .await
@@ -5194,7 +5200,7 @@ async fn username_migration_backfills_what_each_network_was_already_sending() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged() {
-    let pool = sqlx::PgPool::connect(
+    let pool = plain_pool(
         &support::test_db(
             "managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged",
         )
@@ -6306,6 +6312,47 @@ async fn audit_log_filters_and_cursor_pages_are_stable() {
     assert_eq!(filtered.entries.len(), 1);
     assert_eq!(filtered.entries[0].detail, "abuse");
     assert_eq!(filtered.next_before_id, None);
+}
+
+/// A save over a revision another process has since replaced (a replica's
+/// console, `rotate-secrets` re-sealing) is refused, and leaves the in-memory
+/// snapshot holding the stored revision — so the conflict it reports is one
+/// the administrator can read, and the retry from it commits. The snapshot
+/// used to stay stale, refusing every later save until a restart.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_save_over_a_stale_revision_reloads_the_stored_one() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("a_save_over_a_stale_revision_reloads_the_stored_one").await,
+    )
+    .await
+    .expect("connect");
+    let bootstrap =
+        e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
+    let mut current = db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    let loaded = current.revision;
+    sqlx::query("UPDATE server_settings SET revision = revision + 1, updated_by = 'rotation'")
+        .execute(&pool)
+        .await
+        .expect("an out-of-band write");
+    let mut changed = current.settings.clone();
+    changed.description = "after the rotation".into();
+    let actor = db::AuditPrincipal::account("alice");
+    let stale = db::save_managed_config_over(&pool, &mut current, &changed, &actor, "stale").await;
+    assert!(
+        matches!(stale, Err(db::DbError::StaleServerSettings)),
+        "{stale:?}"
+    );
+    assert_eq!(current.revision, loaded + 1, "the stored revision is held");
+    assert_eq!(current.updated_by, "rotation");
+    let saved = db::save_managed_config_over(&pool, &mut current, &changed, &actor, "retry")
+        .await
+        .expect("the retry from the stored revision commits");
+    assert_eq!(saved.revision, loaded + 2);
+    assert_eq!(current.revision, saved.revision);
+    assert_eq!(current.settings.description, "after the rotation");
 }
 
 #[tokio::test]
@@ -8749,7 +8796,9 @@ async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
     let url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/x",
         refusing_port()
-    );
+    )
+    .parse::<db::DatabaseUrl>()
+    .expect("URL");
     // Eight seconds, not two: on Windows a connect to a closed loopback port
     // can run into the two-second probe bound instead of failing at once, and
     // the wait must still fit an attempt, the one-second pause, and a retry.
@@ -8806,7 +8855,9 @@ async fn startup_database_wait_of_zero_is_a_single_attempt() {
     let url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/x",
         refusing_port()
-    );
+    )
+    .parse::<db::DatabaseUrl>()
+    .expect("URL");
     let wait = db::StartupDatabaseWait::from_seconds(0).expect("bounded");
     let mut attempts = 0;
     let error = db::connect_and_migrate_with_retry(
@@ -8881,7 +8932,7 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
-    let real = support::test_db("startup_database_wait_uses_a_database_that_appears").await;
+    let real = support::test_db_text("startup_database_wait_uses_a_database_that_appears").await;
     // `postgres://user:pass@host:port/name?...` -> the host:port to proxy to.
     let authority = real
         .split_once('@')
@@ -8890,7 +8941,10 @@ async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
         .map(|(authority, _)| authority.to_string())
         .expect("database URL has an authority");
     let port = refusing_port();
-    let proxied = real.replacen(&authority, &format!("127.0.0.1:{port}"), 1);
+    let proxied: db::DatabaseUrl = real
+        .replacen(&authority, &format!("127.0.0.1:{port}"), 1)
+        .parse()
+        .expect("proxied URL");
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -9225,7 +9279,9 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn recover_administrator_subcommand_prints_the_password_once() {
-    let url = support::test_db("recover_administrator_subcommand_prints_the_password_once").await;
+    let url_text =
+        support::test_db_text("recover_administrator_subcommand_prints_the_password_once").await;
+    let url: db::DatabaseUrl = url_text.parse().expect("the test database URL");
     let pool = db::connect_and_migrate(&url).await.expect("connect");
     db::create_account_with_contact(&pool, "alice", "forgotten", None)
         .await
@@ -9237,7 +9293,7 @@ async fn recover_administrator_subcommand_prints_the_password_once() {
     std::fs::write(
         &config_path,
         format!(
-            "server_name = \"irc.recover.example\"\nnetwork_name = \"Recover\"\n\n[[listeners]]\naddr = \"127.0.0.1:0\"\n\n[database]\nurl = \"{url}\"\n"
+            "server_name = \"irc.recover.example\"\nnetwork_name = \"Recover\"\n\n[[listeners]]\naddr = \"127.0.0.1:0\"\n\n[database]\nurl = \"{url_text}\"\n"
         ),
     )
     .expect("write config");
@@ -9694,7 +9750,7 @@ async fn a_migration_longer_than_the_statement_timeout_completes() {
         .await
         .expect("a slow migration completes");
     std::fs::remove_dir_all(&directory).expect("clean up");
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     let done: bool = sqlx::query_scalar("SELECT to_regclass('slow_migration_done') IS NOT NULL")
         .fetch_one(&pool)
         .await
@@ -10001,10 +10057,9 @@ async fn settings_rows_written_by_released_versions_load_after_migrating() {
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture).expect("read fixture"))
                 .expect("fixture JSON");
-        let pool =
-            sqlx::PgPool::connect(&support::test_db(&format!("settings_fixture_{name}")).await)
-                .await
-                .expect("connect");
+        let pool = plain_pool(&support::test_db(&format!("settings_fixture_{name}")).await)
+            .await
+            .expect("connect");
         MIGRATIONS
             .run_to(level, &pool)
             .await
@@ -10028,17 +10083,75 @@ async fn settings_rows_written_by_released_versions_load_after_migrating() {
     }
 }
 
+/// A stored server network whose `buffer_cap` is above what storage keeps is
+/// brought to that bound by 0091, the most of it that ever survived a
+/// restart, so the next start does not refuse the stored settings; a network
+/// within it keeps its value.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stored_buffer_cap_above_storage_is_brought_within_it_by_0091() {
+    let pool =
+        plain_pool(&support::test_db("a_stored_buffer_cap_above_storage_is_brought_within").await)
+            .await
+            .expect("connect");
+    MIGRATIONS.run_to(90, &pool).await.expect("through 0090");
+    let network = |name: &str| e6ircd::config::NetworkEntry {
+        kind: e6ircd::config::NetworkKind::Irc,
+        name: name.into(),
+        owner: None,
+        addr: "irc.example.test:6697".into(),
+        tls: true,
+        nick: "n".into(),
+        username: Some("ident".into()),
+        realname: Some("n".into()),
+        autojoin: vec![],
+        buffer_cap: 1000,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    };
+    let config = Config {
+        networks: vec![network("large"), network("small")],
+        ..Config::default()
+    };
+    let bootstrap = e6ircd::config::ManagedConfig::from_config(&config, None).expect("bootstrap");
+    db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    sqlx::query(
+        "UPDATE server_settings
+         SET settings = jsonb_set(settings, '{networks,0,buffer_cap}', '20000'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .expect("store a buffer_cap the old bound admitted");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let loaded = db::load_managed_config(&pool).await.expect("loads");
+    let caps: Vec<(&str, usize)> = loaded
+        .settings
+        .networks
+        .iter()
+        .map(|network| (network.name.as_str(), network.buffer_cap))
+        .collect();
+    assert_eq!(
+        caps,
+        [
+            ("large", e6ircd::config::MAX_NETWORK_BUFFER_CAP),
+            ("small", 1000)
+        ]
+    );
+}
+
 /// A settings row saved while `limits.command_burst` was optional stores it as
 /// `null`, which the required field cannot read: the daemon refused to start on
 /// the deployed row. 0067 turns that `null` into the documented default.
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("a_settings_row_with_a_null_command_burst_loads").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("a_settings_row_with_a_null_command_burst_loads").await)
+            .await
+            .expect("connect");
     MIGRATIONS.run_to(66, &pool).await.expect("through 0066");
     let bootstrap =
         e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
@@ -10076,7 +10189,7 @@ async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_settings_row_counting_the_sendq_in_lines_loads_in_bytes_after_0088() {
     for (sendq, expected) in [(2048_i64, 2048 * 512), (1, 17_406), (65_536, 33_554_432)] {
-        let pool = sqlx::PgPool::connect(
+        let pool = plain_pool(
             &support::test_db(&format!("a_settings_row_counting_the_sendq_{sendq}")).await,
         )
         .await
@@ -10113,11 +10226,10 @@ async fn a_settings_row_counting_the_sendq_in_lines_loads_in_bytes_after_0088() 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn app_password_revocations_from_0059_become_visible_to_their_account() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("app_password_revocations_from_0059_become_visible").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("app_password_revocations_from_0059_become_visible").await)
+            .await
+            .expect("connect");
     MIGRATIONS.run_to(58, &pool).await.expect("through 0058");
     let account: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded) VALUES ('Mixed[Case]', 'mixed{case}')
@@ -10153,11 +10265,10 @@ async fn app_password_revocations_from_0059_become_visible_to_their_account() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bouncer_backlog_is_backfilled_with_its_network_and_cascades() {
-    let pool = sqlx::PgPool::connect(
-        &support::test_db("bouncer_backlog_is_backfilled_with_its_network").await,
-    )
-    .await
-    .expect("connect");
+    let pool =
+        plain_pool(&support::test_db("bouncer_backlog_is_backfilled_with_its_network").await)
+            .await
+            .expect("connect");
     MIGRATIONS.run_to(61, &pool).await.expect("through 0061");
     let account: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice') RETURNING id",
@@ -10228,10 +10339,9 @@ async fn bouncer_backlog_is_backfilled_with_its_network_and_cascades() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn device_grants_name_their_account_by_id() {
-    let pool =
-        sqlx::PgPool::connect(&support::test_db("device_grants_name_their_account_by_id").await)
-            .await
-            .expect("connect");
+    let pool = plain_pool(&support::test_db("device_grants_name_their_account_by_id").await)
+        .await
+        .expect("connect");
     MIGRATIONS.run_to(64, &pool).await.expect("through 0064");
     let account: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice') RETURNING id",
@@ -11210,8 +11320,9 @@ async fn configured_administrator_names_are_not_claimable_by_invitation() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
-    let url =
-        support::test_db("a_stated_console_setting_must_agree_with_the_stored_revision").await;
+    let url_text =
+        support::test_db_text("a_stated_console_setting_must_agree_with_the_stored_revision").await;
+    let url: db::DatabaseUrl = url_text.parse().expect("the test database URL");
     let key_path =
         std::env::temp_dir().join(format!("e6irc-db-managed-drift-key-{}", std::process::id()));
     std::fs::write(&key_path, e6ircd::secret::SecretKey::generate().to_base64())
@@ -11227,7 +11338,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
             [[listeners]]
             addr = "127.0.0.1:0"
             [database]
-            url = {url:?}
+            url = {url_text:?}
             [secrets]
             key_file = {key_path:?}
             [http]
@@ -12197,7 +12308,7 @@ async fn direct_message_targets_come_from_a_summary_every_writer_keeps() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn dm_conversation_summary_is_backfilled_from_stored_history() {
     let url = support::test_db("dm_conversation_summary_is_backfilled").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(75, &pool)
         .await
@@ -12344,7 +12455,7 @@ async fn targets_are_dated_in_the_readers_scope() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn dm_conversation_text_time_is_backfilled_from_stored_history() {
     let url = support::test_db("dm_conversation_text_time_is_backfilled").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let pool = plain_pool(&url).await.expect("connect");
     MIGRATIONS
         .run_to(81, &pool)
         .await
@@ -12713,7 +12824,7 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
     // be that same session, or it waits on the lock forever.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect_with(url.connect_options())
         .await
         .expect("connect");
     MIGRATIONS

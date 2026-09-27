@@ -9,9 +9,11 @@
 //! goes through exactly the parser and validation a configuration file does,
 //! so the two ingresses cannot disagree about what a valid configuration is.
 //!
-//! Required:  `E6IRC_SERVER_NAME`  `E6IRC_PUBLIC_URL`  `E6IRC_DATABASE_URL`
+//! Required:  `E6IRC_PUBLIC_URL`  `E6IRC_DATABASE_URL`
 //!            `APPLICATION_RELEASE_REVISION`
-//! Optional:  `E6IRC_NETWORK_NAME` (default `e6qu`)
+//! Optional:  `E6IRC_SERVER_NAME` (unset: the stored settings' value; the first
+//!              start, with none stored yet, needs it)
+//!            `E6IRC_NETWORK_NAME` (default `e6qu`)
 //!            `E6IRC_HTTP_ADDR` (default `0.0.0.0:8080`)
 //!            `E6IRC_IRC_ADDR` (default `127.0.0.1:6667`: IRC is reached over
 //!              `/ws/irc` publicly; the raw port stays internal)
@@ -246,10 +248,11 @@ pub fn configuration_table(
     }
 
     let mut root = Table::new();
-    root.insert(
-        "server_name".into(),
-        environment.required("E6IRC_SERVER_NAME", None)?,
-    );
+    // Unset, the document leaves the server name to the stored settings, as a
+    // file that omits `server_name` does; the first start needs it stated.
+    if let Some(server_name) = environment.optional("E6IRC_SERVER_NAME")? {
+        root.insert("server_name".into(), Value::String(server_name));
+    }
     root.insert(
         "network_name".into(),
         environment.or_recorded_default(
@@ -547,7 +550,6 @@ mod tests {
     #[test]
     fn each_required_variable_is_refused_by_name_when_absent_or_empty() {
         for required in [
-            "E6IRC_SERVER_NAME",
             "E6IRC_PUBLIC_URL",
             "E6IRC_DATABASE_URL",
             "APPLICATION_RELEASE_REVISION",
@@ -563,6 +565,30 @@ mod tests {
             assert_eq!(table(&absent), expected);
             assert_eq!(table(&with(absent, &[(required, "")])), expected);
         }
+    }
+
+    /// An unset `E6IRC_SERVER_NAME` leaves the server name to the settings the
+    /// console stores, as a file that omits `server_name` does: the two
+    /// ingresses agree that removing a console-owned setting from the
+    /// bootstrap hands it to the console.
+    #[test]
+    fn an_unset_server_name_is_left_to_the_stored_settings() {
+        for unset in [
+            minimal()
+                .into_iter()
+                .filter(|(name, _)| *name != "E6IRC_SERVER_NAME")
+                .collect::<Vec<_>>(),
+            with(minimal(), &[("E6IRC_SERVER_NAME", "")]),
+        ] {
+            let document = table(&unset).expect("the document");
+            assert!(!document.contains_key("server_name"));
+            assert_eq!(
+                config(&unset).left_to_stored_settings,
+                ["server_name"],
+                "the start takes it from the stored revision"
+            );
+        }
+        assert!(config(&minimal()).left_to_stored_settings.is_empty());
     }
 
     #[test]

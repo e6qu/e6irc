@@ -21,8 +21,17 @@ printf '%s\n' \
   'core_workers = 2' \
   '[[listeners]]' \
   'addr = "127.0.0.1:16671"' \
+  '[http]' \
+  'addr = "127.0.0.1:16673"' \
+  'secure_cookies = false' \
+  '[[oper]]' \
+  'name = "load"' \
+  'password = "load-operator-password"' \
   > "$test_dir/e6ircd.toml"
 
+# The harness reads the core shards the server runs from its monitoring
+# observation, with the server's own token.
+export E6IRC_MONITORING_TOKEN=load-smoke-monitoring-token-0123456789
 "$server_bin" --config "$test_dir/e6ircd.toml" \
   >"$test_dir/server.stdout" 2>"$test_dir/server.stderr" &
 server_pid="$!"
@@ -55,6 +64,8 @@ load_args=(
   --minimum-connect-rate 10
   --minimum-fanout-rate 100
   --maximum-p99-ms 5000
+  --core-workers 2
+  --monitoring-url http://127.0.0.1:16673
   --report-json "$test_dir/load-report.json"
 )
 if [[ "$(uname -s)" == "Linux" ]]; then
@@ -67,7 +78,31 @@ fi
 "$load_bin" "${load_args[@]}"
 test -s "$test_dir/load-report.json"
 grep -F '"status": "completed"' "$test_dir/load-report.json" >/dev/null
-grep -F '"format_version": 2' "$test_dir/load-report.json" >/dev/null
+grep -F '"format_version": 3' "$test_dir/load-report.json" >/dev/null
+grep -F '"server_core_shards": 2' "$test_dir/load-report.json" >/dev/null
+
+# A claimed shard count the server does not run is a rejected run.
+if "$load_bin" --addr 127.0.0.1:16671 --clients 4 --channels 1 --burst 2 \
+  --core-workers 3 --monitoring-url http://127.0.0.1:16673 \
+  --report-json "$test_dir/wrong-shards.json"; then
+  echo "load harness accepted a core-worker count the server does not run" >&2
+  exit 1
+fi
+grep -F '"outcome": "rejected"' "$test_dir/wrong-shards.json" >/dev/null
+
+# A burst past the server's command burst would time the flood limiter: it is
+# refused before any client connects, unless the senders oper up (exempt).
+if "$load_bin" --addr 127.0.0.1:16671 --clients 4 --channels 1 --burst 200 \
+  2>"$test_dir/burst.stderr"; then
+  echo "load harness accepted a burst the flood limiter would meter" >&2
+  exit 1
+fi
+grep -F -- '--oper-name' "$test_dir/burst.stderr" >/dev/null
+E6IRC_LOAD_OPER_PASSWORD=load-operator-password "$load_bin" --addr 127.0.0.1:16671 \
+  --clients 4 --channels 1 --burst 200 --oper-name load \
+  --report-json "$test_dir/opered.json"
+grep -F '"senders_are_operators": true' "$test_dir/opered.json" >/dev/null
+grep -F '"outcome": "passed"' "$test_dir/opered.json" >/dev/null
 grep -F '"outcome": "passed"' "$test_dir/load-report.json" >/dev/null
 
 rejected_report="$test_dir/rejected-load-report.json"
