@@ -34,6 +34,92 @@ pub(super) fn service_nick(key: &str) -> Option<&'static str> {
     }
 }
 
+/// A services pseudo-client as the presence queries see it (DESIGN §7.6): one
+/// record per service, `<Service>!<Service>@services.<server>` with Atheme's
+/// real name for it, from which WHOIS, WHO, ISON, USERHOST, MONITOR and INVITE
+/// all answer — as Solanum answers for the services Libera links in.
+pub(super) struct ServiceUser {
+    pub(super) nick: &'static str,
+    pub(super) host: String,
+}
+
+impl ServiceUser {
+    pub(super) fn realname(&self) -> &'static str {
+        match self.nick {
+            "NickServ" => "Nickname Services",
+            _ => "Channel Services",
+        }
+    }
+}
+
+/// The services pseudo-client keyed `key`, if there is one.
+pub(super) fn service_user(
+    state: &ServerState,
+    key: &crate::core::state::NickKey,
+) -> Option<ServiceUser> {
+    let nick = service_nick(key.as_str())?;
+    Some(ServiceUser {
+        nick,
+        host: state.services_host(),
+    })
+}
+
+/// Who holds a nick, for a presence query: a registered user on any shard, or
+/// a services pseudo-client (no user can hold a services nick).
+pub(super) enum Presence {
+    User(std::sync::Arc<crate::core::state::PublicUser>),
+    Service(ServiceUser),
+}
+
+impl Presence {
+    pub(super) fn nick(&self) -> &str {
+        match self {
+            Self::User(user) => &user.nick,
+            Self::Service(service) => service.nick,
+        }
+    }
+
+    pub(super) fn user(&self) -> &str {
+        match self {
+            Self::User(user) => &user.user,
+            Self::Service(service) => service.nick,
+        }
+    }
+
+    pub(super) fn host(&self) -> &str {
+        match self {
+            Self::User(user) => &user.host,
+            Self::Service(service) => &service.host,
+        }
+    }
+
+    pub(super) fn away(&self) -> Option<&str> {
+        match self {
+            Self::User(user) => user.away.as_deref(),
+            Self::Service(_) => None,
+        }
+    }
+
+    pub(super) fn oper(&self) -> bool {
+        match self {
+            Self::User(user) => user.oper,
+            Self::Service(_) => false,
+        }
+    }
+
+    pub(super) fn prefix(&self) -> String {
+        format!("{}!{}@{}", self.nick(), self.user(), self.host())
+    }
+}
+
+/// Who holds `key` right now, for a presence query.
+pub(super) fn presence(state: &ServerState, key: &crate::core::state::NickKey) -> Option<Presence> {
+    match service_user(state, key) {
+        Some(service) => Some(Presence::Service(service)),
+        None => state.registered_user(key).map(Presence::User),
+    }
+}
+
 pub(super) fn services_dispatch(
     state: &mut ServerState,
     conn: ConnId,
@@ -1059,10 +1145,7 @@ fn rename_to_guest(state: &mut ServerState, conn: ConnId) {
             return;
         }
     }
-    let server = state.config.server_name.clone();
-    let reason = "Nickname enforcement: no Guest nick is free";
-    state.send(conn, &format!(":{server} ERROR :Closing Link: {reason}"));
-    state.close(conn, reason);
+    state.close_with_error(conn, "Nickname enforcement: no Guest nick is free");
 }
 
 pub(crate) fn chanserv_register_on_owner(
@@ -2618,7 +2701,6 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     // completing registration.
     {
         let session = &state.sessions[&conn];
-        let host = session.host.clone();
         if let Some((kind, reason)) = state.ban_match(&session.server_ban_subject()) {
             let label = kind.label();
             // The operators' half of a `public|private` reason stays theirs.
@@ -2629,11 +2711,7 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
                 &[],
                 Some(&format!("You are banned from this server: {reason}")),
             );
-            state.send(
-                conn,
-                &format!("ERROR :Closing Link: {host} ({label}d: {reason})"),
-            );
-            state.close(conn, &format!("{label}d: {reason}"));
+            state.close_with_error(conn, &format!("{label}d: {reason}"));
             return;
         }
     }
@@ -2641,7 +2719,7 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         return;
     }
     // `signon` is a real timestamp (WHOIS reports the wall-clock time the
-    // client connected); `last_active` seeds the idle/reaper clock and is
+    // client connected); `idle_since` seeds the idle/reaper clock and is
     // monotonic.
     let signon = (state.config.clock)();
     let active = (state.config.mono_clock)();
@@ -2649,7 +2727,7 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     {
         let session = state.sessions.get_mut(&conn).expect("checked");
         session.signon = signon;
-        session.last_active.set(active);
+        session.idle_since.set(active);
     }
     state.mark_nick_registered(conn);
     // Published now rather than with the rest of this event's changes: the

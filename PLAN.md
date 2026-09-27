@@ -1327,6 +1327,99 @@ qualification (DESIGN §8, §17, §18):
   upgrade note on `trusted_proxies` and a start-up warning when a loopback-only
   HTTP listener without trusted proxies makes every user share one budget.
 
+Maintainer decisions implemented from the last sweep (DESIGN §8, §11, §18):
+
+- **History has one total order, `(ts, msgid)`**, byte-compared in the ring
+  and `COLLATE "C"` in the database (index built concurrently, 0093), so a
+  millisecond's lines persisted by different shards page identically from
+  both; msgid counters are fixed-width so one shard's ids ascend as stamped.
+  An interrupted concurrent index build is dropped and rebuilt on the next
+  attempt.
+- **Read markers stored under a nick follow the identity key (0094):** a
+  grouped nick's to its account, an unregistered nick's to `~nick`, the newer
+  of two kept.
+- **The MOTD is at most 14 lines**, what half the smallest SendQ holds at the
+  longest line; 0094 kept the first 14 of a longer stored MOTD.
+- **`E6IRC_PUBLIC_URL` may be unset**, like a database-backed file's omitted
+  `[http].public_url`: the stored value applies, and a first start with none
+  stored refuses naming `http.public_url`.
+- **A settings save that moved the BNC listener and found its revision stale
+  binds straight to the reloaded revision** (`follow_bnc_listener`, shared with
+  the settings watcher).
+
+Maintainer decisions implemented from a review of Solanum and Libera parity
+(DESIGN §7.2, §7.6, §7.7):
+
+- **NickServ and ChanServ are present to presence queries** — WHOIS, WHO,
+  ISON, USERHOST, MONITOR and INVITE — from one record per service.
+- **Nick changes are throttled** at Solanum's `anti_nick_flood` values as
+  Libera runs them (five per twenty seconds, 438), operators exempt; and one
+  nick keeps at most twenty WHOWAS records.
+- **A bare NAMES lists every visible channel**, then the users in no channel,
+  paced as a LIST is and across every shard.
+- **A young connection's QUIT comment is `Client Quit`** (Solanum's
+  `anti_spam_exit_message_time`, five minutes, as Libera). irctest's
+  `testQuit`, which quits after one second, is deselected with that reason.
+
+The same review found, and this change fixes, each with a test that failed
+before:
+
+- **A channel name could hide a formatting control**: `JOIN #lib\x0fera`
+  created a channel shown as `#libera`. Channel names are parsed once
+  (`ChannelName`) and a look-alike or over-long one is 479, as Solanum's
+  `disable_fake_channels` refuses one.
+- **Any command reset WHOIS idle time**; only a PRIVMSG does now, and the
+  reaper keeps its own liveness clock.
+- **INVITE named the invitee as the inviter typed it** and never said they
+  were away; it uses their own nick and follows 341 with 301.
+- **Empty, listed and server targets**: `WHOIS :`, `WHOWAS :` and `PING :`
+  were answered as a missing nick or not at all, `WHOIS a,b` looked up
+  `a,b`, and a server argument to WHOIS, VERSION, TIME, MOTD, ADMIN or LINKS
+  was ignored; they are 431, 409, the first nick, and 402 or answered here.
+- **WHO** matched a mask against nick and host only, and showed `*` for a
+  nick's channel; it matches username, server and realname too and shows a
+  channel the asker may see. Its `o` flag and WHOX selector parse as
+  Solanum's do, and the help says so.
+- **MONITOR stored targets that could never be nicks**, including a spaced one
+  that broke its 731/732 lists.
+- **Closing lines had four shapes**, and a long stored ban reason made an
+  over-long one at registration; one function builds and fits them all.
+- WHOIS 312 carried the network name where Solanum puts the server's
+  description; MODE's help left out `+R`; `MAXLIST`'s comment said per list.
+
+A review of the bouncer's drivers, registry and attach path found, and this
+change fixes, each with a test that failed before (DESIGN §10):
+
+- **The local driver relayed the core's `ERROR :Closing Link`** (a KILL, a
+  GHOST or REGAIN, a K- or D-line) to every attached client and into the
+  backlog. Both drivers now read every line through one control-line function
+  (`PING`, `CAP`, keepalive `PONG`, `ERROR`); `ERROR` is a notice and the
+  drop's diagnostic. The local driver also rejoins the channels joined at
+  runtime after such a drop, sharing the `irc` driver's `JoinedChannels`.
+- **Attach reconciliation flooded the upstream and the shared queue**: two
+  questions per channel whose JOIN had aged out. Every line the `irc` driver
+  writes is now paced (5 at once, then 2 a second, Solanum's allowance); the
+  session follows each channel's topic and members, so an attach and a
+  browser's `NAMES` are answered from them, and at most two channels' lists
+  are asked for per attach; a full command queue is told live, never retained.
+- **Replay misattributed**: it started at the current nick. The ring keeps the
+  session state at its oldest entry, and an attach is reconciled to it before
+  the replay and to the current state after (maintainer decision); the attach
+  layer's numerics follow the client's current nick.
+- **A client attached before the registration burst never learned the
+  network's ISUPPORT**: the welcome is built from the attach snapshot, and the
+  burst's end is told to each attachment as a `005` of what changed.
+- **Shutdown raced an in-flight replace**, which then started a driver into
+  the emptied registry; shutdown now takes the mutation lane and closes the
+  registry. Drivers are prepared, then launched after persistence subscribes.
+- **Echoes around a `CAP NEW`/`DEL echo-message` were doubled or lost**, and a
+  refused capability was re-requested on every `CAP` line.
+- **Status**: the up-front attach status says why a network is down, a new
+  failure reason within one outage is retained once, and an owned network
+  without a driver says whether it is disabled, being reconfigured, or failed
+  to start and why. The persistence task files a line under the nick it was
+  said under.
+
 A review of account authority found, and this change fixes:
 
 - **A suspended or deleted account stayed attached** through the attach

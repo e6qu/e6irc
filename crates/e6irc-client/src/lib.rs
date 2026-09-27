@@ -225,6 +225,12 @@ pub struct Connection {
     /// Capabilities requested after registration whose verdict has not
     /// arrived, so a repeated `CAP NEW` does not ask twice.
     awaiting_verdict: Vec<&'static str>,
+    /// Capabilities the server refused (`CAP NAK`), during registration or
+    /// since, which are not asked for again until a `CAP NEW` offers them
+    /// anew: asked for on every later `CAP` line, a refusal was answered by
+    /// the same request — the driver re-read `CAP` lines after each, so the
+    /// two sides traded `REQ` and `NAK` for as long as the connection lasted.
+    refused: Vec<&'static str>,
     /// The network's `CASEMAPPING` and `CHANTYPES`, from every 005 read on
     /// this connection (whichever read path read it).
     names: NetworkNames,
@@ -1087,6 +1093,7 @@ impl Connection {
             requested_when_offered: Vec::new(),
             enabled: std::collections::BTreeSet::new(),
             awaiting_verdict: Vec::new(),
+            refused: Vec::new(),
             names: NetworkNames::default(),
             chathistory_limit: None,
             reader,
@@ -1446,6 +1453,9 @@ impl Connection {
                 // Past the bound the server is only not listened to further;
                 // what the connection already has is unaffected.
                 drop(self.advertised.record(list));
+                // Offered anew: a refusal of it before is not this offer's.
+                self.refused
+                    .retain(|refused| !list.split_whitespace().any(|name| name == *refused));
             }
             Some("DEL") => {
                 self.advertised.withdraw(list);
@@ -1468,6 +1478,8 @@ impl Connection {
                     let capability = self.awaiting_verdict.swap_remove(position);
                     if verdict == "ACK" {
                         self.enabled.insert(capability);
+                    } else {
+                        self.refused.push(capability);
                     }
                 }
             }
@@ -1530,6 +1542,7 @@ impl Connection {
                 self.advertised.offers(capability)
                     && !self.enabled(capability)
                     && !self.awaiting_verdict.contains(capability)
+                    && !self.refused.contains(capability)
                     && self.prerequisite_enabled(capability)
             })
             .collect();
@@ -1552,6 +1565,13 @@ impl Connection {
         self.enabled.contains(capability)
     }
 
+    /// Whether a `CAP REQ` for `capability` (from
+    /// [`Connection::capabilities_to_request`]) has been handed out and its
+    /// `ACK` or `NAK` has not arrived: the server may already be acting on it.
+    pub fn awaiting_verdict(&self, capability: &str) -> bool {
+        self.awaiting_verdict.contains(&capability)
+    }
+
     /// Read `message` as the verdict on the one outstanding `CAP REQ` for
     /// `capabilities`, and enable them when it acknowledges them. `Ok(None)`:
     /// not the verdict.
@@ -1561,8 +1581,14 @@ impl Connection {
         capabilities: &[&'static str],
     ) -> io::Result<Option<CapabilityVerdict>> {
         let verdict = capability_verdict(message, capabilities)?;
-        if verdict == Some(CapabilityVerdict::Acknowledged) {
-            self.enabled.extend(capabilities.iter().copied());
+        match verdict {
+            Some(CapabilityVerdict::Acknowledged) => {
+                self.enabled.extend(capabilities.iter().copied());
+            }
+            Some(CapabilityVerdict::Refused(_)) => {
+                self.refused.extend(capabilities.iter().copied())
+            }
+            None => {}
         }
         Ok(verdict)
     }
@@ -3473,6 +3499,50 @@ mod tests {
         connection.next_line_relayable().await.unwrap();
         assert!(connection.enabled("message-tags"));
         connection.next_line_relayable().await.unwrap();
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
+    /// A capability the server refused is not asked for again on the next
+    /// `CAP` line: a relay that re-reads what to request after every `CAP`
+    /// line used to answer each `NAK` with the same `REQ`, for as long as the
+    /// connection lasted. Offered anew by a `CAP NEW`, it is asked for again.
+    #[tokio::test]
+    async fn a_refused_capability_is_asked_for_again_only_when_offered_anew() {
+        let mut steps = after_discovery(
+            ":srv CAP * LS :server-time batch",
+            vec![
+                Expect("CAP REQ :server-time"),
+                Send(":srv CAP * ACK :server-time"),
+            ],
+        );
+        steps.extend(IDENTITY_THEN_WELCOME);
+        steps.extend([
+            Send(":srv CAP nick NEW :echo-message"),
+            Send(":srv CAP nick NAK :echo-message"),
+            Send(":srv CAP nick NEW :echo-message"),
+        ]);
+        let (mut connection, server) = scripted(steps);
+        connection.request_when_offered("echo-message");
+        connection
+            .register(&TEST_IDENTITY)
+            .await
+            .expect("registered");
+        connection.next_line_relayable().await.unwrap();
+        assert_eq!(connection.capabilities_to_request(), vec!["echo-message"]);
+        assert!(connection.awaiting_verdict("echo-message"));
+        connection.next_line_relayable().await.unwrap();
+        assert!(!connection.awaiting_verdict("echo-message"));
+        assert!(
+            connection.capabilities_to_request().is_empty(),
+            "a refusal is not answered with the same request"
+        );
+        connection.next_line_relayable().await.unwrap();
+        assert_eq!(
+            connection.capabilities_to_request(),
+            vec!["echo-message"],
+            "offered anew, it is asked for anew"
+        );
         drop(connection);
         assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }

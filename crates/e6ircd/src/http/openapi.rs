@@ -953,7 +953,7 @@ fn operations() -> serde_json::Value {
             "server_name": { "type": "string", "maxLength": crate::config::MAX_SERVER_NAME_LEN, "description": "A hostname of at most this many bytes." },
             "network_name": { "type": "string", "maxLength": crate::config::MAX_NETWORK_NAME_LEN, "description": "One token of at most this many bytes." },
             "description": { "type": "string", "maxLength": crate::config::MAX_DESCRIPTION_LEN, "description": "The RPL_LINKS server information, at most this many bytes: what the reply has room for at the longest server name and nickname." },
-            "motd": { "type": "array", "items": { "type": "string", "maxLength": crate::config::MAX_MOTD_LINE_LEN }, "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname." },
+            "motd": { "type": "array", "maxItems": crate::config::MAX_MOTD_LINES, "items": { "type": "string", "maxLength": crate::config::MAX_MOTD_LINE_LEN }, "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname, and at most maxItems lines, what the smallest SendQ holds beside the rest of the registration burst." },
             "nicklen": { "type": "integer", "minimum": crate::config::MIN_NICKLEN, "maximum": crate::config::MAX_NICKLEN },
             "sendq_bytes": { "type": "integer", "minimum": crate::config::MIN_SENDQ_BYTES, "maximum": crate::config::MAX_SENDQ_BYTES, "description": "Bytes queued for one connection, output held behind a deferred reply included, before it is closed for SendQ." },
             "core_queue": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_QUEUE },
@@ -2892,7 +2892,10 @@ mod tests {
         assert_eq!(pattern, "^#");
         assert_eq!(name["maxLength"], crate::sanitize::CHANNELLEN);
         for refused in ["&local", "+modeless", "!safe"] {
-            assert!(!crate::sanitize::valid_channel_name(refused), "{refused}");
+            assert!(
+                crate::sanitize::ChannelName::parse(refused).is_err(),
+                "{refused}"
+            );
         }
     }
 

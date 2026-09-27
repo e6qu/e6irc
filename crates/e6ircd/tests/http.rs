@@ -290,21 +290,16 @@ fn temporary_path(label: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn healthz_is_public_and_ok() {
-    // Liveness is the process plus every core shard's heartbeat, so it turns
-    // 200 once each shard has finished its first event (its first tick).
+    // Liveness is the process plus every core shard's heartbeat, and a shard
+    // is heard from the moment its worker is built — before startup returns —
+    // so the very first probe answers 200. It used to wait for each shard's
+    // first finished event, and a probe in the milliseconds before an idle
+    // core's first tick was told "core stalled".
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    let mut last = (0, String::new());
-    for _ in 0..200 {
-        let (status, _, body) = request(http, &get("/healthz")).await;
-        last = (status, body);
-        if last.0 == 200 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert_eq!(last.0, 200, "{}", last.1);
-    assert_eq!(last.1, "ok");
+    let (status, _, body) = request(http, &get("/healthz")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "ok");
 }
 
 #[tokio::test]
@@ -10210,12 +10205,90 @@ async fn a_settings_revision_written_elsewhere_reaches_every_running_server() {
     .await;
 }
 
+/// A save that moves the attach listener and then finds its revision stale
+/// leaves the listener where the stored revision it reloaded says, at once. It
+/// used to put the listener back where the stale revision had it, and only the
+/// settings watcher's next announcement brought it to the stored one — here,
+/// with the announcement never heard, never.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stale_listener_save_leaves_the_listener_where_the_stored_revision_says() {
+    let url = support::test_db("a_stale_listener_save_leaves_the_listener_where").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let session = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("root"),
+        None,
+    )
+    .await
+    .expect("session");
+    let running = start_with_database(&url, &["root"]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+    let current = configuration_of(http, &session).await;
+    assert!(
+        current["runtime"]["bound_bnc_addr"].is_string(),
+        "{current}"
+    );
+
+    // Another writer turns the listener off, and this server does not hear
+    // of it.
+    sqlx::query("ALTER TABLE server_settings DISABLE TRIGGER server_settings_changed")
+        .execute(&pool)
+        .await
+        .expect("silence the announcements");
+    sqlx::query(
+        "UPDATE server_settings
+         SET revision = revision + 1, settings = jsonb_set(settings, '{bnc_addr}', 'null')",
+    )
+    .execute(&pool)
+    .await
+    .expect("an out-of-band revision");
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let mut settings = current["settings"].clone();
+    settings["bnc_addr"] = serde_json::Value::String(format!("127.0.0.1:{port}"));
+    let (status, body) =
+        patch_configuration(http, &session, &csrf, &current["revision"], &settings).await;
+    assert_eq!(status, 409, "{body}");
+    let after = configuration_of(http, &session).await;
+    assert_eq!(
+        after["revision"].as_i64(),
+        current["revision"].as_i64().map(|revision| revision + 1),
+        "{after}"
+    );
+    assert!(
+        after["runtime"]["bound_bnc_addr"].is_null(),
+        "the listener follows the reloaded revision: {after}"
+    );
+}
+
 /// Removing a console-owned setting from the bootstrap hands it to the console
-/// (DESIGN §18), and that includes the three every server needs: a file may
-/// leave out `server_name`, `network_name` and `[[listeners]]` once the
-/// database stores them, and the stored values run. A first start with none
-/// stored refuses, naming each; it used to be impossible to leave them out at
-/// all, so a name changed in the console had to be copied into the file.
+/// (DESIGN §18), and that includes the three every server needs and the public
+/// URL: a file may leave out `server_name`, `network_name`, `[[listeners]]`
+/// and `[http].public_url` once the database stores them, and the stored
+/// values run. A first start with none stored refuses, naming each; it used to
+/// be impossible to leave the names out at all, so a name changed in the
+/// console had to be copied into the file (and `E6IRC_PUBLIC_URL` was
+/// required outright).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
@@ -10227,6 +10300,12 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
         document.insert("database".into(), toml::Value::Table(database));
         let mut http = toml::Table::new();
         http.insert("addr".into(), toml::Value::String("127.0.0.1:0".into()));
+        if names {
+            http.insert(
+                "public_url".into(),
+                toml::Value::String("https://irc.stored.example".into()),
+            );
+        }
         document.insert("http".into(), toml::Value::Table(http));
         if names {
             document.insert("server_name".into(), "irc.stored.example".into());
@@ -10243,14 +10322,19 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
     let omitting = document(false);
     assert_eq!(
         omitting.left_to_stored_settings,
-        ["server_name", "network_name", "listeners"]
+        [
+            "server_name",
+            "network_name",
+            "listeners",
+            "http.public_url"
+        ]
     );
     let refusal = match net::start(omitting).await {
         Ok(_) => panic!("a first start cannot take the names from nothing"),
         Err(error) => error.to_string(),
     };
     assert!(
-        refusal.contains("does not state server_name, network_name, listeners"),
+        refusal.contains("does not state server_name, network_name, listeners, http.public_url"),
         "{refusal}"
     );
     drop(net::start(document(true)).await.expect("the first start"));
@@ -10265,6 +10349,18 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
     assert_eq!(server["server_name"], "irc.stored.example");
     assert_eq!(server["network_name"], "StoredNet");
     assert_eq!(running.addrs.len(), 1, "the stored listener is bound");
+    let (status, _, body) = request(
+        http,
+        "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let device: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        device["verification_uri"], "https://irc.stored.example/device",
+        "the stored public URL runs"
+    );
 }
 
 /// Administrator console pages spend the separate administrator budget that

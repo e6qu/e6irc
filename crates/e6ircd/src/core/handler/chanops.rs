@@ -192,27 +192,37 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "INVITE");
         return;
     };
-    let Some(invitee) = state.registered_nick_owner(&state.nick_key(who)) else {
-        state.err_nosuchnick(conn, who);
-        return;
+    let invitee = match presence(state, &state.nick_key(who)) {
+        None => {
+            state.err_nosuchnick(conn, who);
+            return;
+        }
+        Some(Presence::Service(service)) => crate::core::state::ChannelInvitee::new(
+            crate::core::state::InviteeTarget::Service,
+            service.nick.to_string(),
+            None,
+        ),
+        Some(Presence::User(peer)) => {
+            // +R keeps a user who is not logged in from inviting this one too
+            // (Solanum's `um_regonlymsg` hooks INVITE as it hooks PRIVMSG).
+            if peer.refuses_unregistered(conn, &state.sessions[&conn]) {
+                err_nonreg(state, conn, &peer.nick);
+                return;
+            }
+            crate::core::state::ChannelInvitee::new(
+                crate::core::state::InviteeTarget::Session(peer.recipient.owner()),
+                peer.nick.clone(),
+                peer.away.clone(),
+            )
+        }
     };
-    // +R keeps a user who is not logged in from inviting this one too
-    // (Solanum's `um_regonlymsg` hooks INVITE as it hooks PRIVMSG).
-    if let Some(peer) = state.registered_user(&state.nick_key(who))
-        && peer.refuses_unregistered(conn, &state.sessions[&conn])
-    {
-        err_nonreg(state, conn, &peer.nick);
-        return;
-    }
     let owner = state.channel_owner(target);
     let label = state.channel_reply_label(conn, &owner);
     let command = crate::core::state::ChannelCommand::new(
         owner,
         state.channel_actor(conn),
         target.into(),
-        crate::core::state::ChannelCommandOperation::Invite(
-            crate::core::state::ChannelInvitee::new(invitee, who.into()),
-        ),
+        crate::core::state::ChannelCommandOperation::Invite(invitee),
         label,
     );
     if state.owns_channel(command.owner()) {
@@ -249,9 +259,22 @@ pub(super) fn invite_on_owner(
     if !chan.modes.free_invite && !chan.member(actor.recipient.conn()).is_some_and(|m| m.op) {
         return crate::core::state::ChannelInviteResult::NotOperator { target };
     }
-    if chan.is_member(invitee.owner().conn()) {
+    let invited = match invitee.target() {
+        crate::core::state::InviteeTarget::Session(session) => session,
+        // Solanum relays an INVITE for a service to the services server,
+        // which acts on none: the inviter is told it was sent, and no member
+        // hears of it (invite-notify goes out only where the invitee is).
+        crate::core::state::InviteeTarget::Service => {
+            return crate::core::state::ChannelInviteResult::Invited {
+                invitee: invitee.nick().into(),
+                away: None,
+                channel: display,
+            };
+        }
+    };
+    if chan.is_member(invited.conn()) {
         return crate::core::state::ChannelInviteResult::UserOnChannel {
-            invitee: invitee.requested_nick().into(),
+            invitee: invitee.nick().into(),
             channel: display,
         };
     }
@@ -263,7 +286,7 @@ pub(super) fn invite_on_owner(
     let recipients: Vec<_> = chan
         .recipients_where(|member, modes| {
             member != actor.recipient.conn()
-                && member != invitee.owner().conn()
+                && member != invited.conn()
                 && (free_invite || modes.op)
         })
         .into_iter()
@@ -277,12 +300,12 @@ pub(super) fn invite_on_owner(
     // stocked to be honoured after operators later lock the channel.
     let chan = state.channels.get_mut(&key).expect("checked");
     if chan.modes.invite_only || chan.modes.limit.is_some() {
-        let invited = &mut chan.invited;
-        while invited.len() >= INVITE_LIMIT && !invited.contains(&invitee.owner().conn()) {
-            let victim = *invited.iter().next().expect("non-empty at invite cap");
-            invited.remove(&victim);
+        let holders = &mut chan.invited;
+        while holders.len() >= INVITE_LIMIT && !holders.contains(&invited.conn()) {
+            let victim = *holders.iter().next().expect("non-empty at invite cap");
+            holders.remove(&victim);
         }
-        invited.insert(invitee.owner().conn());
+        holders.insert(invited.conn());
     }
     let now = (state.config.clock)();
     let line = actor.line(
@@ -290,7 +313,7 @@ pub(super) fn invite_on_owner(
         format!(
             ":{} INVITE {} :{display}",
             actor.identity.prefix,
-            invitee.requested_nick()
+            invitee.nick()
         ),
     );
     for recipient in recipients {
@@ -302,13 +325,14 @@ pub(super) fn invite_on_owner(
         ts: now,
         channel: display.clone(),
     };
-    if state.owns_session(invitee.owner()) {
-        emit_invitation(state, invitee.owner().conn(), event);
+    if state.owns_session(invited) {
+        emit_invitation(state, invited.conn(), event);
     } else {
-        state.route_channel_session_event(invitee.owner(), event);
+        state.route_channel_session_event(invited, event);
     }
     crate::core::state::ChannelInviteResult::Invited {
-        invitee: invitee.requested_nick().into(),
+        invitee: invitee.nick().into(),
+        away: invitee.away().map(str::to_string),
         channel: display,
     }
 }
@@ -344,12 +368,22 @@ pub(super) fn emit_invite_result_now(
     result: crate::core::state::ChannelInviteResult,
 ) {
     match result {
-        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => state.numeric(
-            conn,
-            RPL_INVITING,
-            &[Middle::echo(&invitee), Middle::own(&channel)],
-            None,
-        ),
+        crate::core::state::ChannelInviteResult::Invited {
+            invitee,
+            away,
+            channel,
+        } => {
+            state.numeric(
+                conn,
+                RPL_INVITING,
+                &[Middle::own(&invitee), Middle::own(&channel)],
+                None,
+            );
+            // Solanum's `m_invite` follows 341 with the invitee's away message.
+            if let Some(away) = away {
+                state.numeric(conn, RPL_AWAY, &[Middle::own(&invitee)], Some(&away));
+            }
+        }
         crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, &target)
         }
@@ -369,7 +403,7 @@ pub(super) fn emit_invite_result_now(
             .numeric(
                 conn,
                 ERR_USERONCHANNEL,
-                &[Middle::echo(&invitee), Middle::own(&channel)],
+                &[Middle::own(&invitee), Middle::own(&channel)],
                 Some("is already on channel"),
             ),
     }
@@ -453,24 +487,7 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // its rows follow page by page as its send queue has room, inside its
     // batch when it is labeled.
     let label = state.defer_captured_label(conn);
-    let batch = open_channel_list(state, conn, label);
-    state.start_channel_list(conn, batch, filter);
-    pace_channel_list(state, conn);
-}
-
-/// Open `conn`'s LIST reply — inside a labeled-response batch when the LIST
-/// was labeled — and return that batch.
-fn open_channel_list(
-    state: &mut ServerState,
-    conn: ConnId,
-    label: Option<String>,
-) -> Option<String> {
-    let batch = label.map(|label| {
-        let batch = state.next_msgid();
-        let open = labeled_batch_open(&state.config.server_name, &label, &batch);
-        state.send_unheld(conn, bytes::Bytes::from(format!("{open}\r\n")));
-        batch
-    });
+    let batch = open_channel_sweep(state, conn, label);
     let start = state.numeric_line(
         conn,
         RPL_LISTSTART,
@@ -478,7 +495,27 @@ fn open_channel_list(
         Some("Users  Name"),
     );
     send_list_line(state, conn, batch.as_deref(), start);
-    batch
+    state.start_channel_list(
+        conn,
+        batch,
+        crate::core::list::ChannelSweep::List(std::sync::Arc::new(filter)),
+    );
+    pace_channel_list(state, conn);
+}
+
+/// Open `conn`'s LIST or NAMES reply — a labeled-response batch when the
+/// command was labeled — and return that batch.
+pub(super) fn open_channel_sweep(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<String>,
+) -> Option<String> {
+    label.map(|label| {
+        let batch = state.next_msgid();
+        let open = labeled_batch_open(&state.config.server_name, &label, &batch);
+        state.send_unheld(conn, bytes::Bytes::from(format!("{open}\r\n")));
+        batch
+    })
 }
 
 /// Answer one page request of a LIST with this shard's channels after its
@@ -506,7 +543,8 @@ fn channel_list_page(
     state: &ServerState,
     request: &crate::core::state::ChannelListRequest,
 ) -> (Vec<crate::core::state::ChannelListRow>, Option<ChanKey>) {
-    use crate::core::list::{LIST_PAGE_SCAN, ListCandidate};
+    use crate::core::list::{ChannelSweep, LIST_PAGE_SCAN, ListCandidate};
+    use crate::core::state::{ChannelListRow, ChannelRowBody};
     let conn = request.session().conn();
     let mut rows = Vec::new();
     let mut last: Option<&ChanKey> = None;
@@ -515,23 +553,42 @@ fn channel_list_page(
             return (rows, last.cloned());
         }
         last = Some(key);
-        let admitted = channel.hidden_from(conn).is_none()
-            && request.filter().admits(&ListCandidate {
-                key,
-                members: channel.member_count(),
-                created_secs: channel.created_at.as_secs(),
-                topic_set_secs: channel.topic.as_ref().map(|topic| topic.set_at_secs),
-            });
-        if admitted {
-            rows.push(crate::core::state::ChannelListRow {
+        if channel.hidden_from(conn).is_some() {
+            continue;
+        }
+        let body = match request.sweep() {
+            ChannelSweep::List(filter) => {
+                let admitted = filter.admits(&ListCandidate {
+                    key,
+                    members: channel.member_count(),
+                    created_secs: channel.created_at.as_secs(),
+                    topic_set_secs: channel.topic.as_ref().map(|topic| topic.set_at_secs),
+                });
+                admitted.then(|| ChannelRowBody::List {
+                    members: channel.member_count(),
+                    topic: channel
+                        .topic
+                        .as_ref()
+                        .map(|topic| topic.text.clone())
+                        .unwrap_or_default(),
+                })
+            }
+            &ChannelSweep::Names {
+                multi_prefix,
+                userhost_in_names,
+            } => {
+                let names = visible_names(state, channel, conn, multi_prefix, userhost_in_names);
+                (!names.is_empty()).then_some(ChannelRowBody::Names {
+                    secret: channel.modes.secret,
+                    names,
+                })
+            }
+        };
+        if let Some(body) = body {
+            rows.push(ChannelListRow {
                 key: key.clone(),
                 name: channel.name.clone(),
-                members: channel.member_count(),
-                topic: channel
-                    .topic
-                    .as_ref()
-                    .map(|topic| topic.text.clone())
-                    .unwrap_or_default(),
+                body,
             });
         }
     }
@@ -582,10 +639,58 @@ fn finish_channel_list(
     }
     let end = state.numeric_line(conn, RPL_LISTEND, &[], Some("End of /LIST"));
     send_list_line(state, conn, batch.as_deref(), end);
+    close_sweep_batch(state, conn, batch);
+}
+
+fn close_sweep_batch(state: &mut ServerState, conn: ConnId, batch: Option<String>) {
     if let Some(batch) = batch {
         let close = format!(":{} BATCH -{batch}", state.config.server_name);
         state.send_unheld(conn, bytes::Bytes::from(format!("{close}\r\n")));
     }
+}
+
+/// Close a bare NAMES reply as Solanum's `names_global` does: the users in no
+/// channel, under `* *` (an invisible one only to themselves), then
+/// `366 * :End of /NAMES list`.
+fn finish_channel_names(
+    state: &mut ServerState,
+    conn: ConnId,
+    batch: Option<String>,
+    userhost_in_names: bool,
+) {
+    let mut unchanneled: Vec<String> = state
+        .registered_users()
+        .into_iter()
+        .filter(|user| {
+            (!user.invisible || user.conn() == conn) && !state.in_any_channel(user.conn())
+        })
+        .map(|user| {
+            if userhost_in_names {
+                user.prefix()
+            } else {
+                user.nick.clone()
+            }
+        })
+        .collect();
+    unchanneled.sort();
+    let lines = state.numeric_list_lines(
+        conn,
+        RPL_NAMREPLY,
+        &[Middle::own("*"), Middle::own("*")],
+        &unchanneled,
+        ' ',
+    );
+    for line in lines {
+        send_list_line(state, conn, batch.as_deref(), line);
+    }
+    let end = state.numeric_line(
+        conn,
+        RPL_ENDOFNAMES,
+        &[Middle::own("*")],
+        Some("End of /NAMES list"),
+    );
+    send_list_line(state, conn, batch.as_deref(), end);
+    close_sweep_batch(state, conn, batch);
 }
 
 /// Abort `conn`'s LIST if it has one in progress; whether it had. Its cursor
@@ -602,30 +707,59 @@ fn abort_channel_list(state: &mut ServerState, conn: ConnId) -> bool {
     true
 }
 
-/// Send `conn`'s LIST rows while its send queue is under half full, merging
-/// the shards' pages in key order, and ask for the next page of every shard
-/// whose rows are all out; close the reply after the last row.
+/// Send `conn`'s LIST and bare NAMES rows while its send queue is under half
+/// full, merging the shards' pages in key order, and ask for the next page of
+/// every shard whose rows are all out; close each reply after its last row.
 pub(super) fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
-    use crate::core::list::NextRow;
-    let Some((mut room, mut cursor)) =
-        state.take_paced(conn, |session| session.channel_list.take())
+    pace_channel_sweep(state, conn, |session| &mut session.channel_list);
+    pace_channel_sweep(state, conn, |session| &mut session.channel_names);
+}
+
+type SweepSlot =
+    fn(&mut crate::core::state::Session) -> &mut Option<crate::core::list::ChannelListCursor>;
+
+fn pace_channel_sweep(state: &mut ServerState, conn: ConnId, slot: SweepSlot) {
+    use crate::core::list::{ChannelSweep, NextRow};
+    use crate::core::state::ChannelRowBody;
+    let Some((mut room, mut cursor)) = state.take_paced(conn, |session| slot(session).take())
     else {
         return;
     };
     while room > 0 {
         match cursor.next_row() {
             NextRow::Row(row) => {
-                let line = state.numeric_line(
-                    conn,
-                    RPL_LIST,
-                    &[Middle::own(&row.name), Middle::from(row.members)],
-                    Some(&row.topic),
-                );
-                let sent = send_list_line(state, conn, cursor.batch.as_deref(), line);
-                room = room.saturating_sub(sent);
+                let lines = match row.body {
+                    ChannelRowBody::List { members, topic } => vec![state.numeric_line(
+                        conn,
+                        RPL_LIST,
+                        &[Middle::own(&row.name), Middle::from(members)],
+                        Some(&topic),
+                    )],
+                    ChannelRowBody::Names { secret, names } => state.numeric_list_lines(
+                        conn,
+                        RPL_NAMREPLY,
+                        &[
+                            Middle::own(if secret { "@" } else { "=" }),
+                            Middle::own(&row.name),
+                        ],
+                        &names,
+                        ' ',
+                    ),
+                };
+                for line in lines {
+                    let sent = send_list_line(state, conn, cursor.batch.as_deref(), line);
+                    room = room.saturating_sub(sent);
+                }
             }
             NextRow::Waiting => break,
-            NextRow::Finished => return finish_channel_list(state, conn, cursor.batch, false),
+            NextRow::Finished => {
+                return match cursor.sweep {
+                    ChannelSweep::List(_) => finish_channel_list(state, conn, cursor.batch, false),
+                    ChannelSweep::Names {
+                        userhost_in_names, ..
+                    } => finish_channel_names(state, conn, cursor.batch, userhost_in_names),
+                };
+            }
         }
     }
     // A page is asked for only while the client is reading, and no larger
@@ -638,7 +772,7 @@ pub(super) fn pace_channel_list(state: &mut ServerState, conn: ConnId) {
             state.route_channel_list_page(conn, &cursor, shard, after, limit);
         }
     }
-    state.resume_paced(conn, |session| &mut session.channel_list, cursor);
+    state.resume_paced(conn, slot, cursor);
 }
 
 /// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP
@@ -648,14 +782,18 @@ pub(super) fn userhost_entries(state: &ServerState, p: &[&str]) -> Vec<String> {
     let mut entries = Vec::new();
     for &nick in p.iter().take(5) {
         let key = state.nick_key(nick);
-        if let Some(user) = state.registered_user(&key) {
-            let away_marker = if user.away.is_some() { "-" } else { "+" };
+        if let Some(user) = presence(state, &key) {
+            let away_marker = if user.away().is_some() { "-" } else { "+" };
             // `*` after the nick marks an IRC operator (Modern RPL_USERHOST),
             // matching the oper flag WHO/WHOIS already surface.
-            let oper_marker = if user.oper { "*" } else { "" };
+            let oper_marker = if user.oper() { "*" } else { "" };
             entries.push(format!(
                 "{}{}={}{}@{}",
-                user.nick, oper_marker, away_marker, user.user, user.host,
+                user.nick(),
+                oper_marker,
+                away_marker,
+                user.user(),
+                user.host(),
             ));
         }
     }
@@ -695,22 +833,38 @@ pub(super) fn cmd_userip(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.numeric(conn, RPL_USERIP, &[], Some(&trailing));
 }
 
-pub(super) fn cmd_links(state: &mut ServerState, conn: ConnId) {
+/// `LINKS [[<server>] <mask>]`, as Solanum's `mo_links` reads it: the servers
+/// whose names match `mask` (every one without it), asked of `<server>` when
+/// two parameters are given — which must name this server, or it is 402.
+pub(super) fn cmd_links(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    let mask = match p {
+        [] => "",
+        [mask] => mask,
+        [server, mask, ..] => {
+            if !names_this_server(state, server) {
+                return err_nosuchserver(state, conn, server);
+            }
+            mask
+        }
+    };
     // A single server links only to itself, at hop 0.
     let server = state.config.server_name.clone();
-    // `<hopcount> <server info>`: the server's own description, not the
-    // network's name — this server is the only link it knows about.
-    let info = state.config.description.clone();
-    state.numeric(
-        conn,
-        RPL_LINKS,
-        &[Middle::own(&server), Middle::own(&server)],
-        Some(&format!("0 {info}")),
-    );
+    if mask.is_empty() || e6irc_proto::mask::matches(state.casemap, mask, &server) {
+        // `<hopcount> <server info>`: the server's own description, not the
+        // network's name — this server is the only link it knows about.
+        let info = state.config.description.clone();
+        state.numeric(
+            conn,
+            RPL_LINKS,
+            &[Middle::own(&server), Middle::own(&server)],
+            Some(&format!("0 {info}")),
+        );
+    }
+    let shown = if mask.is_empty() { "*" } else { mask };
     state.numeric(
         conn,
         RPL_ENDOFLINKS,
-        &[Middle::own("*")],
+        &[Middle::echo(shown)],
         Some("End of /LINKS list"),
     );
 }

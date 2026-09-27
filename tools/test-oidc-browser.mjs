@@ -2520,8 +2520,11 @@ async function startIrcUpstream() {
     async sendPeerMessage(target, text) {
       assert.ok(activeConnection, "select an upstream connection before sending a peer message");
       outboundSequence += 1;
+      // Stamped now: the journey sets a history retention, and the server
+      // rightly keeps nothing older, so a fixed date would age out of it.
+      const time = new Date().toISOString();
       activeConnection.socket.write(
-        `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
+        `@time=${time};msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
       );
     },
     async waitForLine(predicate) {

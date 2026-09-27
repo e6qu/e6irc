@@ -1786,9 +1786,8 @@ pub(super) async fn admin_patch_configuration(
             Some(&error.to_string()),
         );
     }
-    let previous_bnc = current.settings.bnc();
     let next_bnc = settings.bnc();
-    let bnc_changed = previous_bnc != next_bnc;
+    let bnc_changed = current.settings.bnc() != next_bnc;
     if bnc_changed {
         let Some(listener) = &state.bnc_listener else {
             return problem(
@@ -1844,22 +1843,23 @@ pub(super) async fn admin_patch_configuration(
             })
         }
         Err(error) => {
-            if bnc_changed && let Some(listener) = &state.bnc_listener {
-                match &previous_bnc {
-                    Some(previous) => {
-                        if let Err(rollback) = listener.enable(previous).await {
-                            eprintln!(
-                                "{}",
-                                bnc_listener_rollback_failure(
-                                    previous.addr,
-                                    settings.bnc_addr,
-                                    &rollback
-                                )
-                            );
-                        }
-                    }
-                    None => listener.stop().await,
-                }
+            // The listener already serves the unsaved settings; it is brought
+            // to the revision now held: the one this save was based on, or —
+            // when the save found it stale — the stored one it reloaded, so
+            // the listener never serves the stale revision again on the way.
+            if bnc_changed
+                && let Some(listener) = &state.bnc_listener
+                && let Err(unbound) =
+                    crate::settings_watch::follow_bnc_listener(listener, &current).await
+            {
+                eprintln!(
+                    "{}",
+                    bnc_listener_rollback_failure(
+                        unbound.wanted,
+                        settings.bnc_addr,
+                        &unbound.error
+                    )
+                );
             }
             managed_configuration_save_refused(error)
         }
@@ -1892,17 +1892,19 @@ fn configuration_audit_detail(
     )
 }
 
-/// The line logged when the save failed AND the BNC listener could not be put
-/// back: the process is now serving an address no revision records, which the
-/// operator must know to repair (restart, or save the configuration again).
+/// The line logged when the save failed AND the BNC listener could not be
+/// brought to `held`, where the revision the process now holds has it (the
+/// one the save was based on, or the stored one a stale save reloaded): the
+/// process is serving an address no revision records, which the operator must
+/// know to repair (restart, or save the configuration again).
 fn bnc_listener_rollback_failure(
-    previous: std::net::SocketAddr,
+    held: std::net::SocketAddr,
     unsaved: Option<std::net::SocketAddr>,
     error: &std::io::Error,
 ) -> String {
     format!(
         "http: managed configuration save failed and the BNC listener could not be restored to \
-         {previous}: {error}; it is {} — restart or save the configuration again to reconcile",
+         {held}: {error}; it is {} — restart or save the configuration again to reconcile",
         match unsaved {
             Some(address) => format!("still bound to the unsaved {address}"),
             None => "stopped, which no saved revision records".to_string(),

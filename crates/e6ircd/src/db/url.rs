@@ -12,10 +12,14 @@
 //! must be one of [`QUERY_KEYS`] (the set `tools/postgres-url-environment.py`
 //! accepts too, so a backup connects where the daemon does), each field may be
 //! stated once, and the connection options are built field by field from what
-//! the URL says: no password file is consulted, and the configuration refuses
-//! to load while any of [`LIBPQ_ENVIRONMENT`] is set
-//! (`Config::refuse_libpq_environment`), because sqlx's only constructor fills
-//! the fields a URL leaves out from them.
+//! the URL says: no password file is consulted, and the process connects to
+//! no database while any of [`LIBPQ_ENVIRONMENT`] is set
+//! ([`refuse_libpq_process_environment`], called by every entry point that
+//! connects — the daemon's start, its database subcommands — and by `e6ircd
+//! check`), because sqlx's only constructor fills the fields a URL leaves out
+//! from them. The process environment is read there, at the process's own
+//! boundary, so neither parsing a configuration nor building connection
+//! options depends on the host they run on.
 //!
 //! No message about a URL repeats any of it: a malformed URL can put a
 //! fragment of its password anywhere a parser looks. The URL's `Debug` and
@@ -90,7 +94,7 @@ pub(crate) const QUERY_KEYS: [(&str, UrlField); 17] = [
 /// leaves a field of unstated. They are refused while the daemon is
 /// configured with a database, rather than silently deciding where it
 /// connects or whether TLS is verified.
-pub(crate) const LIBPQ_ENVIRONMENT: [&str; 12] = [
+pub const LIBPQ_ENVIRONMENT: [&str; 12] = [
     "PGHOST",
     "PGHOSTADDR",
     "PGPORT",
@@ -104,6 +108,42 @@ pub(crate) const LIBPQ_ENVIRONMENT: [&str; 12] = [
     "PGAPPNAME",
     "PGOPTIONS",
 ];
+
+/// Refuse while one of [`LIBPQ_ENVIRONMENT`] is set in `environment`. sqlx
+/// fills every field a URL leaves out from them, so `PGSSLMODE=disable` left
+/// in a service's environment would turn TLS off and `PGHOST` would redirect
+/// the connection, each without a word. The URL is the whole description of
+/// the connection; the refusal names every variable set and none of their
+/// values. A variable set to the empty string counts as unset.
+pub(crate) fn refuse_libpq_environment(
+    environment: &impl Fn(&str) -> crate::environment_config::Lookup,
+) -> Result<(), String> {
+    let set: Vec<&str> = LIBPQ_ENVIRONMENT
+        .into_iter()
+        .filter(|variable| {
+            !matches!(
+                crate::environment_config::optional(environment, variable),
+                Ok(None)
+            )
+        })
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} set in the environment: e6ircd connects with what database.url states and \
+         nothing else, so state the connection there and unset {}",
+        set.join(", "),
+        if set.len() == 1 { "it" } else { "them" }
+    ))
+}
+
+/// [`refuse_libpq_environment`] against this process's environment: what every
+/// entry point that connects to the database calls first.
+pub fn refuse_libpq_process_environment() -> Result<(), super::DbError> {
+    refuse_libpq_environment(&crate::environment_config::process_environment)
+        .map_err(super::DbError::LibpqEnvironment)
+}
 
 /// Why a URL cannot be used. Says what is wrong, never what the URL holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,8 +498,9 @@ impl DatabaseUrl {
     /// URL or to libpq's documented default (port 5432, `sslmode=prefer`); no
     /// password file is read. sqlx's constructor still consults libpq's
     /// environment for the fields that have no way to be unset (the password,
-    /// the certificates, `options`), which is why the configuration refuses to
-    /// load while one of [`LIBPQ_ENVIRONMENT`] is set.
+    /// the certificates, `options`), which is why the process refuses to
+    /// connect at all while one of [`LIBPQ_ENVIRONMENT`] is set
+    /// ([`refuse_libpq_process_environment`]).
     pub fn connect_options(&self) -> PgConnectOptions {
         let mut options = PgConnectOptions::new_without_pgpass()
             .port(self.port.unwrap_or(5432))
@@ -803,5 +844,29 @@ mod tests {
             .collect();
         daemon_keys.sort();
         assert_eq!(tool_keys, daemon_keys);
+    }
+
+    /// A libpq variable set in the environment is refused by name — sqlx
+    /// would otherwise read it into every connection the URL leaves a field
+    /// of unstated — and one set to the empty string counts as unset.
+    #[test]
+    fn a_libpq_variable_in_the_environment_is_refused_by_name() {
+        let environment = |variable: &str| -> crate::environment_config::Lookup {
+            Ok(match variable {
+                "PGSSLMODE" => Some("disable".into()),
+                "PGHOST" => Some("elsewhere.example".into()),
+                "PGPASSWORD" => Some(String::new()),
+                _ => None,
+            })
+        };
+        let refusal = super::refuse_libpq_environment(&environment)
+            .expect_err("PGSSLMODE and PGHOST are refused");
+        assert!(refusal.contains("PGHOST, PGSSLMODE set"), "{refusal}");
+        assert!(
+            !refusal.contains("PGPASSWORD"),
+            "set-but-empty is unset: {refusal}"
+        );
+        assert!(!refusal.contains("disable") && !refusal.contains("elsewhere"));
+        assert!(super::refuse_libpq_environment(&|_: &str| Ok(None)).is_ok());
     }
 }

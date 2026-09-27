@@ -750,6 +750,9 @@ fn serves_http(config: &Config) -> bool {
 ///
 /// [`ManagedConfig::bootstrap_drift`]: crate::config::ManagedConfig::bootstrap_drift
 pub fn check_offline(config: &Config) -> io::Result<()> {
+    if config.database.is_some() {
+        crate::db::refuse_libpq_process_environment().map_err(io::Error::other)?;
+    }
     if serves_http(config) {
         crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
     }
@@ -779,6 +782,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         .map(|db| (db.url.clone(), db.startup_wait_seconds, db.pool_size()))
     {
         Some((database_url, startup_wait_seconds, pool_size)) => {
+            crate::db::refuse_libpq_process_environment().map_err(io::Error::other)?;
             let wait = crate::db::StartupDatabaseWait::from_seconds(startup_wait_seconds)
                 .map_err(io::Error::other)?;
             eprintln!(
@@ -993,12 +997,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                         // A configuration-file network may already hold this
                         // key. The operator's own entry wins; say so rather
                         // than abort the boot or run two upstream sessions.
-                        if let Err(error) = reg.add(
-                            Some(&owner),
-                            &row.name,
-                            crate::bouncer::NetworkDefinition::Stored,
-                            driver,
-                        ) {
+                        if let Err(error) = reg
+                            .start_stored(owner.clone(), row.name.clone(), driver)
+                            .await
+                        {
                             telemetry.record_error(ErrorKind::Bouncer);
                             eprintln!("bnc: skipping stored network: {error}");
                         }
@@ -1009,6 +1011,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                             "bnc: not starting network {owner}/{} at boot: {e}",
                             row.name
                         );
+                        // Its owner is told why when they attach, rather than
+                        // that an enabled network is disabled.
+                        reg.record_unstartable(&owner, &row.name, e);
                     }
                 }
             }
@@ -1373,6 +1378,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                  IRCv3 REGISTER and invitations refuse the name)"
             );
         }
+        for name in unjoinable_registered_channels(&founders) {
+            eprintln!(
+                "e6ircd: registered channel {name:?} has a name JOIN refuses (a control \
+                 character, a space-like character or over CHANNELLEN), so nobody can join it; \
+                 drop it with DELETE /api/v1/admin/channels/{{name}} or from its owner's console"
+            );
+        }
         for core in &mut cores {
             core.preload_founders(founders.clone());
             core.preload_successors(successors.clone());
@@ -1498,6 +1510,17 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             connections,
         },
     })
+}
+
+/// The registered channels (`(name_folded, founder)` rows) whose names JOIN
+/// refuses: registered while an older build still let such a name be created,
+/// they can never become live again, so startup names each for its operator.
+fn unjoinable_registered_channels(founders: &[(String, String)]) -> Vec<&str> {
+    founders
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| crate::sanitize::ChannelName::parse(name).is_err())
+        .collect()
 }
 
 /// Bind a listening socket as `tokio::net::TcpListener::bind` does (address
@@ -1705,10 +1728,13 @@ async fn core_worker(
     ingress: CoreIngress,
     ready: tokio::sync::oneshot::Sender<()>,
 ) {
+    // Built before startup is told this shard is ready, so the shard is heard
+    // (its first heartbeat) before anything can probe its liveness.
+    let worker = CoreWorker::new(core, rx, ingress);
     if ready.send(()).is_err() {
         return;
     }
-    let exit = CoreWorker::new(core, rx, ingress).run().await;
+    let exit = worker.run().await;
     if exit != crate::core::CoreWorkerExit::Stopped {
         // Whoever supervises this task treats its end as the failure it is;
         // this says which.
@@ -2395,6 +2421,22 @@ where
 mod tests {
     use super::*;
     use crate::certificate::ReloadingCertificate;
+
+    /// A channel registered under a name the channel-name rule now refuses
+    /// (a formatting control, say) is named at startup rather than preloaded
+    /// silently as a registration no one can use.
+    #[test]
+    fn registered_channels_join_refuses_are_named_at_startup() {
+        let founders = vec![
+            ("#libera".to_string(), "alice".to_string()),
+            ("#lib\x0fera".to_string(), "mallory".to_string()),
+            ("#a\u{a0}b".to_string(), "mallory".to_string()),
+        ];
+        assert_eq!(
+            unjoinable_registered_channels(&founders),
+            ["#lib\x0fera", "#a\u{a0}b"]
+        );
+    }
     use crate::config::TlsConfig;
     use crate::core::Input;
     use e6irc_queue::Sender;

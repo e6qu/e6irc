@@ -583,10 +583,16 @@ impl Telemetry {
             previous_unregistered,
             current_unregistered,
         );
+        self.record_core_heartbeat(shard);
+    }
+
+    /// Core shard `shard` is alive now: when its worker is built to run
+    /// ([`crate::core::CoreWorker::new`]), and each time it finishes an event.
+    pub(crate) fn record_core_heartbeat(&self, shard: usize) {
         let heartbeats = self
             .core_heartbeats
             .get()
-            .expect("a core declares its shard count before handling events");
+            .expect("a core declares its shard count before it runs");
         heartbeats[shard].store(self.elapsed_ms().saturating_add(1), Ordering::Relaxed);
     }
 

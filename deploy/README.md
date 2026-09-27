@@ -183,8 +183,8 @@ them. A variable that still states a console-owned setting must agree with the
 stored value: if it differs, the container fails to start and names each such
 setting (`http.admin_accounts`, `oidc[0].client_secret`) without printing
 either value. Resolve it by unsetting the variable (the stored value applies;
-`E6IRC_PUBLIC_URL` is required, so align that one; an unset `E6IRC_SERVER_NAME`
-takes the stored name, and only a first start, with nothing stored, needs it),
+an unset `E6IRC_SERVER_NAME` or `E6IRC_PUBLIC_URL` takes the stored value, and
+only a first start, with nothing stored, needs it),
 setting it to the stored value, or changing the setting in the console first.
 So removing a name from `E6IRC_ADMIN_ACCOUNTS` or rotating
 `E6IRC_OIDC_CLIENT_SECRET` is done in the console (then the variable is
@@ -214,7 +214,7 @@ configured, the next start seals and imports them atomically.
 | Variable | Required | Meaning |
 |---|---|---|
 | `E6IRC_SERVER_NAME` | on the first start | IRC server name, e.g. `e6irc.dev.e6qu.dev`; unset afterwards, the name the console stores applies |
-| `E6IRC_PUBLIC_URL` | yes | External base URL; OIDC redirect + post-logout base |
+| `E6IRC_PUBLIC_URL` | on the first start | External base URL; OIDC redirect + post-logout base; unset afterwards, the URL the console stores applies |
 | `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant). Its query keys are a closed set — `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey` (or their hyphenated spellings), `application_name`, `options` (`-c name=value` settings), `statement-cache-capacity` — and any other key, a misspelt `sslmode` value or a field stated twice is refused at start; the container must not set libpq variables (`PGHOST`, `PGSSLMODE`, `PGPASSWORD`, ...), which are refused by name: the URL alone describes the connection |
 | `APPLICATION_RELEASE_REVISION` | yes | The deployed revision, shown on the console's configuration page and on the authenticated identity page Shauth's browser validator reads. With the `shauth` provider configured it must be 12–64 lowercase hexadecimal digits or `sha256:` plus 64 of them; the image tag's short SHA qualifies |
 | `E6IRC_SECRET_KEY` | for credential storage (secret) | Base64 32-byte primary key; new managed and account-network credentials are sealed with it |
@@ -312,9 +312,24 @@ Read these before deploying a release that includes the change named.
   `[[listeners]]`** once the console stores them, and `E6IRC_SERVER_NAME` may be
   unset; the stored values apply. A first start with nothing stored refuses,
   naming each.
+- **`E6IRC_PUBLIC_URL` may be unset** once the console stores the public URL,
+  as a database-backed file's `[http]` may omit `public_url`; the stored value
+  applies. A first start with nothing stored refuses, naming
+  `http.public_url` — so a database-backed file with `[http]` states it on the
+  first start too.
 - **`motd` lines and `description` are bounded** (372 and 242 bytes: what their
   replies carry whole). A longer one is refused at start and at a console
   save instead of being cut short on the wire.
+- **The MOTD is at most 14 lines (migration 0094).** A new client is sent all
+  of it at registration; 14 lines at the longest is what half the smallest
+  SendQ holds beside the rest of that burst. A stored MOTD above it keeps its
+  first 14 lines; a configuration file stating more is refused at start.
+- **History pages in `(time, msgid)` order (migrations 0093 and 0094).** 0093
+  builds its index concurrently, outside a transaction, so writers to
+  `messages` are not blocked; on a large table it takes a while. A start
+  interrupted during the build drops the invalid index it left and builds it
+  again. Read markers kept under a correspondent's nick are moved to the
+  identity key conversations use.
 
 ## Stop timeout
 

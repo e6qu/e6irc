@@ -57,6 +57,24 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // Solanum counts a change toward `anti_nick_flood` once the nick is known
+    // to be free (`change_local_nick`); a nick someone else holds is 433 below.
+    let held_by_another = state
+        .nick_reservation(&key)
+        .is_some_and(|owner| owner.conn() != conn);
+    if registered && !held_by_another && nick_change_too_fast(state, conn) {
+        let current = state.sessions[&conn].nick().unwrap_or("*").to_string();
+        state.numeric(
+            conn,
+            ERR_NICKTOOFAST,
+            &[Middle::own(&current), Middle::echo(nick)],
+            Some(&format!(
+                "Nick change too fast. Please wait {} seconds.",
+                crate::core::state::MAX_NICK_TIME_MS / 1000
+            )),
+        );
+        return;
+    }
     if !state.claim_nick(key.clone(), conn) {
         state
             .sessions
@@ -72,6 +90,15 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     change_claimed_nick(state, conn, nick, key);
+}
+
+/// Count a registered user's nick change toward the throttle
+/// ([`crate::core::state::NickChangeThrottle`]); whether it is refused. An
+/// operator is never refused.
+fn nick_change_too_fast(state: &mut ServerState, conn: ConnId) -> bool {
+    let now = (state.config.mono_clock)();
+    let session = state.sessions.get_mut(&conn).expect("dispatching session");
+    session.nick_changes.too_fast(now) && session.oper.is_none()
 }
 
 /// Rename `conn` to `nick` because services said so (NickServ REGAIN, or the
