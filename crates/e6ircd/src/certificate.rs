@@ -1,6 +1,6 @@
 //! TLS server certificates that follow their files.
 //!
-//! A certificate is renewed on disk (by an ACME client, by hand) long before
+//! A certificate is renewed on disk (by an automated certificate client, by hand) long before
 //! the process that serves it restarts. Every TLS listener — the IRC listeners
 //! and the bouncer attach listener — serves its certificate through a
 //! [`ReloadingCertificate`], which reads the files again when the process gets

@@ -11,6 +11,9 @@ cargo build --locked --release -p e6irc-load -p e6ircd
 target/release/e6irc-load --addr 127.0.0.1:6667 --clients 1000 --burst 20
 ```
 
+`e6irc-load --help` (or `-h`) prints every flag with its meaning; the flags
+are described below as well.
+
 Flags: `--addr host:port` (required), `--clients N`
 (default 100), `--channels C` (default 1 — spread clients across C
 channels), `--channel PREFIX` (default `#load`; actual channel is
@@ -156,7 +159,7 @@ burst past the server's default command burst (39 lines and the fence) is
 refused before it starts unless `E6IRC_QUALIFICATION_OPER_NAME` and
 `E6IRC_LOAD_OPER_PASSWORD` name an `[[oper]]` for the senders to oper up as. The
 final four values are
-minimum connect rate, minimum fan-out rate, maximum P99 milliseconds, and
+minimum connect rate, minimum fan-out rate, maximum 99th-percentile latency in milliseconds, and
 maximum incremental server resident bytes per requested connection. The result
 records the SHA-256 digest of `host.txt`; `qualification.json` records digests
 for both raw files. Verify `qualification.json` with its sibling `result.json`
@@ -165,7 +168,7 @@ publishing a claim.
 
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,
-at least 100 deliveries/second, P99 below five seconds, and graceful shutdown.
+at least 100 deliveries/second, 99th-percentile latency below five seconds, and graceful shutdown.
 On Linux it also samples the daemon and rejects more than 1 MiB of incremental
 peak RSS per requested connection. Those deliberately generous shared-runner
 limits catch catastrophic regressions without pretending to be a

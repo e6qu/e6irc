@@ -1,4 +1,4 @@
-//! Epoch → ISO 8601 UTC formatting for the IRCv3 `server-time` tag
+//! Epoch → RFC 3339 UTC formatting for the IRCv3 `server-time` tag
 //! (format `YYYY-MM-DDThh:mm:ss.sssZ`, always UTC).
 //!
 //! Implemented in-repo (days-from-civil inversion per Howard Hinnant's
@@ -59,7 +59,7 @@ impl Millis {
 /// from a bare `u64`: wall-clock time and monotonic time must not be mixed. A
 /// deadline decision — the ping/registration reaper, the flood-bucket refill —
 /// stamped against the wall clock breaks whenever the wall clock steps: an NTP
-/// correction or a VM resume that jumps the clock forward mass-reaps every live
+/// correction or a virtual-machine resume that jumps the clock forward mass-reaps every live
 /// connection at once (every registration "times out", every idle client is
 /// pinged in the same tick), and a backward step freezes the reaper entirely
 /// (nothing ever times out) until the clock climbs back. A monotonic clock

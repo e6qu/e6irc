@@ -103,7 +103,7 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// text*.
 ///
 /// IRC bodies are arbitrary bytes, and a relay cannot know which legacy
-/// encoding a sender used (Latin-1, CP1252, Shift-JIS, KOI8-R are all routine),
+/// encoding a sender used (Latin-1, Windows-1252, Shift-JIS, KOI8-R are all routine),
 /// so every invalid byte becomes U+FFFD: guessing one code page would render
 /// the others as plausible-looking wrong text, where U+FFFD marks the loss
 /// honestly. U+FFFD is three bytes, so a line of high bytes can triple in

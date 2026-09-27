@@ -705,7 +705,7 @@ fn wall_clock() -> e6irc_proto::time::Millis {
 
 /// Monotonic milliseconds since the process started, for timer decisions (the
 /// reaper deadlines and flood-bucket refill). Unlike [`wall_clock`] this never
-/// steps — an NTP correction or a VM resume cannot move it — so a reaper keyed
+/// steps — an NTP correction or a virtual-machine resume cannot move it — so a reaper keyed
 /// on it can neither mass-close live connections on a forward jump nor freeze
 /// on a backward one. The epoch is arbitrary (process start); only differences
 /// are meaningful, which is all the timers ever take.
@@ -1773,7 +1773,7 @@ impl std::fmt::Display for ClientIp {
 
 /// What a per-address limit counts against: an IPv4 address, or the IPv6
 /// `/64` an address belongs to. One subscriber is routinely handed a whole
-/// `/64` (and SLAAC privacy addresses rotate through it), so a limiter keyed by
+/// `/64` (and autoconfigured privacy addresses rotate through it), so a limiter keyed by
 /// the full 128 bits gives each client 2^64 fresh budgets for the asking. Every
 /// limiter — the per-address connection cap, the in-flight HTTP request bound,
 /// the HTTP authentication bucket, and the core's account-creation bucket —

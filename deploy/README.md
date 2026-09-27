@@ -88,10 +88,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now e6ircd
 ```
 
-The unit uses SIGTERM and a 55-second stop budget, exceeding the daemon’s
+The unit uses SIGTERM and a 65-second stop budget, exceeding the daemon’s
 bounded shutdown — up to 15 seconds telling every bouncer network's upstream
-goodbye, then up to 5 seconds draining the core shards, then up to 30 seconds
-flushing PostgreSQL — so systemd cannot kill a still-clean shutdown first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
+goodbye, then up to 5 seconds draining the core shards, then up to 8 seconds
+letting client connections deliver their closing `ERROR`, then up to 30
+seconds flushing PostgreSQL ([Stop timeout](#stop-timeout)) — so systemd cannot
+kill a still-clean shutdown first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
 daemon in milliseconds, and systemd's default limit of five starts in ten
 seconds would otherwise leave the unit permanently failed after a reboot where
 PostgreSQL comes up later than e6irc; restarts stay two seconds apart and each
@@ -131,7 +133,9 @@ Clients attaching to their always-on networks authenticate with their account
 password (SASL PLAIN). The listener therefore refuses to be configured on any
 address but loopback without a certificate — in the configuration file
 (`[bnc] addr = …` needs `tls = { cert_path = …, key_path = … }` unless the
-address is `127.0.0.1`/`::1`) and in the console alike, each refusal naming the
+address is a loopback one — anywhere in `127.0.0.0/8`, `::1`, or an
+IPv4-mapped loopback address such as `::ffff:127.0.0.1`) and in the console
+alike, each refusal naming the
 setting. A loopback listener without TLS is for clients on the same machine
 (or behind a TLS-terminating proxy that runs there). The TLS handshake has the
 same 30-second bound as the IRC listeners'.

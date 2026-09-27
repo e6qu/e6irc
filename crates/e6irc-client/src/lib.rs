@@ -3860,7 +3860,8 @@ mod tests {
         assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
-    /// Libera offers ECDSA, EXTERNAL, PLAIN and SCRAM-SHA-512: a password
+    /// Libera offers `ECDSA-NIST256P-CHALLENGE`, `EXTERNAL`, `PLAIN` and
+    /// `SCRAM-SHA-512`: a password
     /// logs in with SCRAM-SHA-512, and the connection says so.
     #[tokio::test]
     async fn the_strongest_offered_password_mechanism_is_chosen_and_stated() {

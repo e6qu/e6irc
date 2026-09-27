@@ -2171,7 +2171,7 @@ pub(crate) use bridge_start;
 /// address; `connect_async` would resolve and dial it blind. Instead we resolve
 /// the host ourselves, dial a *vetted* address directly, and hand that stream to
 /// tungstenite for the TLS handshake (validated against the URL's hostname, not
-/// the IP) — closing the SSRF vector with no resolve-then-dial TOCTOU.
+/// the IP) — closing the SSRF vector with no resolve-then-dial race between the check and the use.
 #[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) async fn bridge_ws_connect(
     url: &str,
@@ -2585,7 +2585,7 @@ pub(crate) fn bridge_ws_config() -> tokio_tungstenite::tungstenite::protocol::We
 
 /// JSON-parse an upstream HTTP response body under a size cap. `reqwest`'s
 /// `.json()`/`.bytes()` buffer the *whole* body first, so a hostile or
-/// compromised upstream can return a multi-GB body and OOM the shared daemon —
+/// compromised upstream can return a multi-gigabyte body and exhaust the shared daemon's memory —
 /// a cross-tenant DoS, since one process serves every user. This reads chunk by
 /// chunk and rejects a body past `MAX_BRIDGE_RESPONSE_BYTES` before buffering it.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -4654,7 +4654,7 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
 /// message of two thousand newlines used to overflow the network's event
 /// broadcast by itself: every attached client was detached as too slow and
 /// the backlog lost the lines. Sixteen lines of up to ~450 bytes each is some
-/// 7 KB — a long paste still reads, and one message is a small part of what
+/// 7 kilobytes — a long paste still reads, and one message is a small part of what
 /// the broadcast holds ([`BRIDGE_PACING_HIGH_WATER`] is 512 lines).
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) const MAX_BRIDGED_LINES: usize = 16;

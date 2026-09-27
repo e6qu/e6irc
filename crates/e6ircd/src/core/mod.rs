@@ -2655,8 +2655,9 @@ pub(crate) enum CoreWorkerExit {
 pub(crate) const CROSS_SHARD_BACKLOG_LIMIT: usize = 65_536;
 
 /// How long a worker with a LIST or WHO reply being paced out waits, idle,
-/// before giving it another turn: at the default send queue, half of it — 512
-/// rows — per turn.
+/// before giving it another turn. Each turn fills the client's send queue up
+/// to half its `sendq_bytes` ([`SessionOutput::paced_room`]), however many rows
+/// that is.
 pub(crate) const PACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// One core and the only queue allowed to drive its state transitions.

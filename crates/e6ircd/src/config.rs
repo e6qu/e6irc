@@ -288,7 +288,9 @@ pub struct Config {
     /// absent, the `E6IRC_SECRET_KEY` env var is consulted instead.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
-    /// Abuse limits. All off by default.
+    /// Abuse limits. The command-flood bucket is always on, and the
+    /// authentication and API budgets are on by default; the per-address
+    /// connection cap and the account-creation throttle are off unless set.
     #[serde(default)]
     pub limits: LimitsConfig,
     /// In-process operational metrics and bounded historical samples.
@@ -441,9 +443,12 @@ pub struct LimitsConfig {
     /// ([`crate::net::canonical_network`]).
     #[serde(default, deserialize_with = "deserialize_canonical_networks")]
     pub trusted_proxies: Vec<ipnet::IpNet>,
-    /// Token-bucket size for the unauthenticated, work-inducing endpoints
-    /// (password login, OIDC starts and callbacks, device authorization,
-    /// invitation and bootstrap acceptance), per client address (an IPv6
+    /// Token-bucket size for the work-inducing authentication endpoints
+    /// (every handler that takes `http::oidc::RateLimited`): password login,
+    /// OIDC starts, callbacks and front-channel logout, device authorization,
+    /// invitation and bootstrap acceptance, and — although the caller is
+    /// signed in, because each checks a password — app-password creation,
+    /// password change, and re-authentication. Per client address (an IPv6
     /// client's whole `/64`); the bucket refills to full over 60 seconds. On
     /// by default ([`DEFAULT_AUTH_RATE_BURST`]); `"off"` disables it, for a
     /// deployment whose reverse proxy throttles these routes itself.

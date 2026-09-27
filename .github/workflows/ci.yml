@@ -117,6 +117,10 @@ jobs:
       # contract and has exactly one row using the defined evidence vocabulary.
       - run: python3 tools/check-journeys.py
       - run: python3 tools/test-check-journeys.py
+      # Glossary guard: every abbreviation in the docs and code comments is
+      # defined in docs/terminology.md or spelled out where it is used.
+      - run: python3 tools/check-terminology.py
+      - run: python3 tools/test-check-terminology.py
       - run: python3 tools/check-client-capabilities.py
       # Structural server-rendered accessibility: every data table keeps an
       # accessible caption and every navigation landmark keeps a name.
@@ -659,7 +663,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Pinned nightly: the 2026-07-24 nightly ICEs in rustc_codegen_ssa on a
-      # tokio task type under the fuzzer's ASAN+sancov instrumentation (a
+      # tokio task type under the fuzzer's AddressSanitizer+sancov instrumentation (a
       # compiler bug, not our code). Pin to the last nightly that built the fuzz
       # targets; bump when upstream fixes the codegen regression.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12

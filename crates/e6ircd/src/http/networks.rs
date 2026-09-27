@@ -152,8 +152,9 @@ fn require_network_updated(
 }
 
 /// A curated public IRC network whose connection defaults can be selected in
-/// the console. `name` is the stable e6irc selector, deliberately distinct from
-/// the human label so spaces cannot leak into URL/client addressing.
+/// the chat client's add dialog. `id` is the stable selector and `name` the
+/// network name it fills in, both deliberately distinct from the human `label`
+/// so spaces cannot leak into URL/client addressing.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub(super) struct IrcNetworkPreset {
     pub(super) id: &'static str,
@@ -209,7 +210,7 @@ struct NetworkPresetsResponse {
 }
 
 /// The curated catalog, for every client that offers "pick a known network":
-/// the chat client reads it here and the console renders the same constant, so
+/// the chat client's add dialog reads it here rather than keeping a copy, so
 /// an endpoint is corrected in one place.
 pub(super) async fn network_presets() -> Response {
     json_response(NetworkPresetsResponse {
@@ -1081,7 +1082,7 @@ fn validate_single_service_token(value: &str, maximum: usize, field: &str) -> Re
 }
 
 /// A network name is a client-facing `/network` selector that is interpolated
-/// into URL path segments, HTML attributes and JS-string confirm dialogs.
+/// into URL path segments, HTML attributes and JavaScript-string confirm dialogs.
 /// Restricting it to an unambiguous token charset (letters, digits, `-`, `_`,
 /// `.`) makes URL-significant, quote/angle (XSS), whitespace and control
 /// characters unrepresentable in a name rather than relying on correct escaping
@@ -3364,7 +3365,7 @@ mod tests {
         assert!(!network_name_ok("foo%41"));
         assert!(!network_name_ok("a&b"));
         assert!(!network_name_ok("a/b"));
-        // Quote/angle — the JS-string / HTML-attribute XSS vectors.
+        // Quote/angle — the JavaScript-string / HTML-attribute XSS vectors.
         assert!(!network_name_ok("'-alert(1)-'"));
         assert!(!network_name_ok("<script>"));
         assert!(!network_name_ok("a\"b"));

@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    /// A ring of 4 KB-tagged entries stays within its byte budget, shedding
+    /// A ring of entries tagged 4 kilobytes each stays within its byte budget, shedding
     /// its oldest entries long before it reaches its entry cap, and keeps its
     /// newest even when that one alone is over the budget.
     #[test]

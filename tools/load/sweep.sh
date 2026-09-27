@@ -6,7 +6,7 @@
 # Portable to bash 3.2: under `set -u` it takes the plain expansion of an empty
 # array for an unbound variable, hence `${ARRAY[@]+"${ARRAY[@]}"}` below.
 #
-#   tools/load/sweep.sh [ADDR] [COUNTS] [BURST] [--report-dir DIR] [E6IRC-LOAD OPTIONS...]
+#   tools/load/sweep.sh [ADDR] [COUNTS] [BURST] [--report-dir DIR] [e6irc-load options...]
 #
 # Defaults: ADDR=127.0.0.1:6667, COUNTS="100 500 1000 5000", BURST=20.
 set -euo pipefail

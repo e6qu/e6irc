@@ -39,12 +39,13 @@ or environment states one with a value other than the stored one is refused,
 naming each such setting and printing no value.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share the relay-desk visual system and
-accessible light, dark, and forced-colors palettes. Both network forms read one
-server-side preset catalog (`GET /api/v1/network-presets`), use one vocabulary,
-ask first for what a known network cannot supply, and keep the rest under an
-Advanced disclosure. The chat client opens an account's sole runnable network
+accessible light, dark, and forced-colors palettes. The one network form, the
+chat client's dialog, reads the server-side preset catalog
+(`GET /api/v1/network-presets`), asks first for what a known network cannot
+supply, and keeps the rest under an Advanced disclosure. The chat client opens an account's sole runnable network
 by itself (with several, the person chooses), opens a network it has just added, and has one control for each thing: one network
-list, one Server log switch, one command reference. The console navigation
+list, one console (the first conversation, which shows every IRC line the
+network sends and takes raw lines), one command reference. The console navigation
 leads with the account holder's own pages and groups the administrator's. Browser snapshots cover all
 three shells; interaction tests cover Web Content Accessibility Guidelines level AA
 contrast, keyboard focus, Escape
@@ -108,9 +109,10 @@ reports the refusal with the upstream's text, retries on the refusal schedule
 so a ghost of its own session can time out, and parks if the nickname stays
 taken.
 
-Neither browser surface gates saving on a connection test: **Test connection**
-is an optional diagnostic that says `QUIT` when it is done. The console has a bounded,
-owner-scoped **Network log** view for IRC and every bridge driver. Its API reads
+The chat client's network dialog does not gate saving on a connection test:
+**Test connection** is an optional diagnostic that says `QUIT` when it is done.
+A network's console page has a bounded, owner-scoped **IRC transcript** of its
+stored lines, for IRC and every bridge driver. Its API reads
 the live buffer while active and persisted history after stop; typed lifecycle
 and operational failures are safe notices, and storage-failure notices cannot
 retry through the failed writer. Administrators also have a bounded live server
@@ -149,7 +151,7 @@ past while retaining their transcript, and routes server notices to the server
 buffer rather than creating phantom direct messages.
 The BNC marker schema retains the account table's full BIGINT identity width,
 and capacity checks serialize on the durable account row.
-For external networks one routing policy (`conversation_target`) maps
+For external networks one routing policy (`NetworkNames::conversation`) maps
 STATUSMSG `@#channel` and `+#channel` traffic to the underlying channel for live
 delivery, bridge routing, and backlog filing alike; the backlog used to file
 such a line under its sender as a direct message. The core's own STATUSMSG
@@ -169,7 +171,7 @@ Bridge-backed networks now refuse every unsupported or malformed downstream
 command with a bounded notice instead of accepting it into a quiet no-op.
 The browser network rail now distinguishes the driver's parked lifecycle from
 its latest failure code, so rejected Libera credentials and verified-account
-registration policy produce the promised Server log and settings recovery
+registration policy produce the promised console lines and settings recovery
 guidance instead of a bare failed-state label.
 
 A 2026-09-20 review of the whole tree after #333 found, and this change fixes:
@@ -914,7 +916,7 @@ its plain line derived where it is stored. The SendQ is `sendq_bytes` (512
 KiB, the 1,024 lines it held at a full line each; migration 0088 converts the
 stored count), held output and paced LIST/WHO counted in the same bytes. A
 network's backlog holds `buffer_cap` lines of at most 512 bytes' worth each,
-in memory and in storage (5,000 rows, 2.5 MB), trimmed oldest first.
+in memory and in storage (5,000 rows, 2.5 megabytes), trimmed oldest first.
 `limits.auth_rate_burst` defaults to twenty a minute per address and is turned
 off only by `"off"`; a stored unset is migrated to the default (0088). The
 bouncer-shutdown test's upstream now closes the link on `QUIT` as a server
@@ -1139,7 +1141,7 @@ Maintainer decisions implemented from a review of resource bounds (DESIGN
 
 - **LIST keeps a cursor, not a copy.** A LIST used to clone the name and topic
   of every channel it admitted into one sorted list held on the session until
-  it was paced out — some 65 MB per LIST at 100k channels, rebuilt by every
+  it was paced out — some 65 megabytes per LIST at 100k channels, rebuilt by every
   `LIST`/`LIST` abort. It now holds its conditions and one resume key per
   shard, and each turn asks the shards for the next page after it, no larger
   than the room the client's send queue has; rows come out in casemapped name

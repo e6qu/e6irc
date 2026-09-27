@@ -3,9 +3,16 @@
 //! sender bursts messages into a shared channel and every other client
 //! counts deliveries. Reports connect rate and fan-out throughput.
 //!
-//! Usage:
-//!   e6irc-load --addr host:port [--clients N] [--channel #c]
-//!              [--burst K] [--tls]
+//! Usage (`e6irc-load --help` prints each flag's meaning):
+//!   e6irc-load --addr HOST:PORT [--clients N] [--channels C]
+//!              [--channel PREFIX] [--burst K] [--tls]
+//!              [--minimum-connect-rate N] [--minimum-fanout-rate N]
+//!              [--maximum-p99-ms N] [--server-pid PID]
+//!              [--maximum-server-rss-per-connection-bytes N]
+//!              [--host-provenance-sha256 DIGEST] [--report-json PATH]
+//!              [--oper-name NAME] [--server-command-burst N]
+//!              [--monitoring-url http://HOST:PORT] [--core-workers N]
+//!   e6irc-load --help | -h
 //!
 //! It exercises the exact paths the server's scale target stresses
 //! (thousands of sessions, wide fan-out) without any test framework.
@@ -171,10 +178,157 @@ impl Args {
     }
 }
 
-fn parse_args() -> Result<Args, String> {
-    parse_args_with(std::env::args().skip(1), |variable| {
+/// One flag the parser accepts: its spelling, the placeholder for its value
+/// (`None` for a switch), and what it does.
+struct Flag {
+    name: &'static str,
+    value: Option<&'static str>,
+    help: &'static str,
+}
+
+/// Every flag `parse_invocation_with` accepts, in the order `--help` prints
+/// them. `tests/help.rs` holds this list, the module's usage header, and
+/// `tools/load/README.md` to the parser's own match arms, so none can drift.
+const FLAGS: &[Flag] = &[
+    Flag {
+        name: "--addr",
+        value: Some("HOST:PORT"),
+        help: "the server to load (required)",
+    },
+    Flag {
+        name: "--clients",
+        value: Some("N"),
+        help: "concurrent clients (default 100, at most 100000)",
+    },
+    Flag {
+        name: "--channels",
+        value: Some("C"),
+        help: "channels the clients are spread across, each with one sender (default 1)",
+    },
+    Flag {
+        name: "--channel",
+        value: Some("PREFIX"),
+        help: "channel-name prefix; channel i is PREFIX{i} (default #load)",
+    },
+    Flag {
+        name: "--burst",
+        value: Some("K"),
+        help: "messages each channel's sender sends (default 10)",
+    },
+    Flag {
+        name: "--tls",
+        value: None,
+        help: "connect with TLS",
+    },
+    Flag {
+        name: "--minimum-connect-rate",
+        value: Some("N"),
+        help: "fail below N clients a second connected, registered and joined",
+    },
+    Flag {
+        name: "--minimum-fanout-rate",
+        value: Some("N"),
+        help: "fail below N deliveries a second",
+    },
+    Flag {
+        name: "--maximum-p99-ms",
+        value: Some("N"),
+        help: "fail when the 99th-percentile delivery latency exceeds N milliseconds",
+    },
+    Flag {
+        name: "--server-pid",
+        value: Some("PID"),
+        help: "sample e6ircd's resident memory from /proc (Linux) during the run",
+    },
+    Flag {
+        name: "--maximum-server-rss-per-connection-bytes",
+        value: Some("N"),
+        help: "fail when the server's peak resident-memory growth per requested client \
+               exceeds N bytes (requires --server-pid)",
+    },
+    Flag {
+        name: "--host-provenance-sha256",
+        value: Some("DIGEST"),
+        help: "record the controlled host's provenance digest (requires --report-json, \
+               --server-pid, --core-workers with --monitoring-url, and every threshold)",
+    },
+    Flag {
+        name: "--report-json",
+        value: Some("PATH"),
+        help: "write the versioned result report to PATH",
+    },
+    Flag {
+        name: "--oper-name",
+        value: Some("NAME"),
+        help: "oper each sender up as NAME, password from E6IRC_LOAD_OPER_PASSWORD; \
+               operators are exempt from the command-flood limiter",
+    },
+    Flag {
+        name: "--server-command-burst",
+        value: Some("N"),
+        help: "the server's limits.command_burst; a --burst that exceeds it is refused \
+               unless the senders oper up (default 40)",
+    },
+    Flag {
+        name: "--monitoring-url",
+        value: Some("http://HOST:PORT"),
+        help: "read the server's core shard count from its monitoring observation, \
+               bearer from E6IRC_MONITORING_TOKEN",
+    },
+    Flag {
+        name: "--core-workers",
+        value: Some("N"),
+        help: "the core shards the run claims, checked against the server's own count \
+               (requires --monitoring-url)",
+    },
+    Flag {
+        name: "--help",
+        value: None,
+        help: "print this help and exit (also -h)",
+    },
+];
+
+/// The complete usage, built from [`FLAGS`].
+fn usage() -> String {
+    let mut text = String::from(
+        "e6irc-load: open many concurrent IRC clients against a running e6ircd, measure \
+         connect+register throughput, then channel fan-out.\n\nUsage: e6irc-load --addr \
+         HOST:PORT [flags]\n\nFlags:\n",
+    );
+    for flag in FLAGS {
+        let spelled = match flag.value {
+            Some(value) => format!("{} {value}", flag.name),
+            None => flag.name.to_owned(),
+        };
+        text.push_str(&format!("  {spelled}\n      {}\n", flag.help));
+    }
+    text
+}
+
+/// What the command line asks for.
+enum Invocation {
+    /// `--help` or `-h`: print [`usage`] and exit successfully.
+    Help,
+    Run(Box<Args>),
+}
+
+fn parse_invocation() -> Result<Invocation, String> {
+    parse_invocation_with(std::env::args().skip(1), |variable| {
         std::env::var(variable).ok()
     })
+}
+
+/// The arguments of a run, with `environment` answering for the variables
+/// that carry secrets; `--help` is not a run.
+#[cfg(test)]
+fn parse_args_with(
+    arguments: impl IntoIterator<Item = String>,
+    environment: impl Fn(&str) -> Option<String>,
+) -> Result<Args, String> {
+    match parse_invocation_with(arguments, environment)? {
+        Invocation::Run(args) => Ok(*args),
+        Invocation::Help => Err("--help is not a run".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -182,12 +336,12 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
     parse_args_with(arguments, |_| None)
 }
 
-/// The arguments, with `environment` answering for the variables that carry
-/// secrets.
-fn parse_args_with(
+/// The command line, with `environment` answering for the variables that
+/// carry secrets.
+fn parse_invocation_with(
     arguments: impl IntoIterator<Item = String>,
     environment: impl Fn(&str) -> Option<String>,
-) -> Result<Args, String> {
+) -> Result<Invocation, String> {
     let mut addr = None;
     let mut clients = 100;
     let mut channels = 1;
@@ -245,6 +399,7 @@ fn parse_args_with(
                     "--burst",
                 )?
             }
+            "--help" | "-h" => return Ok(Invocation::Help),
             "--tls" => args.tls = true,
             "--minimum-connect-rate" => {
                 args.minimum_connect_rate = Some(parse_positive_float(
@@ -381,7 +536,7 @@ fn parse_args_with(
                 .to_string(),
         );
     }
-    Ok(args)
+    Ok(Invocation::Run(Box::new(args)))
 }
 
 fn parse_num(s: &str, flag: &str) -> Result<usize, String> {
@@ -427,7 +582,14 @@ async fn connect(args: &Args) -> std::io::Result<Connection> {
 }
 
 fn main() -> ExitCode {
-    let args = parse_args().unwrap_or_else(|error| die(&error));
+    let args = match parse_invocation() {
+        Ok(Invocation::Run(args)) => *args,
+        Ok(Invocation::Help) => {
+            print!("{}", usage());
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => die(&format!("{error} (e6irc-load --help lists every flag)")),
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -197,6 +197,8 @@ mistake, before a single line changes.
       --manifest-path fuzz/Cargo.toml --bins` (stable is enough; CI's
       `fuzz-smoke` builds them on nightly, and a struct gaining a field breaks
       every target that builds it field by field).
+- [ ] `tools/check-terminology.py` clean (every abbreviation in the docs and
+      code comments is defined in `docs/terminology.md` or spelled out).
 - [ ] `tools/check-no-defer.sh` clean (no deferral vehicle in use — see the
       No-Deferral Rule above: `BUGS.md` empty, no new "surfaced, not
       done"-style note added to any file).

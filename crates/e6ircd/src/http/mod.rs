@@ -1045,11 +1045,29 @@ mod problem_contract_tests {
         ("networks.rs", include_str!("networks.rs")),
         ("observation.rs", include_str!("observation.rs")),
         ("oidc.rs", include_str!("oidc.rs")),
+        ("oidc_provider.rs", include_str!("oidc_provider.rs")),
         ("openapi.rs", include_str!("openapi.rs")),
         ("preflight.rs", include_str!("preflight.rs")),
+        ("revocation.rs", include_str!("revocation.rs")),
         ("sessions.rs", include_str!("sessions.rs")),
         ("ws.rs", include_str!("ws.rs")),
     ];
+
+    /// The guard reads every file of the module, so a new one cannot escape
+    /// it (`oidc_provider.rs` and `revocation.rs` once did).
+    #[test]
+    fn the_sources_are_every_http_file() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/src/http");
+        let mut files: Vec<String> = std::fs::read_dir(directory)
+            .expect("the http module directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| name.ends_with(".rs"))
+            .collect();
+        files.sort();
+        let listed: Vec<&str> = SOURCES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(files, listed);
+    }
 
     fn occurrences(needle: &str) -> Vec<(&'static str, usize)> {
         SOURCES
@@ -4344,7 +4362,7 @@ mod client_ip_tests {
 
     #[test]
     fn trusted_proxy_uses_rightmost_untrusted_forwarded_entry() {
-        // Behind a trusted proxy, the client is the rightmost XFF entry that
+        // Behind a trusted proxy, the client is the rightmost `X-Forwarded-For` entry that
         // isn't itself a trusted hop — a client-appended left entry can't
         // impersonate someone else.
         let trusted = [net("10.0.0.0/8")];
