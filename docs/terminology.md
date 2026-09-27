@@ -2,7 +2,11 @@
 
 This glossary defines e6irc terms.
 
-Prefer spelled-out terms. Define each new abbreviation here.
+Prefer spelled-out terms. Define each new abbreviation here: every
+abbreviation the prose uses — Markdown, and code comments — is written in
+bold in an entry below, alone or as one of its spellings (`**TLS**`,
+`**Transport Layer Security (TLS)**`, `**Bouncer / BNC**`), or spelled out
+where it is used. `tools/check-terminology.py` enforces it.
 
 See [DESIGN.md](../DESIGN.md), [AGENTS.md](../AGENTS.md), [PLAN.md](../PLAN.md),
 and [journeys](journeys/README.md).
@@ -212,9 +216,12 @@ password.
 **Personal access token / PAT** — a bearer token for the REST API and for
 `OAUTHBEARER` SASL. Shown once at creation; only its hash is stored.
 
-**Web session** — a browser login session: an opaque cookie
-(`e6irc_session`), stored only as its SHA-256 hash, `HttpOnly` +
-`SameSite=Lax`.
+**Web session** — a browser login session: an opaque cookie, stored only as
+its SHA-256 hash, `HttpOnly` + `SameSite=Lax`. With secure cookies (the
+default, `[http] secure_cookies`) it is `__Host-e6irc_session`, also `Secure`
+and pinned to the exact host; plain-HTTP development, which turns secure
+cookies off, gets `e6irc_session`, since the `__Host-` prefix requires
+`Secure`.
 
 **OAuth** — OAuth 2.0, the authorization framework OpenID Connect builds on.
 
@@ -392,11 +399,15 @@ healthy upstream session. A plain `Registry::add` refuses a network that
 already has a live driver, so two upstream sessions can never race for one
 network.
 
-**Server log** — the chat client's wire log: a conversation beside the
-channels that shows every IRC line received for the open network, verbatim
-except that sensitive commands are redacted. The console's per-network
-**Network log** is a different, persisted view of driver lifecycle and
-failures.
+**Console** (chat client) — the first entry in the chat client's
+conversations, where the server buffer used to be: it shows every IRC line
+received for the open network, verbatim except that sensitive commands are
+redacted, beside e6irc's own notices, and sends what is typed there as the IRC
+line itself (a `/command` still means the command). It replaced a separate
+Server log panel (DESIGN §13.2). Not the administration console at `/console`,
+whose per-network page has a different, persisted view: the **IRC
+transcript**, the newest stored IRC lines of that network, including NickServ
+replies and connection errors.
 
 **Relay-desk** — the visual system shared by the identity pages, the console,
 the chat client, and the terminal client: dark routing chrome, compact
@@ -407,19 +418,39 @@ trace joining network context to the active conversation.
 
 ## History and persistence
 
+**Direct message (DM)** — a private conversation between two users (a
+`PRIVMSG` to a nick, a query), stored and replayed like a channel's history
+under the pair of participants.
+
 **CHATHISTORY** — the IRCv3 batch replay of past messages
 (`LATEST`/`BEFORE`/`AFTER`/`AROUND`/`BETWEEN`/`TARGETS`), served from the hot
 ring and paged from PostgreSQL beyond it.
 
 **Hot ring / history ring** — the in-memory bounded ring of recent messages
 per active channel; older history lives only in PostgreSQL. Least-recently-
-active channels evict their ring.
+active channels evict their ring: a **least recently used (LRU)** order.
 
 **msgid** — a unique message identifier (IRCv3 `msgid` tag) used to address a
 message in CHATHISTORY.
 
 **PostgreSQL / PG** — the durable store for accounts, channel registration,
 history, sessions, and server bans. Accessed only by the database worker.
+
+**Database / DB** — in e6irc, always PostgreSQL; the **DB worker** is the
+[database worker](#internal-architecture).
+
+**Structured Query Language (SQL)** — PostgreSQL's query language. Every
+query binds its parameters; migrations are SQL files.
+
+**Create, read, update, delete (CRUD)** — the four operations on a managed
+resource (an app password, a network, a server ban), each an `/api/v1`
+route.
+
+**Block range index (BRIN)** and **generalized inverted index (GIN)** —
+PostgreSQL index kinds. A BRIN stores a summary per range of table blocks and
+suits an append-ordered column such as a message timestamp; a GIN indexes
+each element of an array, which is how a direct message is found by either
+of its participants (`dm_peers`).
 
 **Migration** — a numbered, checksum-pinned SQL schema change under
 `migrations/`, run at startup.
@@ -461,16 +492,187 @@ one code-generation unit.
 
 **Authenticated encryption with associated data (AEAD)** — encryption that
 also proves the ciphertext, and the context it was bound to, were not altered.
+That context is the **additional authenticated data (AAD)**: authenticated
+but not encrypted, so a value sealed for one purpose cannot be opened as
+another's.
 Stored credentials are sealed with the ChaCha20-Poly1305 AEAD cipher.
 
-**Web Content Accessibility Guidelines (WCAG)** — the W3C accessibility
-standard. The browser suites hold the chat, console, and identity pages to its
-level AA, including contrast.
+**Web Content Accessibility Guidelines (WCAG)** — the World Wide Web
+Consortium's accessibility standard. The browser suites hold the chat,
+console, and identity pages to its level **AA** (the middle of its three
+conformance levels), including contrast.
 
 **embed-web** — the build feature that bakes the built web client
 (`web/dist`, a vanilla JavaScript bundle produced by Vite) into the binary and
 serves it at `/`;
 off by default so assets can be hosted separately.
+
+---
+
+## Networking, formats, and systems
+
+**Transmission Control Protocol (TCP)** — the reliable byte-stream transport
+under IRC, HTTP and PostgreSQL connections. A **RST** (reset) aborts a
+connection at once and discards what the peer had not read, which is why
+e6irc's closing paths drain before they close.
+
+**Internet Protocol (IP)** — the network layer. An **IP address** is IPv4 or
+IPv6; per-address limits key on an IPv4 address or an IPv6 `/64`.
+
+**Classless Inter-Domain Routing (CIDR)** — the `address/prefix` notation for
+an address range (`203.0.113.0/24`), used by bans, `trusted_proxies`, and
+`require_sasl_from`.
+
+**Network address translation (NAT)** — rewriting addresses at a router so
+many hosts share one public address. **Carrier-grade NAT** (`100.64.0.0/10`)
+and **NAT64** (an IPv6 host reaching IPv4 through `64:ff9b::/96`) ranges are
+internal addresses to the bouncer's upstream-address check.
+
+**Domain Name System (DNS)** — resolves a hostname to addresses; the bouncer
+vets every result again at dial time.
+
+**Network Time Protocol (NTP)** — clock synchronization. An NTP step can jump
+wall-clock time, so timeouts and reapers use a monotonic clock.
+
+**Transport Layer Security (TLS)** — encrypted, authenticated transport, from
+rustls for listeners, upstream dials, PostgreSQL, and HTTP clients. A
+**certificate authority (CA)** issues the certificates a TLS client trusts.
+**Distinguished Encoding Rules (DER)** is a certificate's binary form;
+**Privacy-Enhanced Mail (PEM)** is its base64 text wrapping
+(`-----BEGIN CERTIFICATE-----`), the form certificate and key files are read
+in.
+
+**Hypertext Transfer Protocol (HTTP) / HTTPS** — the web protocol of the
+REST API, the console, and the WebSocket upgrade; HTTPS is HTTP over TLS.
+
+**WebSocket / WS** — a full-duplex message channel upgraded from an HTTP
+request; the browser's IRC transport ([IRC-over-WebSocket](#bouncer-and-bridges)).
+
+**Uniform Resource Identifier (URI) / Uniform Resource Locator (URL)** — a
+URI names a resource; a URL is a URI that also says where to fetch it (the
+public URL, an OpenID Connect redirect URI).
+
+**Application programming interface (API)** — a programmatic interface; here
+usually the [REST](#internal-architecture) API under `/api/v1`.
+
+**Service provider interface (SPI)** — an interface a plug-in implements for
+its host to call. The bouncer's `NetworkDriver` trait is the driver SPI the IRC
+driver and the bridges implement.
+
+**Application binary interface (ABI)** — the calling convention a function is
+compiled to (`extern "C"`).
+
+**JavaScript Object Notation (JSON)** — the text data format of the REST API,
+reports, and evidence files.
+
+**Tom's Obvious, Minimal Language (TOML)** — the configuration file format
+(`e6ircd.toml`).
+
+**HyperText Markup Language (HTML)**, **Cascading Style Sheets (CSS)**, and
+the **Document Object Model (DOM)** — a page's markup, its styling, and the
+browser's in-memory tree of it. The console and chat scripts build rows as DOM
+nodes, never by assembling markup strings.
+
+**Single-page application (SPA)** — a browser application that renders every
+view in one page with client-side routing. e6irc uses no SPA framework: the
+chat shell is one page of plain JavaScript, and the management pages are
+server-rendered.
+
+**User interface (UI)** — what a person sees and operates: the web pages, the
+terminal client, the console.
+
+**American Standard Code for Information Interchange (ASCII)** — the 7-bit
+character set; IRC's syntax characters and user names are ASCII.
+
+**Unicode Transformation Format (UTF) / UTF-8** — UTF-8 is the
+variable-width Unicode encoding e6irc requires of every line and stores.
+
+**ISO 8601** — the International Organization for Standardization's (**ISO**)
+date and time format; `server-time` and stored read-marker timestamps are its
+UTC form (`2026-09-27T12:00:00.000Z`), which sorts as text.
+
+**CRLF** — carriage return and line feed (`\r\n`), the IRC line terminator.
+
+**Control Sequence Introducer (CSI)** — the `ESC [` pair (or the single C1
+byte `0x9B`) that starts a terminal control sequence; untrusted text reaches
+a terminal only as `TerminalSafe`, which neutralizes it.
+
+**Coordinated Universal Time (UTC)** — the time zone of every stored and
+`server-time` timestamp.
+
+**Request for Comments (RFC)** — a numbered Internet standards document, such
+as RFC 1459/2812 (IRC) or RFC 5802 (SCRAM).
+
+**Secure Hash Algorithm (SHA)** — the hash family; SHA-256 digests identify
+stored tokens, container images, and certificate files. A git **commit SHA**
+is a commit's hash.
+
+**Hash-based message authentication code (HMAC)** — a keyed hash: SCRAM
+computes them, and a session's CSRF token is one.
+
+**Random number generator (RNG)** — keys, tokens, and nonces come from the
+operating system's cryptographically secure one; the reconnect backoff
+deliberately uses none, spreading drivers by a seed instead.
+
+**Identifier (ID)** — a stable, machine-readable name: an account ID, a
+session ID, a message ID (`msgid`).
+
+**Operating system (OS)**, **central processing unit (CPU)**, and
+**random-access memory (RAM)** — the host the daemon runs on.
+
+**Process identifier (PID)** and **resident set size (RSS)** — a process's
+number, and the memory it holds resident. The load harness reads e6ircd's RSS
+through its PID and reports it per connection.
+
+**First in, first out (FIFO) / last in, first out (LIFO)** — queue orders.
+`e6irc-queue` is FIFO, and a queue that opts in serves LIFO (freshest first)
+while it is overloaded.
+
+**Multi-producer single-consumer (MPSC)** — a queue many tasks send into and
+one task receives from, as `e6irc-queue` is.
+
+---
+
+## Web security
+
+**Content Security Policy (CSP)** — a response header naming where a page may
+load scripts, styles, and connections from. Every response carries one,
+limited to its own origin and the few other targets a page needs.
+
+**HTTP Strict Transport Security (HSTS)** — a response header telling the
+browser to reach the site over HTTPS only; sent whenever the public origin is
+HTTPS.
+
+**Cross-site scripting (XSS)** — injecting script into a page another user
+loads. Pages escape every value, and scripts build nodes rather than markup.
+
+**Server-side request forgery (SSRF)** — making a server send a request to an
+address of the attacker's choosing, such as an internal service. The bouncer
+vets every upstream address, at ingress and at dial time.
+
+**Insecure direct object reference (IDOR)** — reaching another account's
+object by naming its identifier. Every owner-scoped query carries its owner.
+
+**Open Worldwide Application Security Project (OWASP)** — publishes the
+password-storage minimums e6irc's argon2id parameters meet.
+
+---
+
+## Development process
+
+**Continuous integration (CI)** — the GitHub Actions workflows
+(`.github/workflows/`) that build, test, and run every guard on each push and
+pull request.
+
+**Pull request (PR)** — a proposed change on GitHub. AGENTS.md allows at most
+one open at a time.
+
+**GNU Affero General Public License (AGPL)** — e6irc's licence (version 3 or later):
+anyone who runs a modified e6irc as a network service must offer its users
+the modified source.
+
+**Large language model (LLM)** — the kind of model an agent working in this
+repository is; AGENTS.md's rules are written with its limits in mind.
 
 ---
 
@@ -493,6 +695,13 @@ Shauth exposes Hydra's public endpoints at its own hostname.
 **Fargate** is the serverless ECS launch type (no host to manage). Tasks run
 on **Graviton** (**ARM64**) CPUs.
 
+**Simple Storage Service (S3)** — AWS object storage; a deployment can serve
+the web client's static assets from it (behind a CDN) instead of embedding
+them.
+
+**Content delivery network (CDN)** — edge caches that serve static files
+close to the browser.
+
 **RDS** — Relational Database Service (managed databases). **fck-rds** is the
 shared PostgreSQL the environment provisions a per-tenant database on.
 
@@ -504,7 +713,8 @@ point used by scale-to-zero services.
 the environment owns the `dev.e6qu.dev` zone.
 
 **Secrets Manager** — AWS's store for secrets (database URLs, OIDC client
-secrets), injected into a task at runtime by ARN rather than committed.
+secrets), injected into a task at runtime by its Amazon Resource Name rather
+than committed.
 
 **GHCR** — GitHub Container Registry (`ghcr.io`), where the e6irc image is
 published.

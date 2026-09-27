@@ -2161,7 +2161,7 @@ impl std::fmt::Display for UnusableForwardedFor {
 
 /// Resolve the real client IP: if the socket peer is a trusted proxy, take the
 /// rightmost non-trusted `X-Forwarded-For` entry (the client the proxy chain
-/// received from); otherwise the peer is the client. XFF is only consulted for
+/// received from); otherwise the peer is the client. `X-Forwarded-For` is only consulted for
 /// trusted peers so a direct client cannot spoof its IP with the header. An
 /// entry that is not an address, reached before that client, refuses the
 /// request ([`UnusableForwardedFor`]): skipping it would walk on into entries

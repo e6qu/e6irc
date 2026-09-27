@@ -149,8 +149,11 @@ manifest shape. Ordinary pull-request CI proves the native packager's exact
 members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
 incomplete archive set. `systemd-analyze verify` checks the service in CI,
-the same gate compares its stop budget to the daemon's core-drain plus
-database-flush budget, and
+the same gate (`tools/check-systemd-unit.sh`) requires its stop budget to
+exceed the sum of the daemon's four shutdown budgets — bouncer-driver stop,
+core drain, connection drain, and database flush — and holds the budget
+`deploy/README.md` states and the one the production-container test stops with
+to the unit's, and
 `crates/e6ircd/tests/config_cli.rs` drives the binary's environment-stated configuration:
 valid, refused by variable name, and never printing a value. The
 production-container job then boots the distroless image itself and proves it
@@ -416,7 +419,7 @@ and host process/memory/CPU telemetry is available.
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires
 every unique expected sequence exactly once, at least 10 connections/second,
-at least 100 fan-out deliveries/second, P99 below five seconds, and graceful
+at least 100 fan-out deliveries/second, 99th-percentile latency below five seconds, and graceful
 process shutdown. The harness exits nonzero on client/socket loss, malformed,
 missing, duplicate, or out-of-range deliveries, or a supplied threshold
 violation. Linux CI also rejects incremental server RSS above 1 MiB per

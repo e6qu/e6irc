@@ -77,7 +77,7 @@ pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = crate::db::READ_MARKER_LI
 /// `registered_topics`) entry that survives disconnect *and* restart — the maps
 /// are reloaded into RAM at boot — and, unlike account REGISTER, it runs no
 /// argon2 so the per-connection credential budget never throttles it. Without a
-/// cap one authenticated account could register channels in a loop (JOIN → CS
+/// cap one authenticated account could register channels in a loop (JOIN → ChanServ
 /// REGISTER → PART) and grow those maps without bound, forever. Checked by
 /// ChanServ REGISTER and the owner console against the count this shard knows
 /// (founded plus its own in-flight registrations) as a fast path; the database

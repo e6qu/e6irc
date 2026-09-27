@@ -1109,7 +1109,7 @@ try {
   await ownerNetworkFailure.waitFor();
   assert.match(await ownerNetworkFailure.innerText(), /invalid API response/i);
   await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
-  await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
+  await page.getByText("No networks yet. Add one in the IRC client.", { exact: true }).waitFor();
   assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
   assert.deepEqual(
     applicationErrors.splice(ownerNetworkFailureErrorStart),

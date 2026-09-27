@@ -2483,7 +2483,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (ownerNetworkCount) ownerNetworkCount.textContent = String(networks.length);
     if (!networks.length) {
       const row = document.createElement("tr");
-      const cell = networkCell("No networks yet. Add one above.");
+      const cell = networkCell("No networks yet. Add one in the IRC client.");
       cell.colSpan = 7;
       cell.className = "empty";
       row.append(cell);

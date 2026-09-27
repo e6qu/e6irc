@@ -48,7 +48,10 @@ and `console_configuration_enables_and_persists_bnc_listener`.
 ## Add Libera Chat, OFTC, Snoonet, or a custom IRC network
 
 **Actor and goal.** An account holder wants an always-on upstream configured
-from the chat client or **Your networks** in the console.
+from the chat client. The console's **Your networks** page lists networks and
+points to the chat client to add or configure one; bridges are added on
+`/console/integrations` ([Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge)
+covers them).
 
 **Preconditions.** PostgreSQL and the network registry are ready, the caller
 has a browser session, and a master key is configured if upstream SASL
@@ -56,10 +59,9 @@ credentials are supplied.
 
 **Flow.**
 
-The chat client carries the everyday path. Both it and the console read one
-server-side catalog of known networks (`GET /api/v1/network-presets` and the
-console's rendered select are the same constant) and ask for the same things in
-the same words.
+The chat client carries the path. Its dialog reads the server-side catalog of
+known networks (`GET /api/v1/network-presets`, the `IRC_NETWORK_PRESETS`
+constant) rather than keeping a copy of its own.
 
 1. In the chat client choose **+** beside **Networks**, or **Add a network** on
    an empty account. The dialog opens in place.
@@ -89,14 +91,13 @@ the same words.
    states follow the server; a network that is not connected quotes the
    upstream's own reason beside its settings control.
 
-The console at `/console/networks` offers the same form plus **Test
-connection** and the bridge drivers. **Test connection** is optional: the
+The same dialog offers **Test connection**, which is optional: the
 owner-scoped preflight uses the production resolver, prohibited-address
 vetting, TCP/TLS connector, optional SASL, and IRC registration path, renders
 DNS, connect, and registration timings, the confirmed nickname, and vetted
-address count without inserting a row or starting a reconnect loop, temporarily
-joins every configured channel, and says `QUIT` when it is done. It never gates
-**Add network**.
+address count without inserting a row or starting a reconnect loop, joins no
+channel (the requested ones are only validated), and says `QUIT` when it is
+done. It never gates **Save**.
 
 **Visible failures and recovery.**
 
@@ -105,8 +106,8 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
   identifier, so an edited or stale choice is validated exactly like hand-typed
   values and cannot select anything the fields do not say.
 - Invalid network ID, endpoint, nickname, channel list, TLS policy, or
-  credential pair re-renders the form with the specific error and non-secret
-  values preserved.
+  credential pair keeps the dialog open with the typed values, shows the
+  server's specific error, and marks the field at fault.
 - Missing secret key refuses a supplied password before persistence.
 - Duplicate owner/network names conflict under IRC casemapping.
 - **Test connection** answers `429` with `Retry-After` while the same account
@@ -181,8 +182,8 @@ API against PostgreSQL.
 The production IRC-driver preflight has a real local registration oracle.
 `console_networks_page_lists_the_callers_networks` proves the rendered
 **Your networks** page against PostgreSQL. In `tools/test-oidc-browser.mjs`
-Chromium, Firefox, and WebKit each find **Add network** enabled before any
-test, run the optional **Test connection** against a local live upstream and
+Chromium, Firefox, and WebKit each find the chat dialog's **Save** enabled
+before any test, run the optional **Test connection** against a local live upstream and
 see that it created nothing, then add the network and watch it join and
 replay; `web/test/visual.spec.js` proves in Chromium that a known network is
 added from a nickname alone, with no forced test.

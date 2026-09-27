@@ -611,7 +611,7 @@ pub fn slack_envelope(envelope_id: &str, event: serde_json::Value) -> serde_json
     json!({ "envelope_id": envelope_id, "type": "events_api", "payload": { "event": event } })
 }
 
-/// A plain user message in C1 from U1.
+/// A plain user message in `C1` from `U1`.
 pub fn slack_message(text: &str) -> serde_json::Value {
     json!({ "type": "message", "channel": "C1", "user": "U1", "text": text })
 }

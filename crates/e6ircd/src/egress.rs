@@ -57,17 +57,17 @@ impl UpstreamRefusal {
     }
 }
 
-/// The IPv4 address a V6 address reaches when the V6 form carries it at a fixed
-/// place, so the V4 rules judge it: the well-known NAT64 prefix `64:ff9b::/96`
+/// The IPv4 address an IPv6 address reaches when the IPv6 form carries it at a fixed
+/// place, so the IPv4 rules judge it: the well-known NAT64 prefix `64:ff9b::/96`
 /// (RFC 6052), 6to4 `2002::/16` (RFC 3056), and the deprecated IPv4-compatible
 /// `::a.b.c.d` (RFC 4291). On a host with NAT64 or a 6to4 relay each of these
-/// connects to the embedded V4 address, internal ones included.
+/// connects to the embedded IPv4 address, internal ones included.
 fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let [.., a, b, c, d] = v6.octets();
     match v6.segments() {
         [0x0064, 0xff9b, 0, 0, 0, 0, _, _] => Some(Ipv4Addr::new(a, b, c, d)),
         [0x2002, high, low, ..] => Some(Ipv4Addr::from((u32::from(high) << 16) | u32::from(low))),
-        // `::` and `::1` are V6's own unspecified and loopback addresses.
+        // `::` and `::1` are IPv6's own unspecified and loopback addresses.
         [0, 0, 0, 0, 0, 0, _, _] if !v6.is_unspecified() && !v6.is_loopback() => {
             Some(Ipv4Addr::new(a, b, c, d))
         }
@@ -78,9 +78,9 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 impl InternalUpstreams {
     /// Why `ip` may not be dialled under this policy, or `None` when it may.
     ///
-    /// The address is canonicalized first: a V4-mapped V6 literal like
-    /// `::ffff:169.254.169.254` connects, at the kernel, to the V4 address, so
-    /// it is classified by the V4 rules.
+    /// The address is canonicalized first: an IPv4-mapped IPv6 literal like
+    /// `::ffff:169.254.169.254` connects, at the kernel, to the IPv4 address, so
+    /// it is classified by the IPv4 rules.
     pub fn refusal(self, ip: IpAddr) -> Option<UpstreamRefusal> {
         let ip = ip.to_canonical();
         if let IpAddr::V6(v6) = ip
@@ -97,7 +97,7 @@ impl InternalUpstreams {
                 v4.is_loopback() || v4.is_private() || is_carrier_grade_nat(v4),
             ),
             // `to_canonical` and `embedded_ipv4` have already mapped every
-            // V4-in-V6 form with a fixed place for the V4 address to V4.
+            // IPv4-in-IPv6 form with a fixed place for the IPv4 address to IPv4.
             IpAddr::V6(v6) => {
                 let [first, second, third, ..] = v6.segments();
                 (
@@ -419,7 +419,7 @@ mod tests {
             "[64:ff9b::5db8:d822]:6697", // NAT64 of a public address
             "irc.libera.chat:6697",
             "https://matrix.org",
-            "100.128.0.1:6667", // just past the CGNAT block
+            "100.128.0.1:6667", // just past the carrier-grade NAT block
             "172.32.0.1:6667",  // just past 172.16/12
         ] {
             assert_eq!(refusal(InternalUpstreams::Refuse, addr), None, "{addr}");

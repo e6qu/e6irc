@@ -18,7 +18,7 @@ product outcomes and their automated evidence are mapped in
 ## 1. Goals
 
 - **One binary** (`e6ircd`) that is simultaneously:
-  - a modern IRCv3 server (single server = the whole network, no S2S linking),
+  - a modern IRCv3 server (single server = the whole network, no server-to-server linking),
   - an HTTP server exposing a versioned REST API,
   - the web backend for the browser chat client and server-rendered console,
   - an OIDC relying party (web users log in via registered OIDC providers),
@@ -492,8 +492,9 @@ These are project-wide rules, enforced in review and (where possible) CI:
     to echo a client token (a `+l` limit, a WHOX token, a STATS letter) split
     the reply's parameters; that call site can no longer be written (§7.1).
   - *No argon2 on the serial DB-worker loop* — both credential-verifying and
-    account-creating requests are intercepted in `run_worker` and spawned under
-    the `verify_sem` bound; their inline `handle_request` arms are `unreachable!`.
+    account-creating requests are intercepted in `run_worker` and spawned, and
+    every argon2 computation waits on the `ARGON2_PERMITS` semaphore
+    (`MAX_CONCURRENT_ARGON2` at once); their inline `handle_request` arms are `unreachable!`.
     So the ~100ms hash never runs on the one serial worker, where a cheap
     one-line REGISTER/AUTHENTICATE could otherwise head-of-line-block every
     queued CHATHISTORY read and login behind it. The structural guard (offload +
@@ -512,16 +513,19 @@ These are project-wide rules, enforced in review and (where possible) CI:
     is a project invariant rather than a reliance on the TUI framework's internal
     control-char filtering. One shared definition across both client crates.
   - *Monotonic watermarks are seeded, never a zero sentinel* — a session's
-    `flood_refilled_to_ms`/`last_active`/`last_ping_sent` are all initialized
-    from the open-time `MonoMillis`, never `MonoMillis(0)`. Because the mono
+    `idle_since`/`last_received`/`last_ping_sent` are all initialized from the
+    open-time `MonoMillis`, never `MonoMillis(0)`, and a connection's command
+    token bucket (`TokenBucket` in `core/line_meter.rs`) starts full with its
+    refill mark at the `Instant` it was made. Because the mono
     clock's epoch is process start, a zero is indistinguishable from a real early
     reading, so a `now − 0 = uptime` computation misbehaves in the first moments
     of uptime. Seeding from the open time removes the sentinel so the class
     cannot recur on a new watermark field.
-  - `bridge_send` — every reverse-direction (IRC→upstream) bridge HTTP send
-    whose failure is an HTTP status funnels through one checked helper that
-    rejects a non-2xx. The raw `reqwest::Response` from a bare `.send()` never
-    reaches delivery-outcome logic, so "send, ignore the status, report
+  - `BridgeRequest` — every bridge HTTP request (in `bouncer/mod.rs`) is built
+    as this type, whose one `send` rejects a non-2xx (a `429` as
+    `BridgeFailure::RateLimited` with its wait, any other as
+    `BridgeFailure::Status`). The raw `reqwest::Response` from a bare `.send()`
+    never reaches delivery-outcome or decoding logic, so "send, ignore the status, report
     delivered" — a silent drop — is unwritable (the Matrix bridge had exactly
     that against a 403/429/5xx). The same choke-point shape as the inbound
     `BoundedJson` body cap.
@@ -587,11 +591,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
 ## 3. Architecture overview
 
 **Module layout.** The HTTP surface lives in `http/`, one module per concern —
-oidc, device, openapi, history, ws, credentials, networks — with `mod.rs`
+oidc, oidc_provider, device, openapi, history, ws, credentials, networks,
+channels, sessions, observation, preflight, revocation — with `mod.rs`
 holding the router, `AppState`, the extractors and the shared response helpers.
 The core worker's command handling lives in
 `core/handler/`, one module per command family — registration, sasl, services,
-channel, message, chanops, query, history, monitor, read_marker, oper — with
+channel, message, chanops, query, history, monitor, read_marker, oper, admin — with
 `mod.rs` holding dispatch and the helpers they share. The split is by *what a
 command does*, so the module a change belongs in follows from the command being
 changed. Submodules reach
@@ -680,7 +685,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | Async runtime | **tokio** (multi-thread) | The ecosystem standard; everything below assumes it. |
 | Queues | **custom `e6irc-queue`** | The core↔DB and per-connection SendQ primitive; built in-repo so it can be step-scheduled, traced, and loom-verified (§7.3). The always-on driver/attach layer (§10) additionally uses tokio `broadcast`/`mpsc` for event fan-out and command delivery. |
 | TLS | **rustls** (default `aws-lc-rs` provider) | No OpenSSL anywhere in the tree (enforced by `cargo-deny`); one TLS stack for listeners, upstream BNC connections, Postgres, and HTTP clients. |
-| HTTP | **axum** + tower | Thin over hyper, tower middleware for auth/rate limits; no needless layers. |
+| HTTP | **axum** + tower | Thin over hyper; tower layers bound concurrency, per-address admission, and body size, while authentication and the per-account API budget are spent where a request is authenticated (§15); no needless layers. |
 | Database | **sqlx** (`runtime-tokio`, `postgres`, `tls-rustls-aws-lc-rs`, `migrate`, `macros`; no default features) | Async; queries are runtime-checked (`sqlx::query`/`query_as` with bound parameters, no `query!` macros — the `macros` feature is there for `migrate!`), and migrations are embedded. |
 | Templates | **askama** | Compile-time templates → fast, no runtime template engine in the binary. |
 | Web client | **askama + standard forms** for server-rendered management; a small first-party runtime for confirmation/copy/refresh; vanilla-JS live chat bundled by **Vite** | No SPA framework or production package dependency; server-rendered where state is the server's, client-parsed where it is the client's (chat buffers/nick lists). |
@@ -708,7 +713,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
   e6irc-qualification's tokio and axum); they never ship.
 - Every dependency must build and pass tests on the full target matrix
   (Linux, macOS, Windows × amd64, arm64); arch- or OS-specific code paths
-  (SIMD, intrinsics, platform APIs) need an equivalent path on the other
+  (vector instructions, intrinsics, platform APIs) need an equivalent path on the other
   targets — no x86-only or Unix-only crates without a gated alternative.
 - The transitive tree is part of the review surface: a change to
   `Cargo.lock` is reviewed in its diff, and `cargo-deny` gates licenses
@@ -834,7 +839,7 @@ strip = "symbols"
   parsed (100 bytes, a realname mask 150), like a channel ban's.
 - Decoding relayed upstream text: IRC bodies are arbitrary bytes and a relay
   cannot know the sender's encoding, so each invalid byte becomes U+FFFD
-  (guessing one legacy code page, say CP1252, would render Shift-JIS or KOI8-R
+  (guessing one legacy code page, say Windows-1252, would render Shift-JIS or KOI8-R
   as plausible-looking wrong text; U+FFFD marks the loss). U+FFFD is three
   bytes, so `decode_server_line` fits the decoded line again — a tag section
   that grew drops the tags that carry U+FFFD, the traditional part is cut on a
@@ -860,7 +865,7 @@ strip = "symbols"
   `filter_tags`: whatever a hostile upstream sends, the line an attached client
   receives never carries a CR/LF/NUL that would split it into two). The hostmask
   glob (`mask::matches`, run against untrusted ban masks) is checked
-  *differentially* against a textbook glob DP: the optimized single-`*`-backtrack
+  *differentially* against a textbook dynamic-programming glob matcher: the optimized single-`*`-backtrack
   matcher must agree with the spec on every input. The CHATHISTORY ring-window
   arithmetic is extracted as a pure `resolve_ring_window` and pinned by an
   exhaustive differential test (every ring size, subcommand, selector position
@@ -1205,11 +1210,12 @@ their configuration once, at start (§18). Any nontrivial optimization lands wit
 - **Syscall economy**: `TCP_NODELAY` plus explicit flush coalescing,
   batched accepts, timer wheels instead of per-connection timers.
 - **Queue internals may evolve, the contract may not**: the mutex ring
-  is the loom-verified baseline; a padded-atomic ring (SPSC fast paths,
+  is the loom-verified baseline; a padded-atomic ring (single-producer single-consumer fast paths,
   seqlock reads) may replace it *if* benchmarks demand — the loom suite
   and public API are the gate any such change must pass unchanged.
 - **Build-level**: fat LTO, `codegen-units = 1` (§6). Benchmark evidence
-  decides PGO, BOLT, and any allocator change.
+  decides profile-guided optimization, post-link binary layout optimization,
+  and any allocator change.
 - **Measured, always**: a microbenchmark, when one is added, lives beside its
   hot module; the `e6irc-load` crate and the `tools/load` scripts are the
   macrobenchmark, tracking connect rate, exact fan-out sequence membership, and
@@ -2230,7 +2236,7 @@ provider-verified email claim.
 | SASL **OAUTHBEARER** (RFC 7628) | e6irc-cli/tui and OAuth-capable clients | client obtains a token via the provider's **device authorization grant**; server validates signature/claims via cached JWKS (or introspection if configured) and maps (iss, sub) → account. |
 | NickServ `IDENTIFY` | legacy clients without SASL | same credential check as PLAIN. Like PLAIN, it takes the account name or any nick grouped to the account. |
 
-CERTFP is explicitly out of scope for v1 (not selected).
+Client-certificate fingerprint login is explicitly out of scope for v1 (not selected).
 
 ### 9.4 REST API authentication
 
@@ -2337,7 +2343,7 @@ and predictable post-restart stale-form targeting. JSON renders IDs and cursors
 as decimal strings so JavaScript cannot round a 64-bit resource identifier.
 The core owns the disconnect choke point: IRC `KILL`, console forms, and REST
 mutations share the same audit, operator-notice, terminal `ERROR`, and close
-path. Actions are admin-gated + CSRF-protected; success redirects (PRG), failure
+path. Actions are admin-gated + CSRF-protected; success redirects (post/redirect/get), failure
 re-renders with an error banner. The equivalent administrator REST surface is
 `GET /api/v1/admin/connections` and
 `DELETE /api/v1/admin/connections/{id}`.
@@ -2490,8 +2496,10 @@ The mutation helpers share one `submitMutation`, whose success is an outcome
 object, so a `204` reads as success rather than as the missing body of a
 failure.
 
-The console is also the home of `/console/networks` — a per-user BNC network
-manager with add (with a connection test) / remove / enable-disable. An IRC
+The console is also the home of `/console/networks` — a per-user list of BNC
+networks with their live state and enable-disable on each row; removal is on a
+network's own page. It has no add form: a network is added, tested, and
+configured in the chat client (the page says so and links there). An IRC
 network's settings have exactly **one** editor, the chat client's dialog
 (`/?network=<name>&settings=1`, which the console links to): connection and
 identity fields (addr, tls, nick, username, realname, autojoin) and write-only
@@ -2508,32 +2516,32 @@ made "keep the stored one" impossible, one discarded what was typed); they are
 gone, and with them the `/console/networks/{name}/edit` and
 `/console/networks/{name}/logs` pages — the stored log is read in the network
 page's own transcript, which loads all of it on request. A bridge is
-configured on the Integrations page. The manager is available to any
-authenticated user for their own networks. The create form defaults to a
-Libera Chat preset and offers a small, provenance-dated catalog of published
-TLS endpoints (Libera, OFTC, Snoonet — each verified as a TLS registration
-through the driver, with a certificate valid for the preset hostname; EFnet is
-absent because no member of its round robin presents one for `irc.efnet.org`)
-plus Custom. A preset's human label
-is never its client/URL identifier: `Libera Chat` maps to the safe stable id
-`libera`. Presets are applied server-side so they work without JavaScript;
-the script only mirrors their fields for editing. A preset is endpoint
-provenance, not a compatibility claim for the deployment's current egress.
-The same catalog is served at `GET /api/v1/network-presets`, which the chat
-client's network dialog reads, so both surfaces offer one list and an endpoint
-is corrected in one place. Both forms ask first for what a known network cannot
+configured on the Integrations page. The list is available to any
+authenticated user for their own networks. The chat client's add dialog
+defaults to a Libera Chat preset and offers a small, provenance-dated catalog
+of published TLS endpoints (Libera, OFTC, Snoonet — each verified as a TLS
+registration through the driver, with a certificate valid for the preset
+hostname; EFnet is absent because no member of its round robin presents one
+for `irc.efnet.org`) plus another network. A preset's human label is never its
+client/URL identifier: `Libera Chat` maps to the safe stable id `libera`. The
+catalog is the server's `IRC_NETWORK_PRESETS`, served at
+`GET /api/v1/network-presets`, which the dialog reads, so an endpoint is
+corrected in one place; a preset only fills the dialog's fields, and the
+create request carries those fields, never a preset identifier. A preset is
+endpoint provenance, not a compatibility claim for the deployment's current
+egress. The dialog asks first for what a known network cannot
 supply — the network, a nickname, an optional NickServ account and password,
-and channels to join — and keep what a preset already determines (name, server,
-TLS, real name) under an Advanced disclosure that opens itself for a custom
-server or an invalid field. **Test connection** runs the production preflight
-on request; it is a diagnostic, never a condition for saving: the API has never
-required it, and each forced test cost a second full registration and a
-join/part flap in every configured channel on a public network. The preflight
-says `QUIT` when it is done instead of dropping the socket. Invalid submissions re-render
-the page with the precise shared validation problem and preserve non-secret
-input, including the resolved preset values. IRC addresses must be a syntactic
+and channels to join — and keeps what a preset already determines (name,
+server, TLS, real name) under an Advanced disclosure that opens itself for a
+custom server or an invalid field. **Test connection** runs the production
+preflight on request; it is a diagnostic, never a condition for saving: the API
+has never required it, and each forced test cost a second full registration on
+a public network. The preflight joins no channel (the requested ones are only
+validated) and says `QUIT` when it is done instead of dropping the socket. An invalid
+submission keeps the dialog open with the typed values, shows the precise
+shared validation problem, and marks the field at fault. IRC addresses must be a syntactic
 `host:port` with a nonzero numeric port (and bracketed IPv6); configuration,
-REST, and console creation share that invariant so an invalid endpoint cannot
+and REST creation share that invariant so an invalid endpoint cannot
 be persisted into an endless reconnect loop. The identity a driver puts on the
 wire is parsed, not checked: `UpstreamNick`, `UpstreamRealname`, and
 `AutojoinChannel` (an `UpstreamChannel` and, for a keyed channel, its
@@ -3158,8 +3166,9 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   mechanism the server offers — is an authentication failure, which parks at
   once. A server that does not offer the mechanism or the capability
   (`sasl_unavailable`), or that ends the exchange without a verdict
-  (`sasl_failed`: nick locked, too long; a 906 abort is `sasl_aborted` and is
-  retried until it clears), is a registration refusal carrying the server's own
+  (`sasl_failed`: nick locked, too long; a 906 abort reports the same
+  `sasl_failed` code but, being the client's `SaslAborted` refusal, is retried
+  until it clears), is a registration refusal carrying the server's own
   words. Treating those as "rejected credentials" parked a network instantly
   and left its owner retyping a correct password. A server with no capability
   negotiation at all — a 421 or 451 to `CAP LS`, or twenty seconds of silence —
@@ -3292,7 +3301,7 @@ commercial-provider claim still requires retained passed evidence.
 
 External qualification parses provider-discovered HTTP and WebSocket endpoints
 before it sends credentials. HTTP endpoints use HTTPS unless the issuer is a
-loopback test oracle; WebSockets use WSS under the same rule, and the bridge
+loopback test oracle; WebSockets use `wss` (WebSocket over TLS) under the same rule, and the bridge
 gateway dialer enforces it: a `ws://` gateway URL from the upstream is refused
 unless the configured API base is itself a loopback `http://` under
 `internal_upstreams = "allow"`. Every bridge HTTP request is built through
@@ -3759,7 +3768,7 @@ Design constraints recorded now:
   history-incomplete and serves CHATHISTORY from Postgres. Target scale
   (2026-07-19, user-confirmed): ~100k channels, ~1k concurrent BNC
   upstream sessions — at 100k channels an always-on 500-entry ring per
-  channel would be tens of GB, so eviction is load-bearing, not an
+  channel would be tens of gigabytes, so eviction is load-bearing, not an
   optimization.
   **Rings are bounded in bytes as well as entries and count.** An entry can
   hold kilobytes a client chose (4,094 bytes of client-only tags are kept with
@@ -4652,16 +4661,19 @@ but the CLI, TUI, and BNC must surface the rejection.
   the environment is wiped; the process is non-dumpable on Linux
   (`PR_SET_DUMPABLE`) and the systemd unit sets `LimitCORE=0`, so an abort
   cannot write keys or passwords to a core file.
-- Not provided, stated rather than implied: TLS client certificates, ALPN and
-  multiple certificates by SNI on IRC listeners (one certificate per
-  listener); OCSP or CRL checks on outbound TLS, whose roots are the
+- Not provided, stated rather than implied: TLS client certificates, application-layer
+  protocol negotiation, and multiple certificates chosen by the requested
+  server name on IRC listeners (one certificate per listener); online
+  certificate-status or revocation-list checks on outbound TLS, whose roots are the
   compiled-in webpki set; hiding the server version (`/api/v1/server` exposes
   it, as IRC `VERSION` does). Concurrent password verification is bounded
   process-wide by the Argon2 permits, which is what bounds a distributed login
   flood's CPU cost; the per-address auth buckets bound a single source.
 - Rate limits: per-address connection/registration throttle, per-session
-  command token bucket, per-account API limits (tower middleware), SASL attempt
-  limits with backoff.
+  command token bucket, a per-account API budget spent at the authentication
+  boundary (`spend_api_budget`, once a request's account is known), and the
+  fixed per-account-name password-attempt window below (no backoff: 10
+  attempts per 15 minutes).
 - Every per-address limit — the connection cap on the IRC, WebSocket, HTTP and
   attach listeners, the in-flight HTTP request bound, the HTTP authentication
   bucket, and the core's account-creation bucket — is keyed by one type,
@@ -4690,7 +4702,10 @@ but the CLI, TUI, and BNC must surface the rejection.
   and via admin API, all audit-logged.
 - Every HTTP response receives a fresh server-generated 128-bit correlation
   identifier. No client-supplied identifier is trusted as provenance.
-- No secrets in logs; `tracing` field redaction for credentials.
+- No secrets in logs. Logging is plain lines on standard error (there is no
+  `tracing` dependency, so no field-level redaction layer); the configuration,
+  password, key, and database-URL types that hold credentials redact them in
+  their `Debug`, and log lines name a credential, never print it.
 - CSRF per §9.2; cookies HttpOnly/Secure; session fixation avoided by
   rotating session id at login.
 - One-time first-administrator bootstrap uses a separate Strict browser-state
@@ -4738,7 +4753,7 @@ The snapshot is the sole source for:
 - `/console/monitoring`, an administrator-only server-rendered view refreshed
   every ten seconds by `/console.js`, with selectable 1-hour, 6-hour, 24-hour,
   and 7-day windows across IRC/BNC traffic, live IRC/BNC connections, upstream
-  availability, core/database queue pressure, new errors, and P95
+  availability, core/database queue pressure, new errors, and 95th-percentile
   core/database/HTTP latency; current queue/percentile tables and the error
   ledger remain alongside the trends, and
   refresh failures remain visibly actionable;
@@ -4805,14 +4820,14 @@ third-party metrics stack.
 
 ## 17. Testing strategy
 
-**Methodology.** Development is **TDD**: tests are written first (red),
+**Methodology.** Development is **test-driven**: tests are written first (red),
 implementation follows (green), then refactor; no feature lands without
 tests at the appropriate level. The **testing pyramid** shapes the suite —
 many fast unit/property tests, fewer integration tests, a small set of
 acceptance/UI/e2e tests at the top. User-visible behavior and its evidence are
 cataloged in `docs/journeys/`. Acceptance is currently expressed as direct
 Rust integration tests and targeted browser/shell scripts; there is no shared
-Given/When/Then scenario DSL.
+Given/When/Then scenario language.
 
 Layers, bottom to top:
 
@@ -4886,7 +4901,7 @@ Layers, bottom to top:
    any client, socket, malformed sequence, missing/duplicate delivery, or
    supplied-threshold failure is a nonzero process exit. CI exercises 64
    clients across eight channels against a real daemon with generous
-   catastrophic-regression floors (10 connects/s, 100 deliveries/s, P99 below
+   catastrophic-regression floors (10 connects/s, 100 deliveries/s, 99th-percentile latency below
    five seconds). The Linux smoke also samples the daemon's pre-run and peak
    resident set and rejects incremental growth above 1 MiB per requested
    connection; controlled hosts can supply a stricter bytes/connection
@@ -5166,7 +5181,9 @@ Layers, bottom to top:
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
   — the bouncer drivers' stop (their goodbye and their last backlog write),
   then the core drain, then the connection drain, then the PostgreSQL flush;
-  the guard sums the four constants. The unit sets `StartLimitIntervalSec=0` (asserted by the same
+  the guard sums the four constants, and holds the budget `deploy/README.md`
+  states and the one `tools/test-production-container.sh` stops the image with
+  to the unit's `TimeoutStopSec`. The unit sets `StartLimitIntervalSec=0` (asserted by the same
   guard): a refused first database connection fails the daemon in
   milliseconds, and systemd's default limit of five starts in ten seconds
   would otherwise leave the unit permanently failed after a reboot where

@@ -24,7 +24,9 @@ allow = [
 ]
 
 # libfuzzer-sys bundles LLVM's libFuzzer runtime, part of which is under the
-# NCSA licence: permissive, OSI-approved, FSF-free, and GPL-compatible. It is
+# NCSA licence: permissive, approved by the Open Source Initiative, free by
+# the Free Software Foundation's definition, and compatible with the GNU
+# General Public License. It is
 # allowed for that crate alone. The crate is in the `fuzz/` package only — a
 # test harness that is never compiled into a shipped binary — and that
 # manifest is checked against this same policy in CI. The workspace check
@@ -64,7 +66,7 @@ deny = [
 yanked = "deny"
 ignore = [
     # RUSTSEC-2023-0071 (Marvin timing attack in `rsa`): pulled by
-    # openidconnect solely for RS256 ID-token *signature verification*
+    # openidconnect solely for `RS256` ID-token *signature verification*
     # (public-key ops); e6ircd never performs RSA decryption, so the
     # decryption-timing sidechannel is not on any exercised path. No
     # fixed `rsa` release exists. Revisit when one ships.

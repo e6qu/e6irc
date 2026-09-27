@@ -1488,7 +1488,7 @@ pub struct CoreConfig {
     /// clock above and used for every *timer* decision — the ping/registration
     /// reaper deadlines and the flood-bucket refill. Kept distinct (in source
     /// and in type, [`e6irc_proto::time::MonoMillis`]) so a timer can never be
-    /// compared against wall-clock time, which an NTP step or VM resume can
+    /// compared against wall-clock time, which an NTP step or virtual-machine resume can
     /// jump forward (mass-reaping every connection) or backward (freezing the
     /// reaper). The wall clock stays the source only for real timestamps
     /// (`server-time`, msgids, signon).
@@ -5779,7 +5779,7 @@ impl ServerState {
 
     /// Append to a target's hot ring, creating it if absent, and keep the
     /// global LRU within `max_hot_channels` and `max_hot_history_bytes`: this
-    /// target is touched to MRU and the least-recently-active rings are
+    /// target is marked most recently used and the least-recently-active rings are
     /// evicted once either is exceeded, as its own oldest entries are past
     /// `max_history_ring_bytes`. An
     /// evicted or overflowed ring is marked incomplete, so CHATHISTORY pages

@@ -59,3 +59,37 @@ if [ "$stop_seconds" -le "$budget" ]; then
   echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${driver_seconds}s driver stop plus ${drain_seconds}s core drain plus ${connection_seconds}s connection drain plus ${flush_seconds}s database flush (${budget}s)" >&2
   exit 1
 fi
+
+# The operator documentation and the production-container test state the same
+# stop budget as the unit: deploy/README.md tells a host how long to wait, and
+# tools/test-production-container.sh stops the image with it. A literal number
+# in either drifts the moment the unit's budget changes.
+readme="deploy/README.md"
+for pattern in \
+  '\([0-9][0-9]*\)-second stop budget' \
+  'at least \([0-9][0-9]*\) seconds' \
+  'stopTimeout: \([0-9][0-9]*\)' \
+  'docker stop --time \([0-9][0-9]*\)' \
+  'stop_grace_period: \([0-9][0-9]*\)s'; do
+  values="$(sed -n "s/^\\(.*[^0-9]\\)\\{0,1\\}${pattern}.*/\\2/p" "$readme")"
+  if [ -z "$values" ]; then
+    echo "$readme no longer states the stop budget as '${pattern}'; update this check to match its wording" >&2
+    exit 1
+  fi
+  for value in $values; do
+    if [ "$value" != "$stop_seconds" ]; then
+      echo "$readme states a ${value}-second stop budget ('${pattern}') but $unit has TimeoutStopSec=${stop_seconds}s" >&2
+      exit 1
+    fi
+  done
+done
+
+container_test="tools/test-production-container.sh"
+if grep -Eq 'docker stop .*--time[ =]*[0-9]' "$container_test"; then
+  echo "$container_test stops the container with a literal budget; read it from $unit's TimeoutStopSec" >&2
+  exit 1
+fi
+if ! grep -q 'TimeoutStopSec' "$container_test" || ! grep -q 'docker stop --time "\$stop_seconds"' "$container_test"; then
+  echo "$container_test must stop the container with the budget it reads from $unit's TimeoutStopSec" >&2
+  exit 1
+fi

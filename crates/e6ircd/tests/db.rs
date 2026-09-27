@@ -8942,7 +8942,7 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
     .expect("config");
     let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"));
     // The daemon refuses to connect while a libpq variable is set (some hosts,
-    // GitHub's Windows image among them, set PGUSER and PGPASSWORD); this test
+    // GitHub's Windows image among them, set `PGUSER` and `PGPASSWORD`); this test
     // is about the startup wait, so its daemon gets none of them.
     for variable in db::LIBPQ_ENVIRONMENT {
         daemon.env_remove(variable);
@@ -10228,7 +10228,7 @@ async fn a_millisecond_pages_in_msgid_order_whatever_shard_stored_it_first() {
     )
     .await
     .expect("connect");
-    // An ICU collation needs a UTF-8 database, which CI's is; a cluster
+    // An International Components for Unicode collation needs a UTF-8 database, which CI's is; a cluster
     // initialized in the C locale (SQL_ASCII) compares bytes whatever the
     // column says, and there the arrival order alone tells the orders apart.
     let encoding: String = sqlx::query_scalar(
