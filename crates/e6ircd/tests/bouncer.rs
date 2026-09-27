@@ -203,7 +203,7 @@ async fn driver_registers_relays_and_buffers() {
         "backlog must keep server-time: {got}"
     );
 
-    // ...and it's in the detached buffer for later playback
+    // ...and it's in the detached buffer, to be played back on attach
     let buffer = handle.buffer_snapshot();
     assert!(
         buffer

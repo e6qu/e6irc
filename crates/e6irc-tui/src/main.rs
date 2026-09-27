@@ -685,7 +685,7 @@ async fn finish(conn: &mut Connection, out_rx: &mut mpsc::Receiver<Queued>) -> S
 }
 
 /// Where what the server says while the client connects goes, as each line
-/// is read. None of it is held for later: a bouncer attach can replay
+/// is read. None of it is held back: a bouncer attach can replay
 /// thousands of lines before the client has joined anything, and the server's
 /// pace must never become the client's memory.
 enum Ui<'a> {

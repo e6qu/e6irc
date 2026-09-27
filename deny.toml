@@ -67,7 +67,7 @@ ignore = [
     # openidconnect solely for RS256 ID-token *signature verification*
     # (public-key ops); e6ircd never performs RSA decryption, so the
     # decryption-timing sidechannel is not on any exercised path. No
-    # fixed `rsa` release exists. Revisit when one ships.
+    # `rsa` release fixes it: the advisory lists no patched version.
     "RUSTSEC-2023-0071",
 ]
 

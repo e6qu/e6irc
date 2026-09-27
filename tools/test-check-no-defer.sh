@@ -49,10 +49,39 @@ for phrase in \
     'Parked for a separate commit.' \
     'Worth a follow-up issue.' \
     'Revisit this once the parser lands.' \
-    'That belongs in a future PR.'; do
+    'That belongs in a future PR.' \
+    'Will fix in a follow-up.' \
+    'The cap is deferred to later.' \
+    'The cleanup is left for later.' \
+    'Deferred to a future release.' \
+    'The race is to be addressed later.' \
+    'The leak is not fixed in this PR.' \
+    'Tracked separately.' \
+    'Postponed until the next release.' \
+    'Retry support is left as future work.' \
+    'Future work: support X.' \
+    'We postpone the migration.' \
+    'Not yet handled in this change.'; do
     printf '%s\n' "$phrase" >> PLAN.md
     expect_fail "\"$phrase\" added to PLAN.md"
 done
+# A file git does not track yet is added lines too: `git diff` alone never
+# shows it, so a note written into a new, unstaged file once passed unread.
+for file in NOTES.md docs/new-guide.md 'docs/with space.md'; do
+    mkdir -p "$(dirname "$file")"
+    printf '%s\n' 'An ordinary line.' 'The retry cap is left for later.' > "$file"
+    expect_fail "deferral note in the untracked $file"
+done
+# An untracked file the repository ignores is not part of the change.
+printf '%s\n' 'scratch/' > .gitignore
+git add .gitignore && git commit -qm ignore
+ignored_base=$(git rev-parse HEAD)
+mkdir scratch
+printf '%s\n' 'The retry cap is left for later.' > scratch/notes.md
+tools/check-no-defer.sh "$ignored_base" >/dev/null
+rm -rf scratch
+git reset --hard -q "$base"
+git clean -fdq
 # Every file's added lines are read, not PLAN.md's alone.
 for file in DESIGN.md README.md docs/guide.md src/lib.rs; do
     mkdir -p "$(dirname "$file")"
@@ -68,7 +97,12 @@ git reset --hard -q "$base"
 git clean -fdq
 # Plain technical prose that shares a word is not a deferral.
 printf '%s\n' 'An error is surfaced, not silently dropped.' \
-    'The reply is deferred until the database answers.' >> DESIGN.md
+    'The reply is deferred until the database answers.' \
+    'A history request on an incomplete ring must defer to the database.' \
+    'Output is held behind a deferred reply; DeferredReply::release frees it.' \
+    'The capture counts its deferrals.' \
+    'Nothing is held for playback; a follow-up message is sent on attach.' \
+    'The future is cancelled when the peer disconnects.' >> DESIGN.md
 git add DESIGN.md
 tools/check-no-defer.sh "$base" >/dev/null
 git reset --hard -q "$base"

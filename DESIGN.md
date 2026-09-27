@@ -46,7 +46,7 @@ product outcomes and their automated evidence are mapped in
 ### Non-goals
 
 - Server-to-server federation (IRC linking). Single-server only; the internal
-  state model is not required to keep seams for later linking.
+  state model is not required to keep seams for a linking protocol.
 - Dynamic plugin loading (`dlopen`). Bridges are compiled in behind feature
   flags; the monolith stays statically linked.
 - Supporting non-vanilla Postgres or other SQL backends. PostgreSQL is the
