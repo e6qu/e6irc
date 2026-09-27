@@ -120,6 +120,7 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
 /// operator writes in natural IPv4 notation silently misses `/ws/irc` users.
 #[tokio::test]
 async fn a_mapped_ipv4_websocket_peer_gets_an_ipv4_host() {
+    require_ipv6_sockets();
     let mut config = config();
     config.http.as_mut().expect("http").addr = "[::]:0".parse().unwrap();
     let running = net::start(config).await.expect("start");
@@ -139,6 +140,37 @@ async fn a_mapped_ipv4_websocket_peer_gets_an_ipv4_host() {
         "the host must be the IPv4 spelling: {whois}"
     );
     assert!(!whois.contains("::ffff:"), "{whois}");
+}
+
+/// "Address family not supported": the operating system has no IPv6 at all.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EAFNOSUPPORT: i32 = 97;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const EAFNOSUPPORT: i32 = 47;
+#[cfg(windows)]
+const EAFNOSUPPORT: i32 = 10047; // WSAEAFNOSUPPORT
+
+/// A dual-stack listener needs IPv6 sockets. On a host whose kernel has none,
+/// the test cannot run, and says so as an environment fact rather than failing
+/// on the daemon's bind as if the product were wrong. It is not skipped: the
+/// test still fails there. Any other outcome of the probe is left to the
+/// product's own bind and connect below, whose every error is a failure.
+fn require_ipv6_sockets() {
+    if let Err(error) = std::net::TcpListener::bind("[::]:0")
+        && error.raw_os_error() == Some(EAFNOSUPPORT)
+    {
+        panic!(
+            "host has no IPv6 support (EAFNOSUPPORT); this test needs a dual-stack \
+             loopback: {error}"
+        );
+    }
 }
 
 /// Read text frames until one contains `needle`; panics on close/timeout.

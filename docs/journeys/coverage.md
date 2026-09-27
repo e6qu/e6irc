@@ -152,7 +152,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 |---|---|
 | `lint` | formatting, warnings, all-feature, default, and per-feature compilation, frontend unit tests/build; shell syntax of every script; the backup/restore, load-sweep, qualification, migration-integrity, no-deferral, and dead-public guard contracts; no-op/dead-code/dead-public/duplication/no-deferral/fuzz-lock/journey/client-capability/template-accessibility/API-first guards |
 | `deny` | licenses, advisories, bans (including one version of each network stack), and dependency-source policy, for the workspace and for the separate `fuzz/` package |
-| `test` | all-feature workspace behavior, plus the default-feature HTTP suite, on six OS/architecture cells |
+| `test` | all-feature workspace behavior, plus the daemon's unit tests and HTTP suite in the default-feature build, on six OS/architecture cells |
 | `coverage` | all-feature workspace line-coverage regression floor |
 | `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/`ws_scope`/CLI journeys |
 | `cross-browser` | the complete OIDC, console, network, and chat browser journey repeated in Firefox and WebKit against the real daemon, PostgreSQL, and a local live upstream |

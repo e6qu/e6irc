@@ -97,7 +97,9 @@ jobs:
       # something `matrix` pulls in builds there and breaks for the deployment
       # that enables one bridge, which is the normal case; and code behind
       # `cfg(not(feature = ..))` compiles only when that feature is off. The
-      # empty entry is the default build, the one most deployments ship.
+      # empty entry is the default build: no bridge and no embedded web
+      # client, what a plain `cargo build -p e6ircd` makes (the image and the
+      # native archives ship --all-features). The test job runs its unit tests.
       # (embed-web needs web/dist, built above.)
       - name: Default features and each feature on its own
         # clippy, not just check: a clippy lint that fires only in one
@@ -181,10 +183,11 @@ jobs:
       # --all-features includes embed-web, which embeds web/dist.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
-      # The union above never compiles a `cfg(not(feature = "embed-web"))`
-      # test (the API-only build that serves no `/`), so run the HTTP suite
-      # once more in the default build.
-      - run: cargo test --locked -p e6ircd --test http --target ${{ matrix.target }}
+      # The union above never compiles a `cfg(not(feature = ..))` test: the
+      # API-only build that serves no `/`, or a bridge kind refused by a build
+      # without its feature. So run the daemon's unit tests and the HTTP suite
+      # once more in the default build, which has none of those features.
+      - run: cargo test --locked -p e6ircd --lib --test http --target ${{ matrix.target }}
 
   # Coverage is a ratchet, not a claim that one percentage proves the product.
   # Combine the portable all-feature suite with the real PostgreSQL database
