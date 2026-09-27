@@ -210,6 +210,17 @@ It uses **SASLprep** (RFC 4013), the normalization applied to the account name
 and password first, and **PBKDF2**, the iterated key derivation that salts the
 password.
 
+**GS2** — the Generic Security Service Application Program Interface
+bridge for SASL (RFC 5801): the header (`n,a=<authzid>,`) that opens an
+`OAUTHBEARER` response (RFC 7628) and a SCRAM one, naming channel binding and
+the authorization identity. e6ircd parses it and refuses an authorization
+identity that is not the token's account.
+
+**NIST** — the United States National Institute of Standards and
+Technology. Its **SP** (Special Publication) 800-63B, *Digital Identity
+Guidelines: Authentication and Lifecycle Management*, is the source of the
+8-character floor for a new password (`NewPassword`).
+
 **App password** — a long, random per-use password minted for an account
 (argon2id-hashed at rest); usable immediately for SASL.
 
