@@ -137,6 +137,27 @@ These are project-wide rules, enforced in review and (where possible) CI:
     assertion panics on), an injection byte is data the core must handle rather
     than abort the shared worker on, so it is neutralized in all builds, not
     asserted against.
+  - `CompletedMultiline` — a closed `draft/multiline` batch becomes a message
+    only through `MultilineBatch::complete`, which refuses one with no line
+    (`FAIL BATCH MULTILINE_INVALID`) or only blank ones (`ERR_NOTEXTTOSEND`),
+    and delivery on the sender's shard and on a channel's owning shard takes
+    nothing else. The all-blank check once lived in the sender's own delivery
+    only, so a batch routed to another shard's channel was delivered and stored.
+  - `CanonicalTarget` — a relayed PRIVMSG/NOTICE/TAGMSG (and multiline batch)
+    line is built only from the target as the server names it (§7.7), never
+    the sender's spelling, on the sender's shard and the channel's owner alike,
+    so a live line and its CHATHISTORY replay are the same bytes.
+  - `MarkerTarget` — a read marker is keyed by a channel's folded name or a
+    correspondent's *identity*, the key their conversation has (§11.1.1), never
+    by the nick a client typed, so a marker survives the peer's nick change.
+  - `core::history_request` — CHATHISTORY's selectors, limit and TARGETS window
+    and MARKREAD's parameters are parsed by one parser the core and the
+    bouncer's attach listener share, so the two refuse a malformed request
+    with the same `FAIL` (they had drifted on both).
+  - `HistoryRetention` — one cell, shared by every core shard and every
+    bouncer network and set live from the console, bounds what is served from
+    memory by `storage.history_retention_days`, as storage maintenance bounds
+    the database (§11.3).
   - `ComposerResult` — a web-composer response is either `Sent` or `Rejected`;
     success cannot carry an error and rejection always has one.
   - `PeerLimitKey` — every per-address limiter is keyed by it, and its only
@@ -833,7 +854,9 @@ strip = "symbols"
   several interleaved and adds the events no client sends (the liveness tick,
   deferred database pages). A panic there takes the single worker down for
   every client, so "survives whatever a client sends" is the whole oracle.
-  `client_messages` runs the other direction — it feeds the shipped TUI
+  `chathistory_window` is differential: out-of-order arrivals into a hot
+  history ring, and every CHATHISTORY window the ring claims to cover checked
+  against a model of the database (§11.3). `client_messages` runs the other direction — it feeds the shipped TUI
   arbitrary *server* output, because a client's state is derived from lines a
   remote server chose and that server need not be this one.
 
@@ -1198,7 +1221,9 @@ whose lines are *all* blank therefore has no text in it, and is refused with
 those recipients as nothing at all, and stored it would be a history row that
 replays as no line, so a page of N rows would arrive as fewer than N messages
 and read as the end of the buffer (§11.2). Refusing it at the sender keeps
-every stored message one that its recipients can actually receive. The
+every stored message one that its recipients can actually receive; the refusal
+is decided when the batch closes, before it is routed to a channel's owning
+shard (`CompletedMultiline`, §2). The
 limits (`max-bytes`, `max-lines`) are advertised as the capability's value, so a
 client can see them before starting a batch it cannot finish.
 
@@ -1531,6 +1556,15 @@ Concretely:
   no `displayed_usercount` floor hides small channels from a bare `LIST`, and
   no global `pace_wait` answers a busy moment with `RPL_LOAD2HI`.
 - NickServ/ChanServ surface per §7.6.
+- **Relayed messages name their target canonically**, as Solanum's do: a
+  PRIVMSG, NOTICE, TAGMSG or multiline batch to `#FOO` reaches members (and the
+  sender's echo) addressed to the channel's own name, `#foo`, with any
+  STATUSMSG sigil kept in front (`@#foo`); one to `BOB` is addressed to the
+  recipient's current nick, `Bob`, and one to `nickserv` to `NickServ`. The
+  line is built from a `CanonicalTarget`, on the sender's shard and on a
+  channel's owning shard alike, and CHATHISTORY replays under the same names,
+  so a replayed message is byte-identical to the one delivered live. Error
+  numerics still echo the target as the client sent it.
 - **Compatibility verification** — complementary checks, none of them a
   build dependency (e6irc is an independent implementation; a reference
   ircd is only ever a cross-check):
@@ -1758,6 +1792,12 @@ Principal tables (columns abridged):
   (`GREATEST`) and the returned committed value drives the core mirror and
   client acknowledgement; an enqueue or PostgreSQL failure is never reported
   as success. Anonymous connections use explicitly session-local markers.
+  A marker's `target` is a channel's folded name, or for a conversation the
+  correspondent's *identity* — their account, `~nick` while they have not
+  authenticated — the key the conversation itself is kept under (§11.1.1), so
+  a marker set on `bob` is found again as `bobby` after bob renames. Markers
+  stored before this rule were keyed by the folded nick; a peer whose account
+  name is that nick (the common case) keeps the same key.
   The retention sweep returns the rows it deleted and storage maintenance
   broadcasts them to every core shard, which drops each mirror entry still at
   (or behind) the deleted value — the database's delete is the one source of
@@ -3375,7 +3415,11 @@ Design constraints recorded now:
   is released on disconnect and anyone may take it, so keying by nick would mean
   registering a nick handed you the previous holder's private messages. `~`
   cannot occur in a nick or an account name, so an unauthenticated identity can
-  never be claimed by an account of the same name. Two successive
+  never be claimed by an account of the same name. A nick nobody holds names
+  the account it is grouped to, or else the account of that name, so a
+  conversation with a registered user is found by any of their nicks while they
+  are away. A read marker on a conversation is kept under the same identity
+  (§8, `read_markers`). Two successive
   *unauthenticated* holders of a nick derive the same `~nick` — there is
   nothing stronger to key on. A conversation with an unauthenticated party is
   therefore never written to the database and never read from it: it lives
@@ -3463,9 +3507,13 @@ Design constraints recorded now:
   the target), too few parameters `NEED_MORE_PARAMS <subcommand>`, too many or
   a malformed value `INVALID_PARAMS <subcommand> <target>`, a store fault
   `MESSAGE_ERROR <subcommand> <target>`; MARKREAD's store fault is
-  `TEMPORARILY_UNAVAILABLE <target>`. The core and the bouncer render them
-  through one closed `HistoryFail` code set, so neither can answer with a code
-  the other (and the spec) does not have. A page is cut by the database in the *client's* scope: a
+  `TEMPORARILY_UNAVAILABLE <target>`. An unknown reference type in either
+  selector outranks a malformed value in the other (`INVALID_MSGREFTYPE`), and
+  a MARKREAD with more than a target and a position is `INVALID_PARAMS`. The
+  core and the bouncer parse both commands' parameters with one parser
+  (`core::history_request`) and render the refusals through one closed
+  `HistoryFail` code set, so neither can accept, or answer with a code, what
+  the other (and the spec) does not. A page is cut by the database in the *client's* scope: a
   stored `TAGMSG` is nothing but tags, so a client that did not negotiate
   `message-tags` cannot receive one at all, and excluding those rows after the
   `LIMIT` returned fewer lines than asked for — indistinguishable from the end
@@ -3534,10 +3582,38 @@ Design constraints recorded now:
   O(targets)); an identity → conversations index answers "free this `~nick`'s
   conversations" on every unauthenticated disconnect or nick change, and
   CHATHISTORY TARGETS' conversation list, without visiting any other ring; and
-  each ring keeps its newest timestamp in each `HistoryScope` as a
-  sliding-window maximum over the entries that scope admits (entries arrive in
-  wall-clock order from several clocks, so the back entry is not necessarily
-  the newest), which a channel's owner publishes for TARGETS on every shard. A permanently deleted account's hot copy follows
+  each ring keeps its newest timestamp in each `HistoryScope` (a count of the
+  entries the scope admits beside their newest time, since the ring only ever
+  sheds its oldest), which a channel's owner publishes for TARGETS on every
+  shard. A ring is sorted by `(ts, arrival)`, an invariant of its insert rather
+  than something each reader re-establishes: entries do not arrive in time
+  order (a conversation's line from the peer's shard, a wall clock stepped
+  back), while every reader pages by time — a `timestamp=` bound and a `msgid=`
+  pivot are found by position, and the database the ring falls back to orders
+  by `(ts, id)`. The place is found searching back from the newest end, one
+  comparison for an entry in order. `time=` is still stamped once (§11.1): a
+  late entry takes its place in time rather than a new time. Within one
+  millisecond, arrival order is the database's `id` order wherever one shard
+  both fills a ring and persists what enters it — a channel on its owner, a
+  conversation line on its sender's shard — since it queues rows in the order
+  they enter the ring. The ring holds the newest part of everything it was
+  given with nothing missing inside it: an entry stamped before one the ring
+  has already shed is not taken in (the database holds it), since held it
+  would sit before a hole, and a page across that hole would skip what was
+  shed. A BETWEEN orders its two pivots by that same `(ts, id)` place — a
+  timestamp before every message stamped with it — as the database does. The
+  `chathistory_window` fuzz target pushes arbitrary out-of-order arrivals
+  through a ring and checks every window it claims to cover against a model of
+  the database holding them all.
+  **History retention applies to memory too.** `storage.history_retention_days`
+  bounds what storage maintenance keeps in `messages` and `bnc_buffer`; every
+  read the core answers takes a floor raised to it (`HistoryFloor`, applied
+  where the floor is computed: ring, database and TARGETS alike), and each
+  bouncer network's in-memory backlog neither keeps nor replays a line older
+  than it. The console's save hands a new value to one shared cell at once, and
+  the maintenance worker hands it the stored one when it starts, so a change
+  applies without a restart; with no database there is no retention setting and
+  no cutoff — the rings are then the whole record. A permanently deleted account's hot copy follows
   the database purge: its lines and its conversations leave the rings, and
   its entries leave every channel's access list, on every shard.
 

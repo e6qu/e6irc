@@ -672,7 +672,12 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
                 );
             }
             if state.sessions[&conn].caps.read_marker {
-                send_current_markread(state, conn, &join.key, &join.display);
+                send_current_markread(
+                    state,
+                    conn,
+                    &crate::core::state::MarkerTarget::from(&join.key),
+                    &join.display,
+                );
             }
             send_join_names(state, conn, *join);
         }

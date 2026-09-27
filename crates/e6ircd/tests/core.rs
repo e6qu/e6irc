@@ -648,11 +648,11 @@ fn privmsg_to_nick_and_errors() {
         s.drain(bob),
         vec![":alice!alice@host1.example PRIVMSG bob :psst"]
     );
-    // case-insensitive target
+    // case-insensitive target, relayed as the recipient's own nick (Solanum)
     s.line(alice, "PRIVMSG BOB :again");
     assert_eq!(
         s.drain(bob),
-        vec![":alice!alice@host1.example PRIVMSG BOB :again"]
+        vec![":alice!alice@host1.example PRIVMSG bob :again"]
     );
 
     s.line(alice, "PRIVMSG ghost :anyone?");
@@ -17389,4 +17389,152 @@ fn chathistory_replays_client_only_tags_and_reactions() {
             expected.replace("1000000000-0-X", reference)
         }),
     );
+}
+
+// ---- canonical targets, shared request parsing, conversation read markers --
+
+/// `line` without its leading `batch=` tag: a replayed line as it would have
+/// been delivered live.
+fn unbatched(line: &str) -> String {
+    let rest = line.strip_prefix("@batch=").expect("a batch tag");
+    match rest.split_once(';') {
+        Some((_, tags)) => format!("@{tags}"),
+        None => rest.split_once(' ').expect("a message").1.to_string(),
+    }
+}
+
+/// A message relayed to a channel or a user names the target as the server
+/// does — the channel's own name, the recipient's current nick — not as the
+/// sender spelled it (Solanum parity), and CHATHISTORY replays exactly the
+/// line that was delivered.
+#[test]
+fn live_and_replayed_messages_name_their_target_canonically() {
+    let mut s = TestServer::new_no_persistence();
+    let caps = "echo-message batch draft/chathistory server-time message-tags";
+    let bob = register_with_caps(&mut s, 2, "Bob", caps);
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    for conn in [bob, alice] {
+        s.line(conn, "JOIN #foo");
+    }
+    s.drain(bob);
+    s.drain(alice);
+
+    for (sent, canonical, replay_target) in [
+        ("PRIVMSG #FOO :hi", " PRIVMSG #foo :hi", "#FOO"),
+        ("PRIVMSG BOB :yo", " PRIVMSG Bob :yo", "bOB"),
+    ] {
+        s.line(alice, sent);
+        let recipient = s.drain(bob);
+        assert!(
+            recipient.iter().any(|line| line.ends_with(canonical)),
+            "{sent}: {recipient:#?}"
+        );
+        let echo = s.drain(alice);
+        let [live] = echo.as_slice() else {
+            panic!("{sent}: one echo: {echo:#?}");
+        };
+        assert!(live.ends_with(canonical), "{sent}: {live}");
+        s.line(alice, &format!("CHATHISTORY LATEST {replay_target} * 1"));
+        let page = s.drain(alice);
+        let replayed: Vec<String> = page
+            .iter()
+            .filter(|line| line.contains(" PRIVMSG "))
+            .map(|line| unbatched(line))
+            .collect();
+        assert_eq!(replayed, std::slice::from_ref(live), "{sent}: {page:#?}");
+    }
+
+    // A STATUSMSG keeps its sigil, before the channel's own name.
+    s.line(bob, "PRIVMSG @#FOO :ops");
+    let echo = s.drain(bob);
+    assert!(
+        echo.iter()
+            .any(|line| line.ends_with(" PRIVMSG @#foo :ops")),
+        "{echo:#?}"
+    );
+    // TAGMSG too.
+    s.line(alice, "@+draft/react=x TAGMSG #FOO");
+    assert!(
+        s.drain(bob)
+            .iter()
+            .any(|line| line.ends_with(" TAGMSG #foo")),
+        "a TAGMSG names the channel canonically"
+    );
+}
+
+/// The core and the bouncer parse CHATHISTORY selectors and MARKREAD
+/// parameters with one parser: an unknown reference type in either selector
+/// outranks a malformed value in the other, and a MARKREAD with a stray third
+/// parameter is refused rather than silently accepted.
+#[test]
+fn chathistory_and_markread_parameters_are_refused_as_the_bouncer_refuses_them() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/chathistory draft/read-marker");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(alice, "CHATHISTORY BETWEEN #c timestamp=bad foo=1 10");
+    assert_eq!(
+        s.drain(alice),
+        [
+            ":irc.test.example FAIL CHATHISTORY INVALID_MSGREFTYPE BETWEEN #c \
+          :Unknown message reference type"
+        ]
+    );
+    s.line(alice, "MARKREAD #c timestamp=2026-07-18T12:00:00.000Z junk");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example FAIL MARKREAD INVALID_PARAMS #c \
+          :Expected <target> [timestamp=<time>]"]
+    );
+    s.line(alice, "MARKREAD #c");
+    assert_eq!(s.drain(alice), [":irc.test.example MARKREAD #c *"]);
+}
+
+/// A logged-in reader's marker on a conversation is kept under the peer's
+/// identity — their account — as the conversation is, so it survives the
+/// peer's nick change.
+#[test]
+fn a_conversation_read_marker_follows_the_peer_across_a_nick_change() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    let bob = s.register(2, "bob");
+    identify(&mut s, bob, "robert");
+
+    s.line(alice, "MARKREAD bob timestamp=2026-07-18T12:00:00.000Z");
+    let request = confirm_read_marker(&mut s);
+    assert_eq!(request.target, "robert", "kept under the peer's account");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example MARKREAD bob timestamp=2026-07-18T12:00:00.000Z"]
+    );
+
+    s.line(bob, "NICK bobby");
+    s.drain(bob);
+    s.line(alice, "MARKREAD bobby");
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example MARKREAD bobby timestamp=2026-07-18T12:00:00.000Z"]
+    );
+}
+
+/// A peer who has not authenticated is keyed as their conversation is, by
+/// `~nick`: whoever holds the nick next is someone else, and does not inherit
+/// the marker.
+#[test]
+fn an_unauthenticated_peers_read_marker_is_keyed_as_their_conversation_is() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    let carol = s.register(2, "carol");
+
+    s.line(alice, "MARKREAD carol timestamp=2026-07-18T12:00:00.000Z");
+    let request = confirm_read_marker(&mut s);
+    assert_eq!(request.target, "~carol");
+    s.drain(alice);
+
+    s.line(carol, "NICK carla");
+    s.drain(carol);
+    s.line(alice, "MARKREAD carla");
+    assert_eq!(s.drain(alice), [":irc.test.example MARKREAD carla *"]);
 }

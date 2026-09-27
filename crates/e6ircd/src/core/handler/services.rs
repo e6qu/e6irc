@@ -23,6 +23,17 @@ pub(super) fn is_service_nick(key: &str) -> bool {
     crate::identity::SERVICE_NICKS.contains(&key)
 }
 
+/// The nick the services pseudo-client keyed `key` (casefolded) goes by — the
+/// name its notices come from, and what a message to it is addressed to on the
+/// wire, however the sender spelled it. `None` for any other nick.
+pub(super) fn service_nick(key: &str) -> Option<&'static str> {
+    match key {
+        "nickserv" => Some("NickServ"),
+        "chanserv" => Some("ChanServ"),
+        _ => None,
+    }
+}
+
 pub(super) fn services_dispatch(
     state: &mut ServerState,
     conn: ConnId,
@@ -2784,4 +2795,20 @@ pub(super) fn send_motd(state: &mut ServerState, conn: ConnId) {
         state.numeric(conn, RPL_MOTD, &[], Some(&format!("- {line}")));
     }
     state.numeric(conn, RPL_ENDOFMOTD, &[], Some("End of /MOTD command."));
+}
+
+#[cfg(test)]
+mod service_nick_tests {
+    /// Every reserved services nick has the name it goes by, and that name
+    /// folds back to it.
+    #[test]
+    fn every_service_has_its_nick() {
+        for key in crate::identity::SERVICE_NICKS {
+            let nick = super::service_nick(key).expect("a services nick");
+            assert_eq!(
+                e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(nick),
+                key
+            );
+        }
+    }
 }

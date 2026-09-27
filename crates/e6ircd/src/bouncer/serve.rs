@@ -66,6 +66,9 @@ pub struct Registry {
     /// The server's policy on upstreams inside its own network, applied to
     /// every driver this registry builds.
     internal_upstreams: crate::egress::InternalUpstreams,
+    /// How long history is kept — the core's own cell, so every network's
+    /// backlog ages out at the bound the core's rings do, live as it changes.
+    history_retention: crate::core::HistoryRetention,
 }
 
 /// [`Registry::add`] found a live driver already registered under the key.
@@ -320,6 +323,7 @@ impl Registry {
             pool,
             telemetry,
             internal_upstreams,
+            history_retention: core.core_tx.history_retention(),
         };
         for e in entries {
             // `local` needs the in-process core handles, so it stays special; all
@@ -459,6 +463,7 @@ impl Registry {
         let kind = driver.kind();
         let handle = Arc::new(driver.start());
         handle.set_label(format!("{}/{}", key.display_owner(), name));
+        handle.set_history_retention(self.history_retention.clone());
         if let Some(telemetry) = &self.telemetry {
             handle.set_telemetry(telemetry.clone());
         }
@@ -2382,6 +2387,7 @@ mod key_tests {
             pool: None,
             telemetry: None,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            history_retention: crate::core::HistoryRetention::default(),
         }
     }
 

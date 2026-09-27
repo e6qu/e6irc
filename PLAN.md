@@ -921,6 +921,38 @@ bouncer-shutdown test's upstream now closes the link on `QUIT` as a server
 does, where it had waited for the driver to close first and raced the end of
 the shutdown (DESIGN §7.2, §7.3, §11, §18).
 
+Cross-shard history and message fixes, with the maintainer's decisions
+implemented (DESIGN §2, §7.7, §8, §11):
+
+- **A multiline batch of only blank lines was delivered and stored** when
+  another shard owned the channel: the check lived in the sender's own
+  delivery only. Closing a batch now yields a `CompletedMultiline`, which a
+  batch with no text cannot become, and both deliveries take only that.
+- **Hot rings are sorted by `(ts, arrival)`.** A conversation line from the
+  peer's shard or a stepped-back clock left rings out of time order, so
+  BEFORE missed a message AFTER included, LATEST came out of order and ring and
+  database pages disagreed at their edge. The ring now inserts in order, never
+  takes in an entry older than one it shed (which would sit before a hole),
+  and BETWEEN orders its pivots by that same place, which it had got wrong for
+  a timestamp older than the ring. The new `chathistory_window` fuzz target
+  (named in the code before it existed) checks every covered window against a
+  model of the database.
+- **TARGETS named another shard's channel by its folded key** (`#foo{x}` for
+  `#Foo[x]`) when the database answered; it is named from the published
+  channel directory.
+- **Relayed messages name their target canonically** (Solanum parity): `#foo`
+  for `PRIVMSG #FOO`, `Bob` for `PRIVMSG BOB`, on both shards' paths, so
+  CHATHISTORY replay is the live line byte for byte.
+- **One parser for CHATHISTORY and MARKREAD** in the core and the bouncer: the
+  bouncer refused `BETWEEN #c timestamp=bad foo=1 10` with the wrong code and
+  the core accepted a MARKREAD with a stray parameter.
+- **A conversation's read marker is kept under the peer's identity**, as the
+  conversation is, so it survives their nick change; an away grouped nick
+  resolves to its account for both.
+- **History retention covers memory**: the core's rings and the bouncer's
+  backlogs no longer serve what storage maintenance deleted, and a console
+  change applies at once.
+
 A review of whether the docs, tests, CI and guards tell the truth found, and
 this change fixes:
 
