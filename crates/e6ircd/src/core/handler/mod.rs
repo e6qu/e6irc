@@ -69,7 +69,19 @@ fn replace_registered_topic(
     }
 }
 
-pub(crate) fn overlong(state: &mut ServerState, conn: ConnId) {
+/// Refuse a line the connection's framing dropped as over-long, under the
+/// `label` (unescaped) its tag section named, exactly as a line that framed
+/// but fails [`e6irc_proto::message::client_frame_fits`] is refused.
+pub(crate) fn overlong(state: &mut ServerState, conn: ConnId, label: Option<&str>) {
+    if !state.sessions.contains_key(&conn) {
+        return; // line raced a close; session already gone
+    }
+    refuse_labeled(state, conn, label, |state| input_too_long(state, conn));
+}
+
+/// `ERR_INPUTTOOLONG`: the one answer to an over-long line, whichever layer
+/// found it too long.
+fn input_too_long(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
 }
 
@@ -355,9 +367,7 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         return refuse_line(state, conn, line, |state| state.send(conn, &refusal));
     };
     if !e6irc_proto::message::client_frame_fits(text.as_bytes()) {
-        return refuse_line(state, conn, line, |state| {
-            state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
-        });
+        return refuse_line(state, conn, line, |state| input_too_long(state, conn));
     }
     let msg = match Message::parse(text) {
         Ok(m) => m,
@@ -422,7 +432,18 @@ fn refuse_line(
     refuse: impl FnOnce(&mut ServerState),
 ) {
     let value = e6irc_proto::message::tag_section_value(line, "label");
-    match response_label(state, conn, value.as_deref()) {
+    refuse_labeled(state, conn, value.as_deref(), refuse);
+}
+
+/// Refuse with `refuse` under `label` (the unescaped tag value the refused
+/// line carried) when the client negotiated labeled responses.
+fn refuse_labeled(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<&str>,
+    refuse: impl FnOnce(&mut ServerState),
+) {
+    match response_label(state, conn, label) {
         Some(label) => {
             let lines = state.capture_lines(conn, &label, refuse);
             frame_labeled(state, conn, &label, lines);

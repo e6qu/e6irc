@@ -361,7 +361,7 @@ impl Input {
             Input::FromShard(input) => input.owner_shard(shards),
             Input::Open { conn, .. }
             | Input::Line { conn, .. }
-            | Input::OverlongLine { conn }
+            | Input::OverlongLine { conn, .. }
             | Input::Closed { conn, .. }
             | Input::Delivery { conn, .. }
             | Input::DbReply { conn, .. }
@@ -630,9 +630,13 @@ pub enum Input {
         conn: ConnId,
         line: Vec<u8>,
     },
-    /// The connection sent an over-long line (framing already dropped it).
+    /// The connection sent an over-long line (framing already dropped it),
+    /// with the unescaped `label` its tag section named, when that could be
+    /// read ([`e6irc_proto::framing::LineEvent::too_long`]): the refusal is
+    /// the answer the client is waiting on under it.
     OverlongLine {
         conn: ConnId,
+        label: Option<String>,
     },
     Delivery {
         conn: ConnId,
@@ -956,6 +960,19 @@ pub enum Input {
     },
 }
 
+impl Input {
+    /// The input for one framed event from `conn`'s client, whichever
+    /// transport framed it (TCP line framing or a WebSocket message).
+    pub(crate) fn framed(conn: ConnId, event: e6irc_proto::framing::LineEvent) -> Self {
+        match event {
+            e6irc_proto::framing::LineEvent::Line(line) => Input::Line { conn, line },
+            e6irc_proto::framing::LineEvent::TooLong { label } => {
+                Input::OverlongLine { conn, label }
+            }
+        }
+    }
+}
+
 /// Drain framed line events into the core queue as [`Input`] lines. Returns
 /// `false` when the core is gone, so the connection stops directly rather
 /// than queueing into a void. Shared by the TCP and WebSocket read loops.
@@ -966,10 +983,7 @@ pub(crate) async fn push_framed(
     events: &mut Vec<e6irc_proto::framing::LineEvent>,
 ) -> bool {
     for event in events.drain(..) {
-        let input = match event {
-            e6irc_proto::framing::LineEvent::Line(line) => Input::Line { conn, line },
-            e6irc_proto::framing::LineEvent::TooLong => Input::OverlongLine { conn },
-        };
+        let input = Input::framed(conn, event);
         meter.spend().await;
         if core_tx.push(input).await.is_err() {
             return false;
@@ -2637,10 +2651,18 @@ impl CoreWorker {
             if self.stopping && traffic.drained(shards.len()) {
                 return CoreWorkerExit::Stopped;
             }
-            let blocked = self.backlog.iter().position(|events| !events.is_empty());
+            let blocked = self
+                .backlog
+                .iter()
+                .enumerate()
+                .find_map(|(destination, events)| {
+                    events
+                        .front()
+                        .map(|oldest| shards[destination].room_for(oldest))
+                });
             let room = async {
                 match blocked {
-                    Some(destination) => shards[destination].room().await,
+                    Some(room) => room.await,
                     None => std::future::pending().await,
                 }
             };
@@ -2967,7 +2989,9 @@ impl Core {
                 // lines are not metered.
                 self.state.sync_flood_exemption(conn);
             }
-            Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
+            Input::OverlongLine { conn, label } => {
+                handler::overlong(&mut self.state, conn, label.as_deref());
+            }
             Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
             Input::ChannelJoin {
                 owner,
@@ -3910,7 +3934,10 @@ mod ingress_tests {
             .await
             .expect("first shard event routed");
         ingress
-            .push(Input::OverlongLine { conn: ConnId(5) })
+            .push(Input::OverlongLine {
+                conn: ConnId(5),
+                label: None,
+            })
             .await
             .expect("second shard event routed");
         ingress
@@ -3932,7 +3959,10 @@ mod ingress_tests {
         ));
         assert!(matches!(
             second.payload,
-            Input::OverlongLine { conn: ConnId(5) }
+            Input::OverlongLine {
+                conn: ConnId(5),
+                ..
+            }
         ));
         let second = second_rx.pop().await.expect("second routed delivery");
         assert!(matches!(
@@ -6101,7 +6131,10 @@ mod ingress_tests {
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     // A full queue hands the event back; the loop offers it again.
-                    drop(tx.try_push(Input::OverlongLine { conn: ConnId(99) }));
+                    drop(tx.try_push(Input::OverlongLine {
+                        conn: ConnId(99),
+                        label: None,
+                    }));
                 }
             })
         };

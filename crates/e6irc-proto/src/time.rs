@@ -143,76 +143,80 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
-/// Parse one unsigned `server-time` numeric field, rejecting a leading `+`/`-`
-/// (or any non-digit). Rust's integer `FromStr` accepts a leading `+`, but the
-/// grammar is plain digits, so without this `2024-+2-+29T+1:+2:+3Z` would parse
-/// to the same instant as `2024-02-29T01:02:03Z` — two strings for one instant.
-/// Every field (year included) goes through this one gate, so the sign-accepting
-/// class cannot reappear on a field a future edit forgets to guard.
-fn parse_time_field<T: std::str::FromStr>(s: &str) -> Option<T> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+/// Parse one `server-time` numeric field of exactly `width` ASCII digits.
+/// Rust's integer `FromStr` accepts a leading `+` and any number of leading
+/// zeros, but the grammar is fixed-width plain digits, so without this
+/// `2024-+2-+29T+1:+2:+3Z`, `2026-7-18T12:0:0Z` and `02026-07-18T12:00:00Z`
+/// would each be another spelling of an instant that has one canonical form.
+/// Every field (fraction included) goes through this one gate, so neither the
+/// sign nor the width class can reappear on a field a future edit forgets.
+fn parse_time_field(s: &str, width: usize) -> Option<u32> {
+    if s.len() != width || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     s.parse().ok()
 }
 
-/// Parse a `server-time` string to epoch **milliseconds**, preserving the
-/// optional `.mmm` fraction (padded/truncated to three digits). `None` on any
+/// Parse a `server-time` string to epoch **milliseconds**. `None` on any
 /// format violation.
+///
+/// The grammar is exactly `YYYY-MM-DDThh:mm:ss[.f]Z`: every field is
+/// fixed-width digits, and the fraction `f` is absent or **one to three**
+/// digits running up to the `Z` (`.5` is 500 ms, `.12` is 120 ms). IRCv3
+/// `server-time` specifies `.sss`, and the one in-repo producer
+/// ([`server_time`]) always emits three digits; one- and two-digit fractions
+/// are still accepted because the bouncer ingests `time` tags from third-party
+/// upstream servers, and such a fraction still names exactly one millisecond.
+/// An empty fraction (`.Z`), a non-digit in it, or a fourth digit (precision
+/// [`Millis`] would have to silently truncate) is rejected.
 pub fn parse_server_time_millis(text: &str) -> Option<Millis> {
     let text = text.strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut date_parts = date.split('-');
-    // Every field goes through the strict digit-only parser, which rejects the
-    // leading `+`/`-` that Rust's integer `FromStr` would otherwise accept.
-    let year: i64 = parse_time_field(date_parts.next()?)?;
-    let month: u32 = parse_time_field(date_parts.next()?)?;
-    let day: u32 = parse_time_field(date_parts.next()?)?;
-    // The `server-time` format has a 4-digit year. Bounding it here is not
-    // cosmetic: it keeps the returned milliseconds small enough that the
-    // `* 1000` below cannot overflow u64 — an unbounded year let a client
-    // trigger that overflow (panic in debug, marker corruption in release).
-    // The day is checked against the actual length of the month (leap years
-    // included), so an impossible date (`2026-02-31`) is rejected rather than
-    // silently rolling forward into the next month.
+    let year = parse_time_field(date_parts.next()?, 4)?;
+    let month = parse_time_field(date_parts.next()?, 2)?;
+    let day = parse_time_field(date_parts.next()?, 2)?;
+    // The four-digit year bounds the result, so the `* 1000` below cannot
+    // overflow u64. The day is checked against the real length of the month
+    // (leap years included), so `2026-02-31` is rejected rather than rolling
+    // forward into the next month.
     if date_parts.next().is_some()
-        || !(0..=9999).contains(&year)
         || !(1..=12).contains(&month)
         || day < 1
-        || day > days_in_month(year, month)
+        || day > days_in_month(i64::from(year), month)
     {
         return None;
     }
-    let (hms, frac) = time.split_once('.').map_or((time, ""), |(t, f)| (t, f));
+    let (hms, frac) = match time.split_once('.') {
+        Some((hms, frac)) => (hms, Some(frac)),
+        None => (time, None),
+    };
     let mut time_parts = hms.split(':');
-    let hh: u64 = parse_time_field(time_parts.next()?)?;
-    let mm: u64 = parse_time_field(time_parts.next()?)?;
-    let ss: u64 = parse_time_field(time_parts.next()?)?;
+    let hh = parse_time_field(time_parts.next()?, 2)?;
+    let mm = parse_time_field(time_parts.next()?, 2)?;
+    let ss = parse_time_field(time_parts.next()?, 2)?;
     // No leap seconds: server-time values are server-generated and never carry
     // `:60`, and accepting it would silently roll a client-supplied timestamp
     // into the next minute.
     if time_parts.next().is_some() || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
-    // Leading fraction digits become milliseconds (`.1` → 100, `.123` → 123,
-    // `.1234` → 123); a non-digit ends the fraction, matching the tolerant
-    // behavior the seconds parser had.
-    let mut millis = 0u64;
-    let mut place = 100u64;
-    for c in frac.chars() {
-        let Some(d) = c.to_digit(10) else { break };
-        if place == 0 {
-            break;
+    let millis = match frac {
+        None => 0,
+        Some(frac) => {
+            let width = frac.len();
+            if !(1..=3).contains(&width) {
+                return None;
+            }
+            parse_time_field(frac, width)? * 10u32.pow(3 - width as u32)
         }
-        millis += d as u64 * place;
-        place /= 10;
-    }
-    let days = days_from_civil(year, month, day);
-    let secs = days.checked_mul(86_400)? + (hh * 3600 + mm * 60 + ss) as i64;
+    };
+    let days = days_from_civil(i64::from(year), month, day);
+    let secs = days.checked_mul(86_400)? + i64::from(hh * 3600 + mm * 60 + ss);
     let ms = u64::try_from(secs)
         .ok()?
         .checked_mul(1000)?
-        .checked_add(millis)?;
+        .checked_add(u64::from(millis))?;
     Some(Millis::from_millis(ms))
 }
 
@@ -304,7 +308,7 @@ mod tests {
             parse_server_time_millis("2019-01-04T14:33:26.123Z"),
             Some(Millis::from_millis(1_546_612_406_123))
         );
-        // Fewer/more digits pad/truncate to three.
+        // One or two digits scale to milliseconds.
         assert_eq!(
             parse_server_time_millis("2026-07-18T12:00:00.5Z"),
             Some(Millis::from_millis(1_784_376_000_500))
@@ -312,10 +316,6 @@ mod tests {
         assert_eq!(
             parse_server_time_millis("2026-07-18T12:00:00.12Z"),
             Some(Millis::from_millis(1_784_376_000_120))
-        );
-        assert_eq!(
-            parse_server_time_millis("2026-07-18T12:00:00.1239Z"),
-            Some(Millis::from_millis(1_784_376_000_123))
         );
         // No fraction ⇒ .000.
         assert_eq!(
@@ -366,5 +366,38 @@ mod tests {
         assert_eq!(parse_server_time_millis("2024-02-29T01:02:+3Z"), None);
         // The canonical form still parses.
         assert!(parse_server_time_millis("2024-02-29T01:02:03Z").is_some());
+    }
+
+    #[test]
+    fn rejects_every_non_canonical_spelling_of_an_instant() {
+        // Each of these once parsed to an instant that also has a canonical
+        // spelling, or silently dropped trailing bytes of the fraction.
+        for bad in [
+            // Field widths are fixed.
+            "2026-7-18T12:00:00Z",
+            "2026-07-8T12:00:00Z",
+            "2026-07-18T2:00:00Z",
+            "2026-07-18T12:0:00Z",
+            "2026-07-18T12:00:0Z",
+            "2026-7-18T12:0:0Z",
+            "02026-07-18T12:00:00Z",
+            "026-07-18T12:00:00Z",
+            "2026-007-18T12:00:00Z",
+            "2026-07-18T012:00:00Z",
+            // The fraction is one to three digits running to the `Z`.
+            "2026-07-18T12:00:00.Z",
+            "2026-07-18T12:00:00.000garbageZ",
+            "2026-07-18T12:00:00.1239Z",
+            "2026-07-18T12:00:00.000000Z",
+            "2026-07-18T12:00:00.+12Z",
+            "2026-07-18T12:00:00.1.2Z",
+            "2026-07-18T12:00:00..1Z",
+        ] {
+            assert_eq!(parse_server_time_millis(bad), None, "{bad}");
+        }
+        assert_eq!(
+            parse_server_time_millis("2026-07-18T12:00:00.000Z"),
+            Some(Millis::from_millis(1_784_376_000_000))
+        );
     }
 }

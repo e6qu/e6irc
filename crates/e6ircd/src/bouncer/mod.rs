@@ -3877,8 +3877,11 @@ impl std::fmt::Display for ReplayCursor {
 /// One exact attach boundary (see
 /// [`NetworkHandle::subscribe_with_replay_snapshot`]): the live receiver, the
 /// replay before it, and the session state and upstream features as of that
-/// same instant.
+/// same instant — and the attachment's place in `attached_clients`, taken at
+/// that instant too, so a client counted as attached is always one that
+/// receives every line published after the count saw it.
 pub(crate) struct AttachSnapshot {
+    pub attachment: NetworkAttachment,
     pub events: tokio::sync::broadcast::Receiver<DriverEvent>,
     pub replay: Replay,
     pub session: Option<IrcSessionSnapshot>,
@@ -4616,6 +4619,7 @@ impl NetworkHandle {
         let events = self.events.subscribe();
         let replay = buffer.replay_after(after);
         AttachSnapshot {
+            attachment: self.track_attachment(),
             events,
             replay,
             session: irc_session.snapshot(),
@@ -4742,7 +4746,7 @@ impl NetworkHandle {
     }
 
     /// Count one attached client until the returned guard is dropped.
-    pub fn track_attachment(&self) -> NetworkAttachment {
+    pub(crate) fn track_attachment(&self) -> NetworkAttachment {
         let telemetry = self
             .telemetry
             .lock()
@@ -5842,9 +5846,9 @@ where
     // are its position instead: each conversation is replayed from where the
     // account stopped reading it, the whole of one it has no marker for.
     let read_positions = ReadPositions::of(handle, account).await;
-    let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
     let AttachSnapshot {
+        attachment: _attachment,
         mut events,
         replay,
         session: session_snapshot,
@@ -6279,8 +6283,10 @@ where
         },
         // The framing contract forbids silently dropping an
         // over-long line; tell the client its line was not
-        // relayed rather than swallowing it.
-        LineEvent::TooLong => {
+        // relayed rather than swallowing it. Its label is not
+        // answered under, like every attach-local reply: the
+        // attach listener does not offer `labeled-response`.
+        LineEvent::TooLong { .. } => {
             write_client_line_error(write, ClientLineError::TooLong).await?;
         }
     }

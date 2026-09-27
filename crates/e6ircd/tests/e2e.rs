@@ -246,6 +246,28 @@ async fn overlong_line_gets_417_and_connection_survives() {
     c.expect("PONG").await;
 }
 
+/// A line so long the framer drops it (past the whole client frame, not just
+/// the body budget) is still answered under the label its tag section named:
+/// the client is waiting on that label.
+#[tokio::test]
+async fn a_line_the_framer_drops_is_refused_under_its_label() {
+    let running = net::start(test_config()).await.expect("start");
+    let mut c = Client::connect(running.addrs[0]).await;
+    c.send("CAP REQ :batch labeled-response").await;
+    c.expect(" ACK ").await;
+    c.send("CAP END").await;
+    c.register("framed").await;
+    let long = format!(
+        "@label=cut PRIVMSG #x :{}",
+        "A".repeat(e6irc_proto::message::MAX_CLIENT_FRAME_LEN)
+    );
+    c.send(&long).await;
+    let reply = c.expect(" 417 ").await;
+    assert!(reply.starts_with("@label=cut "), "{reply}");
+    c.send("PING still-alive").await;
+    c.expect("PONG").await;
+}
+
 #[tokio::test]
 async fn tls_client_full_flow() {
     use rustls_pki_types::pem::PemObject;

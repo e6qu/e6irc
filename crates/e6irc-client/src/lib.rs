@@ -1187,7 +1187,7 @@ impl Connection {
                         self.adopt_isupport(&msg);
                         return Ok(Some((msg, text.to_string())));
                     }
-                    LineEvent::TooLong => {
+                    LineEvent::TooLong { .. } => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "server sent an over-long line",
@@ -1242,7 +1242,7 @@ impl Connection {
                             raw: text,
                         }));
                     }
-                    LineEvent::TooLong => {
+                    LineEvent::TooLong { .. } => {
                         return Ok(Some(RelayEvent::Rejected(RejectedLine::TooLong)));
                     }
                 }

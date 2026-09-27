@@ -34,24 +34,34 @@ impl SecretSources {
     }
 
     /// The secret, from the command line, else the file, else `variable`.
+    /// A source that is given but empty is an error whichever it is: an empty
+    /// secret is a mistake (an unset shell variable expanded into
+    /// `--password "$PW"`, a truncated file), never a credential to send.
     pub fn resolve(
         self,
         variable: &str,
         environment: &impl Fn(&str) -> io::Result<Option<String>>,
     ) -> io::Result<Option<String>> {
-        match (self.argument, self.file) {
-            (Some(_), Some(_)) => Err(invalid(format!(
-                "give the secret on the command line or in a file, not both ({variable})"
-            ))),
-            (Some(argument), None) => Ok(Some(argument)),
-            (None, Some(file)) => read_secret_file(&file).map(Some),
+        let (secret, source) = match (self.argument, self.file) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "give the secret on the command line or in a file, not both ({variable})"
+                )));
+            }
+            (Some(argument), None) => (argument, "the command-line secret".to_owned()),
+            (None, Some(file)) => (
+                read_secret_file(&file)?,
+                format!("the secret file {}", file.display()),
+            ),
             (None, None) => match environment(variable)? {
-                Some(value) if value.is_empty() => {
-                    Err(invalid(format!("{variable} is set but empty")))
-                }
-                value => Ok(value),
+                Some(value) => (value, variable.to_owned()),
+                None => return Ok(None),
             },
+        };
+        if secret.is_empty() {
+            return Err(invalid(format!("{source} is given but empty")));
         }
+        Ok(Some(secret))
     }
 }
 
@@ -96,6 +106,9 @@ impl CredentialArguments {
             ));
         }
         if let Some(account) = self.account {
+            if account.is_empty() {
+                return Err(invalid("--account is given but empty".into()));
+            }
             let password = self
                 .password
                 .resolve(PASSWORD_ENVIRONMENT, environment)?
@@ -335,6 +348,69 @@ mod tests {
             let outcome = resolved(arguments.clone(), pairs);
             assert!(outcome.starts_with("error: "), "{arguments:?} -> {outcome}");
         }
+    }
+
+    /// An empty secret is refused whichever source it came from, and an empty
+    /// account is refused too: each is a mistake (an unset shell variable
+    /// expanded into the flag), never a credential to send.
+    #[test]
+    #[cfg(unix)]
+    fn an_empty_secret_or_account_is_an_error_from_every_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("e6irc-credentials-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let empty_file = directory.join("empty");
+        std::fs::write(&empty_file, b"\n").unwrap();
+        std::fs::set_permissions(&empty_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let from_file = || SecretSources {
+            argument: None,
+            file: Some(empty_file.clone()),
+        };
+        let with_password = |password: SecretSources| CredentialArguments {
+            account: Some("alice".into()),
+            password,
+            ..Default::default()
+        };
+        let with_token = |oauth_token: SecretSources| CredentialArguments {
+            oauth_token,
+            ..Default::default()
+        };
+        let cases: [(CredentialArguments, &'static [(&str, &str)]); 7] = [
+            (with_password(argument("")), &[]),
+            (with_password(from_file()), &[]),
+            (
+                with_password(SecretSources::default()),
+                &[(PASSWORD_ENVIRONMENT, "")],
+            ),
+            (with_token(argument("")), &[]),
+            (with_token(from_file()), &[]),
+            (
+                with_token(SecretSources::default()),
+                &[(OAUTH_TOKEN_ENVIRONMENT, "")],
+            ),
+            (
+                CredentialArguments {
+                    account: Some(String::new()),
+                    password: argument("secret"),
+                    ..Default::default()
+                },
+                &[],
+            ),
+        ];
+        for (arguments, pairs) in cases {
+            let outcome = resolved(arguments.clone(), pairs);
+            assert!(
+                outcome.starts_with("error: ") && outcome.contains("empty"),
+                "{arguments:?} -> {outcome}"
+            );
+        }
+        for sources in [argument(""), from_file()] {
+            let outcome = resolve_server_password(sources.clone(), &environment(&[]));
+            assert!(outcome.is_err(), "{sources:?} -> {outcome:?}");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

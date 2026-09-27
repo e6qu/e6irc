@@ -1399,8 +1399,46 @@ fn invisible_member_hidden_from_channel_who_and_names_by_outsider() {
 fn overlong_line_gets_417() {
     let mut s = TestServer::new();
     let c = s.register(1, "alice");
-    s.core.handle(Input::OverlongLine { conn: c });
+    s.core.handle(Input::OverlongLine {
+        conn: c,
+        label: None,
+    });
     assert!(has_numeric(&s.drain(c), "417"));
+}
+
+/// The framer recovers an over-long line's label; the refusal is framed under
+/// it (re-escaped) for a client that negotiated labeled responses — exactly as
+/// for a line that framed but fails the client frame budgets — and is plain
+/// for one that did not.
+#[test]
+fn a_framer_dropped_line_is_refused_under_its_label() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch labeled-response");
+    s.core.handle(Input::OverlongLine {
+        conn: alice,
+        label: Some("a b".into()),
+    });
+    assert_eq!(
+        s.drain(alice),
+        ["@label=a\\sb :irc.test.example 417 alice :Input line was too long"]
+    );
+    s.core.handle(Input::OverlongLine {
+        conn: alice,
+        label: None,
+    });
+    assert_eq!(
+        s.drain(alice),
+        [":irc.test.example 417 alice :Input line was too long"]
+    );
+    let bob = s.register(2, "bob");
+    s.core.handle(Input::OverlongLine {
+        conn: bob,
+        label: Some("x".into()),
+    });
+    assert_eq!(
+        s.drain(bob),
+        [":irc.test.example 417 bob :Input line was too long"]
+    );
 }
 
 #[test]

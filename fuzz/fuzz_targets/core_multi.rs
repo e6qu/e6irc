@@ -111,7 +111,10 @@ fuzz_target!(|data: &[u8]| {
                 conn: pick(rest),
                 reason: "fuzz close".into(),
             }),
-            b'O' => core.handle(Input::OverlongLine { conn: pick(rest) }),
+            b'O' => core.handle(Input::OverlongLine {
+                conn: pick(rest),
+                label: rest.get(1..).map(str::to_string),
+            }),
             b'H' => core.handle(Input::HistoryPage {
                 conn: pick(rest),
                 display: rest.get(1..).unwrap_or("#c").to_string(),

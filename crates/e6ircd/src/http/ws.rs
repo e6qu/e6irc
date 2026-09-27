@@ -222,11 +222,12 @@ pub(super) async fn ws_irc_conn(
                 // one IRC line, with no CR/LF terminator. Feed the whole value
                 // to the parser so an embedded delimiter is rejected as one
                 // malformed command rather than forged into a second command.
-                let input = if e6irc_proto::message::client_frame_fits(&data) {
-                    Input::Line { conn, line: data }
+                let event = if e6irc_proto::message::client_frame_fits(&data) {
+                    e6irc_proto::framing::LineEvent::Line(data)
                 } else {
-                    Input::OverlongLine { conn }
+                    e6irc_proto::framing::LineEvent::too_long(&data)
                 };
+                let input = Input::framed(conn, event);
                 meter.spend().await;
                 if core_tx.push(input).await.is_err() {
                     break 'conn; // core gone: stop the connection directly
@@ -543,7 +544,6 @@ pub(super) async fn ws_ui_conn(
         send_unavailable(&mut socket).await;
         return;
     }
-    let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
     let session_authority = handle.session_authority();
     let after = match resume {
@@ -551,6 +551,7 @@ pub(super) async fn ws_ui_conn(
         Some(ReplayRequest::Unknown) | None => None,
     };
     let crate::bouncer::AttachSnapshot {
+        attachment: _attachment,
         mut events,
         replay,
         session: session_snapshot,

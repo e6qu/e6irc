@@ -353,8 +353,10 @@ pub struct LimitsConfig {
     /// CIDRs of trusted reverse proxies (e.g. the load balancer). When a
     /// request's socket peer matches one of these, its client IP is taken
     /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsed
-    /// when the configuration is read: an invalid CIDR is a hard error.
-    #[serde(default)]
+    /// when the configuration is read: an invalid CIDR is a hard error, and an
+    /// IPv4-mapped one is read as its IPv4 range
+    /// ([`crate::net::canonical_network`]).
+    #[serde(default, deserialize_with = "deserialize_canonical_networks")]
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Token-bucket size for the unauthenticated, work-inducing endpoints
     /// (password login, OIDC starts and callbacks, device authorization,
@@ -382,8 +384,8 @@ pub struct LimitsConfig {
     pub require_sasl: bool,
     /// The same refusal, only for clients connecting from these address
     /// ranges (a cloud provider's, say). Redundant, and refused, when
-    /// `require_sasl` already covers everyone.
-    #[serde(default)]
+    /// `require_sasl` already covers everyone. Read like `trusted_proxies`.
+    #[serde(default, deserialize_with = "deserialize_canonical_networks")]
     pub require_sasl_from: Vec<ipnet::IpNet>,
 }
 
@@ -1454,6 +1456,26 @@ impl NetworkEntry {
             .map(|_| ())
             .map_err(|error| format!("kind={} has invalid {error}", self.kind.as_db_str()))
     }
+}
+
+/// Address ranges as a client's canonical address is matched against them: an
+/// IPv4-mapped range is its IPv4 equivalent, and one shorter than `/96` (which
+/// spans non-IPv4 addresses too) is refused rather than kept unmatchable.
+fn deserialize_canonical_networks<'de, D>(deserializer: D) -> Result<Vec<ipnet::IpNet>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<ipnet::IpNet>::deserialize(deserializer)?
+        .into_iter()
+        .map(|net| {
+            crate::net::canonical_network(net).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "{net} is an IPv4-mapped range shorter than /96, which also spans \
+                     addresses that are not IPv4; write the IPv4 range instead"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn deserialize_static_networks<'de, D>(deserializer: D) -> Result<Vec<NetworkEntry>, D::Error>
@@ -4022,6 +4044,36 @@ mod tests {
             parsed.limits.trusted_proxies,
             ["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
         );
+    }
+
+    /// Clients are matched by their canonical address (IPv4, never
+    /// IPv4-mapped), so a mapped range is read as the IPv4 range it names —
+    /// kept as written it could never contain a client — and a mapped range
+    /// shorter than /96 is refused.
+    #[test]
+    fn an_ipv4_mapped_range_is_read_as_its_ipv4_range() {
+        let parsed = with_limits(
+            r#"trusted_proxies = ["::ffff:10.0.0.0/104"]
+require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
+            true,
+        )
+        .expect("valid");
+        assert_eq!(
+            parsed.limits.trusted_proxies,
+            ["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
+        );
+        assert!(
+            parsed
+                .limits
+                .sasl_requirement()
+                .covers(Some("192.0.2.7".parse().unwrap()))
+        );
+        for field in ["trusted_proxies", "require_sasl_from"] {
+            let error = with_limits(&format!(r#"{field} = ["::ffff:0.0.0.0/64"]"#), true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("IPv4-mapped"), "{field}: {error}");
+        }
     }
 
     /// The SASL requirement is console-owned like every other limit: the

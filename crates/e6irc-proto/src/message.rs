@@ -1,4 +1,7 @@
-//! IRC message parsing and serialization.
+//! IRC message parsing, the wire budgets, and the wire-safe pieces outbound
+//! lines are built from (tag-value escaping, [`MiddleParam`]). There is no
+//! general `Message` serializer: outbound lines are formatted at their send
+//! funnels from already-validated parts (DESIGN §7.1).
 //!
 //! Grammar per the Modern IRC client protocol
 //! (https://modern.ircdocs.horse/#client-to-server-protocol-structure)

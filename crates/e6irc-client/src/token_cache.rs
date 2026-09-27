@@ -141,8 +141,9 @@ pub fn load_token(path: &Path) -> io::Result<Option<CachedToken>> {
 /// typed where `ps` and the shell history can see it. The file is held to the
 /// token cache's standard — not readable by group or others, and bounded — and
 /// one trailing line break is dropped, because that is what an editor or `echo`
-/// leaves behind. A missing or empty file is an error: the caller was told to
-/// find a secret here.
+/// leaves behind. A missing file is an error: the caller was told to find a
+/// secret here. An empty secret is refused by the one check every source goes
+/// through, `credentials::SecretSources::resolve`.
 pub fn read_secret_file(path: &Path) -> io::Result<String> {
     let bytes = read_private_file(path, "secret file")?.ok_or_else(|| {
         io::Error::new(
@@ -159,12 +160,6 @@ pub fn read_secret_file(path: &Path) -> io::Result<String> {
     let secret = text.strip_suffix('\n').map_or(text.as_str(), |line| {
         line.strip_suffix('\r').unwrap_or(line)
     });
-    if secret.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("secret file is empty: {}", path.display()),
-        ));
-    }
     Ok(secret.to_owned())
 }
 
@@ -495,7 +490,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_secret_file_is_private_nonempty_text_without_its_line_break() {
+    fn a_secret_file_is_private_text_without_its_line_break() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = temporary_path("secret-file");
@@ -510,6 +505,7 @@ mod tests {
             (b"hunter2\r\n", "hunter2"),
             (b"hunter2", "hunter2"),
             (b" spaces are part of it \n", " spaces are part of it "),
+            (b"\n", ""),
         ] {
             write(contents, 0o600);
             assert_eq!(read_secret_file(&path).unwrap(), secret);
@@ -518,13 +514,6 @@ mod tests {
         let exposed = read_secret_file(&path).expect_err("group-readable");
         assert_eq!(exposed.kind(), io::ErrorKind::PermissionDenied);
         assert!(exposed.to_string().contains("chmod 600"), "{exposed}");
-        for empty in [&b""[..], b"\n"] {
-            write(empty, 0o600);
-            assert_eq!(
-                read_secret_file(&path).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
         fs::remove_file(&path).unwrap();
         assert_eq!(
             read_secret_file(&path).unwrap_err().kind(),
