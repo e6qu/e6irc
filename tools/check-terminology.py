@@ -19,6 +19,7 @@ spellings: `**TLS**`, `**Transport Layer Security (TLS)**`,
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -184,19 +185,30 @@ def prose_lines(path: Path, text: str):
             yield number, line[at + len(marker) :]
 
 
+def prose_files(root: Path):
+    """Every file under `root` outside the skipped directories, which are
+    pruned before they are entered: a build tree or a worktree holds far more
+    files than the repository, and walking them only to skip them made the
+    guard slow."""
+    for directory, subdirectories, files in os.walk(root):
+        relative = Path(directory).relative_to(root)
+        subdirectories[:] = [
+            name
+            for name in subdirectories
+            if name not in SKIPPED_DIRECTORIES
+            and not (relative == Path(".") and name in SKIPPED_TOP_LEVEL)
+        ]
+        for name in files:
+            yield Path(directory) / name
+
+
 def undefined_abbreviations(root: Path) -> dict[str, list[str]]:
     """Each undefined abbreviation, with the `path:line` of every use."""
     glossary = (root / GLOSSARY).read_text(encoding="utf-8")
     defined = defined_terms(glossary)
     found: dict[str, list[str]] = {}
-    for path in sorted(root.rglob("*")):
+    for path in sorted(prose_files(root)):
         relative = path.relative_to(root)
-        if any(part in SKIPPED_DIRECTORIES for part in relative.parts[:-1]):
-            continue
-        if relative.parts[0] in SKIPPED_TOP_LEVEL:
-            continue
-        if not path.is_file():
-            continue
         if path.suffix not in LINE_COMMENT and path.suffix not in (".md", ".html"):
             if path.name != "Dockerfile":
                 continue
