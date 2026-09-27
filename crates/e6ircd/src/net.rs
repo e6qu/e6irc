@@ -751,8 +751,7 @@ fn serves_http(config: &Config) -> bool {
 /// [`ManagedConfig::bootstrap_drift`]: crate::config::ManagedConfig::bootstrap_drift
 pub fn check_offline(config: &Config) -> io::Result<()> {
     if config.database.is_some() {
-        crate::db::refuse_libpq_environment(&crate::environment_config::process_environment)
-            .map_err(io::Error::other)?;
+        crate::db::refuse_libpq_process_environment().map_err(io::Error::other)?;
     }
     if serves_http(config) {
         crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
@@ -783,6 +782,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         .map(|db| (db.url.clone(), db.startup_wait_seconds, db.pool_size()))
     {
         Some((database_url, startup_wait_seconds, pool_size)) => {
+            crate::db::refuse_libpq_process_environment().map_err(io::Error::other)?;
             let wait = crate::db::StartupDatabaseWait::from_seconds(startup_wait_seconds)
                 .map_err(io::Error::other)?;
             eprintln!(

@@ -12,7 +12,7 @@ mod support;
 
 /// A plain pool on `url` for the test's own queries, beside the daemon's.
 async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
-    sqlx::PgPool::connect_with(url.connect_options().expect("connect options")).await
+    sqlx::PgPool::connect_with(url.connect_options()).await
 }
 
 #[path = "support/deadline.rs"]

@@ -12,13 +12,14 @@
 //! must be one of [`QUERY_KEYS`] (the set `tools/postgres-url-environment.py`
 //! accepts too, so a backup connects where the daemon does), each field may be
 //! stated once, and the connection options are built field by field from what
-//! the URL says: no password file is consulted, and no connection is made
-//! while any of [`LIBPQ_ENVIRONMENT`] is set ([`refuse_libpq_environment`],
-//! checked by [`DatabaseUrl::connect_options`] and by `e6ircd check`),
-//! because sqlx's only constructor fills the fields a URL leaves out from
-//! them. The check reads the process environment only there, where the
-//! variables could take effect, so parsing a configuration never depends on
-//! the host it runs on.
+//! the URL says: no password file is consulted, and the process connects to
+//! no database while any of [`LIBPQ_ENVIRONMENT`] is set
+//! ([`refuse_libpq_process_environment`], called by every entry point that
+//! connects — the daemon's start, its database subcommands — and by `e6ircd
+//! check`), because sqlx's only constructor fills the fields a URL leaves out
+//! from them. The process environment is read there, at the process's own
+//! boundary, so neither parsing a configuration nor building connection
+//! options depends on the host they run on.
 //!
 //! No message about a URL repeats any of it: a malformed URL can put a
 //! fragment of its password anywhere a parser looks. The URL's `Debug` and
@@ -93,7 +94,7 @@ pub(crate) const QUERY_KEYS: [(&str, UrlField); 17] = [
 /// leaves a field of unstated. They are refused while the daemon is
 /// configured with a database, rather than silently deciding where it
 /// connects or whether TLS is verified.
-pub(crate) const LIBPQ_ENVIRONMENT: [&str; 12] = [
+pub const LIBPQ_ENVIRONMENT: [&str; 12] = [
     "PGHOST",
     "PGHOSTADDR",
     "PGPORT",
@@ -135,6 +136,13 @@ pub(crate) fn refuse_libpq_environment(
         set.join(", "),
         if set.len() == 1 { "it" } else { "them" }
     ))
+}
+
+/// [`refuse_libpq_environment`] against this process's environment: what every
+/// entry point that connects to the database calls first.
+pub fn refuse_libpq_process_environment() -> Result<(), super::DbError> {
+    refuse_libpq_environment(&crate::environment_config::process_environment)
+        .map_err(super::DbError::LibpqEnvironment)
 }
 
 /// Why a URL cannot be used. Says what is wrong, never what the URL holds.
@@ -486,21 +494,14 @@ impl DatabaseUrl {
         }
     }
 
-    /// The options every connection is made with, refused while one of
-    /// [`LIBPQ_ENVIRONMENT`] is set in the process environment: sqlx's
-    /// constructor consults them for the fields that have no way to be unset
-    /// (the password, the certificates, `options`). The refusal sits here, at
-    /// the one place those variables could take effect, so no connection can
-    /// be made past it.
-    pub fn connect_options(&self) -> Result<PgConnectOptions, super::DbError> {
-        refuse_libpq_environment(&crate::environment_config::process_environment)
-            .map_err(super::DbError::LibpqEnvironment)?;
-        Ok(self.options())
-    }
-
-    /// Each field set from the URL or to libpq's documented default (port
-    /// 5432, `sslmode=prefer`); no password file is read.
-    fn options(&self) -> PgConnectOptions {
+    /// The options every connection is made with. Each field is set from the
+    /// URL or to libpq's documented default (port 5432, `sslmode=prefer`); no
+    /// password file is read. sqlx's constructor still consults libpq's
+    /// environment for the fields that have no way to be unset (the password,
+    /// the certificates, `options`), which is why the process refuses to
+    /// connect at all while one of [`LIBPQ_ENVIRONMENT`] is set
+    /// ([`refuse_libpq_process_environment`]).
+    pub fn connect_options(&self) -> PgConnectOptions {
         let mut options = PgConnectOptions::new_without_pgpass()
             .port(self.port.unwrap_or(5432))
             .ssl_mode(self.ssl_mode.unwrap_or(SslMode::Prefer).to_sqlx())
@@ -725,7 +726,7 @@ mod tests {
              &statement-cache-capacity=7",
         )
         .expect("a complete URL");
-        let options = url.options();
+        let options = url.connect_options();
         assert_eq!(options.get_host(), "db.example");
         assert_eq!(options.get_port(), 6543);
         assert_eq!(options.get_username(), "e6irc user");
@@ -768,7 +769,7 @@ mod tests {
     fn a_url_without_sslmode_connects_with_libpq_s_default_whatever_the_environment_says() {
         let options = DatabaseUrl::parse("postgres://db.example/e6irc")
             .expect("URL")
-            .options();
+            .connect_options();
         assert!(matches!(options.get_ssl_mode(), PgSslMode::Prefer));
         assert_eq!(options.get_port(), 5432);
     }
@@ -778,11 +779,11 @@ mod tests {
         let url = DatabaseUrl::parse("postgres:///e6irc?host=%2Fvar%2Frun%2Fpostgresql")
             .expect("socket URL");
         assert_eq!(
-            url.options().get_socket(),
+            url.connect_options().get_socket(),
             Some(&std::path::PathBuf::from("/var/run/postgresql"))
         );
         let bracketed = DatabaseUrl::parse("postgres://[::1]:5524/e6irc").expect("IPv6 URL");
-        assert_eq!(bracketed.options().get_host(), "::1");
+        assert_eq!(bracketed.connect_options().get_host(), "::1");
         assert_eq!(bracketed.to_string(), "postgres://[::1]:5524/e6irc");
     }
 

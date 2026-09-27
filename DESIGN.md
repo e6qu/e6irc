@@ -4725,12 +4725,13 @@ Layers, bottom to top:
   verification) and filled every field a URL left out from libpq's environment
   and `~/.pgpass`. The options are now built field by field without a password
   file, and because sqlx's only constructor still reads libpq's variables for
-  fields it cannot unset, no connection is made (and `e6ircd check` fails)
-  while `PGHOST`, `PGSSLMODE`, `PGPASSWORD` or any other of them is set,
-  naming each (a stray `PGSSLMODE=disable` turned TLS off). The check reads
-  the process environment where a connection is built, not where the
-  configuration is parsed, so a configuration's validity never depends on the
-  host that parses it. `hostaddr` and
+  fields it cannot unset, the process connects to no database (and `e6ircd
+  check` fails) while `PGHOST`, `PGSSLMODE`, `PGPASSWORD` or any other of them
+  is set, naming each (a stray `PGSSLMODE=disable` turned TLS off). The check
+  reads the process environment at the process's own boundary — the daemon's
+  start, its database subcommands, `check` — not where a configuration is
+  parsed or connection options are built, so neither depends on the host
+  that runs them. `hostaddr` and
   `connect_timeout` are refused: sqlx cannot honour them as libpq does.
   `tools/postgres-url-environment.py` accepts exactly the same keys (a source
   test compares the lists), refuses the same duplicates, and removes every

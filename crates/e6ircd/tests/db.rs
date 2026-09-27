@@ -17,7 +17,7 @@ mod support;
 /// (`db::connect_and_migrate`), whose migrations a migration test must run
 /// itself.
 async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx::Error> {
-    sqlx::PgPool::connect_with(url.connect_options().expect("connect options")).await
+    sqlx::PgPool::connect_with(url.connect_options()).await
 }
 
 #[path = "support/deadline.rs"]
@@ -8940,7 +8940,14 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
         ),
     )
     .expect("config");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"));
+    // The daemon refuses to connect while a libpq variable is set (some hosts,
+    // GitHub's Windows image among them, set PGUSER and PGPASSWORD); this test
+    // is about the startup wait, so its daemon gets none of them.
+    for variable in db::LIBPQ_ENVIRONMENT {
+        daemon.env_remove(variable);
+    }
+    let output = daemon
         .arg("--config")
         .arg(&config)
         .output()
@@ -12864,7 +12871,7 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
     // be that same session, or it waits on the lock forever.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect_with(url.connect_options().expect("connect options"))
+        .connect_with(url.connect_options())
         .await
         .expect("connect");
     MIGRATIONS

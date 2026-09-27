@@ -352,6 +352,7 @@ fn rotate_secrets(args: &[String]) -> ExitCode {
         .build()
         .expect("tokio runtime");
     match runtime.block_on(async {
+        e6ircd::db::refuse_libpq_process_environment()?;
         let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
         e6ircd::db::rotate_database_secrets(&pool, &keys, "rotate-secrets").await
     }) {
@@ -399,6 +400,7 @@ fn recover_administrator(args: &[String]) -> ExitCode {
         .build()
         .expect("tokio runtime");
     match runtime.block_on(async {
+        e6ircd::db::refuse_libpq_process_environment()?;
         let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
         e6ircd::db::recover_administrator(&pool, account).await
     }) {

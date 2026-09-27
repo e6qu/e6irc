@@ -26,8 +26,8 @@ pub use credential_change::{
 };
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
 pub(crate) use settings_change::{SettingsChange, SettingsChangeListener};
-pub(crate) use url::refuse_libpq_environment;
 pub use url::{DatabaseUrl, DatabaseUrlError};
+pub use url::{LIBPQ_ENVIRONMENT, refuse_libpq_process_environment};
 
 /// Migrations are compiled into the binary; startup refuses to run on
 /// checksum drift (sqlx's default) rather than guessing.
@@ -46,8 +46,8 @@ const MAX_DATABASE_MILLIS: u64 = 1 << 53;
 pub enum DbError {
     Connect(sqlx::Error),
     /// A libpq environment variable is set; see
-    /// [`url::refuse_libpq_environment`]. Not retried: only the operator can
-    /// clear it.
+    /// [`url::refuse_libpq_process_environment`]. Only the operator can clear
+    /// it.
     LibpqEnvironment(String),
     /// Startup kept retrying the initial connection for its whole wait and
     /// PostgreSQL never accepted one; `last` is the final attempt's error.
@@ -363,10 +363,9 @@ impl TryFrom<u32> for DatabasePoolSize {
 /// unroutable address from hanging startup on the operating system's connect
 /// timeout.
 async fn connect_directly(url: &DatabaseUrl) -> Result<sqlx::PgConnection, DbError> {
-    let options = url.connect_options()?;
     tokio::time::timeout(
         DATABASE_ACQUIRE_TIMEOUT,
-        <sqlx::PgConnection as sqlx::Connection>::connect_with(&options),
+        <sqlx::PgConnection as sqlx::Connection>::connect_with(&url.connect_options()),
     )
     .await
     .map_err(|_| {
@@ -389,7 +388,7 @@ pub(crate) async fn notification_listener(
         .max_connections(1)
         .max_lifetime(None)
         .idle_timeout(None)
-        .connect_with(url.connect_options()?)
+        .connect_with(url.connect_options())
         .await
         .map_err(DbError::Connect)?;
     let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
@@ -507,7 +506,7 @@ async fn connect_and_migrate_sized(
                 Ok(())
             })
         })
-        .connect_with(url.connect_options()?)
+        .connect_with(url.connect_options())
         .await
         .map_err(DbError::Connect)
 }

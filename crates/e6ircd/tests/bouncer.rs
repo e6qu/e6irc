@@ -464,7 +464,7 @@ async fn observer_pool(url: &e6ircd::db::DatabaseUrl) -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect_with(url.connect_options().expect("connect options"))
+        .connect_with(url.connect_options())
         .await
         .expect("observer pool")
 }

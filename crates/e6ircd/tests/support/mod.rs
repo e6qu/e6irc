@@ -90,7 +90,7 @@ async fn create(admin: &str, name: &str) {
     let admin: e6ircd::db::DatabaseUrl = admin
         .parse()
         .expect("E6IRC_TEST_DATABASE_URL is a URL e6ircd accepts");
-    let pool = sqlx::PgPool::connect_with(admin.connect_options().expect("connect options"))
+    let pool = sqlx::PgPool::connect_with(admin.connect_options())
         .await
         .expect("connect to the administrative database");
     // Dropped first so a run starts from an empty database even if a previous
