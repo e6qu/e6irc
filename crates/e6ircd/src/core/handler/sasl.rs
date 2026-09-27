@@ -370,6 +370,7 @@ fn sasl_verify_queued(state: &mut ServerState, conn: ConnId) {
     let label = state.defer_captured_label(conn);
     state.sessions.get_mut(&conn).expect("checked").sasl_verify =
         Some(crate::core::state::PendingServiceReply::new(label));
+    state.credential_check_queued(conn);
 }
 
 pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core::DbReply) {
@@ -433,8 +434,10 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     // the administrative event installs this deny gate, even a successful DB
     // verification that was already in flight is converted to a denial rather
     // than recreating an authenticated session after the disconnect sweep.
+    // A password change is the same, for a check queued before it: the
+    // verdict speaks for a credential that no longer stands.
     if let crate::core::DbReply::PasswordVerified { account, origin } = &reply
-        && state.is_account_suspended(account)
+        && (state.is_account_suspended(account) || state.credentials_ended_since(conn, account))
     {
         verify_denied(state, conn, *origin, sasl_label, Denial::Rejected);
         return;

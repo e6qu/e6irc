@@ -436,7 +436,7 @@ pub async fn verify_attached_client(
                 echo_message: true,
                 ..super::AttachCaps::default()
             },
-            "alice",
+            super::account_lease::lease_for_test("alice"),
             &nick,
             super::ATTACH_LIVENESS_INTERVAL,
         )

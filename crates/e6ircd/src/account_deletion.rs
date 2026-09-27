@@ -89,15 +89,24 @@ impl AccountDeletion {
                 ))
             })?;
 
+        // Every attachment the account holds ends — on the operator's shared
+        // and configured networks too, which do not stop with it — and a
+        // password checked while this ran cannot open another.
+        lane.revoke_account(&target.folded);
+
         // The owner's drivers stop before any row goes — each persistence task
         // finishing the line it is writing — so no late backlog line can land
         // after the deletion (and one that tried would fail the foreign key its
         // network's row no longer satisfies). Drivers for the running networks
         // are built first, so a deletion the database refuses restarts exactly
-        // them.
+        // them. The networks the configuration defines for the account are
+        // held the same way, and stay held once it is gone.
         let restart = self.owner_network_restart(lane, &target).await;
         let stopped_networks = lane
             .remove_owner(&target.folded, crate::bouncer::UnwrittenLines::Discard)
+            .await;
+        let held_configured = lane
+            .hold_configured_owned(&target.folded, crate::bouncer::OwnerHold::Suspended)
             .await;
         let deleted = match crate::db::delete_account_permanently(
             pool,
@@ -110,6 +119,8 @@ impl AccountDeletion {
             Ok(Some(deleted)) => deleted,
             // The account is already gone: nothing of it may run again.
             Ok(None) => {
+                lane.hold_configured_owned(&target.folded, crate::bouncer::OwnerHold::Deleted)
+                    .await;
                 self.undo_gate(&target, actor).await?;
                 return Err(AccountDeletionError::NotFound);
             }
@@ -128,10 +139,23 @@ impl AccountDeletion {
                         );
                     }
                 }
+                // A suspension that stood before stands; otherwise the
+                // configured networks run again.
+                if !target.suspended {
+                    let (_, unbuildable) = lane.release_configured_owned(&target.folded);
+                    for error in unbuildable {
+                        eprintln!(
+                            "account deletion: a configured network of {} stays stopped: {error}",
+                            target.name
+                        );
+                    }
+                }
                 self.undo_gate(&target, actor).await?;
                 return Err(deletion_error(error));
             }
         };
+        lane.hold_configured_owned(&target.folded, crate::bouncer::OwnerHold::Deleted)
+            .await;
         // The account's read markers, channel access and grouped nicks
         // cascaded away with its row, its messages were purged, and its
         // channels with a successor passed on; every core shard's mirror
@@ -150,8 +174,9 @@ impl AccountDeletion {
             )));
         }
         Ok(format!(
-            "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account \
-             name is retired.",
+            "Permanently deleted {} and stopped {stopped_networks} owned network(s) and \
+             {held_configured} configured network(s), which stay stopped. The account name is \
+             retired.",
             deleted.name
         ))
     }

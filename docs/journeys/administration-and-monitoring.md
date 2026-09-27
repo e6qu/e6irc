@@ -87,10 +87,14 @@ audit state.
 - **Accounts** can suspend or reactivate a non-current account by immutable ID.
   Suspension atomically revokes browser sessions, personal access tokens, and
   approved device grants; denies primary/app-password and OpenID Connect
-  authentication; disconnects every live IRC session; and stops every owned
-  network while retaining identity, channel, and network definitions.
-  Reactivation restores credential eligibility and validated enabled networks,
-  but never resurrects a revoked bearer.
+  authentication; disconnects every live IRC session, registered or still
+  registering; ends every bouncer attachment, on shared and configured
+  networks too; stops every owned network; and holds the networks the
+  configuration defines for the account stopped (`owner_suspended` in the
+  network inventory), while retaining identity, channel, and network
+  definitions. Reactivation restores credential eligibility, validated enabled
+  networks and the held configured ones, but never resurrects a revoked
+  bearer. Deletion holds the configured networks for good (`owner_deleted`).
 - **Accounts** can grant or revoke durable administrator authority. The page
   distinguishes durable and restart-scoped configuration grants so removing
   one source never claims the other disappeared.
@@ -121,7 +125,9 @@ projections omit secrets, escape user strings, bound filters/pages, and emit
 redacted audit records for mutations. Account lifecycle and network CRUD share
 one mutation lane. The core suspension event installs its deny key before
 disconnecting sessions, so an already-running password verification cannot
-authenticate after the administrative sweep.
+authenticate after the administrative sweep; the attach listener's
+`AccountLease`, revoked on the lane and refused to a credential check that
+began before the revocation, does the same for bouncer attachments.
 
 Every bounded console table and dynamically rendered backlog/live-log region
 is keyboard-scrollable. Shared constructors give dynamic tables and logs their
@@ -134,7 +140,13 @@ active route scrolls into the horizontal navigation viewport on load.
 
 **Evidence.** Proven by PostgreSQL cursor/filter/posture and atomic bearer
 revocation tests; ordered-core late-verdict/disconnect tests; exact-owner
-registry-stop tests; and a real HTTP suspend/reactivate journey covering
+registry-stop and configured-network hold/release tests; account-lease
+revocation and ticket-race tests; a real attach-listener journey
+(`the_account_lifecycle_ends_attachments_and_holds_configured_networks`) in
+which suspension ends attachments to a shared and a configured network, the
+inventory shows the owner-suspended state, reactivation restarts it, and a password
+change ends the attachment and the IRC session; and a real HTTP
+suspend/reactivate journey covering
 durable administrator discovery, self-protection, authorization, revoked
 cookies/tokens, retained credentials, non-resurrection, live authority
 grant/revoke, and authority-source projection. Administrator-only

@@ -582,8 +582,9 @@ pub(super) struct ChangePasswordRequest {
 /// someone else's hands; app passwords and personal access tokens are
 /// separately managed credentials and are deliberately left alone, so the
 /// person is told to revoke those themselves if they suspect them.
-pub(super) const PASSWORD_CHANGE_DETAIL: &str = "Other browser sessions were signed out; app \
-     passwords and access tokens are unchanged — revoke them below if you suspect them.";
+pub(super) const PASSWORD_CHANGE_DETAIL: &str = "Other browser sessions, IRC connections and \
+     bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke \
+     them below if you suspect them.";
 
 #[derive(serde::Serialize)]
 struct PasswordChangeResponse {
@@ -636,9 +637,19 @@ pub(super) async fn change_password(
         }
     };
     match result {
-        Ok(()) => json_no_store(PasswordChangeResponse {
-            detail: PASSWORD_CHANGE_DETAIL,
-        }),
+        Ok(()) => match super::end_sessions_after_password_change(&state, &account).await {
+            Ok(()) => json_no_store(PasswordChangeResponse {
+                detail: PASSWORD_CHANGE_DETAIL,
+            }),
+            Err(error) => problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Password changed; live IRC sessions not ended",
+                Some(&format!(
+                    "The password changed and other browser sessions were signed out, but live \
+                     IRC connections could not be ended: {error}"
+                )),
+            ),
+        },
         Err(crate::db::DbError::BadCredentials) => problem(
             StatusCode::UNAUTHORIZED,
             "Current password is incorrect",

@@ -18,6 +18,30 @@ mod deadline;
 type UiSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Link an OpenID Connect identity as a recently signed-in browser session of
+/// the account does; the session is removed afterwards, so it counts in
+/// nothing the test goes on to check.
+async fn link_identity(
+    pool: &sqlx::PgPool,
+    account: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<e6ircd::db::LinkOutcome, e6ircd::db::DbError> {
+    let session = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established(account),
+        None,
+    )
+    .await?;
+    let linked = e6ircd::db::link_oidc_identity(pool, &session, account, issuer, subject).await;
+    sqlx::query("DELETE FROM web_sessions WHERE token_hash = sha256(convert_to($1, 'UTF8'))")
+        .bind(&session)
+        .execute(pool)
+        .await
+        .expect("remove the linking session");
+    linked
+}
+
 async fn upstream() -> std::net::SocketAddr {
     let cfg = Config {
         server_name: "irc.up.example".into(),
@@ -587,21 +611,9 @@ async fn every_revocation_path_closes_the_sockets_its_credential_opened() {
     .await;
 
     let issuer = "https://idp.example";
-    db::link_oidc_identity(
-        &pool,
-        &db::create_web_session(
-            &pool,
-            &db::VerifiedAccount::established("alice".to_string()),
-            None,
-        )
+    link_identity(&pool, "alice", issuer, "subject-1")
         .await
-        .expect("linking session"),
-        "alice",
-        issuer,
-        "subject-1",
-    )
-    .await
-    .expect("link");
+        .expect("link");
     let asserted = db::create_web_session_with_identity(
         &pool,
         &e6ircd::db::VerifiedAccount::established("alice"),

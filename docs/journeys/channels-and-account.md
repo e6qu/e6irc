@@ -81,7 +81,9 @@ current primary password unless the account has none.
 **Flow.**
 
 - View secret-free credential posture: kind, label, created/last-used state.
-- Add or rotate the one primary password.
+- Add or rotate the one primary password: at least 8 characters. The change
+  signs out the account's other browser sessions and ends its live IRC
+  sessions and bouncer attachments.
 - Create a bounded number of app passwords; the plaintext is shown once.
 - Revoke an exact app-password credential.
 - Use either primary or app password through SASL PLAIN.

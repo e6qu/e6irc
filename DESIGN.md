@@ -539,6 +539,19 @@ These are project-wide rules, enforced in review and (where possible) CI:
     download) goes through `DeadlineWriter` or `within_send_deadline`, so a peer that stops reading
     ends its connection at the deadline instead of parking the task that owns
     it — and every resource that task holds — forever.
+  - `AccountLease` — `attach` takes a lease on the account it serves instead
+    of its name, so no attachment can outlive a suspension, deletion or
+    password change: the account lifecycle revokes leases on the mutation
+    lane, and a lease is refused to a credential check that began before the
+    revocation. Attachments to shared and configured networks, which do not
+    stop with the account, once stayed open (§9).
+  - `BoundSession` — an OIDC link and a re-authentication flow both seal the
+    session that started them, so neither can be built unbound; its callback
+    acts only for that session, presented again, still live (§9).
+  - `VerifiedAccount` — a credential check yields the account's stored name,
+    and minting an app password or a browser session takes only that type: a
+    grouped nick's exchange once minted for the typed nick and answered 401
+    after a successful verify.
   - `MutationLane` — the registry's transitions (replace, ensure running,
     remove, remove an owner's networks) exist only on the lane
     `Registry::mutate` hands to a unit of work it runs as its own task, so a
@@ -1782,7 +1795,7 @@ Principal tables (columns abridged):
   only a grace period after expiry, so a late poll is answered RFC 8628
   `expired_token` rather than `invalid_grant`. The device code is a bearer
   secret and is stored only as its SHA-256 (`device_code_hash`, migration
-  0092, which hashed the codes of pending grants in place with the built-in
+  0095, which hashed the codes of pending grants in place with the built-in
   `sha256()`), like every other bearer. A grant records the `client_id` that
   started it — a poll naming another client is `invalid_grant` — and paces its
   polls: `poll_interval_seconds` (5 to start) and `last_polled_at`; a poll
@@ -2311,14 +2324,39 @@ change exactly one durable authority or suspension state by immutable account
 ID. Self-suspension, self-demotion, and suspending/demoting the last active
 durable administrator are conflicts. Account-state
 and network CRUD share one mutation lane. After the durable transaction,
-suspension installs a case-folded deny key on the ordered core thread before
-disconnecting every authenticated IRC session, then stops every active network
-owned by that account. A password verdict already in flight is therefore
-converted to denial instead of recreating a session after the sweep.
-Reactivation removes the core deny key and rebuilds every enabled owned
-network; invalid persisted network configuration fails before changing the
-durable state. A runtime reconciliation failure reports the exact committed
-partial state instead of claiming success.
+suspension revokes, on that lane, every bouncer attachment the account holds —
+on an operator's shared or configured network too (`AccountLease`, below) —
+stops every active network the account stored, holds stopped every network
+the configuration defines for it (`owner_suspended` in the administrator
+inventory), and installs a case-folded deny key on the ordered core thread
+before disconnecting every authenticated IRC session, registered or still
+registering. A password verdict already in flight is therefore converted to
+denial instead of recreating a session after the sweep. Reactivation removes
+the core deny key, rebuilds every enabled owned network and restarts the
+configured ones its suspension held; invalid persisted network configuration
+fails before changing the durable state. Deletion revokes and stops the same
+way, and holds the configured networks for good (`owner_deleted`: their owner
+is gone); a process that starts after a suspension or deletion starts them
+held. A runtime reconciliation failure reports the exact committed partial
+state instead of claiming success.
+
+An attachment ends with its account's authority. `attach` takes an
+`AccountLease` on the account it serves — it cannot be called without one —
+and relays until the lease is revoked, telling the client why. The attach
+listener takes a `RevocationTicket` before it checks any credential and spends
+it on the lease after the handshake: a suspension, deletion or password change
+of the account in between refuses the lease, so a password verified a moment
+before the suspension committed cannot open an attachment after the sweep.
+`/ws/ui` sockets end with their browser credential (`CredentialLease`, above).
+
+A password change — rotation or a first password, from a browser session, so
+never from an IRC session — also ends every live IRC session and bouncer
+attachment of the account, however they authenticated (app passwords and
+tokens included; they stay valid and can sign in again). It is the suspension
+sweep without its gate: attachments are revoked on the mutation lane, and every
+core shard closes the account's sessions and refuses a verdict for a
+credential check queued before the change (`EndAccountSessions`); a check
+queued afterwards reads the new credentials.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and
@@ -4398,7 +4436,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   account held (local and app passwords, personal access tokens, device
   grants, browser sessions) exactly as suspension does, through one shared
   revocation. A primary password change or addition ends every other browser
-  session in the same transaction; app passwords and personal access tokens
+  session in the same transaction, then every live IRC session and bouncer
+  attachment of the account (§9); app passwords and personal access tokens
   are separately managed and left unchanged, and the response says so.
   Console pages authenticate by browser session only: a bearer — whatever its
   scopes — gets 401, and suspension or an unavailable database surface as
@@ -4529,7 +4568,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   cookie, the shared authentication rate limit, a 32–512-byte deployment
   secret, constant-time digest comparison, and an atomic empty-store check.
   Account suspension revokes bearer material transactionally and is enforced
-  again by the ordered core so in-flight verification cannot race the action.
+  again by the ordered core so in-flight verification cannot race the action,
+  and by the attach listener's ticket-then-lease (`AccountLease`, §9), so a
+  bouncer attachment cannot either.
 
 ---
 

@@ -14633,6 +14633,129 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
     assert_eq!(page.entries.len(), 1, "reactivation removes the live gate");
 }
 
+/// A connection that authenticated with SASL but has not ended CAP
+/// negotiation, so it holds the account without being registered.
+fn sasl_authenticated_unregistered(s: &mut TestServer, id: u64, account: &str) -> ConnId {
+    let c = s.connect(id);
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(
+        c,
+        &format!("AUTHENTICATE {}", b64(&format!("\0{account}\0pw"))),
+    );
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: account.into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert!(has_numeric(&s.drain(c), "903"));
+    c
+}
+
+/// The suspension sweep closes a connection that authenticated but had not
+/// registered yet: it used to be skipped for want of a nick to KILL, and then
+/// registered as the suspended account.
+#[test]
+fn account_suspension_closes_an_authenticated_session_still_registering() {
+    let mut server = TestServer::new();
+    let registering = sasl_authenticated_unregistered(&mut server, 10, "alice");
+    let suspended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::SetAccountSuspended {
+            account: "alice".into(),
+            suspended: true,
+            reason: "Account suspended".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(
+        matches!(suspended, e6ircd::core::AdminReply::Ok(message) if message.contains("Disconnected 1"))
+    );
+    let out = server.drain(registering);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with("ERROR") && line.contains("Account suspended")),
+        "{out:#?}"
+    );
+    server.line(registering, "NICK alice");
+    server.line(registering, "USER a 0 * :A");
+    server.line(registering, "CAP END");
+    assert!(
+        !has_numeric(&server.drain(registering), "001"),
+        "the closed session does not go on to register"
+    );
+}
+
+/// A password change ends every live session of the account — registered or
+/// still registering — and refuses a verdict for a check queued before it,
+/// without the lasting gate a suspension installs: a check queued afterwards
+/// read the new credentials and logs in.
+#[test]
+fn a_password_change_ends_the_accounts_sessions_and_its_in_flight_verdicts() {
+    use e6ircd::core::AdminReply;
+    let mut server = TestServer::new();
+    let registered = server.register(10, "AliceOne");
+    identify(&mut server, registered, "Alice");
+    let registering = sasl_authenticated_unregistered(&mut server, 20, "ALICE");
+    let bob = server.register(30, "Bob");
+    identify(&mut server, bob, "Bob");
+    // A password checked before the change, whose verdict lands after it.
+    let raced = server.register(40, "Raced");
+    server.line(raced, "PRIVMSG NickServ :IDENTIFY Alice old-password");
+    server.db_requests();
+
+    let ended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::EndAccountSessions {
+            account: "alice".into(),
+            reason: "Password changed".into(),
+            actor: "alice".into(),
+        },
+    );
+    assert!(
+        matches!(&ended, AdminReply::Ok(message) if message.contains("Disconnected 2")),
+        "{ended:?}"
+    );
+    for connection in [registered, registering] {
+        assert!(
+            server
+                .drain(connection)
+                .iter()
+                .any(|line| line.contains("ERROR") && line.contains("Password changed")),
+            "every session of the account ends"
+        );
+    }
+    server.line(bob, "PING :still-here");
+    assert!(server.drain(bob).iter().any(|line| line.contains(" PONG ")));
+
+    server.core.handle(Input::DbReply {
+        conn: raced,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "Alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    assert!(
+        server
+            .drain(raced)
+            .iter()
+            .any(|line| line.contains("Invalid password")),
+        "a verdict for the old password is refused"
+    );
+    identify(&mut server, raced, "Alice");
+    server.line(raced, "WHOIS Raced");
+    assert!(
+        server
+            .drain(raced)
+            .iter()
+            .any(|line| line.contains(" 330 ") && line.contains("Alice")),
+        "a check queued after the change logs in: no gate stays"
+    );
+}
+
 #[test]
 fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
     let mut server = TestServer::new();

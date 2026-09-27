@@ -99,6 +99,30 @@ async fn list_audit_log(
     .entries)
 }
 
+/// Link an OpenID Connect identity as a recently signed-in browser session of
+/// the account does; the session is removed afterwards, so it counts in
+/// nothing the test goes on to check.
+async fn link_identity(
+    pool: &sqlx::PgPool,
+    account: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<e6ircd::db::LinkOutcome, e6ircd::db::DbError> {
+    let session = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established(account),
+        None,
+    )
+    .await?;
+    let linked = e6ircd::db::link_oidc_identity(pool, &session, account, issuer, subject).await;
+    sqlx::query("DELETE FROM web_sessions WHERE token_hash = sha256(convert_to($1, 'UTF8'))")
+        .bind(&session)
+        .execute(pool)
+        .await
+        .expect("remove the linking session");
+    linked
+}
+
 static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// The client the device grants of these tests are started for.
@@ -6066,21 +6090,9 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
     .await
     .expect("browser session");
     assert_eq!(
-        db::link_oidc_identity(
-            &pool,
-            &db::create_web_session(
-                &pool,
-                &db::VerifiedAccount::established("Alice".to_string()),
-                None
-            )
+        link_identity(&pool, "Alice", "https://issuer.example", "alice-subject")
             .await
-            .expect("linking session"),
-            "Alice",
-            "https://issuer.example",
-            "alice-subject"
-        )
-        .await
-        .expect("OIDC link"),
+            .expect("OIDC link"),
         db::LinkOutcome::Linked
     );
     sqlx::query(
@@ -6930,58 +6942,22 @@ async fn oidc_identity_link_list_and_conflict() {
 
     // First link attaches; a repeat for the same account is idempotent.
     assert_eq!(
-        db::link_oidc_identity(
-            &pool,
-            &db::create_web_session(
-                &pool,
-                &db::VerifiedAccount::established("alice".to_string()),
-                None
-            )
+        link_identity(&pool, "alice", "https://idp.example", "sub-1")
             .await
-            .expect("linking session"),
-            "alice",
-            "https://idp.example",
-            "sub-1"
-        )
-        .await
-        .expect("link"),
+            .expect("link"),
         LinkOutcome::Linked
     );
     assert_eq!(
-        db::link_oidc_identity(
-            &pool,
-            &db::create_web_session(
-                &pool,
-                &db::VerifiedAccount::established("alice".to_string()),
-                None
-            )
+        link_identity(&pool, "alice", "https://idp.example", "sub-1")
             .await
-            .expect("linking session"),
-            "alice",
-            "https://idp.example",
-            "sub-1"
-        )
-        .await
-        .expect("relink"),
+            .expect("relink"),
         LinkOutcome::AlreadyYours
     );
     // The same identity cannot be claimed by another account.
     assert_eq!(
-        db::link_oidc_identity(
-            &pool,
-            &db::create_web_session(
-                &pool,
-                &db::VerifiedAccount::established("bob".to_string()),
-                None
-            )
+        link_identity(&pool, "bob", "https://idp.example", "sub-1")
             .await
-            .expect("linking session"),
-            "bob",
-            "https://idp.example",
-            "sub-1"
-        )
-        .await
-        .expect("steal"),
+            .expect("steal"),
         LinkOutcome::Conflict
     );
     // A suspended account cannot gain a login identity.
@@ -7004,21 +6980,9 @@ async fn oidc_identity_link_list_and_conflict() {
         .expect("reactivate bob");
 
     // A second identity for alice; listing is issuer/subject-ordered.
-    db::link_oidc_identity(
-        &pool,
-        &db::create_web_session(
-            &pool,
-            &db::VerifiedAccount::established("alice".to_string()),
-            None,
-        )
+    link_identity(&pool, "alice", "https://idp.example", "sub-0")
         .await
-        .expect("linking session"),
-        "alice",
-        "https://idp.example",
-        "sub-0",
-    )
-    .await
-    .expect("link2");
+        .expect("link2");
     let identities = db::list_oidc_identities(&pool, "alice")
         .await
         .expect("list");
@@ -7116,21 +7080,9 @@ async fn oidc_identity_link_list_and_conflict() {
         db::find_or_create_oidc_account(&pool, "https://idp.example", "oidc-only-0", "oidc-only")
             .await
             .expect("OIDC-only account");
-    db::link_oidc_identity(
-        &pool,
-        &db::create_web_session(
-            &pool,
-            &db::VerifiedAccount::established(oidc_only.to_string()),
-            None,
-        )
+    link_identity(&pool, &oidc_only, "https://idp.example", "oidc-only-1")
         .await
-        .expect("linking session"),
-        &oidc_only,
-        "https://idp.example",
-        "oidc-only-1",
-    )
-    .await
-    .expect("second OIDC-only identity");
+        .expect("second OIDC-only identity");
     let oidc_identities = db::list_oidc_identities(&pool, &oidc_only)
         .await
         .expect("OIDC-only identities");
@@ -10697,7 +10649,7 @@ async fn device_grants_name_their_account_by_id() {
     .execute(&pool)
     .await
     .expect("grants");
-    MIGRATIONS.run_to(91, &pool).await.expect("through 0091");
+    MIGRATIONS.run_to(94, &pool).await.expect("through 0094");
     let rows: Vec<(String, Option<i64>)> =
         sqlx::query_as("SELECT device_code, account_id FROM device_grants ORDER BY device_code")
             .fetch_all(&pool)
@@ -10719,7 +10671,7 @@ async fn device_grants_name_their_account_by_id() {
     assert_eq!(left, 1, "the account's approved grant went with it");
 }
 
-/// 0092 keeps only a device code's digest — the one the server computes — so
+/// 0095 keeps only a device code's digest — the one the server computes — so
 /// a grant started before the upgrade is still collected with its code, and
 /// is its command-line client's.
 #[tokio::test]
@@ -10728,7 +10680,7 @@ async fn device_codes_are_hashed_in_place_by_migration() {
     let pool = plain_pool(&support::test_db("device_codes_are_hashed_in_place_by_migration").await)
         .await
         .expect("connect");
-    MIGRATIONS.run_to(91, &pool).await.expect("through 0091");
+    MIGRATIONS.run_to(94, &pool).await.expect("through 0094");
     sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice')")
         .execute(&pool)
         .await

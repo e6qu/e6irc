@@ -934,9 +934,31 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // them). Server-level [[network]]s start first, then each account's
     // persisted networks are loaded and started.
     let bnc_registry = if pool.is_some() || !config.networks.is_empty() {
+        // A configured network whose owner is suspended or deleted starts
+        // held, as the account lifecycle left it.
+        let mut holds = std::collections::HashMap::new();
+        if let Some(pool) = &pool {
+            let owners: Vec<String> = config
+                .networks
+                .iter()
+                .filter_map(|entry| entry.owner.as_deref())
+                .map(|owner| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner))
+                .collect();
+            for (owner, standing) in crate::db::inactive_network_owners(pool, &owners)
+                .await
+                .map_err(io::Error::other)?
+            {
+                let hold = match standing {
+                    crate::db::OwnerStanding::Suspended => crate::bouncer::OwnerHold::Suspended,
+                    crate::db::OwnerStanding::Deleted => crate::bouncer::OwnerHold::Deleted,
+                };
+                holds.insert(owner, hold);
+            }
+        }
         let reg = Arc::new(
             crate::bouncer::Registry::start_observed(
                 &config.networks,
+                &holds,
                 pool.clone(),
                 crate::bouncer::CoreHandles {
                     core_tx: core_tx.clone(),
@@ -3097,6 +3119,7 @@ mod tests {
                     sasl_password: None,
                     server_password: None,
                 }],
+                &std::collections::HashMap::new(),
                 None,
                 crate::bouncer::CoreHandles {
                     core_tx: CoreIngress::single(core_tx),
@@ -3244,6 +3267,7 @@ mod tests {
         let registry = Arc::new(
             crate::bouncer::Registry::start_observed(
                 &[],
+                &std::collections::HashMap::new(),
                 None,
                 crate::bouncer::CoreHandles {
                     core_tx: CoreIngress::single(core_tx),

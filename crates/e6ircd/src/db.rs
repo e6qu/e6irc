@@ -2372,6 +2372,46 @@ pub async fn list_suspended_accounts(pool: &PgPool) -> Result<Vec<String>, DbErr
         .map_err(query_error)
 }
 
+/// Why an account can no longer own a running network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerStanding {
+    Suspended,
+    /// Deleted: its name is retired.
+    Deleted,
+}
+
+/// Of the folded account names in `owners`, those whose account is suspended
+/// or was deleted — the owners whose configured networks start held.
+pub async fn inactive_network_owners(
+    pool: &PgPool,
+    owners: &[String],
+) -> Result<Vec<(String, OwnerStanding)>, DbError> {
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT o.folded, a.id IS NULL
+         FROM unnest($1::text[]) AS o(folded)
+         LEFT JOIN accounts a ON a.name_folded = o.folded
+         WHERE (a.id IS NOT NULL AND (a.flags & $2) <> 0)
+            OR (a.id IS NULL
+                AND EXISTS (SELECT 1 FROM retired_account_names r WHERE r.name_folded = o.folded))",
+    )
+    .bind(owners)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(owner, deleted)| {
+            let standing = if deleted {
+                OwnerStanding::Deleted
+            } else {
+                OwnerStanding::Suspended
+            };
+            (owner, standing)
+        })
+        .collect())
+}
+
 pub async fn account_name_by_id(pool: &PgPool, account_id: i64) -> Result<Option<String>, DbError> {
     sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1")
         .bind(account_id)

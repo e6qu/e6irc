@@ -330,6 +330,22 @@ fn oauth_error(code: &'static str, description: Option<&'static str>) -> Respons
     response
 }
 
+/// A device endpoint's form parameters, or the answer to a malformed form:
+/// RFC 6749's `invalid_request` saying `expected`, except a body past the size
+/// limit, which is the `413` every endpoint gives.
+fn oauth_form<T>(
+    form: Result<Form<T>, axum::extract::rejection::FormRejection>,
+    expected: &'static str,
+) -> Result<T, Response> {
+    match form {
+        Ok(Form(form)) => Ok(form),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => Err(
+            body_rejection(rejection.status(), "Invalid form", &rejection.to_string()),
+        ),
+        Err(_) => Err(oauth_error("invalid_request", Some(expected))),
+    }
+}
+
 /// An OAuth parameter as RFC 6749 §3.1 reads it: one sent without a value is
 /// treated as omitted.
 fn oauth_parameter(value: Option<String>) -> Option<String> {
@@ -355,11 +371,12 @@ pub(super) async fn device_start(
     _rl: RateLimited,
     form: Result<Form<DeviceStartForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let Ok(Form(form)) = form else {
-        return oauth_error(
-            "invalid_request",
-            Some("send client_id as application/x-www-form-urlencoded, each parameter once"),
-        );
+    let form = match oauth_form(
+        form,
+        "send client_id as application/x-www-form-urlencoded, each parameter once",
+    ) {
+        Ok(form) => form,
+        Err(response) => return response,
     };
     let Some(client) = oauth_parameter(form.client_id) else {
         return oauth_error("invalid_request", Some("client_id is required"));
@@ -436,14 +453,13 @@ pub(super) async fn device_token(
     _rl: RateLimited,
     form: Result<Form<DeviceTokenForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let Ok(Form(form)) = form else {
-        return oauth_error(
-            "invalid_request",
-            Some(
-                "send grant_type, device_code and client_id as \
-                 application/x-www-form-urlencoded, each parameter once",
-            ),
-        );
+    let form = match oauth_form(
+        form,
+        "send grant_type, device_code and client_id as \
+         application/x-www-form-urlencoded, each parameter once",
+    ) {
+        Ok(form) => form,
+        Err(response) => return response,
     };
     let (Some(grant_type), Some(device_code), Some(client)) = (
         oauth_parameter(form.grant_type),
@@ -3163,7 +3179,7 @@ mod token_request_tests {
         Form::<T>::from_request(request, &())
             .await
             .ok()
-            .map(|Form(form)| form)
+            .map(|form| form.0)
     }
 
     /// RFC 6749 §3.1: an OAuth endpoint ignores parameters it does not

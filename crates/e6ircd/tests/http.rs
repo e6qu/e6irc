@@ -82,6 +82,30 @@ fn test_config() -> Config {
     }
 }
 
+/// Link an OpenID Connect identity as a recently signed-in browser session of
+/// the account does; the session is removed afterwards, so it counts in
+/// nothing the test goes on to check.
+async fn link_identity(
+    pool: &sqlx::PgPool,
+    account: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<e6ircd::db::LinkOutcome, e6ircd::db::DbError> {
+    let session = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established(account),
+        None,
+    )
+    .await?;
+    let linked = e6ircd::db::link_oidc_identity(pool, &session, account, issuer, subject).await;
+    sqlx::query("DELETE FROM web_sessions WHERE token_hash = sha256(convert_to($1, 'UTF8'))")
+        .bind(&session)
+        .execute(pool)
+        .await
+        .expect("remove the linking session");
+    linked
+}
+
 async fn request(addr: std::net::SocketAddr, req: &str) -> (u16, String, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream.write_all(req.as_bytes()).await.expect("write");
@@ -2741,6 +2765,8 @@ async fn openapi_spec_is_served() {
             "reconnecting",
             "authentication_failed",
             "registration_failed",
+            "owner_suspended",
+            "owner_deleted",
         ])
     );
     let create_network_schema = &v["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]
@@ -2776,7 +2802,6 @@ async fn openapi_spec_is_served() {
         ("/api/v1/me/profile", "patch"),
         ("/api/v1/me/password", "put"),
         ("/api/v1/me/tokens", "post"),
-        ("/api/v1/auth/device/token", "post"),
         ("/api/v1/auth/device/approve", "post"),
         ("/api/v1/admin/bans", "post"),
         ("/api/v1/admin/configuration", "patch"),
@@ -2801,6 +2826,23 @@ async fn openapi_spec_is_served() {
                         .all(|variant| variant["additionalProperties"] == false)
             });
         assert!(closed, "{method} {path}");
+    }
+    // The RFC 8628 endpoints take forms, and ignore parameters they do not
+    // define (RFC 6749 §3.1).
+    for (path, required) in [
+        (
+            "/api/v1/auth/device/start",
+            serde_json::json!(["client_id"]),
+        ),
+        (
+            "/api/v1/auth/device/token",
+            serde_json::json!(["grant_type", "device_code", "client_id"]),
+        ),
+    ] {
+        let schema = &v["paths"][path]["post"]["requestBody"]["content"]["application/x-www-form-urlencoded"]
+            ["schema"];
+        assert_eq!(schema["required"], required, "{path}");
+        assert!(schema["additionalProperties"].is_null(), "{path}");
     }
     let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"];
@@ -3113,7 +3155,7 @@ async fn openapi_spec_is_served() {
     assert_eq!(
         v["paths"]["/api/v1/me/password"]["put"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["properties"]["detail"]["const"],
-        "Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them."
+        "Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them."
     );
     assert!(v["paths"]["/api/v1/me/password"]["put"]["responses"]["204"].is_null());
     let callback_parameters =
@@ -5373,15 +5415,8 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
         .await
         .expect("API token");
     assert_eq!(
-        e6ircd::db::link_oidc_identity(
+        link_identity(
             &pool,
-            &e6ircd::db::create_web_session(
-                &pool,
-                &e6ircd::db::VerifiedAccount::established("Alice".to_string()),
-                None
-            )
-            .await
-            .expect("linking session"),
             "Alice",
             "https://issuer.example",
             "sensitive-subject",
@@ -8085,36 +8120,12 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
-    e6ircd::db::link_oidc_identity(
-        &pool,
-        &e6ircd::db::create_web_session(
-            &pool,
-            &e6ircd::db::VerifiedAccount::established("alice".to_string()),
-            None,
-        )
+    link_identity(&pool, "alice", "https://idp.example", "alice-primary")
         .await
-        .expect("linking session"),
-        "alice",
-        "https://idp.example",
-        "alice-primary",
-    )
-    .await
-    .expect("primary identity");
-    e6ircd::db::link_oidc_identity(
-        &pool,
-        &e6ircd::db::create_web_session(
-            &pool,
-            &e6ircd::db::VerifiedAccount::established("alice".to_string()),
-            None,
-        )
+        .expect("primary identity");
+    link_identity(&pool, "alice", "https://idp.example", "alice-secondary")
         .await
-        .expect("linking session"),
-        "alice",
-        "https://idp.example",
-        "alice-secondary",
-    )
-    .await
-    .expect("secondary identity");
+        .expect("secondary identity");
     let session = e6ircd::db::create_web_session(
         &pool,
         &e6ircd::db::VerifiedAccount::established("alice"),
@@ -8249,7 +8260,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         Some("Second@new.example".into())
     );
 
-    let api_password = r#"{"current_password":"pw","new_password":"api-pw"}"#;
+    let api_password = r#"{"current_password":"pw","new_password":"api-password"}"#;
     let api_change_without_csrf = format!(
         "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\
@@ -8269,12 +8280,12 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert_eq!(status, 200, "{body}");
     assert!(
         body.contains(
-            "Other browser sessions were signed out; app passwords and access tokens are unchanged"
+            "Other browser sessions, IRC connections and bouncer attachments were signed out; app passwords and access tokens are unchanged"
         ),
         "{body}"
     );
     assert_eq!(
-        e6ircd::db::verify_local_password(&pool, "alice", "api-pw")
+        e6ircd::db::verify_local_password(&pool, "alice", "api-password")
             .await
             .expect("API password verify"),
         Some(e6ircd::db::VerifiedAccount::established("alice"))

@@ -117,7 +117,9 @@ after an unlink.
    a cross-site link, which carries only the cookie, is refused.
 3. The callback applies the provider's verified exact-email-domain policy,
    then attaches the validated `(issuer, subject)` to the initiating account
-   only if no other account owns it.
+   only if no other account owns it, and only for the browser session that
+   started the link: this browser presents it again, and it is still live, the
+   account's, and recently authenticated when the identity is inserted.
 4. Unlink requires an authenticated, CSRF-protected console form or the
    owner-scoped `DELETE /api/v1/me/identities/{id}`.
 5. The account remains usable through its remaining credentials/identities.
@@ -128,7 +130,10 @@ provider domain policy is rejected before linking. A first sign-in through a
 provider that names accounts by email is refused unless the address is
 verified and the provider has an allowed-domain policy. Unlinking an identity
 outside the caller’s account is indistinguishable from absence. The server
-refuses a mutation that would violate the account’s access invariants.
+refuses a mutation that would violate the account’s access invariants. A link
+whose starting session was signed out or ended by a password change before
+the provider answered, or that returns in another session, is refused (`403`)
+and links nothing.
 
 **Security and observability.** Link state and PKCE are bound to the initiating
 session. The callback trusts only validated issuer/subject identity, unlink is
@@ -136,8 +141,9 @@ CSRF-protected and owner-scoped, and neither provider tokens nor claims are
 written to audit details.
 
 **Evidence.** Proven at real Dex/PostgreSQL level by
-`oidc_identity_link_flow_and_conflict` and
-`oidc_identity_link_list_and_conflict`; console rendering/mutation is covered
+`oidc_identity_link_flow_and_conflict`,
+`oidc_identity_link_list_and_conflict` and
+`an_identity_links_only_for_a_live_recent_session_of_the_account`; console rendering/mutation is covered
 by `account_console_manages_credentials_tokens_and_identities`.
 
 ## Join through an administrator invitation

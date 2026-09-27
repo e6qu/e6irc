@@ -1181,7 +1181,7 @@ async fn a_restart_restores_the_whole_configured_buffer() {
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
          SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :restored ' || n,
-                '2026-01-01T00:00:00.000Z'
+                to_char((now() - interval '1 hour') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(STORED)
@@ -4030,7 +4030,8 @@ async fn the_backlog_cap_holds_across_restarts() {
     // A buffer already at the cap, as a long-running network leaves it.
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
-         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n, '2026-01-01T00:00:00.000Z'
+         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n,
+                to_char((now() - interval '1 hour') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(CAP as i32)
@@ -4801,4 +4802,260 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
                 .is_some_and(|text| text.starts_with("2 message(s) before your read markers"))),
         "{replayed:#?}"
     );
+}
+
+// ---- an attachment ends with its account's authority -----------------------
+
+/// One HTTP/1.1 request, answered in full: its status and body.
+async fn http_call(
+    http: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(http).await.expect("connect");
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: t\r\n{headers}Content-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.expect("read");
+    let response = String::from_utf8_lossy(&response).to_string();
+    let status = response
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("status");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// Attach to `network` as alice through the attach listener.
+async fn attach_alice(
+    bnc: std::net::SocketAddr,
+    network: &str,
+    password: &str,
+) -> e6irc_client::Connection {
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .expect("connect");
+    let nick = format!("alice/{network}");
+    client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: &nick,
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            password,
+        )
+        .await
+        .expect("attach");
+    client
+}
+
+/// Read until the attachment ends, returning what it was told last.
+async fn detached(client: &mut e6irc_client::Connection) -> Vec<String> {
+    tokio::time::timeout(deadline::HANG, async {
+        let mut said = Vec::new();
+        loop {
+            match client.next_message().await {
+                Ok(Some(message)) => said.push(message.params.join(" ")),
+                Ok(None) | Err(_) => return said,
+            }
+        }
+    })
+    .await
+    .expect("the attachment stayed open")
+}
+
+/// The configured network `up` as the administrator inventory shows it.
+async fn inventory_state(http: std::net::SocketAddr, token: &str) -> String {
+    let (status, body) = http_call(
+        http,
+        "GET",
+        "/api/v1/admin/networks",
+        &format!("Authorization: Bearer {token}\r\n"),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let inventory: serde_json::Value = serde_json::from_str(&body).expect("inventory JSON");
+    inventory["networks"]
+        .as_array()
+        .expect("networks")
+        .iter()
+        .find(|network| network["name"] == "up")
+        .and_then(|network| network["runtime"]["state"].as_str())
+        .expect("up's state")
+        .to_string()
+}
+
+/// Suspending an account ends every attachment it holds — on an operator's
+/// shared network and on the network the configuration defines for it, which
+/// the attach listener used to leave open for as long as the client liked —
+/// and holds the configured network stopped, as the administrator inventory
+/// shows, until reactivation restarts it. A password change ends the
+/// account's attachments and live IRC sessions the same way.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_account_lifecycle_ends_attachments_and_holds_configured_networks() {
+    let url = bnc_account_db(
+        "the_account_lifecycle_ends_attachments_and_holds_configured_networks",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_by_administrator(
+        &pool,
+        "root",
+        "administrator password",
+        None,
+        true,
+        "root",
+    )
+    .await
+    .expect("administrator");
+    let admin = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "root",
+        "administrator API",
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("administrator token");
+    let alice_id = e6ircd::db::account_id_by_name(&pool, "alice")
+        .await
+        .expect("lookup")
+        .expect("alice");
+    let up = upstream().await;
+    let mut config = bnc_config(up, url);
+    config.networks.push(e6ircd::config::NetworkEntry {
+        kind: NetworkKind::Irc,
+        name: "shared".into(),
+        owner: None,
+        addr: up.to_string(),
+        tls: false,
+        nick: "sharednick".into(),
+        username: Some("tester".into()),
+        realname: Some("shared".into()),
+        autojoin: vec![],
+        buffer_cap: 100,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    });
+    config.http = Some(e6ircd::config::HttpConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        public_url: None,
+        secure_cookies: false,
+        admin_accounts: vec![],
+        hsts_include_subdomains: false,
+    });
+    let running = net::start(config).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    let http = running.http_addr.expect("http bound");
+    wait_joined(up, "bncnick", "#lobby").await;
+
+    let mut configured = attach_alice(bnc, "up", "s3cr3t-password").await;
+    let mut shared = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let suspend = |suspended: bool| {
+        let path = format!("/api/v1/admin/accounts/{alice_id}");
+        let authorization = format!("Authorization: Bearer {admin}\r\n");
+        let body = format!(r#"{{"suspended":{suspended}}}"#);
+        async move { http_call(http, "PATCH", &path, &authorization, &body).await }
+    };
+    let (status, body) = suspend(true).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("1 configured"), "{body}");
+    for (network, client) in [("up", &mut configured), ("shared", &mut shared)] {
+        let said = detached(client).await;
+        assert!(
+            said.iter()
+                .any(|text| text.contains("suspended or deleted")),
+            "{network}: {said:#?}"
+        );
+    }
+    assert_eq!(inventory_state(http, &admin).await, "owner_suspended");
+    wait_gone(up, "bncnick").await;
+
+    // Reactivation restarts the operator's network for the account.
+    let (status, body) = suspend(false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("1 configured"), "{body}");
+    wait_joined(up, "bncnick", "#lobby").await;
+    assert_ne!(inventory_state(http, &admin).await, "owner_suspended");
+
+    // A password change ends the account's attachments and IRC sessions.
+    let mut attached = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let irc = running.addrs[0];
+    let mut session = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("connect");
+    session
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t-password",
+        )
+        .await
+        .expect("IRC login");
+    let browser = e6ircd::db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("browser session");
+    let cookie = format!("Cookie: e6irc_session={browser}\r\n");
+    let (status, me) = http_call(http, "GET", "/api/v1/me", &cookie, "").await;
+    assert_eq!(status, 200, "{me}");
+    let me: serde_json::Value = serde_json::from_str(&me).expect("me JSON");
+    let csrf = me["csrf_token"].as_str().expect("CSRF").to_string();
+    let (status, body) = http_call(
+        http,
+        "PUT",
+        "/api/v1/me/password",
+        &format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n"),
+        r#"{"current_password":"s3cr3t-password","new_password":"a new passphrase"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("IRC connections"), "{body}");
+    let said = detached(&mut attached).await;
+    assert!(
+        said.iter().any(|text| text.contains("password changed")),
+        "{said:#?}"
+    );
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter().any(|text| text.contains("Password changed")),
+        "{said:#?}"
+    );
+    // The new password attaches.
+    attach_alice(bnc, "shared", "a new passphrase").await;
 }

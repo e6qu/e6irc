@@ -1779,6 +1779,10 @@ pub(crate) struct Session {
     pub credential_attempts: crate::identity::CredentialAttemptBudget,
     /// Deferred NickServ IDENTIFY reply.
     pub pending_identify: Option<PendingServiceReply>,
+    /// The shard's credential epoch when this session's outstanding
+    /// credential check (SASL or IDENTIFY; one at a time) was queued: its
+    /// verdict is refused if the account's credentials changed since.
+    pub(crate) verify_epoch: u64,
     /// Deferred NickServ REGISTER reply.
     pub pending_register: Option<PendingServiceReply>,
     /// The protected nick this session holds without having identified to
@@ -4493,6 +4497,14 @@ pub(crate) struct ServerState {
     /// verification already in flight cannot re-authenticate after the
     /// suspension event has run.
     pub suspended_accounts: HashSet<AccountKey>,
+    /// Advances each time an account's sessions end for a credential change
+    /// ([`Self::end_credentials`]); a queued credential check records it
+    /// ([`Session::verify_epoch`]).
+    credential_epoch: u64,
+    /// The epoch each account's credentials last changed at, kept while a
+    /// credential check queued before it may still land — which is all a
+    /// verdict compares ([`Self::credentials_ended_since`]).
+    credentials_ended: HashMap<AccountKey, u64>,
     /// Accounts permanently deleted while this process runs. A write already
     /// in flight when one was deleted (MARKREAD, NickServ GROUP or SET
     /// ENFORCE) can answer after its mirror was emptied; the confirmation adds
@@ -5480,6 +5492,20 @@ impl ServerState {
         });
     }
 
+    pub(crate) fn broadcast_account_sessions_ended(
+        &mut self,
+        account: String,
+        reason: String,
+        actor: String,
+    ) {
+        self.effects
+            .push(CoreEffect::BroadcastAccountSessionsEnded {
+                account,
+                reason,
+                actor,
+            });
+    }
+
     pub(crate) fn broadcast_read_marker(
         &mut self,
         account: String,
@@ -5531,6 +5557,8 @@ impl ServerState {
             doomed: Vec::new(),
             effects: Vec::new(),
             suspended_accounts: HashSet::new(),
+            credential_epoch: 0,
+            credentials_ended: HashMap::new(),
             deleted_accounts: HashSet::new(),
             db_tx,
             started_at,
@@ -5894,6 +5922,47 @@ impl ServerState {
 
     pub fn is_account_suspended(&self, account: &str) -> bool {
         self.suspended_accounts.contains(&self.account_key(account))
+    }
+
+    /// Record that `conn` has just queued a credential check.
+    pub(crate) fn credential_check_queued(&mut self, conn: ConnId) {
+        let epoch = self.credential_epoch;
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.verify_epoch = epoch;
+        }
+    }
+
+    /// Whether `account`'s credentials changed after `conn` queued the check
+    /// whose verdict is landing: that verdict speaks for credentials that no
+    /// longer stand, and is refused.
+    pub(crate) fn credentials_ended_since(&self, conn: ConnId, account: &str) -> bool {
+        let Some(session) = self.sessions.get(&conn) else {
+            return false;
+        };
+        self.credentials_ended
+            .get(&self.account_key(account))
+            .is_some_and(|ended| *ended > session.verify_epoch)
+    }
+
+    /// `account`'s credentials changed: a verdict for any check queued before
+    /// now is refused when it lands. Changes no check still outstanding
+    /// predates are forgotten.
+    pub(crate) fn end_credentials(&mut self, account: AccountKey) {
+        self.credential_epoch += 1;
+        let oldest_outstanding = self
+            .sessions
+            .values()
+            .filter(|session| session.sasl_verify.is_some() || session.pending_identify.is_some())
+            .map(|session| session.verify_epoch)
+            .min();
+        match oldest_outstanding {
+            None => self.credentials_ended.clear(),
+            Some(oldest) => {
+                self.credentials_ended.retain(|_, ended| *ended > oldest);
+                self.credentials_ended
+                    .insert(account, self.credential_epoch);
+            }
+        }
     }
 
     /// The channel key for `target`, or `None` when it does not name a
@@ -6510,6 +6579,7 @@ impl ServerState {
                 sasl_buf: String::new(),
                 credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
+                verify_epoch: 0,
                 pending_register: None,
                 nick_enforcement: NickEnforcement::default(),
                 drop_confirmation: None,

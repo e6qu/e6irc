@@ -441,7 +441,7 @@ fn operations() -> serde_json::Value {
                 { "type": "object", "additionalProperties": false,
                     "required": ["state", "state_changed_at", "next_retry_at", "recent_failures", "connected_at", "last_input_at", "last_output_at", "last_error_at", "last_error", "connect_latency_ms", "connection_attempts", "errors", "attached_clients", "traffic", "buffer"],
                     "properties": {
-                        "state": { "type": "string", "enum": ["connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"] },
+                        "state": { "type": "string", "enum": ["connecting", "connected", "reconnecting", "authentication_failed", "registration_failed", "owner_suspended", "owner_deleted"], "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped)." },
                         "state_changed_at": { "type": "string" }, "next_retry_at": { "type": ["string", "null"] },
                         "recent_failures": { "type": "array", "maxItems": crate::bouncer::NETWORK_FAILURE_HISTORY_LIMIT, "items": {
                             "type": "object", "additionalProperties": false, "required": ["at", "code", "summary"],
@@ -1626,7 +1626,7 @@ fn operations() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "200": json_response("primary password changed; other browser sessions signed out", serde_json::json!({
+                        "200": json_response("primary password changed; other browser sessions, IRC connections and bouncer attachments signed out", serde_json::json!({
                             "type": "object", "additionalProperties": false, "required": ["detail"],
                             "properties": { "detail": { "type": "string", "const": super::credentials::PASSWORD_CHANGE_DETAIL } }
                         }))["200"],

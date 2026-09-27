@@ -715,6 +715,34 @@ async fn mutate_account_lifecycle(
         .await
 }
 
+/// End every live IRC session and bouncer attachment of `account`, whose
+/// password just changed — by the browser session that asked, so no IRC
+/// session is the one that made the change. The same sweep as a suspension's,
+/// without its gate: attachments are revoked on the mutation lane, and the
+/// core refuses a verdict for a check queued before the change.
+pub(super) async fn end_sessions_after_password_change(
+    state: &Arc<AppState>,
+    account: &str,
+) -> Result<(), String> {
+    let registry = registry_of(state).clone();
+    let (state, account) = (state.clone(), account.to_owned());
+    registry
+        .mutate(move |lane| async move {
+            lane.revoke_account(&account);
+            core_action(
+                &state,
+                crate::core::AdminRequest::EndAccountSessions {
+                    account: account.clone(),
+                    reason: "Password changed".into(),
+                    actor: account,
+                },
+            )
+            .await
+            .map(|_| ())
+        })
+        .await
+}
+
 /// Suspend or reactivate an account ([`mutate_account_lifecycle`]).
 pub(super) async fn mutate_account_suspension(
     state: &Arc<AppState>,
@@ -793,8 +821,17 @@ async fn account_suspension_in_lane(
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
+        // Every attachment the account holds ends — on the operator's shared
+        // and configured networks too — and a password checked while this
+        // ran cannot open another.
+        lane.revoke_account(&change.folded);
         let stopped_networks = lane
             .remove_owner(&change.folded, crate::bouncer::UnwrittenLines::Store)
+            .await;
+        // The networks the configuration defines for the account stop with
+        // it, held until it is reactivated.
+        let held_configured = lane
+            .hold_configured_owned(&change.folded, crate::bouncer::OwnerHold::Suspended)
             .await;
         core_action(
             state,
@@ -810,12 +847,14 @@ async fn account_suspension_in_lane(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "Account was suspended and {stopped_networks} network(s) stopped, but live IRC disconnect failed: {error}"
+                    "Account was suspended and {stopped_networks} owned and {held_configured} \
+                     configured network(s) stopped, but live IRC disconnect failed: {error}"
                 ),
             )
         })?;
         Ok(format!(
-            "Suspended {} and stopped {stopped_networks} owned network(s).",
+            "Suspended {} and stopped {stopped_networks} owned and {held_configured} configured \
+             network(s).",
             change.name
         ))
     } else {
@@ -855,9 +894,18 @@ async fn account_suspension_in_lane(
                 held.join(", ")
             )
         };
+        // The configured networks its suspension held run again.
+        let (restarted, unbuildable) = lane.release_configured_owned(&change.folded);
+        let unbuildable = if unbuildable.is_empty() {
+            String::new()
+        } else {
+            format!(" Still stopped: {}.", unbuildable.join("; "))
+        };
         Ok(format!(
-            "Reactivated {} and started {started_networks} owned network(s).{held}",
-            change.name
+            "Reactivated {} and started {started_networks} owned and {} configured network(s).\
+             {held}{unbuildable}",
+            change.name,
+            restarted.len()
         ))
     }
 }
@@ -1081,12 +1129,14 @@ mod problem_contract_tests {
     /// malformed request, a well-formed but invalid logout token included.
     /// Sign-out reads its form only as one of two places the CSRF value may
     /// be (a script sends the header and no body), and answers a request
-    /// that proves it in neither with the CSRF refusal.
+    /// that proves it in neither with the CSRF refusal. The two RFC 8628
+    /// device endpoints answer a malformed form with the OAuth
+    /// `invalid_request` error their protocol specifies.
     #[test]
     fn only_parse_form_unwraps_a_form() {
         assert_eq!(
             occurrences(concat!("Form", "(")),
-            vec![("device.rs", 1), ("mod.rs", 1), ("oidc.rs", 1)]
+            vec![("device.rs", 2), ("mod.rs", 1), ("oidc.rs", 1)]
         );
     }
 
