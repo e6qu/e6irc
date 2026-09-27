@@ -725,17 +725,20 @@ pub(crate) fn resolve_ring_window(
             None => miss(selector),
         },
         ChathistorySub::Between => {
-            // Where each pivot sits in the `(ts, id)` order the database orders
-            // them by: a message at its own place, a timestamp before every
-            // message stamped with it. Counting the entries before each would
-            // tie two pivots that both precede the ring, and could take the
-            // newer for the older.
+            // Where each pivot sits in the `(ts, msgid)` order the ring and
+            // the database share (`HistoryPlace`): a message at its own place,
+            // a timestamp before every message stamped with it. Counting the
+            // entries before each would tie two pivots that both precede the
+            // ring, and could take the newer for the older.
             let place = |sel: &Selector| match sel {
                 Selector::Msgid(msgid) => history
                     .iter()
-                    .position(|e| e.msgid == *msgid)
-                    .map(|p| (history[p].ts, p + 1)),
-                Selector::Timestamp(t) => Some((*t, 0)),
+                    .find(|e| e.msgid == *msgid)
+                    .map(crate::core::HistoryRow::place),
+                Selector::Timestamp(t) => Some(crate::core::HistoryPlace {
+                    ts: *t,
+                    msgid: None,
+                }),
                 Selector::Star => None,
             };
             // Both endpoints must resolve in the ring; otherwise the DB does.

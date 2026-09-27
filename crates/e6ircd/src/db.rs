@@ -436,7 +436,7 @@ pub async fn run_migrations(
             .execute(&mut connection)
             .await
             .map_err(DbError::Connect)?;
-        let outcome = migrator.run(&mut connection).await;
+        let outcome = migrate_holding_the_lock(&mut connection, migrator).await;
         // Closing ends the session, which releases the migrator's advisory
         // lock whatever state a failed attempt left it in.
         <sqlx::PgConnection as sqlx::Connection>::close(connection)
@@ -460,6 +460,103 @@ pub async fn run_migrations(
         }
     }
     unreachable!("the final attempt returns its outcome")
+}
+
+/// The index a `-- no-transaction` migration builds, or `None` when it is not
+/// the one shape such a migration may take: a comment header, then exactly one
+/// `CREATE [UNIQUE] INDEX CONCURRENTLY <name> ...;` statement.
+///
+/// That is the only reason a migration runs outside a transaction here — an
+/// index built on a live table without blocking its writers — and holding it
+/// to one statement is what makes an interruption recoverable: a concurrent
+/// build that fails (a lock wait past [`MIGRATION_LOCK_TIMEOUT`], a lost
+/// connection) leaves its index behind *invalid*, and nothing else, so dropping
+/// that index restores the state before the migration.
+fn concurrent_index_name(sql: &str) -> Option<String> {
+    let statement: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let statement = statement.trim();
+    let body = statement.strip_suffix(';')?;
+    if body.contains(';') {
+        return None;
+    }
+    let mut words = body.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    let mut word = words.next()?;
+    if word.eq_ignore_ascii_case("UNIQUE") {
+        word = words.next()?;
+    }
+    if !word.eq_ignore_ascii_case("INDEX") || !words.next()?.eq_ignore_ascii_case("CONCURRENTLY") {
+        return None;
+    }
+    let name = words.next()?;
+    // The name is interpolated into a DROP below: a plain identifier only.
+    let plain = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    (plain && words.next()?.eq_ignore_ascii_case("ON")).then(|| name.to_owned())
+}
+
+/// Take the migrator's advisory lock, drop what an interrupted concurrent
+/// index build left ([`drop_interrupted_index_builds`]), and migrate. The
+/// lock is taken first because a build in progress is invalid too: another
+/// replica migrating holds it for the build's whole length. It is a
+/// session-level lock and re-entrant — the migrator takes it again and
+/// releases its own hold — and closing the connection releases this one.
+async fn migrate_holding_the_lock(
+    connection: &mut sqlx::PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    use sqlx::migrate::Migrate;
+    connection.lock().await?;
+    drop_interrupted_index_builds(connection, migrator).await?;
+    migrator.run(connection).await
+}
+
+/// Drop what an interrupted concurrent index build left: for each
+/// `-- no-transaction` migration ([`concurrent_index_name`]), its index when
+/// PostgreSQL holds it invalid. sqlx records such a migration only after its
+/// statement succeeds, so the next attempt runs it again — and without this it
+/// would fail on the leftover name for good, where a retry after a lock
+/// timeout is exactly what [`run_migrations`] promises. An invalid index serves
+/// no query, so nothing is lost; a valid one (the build finished) is kept.
+async fn drop_interrupted_index_builds(
+    connection: &mut sqlx::PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    for migration in migrator.iter().filter(|migration| migration.no_tx) {
+        let Some(index) = concurrent_index_name(migration.sql.as_str()) else {
+            return Err(sqlx::migrate::MigrateError::Source(
+                format!(
+                    "migration {} runs outside a transaction but is not one CREATE INDEX \
+                     CONCURRENTLY statement",
+                    migration.version
+                )
+                .into(),
+            ));
+        };
+        let invalid: Option<bool> = sqlx::query_scalar(
+            "SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        )
+        .bind(&index)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if invalid == Some(true) {
+            eprintln!(
+                "db: dropping index {index}, left invalid by an interrupted build of migration {}",
+                migration.version
+            );
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP INDEX {index}")))
+                .execute(&mut *connection)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Migrate, then open a pool of the default size — for a one-shot command
@@ -4399,7 +4496,7 @@ macro_rules! history_where {
 
 /// The windowed form: two bounded halves unioned, then ordered as one. The
 /// inner select aliases the timestamp so the outer query can order by it, and
-/// carries `ts`/`id` for that ordering.
+/// carries `ts` for that ordering beside the `msgid` it selects anyway.
 macro_rules! history_window {
     ($scope:expr, $older:literal, $newer:literal) => {
         by_history_scope!($scope, history_window!($older, $newer))
@@ -4409,15 +4506,15 @@ macro_rules! history_window {
             "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
              client_tags FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
-             body, sender_is_bot, multiline, client_tags, ts, id FROM messages ",
+             body, sender_is_bot, multiline, client_tags, ts FROM messages ",
             history_where!($kind),
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
-             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts, id \
+             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts \
              FROM messages ",
             history_where!($kind),
             $newer,
-            ") ) w ORDER BY ts ASC, id ASC"
+            ") ) w ORDER BY ts ASC, msgid COLLATE \"C\" ASC"
         )
     };
 }
@@ -4490,7 +4587,14 @@ pub(crate) async fn query_history_in_scope(
     // and reads only rows at or above it — pivots included, so a msgid from
     // before the floor is as unknown here as one from another buffer.
     let floor = millis_for_database(floor.millis(), "history floor")?;
-    // BETWEEN resolves each pivot's `(ts, id)` in the DB and derives its own
+    // Every page is ordered by `(ts, msgid COLLATE "C")`: the one total order
+    // the hot ring keeps too (`HistoryRow::place`), computed from the message
+    // alone, so a millisecond's lines persisted by different shards are paged
+    // in the order the ring holds them. `"C"` is a byte comparison, as the
+    // ring's; the database's default collation would order the same ids
+    // differently. Index: `messages_target_ts_msgid_idx` (migration 0093).
+    //
+    // BETWEEN resolves each pivot's `(ts, msgid)` in the DB and derives its own
     // direction, so it produces its final oldest-first order itself rather than
     // going through the shared newest-first reversal below.
     if let HistoryQuery::BetweenSelectors {
@@ -4527,7 +4631,7 @@ pub(crate) async fn query_history_in_scope(
         Option<usize>,
     ) = match query {
         HistoryQuery::Latest { limit } => (
-            history_select!(scope, "ORDER BY ts DESC, id DESC LIMIT $3"),
+            history_select!(scope, "ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $3"),
             None,
             limit,
             None,
@@ -4535,7 +4639,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::Before { before_ts, limit } => (
             history_select!(
                 scope,
-                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 before_ts,
@@ -4550,7 +4654,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::LatestAfter { after_ts, limit } => (
             history_select!(
                 scope,
-                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4562,7 +4666,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::LatestAfterMsgid { msgid, limit } => (
             history_select!(
                 scope,
-                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND (ts, msgid COLLATE \"C\") > (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4571,7 +4675,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::After { after_ts, limit } => (
             history_select!(
                 scope,
-                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4584,8 +4688,8 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::Around { around_ts, limit } => (
             history_window!(
                 scope,
-                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
-                "AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4",
+                "AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $5"
             ),
             Some(Position::Millis(millis_for_database(
                 around_ts,
@@ -4594,7 +4698,7 @@ pub(crate) async fn query_history_in_scope(
             limit / 2,
             Some(limit - limit / 2),
         ),
-        // Msgid pivots: page on the composite (ts, id) relative to the
+        // Msgid pivots: page on the composite (ts, msgid) relative to the
         // pivot row so messages sharing the pivot's timestamp are not
         // skipped.
         //
@@ -4610,7 +4714,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::BeforeMsgid { msgid, limit } => (
             history_select!(
                 scope,
-                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                "AND (ts, msgid COLLATE \"C\") < (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4619,7 +4723,7 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::AfterMsgid { msgid, limit } => (
             history_select!(
                 scope,
-                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
+                "AND (ts, msgid COLLATE \"C\") > (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4628,8 +4732,8 @@ pub(crate) async fn query_history_in_scope(
         HistoryQuery::AroundMsgid { msgid, limit } => (
             history_window!(
                 scope,
-                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
-                "AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
+                "AND (ts, msgid COLLATE \"C\") < (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $4",
+                "AND (ts, msgid COLLATE \"C\") >= (SELECT ts, msgid FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $5"
             ),
             Some(Position::Msgid(msgid)),
             limit / 2,
@@ -4681,12 +4785,15 @@ fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbE
     })
 }
 
-/// The BETWEEN query with each endpoint resolved to a `(ts, id)` position *in the
-/// database*, so the span and the paging direction are correct even when a
-/// `msgid=` pivot has scrolled out of the in-memory ring. A `msgid=` pivot is
-/// looked up within this target (an unknown-here msgid yields an empty result,
-/// like the other msgid pivots); a `timestamp=` bound has no id, so it uses id
-/// sentinels that make its comparison ts-only. Returns rows oldest-first.
+/// The BETWEEN query with each endpoint resolved to a `(ts, msgid)` position
+/// *in the database*, so the span and the paging direction are correct even
+/// when a `msgid=` pivot has scrolled out of the in-memory ring. A `msgid=`
+/// pivot is looked up within this target (an unknown-here msgid yields an
+/// empty result, like the other msgid pivots); a `timestamp=` bound has no
+/// msgid and binds a NULL one, which reduces the row comparison to the time
+/// alone (`(ts, m) > (T, NULL)` is `ts > T`) — the place before every message
+/// stamped in its millisecond, as [`crate::core::HistoryPlace`] orders it.
+/// Returns rows oldest-first.
 async fn query_between_selectors(
     pool: &PgPool,
     target: &str,
@@ -4697,16 +4804,11 @@ async fn query_between_selectors(
     scope: crate::core::HistoryScope,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::SelectorBound;
+    /// A pivot's `(ts, msgid)` place; `msgid` is `None` for a timestamp.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
     struct HistoryMarker {
         ts_millis: i64,
-        id: i64,
-        is_timestamp: bool,
-    }
-
-    #[derive(sqlx::FromRow)]
-    struct HistoryMarkerRow {
-        ts_millis: i64,
-        id: i64,
+        msgid: Option<String>,
     }
 
     async fn marker(
@@ -4718,12 +4820,11 @@ async fn query_between_selectors(
         match b {
             SelectorBound::Timestamp(t) => Ok(Some(HistoryMarker {
                 ts_millis: millis_for_database(*t, "history selector")?,
-                id: 0,
-                is_timestamp: true,
+                msgid: None,
             })),
             SelectorBound::Msgid(m) => {
-                let row: Option<HistoryMarkerRow> = sqlx::query_as(
-                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, id \
+                let ts_millis: Option<i64> = sqlx::query_scalar(
+                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint \
                      FROM messages WHERE msgid = $1 AND target = $2 \
                      AND ts >= to_timestamp($3::double precision / 1000)",
                 )
@@ -4733,10 +4834,9 @@ async fn query_between_selectors(
                 .fetch_optional(pool)
                 .await
                 .map_err(query_error)?;
-                Ok(row.map(|row| HistoryMarker {
-                    ts_millis: row.ts_millis,
-                    id: row.id,
-                    is_timestamp: false,
+                Ok(ts_millis.map(|ts_millis| HistoryMarker {
+                    ts_millis,
+                    msgid: Some(m.clone()),
                 }))
             }
         }
@@ -4755,51 +4855,34 @@ async fn query_between_selectors(
     };
     // Order the two pivots; the first selector being the newer bound means the
     // `limit` cuts from the newest end (CHATHISTORY walks first → second).
-    let newest_first = (m1.ts_millis, m1.id) > (m2.ts_millis, m2.id);
+    // `None < Some` and a byte comparison of the ids: `HistoryPlace`'s order.
+    let newest_first = m1 > m2;
     let (older, newer) = if newest_first { (m2, m1) } else { (m1, m2) };
-    // Lower bound (strictly after the older pivot): a timestamp uses id = MAX so
-    // `(ts,id) > (T, MAX)` is `ts > T`. Upper bound (strictly before the newer
-    // pivot): a timestamp uses id = MIN so `(ts,id) < (T, MIN)` is `ts < T`.
-    let (lo_ts, lo_id) = (
-        older.ts_millis,
-        if older.is_timestamp {
-            i64::MAX
-        } else {
-            older.id
-        },
-    );
-    let (hi_ts, hi_id) = (
-        newer.ts_millis,
-        if newer.is_timestamp {
-            i64::MIN
-        } else {
-            newer.id
-        },
-    );
+    // Strictly after the older pivot, strictly before the newer.
     let sql = if newest_first {
         history_select!(
             scope,
             "\
-             AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
-             AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
-             ORDER BY ts DESC, id DESC LIMIT $7"
+             AND (ts, msgid COLLATE \"C\") > (to_timestamp($3::double precision / 1000), $4::text) \
+             AND (ts, msgid COLLATE \"C\") < (to_timestamp($5::double precision / 1000), $6::text) \
+             ORDER BY ts DESC, msgid COLLATE \"C\" DESC LIMIT $7"
         )
     } else {
         history_select!(
             scope,
             "\
-             AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
-             AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
-             ORDER BY ts ASC, id ASC LIMIT $7"
+             AND (ts, msgid COLLATE \"C\") > (to_timestamp($3::double precision / 1000), $4::text) \
+             AND (ts, msgid COLLATE \"C\") < (to_timestamp($5::double precision / 1000), $6::text) \
+             ORDER BY ts ASC, msgid COLLATE \"C\" ASC LIMIT $7"
         )
     };
     let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = sqlx::query_as(sql)
         .bind(target)
         .bind(floor)
-        .bind(lo_ts)
-        .bind(lo_id)
-        .bind(hi_ts)
-        .bind(hi_id)
+        .bind(older.ts_millis)
+        .bind(older.msgid)
+        .bind(newer.ts_millis)
+        .bind(newer.msgid)
         .bind(limit as i64)
         .fetch_all(pool)
         .await;
@@ -4819,7 +4902,7 @@ struct HistoryTargetRow {
 /// The CHATHISTORY TARGETS statement, in a scope's fragments.
 ///
 /// A channel's newest entry in scope is one backward scan of
-/// `messages_target_ts_id_idx` per requested channel (a LATERAL `max(ts)`
+/// `messages_target_ts_msgid_idx` per requested channel (a LATERAL `max(ts)`
 /// becomes `Index Scan Backward ... Limit 1`, stepping over the TAGMSG rows a
 /// text-scope reader cannot be sent); grouping
 /// `WHERE target = ANY(..)` instead read every row of every joined channel to
@@ -10743,6 +10826,38 @@ mod history_sql_tests {
     /// `ts_millis` alias is load-bearing — the computed column needs a name to
     /// bind to. A silent change here would be a runtime bind failure on every
     /// history read, so it is pinned rather than trusted.
+    /// Every migration that runs outside a transaction is one concurrent index
+    /// build whose index can be named, so an interrupted build can be undone;
+    /// anything else in such a file is refused.
+    #[test]
+    fn a_migration_outside_a_transaction_is_one_concurrent_index_build() {
+        let outside: Vec<_> = super::MIGRATOR.iter().filter(|m| m.no_tx).collect();
+        assert!(!outside.is_empty());
+        for migration in outside {
+            assert!(
+                super::concurrent_index_name(migration.sql.as_str()).is_some(),
+                "migration {}",
+                migration.version
+            );
+        }
+        assert_eq!(
+            super::concurrent_index_name(
+                "-- no-transaction\n-- why\nCREATE UNIQUE INDEX CONCURRENTLY a_idx\n    ON t (c);\n"
+            )
+            .as_deref(),
+            Some("a_idx")
+        );
+        for refused in [
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY a_idx ON t (c); DROP INDEX b_idx;",
+            "-- no-transaction\nCREATE INDEX a_idx ON t (c);",
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY IF NOT EXISTS a_idx ON t (c);",
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY \"A\" ON t (c);",
+            "-- no-transaction\nVACUUM messages;",
+        ] {
+            assert_eq!(super::concurrent_index_name(refused), None, "{refused}");
+        }
+    }
+
     #[test]
     fn history_select_expands_to_the_expected_statement() {
         let prefix = "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
@@ -10780,13 +10895,16 @@ mod history_sql_tests {
                 "the millis column is aliased so FromRow can bind it by name: {sql}"
             );
             assert_eq!(
-                sql.matches("ts, id").count(),
+                sql.matches("client_tags, ts ").count(),
                 2,
-                "both halves carry ordering columns"
+                "both halves carry the ordering column"
             );
             assert_eq!(sql.matches("kind <> 'tagmsg'").count(), cuts, "{sql}");
             assert_eq!(sql.matches("client_tags").count(), 3, "{sql}");
-            assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
+            assert!(
+                sql.trim_end()
+                    .ends_with(r#"ORDER BY ts ASC, msgid COLLATE "C" ASC"#)
+            );
             assert!(sql.contains("UNION ALL"));
         }
     }

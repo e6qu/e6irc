@@ -1522,11 +1522,12 @@
                           "type": "integer"
                         },
                         "motd": {
-                          "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname.",
+                          "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname, and at most maxItems lines, what the smallest SendQ holds beside the rest of the registration burst.",
                           "items": {
                             "maxLength": 372,
                             "type": "string"
                           },
+                          "maxItems": 14,
                           "type": "array"
                         },
                         "network_name": {
@@ -2054,11 +2055,12 @@
                         "type": "integer"
                       },
                       "motd": {
-                        "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname.",
+                        "description": "Message of the day, one RPL_MOTD per line; each line at most maxLength bytes, what the reply has room for at the longest server name and nickname, and at most maxItems lines, what the smallest SendQ holds beside the rest of the registration burst.",
                         "items": {
                           "maxLength": 372,
                           "type": "string"
                         },
+                        "maxItems": 14,
                         "type": "array"
                       },
                       "network_name": {

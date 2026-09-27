@@ -1,0 +1,17 @@
+-- no-transaction
+-- CHATHISTORY now orders a buffer by `(ts, msgid COLLATE "C")` instead of
+-- `(ts, id)`. `id` is the order in which *this* database received the rows,
+-- and a direct-message conversation is persisted by the shard of whichever
+-- party sent each line, so two lines stamped in one millisecond on different
+-- shards could page in one order from the database and in another from the hot
+-- ring. The msgid is a key every shard computes identically from the message,
+-- and the ring orders by the same bytes (`HistoryRow::place`), so both agree;
+-- the `"C"` collation is that byte comparison, which the database's default
+-- collation is not.
+--
+-- The index the paged `LIMIT` queries read, built without blocking writers to
+-- `messages` (hence outside a transaction: `CONCURRENTLY` cannot run in one,
+-- and a migration outside one is exactly this one statement — see
+-- `drop_interrupted_index_builds`). Migration 0094 drops the `(target, ts, id)`
+-- index it supersedes.
+CREATE INDEX CONCURRENTLY messages_target_ts_msgid_idx ON messages (target, ts, msgid COLLATE "C");

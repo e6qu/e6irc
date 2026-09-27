@@ -1178,10 +1178,13 @@ async fn a_restart_restores_the_whole_configured_buffer() {
     )
     .await;
     let pool = observer_pool(&url).await;
+    // Stamped now: the backlog neither keeps nor replays a line older than
+    // the history retention (30 days by default), so a fixed date turned this
+    // test red once the calendar passed it.
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
          SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :restored ' || n,
-                '2026-01-01T00:00:00.000Z'
+                to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(STORED)
