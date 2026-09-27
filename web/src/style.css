@@ -265,7 +265,7 @@ body {
 .buf:hover { background: var(--chrome-raised); }
 .buf.active { border-left-color: var(--route); background: var(--chrome-raised); color: #ffffff; font-weight: 650; }
 .buf.archived:not(.active) { color: var(--chrome-muted); }
-.buf-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.buf-name { flex: 1 1 auto; unicode-bidi: isolate; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .buffer-state {
   flex: 0 0 auto;
   color: var(--chrome-muted);
@@ -304,8 +304,8 @@ body {
 .buffer-identity { min-width: 0; flex: 1 1 auto; }
 .route-kicker { display: flex; gap: 0.4rem; margin: 0 0 0.18rem; color: var(--route); font: 700 0.64rem/1.2 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; }
 .buffer-title { display: flex; align-items: baseline; min-width: 0; gap: 0.75rem; }
-#bufname { margin: 0; font-size: 1.08rem; font-weight: 780; letter-spacing: -0.02em; }
-.topic { color: var(--muted); font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#bufname { margin: 0; unicode-bidi: isolate; font-size: 1.08rem; font-weight: 780; letter-spacing: -0.02em; }
+.topic { unicode-bidi: isolate; color: var(--muted); font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #buffer-action {
   flex: 0 0 auto;
   margin-left: auto;
@@ -444,6 +444,7 @@ body {
   cursor: pointer;
   font: inherit;
   text-align: left;
+  unicode-bidi: isolate;
 }
 .nick:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 :is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }

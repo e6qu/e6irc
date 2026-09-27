@@ -118,8 +118,8 @@ pub struct AppState {
     pub core_tx: crate::core::CoreIngress,
     /// Shared connection-id allocator (with every other ingress transport).
     pub next_conn: std::sync::Arc<crate::core::ConnectionIdAllocator>,
-    /// Per-connection SendQ capacity.
-    pub sendq: usize,
+    /// Per-connection SendQ capacity, in bytes.
+    pub sendq_bytes: usize,
     /// The always-on network registry shared by web chat, management, and the
     /// optional raw attach listener. Present whenever PostgreSQL is available.
     pub bnc_registry: Option<std::sync::Arc<crate::bouncer::Registry>>,
@@ -149,8 +149,9 @@ pub struct AppState {
     /// Trusted reverse-proxy CIDRs; when the socket peer matches one, the
     /// client IP is taken from `X-Forwarded-For` (see [`client_ip`]).
     pub trusted_proxies: Vec<ipnet::IpNet>,
-    /// Token-bucket size for the auth endpoints per client IP; `None` disables
-    /// auth rate limiting. The bucket refills to full over 60 seconds.
+    /// Token-bucket size for the auth endpoints per client address
+    /// (`limits.auth_rate_burst`, on by default); `None` only when the operator
+    /// turned it `"off"`. The bucket refills to full over 60 seconds.
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
     pub(crate) auth_buckets: Mutex<HashMap<crate::net::PeerLimitKey, (f64, std::time::Instant)>>,
@@ -4206,6 +4207,30 @@ mod client_ip_tests {
             &trusted,
         );
         assert_eq!(got, client("203.0.113.7"));
+    }
+
+    /// A WebSocket is secure (umode +Z) only when a trusted proxy says every
+    /// hop was HTTPS: a direct client's own header, a mixed chain, or a
+    /// missing header is plaintext.
+    #[test]
+    fn only_a_trusted_all_https_forwarded_proto_is_secure() {
+        let trusted = [net("10.0.0.0/8")];
+        let proto = |values: &[&str]| {
+            let mut headers = axum::http::HeaderMap::new();
+            for value in values {
+                headers.append("x-forwarded-proto", value.parse().expect("header"));
+            }
+            headers
+        };
+        let secure = |peer: &str, values: &[&str]| {
+            super::oidc::forwarded_https(ip(peer), &proto(values), &trusted)
+        };
+        assert!(secure("10.0.0.1", &["https"]));
+        assert!(secure("10.0.0.1", &["HTTPS", "https"]));
+        assert!(!secure("203.0.113.7", &["https"]), "untrusted peer");
+        assert!(!secure("10.0.0.1", &["https, http"]), "a plaintext hop");
+        assert!(!secure("10.0.0.1", &["https", "http"]), "a plaintext hop");
+        assert!(!secure("10.0.0.1", &[]), "no header");
     }
 
     #[test]

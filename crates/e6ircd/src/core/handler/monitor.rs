@@ -109,10 +109,7 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state.numeric(
                     conn,
                     ERR_MONLISTFULL,
-                    &[
-                        &MONITOR_LIMIT.to_string(),
-                        crate::core::handler::clip_echo(&shown),
-                    ],
+                    &[Middle::from(MONITOR_LIMIT), Middle::echo(&shown)],
                     Some("Monitor list is full."),
                 );
             }
@@ -166,8 +163,11 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 ERR_UNKNOWNCOMMAND,
-                &["MONITOR"],
-                Some(&format!("Unknown MONITOR subcommand {}", clip_echo(other))),
+                &[Middle::own("MONITOR")],
+                Some(&format!(
+                    "Unknown MONITOR subcommand {}",
+                    MiddleParam::echo(other)
+                )),
             );
         }
     }

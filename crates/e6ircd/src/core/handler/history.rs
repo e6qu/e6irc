@@ -379,7 +379,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
     let display = state
         .chan_key_if_channel(target)
         .and_then(|k| state.channels.get(&k).map(|c| c.name.clone()))
-        .unwrap_or_else(|| crate::core::handler::clip_echo(target).to_string());
+        .unwrap_or_else(|| MiddleParam::echo(target).to_string());
     let batch_ref = state.next_msgid();
     let response_caps = crate::core::HistoryResponseCaps::from(caps);
 
@@ -817,7 +817,7 @@ pub(crate) fn targets_page(
         // nick (≤ nicklen), always short — but the value flows from a stored
         // conversation key derived from identities, so clip it to keep this
         // line inside the wire limit regardless of how it was produced.
-        let display = crate::core::handler::clip_echo(&display);
+        let display = MiddleParam::echo(&display).as_str();
         let prefix = if caps.batch {
             format!("@batch={batch_ref} ")
         } else {
@@ -1024,7 +1024,7 @@ pub(crate) fn history_page(
     // database recovery and the core fuzzer can supply it directly. Keep the
     // batch envelope independently wire-safe so one malformed/stale reply
     // cannot turn a history page into an over-long outbound line.
-    let display = crate::core::handler::clip_echo(display);
+    let display = MiddleParam::echo(display).as_str();
     // A store fault answers with a FAIL, not an empty batch — otherwise a
     // transient DB error is indistinguishable from a buffer with no history,
     // and the client would cache "nothing here" for a window that does exist.
@@ -1108,7 +1108,7 @@ pub(crate) fn history_page(
         // or the correspondent), so its target — and thus the space left for the
         // body — can differ from delivery. Tags don't count toward the 512
         // limit, so the head measured here is only the non-tag part.
-        let target = crate::core::handler::clip_echo(target);
+        let target = MiddleParam::echo(target).as_str();
         let kind = match row.kind {
             crate::core::HistoryKind::Privmsg => crate::core::MessageKind::Privmsg,
             crate::core::HistoryKind::Notice => crate::core::MessageKind::Notice,

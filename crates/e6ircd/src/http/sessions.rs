@@ -306,12 +306,13 @@ pub(super) fn validate_live_connection_query(
         Some("tcp") => Some(crate::core::ConnectionTransport::Tcp),
         Some("tls") => Some(crate::core::ConnectionTransport::Tls),
         Some("websocket") => Some(crate::core::ConnectionTransport::WebSocket),
+        Some("wss") => Some(crate::core::ConnectionTransport::SecureWebSocket),
         Some("local") => Some(crate::core::ConnectionTransport::Local),
         Some(_) => {
             return Err(problem(
                 StatusCode::BAD_REQUEST,
                 "Invalid live-connection filter",
-                Some("The transport filter must be tcp, tls, websocket, or local."),
+                Some("The transport filter must be tcp, tls, websocket, wss, or local."),
             )
             .into());
         }

@@ -4,7 +4,8 @@
 //! with a row per member: more than a client's send queue holds, which would
 //! kill the client that asked ("SendQ exceeded"). Such a reply is paced like
 //! LIST's (`SAFELIST`): its lines go out only while the client's send queue is
-//! under half full, and the rest follow as it drains. A connection's paced WHO
+//! under half full (in bytes, the unit the queue is bounded in), and the rest
+//! follow as it drains. A connection's paced WHO
 //! replies go out whole and in the order they were asked; other traffic keeps
 //! flowing beside them.
 
@@ -39,23 +40,30 @@ pub(crate) struct PacedBatch {
 #[derive(Default)]
 pub(crate) struct PacedReplies {
     pub replies: VecDeque<PacedReply>,
-    /// Lines still to go across `replies`, for the admission bound.
-    pub lines: usize,
+    /// Bytes still to go across `replies`, for the admission bound.
+    pub bytes: usize,
 }
 
 impl PacedReplies {
-    /// Whether a reply of `lines` lines may queue behind these. The first is
+    /// Whether a reply of `bytes` bytes may queue behind these. The first is
     /// always taken — it is bounded by the users the server has — and later
-    /// ones while everything queued stays within one send queue (`sendq`):
-    /// a client pipelining WHOs holds at most that much here, as it could in
-    /// its queue.
-    pub(crate) fn admits(&self, lines: usize, sendq: usize) -> bool {
-        self.replies.is_empty() || self.lines + lines <= sendq
+    /// ones while everything queued stays within one send queue
+    /// (`sendq_bytes`): a client pipelining WHOs holds at most that much here,
+    /// as it could in its queue.
+    pub(crate) fn admits(&self, bytes: usize, sendq_bytes: usize) -> bool {
+        self.replies.is_empty() || self.bytes + bytes <= sendq_bytes
     }
 
     pub(crate) fn push(&mut self, reply: PacedReply) {
-        self.lines += reply.lines.len();
+        self.bytes += reply.lines.iter().map(Bytes::len).sum::<usize>();
         self.replies.push_back(reply);
+    }
+
+    /// The next line of the oldest reply, no longer counted as to go.
+    pub(crate) fn take_line(&mut self) -> Option<Bytes> {
+        let line = self.replies.front_mut()?.lines.pop_front()?;
+        self.bytes -= line.len();
+        Some(line)
     }
 }
 
@@ -63,6 +71,7 @@ impl PacedReplies {
 mod tests {
     use super::*;
 
+    /// A reply of `lines` three-byte lines.
     fn reply(lines: usize) -> PacedReply {
         PacedReply {
             batch: None,
@@ -73,12 +82,22 @@ mod tests {
     #[test]
     fn the_first_reply_is_always_taken_and_later_ones_within_a_send_queue() {
         let mut paced = PacedReplies::default();
-        assert!(paced.admits(5_000, 256));
+        assert!(paced.admits(15_000, 768));
         paced.push(reply(5_000));
-        assert!(!paced.admits(1, 256), "already past the bound");
+        assert!(!paced.admits(1, 768), "already past the bound");
         let mut paced = PacedReplies::default();
         paced.push(reply(200));
-        assert!(paced.admits(56, 256));
-        assert!(!paced.admits(57, 256));
+        assert!(paced.admits(168, 768));
+        assert!(!paced.admits(169, 768));
+    }
+
+    /// What is still to go is counted in bytes, and a line taken is no longer.
+    #[test]
+    fn taking_a_line_releases_its_bytes() {
+        let mut paced = PacedReplies::default();
+        paced.push(reply(2));
+        assert_eq!(paced.bytes, 6);
+        assert_eq!(paced.take_line().as_deref(), Some(&b"x\r\n"[..]));
+        assert_eq!(paced.bytes, 3);
     }
 }

@@ -1,4 +1,4 @@
-import { REAUTHENTICATION_REQUIRED, apiContractLoader, getOperationJson } from "/console-contract.js";
+import { REAUTHENTICATION_REQUIRED, apiContractLoader, directoryQuery, getOperationJson } from "/console-contract.js";
 import { loadSettings, saveSetting } from "/console-settings.js";
 
 (() => {
@@ -1102,6 +1102,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return value ? positiveInteger({ get: () => value }, name, label) : null;
   };
 
+  // A throttle that is on unless the operator writes "off".
+  const positiveIntegerOrOff = (fields, name, label) => {
+    const value = fieldValue(fields, name);
+    if (value === "off") return "off";
+    if (!value) throw new Error(`${label} must be a positive whole number, or off.`);
+    return positiveInteger({ get: () => value }, name, label);
+  };
+
   const parseListeners = (value) =>
     value
       .split("\n")
@@ -1146,10 +1154,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         description: fieldValue(fields, "description"),
         motd: textLines(String(fields.get("motd") || "")),
         nicklen: positiveInteger(fields, "nicklen", "Nickname length"),
-        sendq: positiveInteger(fields, "sendq", "Send queue"),
+        sendq_bytes: positiveInteger(fields, "sendq_bytes", "Send queue bytes"),
         core_queue: positiveInteger(fields, "core_queue", "Core queue"),
         core_workers: positiveInteger(fields, "core_workers", "Core workers"),
         max_hot_channels: positiveInteger(fields, "max_hot_channels", "Hot channels"),
+        max_history_ring_bytes: positiveInteger(fields, "max_history_ring_bytes", "History bytes per channel"),
+        max_hot_history_bytes: positiveInteger(fields, "max_hot_history_bytes", "History bytes in all"),
         listeners: parseListeners(String(fields.get("listeners") || "")),
         registration: {
           before_connect: fields.has("registration_before_connect"),
@@ -1162,7 +1172,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           trusted_proxies: splitValues(String(fields.get("trusted_proxies") || ""), "\n"),
           require_sasl: fields.has("require_sasl"),
           require_sasl_from: splitValues(String(fields.get("require_sasl_from") || ""), "\n"),
-          auth_rate_burst: optionalPositiveInteger(fields, "auth_rate_burst", "Authentication burst"),
+          auth_rate_burst: positiveIntegerOrOff(fields, "auth_rate_burst", "Authentication burst"),
           api_rate_burst: positiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
           administrator_api_rate_burst: positiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
           registration_burst: optionalPositiveInteger(fields, "registration_burst", "Registration burst"),
@@ -1521,7 +1531,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
-    for (const name of ["nicklen", "sendq", "core_queue", "core_workers", "max_hot_channels"]) configurationValue(form, name, settings[name]);
+    for (const name of ["nicklen", "sendq_bytes", "core_queue", "core_workers", "max_hot_channels", "max_history_ring_bytes", "max_hot_history_bytes"]) configurationValue(form, name, settings[name]);
     for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "require_sasl", settings.limits.require_sasl);
@@ -1591,7 +1601,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (adminBanRows instanceof HTMLElement) {
     refreshBanDirectory = async () => {
       try {
-        const result = await apiRead(`/api/v1/admin/bans${window.location.search}`);
+        const query = directoryQuery(window.location.search, ["kind", "mask", "limit", "before_id"]);
+        const result = await apiRead(`/api/v1/admin/bans?${query}`);
         const bans = apiCollection(result, "bans", "server-ban directory");
         adminBanRows.replaceChildren();
         const count = document.getElementById("admin-ban-count");
@@ -1601,9 +1612,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           pager.replaceChildren();
           if (result.next_before_id) {
             const link = document.createElement("a");
-            const query = new URLSearchParams(window.location.search);
-            query.set("before_id", String(result.next_before_id));
-            link.href = `/console/bans?${query}`;
+            const older = new URLSearchParams(query);
+            older.set("before_id", String(result.next_before_id));
+            link.href = `/console/bans?${older}`;
             link.textContent = "Older rules";
             pager.append(link);
           }
@@ -1611,7 +1622,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (!bans.length) {
           const row = document.createElement("tr");
           const cell = document.createElement("td");
-          cell.colSpan = 7;
+          cell.colSpan = 8;
           cell.className = "empty";
           cell.textContent = "No server bans match this view.";
           row.append(cell);
@@ -1620,7 +1631,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
         for (const ban of bans) {
           const row = document.createElement("tr");
-          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at].forEach((value) => {
+          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at, ban.expires_at || "Permanent"].forEach((value) => {
             const cell = document.createElement("td");
             cell.textContent = String(value || "");
             row.append(cell);
@@ -1643,7 +1654,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           adminBanRows.append(row);
         }
       } catch (error) {
-        tableLoadFailure(adminBanRows, 7, error, () => void refreshBanDirectory());
+        tableLoadFailure(adminBanRows, 8, error, () => void refreshBanDirectory());
         return false;
       }
       return true;
@@ -1676,11 +1687,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         setBanResult("Choose a policy kind and enter a mask.", false);
         return;
       }
-      void mutateBan(form, "/api/v1/admin/bans", "POST", {
-        kind,
-        mask,
-        reason: fieldValue(fields, "reason"),
-      });
+      const duration = fieldValue(fields, "duration_minutes");
+      const body = { kind, mask, reason: fieldValue(fields, "reason") };
+      if (duration) {
+        const minutes = Number(duration);
+        if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > 524160) {
+          setBanResult("A duration is a whole number of minutes, from 1 to 524160 (52 weeks).", false);
+          return;
+        }
+        body.duration_minutes = minutes;
+      }
+      void mutateBan(form, "/api/v1/admin/bans", "POST", body);
     });
   }
 
@@ -1734,19 +1751,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const sessionMethod = (row) => row.method === "oidc"
       ? `OpenID Connect · ${row.provider || "unknown provider"}`
       : "Local password";
-    const currentQuery = () => new URLSearchParams(window.location.search);
-    const connectionQuery = () => {
-      const source = currentQuery();
-      const query = new URLSearchParams();
-      for (const key of own
-        ? ["nick", "transport", "oper", "limit", "before_id"]
-        : ["nick", "account", "transport", "oper", "limit", "before_id"]) {
-        const value = source.get(key);
-        if (value) query.set(key, value);
-      }
-      if (!query.has("limit")) query.set("limit", "50");
-      return query;
-    };
+    const connectionQuery = () => directoryQuery(
+      window.location.search,
+      own ? ["nick", "transport", "oper", "limit", "before_id"] : ["nick", "account", "transport", "oper", "limit", "before_id"],
+      { limit: "50" },
+    );
     const refresh = async () => {
       const query = connectionQuery();
       const suffix = query.toString();
@@ -1857,7 +1866,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       connections.append(pager);
     };
     if (filters instanceof HTMLFormElement) {
-      const query = currentQuery();
+      const query = connectionQuery();
       for (const input of filters.elements) {
         if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = query.get(input.name) || (input.name === "limit" ? "50" : "");
       }
@@ -2357,8 +2366,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const filters = adminAccountsPage.querySelector("[data-api-admin-accounts-filter]");
     const capability = () => hiddenInput("csrf", csrf);
     const button = (text, className) => { const node = element("button", className, text); node.type = "submit"; return node; };
-    const query = () => { const params = new URLSearchParams(window.location.search); if (!params.get("limit")) params.set("limit", "50"); return params; };
-    const pager = (text, cursor, parameter) => { const wrapper = element("div", "pager"); wrapper.append(element("span", "meta", cursor ? "Showing an older page." : "Showing the newest page.")); if (cursor) { const link = element("a", "", text); const params = query(); params.set(parameter, String(cursor)); link.href = `/console/accounts?${params}`; wrapper.append(link); } return wrapper; };
+    // The page carries both directories' cursors; each API query takes only its own.
+    const pageQuery = () => directoryQuery(window.location.search, ["name", "limit", "before_id", "invitation_before_id"], { limit: "50" });
+    const pager = (text, cursor, parameter) => { const wrapper = element("div", "pager"); wrapper.append(element("span", "meta", cursor ? "Showing an older page." : "Showing the newest page.")); if (cursor) { const link = element("a", "", text); const params = pageQuery(); params.set(parameter, String(cursor)); link.href = `/console/accounts?${params}`; wrapper.append(link); } return wrapper; };
     const renderInvitations = (data) => {
       if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = apiCollection(data, "invitations", "invitation directory");
       if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = captionedTable("Pending account invitations"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
@@ -2368,8 +2378,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
       if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = captionedTable("Account directory"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; form.append(capability(), hiddenInput(key === "suspension" ? "suspended" : "administrator", value), button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const { label: deletionLabel, control: confirmation } = labelledControl("input", "confirmation", `Type ${account.name} to delete`); confirmation.autocomplete = "off"; confirmation.required = true; deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
-    refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); };
-    if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
+    refreshAdminAccounts = async () => { const params = pageQuery(); const accounts = directoryQuery(params, ["name", "limit", "before_id"]); const invitations = directoryQuery(params, ["limit"]); if (params.has("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accountData, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${accounts}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accountData); renderInvitations(invitationData); };
+    if (filters instanceof HTMLFormElement) { const params = pageQuery(); for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = params.get(input.name) || ""; }
     void refreshAdminAccounts().catch((error) => setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false));
   }
 
@@ -2877,10 +2887,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (adminChannelRows instanceof HTMLElement) {
     refreshAdminChannelDirectory = async () => {
       try {
-        const result = await apiRead(`/api/v1/admin/channels${window.location.search}`);
+        const query = directoryQuery(window.location.search, ["name", "founder", "limit", "before_id"]);
+        const result = await apiRead(`/api/v1/admin/channels?${query}`);
         const channels = apiCollection(result, "channels", "channel directory");
         const pager = document.getElementById("admin-channel-pager");
-        if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${query}`; link.textContent = "Older registrations"; pager.append(link); } }
+        if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const older = new URLSearchParams(query); older.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${older}`; link.textContent = "Older registrations"; pager.append(link); } }
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
@@ -2898,7 +2909,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (adminAuditRows instanceof HTMLElement) {
     const refreshAuditDirectory = async () => {
       try {
-        const result = await apiRead(`/api/v1/admin/audit${window.location.search}`);
+        const query = directoryQuery(window.location.search, ["actor", "action", "target", "limit", "before_id"]);
+        const result = await apiRead(`/api/v1/admin/audit?${query}`);
         const entries = apiCollection(result, "audit", "audit directory");
         adminAuditRows.replaceChildren();
         const count = document.getElementById("admin-audit-count");
@@ -2908,15 +2920,15 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           pager.replaceChildren();
           const status = document.createElement("span");
           status.className = "meta";
-          status.textContent = new URLSearchParams(window.location.search).has("before_id")
+          status.textContent = query.has("before_id")
             ? "Showing an older page."
             : "Showing the newest matching actions.";
           pager.append(status);
           if (result.next_before_id) {
             const link = document.createElement("a");
-            const query = new URLSearchParams(window.location.search);
-            query.set("before_id", String(result.next_before_id));
-            link.href = `/console/audit?${query}`;
+            const older = new URLSearchParams(query);
+            older.set("before_id", String(result.next_before_id));
+            link.href = `/console/audit?${older}`;
             link.textContent = "Older actions";
             pager.append(link);
           }

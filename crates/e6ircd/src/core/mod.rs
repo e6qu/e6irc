@@ -11,13 +11,16 @@
 mod banmask;
 mod handler;
 mod hot_history;
+pub(crate) mod line_meter;
 mod list;
+mod middle;
 mod paced;
 mod state;
 mod timer;
 
 pub(crate) use handler::{
-    HistoryFail, cap_reply_lines, cap_version_302, fit_trailing, invalid_utf8_fail,
+    HistoryFail, cap_reply_lines, cap_version_302, fail_line, fit_trailing, fitted_line,
+    invalid_utf8_fail, server_notice,
 };
 
 /// How long an unregistered connection may hold its slot before the core
@@ -146,6 +149,9 @@ pub struct CoreIngress {
     count: CoreShardCount,
     directories: CoreDirectories,
     traffic: Arc<CrossShardTraffic>,
+    /// Every connection's command allowance ([`line_meter`]); `None` only for
+    /// the test harnesses' ingress, which nothing meters.
+    command_flood: Option<CommandFlood>,
 }
 
 /// What the workers know together about the events passing between them. It
@@ -194,6 +200,7 @@ impl CoreIngress {
             count: CoreShardCount::single(),
             directories: CoreDirectories::default(),
             traffic: Arc::default(),
+            command_flood: None,
         }
     }
 
@@ -213,7 +220,27 @@ impl CoreIngress {
             count: CoreShardCount::new(count),
             directories: CoreDirectories::default(),
             traffic: Arc::default(),
+            command_flood: None,
         }
+    }
+
+    /// Meter every connection's lines with `flood`.
+    pub fn with_command_flood(self, flood: CommandFlood) -> Self {
+        Self {
+            command_flood: Some(flood),
+            ..self
+        }
+    }
+
+    /// A new connection's meter, which whatever hands its lines to this
+    /// ingress spends a token of for each ([`line_meter`]).
+    pub(crate) fn line_meter(&self, conn: ConnId) -> line_meter::LineMeter {
+        line_meter::LineMeter::new(
+            conn,
+            self.command_flood,
+            self.directories.flood_exemptions.clone(),
+            tokio::time::Instant::now(),
+        )
     }
 
     pub async fn push(&self, input: Input) -> Result<u64, Box<Input>> {
@@ -360,7 +387,7 @@ impl Input {
             Input::ChannelCommandResult { session, .. } => session.shard(),
             Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
             Input::ChannelListResult { result } => result.session.shard(),
-            Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
+            Input::ChannelList { request } => request.shard(),
             Input::ChannelSessionEvent { session, .. } => session.shard(),
             Input::ChannelMemberUpdate { update } => update.shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
@@ -594,7 +621,7 @@ pub enum Input {
     /// A connection was accepted; `tx` is its send queue.
     Open {
         conn: ConnId,
-        tx: Sender<Output>,
+        tx: SendQueue,
         host: String,
         transport: ConnectionTransport,
     },
@@ -729,11 +756,11 @@ pub enum Input {
         label: Option<String>,
         result: ChannelRegistrationResult,
     },
-    /// One shard's answer to a whole-network LIST request.
+    /// One channel shard's page of a LIST, for the shard of its connection.
     ChannelListResult {
         result: ChannelListResult,
     },
-    /// A whole-network LIST request, delivered once to every channel shard.
+    /// A LIST's request for one page of the channel shard it names.
     ChannelList {
         request: ChannelListRequest,
     },
@@ -934,6 +961,7 @@ pub enum Input {
 /// than queueing into a void. Shared by the TCP and WebSocket read loops.
 pub(crate) async fn push_framed(
     core_tx: &CoreIngress,
+    meter: &mut line_meter::LineMeter,
     conn: ConnId,
     events: &mut Vec<e6irc_proto::framing::LineEvent>,
 ) -> bool {
@@ -942,6 +970,7 @@ pub(crate) async fn push_framed(
             e6irc_proto::framing::LineEvent::Line(line) => Input::Line { conn, line },
             e6irc_proto::framing::LineEvent::TooLong => Input::OverlongLine { conn },
         };
+        meter.spend().await;
         if core_tx.push(input).await.is_err() {
             return false;
         }
@@ -962,6 +991,8 @@ pub enum AdminRequest {
         kind: String,
         reason: String,
         actor: String,
+        /// A temporary ban's length; `None` for a permanent one.
+        duration_minutes: Option<std::num::NonZeroU32>,
     },
     /// Remove a K/D/X-line by (mask, kind).
     RemoveServerBan {
@@ -1115,7 +1146,13 @@ pub enum ChannelRegistrationResult {
 pub enum ConnectionTransport {
     Tcp,
     Tls,
+    /// A WebSocket whose upgrade did not come over HTTPS through a trusted
+    /// proxy: plaintext somewhere between the client and this server.
     WebSocket,
+    /// A WebSocket a trusted proxy says its client reached over HTTPS (every
+    /// `X-Forwarded-Proto` entry is `https`); the listener itself never
+    /// terminates TLS.
+    SecureWebSocket,
     Local,
 }
 
@@ -1125,6 +1162,7 @@ impl ConnectionTransport {
             Self::Tcp => "tcp",
             Self::Tls => "tls",
             Self::WebSocket => "websocket",
+            Self::SecureWebSocket => "wss",
             Self::Local => "local",
         }
     }
@@ -1275,6 +1313,31 @@ impl ServerBanRequester {
     }
 }
 
+/// How long a temporary server ban lasts: set for `minutes`, in force until
+/// `expires_at_secs` (Unix seconds on the wall clock). Decided once, where the
+/// ban was set, and carried to the database and every shard, so they all lift
+/// it at the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerBanExpiry {
+    pub minutes: u32,
+    pub expires_at_secs: u64,
+}
+
+impl ServerBanExpiry {
+    /// The longest temporary ban, in minutes: 52 weeks, Solanum's
+    /// `MAX_TEMP_TIME`. A longer request is held to it, as Solanum holds it.
+    pub const MAX_MINUTES: u32 = 52 * 7 * 24 * 60;
+
+    /// A ban of `minutes` (at most [`Self::MAX_MINUTES`]) set at `now_secs`.
+    pub fn starting(now_secs: u64, minutes: std::num::NonZeroU32) -> Self {
+        let minutes = minutes.get().min(Self::MAX_MINUTES);
+        Self {
+            minutes,
+            expires_at_secs: now_secs.saturating_add(u64::from(minutes) * 60),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerBanMutation {
     Add {
@@ -1283,6 +1346,8 @@ pub enum ServerBanMutation {
         reason: String,
         set_by: String,
         kind: String,
+        /// `None` for a permanent ban.
+        expiry: Option<ServerBanExpiry>,
     },
     Remove {
         expected_id: Option<i64>,
@@ -1308,6 +1373,7 @@ impl ServerBanMutation {
         kind: state::BanKind,
         reason: String,
         set_by: String,
+        expiry: Option<ServerBanExpiry>,
     ) -> Self {
         Self::Add {
             mask: mask.folded().to_string(),
@@ -1315,6 +1381,7 @@ impl ServerBanMutation {
             reason,
             set_by,
             kind: kind.as_str().to_string(),
+            expiry,
         }
     }
 
@@ -2103,7 +2170,8 @@ pub struct HistoryRow {
     /// correspondent, not to themselves.
     pub sender_account: Option<String>,
     pub kind: HistoryKind,
-    /// The text; empty for a `TAGMSG`.
+    /// The text; empty for a `TAGMSG`, and for a multiline message, whose text
+    /// is `multiline` alone (held once, not twice: see [`Self::plain_body`]).
     pub body: String,
     /// The sender was a bot (+B) at send time; replay re-emits the `bot` tag.
     pub sender_is_bot: bool,
@@ -2120,6 +2188,20 @@ pub struct HistoryRow {
     /// negotiated `message-tags`, as live delivery sent them, so a reply or a
     /// reaction keeps what it refers to.
     pub client_tags: String,
+}
+
+impl HistoryRow {
+    /// The text as one plain line: `body`, or a multiline message's lines
+    /// joined with spaces — what the database's `body` column and the REST
+    /// history carry.
+    pub(crate) fn plain_body(&self) -> std::borrow::Cow<'_, str> {
+        match &self.multiline {
+            Some(encoded) => {
+                std::borrow::Cow::Owned(handler::message::multiline_plain_text(encoded))
+            }
+            None => std::borrow::Cow::Borrowed(&self.body),
+        }
+    }
 }
 
 /// Capability state that determines the wire shape of a CHATHISTORY reply.
@@ -2291,6 +2373,59 @@ pub enum AccountDropOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output(pub Bytes);
 
+/// The core's end of one connection's send queue: bounded in the bytes its
+/// lines hold (`sendq_bytes`), like Solanum's class `sendq`, never in their
+/// number — a count lets a few maximum-size lines pin as much as a thousand
+/// short ones. Made only by [`send_queue`], so no connection can be given a
+/// queue measured in anything else.
+#[derive(Debug)]
+pub struct SendQueue(pub(crate) Sender<Output>);
+
+/// A connection's send queue of `bytes` bytes (named `name` in diagnostics):
+/// the core's end, and the receiver its writer drains.
+pub fn send_queue(name: &'static str, bytes: usize) -> (SendQueue, Receiver<Output>) {
+    let (tx, rx) = e6irc_queue::weighted_queue(
+        e6irc_queue::Config {
+            name,
+            capacity: bytes,
+            policy: e6irc_queue::Policy::Fifo,
+        },
+        |output: &Output| output.0.len(),
+    );
+    (SendQueue(tx), rx)
+}
+
+/// Output withheld behind a deferred reply (see `Session::deferred_replies`),
+/// with the bytes it holds counted where lines enter it, so the bound on it is
+/// the send queue's own, in the send queue's unit.
+#[derive(Debug, Default)]
+pub(crate) struct HeldOutput {
+    lines: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl HeldOutput {
+    /// Hold `line` if the held output stays within `sendq_bytes`; `false`
+    /// (and nothing held) when it would not, which is a SendQ kill.
+    pub(crate) fn hold(&mut self, line: Bytes, sendq_bytes: usize) -> bool {
+        if self.bytes + line.len() > sendq_bytes {
+            return false;
+        }
+        self.bytes += line.len();
+        self.lines.push(line);
+        true
+    }
+}
+
+impl IntoIterator for HeldOutput {
+    type Item = Bytes;
+    type IntoIter = std::vec::IntoIter<Bytes>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.lines.into_iter()
+    }
+}
+
 /// A wire line with no embedded CR, LF, or NUL.
 ///
 /// [`deliver`] accepts only this type. [`WireLine::sanitized`] preserves the
@@ -2327,11 +2462,9 @@ pub struct Core {
 /// the emitting shard never appears here: [`Core::handle`] runs it inline, so
 /// a worker is never asked to push into the queue only it can drain.
 pub(crate) enum CoreEffect {
-    /// A typed event for another core owner.
-    Input(Input),
-    BroadcastChannelList {
-        request: ChannelListRequest,
-    },
+    /// A typed event for another core owner. Boxed: an `Input` is several
+    /// times the size of any broadcast here.
+    Input(Box<Input>),
     BroadcastServerBan {
         mutation: ServerBanMutation,
     },
@@ -2363,18 +2496,16 @@ pub(crate) enum CoreEffect {
 }
 
 impl CoreEffect {
+    pub(crate) fn input(input: Input) -> Self {
+        Self::Input(Box::new(input))
+    }
+
     /// One shard's copy of a broadcast, and whether the emitting shard needs a
     /// copy too (it does unless the code that emitted it already applied it
     /// there). `None` for an effect that has a single owner.
     fn broadcast_copy(&self) -> Option<(Input, bool)> {
         Some(match self {
             CoreEffect::Input(_) | CoreEffect::Delivery { .. } => return None,
-            CoreEffect::BroadcastChannelList { request } => (
-                Input::ChannelList {
-                    request: request.clone(),
-                },
-                true,
-            ),
             CoreEffect::BroadcastAdminConnectionList { request_id, query } => (
                 Input::AdminConnectionList {
                     request_id: *request_id,
@@ -2516,13 +2647,7 @@ impl CoreWorker {
             // A LIST or WHO reply being paced out needs a turn once its
             // client has read some of it, even if nothing else happens
             // meanwhile.
-            let pacing = !self.core.state.paced_replies.is_empty()
-                || self
-                    .core
-                    .state
-                    .channel_lists
-                    .values()
-                    .any(list::ListProgress::is_sending);
+            let pacing = !self.core.state.pacing.is_empty();
             let pace = tokio::time::sleep(PACE_INTERVAL);
             let mut paced = false;
             let popped = tokio::select! {
@@ -2720,7 +2845,7 @@ impl Core {
             return;
         }
         let input = match effect {
-            CoreEffect::Input(input) => input,
+            CoreEffect::Input(input) => *input,
             CoreEffect::Delivery { owner, line } => Input::Delivery {
                 conn: owner.conn(),
                 line,
@@ -2773,7 +2898,7 @@ impl Core {
     /// (see [`ServerState::preload_server_bans`]).
     pub fn preload_server_bans(
         &mut self,
-        rows: Vec<(String, String, String, String)>,
+        rows: Vec<crate::db::PersistedServerBan>,
     ) -> Result<(), String> {
         self.state.preload_server_bans(rows)
     }
@@ -2836,7 +2961,12 @@ impl Core {
                 host,
                 transport,
             } => self.state.open(conn, tx, host, transport),
-            Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
+            Input::Line { conn, line } => {
+                handler::dispatch(&mut self.state, conn, &line);
+                // A line is what makes (or unmakes) an IRC operator, whose
+                // lines are not metered.
+                self.state.sync_flood_exemption(conn);
+            }
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
             Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
             Input::ChannelJoin {
@@ -3120,6 +3250,7 @@ impl Core {
             Input::Tick { now } => {
                 handler::reap_idle(&mut self.state, now);
                 handler::services::enforce_nick_protection(&mut self.state, now);
+                handler::oper::expire_server_bans(&mut self.state);
             }
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
             Input::AccountDeleted {
@@ -3296,8 +3427,7 @@ impl Core {
         }
         // Any event is a chance for a paced LIST or WHO reply to use the room
         // its client's send queue has made since.
-        handler::pace_channel_lists(&mut self.state);
-        handler::pace_who_replies(&mut self.state);
+        handler::pace_replies(&mut self.state);
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
         // overflows someone else's queue — hence the loop). Dropping the
@@ -3342,7 +3472,7 @@ impl Core {
 /// they have all stopped. The marker lives here, on the handle every path must
 /// use, so no delivery site has to remember it.
 pub(crate) struct SessionOutput {
-    tx: Sender<Output>,
+    tx: SendQueue,
     said_goodbye: bool,
 }
 
@@ -3354,7 +3484,7 @@ pub(crate) enum Written {
 }
 
 impl SessionOutput {
-    pub(crate) fn new(tx: Sender<Output>) -> Self {
+    pub(crate) fn new(tx: SendQueue) -> Self {
         Self {
             tx,
             said_goodbye: false,
@@ -3368,7 +3498,7 @@ impl SessionOutput {
         if self.said_goodbye {
             return Ok(Written::AfterGoodbye);
         }
-        match self.tx.try_push(Output(line.0)) {
+        match self.tx.0.try_push(Output(line.0)) {
             Ok(_) => Ok(Written::Queued),
             Err(PushError::Full(_)) => Err(SendqExceeded),
             // Receiver gone: the I/O task is already dead. On the common
@@ -3382,15 +3512,17 @@ impl SessionOutput {
         }
     }
 
-    /// How many more lines the queue takes before it is half full: the most
-    /// a paced reply (a LIST, a long WHO) may occupy, leaving the other half
-    /// for whatever else the connection is sent meanwhile. Solanum's SAFELIST
-    /// bound.
+    /// How many more bytes the queue takes before it is half full: the most a
+    /// paced reply (a LIST, a long WHO) may occupy, leaving the other half for
+    /// whatever else the connection is sent meanwhile. Solanum's SAFELIST
+    /// bound. A paced reply sends while any room is left, so it may pass the
+    /// half by at most the one line that crossed it.
     pub(crate) fn paced_room(&self) -> usize {
         self.tx
+            .0
             .capacity()
             .div_ceil(2)
-            .saturating_sub(self.tx.depth())
+            .saturating_sub(self.tx.0.depth())
     }
 
     /// Queue the connection's closing line; nothing is written after it.
@@ -3482,15 +3614,16 @@ mod ingress_tests {
             description: "test".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 1,
+            sendq_bytes: 512,
             motd: Vec::new(),
             nicklen: 30,
             sasl_enabled: false,
             max_hot_channels: 1,
+            max_history_ring_bytes: crate::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: crate::config::DEFAULT_HOT_HISTORY_BYTES,
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
@@ -3566,11 +3699,7 @@ mod ingress_tests {
         first: &mut Core,
         name: &'static str,
     ) -> (SessionOwner, Receiver<Output>) {
-        let (output_tx, output_rx) = queue(Config {
-            name,
-            capacity: 2,
-            policy: Policy::Fifo,
-        });
+        let (output_tx, output_rx) = crate::core::send_queue(name, 2 * 512);
         let session = SessionOwner::new(ConnId(2), CoreShardId(0));
         first.state.open(
             session.conn(),
@@ -3681,11 +3810,7 @@ mod ingress_tests {
             ..
         } = two_worker_harness();
         let (session, _output) = open_session_on_first(&mut first, "account-index-first");
-        let (second_tx, _second_output) = queue(Config {
-            name: "account-index-second",
-            capacity: 2,
-            policy: Policy::Fifo,
-        });
+        let (second_tx, _second_output) = crate::core::send_queue("account-index-second", 2 * 512);
         second.state.open(
             ConnId(9),
             second_tx,
@@ -3718,12 +3843,13 @@ mod ingress_tests {
     fn corrupt_persisted_server_ban_aborts_preload() {
         let TwoWorkerHarness { mut first, .. } = two_worker_harness();
         let error = first
-            .preload_server_bans(vec![(
-                "bad@host".into(),
-                "reason".into(),
-                "oper".into(),
-                "unknown".into(),
-            )])
+            .preload_server_bans(vec![crate::db::PersistedServerBan {
+                mask: "bad@host".into(),
+                reason: "reason".into(),
+                set_by: "oper".into(),
+                kind: "unknown".into(),
+                expires_at: None,
+            }])
             .expect_err("unknown server-ban kind must abort startup");
         assert!(error.contains("server-ban kind"), "{error}");
     }
@@ -4058,11 +4184,7 @@ mod ingress_tests {
 
     /// Open and register `nick` as connection 2 on the first shard.
     fn register_on_first(first: &mut Core, nick: &str) -> (ConnId, Receiver<Output>) {
-        let (tx, rx) = queue(Config {
-            name: "registered-on-first-output",
-            capacity: 64,
-            policy: Policy::Fifo,
-        });
+        let (tx, rx) = crate::core::send_queue("registered-on-first-output", 64 * 512);
         let conn = ConnId(2);
         first
             .state
@@ -4176,7 +4298,7 @@ mod ingress_tests {
                 policy: Policy::Fifo,
             });
             let mut config = core_config();
-            config.sendq = 4096;
+            config.sendq_bytes = 4096 * 512;
             config.max_hot_channels = 16;
             cores.push(Core::with_telemetry_on_shard_with_directories(
                 config,
@@ -4210,11 +4332,7 @@ mod ingress_tests {
         /// Connect and register `nick` as connection `conn` (its shard is
         /// `conn % 2`), returning its output.
         async fn client(&self, conn: u64, nick: &str) -> Receiver<Output> {
-            let (tx, mut rx) = queue(Config {
-                name: "live-pair-client",
-                capacity: 4096,
-                policy: Policy::Fifo,
-            });
+            let (tx, mut rx) = crate::core::send_queue("live-pair-client", 4096 * 512);
             self.ingress
                 .push(Input::Open {
                     conn: ConnId(conn),
@@ -4406,7 +4524,7 @@ mod ingress_tests {
                     }
                     let mut config = core_config();
                     config.sasl_enabled = database;
-                    config.sendq = 256;
+                    config.sendq_bytes = 256 * 512;
                     config.max_hot_channels = 16;
                     config.mono_clock = thread_mono_clock;
                     config.clock = thread_wall_clock;
@@ -4441,11 +4559,12 @@ mod ingress_tests {
 
         /// Connect and register `nick` as connection `conn`, requesting `caps`.
         fn client(&mut self, conn: u64, nick: &str, caps: &str) {
-            let (tx, rx) = queue(Config {
-                name: "shards-client",
-                capacity: 256,
-                policy: Policy::Fifo,
-            });
+            self.client_with_sendq(conn, nick, caps, 256 * 512);
+        }
+
+        /// [`Self::client`] with a send queue of `sendq_bytes`.
+        fn client_with_sendq(&mut self, conn: u64, nick: &str, caps: &str, sendq_bytes: usize) {
+            let (tx, rx) = crate::core::send_queue("shards-client", sendq_bytes);
             self.outputs.insert(conn, rx);
             let shard = conn as usize % self.cores.len();
             self.cores[shard].handle(Input::Open {
@@ -5276,6 +5395,45 @@ mod ingress_tests {
         );
     }
 
+    /// A temporary ban lapses on every shard on the same tick, and each
+    /// operator hears of it once — from the shard its own session lives on.
+    #[test]
+    fn a_temporary_server_ban_lapses_on_every_shard() {
+        let mut shards = operators_on_each_shard(Shards::new());
+        shards.line(2, "KLINE 1 bad@host.example :spam");
+        for conn in [2, 1] {
+            shards.drain(conn);
+        }
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.len() == 1),
+            "every shard enforces the ban"
+        );
+        Shards::advance_clock(60);
+        let now = thread_mono_clock();
+        for core in &mut shards.cores {
+            core.handle(Input::Tick { now });
+        }
+        shards.settle();
+        for conn in [2, 1] {
+            let out = shards.drain(conn);
+            assert_eq!(
+                lines_with(&out, "Temporary K-Line for bad@host.example expired").len(),
+                1,
+                "connection {conn}: {out:#?}"
+            );
+        }
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.is_empty()),
+            "every shard stopped enforcing the ban"
+        );
+    }
+
     /// Answer the one server-ban mutation alice's shard queued.
     fn answer_server_ban(shards: &mut Shards, result: super::ServerBanResult) {
         let shard = shards.shard_of(2);
@@ -5485,6 +5643,398 @@ mod ingress_tests {
         assert!(
             shards.cores[1].state.channels.get(&key).is_none(),
             "the channel is held open by a member whose session is gone"
+        );
+    }
+
+    /// The lister's send queue: small, so a LIST of four hundred rows needs
+    /// many turns (half of it, the room a paced reply may fill, is a few
+    /// dozen rows).
+    const LISTER_SENDQ: usize = 8 * 1024;
+
+    /// The most rows a LIST asks one shard for at once: a row is at most one
+    /// line, so the room of the lister's queue holds this many.
+    const LISTER_PAGE: usize = (LISTER_SENDQ / 2).div_ceil(e6irc_proto::message::MAX_LINE_LEN);
+
+    /// Four hundred channels, `#room000` on, spread over both shards: two
+    /// members on shard 0 hold two hundred each (the channel limit is 250).
+    /// The lister is connection 1, on shard 1, with a small send queue.
+    fn four_hundred_channels() -> Shards {
+        let mut shards = Shards::new();
+        shards.client(2, "member", "");
+        shards.client(4, "other", "");
+        for room in 0..400 {
+            let member = if room < 200 { 2 } else { 4 };
+            shards.line(member, &format!("JOIN #room{room:03}"));
+            shards.drain(member);
+        }
+        shards.client_with_sendq(1, "lister", "", LISTER_SENDQ);
+        shards
+    }
+
+    /// The channels of `out`'s `RPL_LIST` rows, in order.
+    fn listed(out: &[String]) -> Vec<String> {
+        out.iter()
+            .filter(|line| line.split(' ').nth(1) == Some("322"))
+            .map(|line| line.split(' ').nth(3).expect("channel").to_string())
+            .collect()
+    }
+
+    /// Pace the lister's LIST to its end, reading everything it is sent.
+    fn read_list_to_the_end(shards: &mut Shards, mut out: Vec<String>) -> Vec<String> {
+        while !out.iter().any(|line| line.contains(" 323 ")) {
+            shards.cores[1].handle(Input::PaceReplies);
+            shards.settle();
+            let more = shards.drain(1);
+            assert!(!more.is_empty(), "a paced LIST makes progress: {out:#?}");
+            out.extend(more);
+        }
+        out
+    }
+
+    /// Rows a LIST holds on its session, waiting to be sent.
+    fn held_rows(shards: &Shards) -> usize {
+        shards.cores[1].state.sessions[&ConnId(1)]
+            .channel_list
+            .as_ref()
+            .expect("a LIST in progress")
+            .held_rows()
+    }
+
+    /// A LIST keeps a cursor, not a copy: what its session holds is at most a
+    /// page — the room its send queue had — however many channels there are,
+    /// and the rows of both shards still come out whole, merged in order.
+    #[test]
+    fn a_list_holds_at_most_a_page_and_is_complete_and_ordered_across_shards() {
+        let mut shards = four_hundred_channels();
+        shards.line(1, "LIST");
+        let first = shards.drain(1);
+        // Some rows go at once, within the room half the queue leaves, and
+        // what is held is at most a page from each shard.
+        let sent: usize = first.iter().map(|line| line.len() + 2).sum();
+        assert!(
+            !listed(&first).is_empty() && listed(&first).len() < 400,
+            "{first:#?}"
+        );
+        assert!(
+            sent <= LISTER_SENDQ / 2 + e6irc_proto::message::MAX_LINE_LEN,
+            "{sent} bytes: {first:#?}"
+        );
+        assert!(
+            held_rows(&shards) <= 2 * LISTER_PAGE,
+            "a page, not the channel list: {}",
+            held_rows(&shards)
+        );
+        let out = read_list_to_the_end(&mut shards, first);
+        let expected: Vec<String> = (0..400).map(|room| format!("#room{room:03}")).collect();
+        assert_eq!(listed(&out), expected);
+        assert!(
+            shards.cores[1].state.sessions[&ConnId(1)]
+                .channel_list
+                .is_none()
+        );
+    }
+
+    /// A channel is listed if it exists when the LIST's cursor reaches its
+    /// name: one created past the cursor is, one removed before it is reached
+    /// is not, and one created behind the cursor is not. None is listed twice.
+    #[test]
+    fn channels_created_or_removed_during_a_list_are_listed_as_the_cursor_finds_them() {
+        let mut shards = four_hundred_channels();
+        shards.line(1, "LIST");
+        let first = shards.drain(1);
+        // The cursor is past #room001 and well short of #room390.
+        let reached = listed(&first);
+        assert!(reached.contains(&"#room001".to_string()), "{first:#?}");
+        assert!(reached.len() < 390, "{first:#?}");
+        // Behind the cursor, ahead of it, and removed ahead of it.
+        shards.line(2, "JOIN #room000a");
+        shards.line(2, "JOIN #room999");
+        shards.line(4, "PART #room390");
+        shards.drain(2);
+        shards.drain(4);
+        let out = read_list_to_the_end(&mut shards, first);
+        let mut expected: Vec<String> = (0..400)
+            .filter(|room| *room != 390)
+            .map(|room| format!("#room{room:03}"))
+            .collect();
+        expected.push("#room999".into());
+        assert_eq!(listed(&out), expected);
+    }
+
+    /// A LIST sent while another's page is still on its way from the other
+    /// shard aborts that one at once; the page, when it lands, finds no LIST
+    /// to join and is dropped, and nothing more of the aborted one is sent.
+    #[test]
+    fn a_list_during_a_cross_shard_list_aborts_it_before_its_pages_are_in() {
+        let mut shards = four_hundred_channels();
+        shards.push_line(1, "LIST");
+        shards.push_line(1, "LIST");
+        let out = shards.drain(1);
+        assert!(out[0].contains(" 321 lister "), "{out:#?}");
+        assert!(
+            out.ends_with(&[
+                ":irc.test NOTICE lister :/LIST aborted".to_string(),
+                ":irc.test 323 lister :End of /LIST".to_string(),
+            ]),
+            "{out:#?}"
+        );
+        assert!(
+            listed(&out).is_empty(),
+            "no row can go before every shard's first page: {out:#?}"
+        );
+        shards.settle();
+        shards.cores[1].handle(Input::PaceReplies);
+        shards.settle();
+        assert!(shards.drain(1).is_empty());
+        assert!(
+            shards.cores[1].state.sessions[&ConnId(1)]
+                .channel_list
+                .is_none()
+        );
+        shards.line(1, "LIST #room001");
+        assert_eq!(listed(&shards.drain(1)), ["#room001"]);
+    }
+
+    /// A WHO or LIST answered by another shard after the asking connection
+    /// closed finds no session to send to or pace for: the answer goes with
+    /// the session, and the shard goes on serving everyone else.
+    #[test]
+    fn a_remote_who_or_list_answered_after_its_session_closed_is_dropped() {
+        let mut shards = Shards::new();
+        let here = shards.owned[0];
+        shards.client(2, "alice", "");
+        shards.line(2, &format!("JOIN {here}"));
+        shards.client(1, "bob", "batch labeled-response");
+        shards.push_line(1, &format!("WHO {here}"));
+        shards.push_line(1, &format!("@label=w1 WHO {here}"));
+        shards.push_line(1, "LIST");
+        shards.cores[1].handle(Input::Closed {
+            conn: ConnId(1),
+            reason: "Connection reset".into(),
+        });
+        shards.settle();
+        assert!(
+            shards.cores[1].state.pacing.is_empty(),
+            "nothing is paced to a connection that is gone"
+        );
+        shards.client(3, "carol", "");
+        shards.line(3, &format!("WHO {here}"));
+        let out = shards.drain(3);
+        assert_eq!(lines_with(&out, " 352 ").len(), 1, "{out:#?}");
+        assert_eq!(lines_with(&out, " 315 ").len(), 1, "{out:#?}");
+    }
+
+    /// Two JOINs to one channel on another shard, the first refused: the
+    /// channel is still in flight until the second is answered, so a NICK
+    /// sent between the two answers still reaches the owner that admits it.
+    #[test]
+    fn a_second_join_in_flight_to_one_channel_still_hears_member_updates() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(1, "bob", "");
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(1, &format!("MODE {there} +k sekrit"));
+        shards.client(2, "alice", "");
+        shards.drain(1);
+        shards.push_line(2, &format!("JOIN {there} wrong"));
+        shards.push_line(2, &format!("JOIN {there} sekrit"));
+        for super::Routed { to, input } in shards.cores[0].take_effects() {
+            shards.cores[to.0].handle(input);
+        }
+        let mut answers = shards.cores[1].take_effects().into_iter();
+        let refused = answers.next().expect("the first JOIN is answered");
+        assert!(
+            matches!(refused.input, Input::ChannelJoinResult { .. }),
+            "the refusal comes first: {:?}",
+            refused.input
+        );
+        shards.cores[refused.to.0].handle(refused.input);
+        // The refusal is in; the second JOIN is not answered yet.
+        shards.push_line(2, "NICK alicia");
+        for super::Routed { to, input } in answers {
+            shards.cores[to.0].handle(input);
+        }
+        shards.settle();
+        let out = shards.drain(1);
+        assert_eq!(
+            lines_with(&out, " NICK ")
+                .iter()
+                .filter(|l| l.ends_with("alicia"))
+                .count(),
+            1,
+            "bob hears the NICK: {out:#?}"
+        );
+        let key = shards.cores[1].state.chan_key(there);
+        let (_, _, identity, _) = shards.cores[1].state.channels[&key]
+            .member_profiles()
+            .find(|(conn, ..)| *conn == ConnId(2))
+            .expect("alicia is a member");
+        assert_eq!(identity.nick, "alicia", "the owner holds the new nick");
+    }
+
+    /// `JOIN #c wrong; JOIN #c right; JOIN 0`: the refused JOIN admitted
+    /// nothing, so it is the admitted one the `JOIN 0` parts — the user ends
+    /// in no channel, on two workers as on one.
+    #[test]
+    fn join_zero_parts_the_join_that_was_admitted_not_the_first_answered() {
+        for mut shards in [Shards::new(), Shards::on_one_worker()] {
+            let there = shards.owned[1];
+            shards.client(1, "bob", "");
+            shards.line(1, &format!("JOIN {there}"));
+            shards.line(1, &format!("MODE {there} +k sekrit"));
+            shards.client(2, "alice", "");
+            shards.drain(1);
+            shards.push_line(2, &format!("JOIN {there} wrong"));
+            shards.push_line(2, &format!("JOIN {there} sekrit"));
+            shards.push_line(2, "JOIN 0");
+            shards.settle();
+            let out = shards.drain(2);
+            let join_at = out
+                .iter()
+                .position(|l| l.contains(&format!(" JOIN {there}")));
+            let part_at = out
+                .iter()
+                .position(|l| l.contains(&format!(" PART {there}")));
+            assert!(
+                join_at.is_some() && join_at < part_at,
+                "the JOIN, then its PART: {out:#?}"
+            );
+            shards.drain(1);
+            shards.line(1, &format!("NAMES {there}"));
+            let names = shards.drain(1);
+            assert!(lines_with(&names, "alice").is_empty(), "{names:#?}");
+            let session = &shards.cores[shards.shard_of(2)].state.sessions[&ConnId(2)];
+            assert_eq!(session.joins_in_flight().count(), 0);
+        }
+    }
+
+    /// Batch references name the shard that opened them; everything else a
+    /// labeled response says must not depend on how many workers there are.
+    fn without_batch_references(out: Vec<String>) -> Vec<String> {
+        out.into_iter()
+            .map(|line| {
+                line.split(' ')
+                    .map(|word| match word.find("batch=") {
+                        Some(at) => format!("{}batch=*", &word[..at]),
+                        None if word.starts_with('+') || word.starts_with('-') => {
+                            if line.contains(" BATCH ") {
+                                word[..1].to_string()
+                            } else {
+                                word.to_string()
+                            }
+                        }
+                        None => word.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    /// What a labeled MODE, KICK or JOIN answers the operator who sent it —
+    /// including its own copy of what the channel is told — is the same on
+    /// one worker and on two, where the channel lives on another shard.
+    fn labeled_channel_changes(mut shards: Shards, there: &str, registered: &str) -> Vec<String> {
+        let folded = shards.cores[0]
+            .state
+            .chan_key(registered)
+            .as_str()
+            .to_string();
+        for core in &mut shards.cores {
+            core.preload_founders(vec![(folded.clone(), "nobody".into())]);
+            core.preload_mlock(vec![(folded.clone(), "+m".into())])
+                .expect("a valid mode lock");
+        }
+        shards.client(2, "alice", "batch labeled-response");
+        shards.client(1, "bob", "");
+        shards.client(3, "carol", "");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(3, &format!("JOIN {there}"));
+        shards.drain(2);
+        let mut answers = Vec::new();
+        for line in [
+            format!("@label=m1 MODE {there} +v bob"),
+            format!("@label=m2 MODE {there} +m-t"),
+            format!("@label=m3 MODE {there} +o nobody"),
+            format!("@label=k1 KICK {there} bob :out"),
+            format!("@label=k2 KICK {there} carol,nobody"),
+            format!("@label=j1 JOIN {registered}"),
+        ] {
+            shards.line(2, &line);
+            answers.extend(without_batch_references(shards.drain(2)));
+        }
+        answers
+    }
+
+    #[test]
+    fn labeled_mode_kick_and_join_answer_the_actor_alike_on_one_worker_and_two() {
+        // Both channels live on the shard alice's session does not.
+        let two = Shards::new();
+        let there = two.owned[1];
+        let registered = [
+            "#registered",
+            "#enrolled",
+            "#recorded",
+            "#listed",
+            "#signed",
+        ]
+        .into_iter()
+        .find(|name| two.cores[0].state.channel_owner(name).shard() == CoreShardId(1))
+        .expect("a channel owned by the second shard");
+        let one = labeled_channel_changes(Shards::on_one_worker(), there, registered);
+        let two = labeled_channel_changes(two, there, registered);
+        assert_eq!(one, two);
+        for label in ["m1", "m2", "k1"] {
+            let tagged = lines_with(&two, &format!("@label={label} "));
+            assert_eq!(tagged.len(), 1, "{label}: {two:#?}");
+            assert!(
+                tagged[0].contains(" MODE ") || tagged[0].contains(" KICK "),
+                "{label} is answered by the actor's own echo: {two:#?}"
+            );
+        }
+        assert!(lines_with(&two, " ACK").is_empty(), "{two:#?}");
+        let start = two
+            .iter()
+            .position(|l| l.contains("label=j1"))
+            .expect("the JOIN is answered");
+        let join_at = two[start..].iter().position(|l| l.contains(" JOIN #"));
+        let lock_at = two[start..]
+            .iter()
+            .position(|l| l.contains(":ChanServ!ChanServ@services.irc.test MODE #"));
+        assert!(
+            join_at.is_some() && join_at < lock_at,
+            "the joiner hears its JOIN, then the lock it brought about: {two:#?}"
+        );
+    }
+
+    /// A labeled ChanServ VOICE of a channel on another shard answers with
+    /// the requester's own copy of the MODE inside its labeled response, as
+    /// on one worker.
+    #[test]
+    fn a_labeled_chanserv_voice_answers_alike_on_one_worker_and_two() {
+        let answer = |mut shards: Shards, there: &str| {
+            let folded = shards.cores[0].state.chan_key(there).as_str().to_string();
+            for core in &mut shards.cores {
+                core.preload_founders(vec![(folded.clone(), "alice".into())]);
+            }
+            shards.client(2, "alice", "batch labeled-response");
+            identify_on(&mut shards, 2, "alice");
+            shards.line(2, &format!("JOIN {there}"));
+            shards.drain(2);
+            shards.line(2, &format!("@label=v1 PRIVMSG ChanServ :VOICE {there}"));
+            without_batch_references(shards.drain(2))
+        };
+        let two = Shards::with_database();
+        let there = two.owned[1];
+        let one = answer(Shards::build(1, true), there);
+        let two = answer(two, there);
+        assert_eq!(one, two);
+        assert_eq!(lines_with(&two, "label=v1").len(), 1, "{two:#?}");
+        assert_eq!(
+            lines_with(&two, "@batch=* :ChanServ!ChanServ@services.irc.test MODE ").len(),
+            1,
+            "{two:#?}"
         );
     }
 
@@ -5741,15 +6291,10 @@ mod ingress_tests {
             second_rx,
             ingress,
         } = two_worker_harness();
-        // Thirty-two lines: a LIST of more than fifteen rows needs several
-        // turns.
-        let output_config = Config {
-            name: "list-output",
-            capacity: 32,
-            policy: Policy::Fifo,
-        };
-        let (alice_tx, mut alice_rx) = queue(output_config);
-        let (bob_tx, mut bob_rx) = queue(output_config);
+        // Four kilobytes: room for the registration burst, while a LIST of a
+        // hundred and twenty rows of some thirty-five bytes needs several turns.
+        let (alice_tx, mut alice_rx) = crate::core::send_queue("list-output", 4096);
+        let (bob_tx, mut bob_rx) = crate::core::send_queue("list-output", 4096);
         first.state.open(
             ConnId(2),
             alice_tx,
@@ -5774,7 +6319,7 @@ mod ingress_tests {
                 while rx.try_pop().is_some() {}
             }
         }
-        // Twenty channels on each shard, more than the queue holds, and a
+        // Sixty channels on each shard, more than the queue holds, and a
         // secret one.
         let on_shard = |shard: usize, count: usize| -> Vec<String> {
             (0..)
@@ -5783,8 +6328,8 @@ mod ingress_tests {
                 .take(count)
                 .collect()
         };
-        let mut rooms = on_shard(0, 20);
-        rooms.extend(on_shard(1, 20));
+        let mut rooms = on_shard(0, 60);
+        rooms.extend(on_shard(1, 60));
         rooms.sort();
         let secret = (0..)
             .map(|index| format!("#secret{index}"))
@@ -5823,10 +6368,10 @@ mod ingress_tests {
         send(&first_tx, ConnId(2), "LIST >1");
         let crowded = output_until(&mut alice_rx, ":End of /LIST").await;
         assert_eq!(listed(&crowded), [rooms[0].clone()]);
-        let last = &rooms[39];
+        let last = &rooms[119];
         send(&first_tx, ConnId(2), &format!("LIST #room*,!{last},<2"));
         let narrowed = output_until(&mut alice_rx, ":End of /LIST").await;
-        assert_eq!(listed(&narrowed), rooms[1..39]);
+        assert_eq!(listed(&narrowed), rooms[1..119]);
         send(&first_tx, ConnId(2), "LIST #secret*");
         let hidden = output_until(&mut alice_rx, ":End of /LIST").await;
         assert!(listed(&hidden).is_empty(), "{hidden:#?}");
@@ -5863,12 +6408,9 @@ mod ingress_tests {
             .map(|index| format!("#crowd{index}"))
             .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
             .expect("a channel on shard one");
-        // Thirty-two lines: a WHO of forty members needs several turns.
-        let (alice_tx, mut alice_rx) = queue(Config {
-            name: "who-output",
-            capacity: 32,
-            policy: Policy::Fifo,
-        });
+        // Three kilobytes: room for the registration burst, while a WHO of
+        // forty members at some eighty-five bytes a row needs several turns.
+        let (alice_tx, mut alice_rx) = crate::core::send_queue("who-output", 3072);
         first.state.open(
             ConnId(2),
             alice_tx,
@@ -5891,11 +6433,7 @@ mod ingress_tests {
         let mut members = Vec::new();
         for index in 0..40 {
             let conn = ConnId(10 + index);
-            let (tx, mut rx) = queue(Config {
-                name: "who-member-output",
-                capacity: 128,
-                policy: Policy::Fifo,
-            });
+            let (tx, mut rx) = crate::core::send_queue("who-member-output", 128 * 512);
             second
                 .state
                 .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
@@ -5979,13 +6517,8 @@ mod ingress_tests {
             second_rx,
             ingress,
         } = two_worker_harness();
-        let output_config = Config {
-            name: "remote-knock-output",
-            capacity: 64,
-            policy: Policy::Fifo,
-        };
-        let (alice_tx, mut alice_rx) = queue(output_config);
-        let (bob_tx, mut bob_rx) = queue(output_config);
+        let (alice_tx, mut alice_rx) = crate::core::send_queue("remote-knock-output", 64 * 512);
+        let (bob_tx, mut bob_rx) = crate::core::send_queue("remote-knock-output", 64 * 512);
         first.state.open(
             ConnId(2),
             alice_tx,
@@ -6065,7 +6598,7 @@ mod ingress_tests {
             operator
                 .payload
                 .0
-                .ends_with(b" 710 alice #chat bob!bob@host.test :has asked for an invite\r\n")
+                .ends_with(b" 710 #chat #chat bob!bob@host.test :has asked for an invite.\r\n")
         );
         let result = next_output(&mut bob_rx).await;
         assert!(
@@ -6147,7 +6680,12 @@ mod ingress_tests {
             })
             .expect("mode list queued");
         let ban = next_output(&mut bob_rx).await;
-        assert!(ban.payload.0.ends_with(b" 367 robert #chat bad!*@*\r\n"));
+        // The row names who set the ban (the time is the wall clock's).
+        let ban = String::from_utf8_lossy(&ban.payload.0).into_owned();
+        assert!(
+            ban.contains(" 367 robert #chat bad!*@* alice!alice@host.test "),
+            "{ban}"
+        );
         let end = next_output(&mut bob_rx).await;
         assert!(
             end.payload
@@ -6350,22 +6888,14 @@ mod ingress_tests {
             second_rx,
             ingress,
         } = two_worker_harness();
-        let (out_tx, mut out_rx) = queue(Config {
-            name: "remote-member-sendq",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
+        let (out_tx, mut out_rx) = crate::core::send_queue("remote-member-sendq", 8 * 512);
         second.state.open(
             ConnId(1),
             out_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
         );
-        let (sender_tx, _sender_rx) = queue(Config {
-            name: "local-member-sendq",
-            capacity: 64,
-            policy: Policy::Fifo,
-        });
+        let (sender_tx, _sender_rx) = crate::core::send_queue("local-member-sendq", 64 * 512);
         first.state.open(
             ConnId(2),
             sender_tx,
@@ -6434,11 +6964,7 @@ mod ingress_tests {
         } = two_worker_harness();
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
 
-        let (peer_tx, mut peer_rx) = queue(Config {
-            name: "join-peer-sendq",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
+        let (peer_tx, mut peer_rx) = crate::core::send_queue("join-peer-sendq", 8 * 512);
         first.state.open(
             ConnId(2),
             peer_tx,
@@ -6461,11 +6987,7 @@ mod ingress_tests {
         );
         first.state.channels.entry(key).or_insert(channel);
 
-        let (joiner_tx, mut joiner_rx) = queue(Config {
-            name: "joiner-sendq",
-            capacity: 16,
-            policy: Policy::Fifo,
-        });
+        let (joiner_tx, mut joiner_rx) = crate::core::send_queue("joiner-sendq", 16 * 512);
         second.state.open(
             ConnId(1),
             joiner_tx,

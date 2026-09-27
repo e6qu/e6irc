@@ -749,7 +749,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         remaining_core_senders.push(sender);
         core_receivers.push(receiver);
     }
-    let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders);
+    // Every connection's lines are metered where they enter the core: an
+    // empty bucket stops its reader, not the connection (DESIGN §7.2).
+    let command_flood =
+        crate::core::CommandFlood::new(config.limits.command_burst, config.limits.command_rate)
+            .map_err(io::Error::other)?;
+    let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders)
+        .with_command_flood(command_flood);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,
@@ -786,7 +792,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 crate::bouncer::CoreHandles {
                     core_tx: core_tx.clone(),
                     next_conn: next_conn.clone(),
-                    sendq: config.sendq,
+                    sendq_bytes: config.sendq_bytes,
                 },
                 telemetry.clone(),
                 config.internal_upstreams,
@@ -997,7 +1003,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             spent_oidc_flows: crate::http::SpentFlows::new(),
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),
-            sendq: config.sendq,
+            sendq_bytes: config.sendq_bytes,
             bnc_registry: bnc_registry.clone(),
             bnc_listener: bnc_listener.clone(),
             managed_config: managed_config.clone(),
@@ -1013,7 +1019,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 k
             },
             trusted_proxies: trusted_proxies.clone(),
-            auth_rate_burst: config.limits.auth_rate_burst,
+            auth_rate_burst: config.limits.auth_rate_burst.burst(),
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             api_rate_burst: config.limits.api_rate_burst,
             administrator_api_rate_burst: config.limits.administrator_api_rate_burst,
@@ -1093,11 +1099,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         description: config.description.clone(),
         registration_before_connect: config.registration.before_connect,
         registration_require_email: config.registration.require_email,
-        sendq: config.sendq,
+        sendq_bytes: config.sendq_bytes,
         motd: config.motd.clone(),
         nicklen: config.nicklen,
         sasl_enabled,
         max_hot_channels: config.max_hot_channels,
+        max_history_ring_bytes: config.max_history_ring_bytes,
+        max_hot_history_bytes: config.max_hot_history_bytes,
         opers: config
             .opers
             .iter()
@@ -1105,10 +1113,6 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .collect(),
         clock: wall_clock,
         mono_clock,
-        command_flood: Some(
-            crate::core::CommandFlood::new(config.limits.command_burst, config.limits.command_rate)
-                .map_err(io::Error::other)?,
-        ),
         registration_burst: config.limits.registration_burst,
         sasl_requirement: config.limits.sasl_requirement(),
         reserved_account_names: configured_administrators.clone(),
@@ -1271,7 +1275,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             acceptor,
             core_tx.clone(),
             next_conn.clone(),
-            config.sendq,
+            config.sendq_bytes,
             limiter.clone(),
             telemetry.clone(),
         ));
@@ -1768,7 +1772,7 @@ async fn accept_loop(
     tls: Option<TlsAcceptor>,
     core_tx: CoreIngress,
     next_conn: Arc<ConnectionIdAllocator>,
-    sendq: usize,
+    sendq_bytes: usize,
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
 ) {
@@ -1776,7 +1780,7 @@ async fn accept_loop(
         tls: &tls,
         core_tx: &core_tx,
         next_conn: &next_conn,
-        sendq,
+        sendq_bytes,
         limiter: &limiter,
         telemetry: &telemetry,
     };
@@ -1817,7 +1821,7 @@ struct AcceptContext<'a> {
     tls: &'a Option<TlsAcceptor>,
     core_tx: &'a CoreIngress,
     next_conn: &'a Arc<ConnectionIdAllocator>,
-    sendq: usize,
+    sendq_bytes: usize,
     limiter: &'a ConnLimiter,
     telemetry: &'a Arc<Telemetry>,
 }
@@ -1841,7 +1845,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     let core_tx = context.core_tx.clone();
     let tls = context.tls.clone();
     let telemetry = context.telemetry.clone();
-    let sendq = context.sendq;
+    let sendq_bytes = context.sendq_bytes;
     tokio::spawn(async move {
         let _guard = guard;
         if let Err(e) = stream.set_nodelay(true) {
@@ -1864,7 +1868,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                             peer,
                             crate::core::ConnectionTransport::Tls,
                             core_tx,
-                            Outbound::with_sendq(sendq),
+                            Outbound::with_sendq(sendq_bytes),
                             telemetry,
                         )
                         .await
@@ -1886,7 +1890,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     peer,
                     crate::core::ConnectionTransport::Tcp,
                     core_tx,
-                    Outbound::with_sendq(sendq),
+                    Outbound::with_sendq(sendq_bytes),
                     telemetry,
                 )
                 .await
@@ -1895,17 +1899,17 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     });
 }
 
-/// The bounds on what a connection is sent: its SendQ capacity, and how long
-/// one write may wait for a client that has stopped reading.
+/// The bounds on what a connection is sent: its SendQ capacity in bytes, and
+/// how long one write may wait for a client that has stopped reading.
 struct Outbound {
-    sendq: usize,
+    sendq_bytes: usize,
     write_deadline: std::time::Duration,
 }
 
 impl Outbound {
-    fn with_sendq(sendq: usize) -> Self {
+    fn with_sendq(sendq_bytes: usize) -> Self {
         Self {
-            sendq,
+            sendq_bytes,
             write_deadline: crate::peer_write::PEER_WRITE_DEADLINE,
         }
     }
@@ -1923,11 +1927,7 @@ async fn serve_conn<S>(
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (read_half, write_half) = tokio::io::split(stream);
-    let (out_tx, out_rx) = queue::<Output>(e6irc_queue::Config {
-        name: "sendq",
-        capacity: outbound.sendq,
-        policy: Policy::Fifo,
-    });
+    let (out_tx, out_rx) = crate::core::send_queue("sendq", outbound.sendq_bytes);
     if core_tx
         .push(Input::Open {
             conn,
@@ -1989,12 +1989,15 @@ where
     let mut framing = LineBuffer::new(LINE_LIMIT);
     let mut buf = [0u8; READ_BUF];
     let mut events = Vec::new();
+    let mut meter = core_tx.line_meter(conn);
     let reason = loop {
         match read_half.read(&mut buf).await {
             Ok(0) => break "Connection closed".to_string(),
             Ok(n) => {
                 framing.feed(&buf[..n], &mut events);
-                if !crate::core::push_framed(core_tx, conn, &mut events).await {
+                // Nothing more is read until these lines are through the
+                // meter: a client past its allowance waits in its own socket.
+                if !crate::core::push_framed(core_tx, &mut meter, conn, &mut events).await {
                     return; // core gone
                 }
             }
@@ -2563,7 +2566,7 @@ mod tests {
             peer,
             crate::core::ConnectionTransport::Tcp,
             CoreIngress::single(core_tx),
-            Outbound::with_sendq(8),
+            Outbound::with_sendq(4096),
             Arc::new(Telemetry::new()),
         ));
         (core_rx, served)
@@ -2601,7 +2604,7 @@ mod tests {
             crate::core::ConnectionTransport::Tcp,
             CoreIngress::single(core_tx),
             Outbound {
-                sendq: 4096,
+                sendq_bytes: 4096 * 512,
                 write_deadline: std::time::Duration::from_millis(300),
             },
             Arc::new(Telemetry::new()),
@@ -2612,7 +2615,7 @@ mod tests {
         // Far more than both kernel buffers hold: the writer parks mid-write.
         let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
         for _ in 0..4096 {
-            if tx.try_push(Output(line.clone())).is_err() {
+            if tx.0.try_push(Output(line.clone())).is_err() {
                 break;
             }
         }
@@ -2698,15 +2701,16 @@ mod tests {
             description: "test".into(),
             registration_before_connect: false,
             registration_require_email: false,
-            sendq: 64,
+            sendq_bytes: 64 * 512,
             motd: vec!["hi".into()],
             nicklen: 30,
             sasl_enabled: false,
             max_hot_channels: 64,
+            max_history_ring_bytes: crate::config::DEFAULT_HISTORY_RING_BYTES,
+            max_hot_history_bytes: crate::config::DEFAULT_HOT_HISTORY_BYTES,
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
-            command_flood: None,
             registration_burst: None,
             sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
@@ -2769,9 +2773,20 @@ mod tests {
                         .unwrap();
                     heard_tx.send(Some("registered".into())).await.unwrap();
                 } else if line.starts_with("QUIT") {
+                    // As a server does: answer the goodbye and close. The
+                    // driver reads to that close (`say_goodbye`), so both are
+                    // heard before shutdown completes, whatever the platform's
+                    // scheduling; an upstream that never answers is bounded by
+                    // the goodbye deadline instead.
                     heard_tx.send(Some(line)).await.unwrap();
+                    writer
+                        .write_all(b"ERROR :Closing Link: bncbot (Quit)\r\n")
+                        .await
+                        .unwrap();
+                    writer.shutdown().await.unwrap();
                 }
             }
+            // End of stream: the driver closed its socket.
             heard_tx.send(None).await.unwrap();
         });
         let (core_tx, _core_rx) = queue::<Input>(e6irc_queue::Config {
@@ -2802,7 +2817,7 @@ mod tests {
                     next_conn: Arc::new(ConnectionIdAllocator::new(
                         std::num::NonZeroU64::new(1).unwrap(),
                     )),
-                    sendq: 64,
+                    sendq_bytes: 64 * 512,
                 },
                 Arc::new(Telemetry::new()),
                 crate::egress::InternalUpstreams::Allow,
@@ -2819,15 +2834,22 @@ mod tests {
         let mut handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
         handle.bnc_registry = Some(registry.clone());
         assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
-        // What the upstream had read by the time `run` returned.
+        // The goodbye was sent before `run` returned; the upstream may see
+        // the close a moment later on its own task, so wait for it (bounded).
+        // The test still holds the registry, so only the driver closing its
+        // socket can end the upstream's stream.
         let mut heard = Vec::new();
-        while let Ok(line) = heard_rx.try_recv() {
+        while heard.last() != Some(&None) {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+                .await
+                .expect("the driver closed its socket during shutdown")
+                .expect("the upstream reports what it read");
             heard.push(line);
         }
         assert_eq!(
             heard,
             vec![Some("QUIT :e6irc bouncer stopping".to_string()), None],
-            "the upstream reads the goodbye, then end of stream, before shutdown completes"
+            "the upstream reads the goodbye, then the driver's close"
         );
         drop(registry);
     }
@@ -2892,11 +2914,7 @@ mod tests {
 
         // Register one client so there is a session to notify. Its send queue's
         // receiver is held here to observe the ERROR.
-        let (out_tx, mut out_rx) = queue::<Output>(e6irc_queue::Config {
-            name: "t-sendq",
-            capacity: 64,
-            policy: Policy::Fifo,
-        });
+        let (out_tx, mut out_rx) = crate::core::send_queue("t-sendq", 64 * 512);
         core_tx
             .push(Input::Open {
                 conn: ConnId(1),
@@ -2947,6 +2965,52 @@ mod tests {
         assert!(
             saw_error,
             "every client must be notified with an ERROR on shutdown"
+        );
+    }
+
+    /// A client streaming lines — PONGs, before it has even registered — gets
+    /// no more of them into the core's queue than its command allowance: past
+    /// its bucket its reader stops reading the socket until a token is back,
+    /// and the rest wait in the client's own socket buffers.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_streaming_pongs_gets_only_its_allowance_into_the_core_queue() {
+        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-core",
+            capacity: 65536,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::single(core_tx)
+            .with_command_flood(crate::core::CommandFlood::new(40, 20).expect("valid bucket"));
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        client
+            .write_all("PONG :x\r\n".repeat(5000).as_bytes())
+            .await
+            .expect("write");
+        let telemetry = Telemetry::new();
+        let reader = read_loop(server, ConnId(1), &ingress, &telemetry);
+        tokio::pin!(reader);
+        let queued = |rx: &mut Receiver<Input>| {
+            std::iter::from_fn(|| rx.try_pop())
+                .filter(|envelope| matches!(envelope.payload, Input::Line { .. }))
+                .count()
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut reader)
+                .await
+                .is_err(),
+            "the reader is still reading"
+        );
+        assert_eq!(queued(&mut core_rx), 40, "one burst at once");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut reader)
+                .await
+                .is_err(),
+            "the reader is still reading"
+        );
+        let second = queued(&mut core_rx);
+        assert!(
+            (19..=21).contains(&second),
+            "then twenty a second, not {second}"
         );
     }
 }

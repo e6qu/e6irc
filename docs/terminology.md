@@ -115,8 +115,9 @@ line with `@`. `server-time` stamps a message with its origin time so
 history and bouncer playback are ordered.
 
 **SendQ** — the per-connection outbound send queue. A client too slow to
-drain its SendQ past the configured cap is disconnected ("SendQ exceeded")
-so one slow client cannot stall the server.
+drain its SendQ past the configured cap (`sendq_bytes`, in bytes, as
+Solanum's class `sendq`) is disconnected ("SendQ exceeded") so one slow client
+cannot stall the server.
 
 **ELIST / SAFELIST** — the `005` tokens describing `LIST`. `ELIST` (extended
 LIST) names the conditions it takes, one letter each: `C` creation time, `M`
@@ -176,8 +177,13 @@ obtained via the `OPER` command against configured credentials.
 with a `kind`: **K-line** (`user@host`, the host a glob, an address or a
 CIDR range), **D-line** (an IP address, CIDR range or address glob, matched
 against the address the user connected from), **X-line** (realname/gecos).
-A reason `public|private` shows the banned user only the part before `|`. `KILL` forcibly disconnects a client; `WALLOPS` messages
-opers.
+A reason `public|private` shows the banned user only the part before `|`. A
+**temporary** ban (`KLINE <minutes> <mask>`) lapses on its own. `KILL`
+forcibly disconnects a client; `WALLOPS` messages opers.
+
+**`+R` / `+Z`** — user modes. `+R` (registered-only messages): only users
+logged in to an account, and operators, may message or invite you. `+Z`
+(secure): set by the server on a TLS connection; WHOIS shows it as 671.
 
 **SETHOST / chghost** — an oper command that changes a user's displayed host
 (a cloak), announced to peers via the `chghost` capability.
@@ -326,6 +332,8 @@ platform for real-time events.
 
 **IRC-over-WebSocket** — the browser transport (`/ws/irc`) that carries the IRC
 protocol over a WebSocket, so a web client speaks IRC without a raw TCP port.
+**wss** (the connection directory's transport name) is one a trusted proxy
+reports its client reached over HTTPS; `websocket` is any other.
 
 **Preset** — one entry of the curated catalog of public IRC networks
 (`IRC_NETWORK_PRESETS`: Libera Chat, OFTC, Snoonet), served at

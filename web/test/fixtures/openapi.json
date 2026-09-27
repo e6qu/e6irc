@@ -777,6 +777,13 @@
                           "created_at": {
                             "type": "string"
                           },
+                          "expires_at": {
+                            "description": "When a temporary ban lapses (UTC); null for a permanent ban. A lapsed ban is not listed.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "id": {
                             "minimum": 1,
                             "type": "integer"
@@ -805,7 +812,8 @@
                           "reason",
                           "set_by",
                           "kind",
-                          "created_at"
+                          "created_at",
+                          "expires_at"
                         ],
                         "type": "object"
                       },
@@ -872,6 +880,12 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
+                  "duration_minutes": {
+                    "description": "A temporary ban's length in minutes; omitted for a permanent ban. Every shard stops enforcing the ban when it lapses.",
+                    "maximum": 524160,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
                   "kind": {
                     "enum": [
                       "kline",
@@ -918,7 +932,7 @@
             "description": "server ban created"
           },
           "400": {
-            "description": "invalid kind or mask"
+            "description": "invalid kind, mask, or duration"
           },
           "401": {
             "description": "not signed in, or the token or session is invalid or expired"
@@ -1373,10 +1387,15 @@
                               "type": "integer"
                             },
                             "auth_rate_burst": {
-                              "minimum": 1,
-                              "type": [
-                                "integer",
-                                "null"
+                              "description": "Authentication requests one client address (an IPv6 client's /64) may make at once, refilling over a minute; \"off\" turns the throttle off. On by default.",
+                              "oneOf": [
+                                {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                {
+                                  "const": "off"
+                                }
                               ]
                             },
                             "command_burst": {
@@ -1462,8 +1481,20 @@
                           },
                           "type": "array"
                         },
+                        "max_history_ring_bytes": {
+                          "description": "Bytes one channel's or conversation's in-memory history may hold; its oldest entries go first.",
+                          "maximum": 65536000,
+                          "minimum": 1,
+                          "type": "integer"
+                        },
                         "max_hot_channels": {
                           "maximum": 1048576,
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "max_hot_history_bytes": {
+                          "description": "Bytes every in-memory history together may hold; the least recently active are evicted first. At least max_history_ring_bytes.",
+                          "maximum": 68719476736,
                           "minimum": 1,
                           "type": "integer"
                         },
@@ -1694,9 +1725,10 @@
                         "secure_cookies": {
                           "type": "boolean"
                         },
-                        "sendq": {
-                          "maximum": 65536,
-                          "minimum": 1,
+                        "sendq_bytes": {
+                          "description": "Bytes queued for one connection, output held behind a deferred reply included, before it is closed for SendQ.",
+                          "maximum": 33554432,
+                          "minimum": 17406,
                           "type": "integer"
                         },
                         "server_name": {
@@ -1725,10 +1757,12 @@
                         "description",
                         "motd",
                         "nicklen",
-                        "sendq",
+                        "sendq_bytes",
                         "core_queue",
                         "core_workers",
                         "max_hot_channels",
+                        "max_history_ring_bytes",
+                        "max_hot_history_bytes",
                         "listeners",
                         "registration",
                         "limits",
@@ -1876,10 +1910,15 @@
                             "type": "integer"
                           },
                           "auth_rate_burst": {
-                            "minimum": 1,
-                            "type": [
-                              "integer",
-                              "null"
+                            "description": "Authentication requests one client address (an IPv6 client's /64) may make at once, refilling over a minute; \"off\" turns the throttle off. On by default.",
+                            "oneOf": [
+                              {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              {
+                                "const": "off"
+                              }
                             ]
                           },
                           "command_burst": {
@@ -1965,8 +2004,20 @@
                         },
                         "type": "array"
                       },
+                      "max_history_ring_bytes": {
+                        "description": "Bytes one channel's or conversation's in-memory history may hold; its oldest entries go first.",
+                        "maximum": 65536000,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
                       "max_hot_channels": {
                         "maximum": 1048576,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "max_hot_history_bytes": {
+                        "description": "Bytes every in-memory history together may hold; the least recently active are evicted first. At least max_history_ring_bytes.",
+                        "maximum": 68719476736,
                         "minimum": 1,
                         "type": "integer"
                       },
@@ -2197,9 +2248,10 @@
                       "secure_cookies": {
                         "type": "boolean"
                       },
-                      "sendq": {
-                        "maximum": 65536,
-                        "minimum": 1,
+                      "sendq_bytes": {
+                        "description": "Bytes queued for one connection, output held behind a deferred reply included, before it is closed for SendQ.",
+                        "maximum": 33554432,
+                        "minimum": 17406,
                         "type": "integer"
                       },
                       "server_name": {
@@ -2228,10 +2280,12 @@
                       "description",
                       "motd",
                       "nicklen",
-                      "sendq",
+                      "sendq_bytes",
                       "core_queue",
                       "core_workers",
                       "max_hot_channels",
+                      "max_history_ring_bytes",
+                      "max_hot_history_bytes",
                       "listeners",
                       "registration",
                       "limits",
@@ -3263,6 +3317,7 @@
                 "tcp",
                 "tls",
                 "websocket",
+                "wss",
                 "local"
               ],
               "type": "string"
@@ -3328,10 +3383,12 @@
                             "type": "boolean"
                           },
                           "transport": {
+                            "description": "wss is a WebSocket a trusted proxy reports reached over HTTPS; websocket is any other.",
                             "enum": [
                               "tcp",
                               "tls",
                               "websocket",
+                              "wss",
                               "local"
                             ],
                             "type": "string"
@@ -7174,6 +7231,7 @@
                 "tcp",
                 "tls",
                 "websocket",
+                "wss",
                 "local"
               ],
               "type": "string"
@@ -7231,10 +7289,12 @@
                             "type": "boolean"
                           },
                           "transport": {
+                            "description": "wss is a WebSocket a trusted proxy reports reached over HTTPS; websocket is any other.",
                             "enum": [
                               "tcp",
                               "tls",
                               "websocket",
+                              "wss",
                               "local"
                             ],
                             "type": "string"

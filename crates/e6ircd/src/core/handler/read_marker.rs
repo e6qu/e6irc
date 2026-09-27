@@ -34,7 +34,7 @@ pub(super) fn send_current_markread(
         .map(|ms| format!("timestamp={}", e6irc_proto::time::server_time(ms)))
         .unwrap_or_else(|| "*".to_string());
     let server = state.config.server_name.clone();
-    let display = clip_echo(display);
+    let display = MiddleParam::echo(display).as_str();
     state.send(conn, &format!(":{server} MARKREAD {display} {marker}"));
 }
 
@@ -43,7 +43,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &["MARKREAD"],
+            &[Middle::own("MARKREAD")],
             Some("Unknown command"),
         );
         return;
@@ -250,7 +250,7 @@ pub(super) fn read_marker_stored(
     let server = state.config.server_name.clone();
     let line = format!(
         ":{server} MARKREAD {} timestamp={}",
-        clip_echo(&display),
+        MiddleParam::echo(&display),
         e6irc_proto::time::server_time(marker_ms)
     );
 
@@ -296,7 +296,7 @@ pub(crate) fn apply_stored_marker(
     let server = state.config.server_name.clone();
     let line = format!(
         ":{server} MARKREAD {} timestamp={}",
-        clip_echo(display),
+        MiddleParam::echo(display),
         e6irc_proto::time::server_time(marker_ms)
     );
     for peer in state.account_connections(account) {

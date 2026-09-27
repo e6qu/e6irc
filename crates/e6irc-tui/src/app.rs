@@ -221,17 +221,27 @@ pub struct App {
     buffer_limit_reported: bool,
     input_limit_reported: bool,
     outbound_limit_reported: bool,
-    /// The STATUSMSG sigils the server declared in `005` (`@#chan` addresses
-    /// the channel's operators, but is still said in `#chan`).
-    statusmsg_sigils: String,
-    /// The network's CASEMAPPING and CHANTYPES from `005`: which targets are
-    /// channels, and which names are the same buffer.
+    /// The network's CASEMAPPING, CHANTYPES and STATUSMSG from `005`: which
+    /// targets are channels, which names are the same buffer, and which
+    /// sigils narrow a channel message to its ranks (`@#chan` is still said
+    /// in `#chan`).
     names: NetworkNames,
+    /// Whether the connection has `draft/read-marker` enabled. Without it
+    /// the server has no `MARKREAD` to answer, so none is queued.
+    read_markers: bool,
 }
 
-/// The STATUSMSG sigils assumed until the server's `005` says otherwise: the
-/// two every network that supports STATUSMSG at all offers.
-const DEFAULT_STATUSMSG_SIGILS: &str = "@+";
+/// What a registered connection tells the UI before its first line: facts of
+/// the connection, not settings, so the UI cannot disagree with the socket.
+#[derive(Debug, Clone)]
+pub struct SessionStart {
+    /// The nickname the server confirmed.
+    pub nick: String,
+    /// The network's naming rules, as the 005 lines read so far declared them.
+    pub names: NetworkNames,
+    /// Whether `draft/read-marker` is enabled on the connection.
+    pub read_markers: bool,
+}
 
 /// A command the UI wants the network layer to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,9 +274,9 @@ impl Outbound {
 }
 
 impl App {
-    pub fn new(channel: String, nick: String) -> Self {
-        Self {
-            nick,
+    pub fn new(channel: String, session: SessionStart) -> Self {
+        let mut app = Self {
+            nick: String::new(),
             buffers: vec![Buffer::new(channel, BufferKind::Conversation)],
             current: 0,
             input: String::new(),
@@ -279,24 +289,48 @@ impl App {
             buffer_limit_reported: false,
             input_limit_reported: false,
             outbound_limit_reported: false,
-            statusmsg_sigils: DEFAULT_STATUSMSG_SIGILS.to_owned(),
             names: NetworkNames::default(),
+            read_markers: false,
+        };
+        app.begin_session(session);
+        app
+    }
+
+    /// Take up a newly registered connection: its confirmed nickname, the
+    /// network's naming rules as its 005 declared them, and whether it keeps
+    /// read markers. A reconnect may reach a server that differs in any of
+    /// them, so nothing from the previous connection is kept.
+    pub fn begin_session(&mut self, session: SessionStart) {
+        let SessionStart {
+            nick,
+            names,
+            read_markers,
+        } = session;
+        self.set_nick(&nick);
+        self.connected = true;
+        self.read_markers = read_markers;
+        if !read_markers {
+            self.pending_read_marker = None;
+        }
+        let casemapping_changed = names.casemapping() != self.names.casemapping()
+            || names.unrecognised_casemapping() != self.names.unrecognised_casemapping();
+        self.names = names;
+        if casemapping_changed {
+            self.casemapping_changed();
         }
     }
 
     /// The channel a message target is said in: the target itself, or the
-    /// channel a STATUSMSG target (`@#chan`, `+#chan`) addresses a subset of.
+    /// channel a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
+    /// network declared) addresses a subset of.
     fn channel_of<'a>(&self, target: &'a str) -> Option<&'a str> {
-        let bare = target.trim_start_matches(|sigil| self.statusmsg_sigils.contains(sigil));
-        [bare, target]
-            .into_iter()
-            .find(|candidate| self.names.is_channel(candidate))
+        Some(self.names.conversation(target)).filter(|name| self.names.is_channel(name))
     }
 
     /// Adopt the nickname the server confirmed at registration. It is the
     /// server's to choose, and the only name under which this client's own
     /// messages and joins come back.
-    pub fn set_nick(&mut self, nick: &str) {
+    fn set_nick(&mut self, nick: &str) {
         self.nick = nick.to_owned();
     }
 
@@ -416,6 +450,11 @@ impl App {
         if let Some(index) = self.conversation_index(channel) {
             self.buffers[index].read_hold = ReadHold::Free;
         }
+    }
+
+    /// Say beside `channel` that its history did not load, and why.
+    pub fn history_refused(&mut self, channel: &str, text: &str) {
+        self.note_about(channel, text);
     }
 
     /// Hold the read marker of `channel` at its last loaded line: history
@@ -665,27 +704,22 @@ impl App {
     /// Adopt what a `005` line declares that routing depends on. Tokens sit
     /// between the nick and the trailing "are supported by this server".
     fn adopt_isupport(&mut self, msg: &OwnedMessage) {
-        let changed = self.names.adopt_isupport(msg);
-        if changed.casemapping {
-            if let Some(mapping) = self.names.unrecognised_casemapping() {
-                self.note_server(&format!(
-                    "the server's CASEMAPPING={mapping} is not one this client knows; names \
-                     are compared as ascii (letters only)"
-                ));
-            }
-            self.note_merged_buffers();
+        if self.names.adopt_isupport(msg).casemapping {
+            self.casemapping_changed();
         }
-        let tokens = msg
-            .params
-            .get(1..msg.params.len().saturating_sub(1))
-            .unwrap_or_default();
-        for token in tokens {
-            if let Some(sigils) = token.strip_prefix("STATUSMSG=") {
-                sigils.clone_into(&mut self.statusmsg_sigils);
-            } else if token == "-STATUSMSG" {
-                self.statusmsg_sigils.clear();
-            }
+    }
+
+    /// Say what a new case mapping means: that it is not one this client
+    /// knows, and which open buffers it makes one name.
+    fn casemapping_changed(&mut self) {
+        if let Some(mapping) = self.names.unrecognised_casemapping() {
+            let mapping = mapping.to_owned();
+            self.note_server(&format!(
+                "the server's CASEMAPPING={mapping} is not one this client knows; names \
+                 are compared as ascii (letters only)"
+            ));
         }
+        self.note_merged_buffers();
     }
 
     /// Say which open buffers a new case mapping makes one name: lines for that
@@ -739,6 +773,9 @@ impl App {
     }
 
     fn queue_current_marker(&mut self) {
+        if !self.read_markers {
+            return;
+        }
         let buffer = &mut self.buffers[self.current];
         let Some(latest) = buffer.latest_time.clone() else {
             return;
@@ -1110,6 +1147,20 @@ impl App {
     }
 }
 
+/// An app on a connection with the default naming rules that keeps read
+/// markers.
+#[cfg(test)]
+pub(crate) fn test_app(channel: &str, nick: &str) -> App {
+    App::new(
+        channel.to_owned(),
+        SessionStart {
+            nick: nick.to_owned(),
+            names: NetworkNames::default(),
+            read_markers: true,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,7 +1173,7 @@ mod tests {
     /// spends on them must not be the server's decision.
     #[test]
     fn scrollback_is_bounded() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         for i in 0..SCROLLBACK_LINES + 500 {
             app.on_message(&msg(&format!(":a!u@h PRIVMSG #c :line {i}")));
         }
@@ -1153,7 +1204,7 @@ mod tests {
         // Scrolled back into history while the log is trimmed from the front:
         // `scroll` counts from the end, so it must shrink with the drain or it
         // would silently walk off into lines that no longer exist.
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         for i in 0..SCROLLBACK_LINES {
             app.on_message(&msg(&format!(":a!u@h PRIVMSG #c :line {i}")));
         }
@@ -1184,7 +1235,7 @@ mod tests {
 
     #[test]
     fn buffer_count_is_bounded_and_says_so() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         for i in 0..MAX_BUFFERS + 100 {
             app.on_message(&msg(&format!(":a!u@h PRIVMSG #c{i} :hi")));
         }
@@ -1201,7 +1252,7 @@ mod tests {
 
     #[test]
     fn channel_messages_land_in_their_buffer() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.on_message(&msg(":bob!b@h PRIVMSG #c :hello"));
         app.on_message(&msg(":bob!b@h PRIVMSG #other :elsewhere"));
         assert_eq!(app.buffers.len(), 2);
@@ -1226,7 +1277,7 @@ mod tests {
     /// refusal is the only thing that tells the user it was not delivered.
     #[test]
     fn a_refused_message_is_said_in_the_buffer_it_was_sent_from() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         app.on_message(&msg(":me!u@h JOIN #moderated"));
         app.on_message(&msg(":srv 404 me #moderated :Cannot send to channel"));
         assert_eq!(
@@ -1248,7 +1299,7 @@ mod tests {
 
     #[test]
     fn kicks_standard_replies_and_server_errors_are_never_dropped() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         app.on_message(&msg(":op!u@h KICK #home me :enough"));
         assert_eq!(last_line(&app, "#home"), "you were kicked by op: enough");
         app.on_message(&msg(":op!u@h KICK #home troll :bye"));
@@ -1276,7 +1327,7 @@ mod tests {
     /// NICK whose source is that name.
     #[test]
     fn direct_messages_are_recognised_by_the_nick_the_server_confirmed() {
-        let mut app = App::new("#home".into(), "requested".into());
+        let mut app = test_app("#home", "requested");
         app.set_nick("Upstream");
         app.on_message(&msg(":alice!u@h PRIVMSG upstream :hello"));
         assert!(app.buffer_index("alice").is_some());
@@ -1301,7 +1352,16 @@ mod tests {
     /// channel's conversation, not a query with a nick named `@#c`.
     #[test]
     fn statusmsg_targets_are_said_in_their_channel() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut names = NetworkNames::default();
+        names.adopt_tokens(["STATUSMSG=@+"]);
+        let mut app = App::new(
+            "#c".into(),
+            SessionStart {
+                nick: "me".into(),
+                names,
+                read_markers: true,
+            },
+        );
         app.on_message(&msg(":op!o@h NOTICE @#c :ops only"));
         app.on_message(&msg(":op!o@h PRIVMSG +#C :voiced"));
         assert_eq!(app.buffers.len(), 1, "no buffer named for a sigil");
@@ -1325,7 +1385,7 @@ mod tests {
     /// reply belongs beside the channel, not in the server buffer.
     #[test]
     fn names_replies_are_shown_in_their_channel() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.on_message(&msg(":srv 353 me = #C :me @op bob"));
         app.on_message(&msg(":srv 353 me @ #c :carol"));
         assert_eq!(app.buffers.len(), 1, "no server buffer: {:?}", app.buffers);
@@ -1343,7 +1403,7 @@ mod tests {
     /// and with `CHANTYPES=#!` a `!` target is a channel, not a query.
     #[test]
     fn buffers_follow_the_networks_casemapping_and_chantypes() {
-        let mut app = App::new("#a[".into(), "me".into());
+        let mut app = test_app("#a[", "me");
         app.on_message(&msg(":bob!u@h PRIVMSG #a{ :default folds"));
         assert_eq!(app.buffers.len(), 1, "rfc1459 until the network says");
         app.on_message(&msg(
@@ -1368,7 +1428,7 @@ mod tests {
     /// later 005 that makes two open buffers one name says that too.
     #[test]
     fn a_casemapping_change_is_reported_not_silent() {
-        let mut app = App::new("#a[".into(), "me".into());
+        let mut app = test_app("#a[", "me");
         app.on_message(&msg(
             ":srv 005 me CASEMAPPING=rfc7613 :are supported by this server",
         ));
@@ -1400,7 +1460,7 @@ mod tests {
     /// server spells the nick in: nicknames compare under RFC 1459.
     #[test]
     fn user_events_reach_their_query_under_any_case() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.on_message(&msg(":Al[ex]!a@h PRIVMSG me :psst"));
         app.on_message(&msg(":al{EX}!a@h QUIT :bye"));
         assert_eq!(last_line(&app, "Al[ex]"), "al{EX} quit");
@@ -1408,7 +1468,7 @@ mod tests {
 
     #[test]
     fn private_message_opens_a_query_named_for_the_sender() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.on_message(&msg(":al!a@h PRIVMSG ME :psst"));
         let i = app.buffer_index("al").expect("query buffer");
         assert_eq!(app.buffers[i].log[0].text, "psst");
@@ -1416,7 +1476,7 @@ mod tests {
 
     #[test]
     fn rfc1459_equivalent_names_share_one_buffer() {
-        let mut app = App::new("#[room]".into(), "me".into());
+        let mut app = test_app("#[room]", "me");
         app.on_message(&msg(":a!a@h PRIVMSG #{ROOM} :same channel"));
         assert_eq!(app.buffers.len(), 1);
         assert_eq!(app.current().log[0].text, "same channel");
@@ -1424,7 +1484,7 @@ mod tests {
 
     #[test]
     fn typing_and_send_targets_the_current_buffer() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         for ch in "ho".chars() {
             app.on_char(ch);
         }
@@ -1439,7 +1499,7 @@ mod tests {
 
     #[test]
     fn disconnected_input_is_not_echoed_or_queued() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.set_connected(false);
         for character in "unsent".chars() {
             app.on_char(character);
@@ -1464,7 +1524,7 @@ mod tests {
 
     #[test]
     fn slash_join_opens_and_focuses_a_channel() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         for ch in "/join #rust".chars() {
             app.on_char(ch);
         }
@@ -1486,7 +1546,7 @@ mod tests {
             "/quit later",
             "/bogus",
         ] {
-            let mut app = App::new("#c".into(), "me".into());
+            let mut app = test_app("#c", "me");
             app.input = input.into();
             assert_eq!(app.on_enter(), Action::None, "{input}");
             assert_eq!(app.input, input, "{input}");
@@ -1496,7 +1556,7 @@ mod tests {
 
     #[test]
     fn help_literal_slash_direct_message_and_raw_are_first_class() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.input = "/help".into();
         assert_eq!(app.on_enter(), Action::None);
         assert!(app.input.is_empty());
@@ -1542,7 +1602,7 @@ mod tests {
 
     #[test]
     fn composer_and_wire_line_are_bounded_without_truncating() {
-        let mut app = App::new("#channel".into(), "me".into());
+        let mut app = test_app("#channel", "me");
         for _ in 0..MAX_COMPOSER_BYTES + 20 {
             app.on_char('x');
         }
@@ -1565,7 +1625,7 @@ mod tests {
                 .is_some_and(|line| line.text.as_str().contains("exceeds an IRC wire budget"))
         );
 
-        let mut direct = App::new("#channel".into(), "me".into());
+        let mut direct = test_app("#channel", "me");
         direct.input = format!("/msg Alice {}", "x".repeat(MAX_COMPOSER_BYTES - 11));
         let retained = direct.input.clone();
         assert_eq!(direct.on_enter(), Action::None);
@@ -1575,7 +1635,7 @@ mod tests {
 
     #[test]
     fn composer_cursor_edits_on_character_boundaries() {
-        let mut app = App::new("#channel".into(), "me".into());
+        let mut app = test_app("#channel", "me");
         for character in "a界c".chars() {
             app.on_char(character);
         }
@@ -1600,7 +1660,7 @@ mod tests {
 
     #[test]
     fn outbound_refusal_never_creates_a_false_echo_and_is_reported_once() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.input = "unsent".into();
         let Action::Send(outbound) = app.on_enter() else {
             panic!("message should reach queue admission");
@@ -1628,7 +1688,7 @@ mod tests {
 
     #[test]
     fn buffer_switching_wraps() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&msg(":x!x@h PRIVMSG #b :hi"));
         assert_eq!(app.buffers.len(), 2);
         assert_eq!(app.current, 0);
@@ -1642,7 +1702,7 @@ mod tests {
 
     #[test]
     fn slash_win_uses_displayed_one_based_number_or_name() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&msg(":x!x@h PRIVMSG #b :hi"));
         app.input = "/win 2".into();
         assert_eq!(app.on_enter(), Action::None);
@@ -1665,7 +1725,7 @@ mod tests {
 
     #[test]
     fn slash_quit_exits() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         for ch in "/quit".chars() {
             app.on_char(ch);
         }
@@ -1675,7 +1735,7 @@ mod tests {
 
     #[test]
     fn scrollback_windows_and_stays_stable() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         for i in 0..10 {
             app.on_message(&msg(&format!(":u!u@h PRIVMSG #c :line{i}")));
         }
@@ -1693,7 +1753,7 @@ mod tests {
 
     #[test]
     fn messages_seen_only_after_scrollback_do_not_advance_the_read_marker() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&msg(
             "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :one",
         ));
@@ -1725,8 +1785,33 @@ mod tests {
     }
 
     #[test]
+    fn read_markers_are_sent_only_on_a_connection_that_keeps_them() {
+        let session = |read_markers| SessionStart {
+            nick: "me".into(),
+            names: NetworkNames::default(),
+            read_markers,
+        };
+        let mut app = App::new("#a".into(), session(false));
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :one",
+        ));
+        assert_eq!(app.take_read_marker_command(), None, "no MARKREAD to send");
+
+        app.begin_session(session(true));
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:01.000Z :alice!u@h PRIVMSG #a :two",
+        ));
+        let pending = app.take_read_marker_command().expect("markers are kept");
+        app.requeue_read_marker_command(pending);
+        // A reconnect that lands on a server without them drops the pending
+        // one: it would only be refused.
+        app.begin_session(session(false));
+        assert_eq!(app.take_read_marker_command(), None);
+    }
+
+    #[test]
     fn read_markers_coalesce_and_unread_clears_only_when_reached() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&msg(
             "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :one",
         ));
@@ -1767,7 +1852,7 @@ mod tests {
 
     #[test]
     fn invalid_server_time_is_reported_once_and_never_replayed() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&msg("@time=bad :alice!u@h PRIVMSG #a :one"));
         app.on_message(&msg("@time=also-bad :alice!u@h PRIVMSG #a :two"));
         assert!(app.take_read_marker_command().is_none());
@@ -1783,7 +1868,7 @@ mod tests {
 
     #[test]
     fn live_history_overlap_is_deduplicated_by_msgid() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         let line = "@msgid=same;time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :once";
         app.on_message(&msg(line));
         app.on_message(&msg(&format!("@batch=history;{}", &line[1..])));
@@ -1801,7 +1886,7 @@ mod tests {
     /// shown beside the conversation it names, else in the server buffer.
     #[test]
     fn unmodelled_replies_and_commands_are_shown_not_dropped() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         app.on_message(&msg(":srv 001 me :Welcome to the network"));
         app.on_message(&msg(":srv 311 me alice ~a host.example * :Alice Liddell"));
         let server = app.buffer_index(SERVER_BUFFER).expect("a server buffer");
@@ -1854,7 +1939,7 @@ mod tests {
 
     #[test]
     fn actions_and_formatting_render_as_meant() {
-        let mut app = App::new("#home".into(), "me".into());
+        let mut app = test_app("#home", "me");
         app.on_message(&msg(":alice!u@h PRIVMSG #home :\x01ACTION waves\x01"));
         let line = app.current().log.back().expect("a line").clone();
         assert_eq!(line.from, "* alice");
@@ -1872,7 +1957,7 @@ mod tests {
     /// marker over it — that would mark the unloaded lines read everywhere.
     #[test]
     fn the_read_marker_never_passes_the_last_contiguously_loaded_line() {
-        let mut app = App::new("#a".into(), "me".into());
+        let mut app = test_app("#a", "me");
         app.on_message(&msg(":srv MARKREAD #a timestamp=2026-07-30T12:00:00.000Z"));
         app.on_message(&msg(
             "@batch=h;time=2026-07-30T12:00:01.000Z :alice!u@h PRIVMSG #a :oldest unread",
@@ -1913,7 +1998,7 @@ mod tests {
         );
 
         // With no time known at all, the marker does not move.
-        let mut app = App::new("#b".into(), "me".into());
+        let mut app = test_app("#b", "me");
         app.hold_read_marker("#b");
         app.on_message(&msg(
             "@time=2026-07-30T13:00:00.000Z :alice!u@h PRIVMSG #b :live",
@@ -1923,7 +2008,7 @@ mod tests {
 
     #[test]
     fn a_multi_line_paste_is_refused_and_a_single_line_is_inserted() {
-        let mut app = App::new("#c".into(), "me".into());
+        let mut app = test_app("#c", "me");
         app.on_paste("a\rb");
         assert_eq!(app.input(), "");
         assert!(

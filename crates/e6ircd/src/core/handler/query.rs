@@ -24,13 +24,10 @@ fn parse_whox(arg: &str) -> Option<WhoxRequest> {
         return None;
     }
     // The token is echoed as a middle parameter of every 354 row, so a value
-    // that cannot stand as one corrupts the reply's framing for the
-    // requester: an empty token collapses into the adjacent space (shifting
-    // every later field left one column), and a leading `:` starts a
-    // premature trailing that swallows the rest of the row. Treat both as
-    // absent — echoed as the conventional "0", matching Solanum's
-    // empty-querytype default.
-    let token = token.filter(|t| !t.is_empty() && !t.starts_with(':'));
+    // that cannot stand as one (empty, `:`-leading, or spaced: `WHO #c
+    // :%nt,a b`) is treated as absent and echoed as the conventional "0",
+    // Solanum's empty-querytype default.
+    let token = token.filter(|t| MiddleParam::stands_alone(t));
     Some(WhoxRequest {
         fields: fields_part.chars().collect(),
         token,
@@ -55,31 +52,33 @@ struct WhoxRow<'a> {
 }
 
 fn whox_row_line(state: &ServerState, conn: ConnId, req: &WhoxRequest, row: &WhoxRow) -> String {
-    let mut middle: Vec<String> = Vec::new();
+    let mut middle = Vec::new();
     let mut trailing = None;
     for f in "tcuihsnfdlaor".chars() {
         if !req.fields.contains(&f) {
             continue;
         }
-        match f {
-            't' => middle.push(req.token.clone().unwrap_or_else(|| "0".into())),
-            'c' => middle.push(row.channel.to_string()),
-            'u' => middle.push(row.user.to_string()),
-            'i' => middle.push("255.255.255.255".into()), // IPs are not exposed
-            'h' => middle.push(row.host.to_string()),
-            's' => middle.push(row.server.to_string()),
-            'n' => middle.push(row.nick.to_string()),
-            'f' => middle.push(row.flags.to_string()),
-            'd' => middle.push("0".into()), // hop count: single server
-            'l' => middle.push(row.idle_secs.to_string()), // idle seconds
-            'a' => middle.push(row.account.unwrap_or("0").to_string()),
-            'o' => middle.push("n/a".into()), // oplevel unused (charybdis)
-            'r' => trailing = Some(row.realname.to_string()),
-            _ => {} // unknown field chars are ignored per WHOX practice
-        }
+        middle.push(match f {
+            't' => req.token.as_deref().map_or(Middle::own("0"), Middle::echo),
+            'c' => Middle::own(row.channel),
+            'u' => Middle::own(row.user),
+            'i' => Middle::own("255.255.255.255"), // IPs are not exposed
+            'h' => Middle::own(row.host),
+            's' => Middle::own(row.server),
+            'n' => Middle::own(row.nick),
+            'f' => Middle::own(row.flags),
+            'd' => Middle::own("0"),            // hop count: single server
+            'l' => Middle::from(row.idle_secs), // idle seconds
+            'a' => Middle::own(row.account.unwrap_or("0")),
+            'o' => Middle::own("n/a"), // oplevel unused (charybdis)
+            'r' => {
+                trailing = Some(row.realname);
+                continue;
+            }
+            _ => continue, // unknown field chars are ignored per WHOX practice
+        });
     }
-    let refs: Vec<&str> = middle.iter().map(String::as_str).collect();
-    state.numeric_line(conn, RPL_WHOSPCRPL, &refs, trailing.as_deref())
+    state.numeric_line(conn, RPL_WHOSPCRPL, &middle, trailing)
 }
 
 /// WHO status flags: H (here) or G (gone/away), `*` for opers, then the
@@ -107,7 +106,12 @@ struct WhoRowData {
 
 pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&mask) = p.first() else {
-        state.numeric(conn, RPL_ENDOFWHO, &["*"], Some("End of /WHO list"));
+        state.numeric(
+            conn,
+            RPL_ENDOFWHO,
+            &[Middle::own("*")],
+            Some("End of /WHO list"),
+        );
         return;
     };
     if mask.starts_with('#') {
@@ -180,7 +184,12 @@ fn who_reply(
             conn,
             RPL_WHOREPLY,
             &[
-                channel, &row.user, &row.host, &server, &row.nick, &row.flags,
+                Middle::own(channel),
+                Middle::own(&row.user),
+                Middle::own(&row.host),
+                Middle::own(&server),
+                Middle::own(&row.nick),
+                Middle::own(&row.flags),
             ],
             Some(&format!("0 {}", row.realname)),
         ),
@@ -260,13 +269,10 @@ fn who_reply(
             });
         rows.extend(users.map(|row| row_line("*", row)));
     }
-    // The mask is raw client input (`WHO :` → empty, `WHO ::x` → ':'-leading);
-    // clip_echo renders those as the safe "*" placeholder so the terminating
-    // numeric's middle can't break the reply's framing.
     let end = state.numeric_line(
         conn,
         RPL_ENDOFWHO,
-        &[clip_echo(mask)],
+        &[Middle::echo(mask)],
         Some("End of /WHO list"),
     );
     crate::core::paced::WhoReply { rows, end }
@@ -315,10 +321,16 @@ pub(super) fn deliver_who_reply(
     requester: WhoRequester,
     reply: crate::core::paced::WhoReply<bytes::Bytes>,
 ) {
-    let lines = reply.rows.len() + 1;
-    let queued = state.paced_replies.get(&conn);
-    let immediate = queued.is_none() && state.paced_room(conn).is_some_and(|room| lines <= room);
-    let admitted = queued.is_none_or(|queued| queued.admits(lines, state.config.sendq));
+    // A channel owner's reply can arrive after the session it answers has
+    // closed. Its output, and the hold this reply was to release, went with
+    // the session (`ServerState::close`): nothing can be sent or paced to it.
+    let Some(session) = state.sessions.get(&conn) else {
+        return;
+    };
+    let size = reply.rows.iter().map(bytes::Bytes::len).sum::<usize>() + reply.end.len();
+    let queued = session.paced_who.as_ref();
+    let immediate = queued.is_none() && size <= session.paced_room();
+    let admitted = queued.is_none_or(|queued| queued.admits(size, state.config.sendq_bytes));
     let send_now = |state: &mut ServerState, lines: Vec<bytes::Bytes>| match &requester {
         WhoRequester::Local => {
             for line in lines {
@@ -342,7 +354,7 @@ pub(super) fn deliver_who_reply(
         let refusal = state.numeric_line(
             conn,
             RPL_TRYAGAIN,
-            &["WHO"],
+            &[Middle::own("WHO")],
             Some("Please wait a while and try again."),
         );
         return send_now(state, vec![wire_line(&refusal), reply.end]);
@@ -358,11 +370,7 @@ pub(super) fn deliver_who_reply(
     });
     let mut lines: std::collections::VecDeque<_> = reply.rows.into();
     lines.push_back(reply.end);
-    state
-        .paced_replies
-        .entry(conn)
-        .or_default()
-        .push(crate::core::paced::PacedReply { batch, lines });
+    state.queue_paced_who(conn, crate::core::paced::PacedReply { batch, lines });
     match requester {
         WhoRequester::Local => pace_who_replies_to(state, conn),
         // The connection's later output waited on this reply: it has
@@ -375,15 +383,11 @@ pub(super) fn deliver_who_reply(
 
 /// Send `conn`'s paced WHO replies while its send queue is under half full,
 /// each inside its labeled batch if it has one, dropping each once it ends.
-fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
-    // A closing connection's replies go with it (`ServerState::close`).
-    let mut room = state
-        .paced_room(conn)
-        .expect("a WHO is paced only to an open connection");
-    let mut paced = state
-        .paced_replies
-        .remove(&conn)
-        .expect("only a connection with paced WHO replies is paced");
+pub(super) fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
+    let Some((mut room, mut paced)) = state.take_paced(conn, |session| session.paced_who.take())
+    else {
+        return;
+    };
     while let Some(reply) = paced.replies.front_mut() {
         let batch = reply.batch.as_mut().map(|batch| {
             if !batch.opened {
@@ -405,9 +409,8 @@ fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
         if room == 0 {
             break;
         }
-        let line = reply.lines.pop_front().expect("the reply has lines left");
-        paced.lines -= 1;
-        room -= 1;
+        let line = paced.take_line().expect("the reply has lines left");
+        room = room.saturating_sub(line.len());
         let line = match &batch {
             Some(batch) => inject_tag(&line, &format!("batch={batch}")),
             None => line,
@@ -415,15 +418,7 @@ fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
         state.send_unheld(conn, line);
     }
     if !paced.replies.is_empty() {
-        state.paced_replies.insert(conn, paced);
-    }
-}
-
-/// Send what every paced WHO reply on this shard has room for now.
-pub(crate) fn pace_who_replies(state: &mut ServerState) {
-    let paced: Vec<ConnId> = state.paced_replies.keys().copied().collect();
-    for conn in paced {
-        pace_who_replies_to(state, conn);
+        state.resume_paced(conn, |session| &mut session.paced_who, paced);
     }
 }
 
@@ -449,19 +444,42 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 RPL_WHOISUSER,
-                &[nick, user_name, host, "*"],
+                &[
+                    Middle::own(nick),
+                    Middle::own(user_name),
+                    Middle::own(host),
+                    Middle::own("*"),
+                ],
                 Some(realname),
             );
             // Split across as many 319 lines as needed so none exceeds the
             // 512-byte wire limit (the same guard NAMES applies to 353).
-            state.numeric_list(conn, RPL_WHOISCHANNELS, &[nick], &chans, ' ');
+            state.numeric_list(conn, RPL_WHOISCHANNELS, &[Middle::own(nick)], &chans, ' ');
             if user.bot {
-                state.numeric(conn, RPL_WHOISBOT, &[nick], Some("is a bot"));
+                state.numeric(conn, RPL_WHOISBOT, &[Middle::own(nick)], Some("is a bot"));
             }
             if user.oper {
-                state.numeric(conn, RPL_WHOISOPERATOR, &[nick], Some("is an IRC operator"));
+                state.numeric(
+                    conn,
+                    RPL_WHOISOPERATOR,
+                    &[Middle::own(nick)],
+                    Some("is an IRC operator"),
+                );
             }
-            state.numeric(conn, RPL_WHOISSERVER, &[nick, &server], Some(&network));
+            if user.secure {
+                state.numeric(
+                    conn,
+                    RPL_WHOISSECURE,
+                    &[Middle::own(nick)],
+                    Some("is using a secure connection"),
+                );
+            }
+            state.numeric(
+                conn,
+                RPL_WHOISSERVER,
+                &[Middle::own(nick), Middle::own(&server)],
+                Some(&network),
+            );
             // RPL_WHOISIDLE reports seconds idle (elapsed monotonic time since
             // last activity) and a Unix-*second* signon *timestamp* (wall
             // clock) — the two clocks the type split keeps separate.
@@ -471,28 +489,39 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 RPL_WHOISIDLE,
-                &[nick, &idle.to_string(), &user.signon.as_secs().to_string()],
+                &[
+                    Middle::own(nick),
+                    Middle::from(idle),
+                    Middle::from(user.signon.as_secs()),
+                ],
                 Some("seconds idle, signon time"),
             );
             if let Some(away) = &user.away {
-                state.numeric(conn, RPL_AWAY, &[nick], Some(away));
+                state.numeric(conn, RPL_AWAY, &[Middle::own(nick)], Some(away));
             }
             if let Some(account) = &user.account {
                 state.numeric(
                     conn,
                     RPL_WHOISACCOUNT,
-                    &[nick, account],
+                    &[Middle::own(nick), Middle::own(account)],
                     Some("is logged in as"),
                 );
             }
-            state.numeric(conn, RPL_ENDOFWHOIS, &[nick], Some("End of /WHOIS list"));
+            state.numeric(
+                conn,
+                RPL_ENDOFWHOIS,
+                &[Middle::own(nick)],
+                Some("End of /WHOIS list"),
+            );
         }
         None => {
-            // `target` is raw client input; clip_echo keeps an empty or
-            // ':'-leading value from breaking the echo's framing.
-            let shown = clip_echo(target);
-            state.err_nosuchnick(conn, shown);
-            state.numeric(conn, RPL_ENDOFWHOIS, &[shown], Some("End of /WHOIS list"));
+            state.err_nosuchnick(conn, target);
+            state.numeric(
+                conn,
+                RPL_ENDOFWHOIS,
+                &[Middle::echo(target)],
+                Some("End of /WHOIS list"),
+            );
         }
     }
 }
@@ -504,27 +533,23 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &["SETNAME"],
+            &[Middle::own("SETNAME")],
             Some("Unknown command"),
         );
         return;
     }
-    let Some(&new_name) = p.first() else {
+    let Some(&new_name) = p.first().filter(|name| !name.is_empty()) else {
         let server = state.config.server_name.clone();
-        state.send(
-            conn,
-            &format!(":{server} FAIL SETNAME INVALID_REALNAME :Realname required"),
+        let fail = fail_line(
+            &server,
+            "SETNAME",
+            "INVALID_REALNAME",
+            &[],
+            "Realname required",
         );
+        state.send(conn, &fail);
         return;
     };
-    if new_name.is_empty() {
-        let server = state.config.server_name.clone();
-        state.send(
-            conn,
-            &format!(":{server} FAIL SETNAME INVALID_REALNAME :Realname required"),
-        );
-        return;
-    }
     // setname has its own refusal for a realname the server will not take,
     // and NAMELEN told the client the bound: a longer one is refused, never
     // cut to something the client did not ask for.
@@ -586,7 +611,7 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_WASNOSUCHNICK,
-            &[clip_echo(target)],
+            &[Middle::echo(target)],
             Some("There was no such nickname"),
         );
     } else {
@@ -594,7 +619,12 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 RPL_WHOWASUSER,
-                &[&entry.nick, &entry.user, &entry.host, "*"],
+                &[
+                    Middle::own(&entry.nick),
+                    Middle::own(&entry.user),
+                    Middle::own(&entry.host),
+                    Middle::own("*"),
+                ],
                 Some(&entry.realname),
             );
             // The RPL_WHOISSERVER "server info" slot conventionally carries the
@@ -604,7 +634,7 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 RPL_WHOISSERVER,
-                &[&entry.nick, &server],
+                &[Middle::own(&entry.nick), Middle::own(&server)],
                 Some(&format!("last seen {last_seen}")),
             );
         }
@@ -612,7 +642,7 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.numeric(
         conn,
         RPL_ENDOFWHOWAS,
-        &[clip_echo(target)],
+        &[Middle::echo(target)],
         Some("End of WHOWAS"),
     );
 }
@@ -622,7 +652,7 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 pub(super) fn cmd_time(state: &mut ServerState, conn: ConnId) {
     let server = state.config.server_name.clone();
     let now = e6irc_proto::time::server_time((state.config.clock)());
-    state.numeric(conn, RPL_TIME, &[&server], Some(&now));
+    state.numeric(conn, RPL_TIME, &[Middle::own(&server)], Some(&now));
 }
 
 pub(super) fn cmd_info(state: &mut ServerState, conn: ConnId) {
@@ -647,19 +677,19 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
         conn,
         RPL_ISUPPORT,
         &[
-            &casemapping,
-            "CHANTYPES=#",
-            &format!("NICKLEN={nicklen}"),
-            &format!("CHANNELLEN={}", crate::sanitize::CHANNELLEN),
-            &format!("USERLEN={USERLEN}"),
-            &format!("TOPICLEN={TOPICLEN}"),
-            &format!("KICKLEN={KICKLEN}"),
-            &format!("AWAYLEN={AWAYLEN}"),
-            &prefix_isupport(),
-            &format!("STATUSMSG={PREFIX_SIGILS}"),
-            "BOT=B",
-            &chanmodes_isupport(),
-            &format!("NETWORK={}", state.config.network_name),
+            Middle::own(&casemapping),
+            Middle::own("CHANTYPES=#"),
+            Middle::own(format!("NICKLEN={nicklen}")),
+            Middle::own(format!("CHANNELLEN={}", crate::sanitize::CHANNELLEN)),
+            Middle::own(format!("USERLEN={USERLEN}")),
+            Middle::own(format!("TOPICLEN={TOPICLEN}")),
+            Middle::own(format!("KICKLEN={KICKLEN}")),
+            Middle::own(format!("AWAYLEN={AWAYLEN}")),
+            Middle::own(prefix_isupport()),
+            Middle::own(format!("STATUSMSG={PREFIX_SIGILS}")),
+            Middle::own("BOT=B"),
+            Middle::own(chanmodes_isupport()),
+            Middle::own(format!("NETWORK={}", state.config.network_name)),
         ],
         Some("are supported by this server"),
     );
@@ -667,26 +697,26 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
         conn,
         RPL_ISUPPORT,
         &[
-            "EXCEPTS",
-            "INVEX",
-            "KNOCK",
-            "UTF8ONLY",
-            "WHOX",
-            &format!("KEYLEN={KEYLEN}"),
+            Middle::own("EXCEPTS"),
+            Middle::own("INVEX"),
+            Middle::own("KNOCK"),
+            Middle::own("UTF8ONLY"),
+            Middle::own("WHOX"),
+            Middle::own(format!("KEYLEN={KEYLEN}")),
             // Derived from the enforced consts (like MAXLIST/CHANLIMIT below)
             // so the advertisement can never silently drift from enforcement.
-            &format!("MONITOR={MONITOR_LIMIT}"),
-            &format!("CHATHISTORY={CHATHISTORY_MAX}"),
-            "MSGREFTYPES=msgid,timestamp",
-            &format!("NAMELEN={REALLEN}"),
-            &format!("MAXLIST=bqeI:{MAXLIST}"),
-            &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
+            Middle::own(format!("MONITOR={MONITOR_LIMIT}")),
+            Middle::own(format!("CHATHISTORY={CHATHISTORY_MAX}")),
+            Middle::own("MSGREFTYPES=msgid,timestamp"),
+            Middle::own(format!("NAMELEN={REALLEN}")),
+            Middle::own(format!("MAXLIST=bqeI:{MAXLIST}")),
+            Middle::own(format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}")),
             // Every command that bounds its target list, at the bound it keeps
             // (the test pins this list against the enforcing constants).
-            &format!(
+            Middle::own(format!(
                 "TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},TAGMSG:{TARGMAX},KICK:{TARGMAX},\
                  JOIN:{JOIN_TARGMAX},PART:{PART_TARGMAX},NAMES:{NAMES_TARGMAX}"
-            ),
+            )),
         ],
         Some("are supported by this server"),
     );
@@ -698,18 +728,21 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
         conn,
         RPL_ISUPPORT,
         &[
-            &format!(
+            Middle::own(format!(
                 "EXTBAN={},{}",
                 crate::core::banmask::EXTBAN_PREFIX,
                 crate::core::banmask::EXTBAN_TYPES
-            ),
-            &format!("ACCOUNTEXTBAN={}", crate::core::banmask::ACCOUNT_EXTBAN),
+            )),
+            Middle::own(format!(
+                "ACCOUNTEXTBAN={}",
+                crate::core::banmask::ACCOUNT_EXTBAN
+            )),
             // Enforced by the MODE parser (`channel_mode_by`).
-            &format!("MODES={MODES}"),
+            Middle::own(format!("MODES={MODES}")),
             // LIST paces its reply to the client's send queue, and takes
             // exactly the conditions its parser (`ListFilter::parse`) does.
-            "SAFELIST",
-            &format!("ELIST={}", crate::core::list::ELIST),
+            Middle::own("SAFELIST"),
+            Middle::own(format!("ELIST={}", crate::core::list::ELIST)),
         ],
         Some("are supported by this server"),
     );
@@ -721,7 +754,7 @@ pub(super) fn cmd_version(state: &mut ServerState, conn: ConnId) {
     state.numeric(
         conn,
         RPL_VERSION,
-        &[version, &server],
+        &[Middle::own(version), Middle::own(&server)],
         Some("A monolithic Rust IRCv3 server."),
     );
     // A VERSION reply is conventionally followed by the ISUPPORT tokens.
@@ -731,7 +764,12 @@ pub(super) fn cmd_version(state: &mut ServerState, conn: ConnId) {
 pub(super) fn cmd_admin(state: &mut ServerState, conn: ConnId) {
     let server = state.config.server_name.clone();
     let network = state.config.network_name.clone();
-    state.numeric(conn, RPL_ADMINME, &[&server], Some("Administrative info"));
+    state.numeric(
+        conn,
+        RPL_ADMINME,
+        &[Middle::own(&server)],
+        Some("Administrative info"),
+    );
     state.numeric(
         conn,
         RPL_ADMINLOC1,
@@ -769,14 +807,7 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Match Solanum: pack nicks while they fit and drop the rest, which a
     // client re-queries next poll anyway (ISON is a polling command). Uses the
     // shared whole-item packer (same as USERHOST/USERIP) against the real head.
-    let target = state.sessions[&conn].nick().unwrap_or("*");
-    let head_len = format!(
-        ":{} {} {} :",
-        state.config.server_name,
-        e6irc_proto::numerics::code_str(RPL_ISON),
-        target,
-    )
-    .len();
+    let head_len = state.numeric_head_len(conn, RPL_ISON, &[]);
     let shown = crate::core::handler::pack_trailing_list(&online, head_len);
     state.numeric(conn, RPL_ISON, &[], Some(&shown));
 }
@@ -1208,11 +1239,16 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
 
 pub(super) fn send_help(state: &mut ServerState, conn: ConnId, subject: &str, lines: &[&str]) {
     let (first, rest) = lines.split_first().expect("topics are non-empty");
-    state.numeric(conn, RPL_HELPSTART, &[subject], Some(first));
+    state.numeric(conn, RPL_HELPSTART, &[Middle::own(subject)], Some(first));
     for line in rest {
-        state.numeric(conn, RPL_HELPTXT, &[subject], Some(line));
+        state.numeric(conn, RPL_HELPTXT, &[Middle::own(subject)], Some(line));
     }
-    state.numeric(conn, RPL_ENDOFHELP, &[subject], Some("End of help"));
+    state.numeric(
+        conn,
+        RPL_ENDOFHELP,
+        &[Middle::own(subject)],
+        Some("End of help"),
+    );
 }
 
 pub(super) fn cmd_help(state: &mut ServerState, conn: ConnId, p: &[&str], oper_view: bool) {
@@ -1227,7 +1263,7 @@ pub(super) fn cmd_help(state: &mut ServerState, conn: ConnId, p: &[&str], oper_v
                 None => state.numeric(
                     conn,
                     ERR_HELPNOTFOUND,
-                    &[clip_echo(subject)],
+                    &[Middle::echo(subject)],
                     Some("No help available on this topic"),
                 ),
             }
@@ -1236,7 +1272,7 @@ pub(super) fn cmd_help(state: &mut ServerState, conn: ConnId, p: &[&str], oper_v
             state.numeric(
                 conn,
                 RPL_HELPSTART,
-                &["index"],
+                &[Middle::own("index")],
                 Some(if oper_view {
                     "Available commands (including oper-only)"
                 } else {
@@ -1248,17 +1284,15 @@ pub(super) fn cmd_help(state: &mut ServerState, conn: ConnId, p: &[&str], oper_v
                 .filter(visible)
                 .map(|t| t.name.to_string())
                 .collect();
-            let target = state.sessions[&conn].nick().unwrap_or("*");
-            let head_len = format!(
-                ":{} {} {} index :",
-                state.config.server_name,
-                e6irc_proto::numerics::code_str(RPL_HELPTXT),
-                target,
-            )
-            .len();
+            let head_len = state.numeric_head_len(conn, RPL_HELPTXT, &[Middle::own("index")]);
             let packed = pack_trailing_list(&names, head_len);
-            state.numeric(conn, RPL_HELPTXT, &["index"], Some(&packed));
-            state.numeric(conn, RPL_ENDOFHELP, &["index"], Some("End of help"));
+            state.numeric(conn, RPL_HELPTXT, &[Middle::own("index")], Some(&packed));
+            state.numeric(
+                conn,
+                RPL_ENDOFHELP,
+                &[Middle::own("index")],
+                Some("End of help"),
+            );
         }
     }
 }

@@ -215,6 +215,7 @@ struct ServerBanResponse {
     set_by: String,
     kind: String,
     created_at: String,
+    expires_at: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -288,7 +289,8 @@ struct ServerInfoResponse {
 
 /// Start a device grant. No auth: the client is not yet a principal, but each
 /// call inserts a live `device_grants` row that pruning cannot touch for 10
-/// minutes — `RateLimited` caps the per-IP rate so an anonymous flood can't
+/// minutes — `RateLimited` caps the per-address rate (`limits.auth_rate_burst`,
+/// on unless the operator turned it off) so an anonymous flood can't
 /// accumulate rows unboundedly.
 pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLimited) -> Response {
     let Some(verification_uri) = device_verification_uri(state.public_url.as_deref()) else {
@@ -1157,10 +1159,12 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
         description,
         motd,
         nicklen,
-        sendq,
+        sendq_bytes,
         core_queue,
         core_workers,
         max_hot_channels,
+        max_history_ring_bytes,
+        max_hot_history_bytes,
         listeners,
         registration,
         limits,
@@ -1297,10 +1301,12 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
         description,
         motd,
         nicklen,
-        sendq,
+        sendq_bytes,
         core_queue,
         core_workers,
         max_hot_channels,
+        max_history_ring_bytes,
+        max_hot_history_bytes,
         listeners,
         registration,
         limits,
@@ -1333,10 +1339,12 @@ struct AdminScalarSettings {
     description: String,
     motd: Vec<String>,
     nicklen: usize,
-    sendq: usize,
+    sendq_bytes: usize,
     core_queue: usize,
     core_workers: usize,
     max_hot_channels: usize,
+    max_history_ring_bytes: usize,
+    max_hot_history_bytes: usize,
     listeners: Vec<crate::config::ListenerConfig>,
     registration: crate::config::RegistrationConfig,
     limits: crate::config::LimitsConfig,
@@ -1416,10 +1424,12 @@ impl AdminScalarSettings {
             description: self.description,
             motd: self.motd,
             nicklen: self.nicklen,
-            sendq: self.sendq,
+            sendq_bytes: self.sendq_bytes,
             core_queue: self.core_queue,
             core_workers: self.core_workers,
             max_hot_channels: self.max_hot_channels,
+            max_history_ring_bytes: self.max_history_ring_bytes,
+            max_hot_history_bytes: self.max_hot_history_bytes,
             listeners: self.listeners,
             registration: self.registration,
             limits: self.limits,
@@ -2219,6 +2229,7 @@ pub(super) async fn admin_server_bans(
                     set_by: entry.set_by,
                     kind: entry.kind,
                     created_at: entry.created_at,
+                    expires_at: entry.expires_at,
                 })
                 .collect(),
             next_before_id: page.next_before_id,
@@ -2234,6 +2245,9 @@ pub(super) struct AdminServerBanBody {
     mask: String,
     #[serde(default)]
     reason: String,
+    /// A temporary ban's length in minutes; absent for a permanent ban.
+    #[serde(default)]
+    duration_minutes: Option<u32>,
 }
 
 pub(super) async fn admin_create_server_ban(
@@ -2245,6 +2259,24 @@ pub(super) async fn admin_create_server_ban(
         Ok(body) => body,
         Err(response) => return response.into(),
     };
+    let duration_minutes = match body.duration_minutes {
+        None => None,
+        Some(minutes) => match std::num::NonZeroU32::new(minutes)
+            .filter(|minutes| minutes.get() <= crate::core::ServerBanExpiry::MAX_MINUTES)
+        {
+            Some(minutes) => Some(minutes),
+            None => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid server ban",
+                    Some(&format!(
+                        "duration_minutes must be between 1 and {} (52 weeks).",
+                        crate::core::ServerBanExpiry::MAX_MINUTES
+                    )),
+                );
+            }
+        },
+    };
     server_ban_response(
         &state,
         crate::core::AdminRequest::AddServerBan {
@@ -2252,6 +2284,7 @@ pub(super) async fn admin_create_server_ban(
             kind: body.kind,
             reason: body.reason,
             actor,
+            duration_minutes,
         },
         StatusCode::CREATED,
     )

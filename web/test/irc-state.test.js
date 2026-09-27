@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -33,6 +34,7 @@ import {
   outgoingChat,
   parseIrc,
   prependHistory,
+  reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
   seededNick,
@@ -136,7 +138,8 @@ test("IRC parsing distinguishes server and user notice sources", () => {
 });
 
 test("live and history chat routing understands STATUSMSG and server notices", () => {
-  const route = (line) => chatMessageRoute(parseIrc(line), "Alice");
+  const libera = namesFromIsupport(["STATUSMSG=@+"]);
+  const route = (line) => chatMessageRoute(parseIrc(line), "Alice", () => false, libera);
   assert.deepEqual(route(":bob!u@h PRIVMSG @#Ops :operators only"), {
     kind: "channel",
     target: "#Ops",
@@ -162,6 +165,44 @@ test("live and history chat routing understands STATUSMSG and server notices", (
     target: null,
   });
   assert.equal(route(":bob!u@h PRIVMSG #room"), null);
+});
+
+// The server's bnc_statusmsg_lines_belong_to_their_channel and NetworkNames'
+// statusmsg_sigils_come_from_the_network, read by the browser.
+test("STATUSMSG sigils are the network's own, never a hard-coded @+", () => {
+  const route = (line, names, known = () => false) => chatMessageRoute(parseIrc(line), "alice", known, names);
+  const ergo = namesFromIsupport(["STATUSMSG=~&@%+", "CHANTYPES=#&!"]);
+  for (const [addressed, channel] of [
+    ["@#Room", "#Room"],
+    ["+#Room", "#Room"],
+    ["@&local", "&local"],
+    ["%#dev", "#dev"],
+    ["@%#dev", "#dev"],
+    ["&#dev", "#dev"],
+    ["!ABCDEchan", "!ABCDEchan"],
+  ]) {
+    assert.deepEqual(route(`:Bob!u@h PRIVMSG ${addressed} :ops only`, ergo), { kind: "channel", target: channel }, addressed);
+  }
+  assert.deepEqual(route(":alice!u@h NOTICE @#Room :from us", ergo), { kind: "channel", target: "#Room" });
+  assert.deepEqual(
+    route(":Bob!u@h PRIVMSG +alice :a nick, not a STATUSMSG", namesFromIsupport(["STATUSMSG=~&@%+"])),
+    { kind: "dm", target: "Bob" },
+  );
+
+  // Under the default CHANTYPES `#&`, `&#dev` is still #dev's STATUSMSG when
+  // `&` is a status sigil, not a phantom `&#dev` channel.
+  const ampersand = namesFromIsupport(["STATUSMSG=&@"]);
+  assert.deepEqual(route(":Bob!u@h PRIVMSG &#dev :hi", ampersand), { kind: "channel", target: "#dev" });
+  assert.deepEqual(route(":Bob!u@h PRIVMSG &local :hi", ampersand), { kind: "channel", target: "&local" });
+
+  // A sigil the network does not advertise stays part of the target.
+  assert.deepEqual(route(":Bob!u@h PRIVMSG %#dev :hi", namesFromIsupport(["STATUSMSG=@+"])), { kind: "dm", target: "Bob" });
+  assert.deepEqual(route(":Bob!u@h PRIVMSG @#dev :hi", DEFAULT_NAMES), { kind: "dm", target: "Bob" }, "no STATUSMSG yet");
+  const retracted = namesFrom(["me", "-STATUSMSG", "x"], ergo);
+  assert.equal(retracted.statusmsg, "");
+  assert.deepEqual(route(":Bob!u@h PRIVMSG %#dev :hi", retracted), { kind: "dm", target: "Bob" });
+  // A buffer the page already holds as a channel counts, as before.
+  assert.deepEqual(route(":Bob!u@h PRIVMSG @odd :hi", ergo, (name) => name === "odd"), { kind: "channel", target: "odd" });
 });
 
 test("IRC tag values use the protocol escape rules", () => {
@@ -239,6 +280,29 @@ test("bidirectional override and isolate controls are removed from displayed tex
   assert.equal(stripBidiControls(undefined), "");
 });
 
+// A channel named `#a‮b` drew reversed in the sidebar, the header and
+// the member list, which showed buffer and member names unfiltered.
+test("channel and nick names are drawn without bidi controls, in isolation", async () => {
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  const drawn = source.split("\n").filter((line) =>
+    /textContent\s*=|\.title\s*=|setAttribute\("aria-label"|const (label|action) = /.test(line));
+  for (const line of drawn) {
+    assert.doesNotMatch(line, /\b(b|buffer)\.display\b|\bm\.name\b/, `drawn unfiltered: ${line.trim()}`);
+  }
+  assert.match(source, /function bufferLabel\(b\) \{\n\s*return [^\n]*stripBidiControls\(b\.display\);/);
+  assert.match(source, /const shown = stripBidiControls\(m\.name\);/);
+  // Alerts name channels too: their text is filtered once, where it is shown.
+  assert.match(source, /function showAlert\(key, unsafeText[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*const text = stripBidiControls\(unsafeText\);/);
+
+  const styles = await readFile(new URL("../src/style.css", import.meta.url), "utf8");
+  for (const selector of [".buf-name", "#bufname", ".nick"]) {
+    const escaped = selector.replace(/[.#]/g, "\\$&");
+    const rule = styles.match(new RegExp(`^${escaped} \\{([^}]*)\\}`, "m"));
+    assert.ok(rule, selector);
+    assert.match(rule[1], /unicode-bidi: isolate;/, selector);
+  }
+});
+
 test("history merge never replaces live or unidentified lines", () => {
   const history = [
     { identity: "old", text: "old" },
@@ -310,6 +374,23 @@ test("authoritative session channels replace stale replay membership by casefold
       joined: ["#keep", "#New"],
     },
   );
+});
+
+test("PART, KICK and QUIT reasons are rendered without formatting codes", async () => {
+  assert.equal(reasonSuffix("\x0304,01flood\x03 limit"), " (flood limit)");
+  assert.equal(reasonSuffix("plain"), " (plain)");
+  assert.equal(reasonSuffix("\x02\x02"), "", "only formatting is no reason");
+  assert.equal(reasonSuffix(undefined), "");
+  // Each membership event renders its reason through the one helper, never a
+  // hand-built ` (${m.params[n]})`, which is how all three forgot the codes.
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /` \(\$\{m\.params/);
+  for (const command of ["PART", "KICK", "QUIT"]) {
+    const start = source.indexOf(`case "${command}":`);
+    assert.ok(start !== -1, command);
+    const body = source.slice(start, source.indexOf("case ", start + 6));
+    assert.match(body, /reasonSuffix\(m\.params\[\d\]\)/, command);
+  }
 });
 
 test("formatting codes are removed rather than shown as digits and control bytes", () => {

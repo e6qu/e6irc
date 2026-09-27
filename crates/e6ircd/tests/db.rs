@@ -52,6 +52,7 @@ async fn add_server_ban(
             reason: reason.into(),
             set_by: set_by.into(),
             kind: kind.into(),
+            expiry: None,
         },
         &e6ircd::db::AuditPrincipal::operator(set_by),
     )
@@ -629,7 +630,7 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
         }),
         limits: LimitsConfig {
             // Two requests per client IP, then the bucket is empty.
-            auth_rate_burst: Some(2),
+            auth_rate_burst: e6ircd::config::AuthRateBurst::PerMinute(2),
             ..LimitsConfig::default()
         },
         ..Config::default()
@@ -4767,9 +4768,9 @@ async fn channel_mlock_migration_normalizes_historical_rows() {
     );
 }
 
-fn managed_settings_with_oidc_providers(
-    providers: Option<Vec<serde_json::Value>>,
-) -> serde_json::Value {
+/// Today's default settings in the shape 0052 stored: its fields only, each
+/// spelled as it was then.
+fn managed_settings_as_of_0052() -> serde_json::Value {
     let managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None)
         .expect("bootstrap managed settings");
     let mut settings = serde_json::to_value(managed).expect("serialize managed settings");
@@ -4777,6 +4778,15 @@ fn managed_settings_with_oidc_providers(
         .as_object_mut()
         .expect("managed settings object")
         .retain(|field, _| MANAGED_CONFIG_0052_FIELDS.contains(&field.as_str()));
+    // A count of lines until 0088 made it `sendq_bytes`.
+    settings["sendq"] = 1024.into();
+    settings
+}
+
+fn managed_settings_with_oidc_providers(
+    providers: Option<Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut settings = managed_settings_as_of_0052();
     match providers {
         Some(providers) => settings["oidc_providers"] = serde_json::Value::Array(providers),
         None => {
@@ -5083,13 +5093,7 @@ async fn username_migration_backfills_what_each_network_was_already_sending() {
     .await
     .expect("legacy bridge");
 
-    let managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None)
-        .expect("bootstrap managed settings");
-    let mut settings = serde_json::to_value(managed).expect("serialize managed settings");
-    settings
-        .as_object_mut()
-        .expect("managed settings object")
-        .retain(|field, _| MANAGED_CONFIG_0052_FIELDS.contains(&field.as_str()));
+    let mut settings = managed_settings_as_of_0052();
     let legacy_entry = |kind: &str, name: &str, nick: &str| {
         serde_json::json!({
             "name": name, "kind": kind, "owner": null, "addr": "irc.example:6697",
@@ -5562,12 +5566,22 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         CoreIngress::single(core_tx),
     ));
     let conn = e6ircd::core::ConnId(9);
+    // A temporary ban: its expiry is stored and its length audited.
+    let expires_at_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+        + 3600;
     let add = e6ircd::core::ServerBanMutation::Add {
         mask: "baddie@*".into(),
         mask_display: "Baddie@*".into(),
         reason: "spam".into(),
         set_by: "godnick".into(),
         kind: "kline".into(),
+        expiry: Some(e6ircd::core::ServerBanExpiry {
+            minutes: 60,
+            expires_at_secs,
+        }),
     };
     // The operator block `god`, using the nick `godnick`: STATS shows the
     // nick, the audit trail the operator.
@@ -5596,12 +5610,13 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
     ));
     assert_eq!(
         db::list_server_bans(&pool).await.expect("bans"),
-        vec![(
-            "Baddie@*".to_string(),
-            "spam".to_string(),
-            "godnick".to_string(),
-            "kline".to_string(),
-        )]
+        vec![db::PersistedServerBan {
+            mask: "Baddie@*".to_string(),
+            reason: "spam".to_string(),
+            set_by: "godnick".to_string(),
+            kind: "kline".to_string(),
+            expires_at: Some(i64::try_from(expires_at_secs).expect("fits")),
+        }]
     );
     let kinds: (String, String) =
         sqlx::query_as("SELECT actor_kind, target_kind FROM audit_log WHERE action = 'KLINE'")
@@ -5623,7 +5638,7 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
             &"god".to_string(),
             &"KLINE".to_string(),
             &"Baddie@*".to_string(),
-            &"spam".to_string()
+            &"spam (temporary, 60 min.)".to_string()
         )
     );
 
@@ -5693,7 +5708,7 @@ async fn server_bans_persist_and_load() {
     add_server_ban(&pool, "baddie@*", "baddie@*", "gecos", "god", "xline")
         .await
         .expect("add3");
-    let mut list = db::list_server_bans(&pool).await.expect("list");
+    let mut list = permanent_server_bans(&pool).await;
     list.sort();
     assert_eq!(
         list,
@@ -5723,7 +5738,7 @@ async fn server_bans_persist_and_load() {
     add_server_ban(&pool, "baddie@*", "baddie@*", "spam again", "root", "kline")
         .await
         .expect("upsert");
-    let list = db::list_server_bans(&pool).await.expect("list");
+    let list = permanent_server_bans(&pool).await;
     assert_eq!(
         list.iter()
             .filter(|(m, _, _, k)| m == "baddie@*" && k == "kline")
@@ -5748,7 +5763,7 @@ async fn server_bans_persist_and_load() {
         .expect("remove"),
         "the K-line existed"
     );
-    let mut list = db::list_server_bans(&pool).await.expect("list");
+    let mut list = permanent_server_bans(&pool).await;
     list.sort();
     assert_eq!(
         list,
@@ -5767,6 +5782,97 @@ async fn server_bans_persist_and_load() {
             ),
         ]
     );
+}
+
+/// The stored server bans as `(mask, reason, set_by, kind)`, each asserted
+/// permanent.
+async fn permanent_server_bans(pool: &sqlx::PgPool) -> Vec<(String, String, String, String)> {
+    db::list_server_bans(pool)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|ban| {
+            assert_eq!(ban.expires_at, None, "{ban:?}");
+            (ban.mask, ban.reason, ban.set_by, ban.kind)
+        })
+        .collect()
+}
+
+/// A temporary ban past its expiry is not loaded at boot nor listed in the
+/// administrator directory, and storage maintenance deletes its row; one still
+/// in force survives all three.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn expired_temporary_server_bans_are_not_loaded_and_are_swept() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("expired_temporary_server_bans_are_not_loaded_and_are_swept").await,
+    )
+    .await
+    .expect("connect");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    for (mask, expires_at_secs) in [
+        ("*@lapsed.example", now - 60),
+        ("*@live.example", now + 3600),
+    ] {
+        db::mutate_server_ban_audited(
+            &pool,
+            &e6ircd::core::ServerBanMutation::Add {
+                mask: mask.into(),
+                mask_display: mask.into(),
+                reason: "flood".into(),
+                set_by: "god".into(),
+                kind: "kline".into(),
+                expiry: Some(e6ircd::core::ServerBanExpiry {
+                    minutes: 60,
+                    expires_at_secs,
+                }),
+            },
+            &e6ircd::db::AuditPrincipal::operator("god"),
+        )
+        .await
+        .expect("add");
+    }
+    let loaded: Vec<String> = db::list_server_bans(&pool)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|ban| ban.mask)
+        .collect();
+    assert_eq!(loaded, ["*@live.example"]);
+    let directory = db::query_server_ban_directory(
+        &pool,
+        db::ServerBanDirectoryFilter {
+            before_id: None,
+            exact_kind: None,
+            exact_mask: None,
+            page_size: db::ServerBanDirectoryPageSize::new(10).expect("page size"),
+        },
+    )
+    .await
+    .expect("directory");
+    assert_eq!(directory.entries.len(), 1, "{directory:?}");
+    assert_eq!(directory.entries[0].mask, "*@live.example");
+    assert!(directory.entries[0].expires_at.is_some());
+
+    let report = db::run_storage_maintenance(
+        &pool,
+        db::StorageRetention {
+            history_days: 30,
+            audit_days: 30,
+            observability_hours: 24,
+        },
+    )
+    .await
+    .expect("maintenance");
+    assert_eq!(report.server_bans, 1);
+    let stored: Vec<String> = sqlx::query_scalar("SELECT mask FROM server_bans")
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+    assert_eq!(stored, ["*@live.example"]);
 }
 
 #[tokio::test]
@@ -7256,6 +7362,58 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
         .await
         .expect("read");
     assert_eq!(kept, vec!["line 5999"]);
+}
+
+/// The upstream decides how long its lines are: a backlog of long lines is
+/// trimmed to its byte cap, oldest first, well before its row cap.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_buffer_trim_bounds_the_bytes_stored() {
+    let url = support::test_db("bnc_buffer_trim_bounds_the_bytes_stored").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("owner"),
+        "long",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    let names = e6irc_client::NetworkNames::default();
+    // 1,000 lines of four kilobytes: a fifth of the row cap, and
+    // four megabytes, past the byte cap.
+    let tags = "t".repeat(4_000);
+    for i in 0..1_000 {
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            None,
+            &format!("@+x={tags} :n!u@h PRIVMSG #c :line {i}"),
+            &names,
+        )
+        .await
+        .expect("persist");
+    }
+    db::trim_bnc_buffer(&pool, &buffer).await.expect("trim");
+    let (rows, bytes): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), coalesce(sum(octet_length(line)), 0)::bigint
+         FROM bnc_buffer WHERE owner = 'owner' AND network = 'long'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("measure");
+    assert!(bytes <= db::BNC_BUFFER_BYTES, "{bytes} bytes kept");
+    assert!(
+        bytes > db::BNC_BUFFER_BYTES - 4_100,
+        "only what was over the cap went: {bytes} bytes in {rows} rows"
+    );
+    let kept = db::recent_bnc_lines(&pool, "owner", "long", 1)
+        .await
+        .expect("read");
+    assert!(kept[0].ends_with("line 999"), "the newest survive");
+    // A long line brings the next trim nearer in proportion to its bytes.
+    assert_eq!(db::bnc_trim_weight("short"), 1);
+    assert_eq!(db::bnc_trim_weight(&tags), 8);
 }
 
 #[tokio::test]
@@ -9909,6 +10067,45 @@ async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
         loaded.settings.limits.command_burst,
         e6ircd::config::DEFAULT_COMMAND_BURST
     );
+}
+
+/// A settings row that counted the SendQ in lines, with the authentication
+/// throttle unset (`null`, then off), loads after 0088 with the lines as full
+/// 512-byte lines and the throttle at its new default.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_settings_row_counting_the_sendq_in_lines_loads_in_bytes_after_0088() {
+    for (sendq, expected) in [(2048_i64, 2048 * 512), (1, 17_406), (65_536, 33_554_432)] {
+        let pool = sqlx::PgPool::connect(
+            &support::test_db(&format!("a_settings_row_counting_the_sendq_{sendq}")).await,
+        )
+        .await
+        .expect("connect");
+        MIGRATIONS.run_to(87, &pool).await.expect("through 0087");
+        let mut row: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/server_settings/0087-8c7f06b3e17b.json"
+        ))
+        .expect("fixture");
+        row["sendq"] = sendq.into();
+        sqlx::query(
+            "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+             VALUES (TRUE, 1, $1, 'fixture')",
+        )
+        .bind(&row)
+        .execute(&pool)
+        .await
+        .expect("store the old shape");
+        MIGRATIONS.run(&pool).await.expect("migrate to latest");
+        let loaded = db::load_managed_config(&pool)
+            .await
+            .expect("loads after 0088");
+        assert_eq!(loaded.settings.sendq_bytes, expected, "sendq = {sendq}");
+        assert_eq!(
+            loaded.settings.limits.auth_rate_burst,
+            e6ircd::config::AuthRateBurst::default()
+        );
+        pool.close().await;
+    }
 }
 
 /// 0066 folds the targets 0059 wrote under display names, so a mixed-case

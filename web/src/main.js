@@ -12,6 +12,7 @@
 
 import "./style.css";
 import {
+  ALERTS_RESOLVED_BY_CONNECTING,
   ApiError,
   backlogFrom,
   errorMessage,
@@ -62,6 +63,7 @@ import {
   outgoingChat,
   parseIrc,
   prependHistory,
+  reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
   seededNick,
@@ -189,7 +191,12 @@ function bindAlertAction(alert, action) {
   alert.insertBefore(control, alert.lastElementChild);
 }
 
-function showAlert(key, text, tone = "warning", action = null) {
+// Alert text names channels and nicks, which are the network's to choose: their
+// bidirectional controls are removed here, once, so none can reorder the
+// sentence around it.
+function showAlert(key, unsafeText, tone = "warning", unsafeAction = null) {
+  const text = stripBidiControls(unsafeText);
+  const action = unsafeAction && { ...unsafeAction, label: stripBidiControls(unsafeAction.label) };
   const report = `${tone}\n${text}\n${action?.label ?? ""}`;
   let alert = alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`);
   if (reportedAlerts.get(key) === report) {
@@ -221,6 +228,12 @@ function showAlert(key, text, tone = "warning", action = null) {
 function clearAlert(key) {
   reportedAlerts.delete(key);
   alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`)?.remove();
+}
+
+// Being offline has its own alert key: the connection opening resolves it, and it
+// must not take a refused or unconfirmed message's alert down with it.
+function showNotConnected(what) {
+  showAlert("not-connected", `Not connected — ${what}`, "error");
 }
 
 // A setting that could not be stored is reported once, as an alert: the same
@@ -363,7 +376,7 @@ function rejectAllPendingSends(reason) {
   for (const pending of pendingSends.values()) rememberSentText(pending.typed);
   pendingSends.clear();
   showAlert(
-    "send",
+    "unconfirmed",
     `${count} message(s) were not confirmed before ${reason}; use input history to retry.`,
     "error",
   );
@@ -588,6 +601,14 @@ let channelModes = DEFAULT_CHANNEL_MODES;
 // ---- rendering ----------------------------------------------------------
 
 // Reflect total unread in the tab title so a background tab shows activity.
+// A conversation's name as the page draws it. `display` stays the network's
+// own spelling, the target every request is sent to; only what is shown loses
+// bidirectional controls, which in a channel or nick would reorder the label
+// and the text beside it (the stylesheet also isolates each name).
+function bufferLabel(b) {
+  return !b || b.key === SERVER ? CONSOLE_NAME : stripBidiControls(b.display);
+}
+
 function updateTitle() {
   let unread = 0;
   for (const b of buffers.values()) if (b.key !== active) unread += b.unread;
@@ -639,7 +660,7 @@ function updateBufferListItem(li, b) {
   button.className = "buf" + (b.key === active ? " active" : "") + (archived ? " archived" : "");
   if (b.key === active) button.setAttribute("aria-current", "true");
   else button.removeAttribute("aria-current");
-  const bufferName = b.key === SERVER ? CONSOLE_NAME : b.display;
+  const bufferName = bufferLabel(b);
   const inactive = b.key !== active;
   const unreadLabel = b.unread > 0 && inactive
     ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
@@ -764,14 +785,14 @@ function messageRow(line) {
 function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
   routeNetworkEl.textContent = network || "";
-  bufnameEl.textContent = !b || b.key === SERVER ? CONSOLE_NAME : b.display;
+  bufnameEl.textContent = bufferLabel(b);
   buftopicEl.textContent = b ? b.topic : "";
   const action = bufferAction(b, memberTracking);
   bufferActionEl.hidden = action === null;
   if (action !== null) {
     const canLeave = action === "leave";
     bufferActionEl.textContent = canLeave ? "Leave" : "Close";
-    const label = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    const label = canLeave ? `Leave ${bufferLabel(b)}` : `Close conversation with ${bufferLabel(b)}`;
     bufferActionEl.title = label;
     bufferActionEl.setAttribute("aria-label", label);
   }
@@ -878,11 +899,14 @@ function renderNickList() {
     create: nickListItem,
     update: (li, m) => {
       const button = li.firstElementChild;
-      const action = `Open conversation with ${m.name}`;
+      // The dataset keeps the nick as the network spells it: it is what a click
+      // opens a conversation with. Only what is shown loses bidi controls.
+      const shown = stripBidiControls(m.name);
+      const action = `Open conversation with ${shown}`;
       button.title = action;
       button.setAttribute("aria-label", action);
       button.dataset.nick = m.name;
-      button.textContent = nickPrefix(m.modes, channelModes) + m.name;
+      button.textContent = nickPrefix(m.modes, channelModes) + shown;
     },
   });
 }
@@ -970,12 +994,12 @@ bufferActionEl.addEventListener("click", () => {
     return;
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    showAlert("send", `Not connected — ${buffer.display} was not left.`, "error");
+    showNotConnected(`${buffer.display} was not left.`);
     return;
   }
   try {
     if (!sendComposer("", `/part ${buffer.display}`)) {
-      showAlert("send", `Not connected — ${buffer.display} was not left.`, "error");
+      showNotConnected(`${buffer.display} was not left.`);
     }
   } catch {
     showAlert("send", `The request to leave ${buffer.display} was not sent.`, "error");
@@ -1180,10 +1204,11 @@ function maybeNotify(b, line) {
   }
   const isDM = b.kind === "dm";
   if (!(line.mention || isDM)) return;
-  const title = isDM ? `DM from ${line.sender ?? "?"}` : `${b.display}: ${line.sender ?? ""}`;
+  const sender = stripBidiControls(line.sender ?? (isDM ? "?" : ""));
+  const title = isDM ? `DM from ${sender}` : `${bufferLabel(b)}: ${sender}`;
   try {
     // eslint-disable-next-line no-new
-    new Notification(title, { body: line.text, tag: b.key });
+    new Notification(title, { body: stripBidiControls(line.text), tag: b.key });
   } catch (error) {
     settings.notifications = false;
     persistSetting("notifications");
@@ -1261,7 +1286,7 @@ function handleLine(raw) {
       if (!channels.length || !m.nick) {
         break;
       }
-      const reason = m.params[1] ? ` (${m.params[1]})` : "";
+      const reason = reasonSuffix(m.params[1]);
       for (const channel of channels) {
         if (isMe(m.nick)) {
           closeBuffer(channel);
@@ -1278,7 +1303,7 @@ function handleLine(raw) {
       if (!pairs.length) {
         break;
       }
-      const reason = m.params[2] ? ` (${m.params[2]})` : "";
+      const reason = reasonSuffix(m.params[2]);
       const by = m.nick ? ` by ${m.nick}` : "";
       for (const [channel, target] of pairs) {
         if (isMe(target)) {
@@ -1293,7 +1318,7 @@ function handleLine(raw) {
     }
     case "QUIT":
       if (m.nick) {
-        const reason = m.params[0] ? ` (${m.params[0]})` : "";
+        const reason = reasonSuffix(m.params[0]);
         removeNickEverywhere(m.nick, `${stripSigil(m.nick, channelModes)} quit${reason}`);
       }
       break;
@@ -1541,10 +1566,7 @@ function connect() {
     reconnectAttempt = 0;
     setComposerAvailable(true);
     setStatus(`${network}: open`, "ok");
-    clearAlert("socket");
-    clearAlert("send");
-    clearAlert("socket-close");
-    clearAlert("network-unavailable");
+    for (const key of ALERTS_RESOLVED_BY_CONNECTING) clearAlert(key);
   });
   // No alert here: a `close` always follows, and its wording is the one this
   // alert carries. Two sentences under one key alternated, so the repeat guard
@@ -1708,7 +1730,7 @@ composer.addEventListener("submit", (e) => {
     text = message;
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    showAlert("send", "Not connected — your message was not sent.", "error");
+    showNotConnected("your message was not sent.");
     return;
   }
   // The server maps correlated {id, target, message} requests (including
@@ -1776,17 +1798,17 @@ composer.addEventListener("submit", (e) => {
 // True when the request entered the live connection.
 function requestJoin(chan) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    showAlert("send", "Not connected — cannot join yet.", "error");
+    showNotConnected("cannot join yet.");
     return false;
   }
   rememberRequestedJoins(chan);
   try {
     if (!sendComposer("", `/join ${chan}`)) {
-      showAlert("send", "Not connected — cannot join yet.", "error");
+      showNotConnected("cannot join yet.");
       return false;
     }
   } catch {
-    showAlert("send", "Not connected — cannot join yet.", "error");
+    showNotConnected("cannot join yet.");
     return false;
   }
   return true;
@@ -2153,8 +2175,8 @@ async function openNetworkDialog(name = null) {
   el("nf-clear-server-password-row").hidden = !editing;
   showStoredChannelKeys([]);
   el("nf-autojoin-note").textContent = editing
-    ? "Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. A stored key is never shown; it is kept unless you write a new one or remove it below."
-    : "Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.";
+    ? "Separate channels with commas. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. A stored key is never shown; it is kept unless you write a new one or remove it below."
+    : "Separate channels with commas. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.";
   // Editing shows the whole connection: the server, TLS, and the names sent to
   // it are what a person came here to change, and a closed section reads as
   // "these settings do not exist".

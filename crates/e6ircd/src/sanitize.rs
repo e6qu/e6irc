@@ -189,7 +189,9 @@ pub(crate) fn upstream_line(line: String) -> String {
     if e6irc_proto::message::server_frame_fits(line.as_bytes()) {
         line
     } else {
-        ":e6irc NOTICE * :upstream input rejected: server line exceeds an IRC wire budget"
+        // The bouncer speaks for itself as `*bnc*` (DESIGN §10.1), never as a
+        // server name a client could confuse with the upstream's.
+        ":*bnc* NOTICE * :upstream input rejected: server line exceeds an IRC wire budget"
             .to_string()
     }
 }
@@ -525,7 +527,7 @@ mod tests {
         assert_eq!(upstream_line(tagged.clone()), tagged);
 
         let rejected = upstream_line("𝄞".repeat(200));
-        assert!(rejected.contains("upstream input rejected"));
+        assert!(rejected.starts_with(":*bnc* NOTICE * :upstream input rejected"));
         assert!(e6irc_proto::message::server_frame_fits(rejected.as_bytes()));
     }
 

@@ -6,11 +6,13 @@
 
 // ---- network naming ------------------------------------------------------
 //
-// Which targets are channels (CHANTYPES) and when two names are the same
+// Which targets are channels (CHANTYPES), which sigils narrow a channel
+// message to its ranks (STATUSMSG) and when two names are the same
 // (CASEMAPPING) are properties of the network, declared in its 005, exactly as
 // e6irc-client's NetworkNames reads them. Until they arrive -- and after a 005
-// retracts one (`-CASEMAPPING`, `-CHANTYPES`) -- RFC 1459 holds: `rfc1459` and
-// `#&`. The mappings known are the server's own (e6irc-proto CaseMapping):
+// retracts one (`-CASEMAPPING`, `-CHANTYPES`, `-STATUSMSG`) -- RFC 1459 holds:
+// `rfc1459` and `#&`, and no STATUSMSG sigils, since a network that advertises
+// none cannot be sent a message addressed through one. The mappings known are the server's own (e6irc-proto CaseMapping):
 // `rfc1459`, `rfc1459-strict` (also spelled `strict-rfc1459` by older
 // servers) and `ascii`. Any other (`rfc7613`, `rfc3454`, ...) is compared as
 // `ascii` -- the letters every mapping folds and nothing else -- and kept as
@@ -18,6 +20,7 @@
 export const DEFAULT_NAMES = Object.freeze({
   casemapping: "rfc1459",
   chantypes: "#&",
+  statusmsg: "",
   unrecognised: null,
 });
 
@@ -50,7 +53,8 @@ export function isChannel(target, names = DEFAULT_NAMES) {
   return typeof target === "string" && target.length > 0 && names.chantypes.includes(target[0]);
 }
 
-// Fold the CASEMAPPING and CHANTYPES tokens of one 005 line into `current`.
+// Fold the CASEMAPPING, CHANTYPES and STATUSMSG tokens of one 005 line into
+// `current`.
 export function namesFrom(params, current = DEFAULT_NAMES) {
   let names = current;
   // <me> TOKEN... :are supported by this server -- tokens never contain spaces.
@@ -70,19 +74,25 @@ export function namesFrom(params, current = DEFAULT_NAMES) {
     } else if (key === "CHANTYPES") {
       // `CHANTYPES=` (or a bare `CHANTYPES`): the network has no channels.
       names = { ...names, chantypes: value };
+    } else if (key === "-STATUSMSG") {
+      names = { ...names, statusmsg: DEFAULT_NAMES.statusmsg };
+    } else if (key === "STATUSMSG") {
+      names = { ...names, statusmsg: value };
     }
   }
   return Object.freeze(names);
 }
 
 // The rules an authoritative session event's ISUPPORT tokens describe: the
-// defaults, overridden by the network's own CASEMAPPING and CHANTYPES.
+// defaults, overridden by the network's own CASEMAPPING, CHANTYPES and
+// STATUSMSG.
 export function namesFromIsupport(tokens) {
   return namesFrom(["", ...tokens], DEFAULT_NAMES);
 }
 
 // Whether two naming rules key names differently, so buffers keyed under one
-// must be re-keyed under the other.
+// must be re-keyed under the other. STATUSMSG decides which buffer a message
+// files under, never a buffer's key, so it is not compared.
 export function namesDiffer(a, b) {
   return a.casemapping !== b.casemapping || a.chantypes !== b.chantypes;
 }
@@ -117,9 +127,25 @@ export function rekeyBuffers(buffers, names) {
 // The server buffer's key: not a legal channel or nick, so no fold changes it.
 export const SERVER_KEY = "*server*";
 
+// The conversation a message target belongs to, as e6irc-client's
+// NetworkNames::conversation decides it: a STATUSMSG target (`@#ops`, `%#dev`
+// where the network advertises those sigils) is its channel's conversation
+// with a narrower audience, so its sigils come off; anything else is already
+// the conversation, and sigils in front of what is not a channel are part of a
+// nickname. A sigil can also be a channel type (`&` on Ergo and InspIRCd), so
+// the fewest sigils that leave a channel are taken off: `@&local` is
+// `&local`'s, `&#dev` is `#dev`'s.
+function conversationTarget(target, names = DEFAULT_NAMES, isKnownChannel = () => false) {
+  let rest = target;
+  while (rest.length > 0 && names.statusmsg.includes(rest[0])) {
+    rest = rest.slice(1);
+    if (isChannel(rest, names) || isKnownChannel(rest)) return rest;
+  }
+  return target;
+}
+
 // Route chat-bearing commands through one policy for both live delivery and
-// persisted history. IRC STATUSMSG prefixes such as `@#ops` address a subset
-// of a channel but still belong in that channel's buffer.
+// persisted history. A STATUSMSG target belongs in its channel's buffer.
 export function chatMessageRoute(message, ownNick, isKnownChannel = () => false, names = DEFAULT_NAMES) {
   if (
     (message.command !== "PRIVMSG" && message.command !== "NOTICE")
@@ -128,15 +154,7 @@ export function chatMessageRoute(message, ownNick, isKnownChannel = () => false,
   ) return null;
 
   const wireTarget = message.params[0];
-  let target = wireTarget;
-  let statusLength = 0;
-  while (statusLength < target.length && "@+".includes(target[statusLength])) {
-    statusLength += 1;
-  }
-  if (statusLength > 0) {
-    const candidate = target.slice(statusLength);
-    if (isChannel(candidate, names) || isKnownChannel(candidate)) target = candidate;
-  }
+  const target = conversationTarget(wireTarget, names, isKnownChannel);
 
   if (isChannel(target, names) || isKnownChannel(target)) return { kind: "channel", target };
   if (
@@ -400,6 +418,15 @@ const FORMATTING = /\x03(?:\d{1,2}(?:,\d{1,2})?)?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a
 
 export function stripFormatting(text) {
   return String(text ?? "").replace(FORMATTING, "");
+}
+
+// The reason a PART, KICK or QUIT carries, as the ` (reason)` its event line
+// ends with, or nothing. Every membership event renders its reason through
+// here, so none can show a bot's colour codes as `04,01text`; a reason that
+// is only formatting is no reason.
+export function reasonSuffix(reason) {
+  const text = stripFormatting(reason);
+  return text ? ` (${text})` : "";
 }
 
 // Bidirectional embedding, override and isolate controls (LRE, RLE, PDF, LRO,

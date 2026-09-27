@@ -1940,6 +1940,30 @@ test("a link cannot be displayed as a different address by bidi controls", async
   await expect(row.locator(".from")).toHaveCSS("unicode-bidi", "isolate");
 });
 
+test("channel and nick names cannot reorder the page by bidi controls", async ({ page }) => {
+  const channel = "#a‮b";
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [`:viewer!u@h JOIN ${channel}`], [channel]);
+    socket.onMessage((frame) => {
+      if (!JSON.parse(frame).message?.startsWith("/raw NAMES ")) return;
+      socket.send(lineEvent(`:irc.example 353 viewer = ${channel} :viewer ev‮il`, 2));
+      socket.send(lineEvent(`:irc.example 366 viewer ${channel} :End of /NAMES list`, 3));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  const heading = page.getByRole("heading", { level: 1 });
+  await expect(heading).toHaveText("#ab");
+  await expect(heading).toHaveCSS("unicode-bidi", "isolate");
+  const label = page.locator("#buffers .buf-name", { hasText: "#ab" });
+  await expect(label).toHaveText("#ab");
+  await expect(label).toHaveCSS("unicode-bidi", "isolate");
+  const members = page.getByRole("complementary", { name: "Members" });
+  const member = members.getByRole("button", { name: "Open conversation with evil" });
+  await expect(member).toHaveText("evil");
+  await expect(member).toHaveCSS("unicode-bidi", "isolate");
+});
+
 test("a nick changing only its letter case renames the conversation", async ({ page }) => {
   let upstream;
   await page.routeWebSocket(/\/ws\/ui/, (socket) => {

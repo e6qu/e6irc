@@ -300,6 +300,27 @@ function operationParameters(operation, label) {
   });
 }
 
+// The API query a console directory sends, built from its page's own query
+// string: only the named keys, and only those with a non-empty value, plus any
+// default the page applies. A filter form submits every field, so "All kinds"
+// arrives as `kind=`; the server reads an empty filter as none, but the
+// contract's enum does not, and a page-only parameter (a second pager cursor,
+// a one-shot notice flag) is not a declared query parameter at all. Forwarding
+// the page's query verbatim refused both before a request was made. Pager
+// links are built from the same helper so a link never carries them either.
+export function directoryQuery(search, keys, defaults = {}) {
+  const source = new URLSearchParams(search);
+  const query = new URLSearchParams();
+  for (const key of keys) {
+    const value = source.get(key);
+    if (value) query.set(key, value);
+  }
+  for (const [key, value] of Object.entries(defaults)) {
+    if (!query.has(key)) query.set(key, value);
+  }
+  return query;
+}
+
 export function parseOperationQuery(document, method, url, label = "API query") {
   const { operation } = declaredOperation(document, method, url);
   const parameters = operationParameters(operation, label);

@@ -617,7 +617,7 @@ try {
   await settingsForm.getByLabel("Require secure session cookies").uncheck();
   await settingsForm.getByLabel("Administrator accounts").fill("kilgore");
   await settingsForm.getByLabel("Nickname length").fill("24");
-  await settingsForm.getByLabel("Send queue").fill("2048");
+  await settingsForm.getByLabel("Send queue bytes").fill("1048576");
   await settingsForm.getByLabel("Core queue").fill("32768");
   await settingsForm.getByLabel("Hot channels").fill("4096");
   await settingsForm.getByLabel("Connections per IP").fill("128");

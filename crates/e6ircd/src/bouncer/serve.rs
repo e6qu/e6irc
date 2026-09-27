@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use super::{BufferedLine, NetworkConfig, NetworkHandle, attach};
 use crate::config::NetworkEntry;
 use e6irc_proto::framing::LineEvent;
-use e6irc_proto::message::Message;
+use e6irc_proto::message::{Message, MiddleParam};
 
 /// Registry key: the owning account (`None` = shared) and the network
 /// name the client selects with the `/network` suffix.
@@ -827,7 +827,7 @@ async fn persist_and_trim(
     since_trim: &mut u64,
 ) -> Result<(), crate::db::DbError> {
     crate::db::persist_bnc_line(pool, buffer, own_nick, line, names).await?;
-    *since_trim += 1;
+    *since_trim += crate::db::bnc_trim_weight(line);
     if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
         *since_trim = 0;
         crate::db::trim_bnc_buffer(pool, buffer).await?;
@@ -1165,7 +1165,7 @@ where
                             server_name,
                             nick.as_deref(),
                             432,
-                            Some(candidate),
+                            Some(MiddleParam::echo(candidate)),
                             "Erroneous nickname/network selector",
                         )
                         .await?;
@@ -1189,7 +1189,7 @@ where
                             server_name,
                             nick.as_deref(),
                             461,
-                            Some("USER"),
+                            Some(MiddleParam::echo("USER")),
                             "Not enough parameters",
                         )
                         .await?;
@@ -1275,7 +1275,7 @@ where
                                 server_name,
                                 nick.as_deref(),
                                 908,
-                                Some(ATTACH_SASL_MECHANISMS),
+                                Some(MiddleParam::echo(ATTACH_SASL_MECHANISMS)),
                                 "are available SASL mechanisms",
                             )
                             .await?;
@@ -1340,15 +1340,15 @@ where
                                             peer_host,
                                         );
                                         let target =
-                                            nick.as_deref().map_or("*", attach_reply_token);
-                                        write
-                                            .write_all(
-                                                format!(
-                                                    ":{server_name} 900 {target} {mask} {acct} :You are now logged in as {acct}\r\n"
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await?;
+                                            MiddleParam::echo(nick.as_deref().unwrap_or("*"));
+                                        let line = crate::core::fitted_line(
+                                            format!(
+                                                ":{server_name} 900 {target} {mask} {} :",
+                                                MiddleParam::echo(&acct)
+                                            ),
+                                            &format!("You are now logged in as {acct}"),
+                                        );
+                                        write.write_all(format!("{line}\r\n").as_bytes()).await?;
                                         handshake_numeric(
                                             write,
                                             server_name,
@@ -1407,7 +1407,7 @@ where
                         server_name,
                         nick.as_deref(),
                         421,
-                        Some(command),
+                        Some(MiddleParam::echo(command)),
                         "Unknown command",
                     )
                     .await?;
@@ -1447,7 +1447,7 @@ where
             server_name,
             Some(&raw),
             432,
-            Some(&raw),
+            Some(MiddleParam::echo(&raw)),
             &format!(
                 "Nickname selects network {from_nick} but the SASL user name selects {from_sasl}"
             ),
@@ -1486,34 +1486,28 @@ fn attach_selector_ok(selector: &str) -> bool {
     }
 }
 
+/// A numeric of the attach handshake. The target and any echoed client token
+/// are [`MiddleParam`]s, so a token that cannot stand as one parameter (`NICK
+/// :a b`) is shown as `*` rather than splitting the reply, and the trailing is
+/// fitted to the line.
 async fn handshake_numeric<W>(
     write: &mut W,
     server_name: &str,
     nick: Option<&str>,
     numeric: u16,
-    middle: Option<&str>,
+    middle: Option<MiddleParam<'_>>,
     trailing: &str,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let target = nick.map(attach_reply_token).unwrap_or("*");
-    let middle = middle
-        .map(|value| format!(" {}", attach_reply_token(value)))
-        .unwrap_or_default();
-    write
-        .write_all(
-            format!(":{server_name} {numeric:03} {target}{middle} :{trailing}\r\n").as_bytes(),
-        )
-        .await
-}
-
-fn attach_reply_token(token: &str) -> &str {
-    if token.is_empty() || token.starts_with(':') {
-        "*"
-    } else {
-        e6irc_proto::message::truncate_on_char_boundary(token, 64)
-    }
+    let target = MiddleParam::echo(nick.unwrap_or("*"));
+    let middle = middle.map(|value| format!(" {value}")).unwrap_or_default();
+    let line = crate::core::fitted_line(
+        format!(":{server_name} {numeric:03} {target}{middle} :"),
+        trailing,
+    );
+    write.write_all(format!("{line}\r\n").as_bytes()).await
 }
 
 /// The SASL mechanisms the attach listener accepts, as `sasl=` advertises
@@ -1644,7 +1638,7 @@ where
 {
     // The nick is the upstream's to choose once attached; every reply below
     // repeats it, so it is bounded once, as `write_attach_numeric` bounds it.
-    let target = e6irc_proto::message::truncate_on_char_boundary(target, 64);
+    let target = MiddleParam::echo(target).as_str();
     match msg
         .params
         .first()
@@ -1699,7 +1693,7 @@ where
         Some("END") if !registered => *cap_open = false,
         Some("END") => {}
         invalid => {
-            let subcommand = invalid.map(attach_reply_token).unwrap_or("*");
+            let subcommand = MiddleParam::echo(invalid.unwrap_or("*"));
             write
                 .write_all(
                     format!(":{server_name} 410 {target} {subcommand} :Invalid CAP subcommand\r\n")
@@ -1730,10 +1724,10 @@ where
 /// (a `nick/network` selector names the nick first), the USER name, and the
 /// client's address — each `*` while not yet known.
 fn logged_in_mask(nick: Option<&str>, username: Option<&str>, host: &str) -> String {
-    let nick = nick
-        .map(|selector| selector.split_once('/').map_or(selector, |(nick, _)| nick))
-        .map_or("*", attach_reply_token);
-    let user = username.map_or("*", attach_reply_token);
+    let nick = MiddleParam::echo(nick.map_or("*", |selector| {
+        selector.split_once('/').map_or(selector, |(nick, _)| nick)
+    }));
+    let user = MiddleParam::echo(username.unwrap_or("*"));
     format!("{nick}!{user}@{host}")
 }
 
@@ -1932,6 +1926,33 @@ mod cap_tests {
             ":bnc.example 410 * SURPRISE :Invalid CAP subcommand\r\n"
         );
     }
+
+    /// A subcommand in trailing form can hold a space or open with `:`; echoed
+    /// raw it split the reply (`410 * a b :…`). It is the `*` placeholder.
+    #[tokio::test]
+    async fn an_unframeable_cap_subcommand_is_echoed_as_a_placeholder() {
+        for command in ["CAP :a b", "CAP ::x"] {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            handle_cap(
+                &mut server,
+                "bnc.example",
+                "*",
+                &Message::parse(command).expect("CAP request"),
+                false,
+                &mut false,
+                &mut super::super::AttachCaps::default(),
+            )
+            .await
+            .expect("CAP rejection");
+            server.shutdown().await.expect("close server half");
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.expect("read reply");
+            assert_eq!(
+                reply, ":bnc.example 410 * * :Invalid CAP subcommand\r\n",
+                "{command}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1982,6 +2003,27 @@ mod handshake_tests {
         assert!(!attach_selector_ok("alice/"));
         assert!(!attach_selector_ok("alice/bad/name"));
         assert!(!attach_selector_ok(&format!("alice/{}", "x".repeat(65))));
+    }
+
+    /// A refused nick or unknown command is echoed as one middle parameter:
+    /// `NICK :a b` used to answer `432 * a b :…`, which a client reads as the
+    /// nick `a` and a reply text of `b`.
+    #[tokio::test]
+    async fn an_unframeable_handshake_token_is_echoed_as_a_placeholder() {
+        let (replies, registered) =
+            handshake_replies(b"NICK :a b\r\nNICK ::x\r\n:src FROB\r\nQUIT :done\r\n").await;
+        assert_eq!(
+            replies
+                .matches(":bnc.example 432 * * :Erroneous nickname/network selector\r\n")
+                .count(),
+            2,
+            "{replies}"
+        );
+        assert!(
+            replies.contains(":bnc.example 421 * FROB :Unknown command\r\n"),
+            "{replies}"
+        );
+        assert!(matches!(registered, Registered::Closed));
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ use std::collections::HashMap;
 #[cfg(any(feature = "discord", feature = "slack"))]
 use std::future::Future;
 
+use e6irc_proto::message::MiddleParam;
+
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -3942,10 +3944,23 @@ impl RingEntry {
     }
 }
 
-/// Bounded ring of recent upstream lines, for playback on attach.
+/// The bytes a network's backlog may hold per line of its `buffer_cap`: a full
+/// 512-byte IRC line (RFC 1459's limit on a line without tags). A backlog of
+/// `buffer_cap` ordinary lines is held whole; one whose upstream sends
+/// kilobytes of tags with every line keeps fewer of them, never more than
+/// `buffer_cap` × 512 bytes. The same rate bounds the stored backlog
+/// (`crate::db::BNC_BUFFER_BYTES`).
+pub(crate) const BACKLOG_BYTES_PER_LINE: usize = e6irc_proto::message::MAX_LINE_LEN;
+
+/// Bounded ring of recent upstream lines, for playback on attach: at most
+/// `cap` positions and `byte_cap` bytes of lines, the oldest going first.
 pub struct Buffer {
     entries: std::collections::VecDeque<RingEntry>,
     cap: usize,
+    /// `cap` lines of [`BACKLOG_BYTES_PER_LINE`].
+    byte_cap: usize,
+    /// The bytes of the lines held.
+    bytes: usize,
     /// Identifies this ring's lifetime; part of every cursor it hands out.
     epoch: u64,
     /// The position the next pushed line takes. Starts above `cap` so the
@@ -3965,8 +3980,17 @@ impl Buffer {
         Self {
             entries: std::collections::VecDeque::new(),
             cap,
+            byte_cap: cap.max(1).saturating_mul(BACKLOG_BYTES_PER_LINE),
+            bytes: 0,
             epoch,
             next_seq: cap as u64 + 1,
+        }
+    }
+
+    /// Drop the oldest entry.
+    fn evict_oldest(&mut self) {
+        if let Some(RingEntry::Line(line)) = self.entries.pop_front() {
+            self.bytes -= line.line.len();
         }
     }
 
@@ -3975,18 +3999,24 @@ impl Buffer {
         // `>=` (not `==`) so a zero/under-filled cap can never let the ring
         // grow without bound.
         while self.entries.len() >= self.cap.max(1) {
-            self.entries.pop_front();
+            self.evict_oldest();
         }
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
     }
 
-    /// Retain `line` as the newest, returning the position it took.
+    /// Retain `line` as the newest, returning the position it took. Older
+    /// entries go while the lines held pass `byte_cap` — never this one, so a
+    /// ring always holds its newest line.
     fn push(&mut self, line: String) -> u64 {
         let seq = self.next_position();
+        self.bytes += line.len();
         self.entries
             .push_back(RingEntry::Line(BufferedLine { seq, line }));
+        while self.bytes > self.byte_cap && self.entries.len() > 1 {
+            self.evict_oldest();
+        }
         seq
     }
 
@@ -4153,14 +4183,15 @@ pub(super) fn carriable(
         return Some(cmd.line.clone());
     };
     if message.command.eq_ignore_ascii_case("TAGMSG") {
-        let target = message.params.first().map_or("*", |target| {
-            e6irc_proto::message::truncate_on_char_boundary(target, 200)
-        });
+        let target = message.params.first().copied().unwrap_or("*");
         ends.answer(
             cmd.origin,
-            format!(
-                ":*bnc* FAIL TAGMSG CLIENT_TAGS_UNSUPPORTED {target} :the network does not carry \
-                 message tags (CLIENTTAGDENY=*); nothing was sent"
+            crate::core::fail_line(
+                "*bnc*",
+                "TAGMSG",
+                "CLIENT_TAGS_UNSUPPORTED",
+                &[target],
+                "the network does not carry message tags (CLIENTTAGDENY=*); nothing was sent",
             ),
         );
         return None;
@@ -4178,9 +4209,15 @@ fn without_tags(line: &str) -> String {
     }
 }
 
-/// The widest nick a bouncer-made numeric names as its target, as
-/// `write_attach_numeric` bounds it.
-const NUMERIC_TARGET_BYTES: usize = 64;
+/// A `*bnc*` NOTICE to `target` (`*`, or a channel), its text fitted to the
+/// line. The bouncer's own notices carry upstream text — a closing reason, a
+/// SASL refusal, a channel name, a bridge's room id — bounded in characters,
+/// not in bytes, so a `format!`ed notice could outgrow the line and then be
+/// replaced whole by [`ingest`]'s rejection: the notice that exists to say
+/// what happened would say nothing. Every such notice is built here.
+pub(crate) fn bnc_notice(target: &str, text: &str) -> String {
+    crate::core::server_notice("*bnc*", MiddleParam::echo(target).as_str(), text)
+}
 
 /// Take one line into the bouncer: neutralized (see
 /// [`crate::sanitize::upstream_line`]) and stamped with the time it arrived
@@ -4294,8 +4331,11 @@ fn live_isupport(line: &str, client_tags: ClientTags) -> Option<Option<String>> 
 /// framing discards, and the silence came back. It is truncated to fit.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -> String {
-    let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
-    format!(":*bnc* NOTICE {shown} :not delivered: no bridged {platform} {kind} for {shown}")
+    let shown = MiddleParam::echo(target);
+    bnc_notice(
+        shown.as_str(),
+        &format!("not delivered: no bridged {platform} {kind} for {shown}"),
+    )
 }
 
 /// A `*bnc*` NOTICE telling the client its message reached a bridged target but
@@ -4307,7 +4347,10 @@ pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn undelivered_notice(platform: &str, kind: &str, target: &str) -> String {
     let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
-    format!(":*bnc* NOTICE * :not delivered: {platform} send to {kind} {shown} failed")
+    bnc_notice(
+        "*",
+        &format!("not delivered: {platform} send to {kind} {shown} failed"),
+    )
 }
 
 /// A `*bnc*` NOTICE telling the client its message was not delivered because
@@ -4321,10 +4364,12 @@ pub(crate) fn rate_limited_notice(
     retry_after: std::time::Duration,
 ) -> String {
     let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
-    format!(
-        ":*bnc* NOTICE * :not delivered: {platform} rate-limited sends to {kind} {shown} \
-         (it asked for {}s)",
-        retry_after.as_secs_f64().ceil()
+    bnc_notice(
+        "*",
+        &format!(
+            "not delivered: {platform} rate-limited sends to {kind} {shown} (it asked for {}s)",
+            retry_after.as_secs_f64().ceil()
+        ),
     )
 }
 
@@ -4439,7 +4484,10 @@ pub(crate) fn unrelayed_notice(
         || "an unknown sender".to_string(),
         crate::sanitize::nick_token,
     );
-    format!(":*bnc* NOTICE {channel} :{platform}: a {what} message from {sender} was not relayed")
+    bnc_notice(
+        channel,
+        &format!("{platform}: a {what} message from {sender} was not relayed"),
+    )
 }
 
 /// Outcome of a non-blocking send to a network's shared upstream command queue.
@@ -4645,7 +4693,8 @@ impl NetworkHandle {
     /// Prepend older (oldest-first) lines to the front of the buffer,
     /// used once at start to restore persisted backlog. Never evicts
     /// lines already present (they are newer); only the remaining
-    /// capacity is filled, keeping the most recent of `older`.
+    /// capacity, in lines and in bytes, is filled, keeping the most recent
+    /// of `older`.
     ///
     /// Each stored line comes with the time it was stored under, which it is
     /// stamped with when it carries no `time` of its own. A network's
@@ -4658,8 +4707,7 @@ impl NetworkHandle {
             .collect();
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         let room = buf.cap.saturating_sub(buf.entries.len());
-        let skip = older.len().saturating_sub(room);
-        for (line, stored_at) in older[skip..].iter().rev() {
+        for (line, stored_at) in older.iter().rev().take(room) {
             // Each restored line takes the position just below the current
             // oldest: older than everything pushed, in storage order.
             let seq = buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1;
@@ -4670,6 +4718,10 @@ impl NetworkHandle {
             // Both ways into the buffer sanitize, so no reader has to ask which
             // one a line arrived through.
             let line = stamp_time(crate::sanitize::upstream_line(line.clone()), stored_at);
+            if buf.bytes + line.len() > buf.byte_cap {
+                break;
+            }
+            buf.bytes += line.len();
             buf.entries
                 .push_front(RingEntry::Line(BufferedLine { seq, line }));
         }
@@ -5056,7 +5108,7 @@ impl DriverEnds {
             .unwrap_or_else(|| "-CLIENTTAGDENY".to_string());
         let line = ingest(format!(
             ":*bnc* 005 {} {token} :are supported by this server",
-            e6irc_proto::message::truncate_on_char_boundary(&nick, NUMERIC_TARGET_BYTES)
+            MiddleParam::echo(&nick)
         ));
         let buffer = self.buffer.lock().expect("buffer poisoned");
         drop(self.events.send(DriverEvent::Notice(BufferedLine {
@@ -5225,8 +5277,9 @@ impl DriverEnds {
         // this session does not hold and will not restore. Say so to whoever is
         // attached; it is not conversation, so it stays out of the backlog.
         for name in &change.untracked {
-            let line = ingest(format!(
-                ":*bnc* NOTICE * :upstream confirmed a channel name e6irc cannot track: {name}"
+            let line = ingest(bnc_notice(
+                "*",
+                &format!("upstream confirmed a channel name e6irc cannot track: {name}"),
             ));
             // Not retained, so it reports the ring's position unchanged — read
             // and published under the ring's lock, in order with the lines
@@ -5562,10 +5615,13 @@ impl DriverEnds {
 
 fn lifecycle_notice(state: &str, failure: NetworkFailure, diagnostic: Option<&str>) -> String {
     let detail = diagnostic.map_or_else(String::new, |value| format!("; upstream: {value}"));
-    format!(
-        ":*bnc* NOTICE * :component {state}: {} ({}){detail}",
-        failure.summary(),
-        failure.code()
+    bnc_notice(
+        "*",
+        &format!(
+            "component {state}: {} ({}){detail}",
+            failure.summary(),
+            failure.code()
+        ),
     )
 }
 
@@ -6156,7 +6212,7 @@ where
                             write,
                             attachment.nick,
                             421,
-                            Some("MARKREAD"),
+                            Some(MiddleParam::echo("MARKREAD")),
                             "Unknown command",
                         )
                         .await?;
@@ -6264,7 +6320,14 @@ where
         return match command {
             "NICK" => write_attach_numeric(write, nick, 431, None, "No nickname given").await,
             _ => {
-                write_attach_numeric(write, nick, 461, Some(command), "Not enough parameters").await
+                write_attach_numeric(
+                    write,
+                    nick,
+                    461,
+                    Some(MiddleParam::echo(command)),
+                    "Not enough parameters",
+                )
+                .await
             }
         };
     };
@@ -6284,10 +6347,7 @@ where
     }
     let connected = attachment.handle.irc_session_snapshot().is_some();
     for channel in first.split(',').filter(|channel| !channel.is_empty()) {
-        let shown = e6irc_proto::message::truncate_on_char_boundary(
-            channel,
-            upstream_identity::ConfirmedChannel::MAX_BYTES,
-        );
+        let shown = MiddleParam::echo(channel);
         match downstream.channels.get(&downstream.names.fold(channel)) {
             Some(bridged) => {
                 let audience = JoinAudience {
@@ -6353,22 +6413,25 @@ fn attach_pong(token: &str) -> String {
     format!("{HEAD}{token}\r\n")
 }
 
+/// A `*bnc*` numeric to one attached client. The echoed token is a
+/// [`MiddleParam`], so raw client text (`JOIN :#a b`, `JOIN ::x`) cannot reach
+/// a middle position; the target nick, the upstream's to choose, is one too,
+/// and the trailing is fitted to the line.
 async fn write_attach_numeric<W>(
     write: &mut W,
     nick: &str,
     numeric: u16,
-    middle: Option<&str>,
+    middle: Option<MiddleParam<'_>>,
     trailing: &str,
 ) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
-    let nick = e6irc_proto::message::truncate_on_char_boundary(nick, 64);
+    let nick = MiddleParam::echo(nick);
     let middle = middle.map_or_else(String::new, |value| format!(" {value}"));
-    write
-        .write_all(format!(":*bnc* {numeric:03} {nick}{middle} :{trailing}\r\n").as_bytes())
-        .await?;
+    let line = crate::core::fitted_line(format!(":*bnc* {numeric:03} {nick}{middle} :"), trailing);
+    write.write_all(format!("{line}\r\n").as_bytes()).await?;
     write.flush().await
 }
 
@@ -6593,7 +6656,7 @@ where
         )
         .await?;
     }
-    let target = e6irc_proto::message::truncate_on_char_boundary(nick, NUMERIC_TARGET_BYTES);
+    let target = MiddleParam::echo(nick);
     write_synthesized(
         write,
         &[format!(":*bnc* 353 {target} = {channel} :{nick}")],
@@ -8859,6 +8922,54 @@ mod tests {
         attach.await.expect("attach task").expect("attach result");
     }
 
+    /// A bridge's own JOIN answer echoes each requested channel as one middle
+    /// parameter: `JOIN :#a b` used to answer `437 alice #a b :…` and
+    /// `JOIN ::x` `437 alice :x :…`, both of which shift the reply's
+    /// parameters. Each is the `*` placeholder.
+    #[tokio::test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    async fn a_bridge_join_echoes_an_unframeable_channel_as_a_placeholder() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (handle, _ends) = NetworkHandle::bridge_channels(4);
+        let attach = tokio::spawn(async move {
+            attach(
+                server,
+                ClientInput::default(),
+                &handle,
+                AttachCaps::default(),
+                "alice",
+                "alice",
+                ATTACH_LIVENESS_INTERVAL,
+            )
+            .await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        write
+            .write_all(b"JOIN :#a b\r\nJOIN ::x\r\n")
+            .await
+            .expect("send");
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        let mut replies = Vec::new();
+        while replies.len() < 2 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+                .await
+                .expect("attach went silent")
+                .expect("attach read")
+                .expect("attach closed");
+            if !line.starts_with(":*bnc* NOTICE") {
+                replies.push(line);
+            }
+        }
+        for reply in &replies {
+            assert!(reply.starts_with(":*bnc* 437 alice * :"), "{replies:?}");
+        }
+        drop(write);
+        drop(lines);
+        attach.await.expect("attach task").expect("attach result");
+    }
+
     /// A channel whose JOIN has aged out of the replay is re-stated with a
     /// synthesized JOIN, and its real member list and topic are asked of the
     /// upstream on the attaching client's behalf: the answers follow the JOIN
@@ -9138,6 +9249,61 @@ mod tests {
             None,
             "TAGMSG itself is gated by message-tags"
         );
+    }
+
+    /// Lines carrying kilobytes of tags fill a backlog's bytes long before
+    /// its line cap: the ring keeps `cap` lines' worth of bytes, oldest going
+    /// first, and always its newest line.
+    #[test]
+    fn a_backlog_is_bounded_in_bytes_as_well_as_lines() {
+        let cap = 100;
+        let mut ring = Buffer::new(cap);
+        let tagged = |i: usize| format!("@+x={} :n!u@h PRIVMSG #c :line{i}", "t".repeat(4_000));
+        for i in 0..cap {
+            ring.push(tagged(i));
+            let held: usize = ring.lines().map(|entry| entry.line.len()).sum();
+            assert_eq!(held, ring.bytes);
+            assert!(
+                held <= cap * BACKLOG_BYTES_PER_LINE,
+                "{held} bytes after {i}"
+            );
+        }
+        let kept = ring.snapshot();
+        assert!(
+            kept.len() < cap / 5,
+            "{} four-kilobyte lines kept",
+            kept.len()
+        );
+        assert!(kept.last().is_some_and(|line| line.ends_with("line99")));
+        // Ordinary lines are held to the line cap, as before.
+        let mut plain = Buffer::new(cap);
+        for i in 0..3 * cap {
+            plain.push(format!(":n!u@h PRIVMSG #c :line{i}"));
+        }
+        assert_eq!(plain.snapshot().len(), cap);
+        // One line larger than the whole budget is still the newest line held.
+        let mut tiny = Buffer::new(1);
+        tiny.push(tagged(1));
+        tiny.push(tagged(2));
+        assert_eq!(tiny.snapshot().len(), 1);
+    }
+
+    /// Restoring a stored backlog fills only the bytes left, newest first.
+    #[test]
+    fn a_restored_backlog_fills_only_the_bytes_left() {
+        let (handle, _ends) = NetworkHandle::channels(10);
+        let big = format!("@+x={} :n!u@h PRIVMSG #c :old", "t".repeat(2_000));
+        let stored: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("{big}{i}"), "2026-01-01T00:00:00.000Z".to_string()))
+            .collect();
+        handle.preload_front(stored);
+        let buffer = handle.buffer.lock().expect("buffer");
+        let held: usize = buffer.lines().map(|entry| entry.line.len()).sum();
+        assert_eq!(held, buffer.bytes);
+        assert!(held <= buffer.byte_cap, "{held} bytes");
+        let lines = buffer.snapshot();
+        assert!(lines.len() < 10 && !lines.is_empty(), "{}", lines.len());
+        assert!(lines.last().is_some_and(|line| line.ends_with("old9")));
     }
 
     #[test]

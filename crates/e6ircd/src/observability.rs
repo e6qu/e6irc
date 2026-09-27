@@ -1005,7 +1005,7 @@ pub(crate) async fn run_storage_maintenance(
                     "storage maintenance ran {} bounded batches in one tick \
                      (messages={}, bnc_buffer={}, audit_events={}, web_sessions={}, \
                      api_tokens={}, device_grants={}, logout_tokens={}, \
-                     account_invitations={}, observability_samples={}, \
+                     account_invitations={}, server_bans={}, observability_samples={}, \
                      read_markers={}); {}",
                     drain.batches_run,
                     report.messages,
@@ -1016,6 +1016,7 @@ pub(crate) async fn run_storage_maintenance(
                     report.device_grants,
                     report.logout_tokens,
                     report.account_invitations,
+                    report.server_bans,
                     report.observability_samples,
                     report.read_markers,
                     if report.saturated {

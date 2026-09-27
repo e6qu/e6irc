@@ -617,7 +617,7 @@ async fn cli_history_reads_recent_messages() {
                     "history",
                     "#hist",
                     "--count",
-                    "10",
+                    "1000",
                 ])
                 .output()
                 .expect("run cli")
@@ -625,10 +625,13 @@ async fn cli_history_reads_recent_messages() {
     })
     .await
     .expect("join");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "history failed: {stderr}");
+    // e6ircd takes at most 500 lines a request and says so in its 005; a
+    // larger count is cut to that, loudly, not refused by the server.
     assert!(
-        output.status.success(),
-        "history failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("at most 500 lines per history request"),
+        "{stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("first line"), "missing first: {stdout}");
@@ -1084,7 +1087,7 @@ async fn run_cli(
 /// the CLI sent.
 async fn scripted_server(
     advertised: &'static str,
-    replies: &'static [(&'static str, &'static str)],
+    replies: &'static [(&'static str, &'static [u8])],
     late: Option<(&'static str, &'static str, std::time::Duration)>,
 ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1105,18 +1108,18 @@ async fn scripted_server(
                 break;
             }
             let mut reply = match line.as_str() {
-                "CAP LS 302" => format!(":srv CAP * LS :{advertised}"),
-                "CAP END" => ":srv 001 sender :Welcome".to_owned(),
-                _ => String::new(),
+                "CAP LS 302" => format!(":srv CAP * LS :{advertised}").into_bytes(),
+                "CAP END" => b":srv 001 sender :Welcome".to_vec(),
+                _ => Vec::new(),
             };
             if let Some(token) = line.strip_prefix("PING ") {
-                reply = format!(":srv PONG srv {token}");
+                reply = format!(":srv PONG srv {token}").into_bytes();
             }
             if let Some(capabilities) = line.strip_prefix("CAP REQ :") {
-                reply = format!(":srv CAP sender ACK :{capabilities}");
+                reply = format!(":srv CAP sender ACK :{capabilities}").into_bytes();
             }
             if let Some((_, answer)) = replies.iter().find(|(prefix, _)| line.starts_with(prefix)) {
-                reply = (*answer).to_owned();
+                reply = answer.to_vec();
             }
             if let Some((prefix, answer, delay)) = late
                 && line.starts_with(prefix)
@@ -1129,11 +1132,9 @@ async fn scripted_server(
                 });
             }
             if !reply.is_empty() {
+                reply.extend_from_slice(b"\r\n");
                 let mut writer = writer.lock().await;
-                writer
-                    .write_all(format!("{reply}\r\n").as_bytes())
-                    .await
-                    .unwrap();
+                writer.write_all(&reply).await.unwrap();
             }
         }
         seen
@@ -1194,17 +1195,17 @@ async fn cli_send_over_a_bridge_confirms_the_echo_under_the_account_nick() {
         &[
             (
                 "CAP END",
-                ":srv 001 e6ircbot :Welcome to e6irc BNC, attached to 'team'",
+                b":srv 001 e6ircbot :Welcome to e6irc BNC, attached to 'team'",
             ),
             (
                 "JOIN #general",
-                ":e6ircbot!~bnc@e6irc JOIN #general\r\n\
+                b":e6ircbot!~bnc@e6irc JOIN #general\r\n\
                  :*bnc* 353 e6ircbot = #general :e6ircbot\r\n\
                  :*bnc* 366 e6ircbot #general :End of /NAMES list",
             ),
             (
                 "PRIVMSG #general ",
-                ":e6ircbot!e6ircbot@discord PRIVMSG #general :hi",
+                b":e6ircbot!e6ircbot@discord PRIVMSG #general :hi",
             ),
         ],
         None,
@@ -1230,16 +1231,16 @@ async fn cli_send_follows_the_networks_casemapping_and_chantypes() {
         &[
             (
                 "CAP END",
-                ":srv 001 sender :Welcome\r\n\
+                b":srv 001 sender :Welcome\r\n\
                  :srv 005 sender CASEMAPPING=ascii CHANTYPES=#! :are supported by this server",
             ),
             (
                 "JOIN !a[",
-                ":sender!u@h JOIN !a[\r\n:srv 366 sender !a[ :End of NAMES",
+                b":sender!u@h JOIN !a[\r\n:srv 366 sender !a[ :End of NAMES",
             ),
             (
                 "PRIVMSG !a[ ",
-                ":sender!u@h PRIVMSG !a{ :hi\r\n:srv 404 sender !a[ :Cannot send to channel",
+                b":sender!u@h PRIVMSG !a{ :hi\r\n:srv 404 sender !a[ :Cannot send to channel",
             ),
         ],
         None,
@@ -1257,6 +1258,104 @@ async fn cli_send_follows_the_networks_casemapping_and_chantypes() {
         "the echo to another channel was taken as ours; sent {seen:?}; stderr {stderr}"
     );
     assert!(stderr.contains("Cannot send to channel"), "{stderr}");
+}
+
+/// `history` asks for its capabilities while the welcome burst is still
+/// arriving. A Latin-1 MOTD line in it is shown to nobody but must not end the
+/// command, and a count above the server's CHATHISTORY limit is cut to it
+/// with a warning instead of being refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_history_survives_a_latin1_welcome_and_fits_the_servers_limit() {
+    let (address, served) = scripted_server(
+        "batch draft/chathistory server-time",
+        &[
+            (
+                "CAP END",
+                b":srv 001 sender :Welcome\r\n\
+                  :srv 005 sender CHATHISTORY=5 :are supported by this server\r\n\
+                  :srv 372 sender :- caf\xe9 au lait",
+            ),
+            (
+                "JOIN #h",
+                b":sender!u@h JOIN #h\r\n:srv 366 sender #h :End of NAMES",
+            ),
+            (
+                "CHATHISTORY LATEST #h * 5",
+                b":srv BATCH +b chathistory #h\r\n\
+                  @batch=b;time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #h :kept\r\n\
+                  :srv BATCH -b",
+            ),
+        ],
+        None,
+    )
+    .await;
+    let output = run_cli(
+        address,
+        &["--nick", "sender", "history", "#h", "--count", "50"],
+        "",
+    )
+    .await;
+    let seen = served.await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "sent {seen:?}; stderr {stderr}; stdout {stdout}"
+    );
+    assert!(stdout.contains("alice\tkept"), "{stdout}");
+    assert!(stderr.contains("at most 5 lines"), "{stderr}");
+}
+
+/// A network that refuses SCRAM before any credential is sent gets PLAIN
+/// instead — never silently: the command says which mechanism was refused
+/// and what was offered in its place.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_says_when_sasl_offers_a_weaker_mechanism() {
+    let (address, served) = scripted_server(
+        "sasl=PLAIN,SCRAM-SHA-512",
+        &[
+            ("AUTHENTICATE SCRAM-SHA-512", b"AUTHENTICATE +"),
+            ("AUTHENTICATE PLAIN", b"AUTHENTICATE +"),
+            (
+                "AUTHENTICATE *",
+                b":srv 904 * :SASL authentication failed\r\n\
+                  :srv 906 * :SASL authentication aborted",
+            ),
+            (
+                "AUTHENTICATE AHVzZXIAcGVuY2ls",
+                b":srv 903 sender :SASL authentication successful",
+            ),
+            // The client-first message carries a random nonce; the server
+            // refuses the mechanism for this account (`e=other-error`).
+            ("AUTHENTICATE ", b"AUTHENTICATE ZT1vdGhlci1lcnJvcg=="),
+        ],
+        None,
+    )
+    .await;
+    let output = run_cli(
+        address,
+        &[
+            "--nick",
+            "sender",
+            "--account",
+            "user",
+            "--password",
+            "pencil",
+            "raw",
+        ],
+        "",
+    )
+    .await;
+    let seen = served.await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sent {seen:?}; stderr {stderr}");
+    assert!(
+        stderr.contains(
+            "warning: SASL: SCRAM-SHA-512 was refused before any credential was sent \
+             (other-error); offering PLAIN"
+        ),
+        "{stderr}"
+    );
 }
 
 /// Register an observer on `address` as `nick`, and join `channel` (so it

@@ -1,4 +1,4 @@
-NICK a
+0NICK a
 USER a 0 * :A
 JOIN #c
 TOPIC #c :the topic

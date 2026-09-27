@@ -438,57 +438,65 @@ async fn per_ip_connection_limit_refuses_excess() {
     .expect("a freed slot should admit a new connection");
 }
 
+/// Lines past the command allowance are paced, not refused: the server stops
+/// reading the connection until its bucket refills, and answers every line in
+/// the end. PING is metered like any other command.
 #[tokio::test]
-async fn command_flood_throttle_closes_excess() {
+async fn command_flood_paces_excess_lines_instead_of_closing_the_link() {
     use e6ircd::config::LimitsConfig;
     let config = Config {
-        server_name: "irc.flood.example".into(),
-        network_name: "FloodNet".into(),
-        listeners: vec![ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-            websocket: false,
-        }],
         limits: LimitsConfig {
             max_connections_per_ip: None,
-            command_burst: 5,
-            command_rate: 1,
+            command_burst: 10,
+            command_rate: 10,
             registration_burst: None,
             ..LimitsConfig::default()
         },
-        ..Config::default()
+        ..test_config()
     };
-    let addr = net::start(config).await.expect("start").addrs[0];
-
-    let mut c = e6irc_client::Connection::connect(&addr.to_string())
-        .await
-        .unwrap();
-    c.register(&e6irc_client::Identity {
-        nick: "flooder",
-        username: "flooder",
-        realname: "f",
-        server_password: None,
-    })
-    .await
-    .expect("register");
-
-    // Burst well past the bucket within the same second; the socket may
-    // close mid-burst, so send errors are expected and ignored.
-    for _ in 0..12 {
-        let _ = c.send_line("PRIVMSG nobody :flood").await;
+    let running = net::start(config).await.expect("start");
+    let mut c = Client::connect(running.addrs[0]).await;
+    c.register("flooder").await;
+    let started = std::time::Instant::now();
+    let pings: String = (0..30).map(|index| format!("PING :p{index}\r\n")).collect();
+    c.writer.write_all(pings.as_bytes()).await.expect("write");
+    for index in 0..30 {
+        let pong = c.expect(" PONG ").await;
+        assert!(pong.ends_with(&format!(":p{index}")), "{pong}");
     }
+    // At most a burst of ten went at once; the other twenty or more waited
+    // for tokens regained at ten a second.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "30 lines through a 10-token bucket at 10/s took only {elapsed:?}"
+    );
+    // Still connected and answering.
+    c.send("PING :after").await;
+    c.expect(":after").await;
+}
 
-    // The link is closed loudly (ERROR) then EOF.
-    let killed = timeout(Duration::from_secs(5), async {
-        loop {
-            match c.next_message().await {
-                Ok(Some(m)) if m.command == "ERROR" => return true,
-                Ok(Some(_)) => {}
-                _ => return true, // EOF / error = closed
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-    assert!(killed, "excess commands must close the link (Excess Flood)");
+/// A client's registration — capability negotiation, SASL, NICK and USER —
+/// and a burst of keepalives after it, all sent at once, fit the default
+/// allowance and are answered promptly.
+#[tokio::test]
+async fn a_registration_burst_fits_the_default_allowance() {
+    let running = net::start(test_config()).await.expect("start");
+    let mut c = Client::connect(running.addrs[0]).await;
+    let started = std::time::Instant::now();
+    let mut burst = String::from(
+        "CAP LS 302\r\nCAP REQ :message-tags server-time\r\nAUTHENTICATE PLAIN\r\n\
+         AUTHENTICATE *\r\nCAP END\r\nNICK prompt\r\nUSER prompt 0 * :prompt\r\n",
+    );
+    for index in 0..30 {
+        burst.push_str(&format!("PING :k{index}\r\n"));
+    }
+    c.writer.write_all(burst.as_bytes()).await.expect("write");
+    c.expect(" 001 prompt ").await;
+    c.expect(":k29").await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "37 lines are within the default burst of 40, yet took {elapsed:?}"
+    );
 }

@@ -140,11 +140,11 @@ pub(super) async fn history(
     let messages = rows
         .into_iter()
         .map(|row| HistoryMessage {
+            body: row.plain_body().into_owned(),
             msgid: row.msgid,
             time: e6irc_proto::time::server_time(row.ts),
             from: row.sender_prefix,
             kind: row.kind.wire().into(),
-            body: row.body,
         })
         .collect();
     json_no_store(HistoryResponse {

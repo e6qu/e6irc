@@ -356,14 +356,29 @@ These are project-wide rules, enforced in review and (where possible) CI:
     critical failure it is.
   - One worker and N workers give the same answers by construction. The
     session's shard counts the JOINs it has routed to another shard
-    (`Session::pending_joins`) from the moment they are sent, so a pipelined
-    burst meets the channel limit exactly as on one worker. A change to the
-    user while such a JOIN is in flight (NICK, AWAY, SETNAME, CHGHOST, QUIT)
-    is sent to that channel's owner too: owner queues are FIFO, so it lands
-    after the JOIN and corrects the member the JOIN's snapshot created (an
-    owner that refused the JOIN has no member and tells no one). `JOIN 0`
-    parts every channel whichever shard owns it, and parts an in-flight JOIN
-    as soon as it is answered (`Session::part_on_join`). What a
+    (`Session::pending_joins`, a count per channel) from the moment they are
+    sent, so a pipelined burst meets the channel limit exactly as on one
+    worker, and a channel stays in flight until the *last* JOIN to it is
+    answered — a refused `JOIN #c wrong` answered first does not end the
+    window of the `JOIN #c right` behind it. A change to the user while such a
+    JOIN is in flight (NICK, AWAY, SETNAME, CHGHOST, QUIT) is sent to that
+    channel's owner too: owner queues are FIFO, so it lands after the JOIN and
+    corrects the member the JOIN's snapshot created (an owner that refused the
+    JOIN has no member and tells no one). `JOIN 0` parts every channel
+    whichever shard owns it, and parts each JOIN in flight when it was sent as
+    that JOIN is answered, if it admitted the user (`Session::part_on_join`,
+    counted the same way, so it is spent answer by answer and a refusal does
+    not use up the part owed to the admission after it). The actor's own
+    copy of what its command broadcast (a KICK, a MODE, the MODE of a ChanServ
+    OP/VOICE or of a mode lock its JOIN enforced) is part of that command's
+    response, where one worker's capture puts it: the owner leaves the actor
+    out of the broadcast and returns the copy in the result
+    (`ChannelKickResult::Kicked { echo }`,
+    `ServerState::broadcast_channel_answering`), and a broadcast made under a
+    capture sends the capture's connection its copy there whichever shard it
+    lives on (a remote MODE's echo is among its captured lines). Left to the
+    broadcast, it reached the session as a delivery held behind the deferred
+    reply and came out after the labeled `ACK`, untagged. What a
     command needs to know about a user or channel on another shard (WHOIS,
     ISON, USERHOST, MONITOR, WHOWAS, LUSERS, a labeled away reply) is read
     from process-wide directories that every shard — including a lone one —
@@ -400,7 +415,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     inline with `AppState::csrf_valid`; the token rides in the body, so a
     standard browser submission works without a client runtime.
   - `RateLimited` — a request that has spent one token from the per-IP
-    auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
+    auth-rate budget (`limits.auth_rate_burst`, on by default, §7.2), as a
+    `FromRequestParts` extractor. Every unauthenticated,
     work-inducing route declares the throttle by asking for `_: RateLimited`
     instead of opening with the `client_ip` + `spend_auth_budget` prologue (and
     pulling in `ConnectInfo` + `HeaderMap`) by hand — so the gate lives in one
@@ -412,6 +428,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     tag escape and cannot ride a wire line) is dropped, so no line this system
     tags can carry a raw NUL onto the wire and truncate it. The single choke
     point for tag-value wire safety, rather than a guard one call path can skip.
+  - `Middle` — a middle parameter of a core numeric is typed by where its text
+    came from (`Middle::echo` for a client's or an upstream's, `Middle::own`
+    for the server's, `From` an integer), and each is written as exactly one
+    parameter. The funnel used to take strings and let a space through for the
+    pre-joined mode string of `RPL_CHANNELMODEIS`, so a call site that forgot
+    to echo a client token (a `+l` limit, a WHOX token, a STATS letter) split
+    the reply's parameters; that call site can no longer be written (§7.1).
   - *No argon2 on the serial DB-worker loop* — both credential-verifying and
     account-creating requests are intercepted in `run_worker` and spawned under
     the `verify_sem` bound; their inline `handle_request` arms are `unreachable!`.
@@ -729,7 +752,40 @@ strip = "symbols"
   many middles *and* a client-influenced trailing (WHOX's `RPL_WHOSPCRPL`, a
   realname) can't sum past 512 and be discarded whole. `server_name`/
   `network_name` are length-bounded at config load so the fixed head they sit in
-  can't inflate that budget.
+  can't inflate that budget. A client token echoed into a middle parameter (an
+  unknown command, a refused nick, a FAIL's context, a bridge's JOIN target) is
+  an `e6irc_proto::message::MiddleParam`, whose one constructor renders an
+  empty, `:`-leading, spaced or control-bearing token as `*` and clips the rest
+  to 64 bytes; the core's echoes and the bouncer's attach numerics
+  (`handshake_numeric`, `write_attach_numeric`, which take only that type) share
+  it, so `NICK :a b` cannot become `432 * a b :…` on either side. The core's
+  numeric funnel takes its middles as `core::Middle` values, never strings:
+  `Middle::echo` for text a client or an upstream supplied (the `MiddleParam`
+  rule), `Middle::own` for a value the server holds (validated where it
+  entered, held to 100 bytes), and `From` an integer. Every `Middle` is written
+  as exactly one parameter — a value that cannot stand as one is `*` whatever
+  its constructor, and a server-owned one that cannot is also a debug
+  assertion, since it is a server bug — and there is no constructor for a
+  pre-joined run of parameters: `RPL_CHANNELMODEIS` passes its mode string and
+  each argument as a `Middle` of its own. So a call site that forgets which of
+  its values came from the client cannot split a reply; it can only clip one
+  differently. Lines that
+  carry free text are built by the funnels that fit it — `fitted_line`, the
+  `server_notice` every server NOTICE goes through (operator notices echo
+  masks, hosts and stored reasons), the `fail_line` every `FAIL` goes through
+  (it clips its context and fits its detail), and the bouncer's `bnc_notice` —
+  never by a `format!` of the text. A server-ban mask is bounded where it is
+  parsed (100 bytes, a realname mask 150), like a channel ban's.
+- Decoding relayed upstream text: IRC bodies are arbitrary bytes and a relay
+  cannot know the sender's encoding, so each invalid byte becomes U+FFFD
+  (guessing one legacy code page, say CP1252, would render Shift-JIS or KOI8-R
+  as plausible-looking wrong text; U+FFFD marks the loss). U+FFFD is three
+  bytes, so `decode_server_line` fits the decoded line again — a tag section
+  that grew drops the tags that carry U+FFFD, the traditional part is cut on a
+  character boundary — and a line that fits the budgets as bytes is always
+  relayed, never replaced by the bouncer's `*bnc*` "upstream input rejected"
+  notice, which only a line over a budget as received earns. The
+  `bouncer_lines` fuzz target pins that.
 - Casemapping: **`rfc1459`** (what Libera/Solanum advertises), implemented
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL
@@ -769,22 +825,55 @@ strip = "symbols"
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
-  No unbounded buffering, no silent drops.
+  No unbounded buffering, no silent drops. The bound is in **bytes**, like
+  Solanum's class `sendq`: `sendq_bytes`, default 512 KiB — the 1,024 lines the
+  queue held when it counted lines, at a full 512-byte line each, so ordinary
+  traffic queues what it did — at least two of the longest lines the server
+  sends (17,406 bytes) and at most 32 MiB. A count of lines let a reader that
+  stopped reading pin 1,024 lines of up to 8,703 bytes each (8.5 MiB); in
+  bytes, a few dozen maximum-size lines are what overrun it. Output held
+  behind a deferred reply (§11) is counted in the same bytes against the same
+  bound. The queue is made only by `core::send_queue`, which weighs each line
+  by its length (`e6irc_queue::weighted_queue`), so no connection can be given
+  a queue measured in anything else.
 - The replies a client cannot bound — `LIST` of every channel, and a `WHO *`
   or a `WHO` of a large channel — are paced instead (`SAFELIST`): their rows
-  go out only while the client's SendQ is under half full, and the rest follow
+  go out only while the client's SendQ is under half full — in bytes, the
+  line that crosses the half being the last of a turn — and the rest follow
   as the client reads — on the next event its shard handles, or on the
   worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
   Other traffic keeps flowing beside the rows, and a labeled one stays one
   labeled batch across its turns. A second `LIST` aborts the first (`/LIST
-  aborted`), so a connection paces at most one. A `WHO` whose reply fits the
+  aborted`), so a connection paces at most one.
+- A `LIST` keeps a cursor, not a copy of the channel list (`core/list.rs`,
+  as Solanum's SAFELIST keeps its place in the channel hash). Its reply opens
+  at once; each channel shard is then asked, turn by turn, for the next page
+  of its channels after the last key it reported — no more rows than the room
+  the client's SendQ has, from at most 1024 channels examined — that the
+  `ELIST` conditions admit and the asker may see. The session holds its filter,
+  one resume key per shard and at most one unsent page per shard, so a `LIST`
+  of 100k channels costs a page of memory, not the whole list, and aborting it
+  drops the cursor at no cost (a page still on its way finds no `LIST` of its
+  id and is dropped). **Ordering:** rows come out in casemapped channel-name
+  order across the whole network: each shard's pages are in key order (its
+  channels live in an ordered map) and the asker's shard merges them, sending
+  a row only once every shard still reporting has a row queued to compare it
+  with. **Consistency:** a channel is listed if it exists and qualifies when
+  its shard's cursor reaches its name, with the member count and topic it has
+  then; one created behind the cursor or removed ahead of it is not listed, and
+  none is listed twice. A `WHO` whose reply fits the
   room left, with none paced ahead of it, goes out at once; otherwise it waits
   behind the connection's paced WHO replies and follows them whole, in order
   (`core/paced.rs`). What waits is bounded: once one is paced, more may queue
-  behind it only while everything waiting fits one SendQ, and a `WHO` past
+  behind it only while the bytes of everything waiting fit one SendQ, and a
+  `WHO` past
   that is answered `263 RPL_TRYAGAIN` and its `RPL_ENDOFWHO` at once. A remote
   channel's `WHO` is paced on the asker's shard, from the rows its owner sent
-  back.
+  back. What is being paced lives on the session (`Session::channel_list`,
+  `Session::paced_who`), so it cannot outlive the connection: a remote
+  channel's WHO rows or LIST rows that arrive after the asker closed find no
+  session and are dropped with it, where a paced reply once queued for a
+  closed connection aborted the worker.
 - Every write to a peer is bounded (`peer_write`): a write, flush or shutdown
   that makes no progress for 30 s fails, so a client with a shut receive
   window is closed ("Write timeout") instead of parking its writer forever —
@@ -796,18 +885,47 @@ strip = "symbols"
   session and then EOF) still reads every reply to what it sent — its welcome,
   its `ERROR` — for up to 5 s after its EOF, before the connection is torn
   down.
-- RecvQ/flood control: a token bucket per connection, on by default with
+- RecvQ/flood control: every line a connection sends is metered where it
+  enters the core (`core/line_meter.rs`), by a token bucket per connection with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
-  20` per second; a registered non-oper session spends one per command, PING
-  and PONG exempt, and is closed with Excess Flood when the bucket is empty).
-  It used to be off by default with a fixed one-token-per-second refill, which
-  left every output-amplifying command class — repeated JOIN/NAMES targets,
-  repeated list modes — unbounded for anyone who never turned it on, and made
-  any burst that was turned on flood-kill an ordinary autojoin storm. Two
+  20` per second). Every line spends one — PING and PONG, and lines sent before
+  registration, included — whether it arrives over TCP, `/ws/irc`, or from the
+  bouncer's in-process session. An empty bucket closes nothing: the connection's
+  reader stops reading until a token is back, so a client sending too fast waits
+  in its own socket buffers, as Solanum parses a client's receive queue only as
+  fast as its allowance. One connection therefore occupies at most its bucket's
+  worth of the core's queue: a client streaming PONGs, or churning NICK before
+  it registers, can no longer monopolise its shard. A WebSocket or bouncer
+  session past its allowance keeps receiving what the core sends it; only its
+  input waits. IRC operators are exempt (Solanum's `no_oper_flood`): the shard
+  owning the session publishes its operator status after each of its lines,
+  and the reader consults it only when its bucket is empty. The allowance
+  covers a registration with capability negotiation and SASL, a full
+  `draft/multiline` batch (32 lines plus its `BATCH` pair) and a paste within
+  the burst without any pause; a longer paste or autojoin is paced at 20 lines
+  a second rather than, as before, closed with Excess Flood. The bucket used
+  to live in the core and apply only to registered sessions' non-keepalive
+  commands, after each line was already queued, so it bounded nothing a
+  connection could put in the queue ahead of it; before that it was off by
+  default with a fixed one-token-per-second refill. Two
   per-address bounds are off unless configured: `limits.max_connections_per_ip`
   caps simultaneous connections from one address (the excess is refused at
   accept), and `limits.registration_burst` throttles account creation
-  (REGISTER and NickServ REGISTER) per address.
+  (REGISTER and NickServ REGISTER) per address. The HTTP authentication
+  throttle, `limits.auth_rate_burst`, is on by default: twenty requests a
+  minute from one address (an IPv6 client's `/64`) to the routes that take
+  `RateLimited` (§2) — password login, the OIDC starts and callback, the
+  device grant's start and polling, invitation and bootstrap acceptance, app
+  passwords, password changes and re-authentication. A sign-in spends two or
+  three, a device polling every five seconds twelve a minute. The per-account
+  attempt window (ten in fifteen minutes) bounds guessing at one account; this
+  bounds what one address can drive across all of them — names sprayed, argon2
+  checks, OIDC round trips, device grants. It was
+  off unless configured, so every `RateLimited` route's promise to cap a flood
+  held only where an operator had turned it on. `"off"` turns it off (a
+  deployment whose reverse proxy throttles these routes itself); `0` is
+  refused, and a stored `null` from before (the old unset) is migrated to the
+  default (0088).
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with
@@ -876,6 +994,12 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   sequence number. The bound is an admission limit, not an eager allocation:
   storage grows only with admitted envelopes, which prevents every empty
   per-connection SendQ from reserving its maximum capacity.
+- **Bounded by weight**: `weighted_queue` bounds the sum of its events'
+  weights (a SendQ weighs each line by its bytes) where `queue` weighs each
+  event 1; depth, capacity, the adaptive watermarks and every admission are in
+  that one unit. An event heavier than the whole capacity is admitted only into
+  an empty queue, so none is unsendable and the bound is exceeded by at most
+  one event.
 - **No silent loss**: `try_push` returns `Err(Full(event))` — the
   producer decides (kill the slow consumer's connection, exert
   backpressure, or shed *with accounting*). Delivered-or-returned is an
@@ -1133,7 +1257,17 @@ subset's exact behavior.
   for a key a `,`, which would split JOIN's key list) is refused, not rewritten.
   Implemented today: lists `+b +q +e +I`, `+k`, `+l`, and the flags
   `+g +i +m +n +s +t +C` (`ChanModes::FLAGS` is the one flag table; MLOCK can
-  lock each); the rest of Solanum's set answers 472.
+  lock each); the rest of Solanum's set answers 472 — once per MODE command,
+  naming the first unknown letter (Solanum's `chm_nosuch`), while the known
+  modes around it apply. `MODE #c` from a non-member shows `+k` and `+l`
+  without their arguments (Solanum's `channel_modes`); a member sees both.
+  Deliberate difference from Solanum: `+l 10abc` and `+l 0` are refused with
+  696 (`ERR_INVALIDMODEPARAM`) rather than read as `+l 10` and ignored — a
+  limit the operator did not type is never enforced silently.
+- Each list-mode entry records who set it (`nick!user@host`) and when, and
+  RPL_BANLIST, RPL_QUIETLIST, RPL_EXCEPTLIST and RPL_INVITELIST report both,
+  as Solanum does: `367 <me> <channel> <mask> <setter> <set-at>`. The lists
+  live with the channel and are not persisted, registered or not.
 - List-mode masks follow Solanum's `pretty_mask`: `nick` → `nick!*@*`, and a
   bare token with a `.` or `:` (a host or an address) → `*!*@token`. A host
   that is an address or a CIDR range (`*!*@203.0.113.0/24`,
@@ -1150,14 +1284,22 @@ subset's exact behavior.
   casefolded, in constant time), `+i` (an invite or `+I` passes), `+l` (an
   invite passes). INVITE takes channel-operator status unless the channel is
   `+g`; an invite is recorded only while the channel is `+i` or `+l`, the
-  modes it lets its holder past. `+k` on a keyed channel replaces the key.
+  modes it lets its holder past, and opening the channel revokes those held:
+  `-i` always (ircd-hybrid's rule; Solanum keeps them until the channel is
+  destroyed), `-l` when the channel is not `+i`, so an invite cannot be
+  stocked and spent after the channel is locked again. `+k` on a keyed
+  channel replaces the key. TOPIC needs what a message does (Solanum's
+  `m_topic` calls `can_send`): a banned or quieted member, or an unvoiced one
+  under `+m`, is refused with 404 even on a `-t` channel.
   A STATUSMSG (`@#c`/`+#c`) — PRIVMSG, NOTICE, TAGMSG or multiline — needs
   op or voice in the channel (482 otherwise). A PART reason is dropped
   whenever the member could not say it as a message (banned, quieted, or
   unvoiced under `+m`). KNOCK is for a channel that is `+i`, keyed or full;
   the banned and the quieted are refused, and each user may knock once per
   five minutes and each channel be knocked on once per minute (712,
-  Solanum's `knock_delay` / `knock_delay_channel`). `QUIT` with no comment
+  Solanum's `knock_delay` / `knock_delay_channel`). RPL_KNOCK goes to every
+  member of a `+g` channel, to the operators otherwise, in Solanum's shape:
+  `710 <channel> <channel> <nick!user@host> :has asked for an invite.` `QUIT` with no comment
   leaves as `Quit: <nick>`, `QUIT :` with an empty reason. PART of a channel
   that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
@@ -1167,9 +1309,22 @@ subset's exact behavior.
 - The first joiner of an unregistered channel creates it and is opped. A
   *registered* channel recreated after it emptied opens no ops by arrival:
   only the founder or an access holder is opped on join (Atheme semantics).
-- User modes: Solanum-compatible core (`+i +w +Z +R …`) plus oper modes. A
-  user MODE reports only the net change (nothing when nothing changed), and
-  `MODE <nick>` for a nick nobody holds is `ERR_NOSUCHNICK`, not 502.
+- User modes: `+i +o +w +B +R +Z` (`USER_MODES`, which RPL_MYINFO
+  advertises). `+R` (Solanum's `um_regonlymsg`) admits a PRIVMSG, NOTICE,
+  TAGMSG or INVITE only from a user logged in to an account or an operator;
+  anyone else gets 486 `ERR_NONONREG` (`You must log in with services to
+  message this user`), a NOTICE nothing. `+Z` is the server's: set on a TLS
+  connection — a TLS listener, or a WebSocket a trusted proxy reports reached
+  over HTTPS (every `X-Forwarded-Proto` entry `https`; the HTTP listener never
+  terminates TLS itself, and such a session's transport is `wss` in the
+  connection directory) — told to the client after the MOTD
+  (`:<nick> MODE <nick> :+Z`), shown in WHOIS as 671 `RPL_WHOISSECURE`, and a
+  client's own `+Z`/`-Z` changes nothing, as in Solanum. Both are part of
+  the published user record, so every shard judges and reports them alike.
+  Only a user MODE's first argument is its mode string (`MODE me +i foo` sets
+  `+i`). A user MODE reports only the net change (nothing when nothing
+  changed), and `MODE <nick>` for a nick nobody holds is `ERR_NOSUCHNICK`,
+  not 502.
 - An over-long `USER` name is truncated to `USERLEN`, never refused (Modern
   IRC); only a character the source prefix cannot carry is refused (468).
 - Oper system: config-defined opers, privileges (kline/dline/xline-style
@@ -1177,12 +1332,38 @@ subset's exact behavior.
   that is an address or CIDR range matches the connection's real address; a
   D-line must be an IP address, CIDR range or address glob (anything else is
   refused) and matches only that address; so a SETHOST lifts neither. A
-  reason `public|private` shows the banned user and their peers only the
-  public part; the operator listing and the audit trail keep both. `STATS k`,
-  `STATS d` and `STATS x` (either case) are that operator listing in Solanum's
-  numerics — `216 K <host> * <user>`, `225 D <address>`, `247 X 0 <mask>`,
-  each with the whole reason, then 219; a non-operator gets 481 and the 219
-  terminator, as Solanum's stats access table answers. A mask part is spelled
+  K-line target that can only be a nick (no `@`, `.`, `:`, `/` or glob) bans
+  that user's host, `*@<host>`, and is refused with 401 when nobody holds
+  the nick (the ratbox-family nick K-line; current Solanum refuses a bare nick
+  outright). A mask is at most `BANMASKLEN` bytes (100), an X-line's at most
+  `REALLEN` (150), longer ones refused. A leading all-digits argument
+  (`KLINE 60 *@host :spam`, likewise DLINE and XLINE) makes the ban temporary
+  for that many minutes (Solanum's `valid_temp_time`: at most 52 weeks, `0`
+  permanent): its expiry is decided where it is set and carried to the
+  database (`server_bans.expires_at`, migration 0089) and every shard, the
+  audit row names its length, the confirmation and the operators' notice say
+  `temporary <n> min.`, and when it lapses every shard stops enforcing it on
+  the next tick — a lapsed ban bans no one even before then — and tells its
+  own operators (`Temporary K-Line for <mask> expired`), so each hears it
+  once. A lapsed row is not loaded at boot nor listed by the administrator
+  API, and storage maintenance deletes it. `UNKLINE` lifts a temporary ban
+  early. The administrator API takes the same as `duration_minutes` and lists
+  `expires_at`. A reason `public|private` shows the banned user and their
+  peers only the public part; the operator listing and the audit trail keep
+  both. `STATS k`, `STATS d` and `STATS x` (either case) are that operator
+  listing in Solanum's numerics — `216 K <host> * <user>`,
+  `225 D <address>`, `247 X 0 <mask>`, each with the whole reason, then 219; a
+  temporary ban has the lowercase letter, as Solanum marks one, and its reason
+  starts with the time left, as ratbox and charybdis wrote it
+  (`Temporary K-Line 40 min. - <reason>`). A non-operator gets 481 and the 219
+  terminator, as Solanum's stats access table answers. A second OPER by an
+  operator is answered 381 and changes nothing — not the operator identity its
+  actions are audited under (Solanum's `m_oper`). A KILL victim is sent the
+  `:<killer!user@host> KILL <victim> :<reason>` line before its closing
+  `ERROR` (the server name is the source of a console kill). SETHOST takes
+  Solanum's `clean_host` alphabet — letters, digits, `.` `-` `:` `/`, the
+  part after the last `/` not starting with a digit — so a host can never be
+  a glob or a list. A mask part is spelled
   as Solanum spells it so it stays one middle parameter
   (`sanitize::mask_middle`): a space (X-line masks hold them) as `\s`, and a
   leading `:` (an IPv6 address such as `::1`) with a `0` in front. A session's
@@ -1197,6 +1378,10 @@ subset's exact behavior.
   created via NickServ and via web/OIDC are the same account rows (§9.1).
   `SASL` and `IDENTIFY` set the same account state; `account-notify`/WHOIS
   reflect it identically to Libera. Each command's `HELP` line lists it.
+  A pseudo-client speaks as `<Service>!<Service>@services.<server>` — its
+  notices and every channel mode ChanServ sets (a mode lock's correction,
+  `OP`/`VOICE` and their inverses, an access holder's op or voice on join)
+  alike, from one helper (`ServerState::service_prefix`).
   - NickServ: `REGISTER`, `IDENTIFY`, `LOGOUT`; `GROUP`/`UNGROUP` add the
     current nick to the identified account or remove a grouped one (an account
     holds at most five nicks, its name included — Atheme's `maxnicks`; a nick
@@ -1474,8 +1659,16 @@ Principal tables (columns abridged):
   cap one entry to the IRC wire limit. A replay cannot inject a second line or
   make the bounded buffer retain an unbounded entry.
   Retention is per (owner, network): the persistence task counts its own
-  appends and trims to the newest `BNC_BUFFER_CAP` at every
-  `BNC_TRIM_INTERVAL`, and rows older than `storage.history_retention_days`
+  appends and trims to the newest `BNC_BUFFER_CAP` (5,000) rows, and of those
+  to the newest `BNC_BUFFER_BYTES` (5,000 × 512 bytes), at every
+  `BNC_TRIM_INTERVAL` — a thousand ordinary lines, each line weighing one per
+  512 bytes it holds (`bnc_trim_weight`), so a trim is also due after half a
+  megabyte of long ones. The upstream decides how long its lines are; counted
+  only in rows, 5,000 lines of eight kilobytes of tags each stood. The
+  in-memory backlog is held to the same rate: `buffer_cap` lines and
+  `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), oldest first,
+  its newest line always kept, on every push and when a stored backlog is
+  restored. Rows older than `storage.history_retention_days`
   are deleted by storage maintenance in bounded batches (index
   `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
   bouncer history, direct messages included, not only the server's own. Read
@@ -2162,7 +2355,9 @@ two-parameter `NICK`; an autojoin entry of `0` means "leave every channel";
 `#a,#b` is two channels; a key with a space, a comma, or a leading `:` is not
 one `JOIN` parameter) — not a network's nickname policy, which still comes
 back as a loud 432. An account network's autojoin entry is `#channel` or
-`#channel key`; the key is a secret of the channel's members, stored sealed
+`#channel key` (the chat client's settings box separates entries by commas
+only, so the word after a channel is its key whatever it begins with, and an
+entry of three words is refused); the key is a secret of the channel's members, stored sealed
 under the owner's context in `bnc_networks.autojoin_keys_sealed` (migration
 0087: one entry per `autojoin` channel, NULL for none, held to one length and
 to IRC networks by table constraints), re-sealed by key rotation, opened only
@@ -2498,7 +2693,11 @@ core is this binary: a refusal, or a welcome without the answer, is an
   is enabled follows the upstream's `CAP NEW` and `CAP DEL` for the whole
   session: the connection tracks it, and the driver asks for a wanted
   capability a `CAP NEW` offers and re-reads how it writes (echoes,
-  client-only tags, reply correlation) after every change. Names are compared
+  client-only tags, reply correlation) after every change. A `CAP ACK` or
+  `NAK` counts only for a name the connection asked for and is still waiting
+  on; the enabled set holds the program's own capability names
+  (`&'static str`), so an upstream streaming acknowledgements of names nobody
+  requested cannot enable anything or grow it. Names are compared
   and classified the network's way everywhere — its 005 `CASEMAPPING`,
   `CHANTYPES` and `STATUSMSG`, read through the client crate's
   `NetworkNames` — in the session tracker, the rejoin set, echo matching,
@@ -2651,7 +2850,15 @@ core is this binary: a refusal, or a welcome without the answer, is an
   offered once on the same connection. A failed SCRAM (a 904 on the proof, a
   forged or malformed server message, a credential SASLprep cannot carry) is
   never retried as PLAIN: that would hand the password to the server that just
-  failed to prove itself. SCRAM's iteration count is bounded at 1,000,000. A network may also carry a server
+  failed to prove itself. A mechanism the network refuses *before* any
+  credential is sent — Libera answers SCRAM's first message with
+  `e=other-error` for an account whose stored password predates SCRAM — is
+  followed by the next weaker one it offers, on the same connection, and never
+  silently: every consumer of `e6irc_client::Connection::sasl_notes` says which
+  was refused and what was offered instead (a `:*bnc*` notice here, stderr in
+  the CLI, a status line in the TUI). It hands the server nothing it could not
+  have asked for by not advertising SCRAM, so it is not opt-in; a failure after
+  a credential was sent is still final. SCRAM's iteration count is bounded at 1,000,000. A network may also carry a server
   password — the `PASS` a private server requires before `CAP LS`, `NICK` and
   `USER`; the driver and the connection test send it as the first line
   through the one `register()`. It is a `ServerPassword` (at most 504 bytes,
@@ -3168,8 +3375,9 @@ Design constraints recorded now:
   later output is held behind it — replies must reach a client in the order it
   issued the commands, or a client that pipelines CHATHISTORY and PING sees the
   PONG first and concludes the history was empty. Held output carries the same
-  bound as the send queue it is waiting to enter, so a connection blocked on the
-  database is still killed for SendQ overrun rather than buffering without limit.
+  bound as the send queue it is waiting to enter, in the same bytes, so a
+  connection blocked on the database is still killed for SendQ overrun rather
+  than buffering without limit.
   **Rings are lazy and LRU-evicted** so hot-history RAM
   is bounded by *activity*, not target count: only the
   `max_hot_channels` (default 8192) most-recently-active targets hold a
@@ -3179,6 +3387,24 @@ Design constraints recorded now:
   upstream sessions — at 100k channels an always-on 500-entry ring per
   channel would be tens of GB, so eviction is load-bearing, not an
   optimization.
+  **Rings are bounded in bytes as well as entries and count.** An entry can
+  hold kilobytes a client chose (4,094 bytes of client-only tags are kept with
+  every message but a typing indicator), so 500 entries × 8,192 rings bounded
+  nothing in bytes — some fifty gigabytes of twelve-kilobyte entries. Each
+  ring holds at most `max_history_ring_bytes` (default 500 KiB: its 500 entries
+  at a kilobyte, which an ordinary line stays under), its oldest entries going
+  first and its newest always kept; all rings together hold at most
+  `max_hot_history_bytes` (default 512 MiB, a thousand full rings of ordinary
+  lines), beyond which the least recently active rings are evicted, as beyond
+  `max_hot_channels` and in the same order — never the ring just written. An
+  entry counts its own fields and every string it owns
+  (`hot_history::footprint`); the ring's and the store's byte counts are
+  running sums kept where entries come and go. A shed or evicted ring is
+  incomplete as ever, and CHATHISTORY falls back to Postgres. A multiline
+  message's text is held once, in its encoded lines: the joined single line the
+  `body` column and the REST history carry is derived from them
+  (`HistoryRow::plain_body`) when the row is persisted or served, so what is
+  stored and replayed is unchanged.
   The store (`core::hot_history::HotHistory`) keeps what each event asks of
   it as an index updated where a ring comes or goes: the LRU order is a
   `Recency` (a stamp per touch, stale stamps skipped and periodically
@@ -3334,7 +3560,13 @@ the active route is brought into the horizontal console-navigation viewport on
 load. The console works
 in the default build and `embed-web`; its private pages permit only that
 same-origin script. The shared browser contract parser validates each path,
-query, JSON request, and JSON response before a request or view uses it.
+query, JSON request, and JSON response before a request or view uses it. A
+directory page (sessions, accounts, channels, bans, audit) never forwards its
+own query string: its API query and its pager links are built by the shared
+`directoryQuery` from the keys that directory's operation declares, keeping
+only non-empty values, so a filter form's "All kinds" (`kind=`) or a
+page-only parameter (a second pager cursor, a one-shot notice flag) cannot
+fail the contract before the request is made.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle
@@ -3401,7 +3633,13 @@ network (a test scans the chat shell and every template for it). A failure of so
 did not enter the socket, a join that was not sent, backlog that would not
 load, a refused notification permission -- is reported once, as an alert above
 the chat, which is read whatever conversation is open and is deduplicated by
-key. The console conversation keeps the connection's own record (what it sent
+key. A live connection opening clears only the alerts that report the
+connection being down (`ALERTS_RESOLVED_BY_CONNECTING`, with "Not connected"
+under a key of its own); a refused message, or messages not confirmed before a
+connection closed, stay until the person dismisses the alert or acts on it,
+since reconnecting delivers neither. Alert text is stripped of bidirectional
+controls where it is shown, because it names channels and nicks. The console
+conversation keeps the connection's own record (what it sent
 and received, what was enabled, why a socket was not opened); it is not a
 second place for failures, which used to be written there as well, in wording
 that had drifted from the alert's. The
@@ -3445,7 +3683,10 @@ old nick, mode table or membership. Raw line events preserve IRCv3 `time` and `m
 persisted timelines use the same clock and have stable overlap identity. The
 client applies the protocol parser's last-duplicate-tag rule, parses each line,
 routes it to the right buffer (channel / DM / server), with STATUSMSG targets
-such as `@#ops` routed to the underlying channel,
+such as `@#ops` routed to the underlying channel -- only the sigils the
+network's `005 STATUSMSG` advertises, none before it does, taken off exactly as
+`NetworkNames::conversation` takes them (the fewest that leave a channel, so
+with `&` a sigil `&#dev` is `#dev`'s),
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
@@ -3453,7 +3694,12 @@ inject markup). Bidirectional embedding, override and isolate controls
 (U+202A–U+202E, U+2066–U+2069) are removed from rendered text, and the
 sender, the text and each link are separate bidi isolates (a link laid out
 left to right), so a line cannot display a link as an address other than the
-one it opens. The transcript is `aria-busy` and `aria-live="off"` from each
+one it opens. Channel and nick names are drawn the same way wherever they
+appear -- the conversation list, the header, the member list, alerts and
+desktop notifications -- while the name sent back to the network keeps its
+own spelling; each drawn name is its own isolate. mIRC formatting is removed
+from chat text, topics, and the reason a PART, KICK or QUIT carries, which is
+rendered by one helper (`reasonSuffix`). The transcript is `aria-busy` and `aria-live="off"` from each
 connect until the replay boundary, so a screen reader announces live traffic,
 not the replayed backlog. The conversation and member lists are reconciled in
 place, keyed by conversation and member, so a new line or a JOIN, PART or MODE
@@ -3599,6 +3845,19 @@ it bounds each HTTP request of `api` and `login` too. Those two open no IRC
 connection, so an IRC-only global option given to them (`--server`, `--nick`,
 `--tls`, the SASL and server-password options, ...) is an argument error
 naming it, not a silently ignored flag.
+A capability a command requires is asked for while the welcome burst is
+still arriving, and that burst is read the way the steady-state stream is: a
+Latin-1 MOTD line cannot fail `history` or `send`. Neither that wait nor the
+round trip that ends the burst holds what it reads:
+`Connection::require_capabilities` and `Connection::round_trip` hand each
+line to an `e6irc_client::LineSink` as it is read, and read the next only
+once the sink has taken it. A bouncer attach can replay thousands of lines
+there; `tail` prints those for its target as they arrive, under the naming
+rules the burst's 005 declares, and nothing waits in a list. `history --count` is cut to the
+server's 005 `CHATHISTORY` limit with a warning on stderr, instead of being
+sent and refused. A SASL mechanism the server refused before any credential,
+and the one offered instead (`Connection::sasl_notes`), is a warning on
+stderr.
 `send` confirms delivery: it requires `echo-message` and, without it, fails
 with "delivery cannot be confirmed" before sending anything; it gets past the
 registration burst with a PING round trip and exits 0 only on its own echo,
@@ -3698,13 +3957,19 @@ are never retried (the client stops with a final status, as the bouncer's
 driver parks) — a SCRAM server-final `e=invalid-proof`, `e=unknown-user`,
 `e=invalid-encoding` or `e=invalid-username-encoding` is a credential rejection
 exactly like a 904 answering the proof — and any other failure backs off exponentially from
-`--reconnect-delay` to five minutes. A refused channel is dropped from the
+`--reconnect-delay` to five minutes. Registering is not success: the backoff
+starts afresh only after a session stayed up for one liveness window, so a
+server that welcomes the client and drops it at once is answered with the
+same growing waits as one that refuses the connection. A refused channel is dropped from the
 session with a status line instead of failing the whole connect. A refusal is
 any error numeric or `FAIL JOIN` about that channel, not a list of known
 numerics: one this client never heard of (479, 489, 520, ...) would otherwise
 leave the join waiting out its deadline and the client reconnecting forever.
 Messages to a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
-server's `005 STATUSMSG` declares) are shown in the channel's buffer.
+server's `005 STATUSMSG` declares, and none before it declares any) are shown
+in the channel's buffer. The UI takes the connection's `NetworkNames` on
+connect and on every reconnect, so it names things as the network does from
+its first line, and nothing from a previous server survives a reconnect.
 Which targets are channels and which names are the same are the network's:
 every native client (CLI, TUI, and the `e6irc-client` join/refusal matching)
 reads `005 CASEMAPPING` and `CHANTYPES` through one
@@ -3730,10 +3995,29 @@ closed: malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
-uses, rejoins every channel confirmed for the client, pages `CHATHISTORY AFTER`
+uses — reading the rest of the welcome burst on the way, up to a round trip,
+as the steady-state stream is read, so a Latin-1 MOTD line cannot fail the
+connect, and showing that burst (MOTD, 005, a bouncer's playback) in
+`*server*` — rejoins every channel confirmed for the client, pages
+`CHATHISTORY AFTER`
 the server's marker forward (by msgid, else time) until a short page — at most
 ten pages and never more than the scrollback — or loads the latest bounded
-window, and coalesces shared read-marker writes as buffer focus advances. A
+window, and coalesces shared read-marker writes as buffer focus advances.
+Everything read while connecting reaches the UI as it is read, never
+gathered first: on the first connect straight into the UI state, which exists
+before the connection does; on a reconnect through the UI's bounded queue,
+whose backpressure stops the socket read. Lines the UI queued against the
+previous connection are set aside before it learns of the new one.
+No page asks for more than the server's 005 `CHATHISTORY` limit: a page the
+server cut to its own limit would read as short, and a short page is taken
+to mean every unread line is loaded. A `FAIL CHATHISTORY` costs that channel
+its history, never the connection: the channel is joined, the refusal is said
+beside it, and when unread lines may remain its read marker is held as below.
+Read markers are sent only when the connection has `draft/read-marker`
+enabled — a fact of the connection handed to the UI with each session, not
+the `--no-read-markers` setting, so the two cannot drift into `MARKREAD`
+lines the server answers with 421. A SASL mechanism refused before any
+credential, and the one offered instead, is said on connect. A
 channel with unread lines beyond what was loaded says "more unread lines were
 not loaded", and its read marker is held at the last contiguously loaded line
 until a later session loads every unread line: loading the oldest page and
@@ -4222,9 +4506,14 @@ Layers, bottom to top:
   binds `[::]` dual-stack on every platform (Linux defaults a v6 socket to
   dual-stack, Windows and several BSDs to v6-only), so `[::]` also collides
   with any IPv4 address on its port. Sizes have upper bounds as well as lower ones: `core_workers`
-  ≤ 64, `core_queue` ≤ 1,048,576, `sendq` ≤ 65,536, `max_hot_channels` ≤
-  1,048,576, a network's `buffer_cap` ≤ 100,000. `usize::MAX` workers used to
-  validate.
+  ≤ 64, `core_queue` ≤ 1,048,576, 17,406 ≤ `sendq_bytes` ≤ 33,554,432,
+  `max_hot_channels` ≤ 1,048,576, `max_history_ring_bytes` ≤ 65,536,000,
+  `max_hot_history_bytes` ≤ 68,719,476,736 and at least
+  `max_history_ring_bytes`, a network's `buffer_cap` ≤ 100,000. `usize::MAX`
+  workers used to validate. `sendq` counted lines until migration 0088 renamed
+  it `sendq_bytes` (a stored count became that many 512-byte lines); a
+  configuration file that still states `sendq` is refused by name rather than
+  read as a byte count a five-hundredth of what it meant.
 - The BNC registry exists whenever PostgreSQL does, independently of the raw
   attach listener. Its listener is runtime-managed: enabling or rebinding first
   binds the replacement socket, swaps only after success, and retains the

@@ -82,9 +82,10 @@ The harness and the server both need OS headroom well above defaults:
   use Linux for high counts.
 - **Backlog & buffers** — raise `net.core.somaxconn` and the listen backlog;
   watch `net.ipv4.tcp_mem` / socket buffer pressure.
-- **Server sizing** — `core_queue`, `sendq`, and `max_hot_channels` in the
-  server config govern memory under load. Queue bounds allocate lazily, so an
-  empty per-connection SendQ does not reserve its maximum 1,024 envelopes.
+- **Server sizing** — `core_queue`, `sendq_bytes`, `max_hot_channels`,
+  `max_history_ring_bytes` and `max_hot_history_bytes` in the server config
+  govern memory under load. Queue bounds allocate lazily, so an empty
+  per-connection SendQ does not reserve its maximum 512 KiB.
   Pass the server process ID and a host-specific
   `--maximum-server-rss-per-connection-bytes` value to enforce the chosen
   incremental resident-memory budget.

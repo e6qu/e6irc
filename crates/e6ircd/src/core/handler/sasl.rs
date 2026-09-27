@@ -237,7 +237,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 state.numeric(
                     conn,
                     RPL_SASLMECHS,
-                    &["PLAIN,OAUTHBEARER"],
+                    &[Middle::own("PLAIN,OAUTHBEARER")],
                     Some("are available SASL mechanisms"),
                 );
                 sasl_fail(state, conn);
