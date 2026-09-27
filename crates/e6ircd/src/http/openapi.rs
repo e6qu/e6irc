@@ -441,7 +441,7 @@ fn operations() -> serde_json::Value {
                 { "type": "object", "additionalProperties": false,
                     "required": ["state", "state_changed_at", "next_retry_at", "recent_failures", "connected_at", "last_input_at", "last_output_at", "last_error_at", "last_error", "connect_latency_ms", "connection_attempts", "errors", "attached_clients", "traffic", "buffer"],
                     "properties": {
-                        "state": { "type": "string", "enum": ["connecting", "connected", "reconnecting", "authentication_failed", "registration_failed", "owner_suspended", "owner_deleted"], "description": "owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped)." },
+                        "state": { "type": "string", "enum": ["connecting", "connected", "regaining_nickname", "reconnecting", "authentication_failed", "registration_failed", "owner_suspended", "owner_deleted"], "description": "regaining_nickname: the configured nickname was in use (a session of this network the upstream never saw end), so the network registered under an alternative and is taking the configured one back; it is not connected, and last_error.diagnostic says which name it holds. owner_suspended and owner_deleted: an operator-configured network held stopped by its owning account's suspension (reactivation restarts it) or deletion (it stays stopped)." },
                         "state_changed_at": { "type": "string" }, "next_retry_at": { "type": ["string", "null"] },
                         "recent_failures": { "type": "array", "maxItems": crate::bouncer::NETWORK_FAILURE_HISTORY_LIMIT, "items": {
                             "type": "object", "additionalProperties": false, "required": ["at", "code", "summary"],
@@ -883,7 +883,13 @@ fn operations() -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "before_connect": { "type": "boolean" },
-            "require_email": { "type": "boolean" }
+            "require_email": { "type": "boolean" },
+            "minimum_password_length": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::identity::MAX_MINIMUM_PASSWORD_CHARS,
+                "description": "The fewest characters a password being set may have, on IRC and NickServ REGISTER, the web and this API; 8 (NIST SP 800-63B) unless configured. Existing passwords still verify. Applied without a restart."
+            }
         }
     });
     let limits_schema = serde_json::json!({
@@ -1627,7 +1633,7 @@ fn operations() -> serde_json::Value {
                             "required": ["new_password"],
                             "properties": {
                                 "current_password": { "type": "string", "minLength": 1, "maxLength": 512 },
-                                "new_password": { "type": "string", "minLength": 8, "maxLength": 512, "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes." }
+                                "new_password": { "type": "string", "minLength": 1, "maxLength": 512, "description": "At least registration.minimum_password_length characters (8 unless configured, NIST SP 800-63B) and at most 512 bytes." }
                             }
                         }
                     } } },
@@ -2092,7 +2098,7 @@ fn operations() -> serde_json::Value {
                             "additionalProperties": false,
                             "properties": {
                                 "account": { "type": "string", "maxLength": 64 },
-                                "password": { "type": "string", "minLength": 8, "maxLength": 512, "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes." },
+                                "password": { "type": "string", "minLength": 1, "maxLength": 512, "description": "At least registration.minimum_password_length characters (8 unless configured, NIST SP 800-63B) and at most 512 bytes." },
                                 "contact_email": { "type": ["string", "null"], "maxLength": 254 },
                                 "administrator": { "type": "boolean", "default": false }
                             }

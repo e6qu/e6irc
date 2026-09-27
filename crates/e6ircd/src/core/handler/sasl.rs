@@ -429,10 +429,16 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     // the administrative event installs this deny gate, even a successful DB
     // verification that was already in flight is converted to a denial rather
     // than recreating an authenticated session after the disconnect sweep.
-    // A password change is the same, for a check queued before it: the
-    // verdict speaks for a credential that no longer stands.
-    if let crate::core::DbReply::PasswordVerified { account, origin } = &reply
-        && (state.is_account_suspended(account) || state.credentials_ended_since(conn, account))
+    // A password change, or the revocation of the app password or token
+    // checked, is the same, for a check queued before it: the verdict speaks
+    // for a credential that no longer stands.
+    if let crate::core::DbReply::PasswordVerified {
+        account,
+        credential,
+        origin,
+    } = &reply
+        && (state.is_account_suspended(account)
+            || state.credentials_ended_since(conn, account, *credential))
     {
         verify_denied(state, conn, *origin, sasl_label, Denial::Rejected);
         return;
@@ -441,6 +447,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         // Route credential verdicts by request origin.
         crate::core::DbReply::PasswordVerified {
             account,
+            credential,
             origin: crate::core::CredentialOrigin::Sasl,
         } => {
             if state.sessions[&conn].sasl != SaslState::Verifying {
@@ -451,7 +458,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             sasl_verdict(state, conn, sasl_label, move |state| {
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
                 // RPL_LOGGEDIN comes from `set_account`, the one login path.
-                state.set_account(conn, logged_in);
+                state.set_account(conn, logged_in, credential);
                 state.numeric(
                     conn,
                     RPL_SASLSUCCESS,
@@ -468,6 +475,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         }
         crate::core::DbReply::PasswordVerified {
             account,
+            credential,
             origin: crate::core::CredentialOrigin::NickServIdentify,
         } => {
             let Some(label) = take_identify_label(state, conn) else {
@@ -479,7 +487,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             // output like a real server.
             let account_for_notice = account.clone();
             state.emit_labeled_unheld(conn, label, move |state| {
-                state.set_account(conn, account_for_notice.clone());
+                state.set_account(conn, account_for_notice.clone(), credential);
                 state.service_notice(
                     conn,
                     "NickServ",
@@ -537,7 +545,11 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         crate::core::DbReply::AccountCreated { account, origin } => {
             match origin {
                 crate::core::AccountOrigin::NickServ => {
-                    state.set_account(conn, account.clone());
+                    state.set_account(
+                        conn,
+                        account.clone(),
+                        crate::identity::CredentialId::AccountPassword,
+                    );
                     state.service_notice(
                         conn,
                         "NickServ",
@@ -549,7 +561,11 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     let server = state.config.server_name.clone();
                     let account = account.clone();
                     state.emit_deferred_labeled(conn, label, move |state| {
-                        state.set_account(conn, account.clone());
+                        state.set_account(
+                            conn,
+                            account.clone(),
+                            crate::identity::CredentialId::AccountPassword,
+                        );
                         state.send(
                             conn,
                             &format!(

@@ -182,18 +182,30 @@ def wait_for_postgres(container: str) -> None:
     raise TimeoutError(f"PostgreSQL did not become ready: {last_error}")
 
 
+# The device authorization request `e6irc login` makes (RFC 8628 §3.1).
+DEVICE_AUTHORIZATION_FORM = {"client_id": "e6irc-cli"}
+
+
 def http_request(
     origin: str,
     path: str,
     *,
     method: str = "GET",
+    form: dict[str, str] | None = None,
     timeout: float = 6.0,
 ) -> tuple[int, bytes]:
+    headers = {"Accept": "application/json"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif method == "POST":
+        data = b""
     request = urllib.request.Request(
         f"{origin}{path}",
-        data=b"" if method == "POST" else None,
+        data=data,
         method=method,
-        headers={"Accept": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -379,10 +391,13 @@ def main() -> None:
                     "channel message during PostgreSQL interruption",
                 )
                 device_failure_started = time.monotonic()
+                # An RFC 8628 device authorization request, as `e6irc login`
+                # sends it: the form is checked before the database is asked.
                 status, body = http_request(
                     origin,
                     "/api/v1/auth/device/start",
                     method="POST",
+                    form=DEVICE_AUTHORIZATION_FORM,
                     timeout=6.0,
                 )
                 device_failure_latency = time.monotonic() - device_failure_started
@@ -399,7 +414,10 @@ def main() -> None:
                 assert json.loads(recovered_body)["database"] == "ready"
 
                 status, body = http_request(
-                    origin, "/api/v1/auth/device/start", method="POST"
+                    origin,
+                    "/api/v1/auth/device/start",
+                    method="POST",
+                    form=DEVICE_AUTHORIZATION_FORM,
                 )
                 assert status == 200, (status, body)
                 grant = json.loads(body)

@@ -1188,6 +1188,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         registration: {
           before_connect: fields.has("registration_before_connect"),
           require_email: fields.has("registration_require_email"),
+          minimum_password_length: positiveInteger(fields, "registration_minimum_password_length", "Minimum password length"),
         },
         limits: {
           max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
@@ -1566,6 +1567,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "observability_retention_hours", settings.observability.retention_hours);
     configurationChecked(form, "registration_before_connect", settings.registration.before_connect);
     configurationChecked(form, "registration_require_email", settings.registration.require_email);
+    configurationValue(form, "registration_minimum_password_length", settings.registration.minimum_password_length);
     const bncStatus = root.querySelector("[data-configuration-bnc-status]");
     bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
     if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
@@ -1936,6 +1938,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const identityList = accountRoot.querySelector("[data-api-account-identity-list]");
     const linkProviders = accountRoot.querySelector("[data-api-account-link-providers]");
     const csrf = accountRoot.dataset.csrf || "";
+    const minimumPasswordLength = Number(accountRoot.dataset.minimumPasswordLength);
     const renderPassword = (hasLocalPassword) => {
       if (!(passwordPanel instanceof HTMLElement)) return;
       const title = hasLocalPassword ? "Primary password" : "Add a local password";
@@ -1950,7 +1953,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const passwordField = (label, name, autocomplete) => {
         const { label: field, control: input } = labelledControl("input", name, label);
         input.type = "password"; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
-        if (autocomplete === "new-password") input.minLength = 8;
+        if (autocomplete === "new-password") input.minLength = minimumPasswordLength;
         addRevealControl(input);
         return field;
       };

@@ -497,9 +497,13 @@ try {
     page.getByRole("button", { name: "Add password", exact: true }).click(),
   ]);
   // 200, not 204: the answer says what else the change did (other browser
-  // sessions ended; app passwords and tokens untouched).
+  // sessions, IRC connections and bouncer attachments ended; app passwords and
+  // tokens untouched).
   assert.equal(passwordResponse.status(), 200, await passwordResponse.text());
-  assert.match((await passwordResponse.json()).detail, /Other browser sessions were signed out/);
+  assert.match(
+    (await passwordResponse.json()).detail,
+    /Other browser sessions, IRC connections and bouncer attachments were signed out/,
+  );
   await expectStatus(page, /Local password added/);
   await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/login`);

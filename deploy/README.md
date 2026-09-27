@@ -360,8 +360,9 @@ deliver its closing `ERROR` and close for at most 8 seconds, flushes buffered
 writes to PostgreSQL for at most 30 seconds, and then gives the serving lease
 back for at most 5 seconds, so a standby takes over at once. A process that is
 killed instead says no goodbye: its upstream sessions end when the upstream
-notices the dropped connection, and the next process to serve may find its
-nick still held there until then. Give the container at least 65 seconds
+notices the dropped connection, and until then the next process to serve
+finds its nick held there — it registers under the alternative nickname and
+takes the configured one back once the ghost is gone or NickServ regains it. Give the container at least 65 seconds
 before it is killed, as
 `e6ircd.service` does: `stopTimeout: 65` (or more) in the ECS container
 definition, `docker stop --time 65`, or `stop_grace_period: 65s` in Compose.

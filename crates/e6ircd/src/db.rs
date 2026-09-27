@@ -28,6 +28,7 @@ pub(crate) use announcements::{
 pub(crate) use credential_change::CredentialChange;
 pub use credential_change::{
     AccountAnnouncement, AccountAuthority, RevocableCredential, credential_remaining,
+    issued_credentials_stored,
 };
 pub(crate) use credential_change::{account_authority, every_account_authority};
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
@@ -141,6 +142,10 @@ pub enum DbError {
     /// Taking the serving lease could not end this many connections of the
     /// previous holder; the lease was not taken.
     PreviousHolderLingers(i64),
+    /// This process has lost the serving lease (fenced, or taken over), so
+    /// the database refuses it connections: what a pool timeout or a refused
+    /// connection means once [`mark_fenced`] has recorded why.
+    NotServing(String),
 }
 
 impl std::fmt::Display for DbError {
@@ -254,6 +259,11 @@ impl std::fmt::Display for DbError {
                 "the database schema is older than this binary and {held} serves it; upgrade \
                  the serving process first, which migrates it"
             ),
+            Self::NotServing(why) => write!(
+                f,
+                "this process no longer holds the serving lease ({why}); it cannot use the \
+                 database"
+            ),
             Self::PreviousHolderLingers(count) => write!(
                 f,
                 "{count} connection(s) of the previous serving-lease holder did not end when \
@@ -270,13 +280,42 @@ impl std::error::Error for DbError {}
 /// telemetry as `e6irc_database_pool_acquire_timeouts_total`.
 static POOL_ACQUIRE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Why this process lost the serving lease, once it has: set once, by the
+/// lease's renewal task when the lease ends ([`mark_fenced`]).
+static FENCED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record that this process no longer holds the serving lease, and why (who
+/// holds it now, or that it fenced itself). From then on a pool that cannot
+/// hand out a connection — the database refuses every new one this process
+/// opens — reports that, not a bare timeout. The first reason stands.
+pub(crate) fn mark_fenced(why: String) {
+    FENCED.get_or_init(|| why);
+}
+
+/// SQLSTATE `serving_lease_register_backend` (migration 0098) raises for a
+/// process that does not hold the lease.
+const NOT_THE_LEASE_HOLDER: &str = "E6L01";
+
 /// Every query failure in this module passes through here on its way into a
-/// [`DbError`], so an exhausted pool is counted wherever it is met.
+/// [`DbError`], so an exhausted pool is counted wherever it is met, and a
+/// process that has lost the serving lease says so.
 pub(crate) fn query_error(error: sqlx::Error) -> DbError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+    classify_query_error(error, FENCED.get().map(String::as_str))
+}
+
+fn classify_query_error(error: sqlx::Error, fenced: Option<&str>) -> DbError {
+    let timed_out = matches!(error, sqlx::Error::PoolTimedOut);
+    if timed_out {
         POOL_ACQUIRE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    DbError::Query(error)
+    let refused = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == NOT_THE_LEASE_HOLDER);
+    match fenced {
+        Some(why) if timed_out || refused => DbError::NotServing(why.to_owned()),
+        _ => DbError::Query(error),
+    }
 }
 
 pub(crate) fn pool_acquire_timeouts() -> u64 {
@@ -3119,6 +3158,9 @@ struct CredentialVerificationPlan {
     /// Verifications against the dummy hash, spent so the attempt costs the
     /// same whatever the account holds.
     dummies: usize,
+    /// The primary password's credential id, if it is a candidate: a match on
+    /// any other candidate is an app password.
+    primary: Option<i64>,
 }
 
 /// Decide what to verify `presented` against.
@@ -3144,6 +3186,7 @@ fn plan_credential_verification(
         }
     }
     let dummies = usize::from(primary.is_none()) + usize::from(named.is_none());
+    let primary_id = primary.as_ref().map(|credential| credential.credential_id);
     let candidates = primary
         .into_iter()
         .chain(named)
@@ -3155,6 +3198,7 @@ fn plan_credential_verification(
     CredentialVerificationPlan {
         candidates,
         dummies,
+        primary: primary_id,
     }
 }
 
@@ -3681,14 +3725,14 @@ async fn handle_request(
             let outcome = match api_token_account(pool, &token).await {
                 // e6irc never lets one account act as another: a GS2
                 // authorization identity must name the token's own account.
-                Ok(Some(account))
-                    if authzid
-                        .as_deref()
-                        .is_some_and(|authzid| !CaseMapping::Rfc1459.eq(authzid, &account)) =>
+                Ok(Some(signed_in))
+                    if authzid.as_deref().is_some_and(|authzid| {
+                        !CaseMapping::Rfc1459.eq(authzid, signed_in.account.name())
+                    }) =>
                 {
                     VerifyOutcome::Rejected
                 }
-                Ok(Some(account)) => VerifyOutcome::Verified(account),
+                Ok(Some(signed_in)) => VerifyOutcome::Verified(signed_in),
                 Ok(None) => VerifyOutcome::Rejected,
                 Err(e) => {
                     record_database_error(telemetry);
@@ -7028,7 +7072,7 @@ async fn founder_capacity(
 /// inventing a bogus [`CredentialOrigin`]; the worker maps it to the
 /// origin-carrying reply at the one place that knows which command asked.
 enum VerifyOutcome {
-    Verified(String),
+    Verified(VerifiedSignIn),
     Rejected,
     Throttled(LoginRetryAfter),
     Unavailable,
@@ -7037,7 +7081,11 @@ enum VerifyOutcome {
 impl VerifyOutcome {
     fn into_reply(self, origin: crate::core::CredentialOrigin) -> DbReply {
         match self {
-            Self::Verified(account) => DbReply::PasswordVerified { account, origin },
+            Self::Verified(signed_in) => DbReply::PasswordVerified {
+                account: signed_in.account.into_name(),
+                credential: signed_in.credential,
+                origin,
+            },
             Self::Rejected => DbReply::PasswordRejected { origin },
             Self::Throttled(retry_after) => DbReply::PasswordThrottled {
                 origin,
@@ -7080,7 +7128,7 @@ async fn handle_create_account(
 
 async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOutcome {
     match verify_credentials(pool, account, password).await {
-        Ok(Some(account)) => VerifyOutcome::Verified(account.into_name()),
+        Ok(Some(signed_in)) => VerifyOutcome::Verified(signed_in),
         Ok(None) => VerifyOutcome::Rejected,
         Err(DbError::LoginThrottled(retry_after)) => VerifyOutcome::Throttled(retry_after),
         Err(e) => {
@@ -7831,6 +7879,15 @@ impl std::ops::Deref for VerifiedAccount {
     }
 }
 
+/// A sign-in the store verified: the account, and the credential that opened
+/// it, which whatever the sign-in opens keeps so that revoking the credential
+/// ends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSignIn {
+    pub account: VerifiedAccount,
+    pub credential: crate::identity::CredentialId,
+}
+
 /// Verify an account password or app password.
 ///
 /// Every attempt costs two Argon2 computations under one permit, whether or
@@ -7841,7 +7898,7 @@ pub async fn verify_credentials(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<VerifiedAccount>, DbError> {
+) -> Result<Option<VerifiedSignIn>, DbError> {
     let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
@@ -7855,7 +7912,7 @@ async fn verify_any_credential(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<VerifiedAccount>, DbError> {
+) -> Result<Option<VerifiedSignIn>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let display_name: Option<String> =
         sqlx::query_scalar("SELECT name FROM accounts WHERE name_folded = $1 AND (flags & $2) = 0")
@@ -7878,13 +7935,22 @@ async fn verify_any_credential(
     .await
     .map_err(query_error)?;
     let plan = plan_credential_verification(stored, password);
+    let primary = plan.primary;
     let matched_id =
         matching_credential_id(plan.candidates, plan.dummies, password.to_string()).await?;
     let (Some(display_name), Some(id)) = (display_name, matched_id) else {
         return Ok(None);
     };
     record_credential_use(pool, id).await?;
-    Ok(Some(VerifiedAccount(display_name)))
+    let credential = if primary == Some(id) {
+        crate::identity::CredentialId::AccountPassword
+    } else {
+        crate::identity::CredentialId::Issued(crate::identity::IssuedCredential::AppPassword(id))
+    };
+    Ok(Some(VerifiedSignIn {
+        account: VerifiedAccount(display_name),
+        credential,
+    }))
 }
 
 /// Record that credential `credential_id` just verified, for the credential
@@ -10749,10 +10815,14 @@ async fn mint_api_token_under_cap(
     Ok(token)
 }
 
-/// Resolve a PAT to its account, if valid and unexpired.
-pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<String>, DbError> {
-    sqlx::query_scalar(
-        "SELECT a.name FROM api_tokens t
+/// Resolve a PAT that may sign in to IRC to its account and itself, if valid
+/// and unexpired.
+pub async fn api_token_account(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<VerifiedSignIn>, DbError> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT a.name, t.id FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
            AND t.expires_at > now()
@@ -10763,7 +10833,13 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    Ok(row.map(|(name, id)| VerifiedSignIn {
+        account: VerifiedAccount(name),
+        credential: crate::identity::CredentialId::Issued(
+            crate::identity::IssuedCredential::ApiToken(id),
+        ),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11033,6 +11109,34 @@ mod pool_size_tests {
         let parsed: DatabasePoolSize = serde_json::from_str("48").expect("in bounds");
         assert_eq!(parsed.get(), 48);
         assert!(serde_json::from_str::<DatabasePoolSize>("0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod fence_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_fenced_process_s_refused_or_timed_out_pool_names_the_lease() {
+        let why = "held by 10.0.0.2 pid 7, e6ircd 0.1.0";
+        let fenced = classify_query_error(sqlx::Error::PoolTimedOut, Some(why));
+        assert!(matches!(&fenced, DbError::NotServing(reason) if reason == why));
+        assert!(
+            fenced
+                .to_string()
+                .starts_with("this process no longer holds the serving lease (held by 10.0.0.2"),
+            "{fenced}"
+        );
+        // Serving still: a timeout is a timeout.
+        assert!(matches!(
+            classify_query_error(sqlx::Error::PoolTimedOut, None),
+            DbError::Query(sqlx::Error::PoolTimedOut)
+        ));
+        // Fenced, but an unrelated failure is itself.
+        assert!(matches!(
+            classify_query_error(sqlx::Error::RowNotFound, Some(why)),
+            DbError::Query(sqlx::Error::RowNotFound)
+        ));
     }
 }
 

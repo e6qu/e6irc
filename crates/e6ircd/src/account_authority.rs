@@ -20,6 +20,13 @@
 //! password. The watcher's baseline is read before the rest of the server
 //! reads suspended accounts at boot, and read again whenever its connection is
 //! lost, so nothing committed in between is missed.
+//!
+//! Migration 0097 has app passwords and personal access tokens announce their
+//! revocation on the same channel. A revocation ends exactly the IRC sessions
+//! and attachments that credential signed in, whichever process revoked it;
+//! nothing is recorded, since a revoked credential cannot sign in again.
+//! After its connection is lost the watcher asks which of the credentials
+//! still signed in here are still stored, and ends what the others signed in.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,6 +37,7 @@ use crate::db::{
     AccountAnnouncement, AccountAuthority, Announcements, CREDENTIAL_CHANGED_CHANNEL,
     CredentialChange,
 };
+use crate::identity::IssuedCredential;
 
 /// Who the core is told acted, for a change another process committed.
 const ANOTHER_PROCESS: &str = "another process";
@@ -303,6 +311,23 @@ pub(crate) async fn end_sessions_here(
         .map(|_| ())
 }
 
+/// This server's side of the revocation of an app password or a personal
+/// access token: every attachment it signed in ends, a check of it under way
+/// cannot open another, and the core ends every IRC session it signed in and
+/// refuses a verdict for a check of it queued before. The account's other
+/// sessions stay.
+pub(crate) async fn end_credential_here(
+    registry: &Registry,
+    core_tx: &CoreIngress,
+    credential: IssuedCredential,
+) -> Result<(), String> {
+    registry.account_revocations().revoke_credential(credential);
+    core_tx
+        .admin_action(AdminRequest::EndCredentialSessions { credential })
+        .await
+        .map(|_| ())
+}
+
 /// Connect the listener and read every account's authority: the baseline this
 /// server's boot reflects. Called before the boot reads suspended accounts, so
 /// a change committed while it boots is announced after the baseline.
@@ -368,7 +393,7 @@ impl AccountAuthorityWatcher {
     }
 
     /// Apply what every account asks of this server after announcements were
-    /// missed.
+    /// missed, then end what every credential revoked meanwhile signed in.
     async fn resynchronize(&self) -> Result<(), String> {
         let this = self.clone_handles();
         self.registry
@@ -379,9 +404,43 @@ impl AccountAuthorityWatcher {
                 for step in lane.authority_ledger().resynchronize(&accounts) {
                     this.apply(&lane, step).await;
                 }
-                Ok(())
+                Ok::<(), String>(())
             })
+            .await?;
+        self.resynchronize_credentials().await
+    }
+
+    /// End what every credential signed in here that is no longer stored
+    /// signed in: its revocation was announced while no one listened.
+    async fn resynchronize_credentials(&self) -> Result<(), String> {
+        let mut held = self.core_tx.signed_in_credentials();
+        held.extend(self.registry.account_revocations().held_credentials());
+        held.sort_unstable();
+        held.dedup();
+        if held.is_empty() {
+            return Ok(());
+        }
+        let stored = crate::db::issued_credentials_stored(&self.pool, &held)
             .await
+            .map_err(|error| error.to_string())?;
+        for credential in held {
+            if !stored.contains(&credential) {
+                self.end_credential(credential).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// End what the revoked `credential` signed in here. What cannot be ended
+    /// is said on stderr: the revocation is committed, and this server's share
+    /// of it is as much as it could do.
+    async fn end_credential(&self, credential: IssuedCredential) {
+        if let Err(error) = end_credential_here(&self.registry, &self.core_tx, credential).await {
+            eprintln!(
+                "account authority: the {credential} was revoked, but the IRC sessions it signed \
+                 in here were not ended: {error}"
+            );
+        }
     }
 
     fn clone_handles(&self) -> Arc<Handles> {
@@ -398,6 +457,10 @@ impl crate::db::Follower for AccountAuthorityWatcher {
     async fn on_change(&mut self, announcement: crate::db::Announcement) -> Result<(), String> {
         match CredentialChange::of(announcement) {
             CredentialChange::Account(announced) => self.follow(announced).await,
+            CredentialChange::IssuedRevoked(credential) => {
+                self.end_credential(credential).await;
+                Ok(())
+            }
             // A browser credential: the chat sockets' listener's.
             CredentialChange::Changed(_) => Ok(()),
             CredentialChange::Resynchronize => self.resynchronize().await,

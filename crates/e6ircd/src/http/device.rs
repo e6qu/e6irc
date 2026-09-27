@@ -1497,6 +1497,7 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
     let RegistrationConfig {
         before_connect: _,
         require_email: _,
+        minimum_password_length: _,
     } = &registration;
     let LimitsConfig {
         max_connections_per_ip: _,

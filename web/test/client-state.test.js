@@ -228,6 +228,23 @@ test("a refusal quotes the network's own reason, while retrying as well as once 
   );
 });
 
+// Regaining the nickname is progress, not a refusal: the row says which name
+// the bouncer holds meanwhile, in its own words rather than the network's.
+test("a network regaining its nickname says so and which name it holds", () => {
+  const help = networkStateHelp({
+    state: "regaining_nickname",
+    failureCode: "nickname_in_use",
+    failureDetail: "connected as alice_, regaining alice",
+  });
+  assert.match(help, /temporary one.*\(connected as alice_, regaining alice\)\.$/);
+  assert.doesNotMatch(help, /The network said/);
+  assert.equal(networkStateIsFailure({ state: "regaining_nickname" }), false);
+  assert.match(
+    networkStateHelp({ state: "registration_failed", failureCode: "nickname_regain_refused", failureDetail: null }),
+    /belongs to another account/,
+  );
+});
+
 // A 464 is a setting to change, and which one depends on whether a server
 // password was configured at all.
 test("a missing or rejected server password points at the setting that repairs it", () => {

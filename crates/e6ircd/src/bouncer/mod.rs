@@ -20,7 +20,9 @@ use std::future::Future;
 use e6irc_proto::message::MiddleParam;
 
 mod account_lease;
-pub use account_lease::{AccountLease, AccountRevocations, AccountRevoked, RevocationTicket};
+pub use account_lease::{
+    AccountLease, AccountRevocations, AccountRevoked, Revocation, RevocationTicket,
+};
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -35,6 +37,7 @@ mod irc_driver;
 mod local_driver;
 #[cfg(feature = "matrix")]
 mod matrix;
+mod nick_regain;
 mod replies;
 mod serve;
 #[cfg(feature = "slack")]
@@ -51,6 +54,7 @@ pub use irc_driver::{
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
+pub use nick_regain::NickRegainTiming;
 pub use serve::{ConfiguredNetwork, DriverStops, NetworkStatus, Registry};
 pub(crate) use serve::{
     ConfiguredNetworkHeld, MutationLane, RegistryRefusal, UnwrittenLines, bnc_serve,
@@ -400,6 +404,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
                 internal_upstreams,
                 first_dial,
+                nick_regain: NickRegainTiming::default(),
             })))
         }
         NetworkKind::Local => {
@@ -3273,6 +3278,8 @@ impl IrcSessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverConnectionStatus {
     Connected,
+    /// Registered under an alternative nickname; not connected.
+    RegainingNickname,
     Reconnecting(NetworkFailure),
     AuthenticationFailed,
     RegistrationFailed(NetworkFailure),
@@ -3282,6 +3289,7 @@ impl DriverConnectionStatus {
     pub const fn lifecycle(self) -> NetworkLifecycle {
         match self {
             Self::Connected => NetworkLifecycle::Connected,
+            Self::RegainingNickname => NetworkLifecycle::RegainingNickname,
             Self::Reconnecting(_) => NetworkLifecycle::Reconnecting,
             Self::AuthenticationFailed => NetworkLifecycle::AuthenticationFailed,
             Self::RegistrationFailed(_) => NetworkLifecycle::RegistrationFailed,
@@ -3291,6 +3299,7 @@ impl DriverConnectionStatus {
     pub const fn failure(self) -> Option<NetworkFailure> {
         match self {
             Self::Connected => None,
+            Self::RegainingNickname => Some(NetworkFailure::NicknameInUse),
             Self::Reconnecting(failure) | Self::RegistrationFailed(failure) => Some(failure),
             Self::AuthenticationFailed => Some(NetworkFailure::AuthenticationRejected),
         }
@@ -3300,6 +3309,11 @@ impl DriverConnectionStatus {
 fn status_notice(status: DriverConnectionStatus) -> String {
     match status {
         DriverConnectionStatus::Connected => ":*bnc* NOTICE * :upstream connected".to_string(),
+        DriverConnectionStatus::RegainingNickname => format!(
+            ":*bnc* NOTICE * :upstream regaining the configured nickname: {} ({})",
+            NetworkFailure::NicknameInUse.summary(),
+            NetworkFailure::NicknameInUse.code()
+        ),
         DriverConnectionStatus::Reconnecting(failure) => format!(
             ":*bnc* NOTICE * :upstream reconnecting: {} ({})",
             failure.summary(),
@@ -3346,6 +3360,10 @@ pub struct ClientCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connected,
+    /// The configured nickname was in use, so the session registered under
+    /// an alternative and is taking the configured one back (§10.3). It is
+    /// not connected: nothing is joined or sent under the alternative.
+    RegainingNickname(NicknameRegain),
     /// A classified transient failure ended the current attempt; another
     /// attempt follows. Carrying the reason makes an unclassified disconnect
     /// impossible for every driver using the public SPI.
@@ -3366,6 +3384,28 @@ pub enum ConnectionEvent {
     /// shares the registration-failed lifecycle: both mean "this network's
     /// settings do not work against this upstream".
     ConfigurationFailed(ConfigurationRefusal),
+}
+
+/// A session registered under an alternative nickname while it takes the
+/// configured one back: who it is and who it is waiting to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NicknameRegain {
+    diagnostic: String,
+}
+
+impl NicknameRegain {
+    pub fn new(registered_as: &str, configured: &str) -> Self {
+        Self {
+            diagnostic: e6irc_client::bounded_diagnostic(&format!(
+                "connected as {registered_as}, regaining {configured}"
+            )),
+        }
+    }
+
+    /// "connected as <alternative>, regaining <configured>".
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -3420,6 +3460,9 @@ pub struct NetworkHistory {
 pub enum NetworkLifecycle {
     Connecting,
     Connected,
+    /// Registered under an alternative nickname, taking the configured one
+    /// back ([`ConnectionEvent::RegainingNickname`]).
+    RegainingNickname,
     Reconnecting,
     AuthenticationFailed,
     RegistrationFailed,
@@ -3436,6 +3479,7 @@ impl NetworkLifecycle {
         match self {
             Self::Connecting => "connecting",
             Self::Connected => "connected",
+            Self::RegainingNickname => "regaining_nickname",
             Self::Reconnecting => "reconnecting",
             Self::AuthenticationFailed => "authentication_failed",
             Self::RegistrationFailed => "registration_failed",
@@ -3476,6 +3520,9 @@ pub enum NetworkFailure {
     InvalidNickname,
     InvalidUsername,
     NicknameInUse,
+    /// Services refused to hand the configured nickname back: it is
+    /// registered to another account.
+    NicknameRegainRefused,
     /// 464 after the configured server password was sent.
     ServerPasswordRejected,
     /// 464 with no server password configured.
@@ -3526,6 +3573,7 @@ impl NetworkFailure {
             Self::InvalidNickname => "invalid_nickname",
             Self::InvalidUsername => "invalid_username",
             Self::NicknameInUse => "nickname_in_use",
+            Self::NicknameRegainRefused => "nickname_regain_refused",
             Self::ServerPasswordRejected => "server_password_rejected",
             Self::ServerPasswordRequired => "server_password_required",
             Self::NetworkBanned => "network_banned",
@@ -3566,6 +3614,9 @@ impl NetworkFailure {
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
             Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
+            Self::NicknameRegainRefused => {
+                "The configured nickname belongs to another account; the network will not hand it back."
+            }
             Self::ServerPasswordRejected => "The network rejected the configured server password.",
             Self::ServerPasswordRequired => {
                 "The network requires a server password, which this network configuration does not supply."
@@ -3733,6 +3784,8 @@ enum FailureDisposition {
     Retry {
         next_attempt_in: Option<std::time::Duration>,
     },
+    /// Registered, but under an alternative nickname: not a connection yet.
+    RegainingNickname,
     Terminal(TerminalNetworkLifecycle),
 }
 
@@ -3760,6 +3813,9 @@ enum NetworkRuntimePhase {
     Connected {
         connected_at: e6irc_proto::time::Millis,
     },
+    /// Registered under an alternative nickname, taking the configured one
+    /// back; not connected.
+    RegainingNickname,
     Terminal(TerminalNetworkLifecycle),
     /// Stopped by its owner's account lifecycle; the driver is gone.
     Held(OwnerHold),
@@ -3771,6 +3827,7 @@ impl NetworkRuntimePhase {
             Self::Connecting => NetworkLifecycle::Connecting,
             Self::Reconnecting { .. } => NetworkLifecycle::Reconnecting,
             Self::Connected { .. } => NetworkLifecycle::Connected,
+            Self::RegainingNickname => NetworkLifecycle::RegainingNickname,
             Self::Terminal(lifecycle) => lifecycle.lifecycle(),
             Self::Held(hold) => hold.lifecycle(),
         }
@@ -3779,16 +3836,22 @@ impl NetworkRuntimePhase {
     const fn next_retry_at(self) -> Option<e6irc_proto::time::Millis> {
         match self {
             Self::Reconnecting { next_retry_at } => next_retry_at,
-            Self::Connecting | Self::Connected { .. } | Self::Terminal(_) | Self::Held(_) => None,
+            Self::Connecting
+            | Self::Connected { .. }
+            | Self::RegainingNickname
+            | Self::Terminal(_)
+            | Self::Held(_) => None,
         }
     }
 
     const fn connected_at(self) -> Option<e6irc_proto::time::Millis> {
         match self {
             Self::Connected { connected_at } => Some(connected_at),
-            Self::Connecting | Self::Reconnecting { .. } | Self::Terminal(_) | Self::Held(_) => {
-                None
-            }
+            Self::Connecting
+            | Self::Reconnecting { .. }
+            | Self::RegainingNickname
+            | Self::Terminal(_)
+            | Self::Held(_) => None,
         }
     }
 }
@@ -3916,6 +3979,7 @@ impl NetworkRuntime {
                     )
                 }),
             },
+            FailureDisposition::RegainingNickname => NetworkRuntimePhase::RegainingNickname,
             FailureDisposition::Terminal(lifecycle) => NetworkRuntimePhase::Terminal(lifecycle),
         };
         state.state_changed_at = now;
@@ -6028,6 +6092,12 @@ impl DriverEnds {
             }
             failure_event => {
                 let (status, disposition, failure, diagnostic) = match failure_event {
+                    ConnectionEvent::RegainingNickname(ref regain) => (
+                        DriverConnectionStatus::RegainingNickname,
+                        FailureDisposition::RegainingNickname,
+                        NetworkFailure::NicknameInUse,
+                        Some(regain.diagnostic()),
+                    ),
                     ConnectionEvent::Reconnecting(failure) => (
                         DriverConnectionStatus::Reconnecting(failure),
                         FailureDisposition::Retry { next_attempt_in },
@@ -6096,6 +6166,11 @@ impl DriverEnds {
                     ),
                     FailureDisposition::Retry { .. } => eprintln!(
                         "bnc: {} disconnected ({}); reconnecting",
+                        self.runtime.label(),
+                        failure.code(),
+                    ),
+                    FailureDisposition::RegainingNickname => eprintln!(
+                        "bnc: {} registered under an alternative nickname ({}); regaining",
                         self.runtime.label(),
                         failure.code(),
                     ),
@@ -6291,6 +6366,9 @@ const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> Net
         }
         e6irc_client::RegistrationRefusal::InvalidUsername => NetworkFailure::InvalidUsername,
         e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
+        e6irc_client::RegistrationRefusal::NicknameRegainRefused => {
+            NetworkFailure::NicknameRegainRefused
+        }
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             NetworkFailure::ServerPasswordRejected
         }
@@ -6418,15 +6496,10 @@ impl std::fmt::Display for AttachEnd {
             Self::ClientUnresponsive => "the client stopped answering liveness pings",
             Self::NetworkRemoved => "the network was removed or replaced",
             Self::DriverStopped => "the network's driver stopped",
-            Self::AccountRevoked => "the account was suspended or deleted, or its password changed",
+            Self::Revoked(revocation) => return write!(f, "{revocation}"),
         })
     }
 }
-
-/// What a client whose account's authority ended is told as it is detached.
-const ACCOUNT_REVOKED_NOTICE: &[u8] =
-    b":*bnc* NOTICE * :your account was suspended or deleted, or \
-    its password changed; detaching\r\n";
 
 /// How long an attached client may stay silent before the bouncer pings it,
 /// and again before it gives up on it. A quiet or parked network writes
@@ -6435,6 +6508,18 @@ const ACCOUNT_REVOKED_NOTICE: &[u8] =
 /// holds its task, its socket and its place in `attached_clients` until the
 /// next broadcast line — which on a parked network never comes.
 pub const ATTACH_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Tell a client whose account's authority or credential ended why, and end
+/// its attachment.
+async fn detach_revoked<W>(write: &mut W, revocation: Revocation) -> std::io::Result<AttachEnd>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    write.write_all(revocation.notice().as_bytes()).await?;
+    write.flush().await?;
+    Ok(AttachEnd::Revoked(revocation))
+}
 
 /// Why an attachment ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6452,9 +6537,10 @@ pub enum AttachEnd {
     NetworkRemoved,
     /// The network's driver is gone.
     DriverStopped,
-    /// The account's authority ended: it was suspended or deleted, or its
-    /// password changed.
-    AccountRevoked,
+    /// The account's authority ended — it was suspended or deleted, or its
+    /// password changed — or the app password the client signed in with was
+    /// revoked.
+    Revoked(Revocation),
 }
 
 /// Attach a downstream client stream to a running network: welcome it, replay
@@ -6469,9 +6555,10 @@ pub enum AttachEnd {
 /// `authority` is the lease on the authenticated account's authority: the
 /// account keys the BNC-local per-target read markers (shared networks keep
 /// per-account positions), and the attachment ends
-/// ([`AttachEnd::AccountRevoked`]) when the account is suspended or deleted or
-/// its password changes — on any network, the operator's shared and
-/// configured ones included. An attachment cannot be made without one.
+/// ([`AttachEnd::Revoked`]) when the account is suspended or deleted or its
+/// password changes, or the credential it signed in with is revoked — on any
+/// network, the operator's shared and configured ones included. An attachment
+/// cannot be made without one.
 /// `greeting` names who welcomes the client and the nick it registered with.
 /// `liveness` is how long the client may stay silent before it is pinged, and
 /// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
@@ -6548,10 +6635,8 @@ where
     let account = account.as_str();
     let (mut read, mut write) = tokio::io::split(stream);
     // Revoked between the lease and here: the attachment never begins.
-    if authority.is_revoked() {
-        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
-        write.flush().await?;
-        return Ok(AttachEnd::AccountRevoked);
+    if let Some(revocation) = authority.revocation() {
+        return detach_revoked(&mut write, revocation).await;
     }
 
     // Detach the client if the network is removed. The broadcast does not close
@@ -6770,11 +6855,10 @@ where
     let mut awaiting_pong = false;
     loop {
         tokio::select! {
-            // The account's authority ended: tell the client and detach.
-            () = authority.revoked() => {
-                write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
-                write.flush().await?;
-                return Ok(AttachEnd::AccountRevoked);
+            // The account's authority or the credential ended: tell the
+            // client and detach.
+            revocation = authority.revoked() => {
+                return detach_revoked(&mut write, revocation).await;
             }
             // Network removed/replaced: tell the client and detach.
             res = shutdown.changed() => {
@@ -6782,10 +6866,8 @@ where
                     // The account lifecycle revokes before it stops the
                     // account's networks, and both can be ready here at once:
                     // the network stopped because the authority ended.
-                    if authority.is_revoked() {
-                        write.write_all(ACCOUNT_REVOKED_NOTICE).await?;
-                        write.flush().await?;
-                        return Ok(AttachEnd::AccountRevoked);
+                    if let Some(revocation) = authority.revocation() {
+                        return detach_revoked(&mut write, revocation).await;
                     }
                     write
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
@@ -8621,7 +8703,11 @@ mod tests {
             let handle = std::sync::Arc::new(handle);
             let revocations = AccountRevocations::new();
             let lease = revocations
-                .lease(revocations.ticket(), "alice")
+                .lease(
+                    revocations.ticket(),
+                    "alice",
+                    crate::identity::CredentialId::AccountPassword,
+                )
                 .expect("lease");
             let (client_side, server_side) = tokio::io::duplex(4096);
             let attached = tokio::spawn({
@@ -8658,7 +8744,7 @@ mod tests {
                 .expect("the attachment ends")
                 .expect("attach task")
                 .expect("attach");
-            assert_eq!(end, AttachEnd::AccountRevoked);
+            assert_eq!(end, AttachEnd::Revoked(Revocation::Account));
         }
     }
 
@@ -8673,7 +8759,11 @@ mod tests {
         let handle = std::sync::Arc::new(handle);
         let revocations = AccountRevocations::new();
         let lease = revocations
-            .lease(revocations.ticket(), "Alice")
+            .lease(
+                revocations.ticket(),
+                "Alice",
+                crate::identity::CredentialId::AccountPassword,
+            )
             .expect("lease");
         let (client_side, server_side) = tokio::io::duplex(4096);
         let attached = tokio::spawn({
@@ -8709,7 +8799,7 @@ mod tests {
             .expect("a revoked attachment ends")
             .expect("attach task")
             .expect("attach");
-        assert_eq!(end, AttachEnd::AccountRevoked);
+        assert_eq!(end, AttachEnd::Revoked(Revocation::Account));
         let notice = lines.next_line().await.expect("read").expect("notice");
         assert!(notice.contains("suspended or deleted"), "{notice}");
         assert!(
@@ -8719,7 +8809,11 @@ mod tests {
 
         // Revoked between the lease and the attachment: it never begins.
         let late = revocations
-            .lease(revocations.ticket(), "alice")
+            .lease(
+                revocations.ticket(),
+                "alice",
+                crate::identity::CredentialId::AccountPassword,
+            )
             .expect("lease");
         revocations.revoke("alice");
         let (_client_side, server_side) = tokio::io::duplex(4096);
@@ -8742,8 +8836,64 @@ mod tests {
         .await
         .expect("returns at once")
         .expect("attach");
-        assert_eq!(end, AttachEnd::AccountRevoked);
+        assert_eq!(end, AttachEnd::Revoked(Revocation::Account));
         assert_eq!(handle.runtime_snapshot().attached_clients, 0);
+    }
+
+    /// Revoking the app password an attachment signed in with detaches it,
+    /// saying so, from a network that keeps running.
+    #[tokio::test]
+    async fn a_revoked_credential_detaches_the_client_it_signed_in() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let revoked = crate::identity::IssuedCredential::AppPassword(7);
+        let (handle, _ends) = NetworkHandle::channels(16);
+        let revocations = AccountRevocations::new();
+        let lease = revocations
+            .lease(
+                revocations.ticket(),
+                "alice",
+                crate::identity::CredentialId::Issued(revoked),
+            )
+            .expect("lease");
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let attached = attach(
+            server_side,
+            ClientInput::default(),
+            &handle,
+            AttachCaps::default(),
+            lease,
+            Greeting {
+                server_name: "bnc.test",
+                network: "net",
+                requested_nick: "alice",
+            },
+            ATTACH_LIVENESS_INTERVAL,
+        );
+        let revoke = async {
+            let mut lines = BufReader::new(client_side).lines();
+            loop {
+                let line = lines.next_line().await.expect("read").expect("welcome");
+                if line.contains("NOTICE") && line.contains("upstream") {
+                    break;
+                }
+            }
+            assert_eq!(revocations.revoke_credential(revoked), 1);
+            lines.next_line().await.expect("read").expect("notice")
+        };
+        let (end, notice) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(attached, revoke)
+        })
+        .await
+        .expect("a revoked attachment ends");
+        assert_eq!(
+            end.expect("attach"),
+            AttachEnd::Revoked(Revocation::Credential(revoked))
+        );
+        assert!(
+            notice.contains("the app password you signed in with was revoked"),
+            "{notice}"
+        );
+        assert!(!*handle.watch_shutdown().borrow());
     }
 
     /// An attached client that stops reading ends its attachment as too slow

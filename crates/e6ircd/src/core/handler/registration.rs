@@ -369,14 +369,14 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
     };
-    let password = match crate::identity::NewPassword::parse(password) {
+    let password = match state.password_policy.new_password(password) {
         Ok(password) => password,
         Err(refusal) => {
             let code = match refusal {
-                crate::identity::PasswordRefusal::TooShort => "WEAK_PASSWORD",
-                crate::identity::PasswordRefusal::TooLong => "UNACCEPTABLE_PASSWORD",
+                crate::identity::PasswordRefusal::TooShort { .. } => "WEAK_PASSWORD",
+                crate::identity::PasswordRefusal::TooLong { .. } => "UNACCEPTABLE_PASSWORD",
             };
-            register_fail(state, conn, code, &nick, refusal.explanation());
+            register_fail(state, conn, code, &nick, &refusal.explanation());
             return;
         }
     };

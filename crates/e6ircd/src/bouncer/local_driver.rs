@@ -222,7 +222,7 @@ async fn await_welcome(
             "001" => {
                 let welcomed = message.params.first().cloned().unwrap_or_default();
                 // Before its 005, a network's names compare as RFC 1459 says.
-                let nick = super::irc_driver::configured_nick_was_granted(
+                let nick = super::irc_driver::requested_nick_was_granted(
                     &e6irc_client::NetworkNames::default(),
                     &session.nick,
                     welcomed,

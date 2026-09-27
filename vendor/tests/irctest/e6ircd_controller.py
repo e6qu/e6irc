@@ -157,6 +157,12 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
             f"require_email = {str(self.test_config.account_registration_requires_email).lower()}\n"
         )
         if _DB_URL is not None:
+            # Any non-empty password may be set: irctest registers its
+            # accounts, and tests account registration, with passwords shorter
+            # than e6ircd's default eight characters ("sesame"), as the
+            # services it drives elsewhere accept. Without a database there
+            # are no accounts, and e6ircd refuses registration policy.
+            config += "minimum_password_length = 1\n"
             # Fresh persistent state per test (a no-op on the very first run,
             # before migrations create the schema). Managed settings must be
             # reset too: each irctest case supplies a new ephemeral listener

@@ -141,6 +141,22 @@ pub enum LeaseEnd {
     RenewalsStopped,
 }
 
+impl LeaseEnd {
+    /// Why this process can no longer use the database, as its database
+    /// errors say from now on ([`crate::db::DbError::NotServing`]).
+    fn fence_reason(&self) -> String {
+        match self {
+            Self::Taken { by: Some(held) } => format!("held by {held}"),
+            Self::Taken { by: None } => "taken over by another process".to_owned(),
+            Self::Fenced => format!(
+                "fenced: no renewal was confirmed for {}s",
+                FENCE_AFTER.as_secs()
+            ),
+            Self::RenewalsStopped => "its renewals stopped".to_owned(),
+        }
+    }
+}
+
 impl fmt::Display for LeaseEnd {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -483,6 +499,7 @@ async fn renew(mut renewal: Renewal) {
         }
     };
     renewal.status.held.store(false, Ordering::Relaxed);
+    crate::db::mark_fenced(end.fence_reason());
     renewal.ended.send_replace(Some(end));
 }
 

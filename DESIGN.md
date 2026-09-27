@@ -295,11 +295,14 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asynchronous answer — held (`emit_deferred_labeled`) or not
     (`emit_labeled_unheld`) — is gathered with what the command answered on the
     spot into the one labeled response.
-  - `NewPassword` — a password an account may be given (8 characters to 512 bytes) is parsed
-    once; account creation takes only this type, and the REST/web validators
-    call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
-    cannot store a password another surface refuses to verify (an empty one
-    was storable through `REGISTER` and could then never be logged in to).
+  - `NewPassword` — a password an account may be given (the configured
+    minimum, 8 characters unless stated, to 512 bytes) is parsed once, by the
+    one `PasswordPolicy` every surface shares; account creation takes only
+    this type, and the REST/web validators call the same parser, so IRC
+    `REGISTER`, NickServ `REGISTER` and the web cannot store a password
+    another surface refuses to verify (an empty one was storable through
+    `REGISTER` and could then never be logged in to), nor hold one to a
+    different minimum.
   - `MemberModes::sigils` — the one renderer of a member's rank sigils,
     honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
     copy that ignored the capability.
@@ -579,6 +582,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     lane, and a lease is refused to a credential check that began before the
     revocation. Attachments to shared and configured networks, which do not
     stop with the account, once stayed open (§9).
+  - `CredentialId` — an IRC session's login and an attachment's lease carry
+    the credential that signed them in, from the verification that named it,
+    so revoking an app password or a personal access token ends exactly what
+    it opened. Neither recorded it, and a revoked credential's sessions and
+    attachments stayed open for as long as they lived (§9.1).
   - `AuthorityLedger` — a change of an account's authority is applied in the
     serving process exactly once, whichever process committed it: the
     accounts row counts each change (`authority_generation`, migration 0095),
@@ -1824,13 +1832,15 @@ Principal tables (columns abridged):
   holds at most the names tried within one window.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
-  revocable, shown once at creation
+  revocable, shown once at creation; an app password's deletion is announced
+  by id (migration 0097), ending what it signed in (§9.1)
 - `oidc_identities` (issuer, subject) → account_id, UNIQUE(issuer, subject)
 - `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
   creation/expiry, bounded user agent, optional OIDC identity/session metadata)
 - `api_tokens` (hashed PATs, scopes, expiry) — at most 32 unexpired tokens per
   account, counted under the account-row lock; an expired token holds no slot
-  while it waits for storage maintenance to delete it.
+  while it waits for storage maintenance to delete it. A deletion is
+  announced by digest (migration 0077) and by id (migration 0097).
 - `channels` (registered channels: founder, successor, flags, topic
   retention, mlock). The founder reference is `ON DELETE RESTRICT` (migration
   0071): a channel is never account-owned data, so no account deletion can
@@ -2163,10 +2173,17 @@ the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge — including the password rule
-(`NewPassword`: at least 8 characters, the NIST SP 800-63B floor, and at most
-512 bytes, which the web forms and REST API apply too, NickServ `REGISTER` and a
-password change included; a password set before the floor still verifies):
-`REGISTER`
+(`NewPassword`: at least `registration.minimum_password_length` characters and
+at most 512 bytes, which the web forms and REST API apply too, NickServ
+`REGISTER` and a password change included; a password set before the floor
+still verifies). The minimum is console-owned: 8 unless stated, the NIST SP
+800-63B floor; at least 1, since the empty password no login surface accepts;
+at most 128, a quarter of the 512-byte bound, so a password that meets it fits
+in every script, a character being at most four UTF-8 bytes. Every surface
+reads it from one `PasswordPolicy` cell, which a console save or another
+writer's revision sets live (`CoreIngress::adopt_live_settings`), and the web
+forms render it as their `minlength`. irctest runs e6ircd at 1, as the services
+it drives elsewhere accept its short passwords. `REGISTER`
 refuses a shorter password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
 one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
 account after with `NEED_NICK`; the capability's advertised value states
@@ -2235,9 +2252,10 @@ provider-verified email claim.
   `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
   verifier, nonce, ten-minute expiry, link target, and silent flag into the
   `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under a
-  per-startup key and a flow-specific associated-data context (the same
-  lifetime and reason as the CSRF key: short-lived browser state that must not
-  depend on the optional at-rest secret key). The callback admits only the
+  per-startup key and a flow-specific associated-data context. The key is not
+  derived from the master key, as the CSRF key is: the record of spent flows
+  below is held in memory, and a flow that survived a restart would outlive
+  that record. The callback admits only the
   sealed flow whose `state` equals the returned one (constant-time), for that
   provider, before its expiry. An anonymous flood of starts therefore holds no
   server capacity a real login needs — the earlier bounded in-memory table
@@ -2288,7 +2306,14 @@ provider-verified email claim.
   mutation — REST methods (and the console's scripts) in the `X-E6IRC-CSRF`
   header at the shared authentication boundary (§9.4), and the few
   server-rendered form posts that cannot set a header (`/device`, sign-out)
-  in their body. Each login records a
+  in their body. The HMAC key is derived from the master secret key
+  (HKDF-SHA256, an info string of its own), so every process with that key
+  issues and accepts the same value: an open page keeps working across a
+  restart and a standby's takeover (§18). During a key rotation a value
+  derived from a previous key is still accepted and new ones come from the
+  primary, as sealing does (§15). A deployment with no master key has a key
+  per process, and startup says once that open pages stop posting after a
+  restart. Each login records a
   bounded, display-safe user agent and a separate stable resource id; neither
   the opaque token nor its hash is exposed by session inventory.
 - Local and OpenID Connect login cannot issue a session for a suspended
@@ -2329,10 +2354,17 @@ provider-verified email claim.
 | Mechanism | For | Notes |
 |---|---|---|
 | SASL **PLAIN** | every existing IRC client | password = local password **or** an app password generated in the web UI. |
-| SASL **OAUTHBEARER** (RFC 7628) | e6irc-cli/tui and OAuth-capable clients | client obtains a token via the provider's **device authorization grant**; server validates signature/claims via cached JWKS (or introspection if configured) and maps (iss, sub) → account. |
+| SASL **OAUTHBEARER** (RFC 7628) | e6irc-cli/tui and OAuth-capable clients | the bearer is a personal access token with the `irc` grant, which e6irc's own **device authorization grant** (RFC 8628) mints for a client or the web UI issues; the server looks its hash up (§9.4). |
 | NickServ `IDENTIFY` | legacy clients without SASL | same credential check as PLAIN. Like PLAIN, it takes the account name or any nick grouped to the account. |
 
 Client-certificate fingerprint login is explicitly out of scope for v1 (not selected).
+
+A session keeps the credential that signed it in (`CredentialId`): the account
+password, one app password, or one personal access token — the verification
+names which, by row id — and so does a bouncer attachment's `AccountLease`.
+Revoking an app password or a token ends exactly what it signed in, whichever
+process revokes it (§9.1); the account's sessions signed in with its password
+or another credential stay. `REGISTER` signs in with the password it just set.
 
 ### 9.4 REST API authentication
 
@@ -2528,6 +2560,25 @@ sweep without its gate: attachments are revoked on the mutation lane, and every
 core shard closes the account's sessions and refuses a verdict for a
 credential check queued before the change (`EndAccountSessions`); a check
 queued afterwards reads the new credentials.
+
+Revoking one app password or one personal access token ends the IRC sessions
+and bouncer attachments that credential signed in (`CredentialId`, §9.3),
+whichever process revoked it, and nothing else the account holds. The
+deletion of its row is the revocation — by its endpoint, recovery, storage
+maintenance's pruning of an expired token, or the account's deletion — and
+migration 0097's triggers announce it on `e6irc_credential_changed` as
+`app_password:<id>` or `api_token:<id>`. The account-authority listener hears
+it and, with nothing to re-read or record (a revoked credential cannot sign in
+again), revokes the attachments whose lease holds it — the client is told the
+app password it signed in with was revoked — and has every core shard close
+each session it signed in with `ERROR :Closing Link: … (App password revoked)`
+or `(Personal access token revoked)`. A check of the credential queued before
+that is refused when its verdict lands, as after a password change (the shard's
+credential epoch), and the attach listener's `RevocationTicket` refuses the
+lease of one under way. The core counts, in one directory every shard shares,
+the credentials its live sessions signed in with; after the listener's
+connection is lost it asks which of those and of the attachments' are still
+stored and ends what the others signed in.
 
 One process serves a database (§18), and the account's sessions and
 attachments live there, but not every change of an account's authority is
@@ -3175,14 +3226,16 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   `RegistrationRefusal::retry_policy` decides, per kind and in the client
   crate so no caller can re-type it, one of three policies. **Park now**:
   rejected credentials (a retry re-sends the same password, can only fail the
-  same way, and every failure counts against the owner's account) and a
+  same way, and every failure counts against the owner's account), a
   welcome under another nickname (`WelcomedAsAnotherNickname`; the owner must
-  change the nick). **Schedule, then park**: a refusal the owner may be able
-  to outwait but that may also be a configuration fault — 433/436/437 on the
-  nick, 432, 468, 464, a SASL exchange that ended without a verdict — retries
-  after 30s, 1m, 2m, and 4m and parks on the fifth **of one kind** in a row; a
-  refusal of another kind starts the count over, so the 433 that follows a
-  services outage (the driver's own ghost) is owed the whole schedule. **Until
+  change the nick), and a nickname the network says belongs to another account
+  (`NicknameRegainRefused`, below). **Schedule, then park**: a refusal the
+  owner may be able to outwait but that may also be a configuration fault —
+  433/436/437 on the nickname *and* its alternative, a nickname still held when
+  the regain window below ends, 432, 468, 464, a SASL exchange that ended
+  without a verdict — retries after 30s, 1m, 2m, and 4m and parks on the fifth
+  **of one kind** in a row; a refusal of another kind starts the count over, so
+  a taken nickname that follows a services outage is owed the whole schedule. **Until
   it clears, never park**: a capacity or policy answer from the network — a
   pre-welcome `ERROR` (a connection throttle, "too many host connections", a
   K-line, "SASL access only"), a 465 ban, `sasl_unavailable`, a 906 abort —
@@ -3212,17 +3265,49 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   requests, SASL, and the welcome — so its reason (`Trying to reconnect too
   fast`, `SASL access only`) is typed and kept wherever it arrives.
   Authentication and registration rejection have distinct terminal lifecycle
-  states. The driver only ever offers the nickname the owner configured. A
-  433 is a refusal like any other: it is reported with the upstream's text,
-  retried on the refusal schedule — which outlasts the usual cause, a ghost of
-  our own previous session awaiting its ping timeout — and parks if the
-  nickname stays taken. It never substitutes `nick_` or any other invented
-  nickname: ZNC and soju do, and the result is an identity the owner did not
-  choose, holding channel access and a NickServ relationship they did not
-  expect; HexChat, which tries only the alternates its user typed and then
-  stops, is the model (§2, no silent fallbacks). The same holds when the
+  states. **A ghost of the network's own session is regained.** A session
+  the upstream never saw end — the process crashed and a standby took over
+  (§18), or the link died without a `QUIT` — keeps the configured nickname
+  until the upstream's ping timeout reaps it, and the next dial meets it as a
+  433. Nothing on the wire tells that ghost from anyone else holding the
+  nickname, so the rule is one of policy and time: *whenever* the configured
+  nickname is refused as in use (433, 436, 437) during registration, on the
+  first dial after a start as on any reconnect, the driver offers exactly one
+  alternative — the configured nickname with `_` appended, or, when appending
+  could exceed the upstream's NICKLEN (unknown until after the welcome), with
+  its last character replaced by `_` (`-` when it already is one), so it is
+  never longer than the larger of the configured length and RFC 1459's nine —
+  and then lets the holder show what it is. A session under the alternative is
+  **not a connection**: its lifecycle is `regaining_nickname`, with the
+  failure `nickname_in_use` and the diagnostic `connected as <alternative>,
+  regaining <nickname>` in the runtime snapshot and a `*bnc*` notice; it joins no
+  channel, forwards no attached client's command (they wait in the queue),
+  and does not reset the refusal count. From the end of the welcome burst it
+  takes the nickname back: authenticated with SASL, it asks NickServ to
+  `REGAIN` it (Atheme's syntax, which Libera.Chat runs; services then rename
+  the session), and in every case it watches the nickname — `MONITOR +` where
+  the 005 offers `MONITOR`, otherwise `ISON` every 15 s — and says `NICK` once
+  it is free, one at a time and, after a refused attempt, no sooner than the
+  next poll, so no answer of the upstream can drive a loop. The rename back is
+  recorded as asked for, not as `renamed_by_upstream`; only then does the
+  driver join, send what waited, and report `Connected`. It stops at once on a
+  definite refusal — NickServ answering that the nickname is another
+  account's ("Invalid password for X", "Access denied", "You may not"), or a
+  432 — with a `QUIT` (the alternative leaves no ghost of its own) and parks
+  (`nickname_regain_refused`); and it stops after five minutes, past the four
+  a Solanum-family server takes to reap a client that stopped answering, so a
+  ghost always ends inside the window and a holder that outlasts it is someone
+  else: a `QUIT` and a `nickname_in_use` refusal on the schedule. A 433 of the
+  alternative too is the refusal it always was. The connection test offers no
+  alternative and reports a taken nickname as `nickname_in_use`. The driver
+  never *runs* under the alternative or any other invented nickname: ZNC and
+  soju substitute `nick_` and stay there, and the result is an identity the
+  owner did not choose, holding channel access and a NickServ relationship
+  they did not expect; here the alternative holds nothing, says nothing, and
+  lasts only until the configured nickname is back or the attempt ends (§2, no
+  silent fallbacks). The same holds when the
   upstream does the substituting: a welcome addressed to any other nickname
-  than the configured one (a server truncating to its NICKLEN, a services
+  than the one requested (a server truncating to its NICKLEN, a services
   rename on connect) is a registration refusal that names both, not a
   connection: the driver says `QUIT` first and parks on the first occurrence,
   because nothing but the configured nick can clear it; a difference of case
@@ -4749,6 +4834,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   session in the same transaction, then every live IRC session and bouncer
   attachment of the account (§9); app passwords and personal access tokens
   are separately managed and left unchanged, and the response says so.
+  Revoking one of those, by any process, ends exactly the IRC sessions and
+  attachments it signed in, and refuses a check of it already under way
+  (§9.1).
   Console pages authenticate by browser session only: a bearer — whatever its
   scopes — gets 401, and suspension or an unavailable database surface as
   their problem documents, not a login redirect.
@@ -5125,7 +5213,11 @@ Layers, bottom to top:
   which the operator may state) as the holder's; taking the lease ends every
   connection a previous holder recorded (`pg_terminate_backend`), inside the
   takeover's transaction. Nothing a stalled holder had in flight commits
-  after the takeover, and it cannot open another connection.
+  after the takeover, and it cannot open another connection; once its lease
+  has ended it records why (`db::mark_fenced`), and a pool timeout or refused
+  connection then reads "this process no longer holds the serving lease (held
+  by …)" rather than a bare timeout, from the one place database errors are
+  made (`db::query_error`).
   *Standby.* A process that finds the lease held says so on stderr, binds only
   its HTTP address — `/healthz` 200, `/readyz` 503 with its role and the
   holder's label (address, process id, release), everything else 503, every
@@ -5236,9 +5328,10 @@ Layers, bottom to top:
   notifying `e6irc_server_settings_changed`, as 0077 does for credentials) and
   the serving process adopts a later revision it hears (`settings_watch`):
   the snapshot the console and the maintenance loops read
-  is replaced, the core takes the settings it follows live (history retention
-  and `limits.anti_spam_exit_message_time_seconds`, through the one
-  `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
+  is replaced, the core takes the settings it follows live (history retention,
+  `limits.anti_spam_exit_message_time_seconds` and
+  `registration.minimum_password_length`, which the web shares, through the
+  one `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
   what it says — exactly what a console save in that process applies, and
   nothing restart-only. A
   save that still finds its revision stale reloads the stored row before it
@@ -5333,10 +5426,11 @@ Layers, bottom to top:
   its upstream (`QUIT`, or the Matrix logout; at most 15 s for all of them, a
   laggard is logged and the stop stands), so the next process to serve — a
   restart, or the standby taking over — does not meet this one's session
-  still logged in upstream (after a crash there is no goodbye: the upstream
-  holds the dead session, and its nick, until it notices the dropped
-  connection, and the next process's dial has to contend with that ghost as a
-  reconnect does); the core drains (at most 5 s, the shutdown request to its shards
+  still logged in upstream. A crash says no `QUIT`: the process that takes
+  over meets each network's ghost as a 433, registers under the alternative
+  nickname, and takes the configured one back when the upstream reaps the
+  ghost or NickServ regains it (§10.3); the core drains (at most 5 s, the
+  shutdown request to its shards
   included, so a shard that no longer takes from a full queue cannot hold the
   request itself); every client connection delivers its closing `ERROR` and
   closes (at most 8 s: the closing drain and the lingering close of §7.2, all

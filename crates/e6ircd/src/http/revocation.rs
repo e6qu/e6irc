@@ -191,6 +191,10 @@ impl crate::db::Follower for CredentialFollower {
             // suspension or deletion also ends the account's browser
             // credentials, which are announced themselves.
             CredentialChange::Account(_) => {}
+            // An app password or token's IRC sessions and attachments: the
+            // account-authority watcher's. A token's chat sockets hear its
+            // `Changed` announcement.
+            CredentialChange::IssuedRevoked(_) => {}
         }
         Ok(())
     }

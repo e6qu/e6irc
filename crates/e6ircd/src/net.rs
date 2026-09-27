@@ -1191,6 +1191,9 @@ async fn serve(
     // Followed live from here on (`CoreIngress::adopt_live_settings`).
     core_tx
         .set_anti_spam_exit_message_time_seconds(config.limits.anti_spam_exit_message_time_seconds);
+    core_tx
+        .password_policy()
+        .set_minimum_chars(config.registration.minimum_password_length);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,
@@ -1496,6 +1499,10 @@ async fn serve(
                 critical_tx.clone(),
             ));
         }
+        let (csrf_keys, csrf_warning) = crate::http::CsrfKeys::for_keyring(secret_key.as_deref());
+        if let Some(warning) = csrf_warning {
+            eprintln!("{warning}");
+        }
         Some(Arc::new(crate::http::AppState {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -1522,14 +1529,7 @@ async fn serve(
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
             configured_admin_accounts: configured_administrators.clone(),
-            csrf_key: {
-                use aws_lc_rs::rand::SecureRandom;
-                let mut k = [0u8; 32];
-                aws_lc_rs::rand::SystemRandom::new()
-                    .fill(&mut k)
-                    .expect("system RNG for CSRF key");
-                k
-            },
+            csrf_keys,
             trusted_proxies: trusted_proxies.clone(),
             auth_rate_burst: config.limits.auth_rate_burst.burst(),
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),

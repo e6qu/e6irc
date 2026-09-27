@@ -331,6 +331,7 @@ fn configured_driver(
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
             internal_upstreams,
             first_dial: super::FirstDial::Immediate,
+            nick_regain: super::NickRegainTiming::default(),
         };
         return Ok(Box::new(super::LocalDriver::new(core.clone(), config)));
     }
@@ -993,6 +994,7 @@ impl MutationLane {
             Some(
                 super::NetworkLifecycle::Connecting
                 | super::NetworkLifecycle::Connected
+                | super::NetworkLifecycle::RegainingNickname
                 | super::NetworkLifecycle::Reconnecting,
             ) => Ok(false),
             Some(
@@ -1441,6 +1443,9 @@ enum Registered {
     /// `caps` (which message tags it may receive on attach).
     Ok {
         account: String,
+        /// The credential that authenticated it, which the attachment's lease
+        /// holds.
+        credential: crate::identity::CredentialId,
         network: String,
         requested_nick: String,
         caps: super::AttachCaps,
@@ -1479,7 +1484,7 @@ where
     // Bound the pre-attach handshake: a client that connects and never
     // completes registration (sends nothing, or authenticates but never ends
     // CAP negotiation) must not hold a task + socket indefinitely.
-    let (account, network, requested_nick, caps, input) = match tokio::time::timeout(
+    let (account, credential, network, requested_nick, caps, input) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         handshake(&mut read, &mut write, pool, server_name, peer),
     )
@@ -1487,11 +1492,12 @@ where
     {
         Ok(Ok(Registered::Ok {
             account,
+            credential,
             network,
             requested_nick,
             caps,
             input,
-        })) => (account, network, requested_nick, caps, input),
+        })) => (account, credential, network, requested_nick, caps, input),
         Ok(Ok(Registered::Closed)) => return Ok(()),
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -1558,8 +1564,12 @@ where
         }
     };
 
-    // The account's authority, held for as long as the attachment lives.
-    let authority = match registry.account_revocations().lease(ticket, &account) {
+    // The account's authority and the credential's, held for as long as the
+    // attachment lives.
+    let authority = match registry
+        .account_revocations()
+        .lease(ticket, &account, credential)
+    {
         Ok(authority) => authority,
         Err(revoked) => {
             write
@@ -1808,7 +1818,7 @@ where
     // the protocol crate's shared bound so a client cannot grow it without end.
     let mut sasl_buf = String::new();
     let mut credential_attempts = crate::identity::CredentialAttemptBudget::default();
-    let mut account: Option<String> = None;
+    let mut account: Option<crate::db::VerifiedSignIn> = None;
     // The network the SASL username named, if it named one (soju's form).
     let mut sasl_network: Option<String> = None;
     let mut caps = super::AttachCaps::default();
@@ -1816,9 +1826,10 @@ where
     // Registration is complete only once the client has a nick, has sent
     // USER, has authenticated, and has closed CAP negotiation.
     let registered =
-        |nick: &Option<String>, have_user: bool, account: &Option<String>, cap_open: bool| {
-            nick.is_some() && have_user && account.is_some() && !cap_open
-        };
+        |nick: &Option<String>,
+         have_user: bool,
+         account: &Option<crate::db::VerifiedSignIn>,
+         cap_open: bool| { nick.is_some() && have_user && account.is_some() && !cap_open };
     'handshake: loop {
         if registered(&nick, have_user, &account, cap_open) {
             break;
@@ -2030,7 +2041,8 @@ where
                                         )
                                         .await?;
                                     }
-                                    PlainVerification::Accepted(acct, selected) => {
+                                    PlainVerification::Accepted(signed_in, selected) => {
+                                        let acct = signed_in.account.name();
                                         // RPL_LOGGEDIN names the client and
                                         // its mask as far as they are known:
                                         // the nick it gave, the user name
@@ -2045,7 +2057,7 @@ where
                                         let line = crate::core::fitted_line(
                                             format!(
                                                 ":{server_name} 900 {target} {mask} {} :",
-                                                MiddleParam::echo(&acct)
+                                                MiddleParam::echo(acct)
                                             ),
                                             &format!("You are now logged in as {acct}"),
                                         );
@@ -2059,7 +2071,7 @@ where
                                             "SASL authentication successful",
                                         )
                                         .await?;
-                                        account = Some(acct);
+                                        account = Some(signed_in);
                                         sasl_network = selected;
                                     }
                                     PlainVerification::AttemptsExhausted => {
@@ -2169,7 +2181,8 @@ where
         |(nick, network)| (nick, network),
     );
     Ok(Registered::Ok {
-        account,
+        account: account.account.into_name(),
+        credential: account.credential,
         network: network.to_string(),
         requested_nick: requested_nick.to_string(),
         caps,
@@ -2445,9 +2458,9 @@ fn logged_in_mask(
 /// Verify a SASL PLAIN payload (`base64(authzid \0 authcid \0 passwd)`)
 /// against the account store. Returns the canonical account name.
 enum PlainVerification {
-    /// The stored account name, and the network its SASL username selected
-    /// (soju's `<account>/<network>`), if it carried one.
-    Accepted(String, Option<String>),
+    /// The sign-in, and the network its SASL username selected (soju's
+    /// `<account>/<network>`), if it carried one.
+    Accepted(crate::db::VerifiedSignIn, Option<String>),
     Rejected,
     /// The account name has spent its password attempts for the window.
     Throttled(crate::db::LoginRetryAfter),
@@ -2483,7 +2496,7 @@ async fn verify_plain(
     // fail closed, but surface the error instead of silently masking it as a
     // bad password.
     match crate::db::verify_credentials(pool, account, &credentials.password).await {
-        Ok(Some(name)) => PlainVerification::Accepted(name.into_name(), network),
+        Ok(Some(signed_in)) => PlainVerification::Accepted(signed_in, network),
         Ok(None) => PlainVerification::Rejected,
         Err(crate::db::DbError::LoginThrottled(retry_after)) => {
             PlainVerification::Throttled(retry_after)

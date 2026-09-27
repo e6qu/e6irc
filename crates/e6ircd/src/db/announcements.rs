@@ -50,6 +50,14 @@ pub(crate) trait Follower: Send {
         &mut self,
         announcement: Announcement,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// The listening connection is now its `generation`th: 0 for one the
+    /// caller connected, then one more for each connection made again (a new
+    /// one, or one `PgListener` re-established by itself). Called before the
+    /// [`Announcement::Resynchronize`] that follows each reconnection, so a
+    /// follower can tell what it read under an earlier connection from what
+    /// it reads under this one.
+    fn reconnected(&mut self, _generation: u64) {}
 }
 
 /// Follow `channel` for the life of the process, handing each announcement to
@@ -68,6 +76,7 @@ pub(crate) async fn follow_announcements(
 ) {
     const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
     const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut generation: u64 = 0;
     let mut listener = connected;
     let mut retry = RETRY_MIN;
     loop {
@@ -75,11 +84,17 @@ pub(crate) async fn follow_announcements(
             Some(connected) => connected,
             None => {
                 let reconnected = match Announcements::connect(&url, channel).await {
-                    Ok(connected) => follower
-                        .on_change(Announcement::Resynchronize)
-                        .await
-                        .map(|()| connected)
-                        .map_err(|error| format!("could not read again what it follows: {error}")),
+                    Ok(connected) => {
+                        generation += 1;
+                        follower.reconnected(generation);
+                        follower
+                            .on_change(Announcement::Resynchronize)
+                            .await
+                            .map(|()| connected)
+                            .map_err(|error| {
+                                format!("could not read again what it follows: {error}")
+                            })
+                    }
                     Err(error) => Err(format!("listener unavailable: {error}")),
                 };
                 match reconnected {
@@ -96,7 +111,13 @@ pub(crate) async fn follow_announcements(
         retry = RETRY_MIN;
         loop {
             let followed = match connected.next().await {
-                Ok(announcement) => follower.on_change(announcement).await,
+                Ok(announcement) => {
+                    if announcement == Announcement::Resynchronize {
+                        generation += 1;
+                        follower.reconnected(generation);
+                    }
+                    follower.on_change(announcement).await
+                }
                 Err(error) => Err(format!("listener lost: {error}")),
             };
             if let Err(error) = followed {

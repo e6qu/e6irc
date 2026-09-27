@@ -289,16 +289,34 @@ impl CoreIngress {
     }
 
     /// Apply what of a stored settings revision the core follows live: the
-    /// history retention and the QUIT-comment delay. The one way a revision
-    /// reaches the running core, whether a console save here or another
-    /// writer's revision adopted here, so no path can apply one without the
-    /// other ([`crate::config::ManagedConfig::requires_restart_to_reach`]
-    /// names the same settings).
+    /// history retention, the QUIT-comment delay and the password minimum. The
+    /// one way a revision reaches the running core, whether a console save
+    /// here or another writer's revision adopted here, so no path can apply one
+    /// without the others
+    /// ([`crate::config::ManagedConfig::requires_restart_to_reach`] names the
+    /// same settings).
     pub(crate) fn adopt_live_settings(&self, settings: &crate::config::ManagedConfig) {
         self.set_history_retention_days(settings.storage.history_retention_days);
         self.set_anti_spam_exit_message_time_seconds(
             settings.limits.anti_spam_exit_message_time_seconds,
         );
+        self.directories
+            .password_policy
+            .set_minimum_chars(settings.registration.minimum_password_length);
+    }
+
+    /// The rule for a password being set, which the core holds `REGISTER`
+    /// and NickServ `REGISTER` to and the web and the REST API read too: one
+    /// cell, so a change of `registration.minimum_password_length` reaches
+    /// every surface at once.
+    pub(crate) fn password_policy(&self) -> crate::identity::PasswordPolicy {
+        self.directories.password_policy.clone()
+    }
+
+    /// Every app password and personal access token a live IRC session, on
+    /// any shard, signed in with.
+    pub(crate) fn signed_in_credentials(&self) -> Vec<crate::identity::IssuedCredential> {
+        self.directories.signed_in_credentials.held()
     }
 
     /// The history retention cell, for the bouncer's backlogs.
@@ -453,8 +471,8 @@ impl Input {
             Input::AccountSuspensionApplied { .. } => {
                 panic!("account-suspension event must be broadcast by a core worker")
             }
-            Input::AccountSessionsEnded { .. } => {
-                panic!("account-sessions event must be broadcast by a core worker")
+            Input::AccountSessionsEnded { .. } | Input::CredentialSessionsEnded { .. } => {
+                panic!("sessions-ended event must be broadcast by a core worker")
             }
             Input::ReadMarkerApplied { .. } => {
                 panic!("read-marker event must be broadcast by a core worker")
@@ -970,6 +988,11 @@ pub enum Input {
         reason: String,
         actor: String,
     },
+    /// An issued credential was revoked: every core shard ends the sessions
+    /// it opened.
+    CredentialSessionsEnded {
+        credential: crate::identity::IssuedCredential,
+    },
     /// A stored account read marker applied on every non-origin core shard.
     ReadMarkerApplied {
         account: String,
@@ -1095,6 +1118,14 @@ pub enum AdminRequest {
         account: String,
         reason: String,
         actor: String,
+    },
+    /// End every live session the app password or personal access token
+    /// `credential` opened, because it was revoked: a verdict for a check of
+    /// it queued before now is refused when it lands, then each such session
+    /// is closed with an `ERROR` naming the revocation. The account's other
+    /// sessions stay.
+    EndCredentialSessions {
+        credential: crate::identity::IssuedCredential,
     },
     /// Mutate one registered channel owned by `actor`. This is the shared
     /// control-plane entry used by the owner API and console.
@@ -2360,6 +2391,9 @@ impl From<state::Caps> for HistoryResponseCaps {
 pub enum DbReply {
     PasswordVerified {
         account: String,
+        /// The credential that verified, which the session keeps: revoking it
+        /// ends the session.
+        credential: crate::identity::CredentialId,
         origin: CredentialOrigin,
     },
     PasswordRejected {
@@ -2586,6 +2620,9 @@ pub(crate) enum CoreEffect {
         reason: String,
         actor: String,
     },
+    BroadcastCredentialSessionsEnded {
+        credential: crate::identity::IssuedCredential,
+    },
     BroadcastReadMarker {
         account: String,
         target: String,
@@ -2660,6 +2697,12 @@ impl CoreEffect {
                     account: account.clone(),
                     reason: reason.clone(),
                     actor: actor.clone(),
+                },
+                false,
+            ),
+            CoreEffect::BroadcastCredentialSessionsEnded { credential } => (
+                Input::CredentialSessionsEnded {
+                    credential: *credential,
                 },
                 false,
             ),
@@ -3511,6 +3554,9 @@ impl Core {
                     &actor,
                 );
             }
+            Input::CredentialSessionsEnded { credential } => {
+                handler::admin::apply_credential_sessions_ended(&mut self.state, credential);
+            }
             Input::AccountSuspensionApplied {
                 account,
                 suspended,
@@ -4132,8 +4178,16 @@ mod ingress_tests {
             }
         };
         check(&first, &second);
-        first.state.set_account(session.conn(), "Alice".into());
-        second.state.set_account(ConnId(9), "alice".into());
+        first.state.set_account(
+            session.conn(),
+            "Alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
+        second.state.set_account(
+            ConnId(9),
+            "alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         check(&first, &second);
         assert_eq!(indexed(&first, "alice"), vec![session.conn()]);
         assert_eq!(indexed(&second, "alice"), vec![ConnId(9)]);
@@ -4559,7 +4613,11 @@ mod ingress_tests {
         let (alice, mut alice_rx) = register_on_first(&mut first, "alice");
         // alice is the founder: arriving first in a registered channel opens
         // no ops, so only the founder can set its (+t) topic.
-        first.state.set_account(alice, "founder".into());
+        first.state.set_account(
+            alice,
+            "founder".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         first.handle(Input::Line {
             conn: alice,
             line: format!("JOIN {channel}").into_bytes(),
@@ -5211,7 +5269,11 @@ mod ingress_tests {
         // carol's account owns the nick a stale connection still holds.
         shards.client(3, "carol", "");
         shards.client(4, "visitor", "");
-        shards.cores[0].state.set_account(ConnId(4), "carol".into());
+        shards.cores[0].state.set_account(
+            ConnId(4),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         shards.settle();
         shards.line(4, "PRIVMSG NickServ :GHOST carol");
         assert!(
@@ -5751,6 +5813,21 @@ mod ingress_tests {
 
     /// Identify `conn` to `account` through NickServ, answering the verify.
     fn identify_on(shards: &mut Shards, conn: u64, account: &str) {
+        identify_with_on(
+            shards,
+            conn,
+            account,
+            crate::identity::CredentialId::AccountPassword,
+        );
+    }
+
+    /// [`identify_on`], the store answering that `credential` verified.
+    fn identify_with_on(
+        shards: &mut Shards,
+        conn: u64,
+        account: &str,
+        credential: crate::identity::CredentialId,
+    ) {
         shards.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
         let shard = shards.shard_of(conn);
         shards.database_request(shard, |request| {
@@ -5760,11 +5837,112 @@ mod ingress_tests {
             conn: ConnId(conn),
             reply: super::DbReply::PasswordVerified {
                 account: account.into(),
+                credential,
                 origin: super::CredentialOrigin::NickServIdentify,
             },
         });
         shards.settle();
         shards.drain(conn);
+    }
+
+    /// `registration.minimum_password_length` is eight until it is set, and a
+    /// change of it applies to the next `REGISTER` and NickServ `REGISTER` on
+    /// every shard, without a restart: at one, irctest's "sesame" is a
+    /// password an account may be given.
+    #[test]
+    fn the_password_minimum_is_followed_live_on_every_shard() {
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+            shards.client(conn, nick, "draft/account-registration");
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        shards.line(1, "REGISTER * * sesame");
+        assert!(
+            shards
+                .drain(1)
+                .iter()
+                .any(|line| line.contains("FAIL REGISTER WEAK_PASSWORD")
+                    && line.contains("at least 8 characters")),
+            "eight characters unless configured"
+        );
+
+        let mut settings =
+            crate::config::ManagedConfig::from_config(&crate::config::Config::default(), None)
+                .expect("managed");
+        settings.registration.minimum_password_length = 1;
+        shards.ingress.adopt_live_settings(&settings);
+        for (conn, command) in [
+            (2, "REGISTER * * sesame"),
+            (3, "PRIVMSG NickServ :REGISTER sesame"),
+        ] {
+            shards.line(conn, command);
+            let shard = shards.shard_of(conn);
+            let password = shards.database_request(shard, |request| match request {
+                super::DbRequest::CreateAccount { password, .. } => Some(password),
+                _ => None,
+            });
+            assert_eq!(&*password, "sesame", "{command}");
+        }
+        assert_eq!(
+            shards.ingress.password_policy().minimum_chars(),
+            1,
+            "the web and the REST API read the same cell"
+        );
+    }
+
+    /// A revoked app password's sessions end on every shard, whichever shard
+    /// the request reached, and the count of what live sessions signed in
+    /// with, which a listener that missed announcements reads, follows every
+    /// login and departure.
+    #[test]
+    fn a_revoked_credential_ends_its_sessions_on_every_shard() {
+        use crate::identity::{CredentialId, IssuedCredential};
+        const APP_A: IssuedCredential = IssuedCredential::AppPassword(1);
+        const APP_B: IssuedCredential = IssuedCredential::AppPassword(2);
+        let mut shards = Shards::with_database();
+        for (conn, nick) in [(1, "alice1"), (2, "alice2"), (3, "alice3"), (4, "alice4")] {
+            shards.client(conn, nick, "");
+        }
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        identify_with_on(&mut shards, 1, "alice", CredentialId::Issued(APP_A));
+        identify_with_on(&mut shards, 2, "alice", CredentialId::Issued(APP_A));
+        identify_with_on(&mut shards, 3, "alice", CredentialId::Issued(APP_B));
+        identify_on(&mut shards, 4, "alice");
+        let mut held = shards.ingress.signed_in_credentials();
+        held.sort_unstable();
+        assert_eq!(held, vec![APP_A, APP_B]);
+
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        shards.cores[0].handle(Input::Admin {
+            req: super::AdminRequest::EndCredentialSessions { credential: APP_A },
+            reply,
+        });
+        shards.settle();
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(super::AdminReply::Ok(message)) if message.contains("Disconnected 1")
+        ));
+        for revoked in [1, 2] {
+            assert!(
+                shards.drain(revoked).iter().any(|line| {
+                    line.starts_with("ERROR :Closing Link") && line.contains("App password revoked")
+                }),
+                "connection {revoked}, on shard {}",
+                shards.shard_of(revoked)
+            );
+        }
+        for kept in [3, 4] {
+            shards.line(kept, "PING :here");
+            assert!(
+                shards
+                    .drain(kept)
+                    .iter()
+                    .any(|line| line.contains(" PONG "))
+            );
+        }
+        assert_eq!(shards.ingress.signed_in_credentials(), vec![APP_B]);
+        shards.close(3);
+        assert!(shards.ingress.signed_in_credentials().is_empty());
     }
 
     /// REGAIN reaches a holder on another shard: its shard renames it to a
@@ -5854,6 +6032,7 @@ mod ingress_tests {
             conn: ConnId(2),
             reply: super::DbReply::PasswordVerified {
                 account: "alice".into(),
+                credential: crate::identity::CredentialId::AccountPassword,
                 origin: super::CredentialOrigin::NickServIdentify,
             },
         });
