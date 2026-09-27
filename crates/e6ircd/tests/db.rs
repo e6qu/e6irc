@@ -13620,3 +13620,131 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
             .expect("markers");
     assert_eq!(markers, ["#ok"]);
 }
+
+/// Migration 0095 counts every change of an account's authority — its
+/// suspension flipping, its primary password added, replaced or removed, by
+/// whichever path — and nothing else, and announces each created account,
+/// counted change and deleted account on the credential channel, which is how
+/// every server serving the database hears a change another one made.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_authority_changes_are_counted_and_announced() {
+    let url = support::test_db("account_authority_changes_are_counted_and_announced").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    // Another administrator, so alice may be suspended and, once a recovery
+    // has made her one, deleted.
+    let root = db::create_account_with_contact(&pool, "root", "root password", None)
+        .await
+        .expect("root");
+    sqlx::query("UPDATE accounts SET flags = 1 WHERE id = $1")
+        .bind(root)
+        .execute(&pool)
+        .await
+        .expect("root administers");
+    let mut listener = db::CredentialChangeListener::connect(&url)
+        .await
+        .expect("listen");
+    let mut announced = async || {
+        loop {
+            let change = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+                .await
+                .expect("an announcement")
+                .expect("listener");
+            if let db::CredentialChange::Account(account) = change {
+                return account;
+            }
+        }
+    };
+    let generation = async |id: i64| -> i64 {
+        sqlx::query_scalar("SELECT authority_generation FROM accounts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("generation")
+    };
+
+    let id = db::create_account_with_contact(&pool, "Alice", "first password", None)
+        .await
+        .expect("alice");
+    let created = announced().await;
+    assert_eq!((created.id, created.folded.as_str()), (id, "alice"));
+    // Its primary password was added.
+    assert_eq!(generation(id).await, 1);
+
+    // Signing in, an app password, and administrator authority change nothing
+    // the account's sessions stand on.
+    db::verify_credentials(&pool, "alice", "first password")
+        .await
+        .expect("verify")
+        .expect("verified");
+    db::issue_app_password(&pool, "alice", "first password", "laptop")
+        .await
+        .expect("app password");
+    for granted in [
+        "UPDATE accounts SET flags = flags | 1 WHERE id = $1",
+        "UPDATE accounts SET flags = flags & ~1 WHERE id = $1",
+    ] {
+        sqlx::query(granted)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("administrator");
+    }
+    assert_eq!(generation(id).await, 1);
+
+    let suspended = db::set_account_suspended(&pool, id, true, "root", &[])
+        .await
+        .expect("suspend")
+        .expect("alice");
+    assert_eq!(announced().await.id, id);
+    assert_eq!(
+        (
+            suspended.authority.generation,
+            suspended.authority.suspended
+        ),
+        (2, true)
+    );
+    assert_eq!(generation(id).await, 2);
+    let reactivated = db::set_account_suspended(&pool, id, false, "root", &[])
+        .await
+        .expect("reactivate")
+        .expect("alice");
+    assert_eq!(announced().await.id, id);
+    assert_eq!(
+        (
+            reactivated.authority.generation,
+            reactivated.authority.suspended
+        ),
+        (3, false)
+    );
+
+    let session = db::create_web_session(&pool, &db::VerifiedAccount::established("alice"), None)
+        .await
+        .expect("session");
+    let changed = db::change_local_password(
+        &pool,
+        "alice",
+        "first password",
+        "second password",
+        &session,
+    )
+    .await
+    .expect("change");
+    assert_eq!(announced().await.id, id);
+    assert_eq!((changed.id, changed.generation), (id, 4));
+
+    // A recovery removes the primary password and installs another: one
+    // announcement of the transaction, both counted.
+    db::recover_administrator(&pool, "alice")
+        .await
+        .expect("recover");
+    assert_eq!(announced().await.id, id);
+    assert_eq!(generation(id).await, 6);
+
+    db::delete_account_permanently(&pool, id, "root", &[])
+        .await
+        .expect("delete")
+        .expect("deleted");
+    let deleted = announced().await;
+    assert_eq!((deleted.id, deleted.folded.as_str()), (id, "alice"));
+}

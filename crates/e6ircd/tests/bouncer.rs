@@ -5048,6 +5048,106 @@ async fn attach_alice(
     client
 }
 
+/// An operator's shared network on `up`, which no account owns.
+fn shared_network(up: std::net::SocketAddr) -> e6ircd::config::NetworkEntry {
+    e6ircd::config::NetworkEntry {
+        kind: NetworkKind::Irc,
+        name: "shared".into(),
+        owner: None,
+        addr: up.to_string(),
+        tls: false,
+        nick: "sharednick".into(),
+        username: Some("tester".into()),
+        realname: Some("shared".into()),
+        autojoin: vec![],
+        buffer_cap: 100,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: None,
+    }
+}
+
+/// An HTTP listener on an ephemeral port.
+fn http_listener() -> e6ircd::config::HttpConfig {
+    e6ircd::config::HttpConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        public_url: None,
+        secure_cookies: false,
+        admin_accounts: vec![],
+        hsts_include_subdomains: false,
+    }
+}
+
+/// An IRC session of alice's, logged in with SASL.
+async fn irc_alice(irc: std::net::SocketAddr, password: &str) -> e6irc_client::Connection {
+    let mut session = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("connect");
+    session
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            password,
+        )
+        .await
+        .expect("IRC login");
+    session
+}
+
+/// Change alice's password from a browser session on `http`.
+async fn change_alices_password(
+    pool: &sqlx::PgPool,
+    http: std::net::SocketAddr,
+    current: &str,
+    new: &str,
+) {
+    let browser = e6ircd::db::create_web_session(
+        pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("browser session");
+    let cookie = format!("Cookie: e6irc_session={browser}\r\n");
+    let (status, me) = http_call(http, "GET", "/api/v1/me", &cookie, "").await;
+    assert_eq!(status, 200, "{me}");
+    let me: serde_json::Value = serde_json::from_str(&me).expect("me JSON");
+    let csrf = me["csrf_token"].as_str().expect("CSRF").to_string();
+    let (status, body) = http_call(
+        http,
+        "PUT",
+        "/api/v1/me/password",
+        &format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n"),
+        &format!(r#"{{"current_password":"{current}","new_password":"{new}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("IRC connections"), "{body}");
+}
+
+/// Whether `session` still answers: a PING it sends is answered with a PONG.
+async fn still_open(session: &mut e6irc_client::Connection) -> bool {
+    if session.send_line("PING :still-open").await.is_err() {
+        return false;
+    }
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            match session.next_message().await {
+                Ok(Some(message)) if message.command == "PONG" => return true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Read until the attachment ends, returning what it was told last.
 async fn detached(client: &mut e6irc_client::Connection) -> Vec<String> {
     tokio::time::timeout(deadline::HANG, async {
@@ -5129,28 +5229,8 @@ async fn the_account_lifecycle_ends_attachments_and_holds_configured_networks() 
         .expect("alice");
     let up = upstream().await;
     let mut config = bnc_config(up, url);
-    config.networks.push(e6ircd::config::NetworkEntry {
-        kind: NetworkKind::Irc,
-        name: "shared".into(),
-        owner: None,
-        addr: up.to_string(),
-        tls: false,
-        nick: "sharednick".into(),
-        username: Some("tester".into()),
-        realname: Some("shared".into()),
-        autojoin: vec![],
-        buffer_cap: 100,
-        sasl_account: None,
-        sasl_password: None,
-        server_password: None,
-    });
-    config.http = Some(e6ircd::config::HttpConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        public_url: None,
-        secure_cookies: false,
-        admin_accounts: vec![],
-        hsts_include_subdomains: false,
-    });
+    config.networks.push(shared_network(up));
+    config.http = Some(http_listener());
     let running = net::start(config).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
     let http = running.http_addr.expect("http bound");
@@ -5187,45 +5267,8 @@ async fn the_account_lifecycle_ends_attachments_and_holds_configured_networks() 
 
     // A password change ends the account's attachments and IRC sessions.
     let mut attached = attach_alice(bnc, "shared", "s3cr3t-password").await;
-    let irc = running.addrs[0];
-    let mut session = e6irc_client::Connection::connect(&irc.to_string())
-        .await
-        .expect("connect");
-    session
-        .register_sasl(
-            &e6irc_client::Identity {
-                nick: "alice",
-                username: "alice",
-                realname: "Alice",
-                server_password: None,
-            },
-            "alice",
-            "s3cr3t-password",
-        )
-        .await
-        .expect("IRC login");
-    let browser = e6ircd::db::create_web_session(
-        &pool,
-        &e6ircd::db::VerifiedAccount::established("alice"),
-        None,
-    )
-    .await
-    .expect("browser session");
-    let cookie = format!("Cookie: e6irc_session={browser}\r\n");
-    let (status, me) = http_call(http, "GET", "/api/v1/me", &cookie, "").await;
-    assert_eq!(status, 200, "{me}");
-    let me: serde_json::Value = serde_json::from_str(&me).expect("me JSON");
-    let csrf = me["csrf_token"].as_str().expect("CSRF").to_string();
-    let (status, body) = http_call(
-        http,
-        "PUT",
-        "/api/v1/me/password",
-        &format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n"),
-        r#"{"current_password":"s3cr3t-password","new_password":"a new passphrase"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("IRC connections"), "{body}");
+    let mut session = irc_alice(running.addrs[0], "s3cr3t-password").await;
+    change_alices_password(&pool, http, "s3cr3t-password", "a new passphrase").await;
     let said = detached(&mut attached).await;
     assert!(
         said.iter().any(|text| text.contains("password changed")),
@@ -5237,5 +5280,141 @@ async fn the_account_lifecycle_ends_attachments_and_holds_configured_networks() 
         "{said:#?}"
     );
     // The new password attaches.
+    attach_alice(bnc, "shared", "a new passphrase").await;
+}
+
+/// Several servers may serve one database, and an account's authority changed
+/// on one of them is changed on every one. Suspending alice on the first
+/// server ends her attachments and IRC session on the second — which used to
+/// keep them open for as long as the clients liked — and holds the second's
+/// configured network of hers stopped; reactivating her on the first runs it
+/// again. A password change on the first ends her attachment and IRC session
+/// on the second, while the IRC session she opens on the first with the new
+/// password survives that server hearing its own announcement.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_account_authority_change_on_one_server_reaches_every_server() {
+    let url = bnc_account_db(
+        "an_account_authority_change_on_one_server_reaches_every_server",
+        "alice",
+        "s3cr3t-password",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_by_administrator(
+        &pool,
+        "root",
+        "administrator password",
+        None,
+        true,
+        "root",
+    )
+    .await
+    .expect("administrator");
+    let admin = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "root",
+        "administrator API",
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("administrator token");
+    let alice_id = e6ircd::db::account_id_by_name(&pool, "alice")
+        .await
+        .expect("lookup")
+        .expect("alice");
+    // Replicas serve one configuration. Each dials the same upstream sessions,
+    // so only one of the two holds each nick there; an attachment does not
+    // need its network connected.
+    let up = upstream().await;
+    let config = || {
+        let mut config = bnc_config(up, url.clone());
+        config.networks.push(shared_network(up));
+        config.http = Some(http_listener());
+        // The test polls the administrator inventory; that is not what the
+        // administrator's request budget is for.
+        config.limits.administrator_api_rate_burst = 10_000;
+        config
+    };
+    let first = net::start(config()).await.expect("start the first server");
+    let second = net::start(config()).await.expect("start the second server");
+    let http = first.http_addr.expect("http bound");
+    let (http_second, bnc) = (
+        second.http_addr.expect("http bound"),
+        second.bnc_addr.expect("bnc bound"),
+    );
+    // Alice's configured network on the second server, as its administrator
+    // inventory shows it.
+    let configured_becomes = async |wanted: fn(&str) -> bool| {
+        let mut last = String::new();
+        let reached = tokio::time::timeout(deadline::HANG, async {
+            loop {
+                last = inventory_state(http_second, &admin).await;
+                if wanted(&last) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the second server's configured network stayed {last}"
+        );
+    };
+
+    let mut configured = attach_alice(bnc, "up", "s3cr3t-password").await;
+    let mut shared = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session = irc_alice(second.addrs[0], "s3cr3t-password").await;
+    let suspend = |suspended: bool| {
+        let path = format!("/api/v1/admin/accounts/{alice_id}");
+        let authorization = format!("Authorization: Bearer {admin}\r\n");
+        let body = format!(r#"{{"suspended":{suspended}}}"#);
+        async move { http_call(http, "PATCH", &path, &authorization, &body).await }
+    };
+    let (status, body) = suspend(true).await;
+    assert_eq!(status, 200, "{body}");
+    for (network, client) in [("up", &mut configured), ("shared", &mut shared)] {
+        let said = detached(client).await;
+        assert!(
+            said.iter()
+                .any(|text| text.contains("suspended or deleted")),
+            "{network}: {said:#?}"
+        );
+    }
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter().any(|text| text.contains("Account suspended")),
+        "{said:#?}"
+    );
+    configured_becomes(|state| state == "owner_suspended").await;
+
+    let (status, body) = suspend(false).await;
+    assert_eq!(status, 200, "{body}");
+    configured_becomes(|state| state != "owner_suspended").await;
+
+    let mut attached = attach_alice(bnc, "shared", "s3cr3t-password").await;
+    let mut session = irc_alice(second.addrs[0], "s3cr3t-password").await;
+    change_alices_password(&pool, http, "s3cr3t-password", "a new passphrase").await;
+    let mut signed_in_again = irc_alice(first.addrs[0], "a new passphrase").await;
+    let said = detached(&mut attached).await;
+    assert!(
+        said.iter().any(|text| text.contains("password changed")),
+        "{said:#?}"
+    );
+    let said = detached(&mut session).await;
+    assert!(
+        said.iter().any(|text| text.contains("Password changed")),
+        "{said:#?}"
+    );
+    // The second server has heard the announcement, and so, by now, has the
+    // first: the session opened there with the new password is still open.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(still_open(&mut signed_in_again).await);
+    // The new password attaches on the second server.
     attach_alice(bnc, "shared", "a new passphrase").await;
 }

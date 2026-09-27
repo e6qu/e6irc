@@ -189,6 +189,10 @@ impl CredentialWatch {
                         self.refresh(&pool, &credential).await;
                     }
                     Ok(CredentialChange::Resynchronize) => self.refresh_all(&pool).await,
+                    // An account's authority: the account-authority watcher's.
+                    // A suspension or deletion also ends the account's browser
+                    // credentials, which are announced themselves.
+                    Ok(CredentialChange::Account(_)) => {}
                     Err(error) => {
                         eprintln!("http: credential-change listener lost: {error}");
                         break;

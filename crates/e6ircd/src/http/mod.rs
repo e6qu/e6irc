@@ -652,10 +652,6 @@ pub(super) fn parse_optional_contact_email(
 /// Run one HTTP control-plane mutation on the core and await its typed outcome.
 /// The core owns live-state ordering and the database verdict; HTTP handlers do
 /// not write durable/live state along a second path.
-async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result<String, String> {
-    state.core_tx.admin_action(req).await
-}
-
 async fn core_reply(
     state: &AppState,
     req: crate::core::AdminRequest,
@@ -715,30 +711,29 @@ async fn mutate_account_lifecycle(
         .await
 }
 
-/// End every live IRC session and bouncer attachment of `account`, whose
-/// password just changed — by the browser session that asked, so no IRC
-/// session is the one that made the change. The same sweep as a suspension's,
-/// without its gate: attachments are revoked on the mutation lane, and the
-/// core refuses a verdict for a check queued before the change.
+/// End every live IRC session and bouncer attachment of the account whose
+/// password just changed (`authority`, as the change left it) — by the browser
+/// session that asked, so no IRC session is the one that made the change. The
+/// same sweep as a suspension's, without its gate: attachments are revoked on
+/// the mutation lane, and the core refuses a verdict for a check queued before
+/// the change. Every other server does the same when the change is announced
+/// ([`crate::account_authority`]); this one records it as applied.
 pub(super) async fn end_sessions_after_password_change(
     state: &Arc<AppState>,
-    account: &str,
+    authority: crate::db::AccountAuthority,
 ) -> Result<(), String> {
     let registry = registry_of(state).clone();
-    let (state, account) = (state.clone(), account.to_owned());
+    let state = state.clone();
     registry
         .mutate(move |lane| async move {
-            lane.revoke_account(&account);
-            core_action(
-                &state,
-                crate::core::AdminRequest::EndAccountSessions {
-                    account: account.clone(),
-                    reason: "Password changed".into(),
-                    actor: account,
-                },
+            lane.authority_ledger().applied(&authority);
+            crate::account_authority::end_sessions_here(
+                &lane,
+                &state.core_tx,
+                &authority.folded,
+                &authority.folded,
             )
             .await
-            .map(|_| ())
         })
         .await
 }
@@ -820,35 +815,31 @@ async fn account_suspension_in_lane(
     .map_err(|error| authority_error_status("account lifecycle mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
+    // Every other server applies the change when it is announced
+    // ([`crate::account_authority`]); this one applies it now.
+    lane.authority_ledger().applied(&change.authority);
     if suspended {
-        // Every attachment the account holds ends — on the operator's shared
-        // and configured networks too — and a password checked while this
-        // ran cannot open another.
-        lane.revoke_account(&change.folded);
-        let stopped_networks = lane
-            .remove_owner(&change.folded, crate::bouncer::UnwrittenLines::Store)
-            .await;
-        // The networks the configuration defines for the account stop with
-        // it, held until it is reactivated.
-        let held_configured = lane
-            .hold_configured_owned(&change.folded, crate::bouncer::OwnerHold::Suspended)
-            .await;
-        core_action(
-            state,
-            crate::core::AdminRequest::SetAccountSuspended {
-                account: change.folded.clone(),
-                suspended: true,
-                reason: "Account suspended".into(),
-                actor: actor.to_string(),
-            },
+        // Every attachment the account holds ends, its networks stop — the
+        // ones the configuration defines for it held until it is reactivated
+        // — and the core gates it.
+        let crate::account_authority::SuspendedHere {
+            stopped_networks,
+            held_configured,
+        } = crate::account_authority::suspend_here(
+            lane,
+            &state.core_tx,
+            &change.folded,
+            "Account suspended",
+            actor,
         )
         .await
-        .map_err(|error| {
+        .map_err(|(stopped, error)| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "Account was suspended and {stopped_networks} owned and {held_configured} \
-                     configured network(s) stopped, but live IRC disconnect failed: {error}"
+                    "Account was suspended and {} owned and {} configured network(s) stopped, \
+                     but live IRC disconnect failed: {error}",
+                    stopped.stopped_networks, stopped.held_configured
                 ),
             )
         })?;
@@ -858,43 +849,25 @@ async fn account_suspension_in_lane(
             change.name
         ))
     } else {
-        core_action(
-            state,
-            crate::core::AdminRequest::SetAccountSuspended {
-                account: change.folded.clone(),
-                suspended: false,
-                reason: "Account reactivated".into(),
-                actor: actor.to_string(),
-            },
+        let crate::account_authority::ReactivatedHere {
+            started_networks,
+            held,
+            restarted,
+            unbuildable,
+        } = crate::account_authority::reactivate_here(
+            lane,
+            &state.core_tx,
+            &change.folded,
+            actor,
+            prepared_networks,
         )
         .await
         .map_err(|error| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Account was reactivated, but the live IRC core remained gated: {error}"),
+                format!("Account {} was reactivated, but {error}", change.name),
             )
         })?;
-        let mut started_networks = 0_usize;
-        let mut held = Vec::new();
-        for (name, driver) in prepared_networks {
-            match lane
-                .ensure_running(Some(&change.folded), &name, driver)
-                .await
-            {
-                Ok(_) => started_networks += 1,
-                Err(crate::bouncer::RegistryRefusal::ConfiguredNetworkHeld(_)) => held.push(name),
-                Err(crate::bouncer::RegistryRefusal::Closed(closed)) => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "Reactivated {}, but started only {started_networks} owned \
-                             network(s): {closed}",
-                            change.name
-                        ),
-                    ));
-                }
-            }
-        }
         let held = if held.is_empty() {
             String::new()
         } else {
@@ -904,8 +877,6 @@ async fn account_suspension_in_lane(
                 held.join(", ")
             )
         };
-        // The configured networks its suspension held run again.
-        let (restarted, unbuildable) = lane.release_configured_owned(&change.folded);
         let unbuildable = if unbuildable.is_empty() {
             String::new()
         } else {

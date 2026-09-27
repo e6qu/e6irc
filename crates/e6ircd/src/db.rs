@@ -22,8 +22,10 @@ mod secret_rotation;
 mod settings_change;
 mod url;
 pub use credential_change::{
-    CredentialChange, CredentialChangeListener, RevocableCredential, credential_remaining,
+    AccountAnnouncement, AccountAuthority, CredentialChange, CredentialChangeListener,
+    RevocableCredential, credential_remaining,
 };
+pub(crate) use credential_change::{account_authority, every_account_authority};
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
 pub(crate) use settings_change::{SettingsChange, SettingsChangeListener};
 pub use url::{DatabaseUrl, DatabaseUrlError};
@@ -2527,6 +2529,8 @@ pub struct AccountStateChange {
     pub name: String,
     pub folded: String,
     pub suspended: bool,
+    /// The account's authority as this change left it.
+    pub authority: AccountAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2796,11 +2800,13 @@ pub async fn set_account_suspended(
         "",
     )
     .await?;
+    let authority = committed_authority(&mut transaction, account_id).await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountStateChange {
         name,
         folded,
         suspended,
+        authority,
     }))
 }
 
@@ -7848,7 +7854,7 @@ pub async fn change_local_password(
     current_password: &str,
     new_password: &str,
     current_session: &str,
-) -> Result<(), DbError> {
+) -> Result<AccountAuthority, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let row: Option<LocalCredentialRow> = sqlx::query_as(
         "SELECT c.id AS credential_id, c.argon2_hash
@@ -7908,8 +7914,9 @@ pub async fn change_local_password(
         "primary password changed; other browser sessions ended",
     )
     .await?;
+    let authority = committed_password_authority(&mut transaction, credential_id).await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(())
+    Ok(authority)
 }
 
 /// Add the first primary password to an authenticated account provisioned by
@@ -7923,7 +7930,7 @@ pub async fn set_local_password(
     account: &str,
     new_password: &str,
     current_session: &str,
-) -> Result<(), DbError> {
+) -> Result<AccountAuthority, DbError> {
     let PasswordMutation {
         mut transaction,
         folded,
@@ -7956,8 +7963,37 @@ pub async fn set_local_password(
         "primary password added; other browser sessions ended",
     )
     .await?;
+    let authority = committed_authority(&mut transaction, account_id).await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(())
+    Ok(authority)
+}
+
+/// The authority `account_id` will have once `transaction` commits, as
+/// migration 0095's triggers counted this transaction's change: what the
+/// server that made the change records as applied, so it does not apply its
+/// own change a second time when the announcement reaches it.
+async fn committed_authority(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<AccountAuthority, DbError> {
+    account_authority(&mut **transaction, account_id)
+        .await?
+        .ok_or_else(|| DbError::UnknownAccount(account_id.to_string()))
+}
+
+/// [`committed_authority`] of the account a primary password credential
+/// belongs to.
+async fn committed_password_authority(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    credential_id: i64,
+) -> Result<AccountAuthority, DbError> {
+    let account_id: i64 =
+        sqlx::query_scalar("SELECT account_id FROM account_credentials WHERE id = $1")
+            .bind(credential_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(query_error)?;
+    committed_authority(transaction, account_id).await
 }
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------

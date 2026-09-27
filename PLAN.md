@@ -1445,6 +1445,11 @@ Maintainer decisions implemented from the same review:
   deletion holds them for good (`owner_deleted`), across restarts too.
 - **A password change ends every live IRC session and bouncer attachment** of
   the account, and a verdict for a check queued before it is refused.
+- **Every server serving the database applies an account's authority**: a
+  suspension, deletion or primary password change committed by any server (or
+  by `recover-administrator`) ends the account's IRC sessions and attachments
+  on each, which apply it once from the store's announcement (0095's
+  `authority_generation`, `AuthorityLedger`).
 - **New passwords are at least 8 characters** (NIST SP 800-63B); existing
   passwords still verify.
 - **Device authorization speaks RFC 8628 as written**: form bodies with a

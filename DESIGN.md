@@ -568,6 +568,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     lane, and a lease is refused to a credential check that began before the
     revocation. Attachments to shared and configured networks, which do not
     stop with the account, once stayed open (§9).
+  - `AuthorityLedger` — a change of an account's authority is applied on
+    every server serving the database, each exactly once: the accounts row
+    counts each change (`authority_generation`, migration 0095), the server
+    that commits one records it as applied on the mutation lane, and the
+    others apply it from the announcement. Another server's suspension, or a
+    password change there, once left this server's sessions and attachments
+    open (§9).
   - `BoundSession` — an OIDC link and a re-authentication flow both seal the
     session that started them, so neither can be built unbound; its callback
     acts only for that session, presented again, still live (§9).
@@ -1739,6 +1746,11 @@ Principal tables (columns abridged):
   and suspension; a database constraint rejects every other value. At least
   one effective durable-or-configured administrator remains active across
   HTTP deletion. `nick_enforce` is NickServ `SET ENFORCE` (migration 0075).
+  `authority_generation` counts each change of the account's authority — its
+  suspension flipping, its primary password added, replaced or removed — and
+  triggers announce every created account, counted change and deleted account
+  on `e6irc_credential_changed`, so every server serving the database ends the
+  account's sessions (migration 0095, §9).
 - `account_nicks` (casefolded nick, display nick, account_id, registered_at) —
   NickServ `GROUP`, cascading with the account (migration 0075). Two triggers,
   under the per-name lock account creation and deletion take, keep a nick from
@@ -2455,6 +2467,28 @@ sweep without its gate: attachments are revoked on the mutation lane, and every
 core shard closes the account's sessions and refuses a verdict for a
 credential check queued before the change (`EndAccountSessions`); a check
 queued afterwards reads the new credentials.
+
+Several servers may serve one database, and each of them ends the account's
+sessions and attachments, whichever server committed the change
+(`account_authority`). The accounts row counts every change of an account's
+authority in `authority_generation` — its suspended flag flipping, its primary
+password added, replaced or removed, by any path, the host's
+`recover-administrator` included — and migration 0095's triggers announce each
+created account, counted change and deleted account on
+`e6irc_credential_changed` as `account:<id>:<folded name>`. One listener per
+process, on its own connection, re-reads the announced row on the mutation lane
+and compares it with its `AuthorityLedger`, the generation and standing this
+server has applied: a suspension is applied as here (sessions, attachments,
+stored networks, configured networks held, core gate), a reactivation lifts
+the gate and runs the networks again, a counted change of an active account
+ends its sessions and attachments as a password change, and a deleted row is
+applied as a suspension whose configured networks stay held. The server that
+committed the change records it as applied in the same turn on the lane, so it
+never applies its own change twice — which would end the sessions opened with
+the new password. The ledger's baseline is read at boot before the server
+reads which accounts are suspended, and every account is read again after the
+listener's connection is lost, since what was announced in between was not
+heard.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and
@@ -4772,7 +4806,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   Account suspension revokes bearer material transactionally and is enforced
   again by the ordered core so in-flight verification cannot race the action,
   and by the attach listener's ticket-then-lease (`AccountLease`, §9), so a
-  bouncer attachment cannot either.
+  bouncer attachment cannot either — on every server serving the database,
+  which each apply it from the store's announcement (`AuthorityLedger`, §9).
 
 ---
 

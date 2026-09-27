@@ -75,6 +75,9 @@ pub struct Registry {
     /// Every attachment's lease on its account's authority; the account
     /// lifecycle revokes them on the mutation lane.
     revocations: Arc<AccountRevocations>,
+    /// What this server has applied of each account's authority, so a change
+    /// is applied here once whichever server committed it.
+    authority: crate::account_authority::AuthorityLedger,
 }
 
 /// What the registry holds: the running networks, and what an attaching
@@ -512,6 +515,7 @@ impl Registry {
             history_retention: core.core_tx.history_retention(),
             core: Some(core),
             revocations: AccountRevocations::new(),
+            authority: crate::account_authority::AuthorityLedger::default(),
         };
         for e in entries {
             let definition =
@@ -1028,6 +1032,12 @@ impl MutationLane {
     /// many attachments were told.
     pub(crate) fn revoke_account(&self, account: &str) -> usize {
         self.registry.revocations.revoke(account)
+    }
+
+    /// What this server has applied of each account's authority: a change is
+    /// recorded in the same turn on this lane as it is applied.
+    pub(crate) fn authority_ledger(&self) -> &crate::account_authority::AuthorityLedger {
+        &self.registry.authority
     }
 
     /// Hold stopped every network the configuration defines for `owner`: its
@@ -2928,6 +2938,7 @@ mod key_tests {
             history_retention: crate::core::HistoryRetention::default(),
             core: None,
             revocations: AccountRevocations::new(),
+            authority: crate::account_authority::AuthorityLedger::default(),
         }
     }
 

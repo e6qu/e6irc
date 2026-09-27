@@ -119,6 +119,7 @@ impl AccountDeletion {
             Ok(Some(deleted)) => deleted,
             // The account is already gone: nothing of it may run again.
             Ok(None) => {
+                lane.authority_ledger().deleted(account_id, &target.folded);
                 lane.hold_configured_owned(&target.folded, crate::bouncer::OwnerHold::Deleted)
                     .await;
                 self.undo_gate(&target, actor).await?;
@@ -154,6 +155,9 @@ impl AccountDeletion {
                 return Err(deletion_error(error));
             }
         };
+        // Every other server applies the deletion when it is announced
+        // ([`crate::account_authority`]); this one has applied it.
+        lane.authority_ledger().deleted(account_id, &target.folded);
         lane.hold_configured_owned(&target.folded, crate::bouncer::OwnerHold::Deleted)
             .await;
         // The account's read markers, channel access and grouped nicks

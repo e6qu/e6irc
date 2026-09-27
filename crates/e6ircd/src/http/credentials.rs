@@ -637,7 +637,7 @@ pub(super) async fn change_password(
         }
     };
     match result {
-        Ok(()) => match super::end_sessions_after_password_change(&state, &account).await {
+        Ok(authority) => match super::end_sessions_after_password_change(&state, authority).await {
             Ok(()) => json_no_store(PasswordChangeResponse {
                 detail: PASSWORD_CHANGE_DETAIL,
             }),
