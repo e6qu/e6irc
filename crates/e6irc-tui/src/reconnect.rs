@@ -114,6 +114,7 @@ fn permanent_refusal(error: &io::Error) -> Option<String> {
         | RegistrationRefusal::NicknameInUse
         | RegistrationRefusal::NotRegistered
         | RegistrationRefusal::WelcomedAsAnotherNickname
+        | RegistrationRefusal::NicknameRegainRefused
         | RegistrationRefusal::SaslUnavailable
         | RegistrationRefusal::SaslAborted
         | RegistrationRefusal::SaslFailed => return None,

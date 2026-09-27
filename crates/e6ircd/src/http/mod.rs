@@ -108,9 +108,10 @@ pub struct AppState {
     pub(crate) monitoring_token_digest: Option<[u8; 32]>,
     /// Per-startup key sealing each in-flight OpenID Connect authorization
     /// into the browser's own state cookie, so the server holds no per-flow
-    /// state an anonymous flood could exhaust. Like `csrf_key`, it protects
-    /// only short-lived browser state and is not derived from the optional
-    /// at-rest `secret_key`: a restart ends flows begun before it.
+    /// state an anonymous flood could exhaust. Unlike `csrf_keys` it is not
+    /// derived from the master key: a restart ends the flows begun before it,
+    /// which is what keeps `spent_oidc_flows`, held in memory, a complete
+    /// record of the flows this key's cookies could still replay.
     pub oidc_flow_key: crate::secret::SecretKey,
     /// Authorization flows whose callback has been answered, so a kept copy
     /// of a flow cookie cannot be answered again.
@@ -141,9 +142,9 @@ pub struct AppState {
     /// cannot revoke authority configuration still gives (or pretend it did).
     /// The same set the core refuses as account names.
     pub configured_admin_accounts: crate::identity::ReservedAccountNames,
-    /// Per-startup key for deriving CSRF tokens for cookie-authenticated
-    /// form posts from the server-rendered pages.
-    pub csrf_key: [u8; 32],
+    /// The keys of the CSRF tokens cookie-authenticated form posts carry
+    /// (see [`CsrfKeys`]).
+    pub csrf_keys: CsrfKeys,
     /// Trusted reverse-proxy CIDRs; when the socket peer matches one, the
     /// client IP is taken from `X-Forwarded-For` (see [`client_ip`]).
     pub trusted_proxies: Vec<ipnet::IpNet>,
@@ -370,22 +371,74 @@ impl AppState {
         }
     }
 
-    /// A CSRF token bound to a web session: `HMAC(csrf_key, session)`.
+    /// A CSRF token bound to a web session (see [`CsrfKeys::token`]).
     pub fn csrf_token(&self, session: &str) -> String {
-        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &self.csrf_key);
+        self.csrf_keys.token(session)
+    }
+
+    fn csrf_valid(&self, session: &str, token: &str) -> bool {
+        self.csrf_keys.valid(session, token)
+    }
+}
+
+/// The keys of the session-bound CSRF token: `HMAC-SHA256(key, session)`.
+///
+/// Derived from the master secret key (HKDF,
+/// [`crate::secret::DerivedKeyPurpose::FormCsrf`]), so every process
+/// configured with that key issues and accepts the same tokens: a form open in
+/// a browser still posts after a restart, or after a standby takes over from a
+/// crashed process. During a key rotation a token issued under a previous key
+/// is still accepted, and new ones are issued under the primary. Without a
+/// master key the key is the process's own and a restart invalidates every
+/// open form, which startup says once.
+pub struct CsrfKeys(crate::secret::DerivedKeys);
+
+impl CsrfKeys {
+    /// What a deployment without a master key is told once at startup.
+    const PROCESS_SCOPED_WARNING: &'static str = "e6ircd: no secret key is configured, so \
+        the key of form CSRF tokens is this process's own: forms open in a browser stop \
+        posting after a restart or a standby's takeover";
+
+    /// The keys for this deployment, with the warning to log when they are
+    /// the process's own.
+    pub(crate) fn for_keyring(
+        keyring: Option<&crate::secret::SecretKeyring>,
+    ) -> (Self, Option<&'static str>) {
+        match keyring {
+            Some(keyring) => (
+                Self(keyring.derive(crate::secret::DerivedKeyPurpose::FormCsrf)),
+                None,
+            ),
+            None => (
+                Self(crate::secret::DerivedKeys::random()),
+                Some(Self::PROCESS_SCOPED_WARNING),
+            ),
+        }
+    }
+
+    fn token_under(key: &[u8; 32], session: &str) -> String {
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
         let tag = aws_lc_rs::hmac::sign(&key, session.as_bytes());
         tag.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Constant-time check of a CSRF token against the session.
-    fn csrf_valid(&self, session: &str, token: &str) -> bool {
-        let expected = self.csrf_token(session);
-        expected.len() == token.len()
-            && aws_lc_rs::constant_time::verify_slices_are_equal(
-                expected.as_bytes(),
-                token.as_bytes(),
-            )
-            .is_ok()
+    /// The token issued for `session`: under the primary key.
+    pub fn token(&self, session: &str) -> String {
+        Self::token_under(self.0.primary(), session)
+    }
+
+    /// Whether `token` is `session`'s under any accepted key, each compared in
+    /// constant time.
+    fn valid(&self, session: &str, token: &str) -> bool {
+        self.0.accepted().any(|key| {
+            let expected = Self::token_under(key, session);
+            expected.len() == token.len()
+                && aws_lc_rs::constant_time::verify_slices_are_equal(
+                    expected.as_bytes(),
+                    token.as_bytes(),
+                )
+                .is_ok()
+        })
     }
 }
 
@@ -5147,5 +5200,69 @@ mod readiness_tests {
             2,
             "a stale answer is probed again"
         );
+    }
+}
+
+#[cfg(test)]
+mod csrf_key_tests {
+    use super::CsrfKeys;
+    use crate::secret::{SecretKey, SecretKeyring};
+
+    fn keyring(primary: &SecretKey, previous: &[&SecretKey]) -> SecretKeyring {
+        let copy = |key: &SecretKey| SecretKey::from_base64(&key.to_base64()).expect("a key");
+        SecretKeyring::new(
+            copy(primary),
+            previous.iter().map(|key| copy(key)).collect(),
+        )
+        .expect("distinct keys")
+    }
+
+    /// A form rendered by one process posts to another configured with the
+    /// same master key: a restart, or a standby's takeover, does not turn every
+    /// open form into a CSRF refusal.
+    #[test]
+    fn a_form_token_from_one_process_is_accepted_by_another_with_the_same_key() {
+        let master = SecretKey::generate();
+        let (first, first_warning) = CsrfKeys::for_keyring(Some(&keyring(&master, &[])));
+        let (second, second_warning) = CsrfKeys::for_keyring(Some(&keyring(&master, &[])));
+        assert_eq!((first_warning, second_warning), (None, None));
+        let token = first.token("session-token");
+        assert!(second.valid("session-token", &token));
+        assert!(
+            !second.valid("another-session", &token),
+            "bound to its session"
+        );
+        let (other, _) = CsrfKeys::for_keyring(Some(&keyring(&SecretKey::generate(), &[])));
+        assert!(!other.valid("session-token", &token), "bound to its key");
+    }
+
+    /// During a rotation a form issued under the old key still posts, and new
+    /// forms are issued under the new one, which a process still on the old
+    /// key alone does not accept.
+    #[test]
+    fn a_rotation_accepts_the_previous_keys_token_and_issues_under_the_primary() {
+        let old = SecretKey::generate();
+        let new = SecretKey::generate();
+        let (before, _) = CsrfKeys::for_keyring(Some(&keyring(&old, &[])));
+        let (rotated, _) = CsrfKeys::for_keyring(Some(&keyring(&new, &[&old])));
+        let (after, _) = CsrfKeys::for_keyring(Some(&keyring(&new, &[])));
+        assert!(rotated.valid("session", &before.token("session")));
+        assert_eq!(rotated.token("session"), after.token("session"));
+        assert!(!before.valid("session", &rotated.token("session")));
+    }
+
+    /// Without a master key each process has its own key, and startup is
+    /// given the one line that says forms will not survive a restart.
+    #[test]
+    fn without_a_master_key_the_key_is_the_process_own_and_startup_says_so() {
+        let (first, warning) = CsrfKeys::for_keyring(None);
+        let (second, _) = CsrfKeys::for_keyring(None);
+        assert_eq!(warning, Some(CsrfKeys::PROCESS_SCOPED_WARNING));
+        assert!(
+            warning.is_some_and(|text| text.contains("restart")),
+            "{warning:?}"
+        );
+        assert!(first.valid("session", &first.token("session")));
+        assert!(!second.valid("session", &first.token("session")));
     }
 }

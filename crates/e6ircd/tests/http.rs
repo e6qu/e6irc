@@ -2757,6 +2757,7 @@ async fn openapi_spec_is_served() {
         serde_json::json!([
             "connecting",
             "connected",
+            "regaining_nickname",
             "reconnecting",
             "authentication_failed",
             "registration_failed",

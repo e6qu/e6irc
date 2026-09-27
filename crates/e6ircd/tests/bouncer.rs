@@ -4,7 +4,7 @@
 
 use e6ircd::bouncer::{
     DriverConnectionStatus, DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle,
-    NetworkLifecycle, SendOutcome, preflight_irc,
+    NetworkLifecycle, NickRegainTiming, SendOutcome, preflight_irc,
 };
 use e6ircd::config::{Config, ListenerConfig, NetworkKind};
 use e6ircd::egress::InternalUpstreams;
@@ -99,7 +99,11 @@ async fn wait_connected(
                     ..
                 }) => return,
                 Ok(DriverEvent::Status { status, .. })
-                    if !matches!(status, DriverConnectionStatus::Reconnecting(_)) =>
+                    if !matches!(
+                        status,
+                        DriverConnectionStatus::Reconnecting(_)
+                            | DriverConnectionStatus::RegainingNickname
+                    ) =>
                 {
                     panic!("driver disconnected before connecting");
                 }
@@ -1932,19 +1936,20 @@ async fn a_connection_test_joins_nothing_and_still_quits() {
     );
 }
 
-/// A taken nickname is reported, never worked around. The driver does not
-/// invent `bncbot_` on the owner's behalf: it says what the upstream said, waits
-/// on the refusal schedule, and -- when the holder was only a ghost of its own
-/// previous session -- registers under the configured nickname once it is free.
+/// A nickname held under its one alternative too is a refusal. The driver
+/// offers the configured nickname and `bncbot_` once, nothing else: it says
+/// what the upstream said, waits on the refusal schedule, and registers under
+/// the configured nickname once it is free.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_taken_nickname_is_reported_and_never_replaced() {
+async fn a_nickname_held_under_its_alternative_too_is_a_refusal() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(8);
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let _upstream = ScriptedTask::spawn(async move {
-        // First dial: the nickname is held. Record every NICK the driver
-        // offers on this connection; it must offer exactly the configured one.
+        // First dial: the nickname and its alternative are held. Record every
+        // NICK the driver offers on this connection: the configured one and
+        // its one alternative.
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
         loop {
@@ -2016,8 +2021,8 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
     }
     assert_eq!(
         offered,
-        ["bncbot", "bncbot"],
-        "only the configured nickname is ever offered"
+        ["bncbot", "bncbot_", "bncbot"],
+        "the configured nickname and its one alternative, and no other"
     );
 }
 
@@ -2964,14 +2969,18 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
                 continue;
             }
             session.negotiate_capabilities().await;
-            loop {
-                if session.read_line().await.starts_with("USER ") {
-                    break;
+            // The nickname and its alternative are both held.
+            let mut refused = 0;
+            while refused < 2 {
+                let line = session.read_line().await;
+                assert!(!line.is_empty(), "the driver left before its alternative");
+                if let Some(nick) = line.strip_prefix("NICK ") {
+                    session
+                        .send(&format!(":up 433 * {nick} :Nickname is already in use"))
+                        .await;
+                    refused += 1;
                 }
             }
-            session
-                .send(":up 433 * bncbot :Nickname is already in use")
-                .await;
         }
     });
     let handle = IrcNetwork::start(NetworkConfig {
@@ -3821,9 +3830,10 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
     );
 }
 
-/// 437 (the nick delay after a recent holder) is a refusal like 433: it is
-/// reported with the upstream's text at once, not after the 30 s registration
-/// timeout as an anonymous `registration_timed_out`.
+/// 437 (the nick delay after a recent holder) is a refusal like 433: on the
+/// nickname it is answered with the alternative, and on the alternative too it
+/// is reported with the upstream's text at once, not after the 30 s
+/// registration timeout as an anonymous `registration_timed_out`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3838,6 +3848,14 @@ async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
         }
         session
             .send(":up 437 * bncbot :Nick/channel is temporarily unavailable")
+            .await;
+        loop {
+            if session.read_line().await == "NICK bncbot_" {
+                break;
+            }
+        }
+        session
+            .send(":up 437 * bncbot_ :Nick/channel is temporarily unavailable")
             .await;
         // Hold later dials open so the driver stays in its retry wait.
         let _held = fake_accept(&listener).await;
@@ -5449,4 +5467,324 @@ async fn an_account_authority_change_on_one_server_reaches_every_server() {
     assert!(still_open(&mut signed_in_again).await);
     // The new password attaches on the second server.
     attach_alice(bnc, "shared", "a new passphrase").await;
+}
+
+/// Register the driver as an upstream still holding the ghost of its last
+/// session does: the configured nickname is answered with 433, the one
+/// alternative is welcomed, and the burst ends with `isupport`. Returns every
+/// `NICK` the driver offered on the way.
+async fn welcome_past_a_ghost(
+    session: &mut FakeSession,
+    sasl: bool,
+    isupport: &str,
+) -> Vec<String> {
+    if sasl {
+        session.negotiate_sasl_capabilities().await;
+    } else {
+        session.negotiate_capabilities().await;
+    }
+    let mut offered: Vec<String> = Vec::new();
+    let (mut user, mut cap_end, mut authenticated) = (false, false, !sasl);
+    while !(user && cap_end && authenticated && offered.len() == 2) {
+        let line = session.read_line().await;
+        assert!(!line.is_empty(), "the driver left during registration");
+        if let Some(nick) = line.strip_prefix("NICK ") {
+            offered.push(nick.to_string());
+            if offered.len() == 1 {
+                session
+                    .send(&format!(":up 433 * {nick} :Nickname is already in use"))
+                    .await;
+            }
+        } else if line == "AUTHENTICATE PLAIN" {
+            session.send("AUTHENTICATE +").await;
+        } else if line.starts_with("AUTHENTICATE ") {
+            session
+                .send(":up 903 * :SASL authentication successful")
+                .await;
+            authenticated = true;
+        } else if line.starts_with("USER ") {
+            user = true;
+        } else if line == "CAP END" {
+            cap_end = true;
+        }
+    }
+    let alternative = &offered[1];
+    session
+        .send(&format!(":up 001 {alternative} :welcome"))
+        .await;
+    session
+        .send(&format!(
+            ":up 005 {alternative} {isupport} :are supported by this server"
+        ))
+        .await;
+    session
+        .send(&format!(":up 376 {alternative} :End of /MOTD command."))
+        .await;
+    offered
+}
+
+/// The configuration of a network whose ghost the tests make the driver meet.
+fn ghost_network(
+    addr: std::net::SocketAddr,
+    sasl: bool,
+    timing: NickRegainTiming,
+) -> NetworkConfig {
+    NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#lobby".parse().expect("test channel")],
+        sasl: sasl.then(|| ("bncbot".to_string(), "hunter2".to_string())),
+        // No redial within a test: the first attempt's outcome is the subject.
+        rejection_retry_floor: std::time::Duration::from_secs(600),
+        internal_upstreams: InternalUpstreams::Allow,
+        nick_regain: timing,
+        ..NetworkConfig::default()
+    }
+}
+
+/// Wait until the driver is registered under its alternative, and check that
+/// it says so rather than reporting a connection.
+async fn wait_regaining(handle: &NetworkHandle) {
+    wait_lifecycle(handle, NetworkLifecycle::RegainingNickname).await;
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("connected as bncbot_, regaining bncbot"),
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.connected_at, None, "{snapshot:?}");
+}
+
+/// A crash leaves a ghost the next dial meets. Authenticated with SASL, the
+/// driver registers as `bncbot_`, asks NickServ to `REGAIN` the configured
+/// nickname, and only once services have renamed it back joins its channels,
+/// sends what an attached client typed meanwhile, and reports a connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_ghost_is_regained_through_nickserv() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (asked_tx, asked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        let offered =
+            welcome_past_a_ghost(&mut session, true, "CASEMAPPING=rfc1459 MONITOR=100").await;
+        assert_eq!(offered, ["bncbot", "bncbot_"]);
+        assert_eq!(session.read_line().await, "PRIVMSG NickServ :REGAIN bncbot");
+        assert_eq!(session.read_line().await, "MONITOR + bncbot");
+        asked_tx.send(()).unwrap();
+        answer_rx.await.unwrap();
+        session
+            .send(":NickServ!NickServ@services. NOTICE bncbot_ :\x02bncbot\x02 has been regained.")
+            .await;
+        session.send(":bncbot_!~bncbot@up NICK :bncbot").await;
+        // Up to what the client typed during the wait.
+        let mut after = Vec::new();
+        loop {
+            let line = session.read_line().await;
+            assert!(!line.is_empty(), "closed before the held line: {after:?}");
+            let typed = line.starts_with("PRIVMSG");
+            after.push(line);
+            if typed {
+                return after;
+            }
+        }
+    });
+    let handle = IrcNetwork::start(ghost_network(addr, true, NickRegainTiming::default()));
+    let mut events = handle.subscribe();
+    wait_regaining(&handle).await;
+    asked_rx.await.expect("the driver asked for its nickname");
+    // Typed while the session holds only the alternative: held back.
+    assert_eq!(handle.send("PRIVMSG #lobby :hello"), SendOutcome::Sent);
+    answer_tx.send(()).unwrap();
+    wait_connected(&handle, &mut events).await;
+    let snapshot = handle.runtime_snapshot();
+    assert!(
+        snapshot
+            .recent_failures
+            .iter()
+            .all(|failure| failure.code() != "renamed_by_upstream"),
+        "the rename back was asked for: {snapshot:?}"
+    );
+    let after = upstream.finish().await;
+    handle.shutdown_and_wait().await;
+    assert_eq!(
+        after,
+        ["MONITOR - bncbot", "JOIN #lobby", "PRIVMSG #lobby :hello"],
+        "nothing is joined or said before the configured nickname is back"
+    );
+}
+
+/// Without SASL there is no one to ask: the driver watches the ghost with
+/// `MONITOR` and takes the nickname the moment the upstream reaps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ghost_that_times_out_is_regained_through_monitor() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (reaped_tx, reaped_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, false, "MONITOR=100").await;
+        assert_eq!(session.read_line().await, "MONITOR + bncbot");
+        session.send(":up 730 bncbot_ :bncbot!~bncbot@ghost").await;
+        reaped_rx.await.unwrap();
+        session.send(":up 731 bncbot_ :bncbot").await;
+        assert_eq!(session.read_line().await, "NICK bncbot");
+        session.send(":bncbot_!~bncbot@up NICK :bncbot").await;
+        assert_eq!(session.read_line().await, "MONITOR - bncbot");
+        assert_eq!(session.read_line().await, "JOIN #lobby");
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(ghost_network(addr, false, NickRegainTiming::default()));
+    let mut events = handle.subscribe();
+    wait_regaining(&handle).await;
+    reaped_tx.send(()).unwrap();
+    wait_connected(&handle, &mut events).await;
+    handle.shutdown_and_wait().await;
+    upstream.finish().await;
+}
+
+/// An upstream without `MONITOR` is asked with `ISON`, once a poll, until the
+/// ghost is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ghost_that_times_out_is_regained_through_ison() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let poll = std::time::Duration::from_millis(200);
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, false, "CASEMAPPING=rfc1459").await;
+        assert_eq!(session.read_line().await, "ISON bncbot");
+        session.send(":up 303 bncbot_ :bncbot").await;
+        let asked = tokio::time::Instant::now();
+        assert_eq!(session.read_line().await, "ISON bncbot");
+        assert!(asked.elapsed() >= poll / 2, "polled at the interval");
+        session.send(":up 303 bncbot_ :").await;
+        assert_eq!(session.read_line().await, "NICK bncbot");
+        session.send(":bncbot_!~bncbot@up NICK :bncbot").await;
+        assert_eq!(session.read_line().await, "JOIN #lobby");
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(ghost_network(
+        addr,
+        false,
+        NickRegainTiming {
+            poll,
+            window: std::time::Duration::from_secs(60),
+        },
+    ));
+    let mut events = handle.subscribe();
+    wait_regaining(&handle).await;
+    wait_connected(&handle, &mut events).await;
+    handle.shutdown_and_wait().await;
+    upstream.finish().await;
+}
+
+/// A nickname registered to another account is not coming back: services'
+/// refusal ends the session with a `QUIT` (the alternative leaves no ghost of
+/// its own) and parks the network with the reason, without another dial.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nickname_services_refuse_to_regain_parks_the_network() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, true, "CASEMAPPING=rfc1459").await;
+        assert_eq!(session.read_line().await, "PRIVMSG NickServ :REGAIN bncbot");
+        assert_eq!(session.read_line().await, "ISON bncbot");
+        session
+            .send(
+                ":NickServ!NickServ@services. NOTICE bncbot_ :Invalid password for \x02bncbot\x02.",
+            )
+            .await;
+        let goodbye = session.read_line().await;
+        // No second dial follows the refusal.
+        let redial =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        (goodbye, redial.is_ok())
+    });
+    let handle = IrcNetwork::start(ghost_network(addr, true, NickRegainTiming::default()));
+    wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
+    let (goodbye, redialled) = upstream.finish().await;
+    assert_eq!(
+        goodbye,
+        "QUIT :the configured nickname could not be regained"
+    );
+    assert!(!redialled, "a definite refusal is not retried");
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameRegainRefused),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("bncbot cannot be regained: Invalid password for bncbot."),
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.connection_attempts, 1, "{snapshot:?}");
+}
+
+/// A holder that is not a ghost never goes away. However the upstream
+/// answers — the nickname free by `ISON` yet refused on every `NICK` — the
+/// driver sends one `NICK` a poll at most, stops at the end of its window with
+/// a `QUIT`, and takes the ordinary refusal schedule for a nickname in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn regaining_is_bounded_and_never_loops() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let poll = std::time::Duration::from_millis(100);
+    let window = std::time::Duration::from_millis(1_000);
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        welcome_past_a_ghost(&mut session, false, "CASEMAPPING=rfc1459").await;
+        let mut nicks = 0usize;
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() || line.starts_with("QUIT") {
+                return (nicks, line);
+            }
+            if line == "ISON bncbot" {
+                session.send(":up 303 bncbot_ :").await;
+            } else if line == "NICK bncbot" {
+                nicks += 1;
+                session
+                    .send(":up 433 bncbot_ bncbot :Nickname is already in use")
+                    .await;
+            } else {
+                panic!("unexpected line while regaining: {line}");
+            }
+        }
+    });
+    let handle = IrcNetwork::start(ghost_network(
+        addr,
+        false,
+        NickRegainTiming { poll, window },
+    ));
+    wait_regaining(&handle).await;
+    let (nicks, goodbye) = upstream.finish().await;
+    assert_eq!(
+        goodbye,
+        "QUIT :the configured nickname could not be regained"
+    );
+    let most = (window.as_millis() / poll.as_millis()) as usize + 1;
+    assert!((1..=most).contains(&nicks), "{nicks} NICKs in the window");
+    wait_lifecycle(&handle, NetworkLifecycle::Reconnecting).await;
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("bncbot was still in use 1s after registering as bncbot_"),
+        "{snapshot:?}"
+    );
+    assert!(snapshot.next_retry_at.is_some(), "{snapshot:?}");
 }

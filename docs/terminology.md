@@ -621,6 +621,11 @@ is a commit's hash.
 **Hash-based message authentication code (HMAC)** — a keyed hash: SCRAM
 computes them, and a session's CSRF token is one.
 
+**HMAC-based key derivation function (HKDF)** — RFC 5869's way to derive
+independent keys from one secret: the CSRF token's key is derived from the
+master secret key with its own info string, so every process holding that key
+issues and accepts the same tokens.
+
 **Random number generator (RNG)** — keys, tokens, and nonces come from the
 operating system's cryptographically secure one; the reconnect backoff
 deliberately uses none, spreading drivers by a seed instead.
