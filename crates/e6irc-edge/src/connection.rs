@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use crate::address::{ClientIp, ConnLimiter, PeerRefusal};
+use crate::address::{ClientIp, ConnLimiter, PeerRefusal, PeerRefusalLog};
 
 /// Traditional 512-byte line minus CRLF, plus the 4096-byte client tag
 /// allowance (message-tags spec); the body-only limit is enforced in
@@ -38,7 +38,42 @@ const ACCEPT_BATCH: usize = 64;
 /// reaper. A plaintext peer has no such window (it hits `serve_conn` at once).
 /// A real handshake completes in well under a second; 30s matches the
 /// registration budget a plaintext peer already gets.
-pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+
+/// Complete the TLS handshake on `stream`, accepted from `client`, within
+/// [`TLS_HANDSHAKE_TIMEOUT_SECS`]. A handshake that fails or runs out of time
+/// is counted and noted in `refusals` under its own class, and gives `None`:
+/// the connection is over. Every TLS listener — the IRC listeners and the
+/// attach listener — accepts through this one bound.
+pub async fn tls_handshake<S>(
+    acceptor: &TlsAcceptor,
+    stream: S,
+    client: ClientIp,
+    refusals: &PeerRefusalLog,
+    telemetry: &dyn TransportTelemetry,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let handshake = tokio::time::timeout(
+        std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+        acceptor.accept(stream),
+    )
+    .await;
+    match handshake {
+        Ok(Ok(tls_stream)) => Some(tls_stream),
+        Ok(Err(e)) => {
+            telemetry.record_error(TransportError::TlsHandshake);
+            refusals.note(client, PeerRefusal::TlsHandshakeFailed, Some(&e));
+            None
+        }
+        Err(_) => {
+            telemetry.record_error(TransportError::TlsHandshake);
+            refusals.note(client, PeerRefusal::TlsHandshakeTimedOut, None);
+            None
+        }
+    }
+}
 
 /// How long a connection whose session is over — ended by the core, or
 /// half-closed by its client — may take to receive what it is still owed (the
@@ -351,36 +386,24 @@ fn spawn_accepted<C: CorePort>(
         }
         match tls {
             Some(acceptor) => {
-                let handshake = tokio::time::timeout(
-                    std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
-                    acceptor.accept(stream),
+                let Some(tls_stream) =
+                    tls_handshake(&acceptor, stream, client, &refusals, &*telemetry).await
+                else {
+                    return;
+                };
+                serve_conn(
+                    tls_stream,
+                    AcceptedConnection {
+                        conn,
+                        peer,
+                        transport: ConnectionTransport::Tls,
+                        task,
+                    },
+                    core_tx,
+                    Outbound::with_sendq(sendq_bytes),
+                    telemetry,
                 )
-                .await;
-                match handshake {
-                    Ok(Ok(tls_stream)) => {
-                        serve_conn(
-                            tls_stream,
-                            AcceptedConnection {
-                                conn,
-                                peer,
-                                transport: ConnectionTransport::Tls,
-                                task,
-                            },
-                            core_tx,
-                            Outbound::with_sendq(sendq_bytes),
-                            telemetry,
-                        )
-                        .await
-                    }
-                    Ok(Err(e)) => {
-                        telemetry.record_error(TransportError::TlsHandshake);
-                        refusals.note(client, PeerRefusal::TlsHandshakeFailed, Some(&e));
-                    }
-                    Err(_) => {
-                        telemetry.record_error(TransportError::TlsHandshake);
-                        refusals.note(client, PeerRefusal::TlsHandshakeTimedOut, None);
-                    }
-                }
+                .await
             }
             None => {
                 serve_conn(
@@ -771,6 +794,129 @@ mod tests {
             write_loop(FlushFails, rx, Arc::new(Uncounted)).await,
             WriterEnd::Failed("Write error")
         ));
+    }
+
+    /// Counts the TLS handshakes it is told failed.
+    #[derive(Default)]
+    struct HandshakeFailures(std::sync::atomic::AtomicUsize);
+
+    impl TransportTelemetry for HandshakeFailures {
+        fn record_error(&self, kind: TransportError) {
+            assert_eq!(kind, TransportError::TlsHandshake);
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn record_connection_rejected(&self) {}
+    }
+
+    /// An acceptor serving a fresh self-signed certificate for `localhost`,
+    /// and a connector that trusts it.
+    fn tls_pair(name: &str) -> (TlsAcceptor, tokio_rustls::TlsConnector) {
+        crate::certificate::install_crypto_provider();
+        let dir = std::env::temp_dir().join(format!("e6irc-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let files = crate::certificate::TlsConfig {
+            cert_path: dir.join("cert.pem"),
+            key_path: dir.join("key.pem"),
+        };
+        let trusted = crate::certificate::write_self_signed(&files);
+        let acceptor = crate::certificate::CertificateReloads::default()
+            .acceptor(&files)
+            .expect("acceptor");
+        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted).expect("root");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        (acceptor, connector)
+    }
+
+    fn client() -> ClientIp {
+        ClientIp::new("192.0.2.7".parse().unwrap())
+    }
+
+    /// A completed handshake gives the stream, and counts nothing.
+    #[tokio::test]
+    async fn a_completed_handshake_gives_the_stream() {
+        let (acceptor, connector) = tls_pair("handshake-ok");
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let refusals = PeerRefusalLog::new(std::time::Duration::from_secs(60));
+        let failures = HandshakeFailures::default();
+        // The client's end is kept open until the server's side is done.
+        let client_side = tokio::spawn(async move {
+            connector
+                .connect("localhost".try_into().expect("name"), far)
+                .await
+        });
+        let served = tls_handshake(&acceptor, near, client(), &refusals, &failures).await;
+        let connected = client_side
+            .await
+            .expect("client task")
+            .expect("client handshake");
+        assert!(served.is_some(), "the handshake completes");
+        drop(connected);
+        assert_eq!(failures.0.load(Ordering::SeqCst), 0);
+    }
+
+    /// A peer that sends something other than a ClientHello fails the
+    /// handshake: counted, and noted under its own class.
+    #[tokio::test]
+    async fn a_failed_handshake_is_counted_and_noted() {
+        let (acceptor, _connector) = tls_pair("handshake-failed");
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        far.write_all(b"NICK alice\r\nUSER alice 0 * :Alice\r\n")
+            .await
+            .expect("send plaintext");
+        let refusals = PeerRefusalLog::new(std::time::Duration::from_secs(60));
+        let failures = HandshakeFailures::default();
+        let served = tls_handshake(&acceptor, near, client(), &refusals, &failures).await;
+        assert!(served.is_none());
+        assert_eq!(failures.0.load(Ordering::SeqCst), 1);
+        let now = std::time::Instant::now();
+        assert!(
+            refusals
+                .line_at(now, client(), PeerRefusal::TlsHandshakeFailed, None)
+                .is_none(),
+            "the failure was noted, so its window is open"
+        );
+        assert!(
+            refusals
+                .line_at(now, client(), PeerRefusal::TlsHandshakeTimedOut, None)
+                .is_some(),
+            "and not as a timeout"
+        );
+    }
+
+    /// A peer that connects and never sends a ClientHello is given up on at
+    /// the bound, rather than holding its task and slot for as long as it
+    /// likes.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_times_out_at_the_bound() {
+        let (acceptor, _connector) = tls_pair("handshake-silent");
+        let (near, _far) = tokio::io::duplex(64 * 1024);
+        let refusals = PeerRefusalLog::new(std::time::Duration::from_secs(60));
+        let failures = HandshakeFailures::default();
+        let started = tokio::time::Instant::now();
+        let served = tls_handshake(&acceptor, near, client(), &refusals, &failures).await;
+        assert!(served.is_none());
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS)
+        );
+        assert_eq!(failures.0.load(Ordering::SeqCst), 1);
+        assert!(
+            refusals
+                .line_at(
+                    std::time::Instant::now(),
+                    client(),
+                    PeerRefusal::TlsHandshakeTimedOut,
+                    None,
+                )
+                .is_none(),
+            "the timeout was noted, so its window is open"
+        );
     }
 
     #[test]

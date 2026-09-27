@@ -5763,8 +5763,9 @@ system; §19.9 lists the sections each phase rewrites.
   graceful stop finishes the requests in flight before the cut, so a deploy
   costs no HTTP error.
 - **Phase 1 as built.** `e6irc-edge` holds, moved unchanged from e6ircd:
-  `connection` (`bind_listener`, the batched accept with `TCP_NODELAY` and the
-  TLS handshake bound, `serve_conn` with its read and write loops and
+  `connection` (`bind_listener`, the batched accept with `TCP_NODELAY`, the
+  bounded TLS handshake `tls_handshake` — the one the attach listener's accept
+  loop uses too — `serve_conn` with its read and write loops and
   vectored writes, the closing drain, `ConnectionTasks`, and the session
   identity the accept assigns — `ConnId`, `ConnectionIdAllocator`,
   `ConnectionTransport` and the `Output` line), `certificate` (the TLS files,

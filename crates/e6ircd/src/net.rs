@@ -23,8 +23,7 @@ use crate::serving_lease::{self, AcquireRefusal, HolderId, ServingLease};
 use e6irc_edge::address::{ClientIp, ConnGuard, ConnLimiter, PeerRefusal, PeerRefusalLog};
 use e6irc_edge::certificate::{CertificateReloads, Hangups, install_crypto_provider};
 use e6irc_edge::connection::{
-    AcceptContext, CLOSING_DRAIN, ConnectionTasks, TLS_HANDSHAKE_TIMEOUT_SECS, accept_loop,
-    bind_listener,
+    AcceptContext, CLOSING_DRAIN, ConnectionTasks, accept_loop, bind_listener, tls_handshake,
 };
 use e6irc_queue::{Policy, Receiver, queue};
 
@@ -561,41 +560,25 @@ fn spawn_bnc_listener(
                             // password; off loopback that only ever travels
                             // inside TLS (config refuses anything else).
                             Some(acceptor) => {
-                                let handshake = tokio::time::timeout(
-                                    std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
-                                    acceptor.accept(stream),
+                                let Some(stream) = tls_handshake(
+                                    &acceptor,
+                                    stream,
+                                    client,
+                                    &refusals,
+                                    &*telemetry,
                                 )
-                                .await;
-                                match handshake {
-                                    Ok(Ok(stream)) => {
-                                        crate::bouncer::bnc_serve(
-                                            stream,
-                                            registry,
-                                            &pool,
-                                            &server_name,
-                                            client,
-                                        )
-                                        .await
-                                    }
-                                    Ok(Err(e)) => {
-                                        telemetry.record_error(ErrorKind::TlsHandshake);
-                                        refusals.note(
-                                            client,
-                                            PeerRefusal::TlsHandshakeFailed,
-                                            Some(&e),
-                                        );
-                                        return;
-                                    }
-                                    Err(_) => {
-                                        telemetry.record_error(ErrorKind::TlsHandshake);
-                                        refusals.note(
-                                            client,
-                                            PeerRefusal::TlsHandshakeTimedOut,
-                                            None,
-                                        );
-                                        return;
-                                    }
-                                }
+                                .await
+                                else {
+                                    return;
+                                };
+                                crate::bouncer::bnc_serve(
+                                    stream,
+                                    registry,
+                                    &pool,
+                                    &server_name,
+                                    client,
+                                )
+                                .await
                             }
                             None => {
                                 crate::bouncer::bnc_serve(
