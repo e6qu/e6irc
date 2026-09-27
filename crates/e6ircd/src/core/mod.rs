@@ -1608,7 +1608,14 @@ pub enum DbRequest {
     /// Verify a bearer token (SASL OAUTHBEARER); answered with the same
     /// `PasswordVerified`/`PasswordRejected` replies as a password. A token is
     /// only ever presented by SASL, so its reply origin is always `Sasl`.
-    VerifyToken { conn: ConnId, token: String },
+    /// `authzid` is the GS2 authorization identity the client asked to act
+    /// as; a token is refused unless it is absent or names the token's own
+    /// account (RFC 7628 §3.1).
+    VerifyToken {
+        conn: ConnId,
+        token: String,
+        authzid: Option<String>,
+    },
     CreateAccount {
         conn: ConnId,
         name: String,

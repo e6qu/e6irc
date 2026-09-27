@@ -36,9 +36,26 @@ struct DeviceError {
     error: String,
 }
 
+/// The client this program starts device grants as (RFC 8628 §3.1
+/// `client_id`); the server binds the grant to it and labels the issued token
+/// with it.
+const DEVICE_CLIENT_ID: &str = "e6irc-cli";
+
+/// The grant type a device access token request names (RFC 8628 §3.4).
+const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// The device authorization request (RFC 8628 §3.1), sent as a form.
+#[derive(Serialize)]
+struct DeviceStartRequest<'a> {
+    client_id: &'a str,
+}
+
+/// The device access token request (RFC 8628 §3.4), sent as a form.
 #[derive(Serialize)]
 struct DeviceTokenRequest<'a> {
+    grant_type: &'a str,
     device_code: &'a str,
+    client_id: &'a str,
 }
 
 fn verification_uri(value: &str) -> io::Result<&str> {
@@ -214,6 +231,9 @@ pub async fn login(base: &str, cache_path: &Path, transport: Transport) -> io::R
     let start_response = client
         .post(endpoint(&base, "/api/v1/auth/device/start")?)
         .header(reqwest::header::ACCEPT, "application/json")
+        .form(&DeviceStartRequest {
+            client_id: DEVICE_CLIENT_ID,
+        })
         .send()
         .await
         .map_err(transport_error)?;
@@ -259,13 +279,11 @@ pub async fn login(base: &str, cache_path: &Path, transport: Transport) -> io::R
         let response = client
             .post(endpoint(&base, "/api/v1/auth/device/token")?)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(
-                serde_json::to_vec(&DeviceTokenRequest {
-                    device_code: &start.device_code,
-                })
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-            )
+            .form(&DeviceTokenRequest {
+                grant_type: DEVICE_CODE_GRANT_TYPE,
+                device_code: &start.device_code,
+                client_id: DEVICE_CLIENT_ID,
+            })
             .send()
             .await
             .map_err(transport_error)?;
@@ -711,16 +729,52 @@ mod tests {
             for response in [
                 r#"{"device_code":"device","user_code":"ABCD-EFGH","verification_uri":"https://verify.example/device","interval":1,"expires_in":10}"#,
                 r#"{"error":"authorization_pending"}"#,
-                r#"{"access_token":"issued-secret","token_type":"bearer"}"#,
+                r#"{"access_token":"issued-secret","token_type":"Bearer","expires_in":2592000,"scope":"read write irc"}"#,
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 8192];
-                let read = stream.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]);
+                // The whole request: its head, then the body its
+                // Content-Length announces.
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !String::from_utf8_lossy(&request)
+                    .split_once("\r\n\r\n")
+                    .is_some_and(|(head, body)| {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|length| length.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        body.len() >= length
+                    })
+                {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "the request ended early");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8_lossy(&request);
                 assert!(
                     request.starts_with("POST /api/v1/auth/device/"),
                     "{request}"
                 );
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("content-type: application/x-www-form-urlencoded"),
+                    "RFC 8628 requests are forms: {request}"
+                );
+                let form = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                if request.starts_with("POST /api/v1/auth/device/start") {
+                    assert_eq!(form, "client_id=e6irc-cli");
+                } else {
+                    assert_eq!(
+                        form,
+                        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code\
+                         &device_code=device&client_id=e6irc-cli"
+                    );
+                }
                 let status = if response.contains("\"error\"") {
                     "400 Bad Request"
                 } else {
@@ -745,14 +799,5 @@ mod tests {
         assert_eq!(cached.base_url(), format!("http://{address}"));
         assert_eq!(cached.access_token(), "issued-secret");
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn device_token_request_uses_the_closed_wire_shape() {
-        let request = serde_json::to_string(&DeviceTokenRequest {
-            device_code: "device",
-        })
-        .unwrap();
-        assert_eq!(request, r#"{"device_code":"device"}"#);
     }
 }

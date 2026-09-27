@@ -101,6 +101,11 @@ async fn list_audit_log(
 
 static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
+/// The client the device grants of these tests are started for.
+fn device_client() -> db::DeviceClientId {
+    db::DeviceClientId::parse("e6irc-test").expect("a visible ASCII client identifier")
+}
+
 const MANAGED_CONFIG_0052_FIELDS: &[&str] = &[
     "server_name",
     "network_name",
@@ -501,6 +506,47 @@ async fn sasl_oauthbearer_with_api_token() {
         .is_err(),
         "invalid token must be refused"
     );
+
+    // The GS2 authorization identity is held to the token's account (RFC 7628
+    // §3.1): naming another account is refused, naming its own is admitted.
+    let oauthbearer_numeric = |authzid: &'static str| {
+        let token = token.clone();
+        async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let response = e6irc_proto::base64::encode(
+                format!("n,{authzid},\x01auth=Bearer {token}\x01\x01").as_bytes(),
+            );
+            write
+                .write_all(
+                    format!(
+                        "CAP REQ :sasl\r\nNICK authz\r\nUSER authz 0 * :A\r\n\
+                         AUTHENTICATE OAUTHBEARER\r\nAUTHENTICATE {response}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+            tokio::time::timeout(deadline::HANG, async {
+                loop {
+                    let line = lines.next_line().await.expect("read").expect("line");
+                    let numeric = line.split(' ').nth(1).unwrap_or_default().to_string();
+                    if numeric == "903" || numeric == "904" {
+                        return numeric;
+                    }
+                }
+            })
+            .await
+            .expect("a SASL verdict")
+        }
+    };
+    assert_eq!(
+        oauthbearer_numeric("a=someone-else").await,
+        "904",
+        "a token must not act as another account"
+    );
+    assert_eq!(oauthbearer_numeric("a=TOKUSER").await, "903");
 }
 
 #[tokio::test]
@@ -1106,9 +1152,13 @@ async fn credential_list_and_revoke() {
     db::issue_app_password(&pool, "creduser", "pw", "phone")
         .await
         .expect("ap2");
-    let session = db::create_web_session(&pool, "creduser", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("creduser"),
+        None,
+    )
+    .await
+    .expect("session");
     drop(pool);
 
     let config = Config {
@@ -1253,7 +1303,7 @@ async fn verify_records_credential_last_used() {
         db::verify_credentials(&pool, "lu", &app)
             .await
             .expect("verify"),
-        Some("lu".to_string())
+        Some(db::VerifiedAccount::established("lu"))
     );
     let after = db::list_credentials(&pool, "lu").await.expect("list");
     assert!(
@@ -1308,7 +1358,7 @@ async fn revoke_credential_cannot_delete_the_primary_password() {
         db::verify_credentials(&pool, "rc", "pw")
             .await
             .expect("verify"),
-        Some("rc".to_string())
+        Some(db::VerifiedAccount::established("rc"))
     );
     // The app password IS revocable.
     assert!(
@@ -1351,12 +1401,20 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     // The browser making the change keeps its session; every other one ends —
     // the old password may be in someone else's hands, and they may be signed
     // in with it.
-    let changing_session = db::create_web_session(&pool, "rotate", None)
-        .await
-        .expect("changing session");
-    let other_session = db::create_web_session(&pool, "rotate", None)
-        .await
-        .expect("other session");
+    let changing_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("rotate"),
+        None,
+    )
+    .await
+    .expect("changing session");
+    let other_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("rotate"),
+        None,
+    )
+    .await
+    .expect("other session");
     db::change_local_password(&pool, "ROTATE", "old", "new", &changing_session)
         .await
         .expect("rotate");
@@ -1385,13 +1443,13 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
         db::verify_local_password(&pool, "rotate", "new")
             .await
             .expect("new verify"),
-        Some("rotate".into())
+        Some(db::VerifiedAccount::established("rotate"))
     );
     assert_eq!(
         db::verify_credentials(&pool, "rotate", &app)
             .await
             .expect("app verify"),
-        Some("rotate".into()),
+        Some(db::VerifiedAccount::established("rotate")),
         "rotating the primary must not silently revoke independent app passwords"
     );
 
@@ -1420,12 +1478,20 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     )
     .await
     .expect("OIDC account");
-    let adding_session = db::create_web_session(&pool, &oidc_account, None)
-        .await
-        .expect("adding session");
-    let stale_session = db::create_web_session(&pool, &oidc_account, None)
-        .await
-        .expect("stale session");
+    let adding_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established(oidc_account.as_str()),
+        None,
+    )
+    .await
+    .expect("adding session");
+    let stale_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established(oidc_account.as_str()),
+        None,
+    )
+    .await
+    .expect("stale session");
     db::set_local_password(&pool, &oidc_account, "first-local", &adding_session)
         .await
         .expect("set first password");
@@ -1433,7 +1499,7 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
         db::verify_local_password(&pool, &oidc_account, "first-local")
             .await
             .expect("verify first password"),
-        Some(oidc_account.clone())
+        Some(db::VerifiedAccount::established(oidc_account.clone()))
     );
     assert_eq!(
         db::list_web_sessions(&pool, &oidc_account, Some(&adding_session))
@@ -1836,16 +1902,24 @@ async fn history_rest_endpoint() {
     .execute(&pool)
     .await
     .expect("register #web");
-    let session = db::create_web_session(&pool, "web", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("web"),
+        None,
+    )
+    .await
+    .expect("session");
     // A second account with no relationship to #web must be refused (IDOR).
     db::create_account_with_contact(&pool, "other", "pw", None)
         .await
         .expect("create other");
-    let other_session = db::create_web_session(&pool, "other", None)
-        .await
-        .expect("other session");
+    let other_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("other"),
+        None,
+    )
+    .await
+    .expect("other session");
     let pool2 = pool.clone();
     drop(pool);
 
@@ -2070,9 +2144,13 @@ PING x
     db::create_account_with_contact(&pool2, "snoop", "pw", None)
         .await
         .expect("snoop");
-    let snoop_session = db::create_web_session(&pool2, "snoop", None)
-        .await
-        .expect("snoop session");
+    let snoop_session = db::create_web_session(
+        &pool2,
+        &e6ircd::db::VerifiedAccount::established("snoop"),
+        None,
+    )
+    .await
+    .expect("snoop session");
     for probe in ["web", "other", "other!web", "web!other"] {
         let v: serde_json::Value = client
             .get(format!("{base}/api/v1/history?target={probe}"))
@@ -5970,19 +6048,39 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
             .await
             .unwrap_or_else(|error| panic!("create {name}: {error}"));
     }
-    db::issue_app_password_for_account(&pool, "Alice", "desktop")
-        .await
-        .expect("app password");
+    db::issue_app_password_for_account(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        "desktop",
+    )
+    .await
+    .expect("app password");
     issue_api_token(&pool, "Alice", "active")
         .await
         .expect("API token");
-    db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("browser session");
+    db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("browser session");
     assert_eq!(
-        db::link_oidc_identity(&pool, "Alice", "https://issuer.example", "alice-subject")
+        db::link_oidc_identity(
+            &pool,
+            &db::create_web_session(
+                &pool,
+                &db::VerifiedAccount::established("Alice".to_string()),
+                None
+            )
             .await
-            .expect("OIDC link"),
+            .expect("linking session"),
+            "Alice",
+            "https://issuer.example",
+            "alice-subject"
+        )
+        .await
+        .expect("OIDC link"),
         db::LinkOutcome::Linked
     );
     sqlx::query(
@@ -6751,6 +6849,70 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
     );
 }
 
+/// A login identity is linked only for the browser session that asked, checked
+/// with the insert: live, the account's, and recently authenticated. A stolen
+/// cookie that was signed out, or has aged past the step-up window, cannot
+/// finish a link it started.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_identity_links_only_for_a_live_recent_session_of_the_account() {
+    use e6ircd::db::LinkOutcome;
+    let (pool, _) =
+        alice_and_bob("an_identity_links_only_for_a_live_recent_session_of_the_account").await;
+    let issuer = "https://idp.example";
+    let session_of = |account: &'static str| {
+        let pool = pool.clone();
+        async move {
+            db::create_web_session(&pool, &db::VerifiedAccount::established(account), None)
+                .await
+                .expect("session")
+        }
+    };
+    let signed_out = session_of("alice").await;
+    db::delete_web_session(&pool, &signed_out)
+        .await
+        .expect("sign out");
+    assert_eq!(
+        db::link_oidc_identity(&pool, &signed_out, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::SessionEnded
+    );
+    let bobs = session_of("bob").await;
+    assert_eq!(
+        db::link_oidc_identity(&pool, &bobs, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::SessionEnded,
+        "another account's session links nothing to alice"
+    );
+    let stale = session_of("alice").await;
+    sqlx::query("UPDATE web_sessions SET authenticated_at = now() - interval '11 minutes'")
+        .execute(&pool)
+        .await
+        .expect("age the session");
+    assert_eq!(
+        db::link_oidc_identity(&pool, &stale, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::SessionNotRecent
+    );
+    assert!(
+        db::list_oidc_identities(&pool, "alice")
+            .await
+            .expect("identities")
+            .is_empty(),
+        "no refused link stored an identity"
+    );
+    let fresh = session_of("alice").await;
+    assert_eq!(
+        db::link_oidc_identity(&pool, &fresh, "alice", issuer, "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::Linked
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_identity_link_list_and_conflict() {
@@ -6768,22 +6930,58 @@ async fn oidc_identity_link_list_and_conflict() {
 
     // First link attaches; a repeat for the same account is idempotent.
     assert_eq!(
-        db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-1")
+        db::link_oidc_identity(
+            &pool,
+            &db::create_web_session(
+                &pool,
+                &db::VerifiedAccount::established("alice".to_string()),
+                None
+            )
             .await
-            .expect("link"),
+            .expect("linking session"),
+            "alice",
+            "https://idp.example",
+            "sub-1"
+        )
+        .await
+        .expect("link"),
         LinkOutcome::Linked
     );
     assert_eq!(
-        db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-1")
+        db::link_oidc_identity(
+            &pool,
+            &db::create_web_session(
+                &pool,
+                &db::VerifiedAccount::established("alice".to_string()),
+                None
+            )
             .await
-            .expect("relink"),
+            .expect("linking session"),
+            "alice",
+            "https://idp.example",
+            "sub-1"
+        )
+        .await
+        .expect("relink"),
         LinkOutcome::AlreadyYours
     );
     // The same identity cannot be claimed by another account.
     assert_eq!(
-        db::link_oidc_identity(&pool, "bob", "https://idp.example", "sub-1")
+        db::link_oidc_identity(
+            &pool,
+            &db::create_web_session(
+                &pool,
+                &db::VerifiedAccount::established("bob".to_string()),
+                None
+            )
             .await
-            .expect("steal"),
+            .expect("linking session"),
+            "bob",
+            "https://idp.example",
+            "sub-1"
+        )
+        .await
+        .expect("steal"),
         LinkOutcome::Conflict
     );
     // A suspended account cannot gain a login identity.
@@ -6791,11 +6989,14 @@ async fn oidc_identity_link_list_and_conflict() {
         .await
         .expect("bob id")
         .expect("bob exists");
+    let bob_session = db::create_web_session(&pool, &db::VerifiedAccount::established("bob"), None)
+        .await
+        .expect("bob session");
     db::set_account_suspended(&pool, bob_id, true, "alice", &[])
         .await
         .expect("suspend bob");
     assert!(matches!(
-        db::link_oidc_identity(&pool, "bob", "https://idp.example", "sub-9").await,
+        db::link_oidc_identity(&pool, &bob_session, "bob", "https://idp.example", "sub-9").await,
         Err(db::DbError::BadCredentials)
     ));
     db::set_account_suspended(&pool, bob_id, false, "alice", &[])
@@ -6803,9 +7004,21 @@ async fn oidc_identity_link_list_and_conflict() {
         .expect("reactivate bob");
 
     // A second identity for alice; listing is issuer/subject-ordered.
-    db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-0")
+    db::link_oidc_identity(
+        &pool,
+        &db::create_web_session(
+            &pool,
+            &db::VerifiedAccount::established("alice".to_string()),
+            None,
+        )
         .await
-        .expect("link2");
+        .expect("linking session"),
+        "alice",
+        "https://idp.example",
+        "sub-0",
+    )
+    .await
+    .expect("link2");
     let identities = db::list_oidc_identities(&pool, "alice")
         .await
         .expect("list");
@@ -6828,7 +7041,7 @@ async fn oidc_identity_link_list_and_conflict() {
     // identity. A local session and the other identity's session survive.
     let removed_session = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             issuer: Some("https://idp.example"),
             subject: Some("sub-0"),
@@ -6840,7 +7053,7 @@ async fn oidc_identity_link_list_and_conflict() {
     .expect("removed identity session");
     let retained_session = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             issuer: Some("https://idp.example"),
             subject: Some("sub-1"),
@@ -6850,9 +7063,13 @@ async fn oidc_identity_link_list_and_conflict() {
     )
     .await
     .expect("retained identity session");
-    let local_session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("local session");
+    let local_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("local session");
     assert_eq!(
         db::unlink_oidc_identity(&pool, "alice", identities[0].id)
             .await
@@ -6899,9 +7116,21 @@ async fn oidc_identity_link_list_and_conflict() {
         db::find_or_create_oidc_account(&pool, "https://idp.example", "oidc-only-0", "oidc-only")
             .await
             .expect("OIDC-only account");
-    db::link_oidc_identity(&pool, &oidc_only, "https://idp.example", "oidc-only-1")
+    db::link_oidc_identity(
+        &pool,
+        &db::create_web_session(
+            &pool,
+            &db::VerifiedAccount::established(oidc_only.to_string()),
+            None,
+        )
         .await
-        .expect("second OIDC-only identity");
+        .expect("linking session"),
+        &oidc_only,
+        "https://idp.example",
+        "oidc-only-1",
+    )
+    .await
+    .expect("second OIDC-only identity");
     let oidc_identities = db::list_oidc_identities(&pool, &oidc_only)
         .await
         .expect("OIDC-only identities");
@@ -6947,9 +7176,13 @@ async fn oidc_web_session_records_logout_hint() {
         .expect("acct");
 
     // A plain session carries no logout hint.
-    let plain = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("plain");
+    let plain = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("plain");
     assert_eq!(
         db::session_logout_hint(&pool, &plain).await.expect("hint"),
         db::SessionLogoutHint {
@@ -6961,7 +7194,7 @@ async fn oidc_web_session_records_logout_hint() {
     // An OIDC session records the id token + provider for RP-initiated logout.
     let sso = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("the.id.token"),
             provider: Some("shauth"),
@@ -7011,7 +7244,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         .expect("acct");
     let first = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("first.id.token"),
             provider: Some("shauth"),
@@ -7027,7 +7260,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     .expect("first session");
     let second = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("second.id.token"),
             provider: Some("shauth"),
@@ -7109,7 +7342,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     );
     let third = db::create_web_session_with_identity(
         &pool,
-        "alice",
+        &e6ircd::db::VerifiedAccount::established("alice"),
         db::OidcSessionIdentity {
             id_token: Some("third.id.token"),
             provider: Some("shauth"),
@@ -7221,19 +7454,24 @@ async fn device_grants_are_pruned_on_create() {
     // A grant expired past the grace period, as a never-approved /device/start
     // flood leaves.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ('dead', 'DEADDEAD', now() - interval '1 day')",
+        "INSERT INTO device_grants (device_code_hash, user_code, client_id, expires_at)
+         VALUES (sha256(convert_to('dead', 'UTF8')), 'DEADDEAD', 'e6irc-test',
+                 now() - interval '1 day')",
     )
     .execute(&pool)
     .await
     .expect("insert expired");
     // Creating a new grant prunes expired ones (unauthenticated growth guard).
-    db::create_device_grant(&pool).await.expect("create");
-    let expired: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM device_grants WHERE device_code = 'dead'")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
+    db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("create");
+    let expired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM device_grants
+             WHERE device_code_hash = sha256(convert_to('dead', 'UTF8'))",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
     assert_eq!(expired, 0, "expired grant must be pruned on create");
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM device_grants")
         .fetch_one(&pool)
@@ -7255,14 +7493,15 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         .expect("create account");
     // A pre-approval poll is Pending, not consumed.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ('dc', 'USERCODE1', now() + interval '10 minutes')",
+        "INSERT INTO device_grants (device_code_hash, user_code, client_id, expires_at)
+         VALUES (sha256(convert_to('dc', 'UTF8')), 'USERCODE1', 'e6irc-test',
+                 now() + interval '10 minutes')",
     )
     .execute(&pool)
     .await
     .expect("insert grant");
     assert_eq!(
-        db::poll_device_grant(&pool, "dc", "device")
+        db::poll_device_grant(&pool, "dc", &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Pending,
@@ -7275,8 +7514,13 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         db::DeviceApproval::Approved,
         "a fresh grant approves"
     );
+    // The device waited out its interval.
+    sqlx::query("UPDATE device_grants SET last_polled_at = now() - interval '1 minute'")
+        .execute(&pool)
+        .await
+        .expect("pace");
     // Approved poll: consume + mint atomically, and the token must actually work.
-    let token = match db::poll_device_grant(&pool, "dc", "device")
+    let token = match db::poll_device_grant(&pool, "dc", &device_client())
         .await
         .expect("poll approved")
     {
@@ -7294,7 +7538,7 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
     // The grant is gone: a replayed poll finds nothing (single-use), and no
     // second token was minted.
     assert_eq!(
-        db::poll_device_grant(&pool, "dc", "device")
+        db::poll_device_grant(&pool, "dc", &device_client())
             .await
             .expect("poll consumed"),
         db::DeviceStatus::Unknown,
@@ -7341,7 +7585,9 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
     }
 
     // Approved with one slot left, which is then taken before the device polls.
-    let (raced_device, raced_user) = db::create_device_grant(&pool).await.expect("grant");
+    let (raced_device, raced_user) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     assert_eq!(
         db::approve_device_grant(&pool, &raced_user, "devacct")
             .await
@@ -7351,7 +7597,9 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
     mint("token 31".into()).await.expect("the last slot");
 
     // At the cap, approval is refused where a person can read why.
-    let (refused_device, refused_user) = db::create_device_grant(&pool).await.expect("grant");
+    let (refused_device, refused_user) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     assert_eq!(
         db::approve_device_grant(&pool, &refused_user, "devacct")
             .await
@@ -7359,7 +7607,7 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
         db::DeviceApproval::TokenLimitReached
     );
     assert_eq!(
-        db::poll_device_grant(&pool, &refused_device, "device")
+        db::poll_device_grant(&pool, &refused_device, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Pending,
@@ -7368,13 +7616,13 @@ async fn device_grants_mint_under_the_per_account_token_cap() {
 
     // The grant approved earlier cannot mint past the cap, and says so once.
     assert_eq!(
-        db::poll_device_grant(&pool, &raced_device, "device")
+        db::poll_device_grant(&pool, &raced_device, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Denied
     );
     assert_eq!(
-        db::poll_device_grant(&pool, &raced_device, "device")
+        db::poll_device_grant(&pool, &raced_device, &device_client())
             .await
             .expect("poll again"),
         db::DeviceStatus::Unknown,
@@ -7520,15 +7768,27 @@ async fn web_session_inventory_and_revocation_are_owner_scoped() {
 
     let desktop_agent = db::SessionUserAgent::from_header(" Desktop\tBrowser ")
         .expect("normalized desktop user agent");
-    let first = db::create_web_session(&pool, "alice", Some(&desktop_agent))
-        .await
-        .expect("first session");
-    let second = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("second session");
-    let bob = db::create_web_session(&pool, "bob", None)
-        .await
-        .expect("bob session");
+    let first = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        Some(&desktop_agent),
+    )
+    .await
+    .expect("first session");
+    let second = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("second session");
+    let bob = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("bob"),
+        None,
+    )
+    .await
+    .expect("bob session");
 
     let sessions = db::list_web_sessions(&pool, "alice", Some(&second))
         .await
@@ -7594,9 +7854,13 @@ async fn concurrent_browser_session_issuance_enforces_the_active_cap() {
     for _ in 0..(db::MAX_BROWSER_SESSIONS_PER_ACCOUNT + 8) {
         let pool = pool.clone();
         issuers.spawn(async move {
-            db::create_web_session(&pool, "alice", None)
-                .await
-                .expect("concurrent session issuance")
+            db::create_web_session(
+                &pool,
+                &e6ircd::db::VerifiedAccount::established("alice"),
+                None,
+            )
+            .await
+            .expect("concurrent session issuance")
         });
     }
     let mut tokens = Vec::new();
@@ -7758,13 +8022,19 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     let bob_id = db::create_account_with_contact(&pool, "Bob", "bob password", None)
         .await
         .expect("Bob");
-    let session = db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("browser session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("browser session");
     let token = issue_api_token(&pool, "Bob", "automation")
         .await
         .expect("personal access token");
-    let (device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
+    let (device_code, user_code) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("device grant");
     assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Bob")
             .await
@@ -7816,13 +8086,18 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
         None
     );
     assert!(matches!(
-        db::poll_device_grant(&pool, &device_code, "device")
+        db::poll_device_grant(&pool, &device_code, &device_client())
             .await
             .expect("device lookup"),
         db::DeviceStatus::Unknown
     ));
     assert!(matches!(
-        db::create_web_session(&pool, "Bob", None).await,
+        db::create_web_session(
+            &pool,
+            &e6ircd::db::VerifiedAccount::established("Bob"),
+            None
+        )
+        .await,
         Err(db::DbError::BadCredentials)
     ));
     assert!(matches!(
@@ -7838,7 +8113,7 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
         db::verify_credentials(&pool, "Bob", "bob password")
             .await
             .expect("credential query"),
-        Some("Bob".into()),
+        Some(db::VerifiedAccount::established("Bob")),
         "reactivation restores durable credentials but not revoked bearers"
     );
     let actions: Vec<String> = sqlx::query_scalar(
@@ -8043,7 +8318,7 @@ async fn account_invitations_are_single_use_expiring_and_digest_only() {
         db::verify_local_password(&pool, "bob", "invited password")
             .await
             .expect("password"),
-        Some("Bob".into())
+        Some(db::VerifiedAccount::established("Bob"))
     );
     assert!(
         db::account_flags(&pool, "Bob")
@@ -8129,9 +8404,13 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
             .expect("transfer"),
         db::FounderTransfer::Transferred { .. }
     ));
-    let session = db::create_web_session(&pool, "Bob", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Bob"),
+        None,
+    )
+    .await
+    .expect("session");
     let api_token = issue_api_token(&pool, "Bob", "automation")
         .await
         .expect("token");
@@ -8173,7 +8452,9 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     .execute(&pool)
     .await
     .expect("messages");
-    let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device");
+    let (_device_code, user_code) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("device");
     assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Bob")
             .await
@@ -8283,9 +8564,13 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     db::create_account_with_contact(&pool, "Bob", "other password", None)
         .await
         .expect("Bob");
-    let session = db::create_web_session(&pool, "Alice", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("Alice"),
+        None,
+    )
+    .await
+    .expect("session");
     let bearer = issue_api_token(&pool, "Alice", "secret-token-label")
         .await
         .expect("token");
@@ -8542,10 +8827,10 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     // An expired grant is kept for a grace period (a late poll is answered
     // `expired_token`); one past it is pruned.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
+        "INSERT INTO device_grants (device_code_hash, user_code, client_id, expires_at)
          VALUES
-           ('old-device', 'OLDDEV01', now() - interval '1 day'),
-           ('new-device', 'NEWDEV01', now() + interval '1 day')",
+           (sha256('old-device'::bytea), 'OLDDEV01', 'e6irc-test', now() - interval '1 day'),
+           (sha256('new-device'::bytea), 'NEWDEV01', 'e6irc-test', now() + interval '1 day')",
     )
     .execute(&pool)
     .await
@@ -9158,9 +9443,13 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     db::create_account_with_contact(&pool, "root", "pw", None)
         .await
         .expect("root");
-    let stale_session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let stale_session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     // Everything else the lost credential could have been used to mint is
     // revoked with it: an app password, a personal access token, a device
     // grant.
@@ -9177,7 +9466,9 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     )
     .await
     .expect("api token");
-    let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
+    let (_device_code, user_code) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("device grant");
     assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Alice")
             .await
@@ -9479,9 +9770,13 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
     let mut secrets = Vec::new();
     for index in 0..3 {
         secrets.push(
-            db::issue_app_password_for_account(&pool, "alice", &format!("device {index}"))
-                .await
-                .expect("app password"),
+            db::issue_app_password_for_account(
+                &pool,
+                &e6ircd::db::VerifiedAccount::established("alice"),
+                &format!("device {index}"),
+            )
+            .await
+            .expect("app password"),
         );
     }
     for secret in secrets.iter().chain([&"primary".to_string()]) {
@@ -9848,9 +10143,13 @@ async fn a_password_change_waiting_for_argon2_does_not_block_the_account_row() {
     db::create_account_with_contact(&pool, "alice", "current password", None)
         .await
         .expect("alice");
-    let session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
 
     // Keep every Argon2 permit busy for the whole test.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -10398,7 +10697,7 @@ async fn device_grants_name_their_account_by_id() {
     .execute(&pool)
     .await
     .expect("grants");
-    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    MIGRATIONS.run_to(91, &pool).await.expect("through 0091");
     let rows: Vec<(String, Option<i64>)> =
         sqlx::query_as("SELECT device_code, account_id FROM device_grants ORDER BY device_code")
             .fetch_all(&pool)
@@ -10418,6 +10717,61 @@ async fn device_grants_name_their_account_by_id() {
         .await
         .expect("count");
     assert_eq!(left, 1, "the account's approved grant went with it");
+}
+
+/// 0092 keeps only a device code's digest — the one the server computes — so
+/// a grant started before the upgrade is still collected with its code, and
+/// is its command-line client's.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn device_codes_are_hashed_in_place_by_migration() {
+    let pool = plain_pool(&support::test_db("device_codes_are_hashed_in_place_by_migration").await)
+        .await
+        .expect("connect");
+    MIGRATIONS.run_to(91, &pool).await.expect("through 0091");
+    sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice')")
+        .execute(&pool)
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO device_grants (device_code, user_code, account_id, expires_at)
+         VALUES ('pending-code', 'PENDING1', NULL, now() + interval '5 minutes'),
+                ('approved-code', 'APPROVE1', (SELECT id FROM accounts), now() + interval '5 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("grants");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+         WHERE table_name = 'device_grants' ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    assert!(
+        !columns.iter().any(|column| column == "device_code"),
+        "{columns:?}"
+    );
+    let clients: Vec<String> = sqlx::query_scalar("SELECT DISTINCT client_id FROM device_grants")
+        .fetch_all(&pool)
+        .await
+        .expect("clients");
+    assert_eq!(clients, ["e6irc-cli"]);
+    let client = db::DeviceClientId::parse("e6irc-cli").expect("client");
+    assert_eq!(
+        db::poll_device_grant(&pool, "pending-code", &client)
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Pending,
+        "the digest the migration stored is the one a poll computes"
+    );
+    assert!(matches!(
+        db::poll_device_grant(&pool, "approved-code", &client)
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Approved(_)
+    ));
 }
 
 // ---- audit rows commit with their mutations --------------------------------
@@ -11039,13 +11393,17 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
     )
     .await
     .expect("connect");
-    let (expired, _) = db::create_device_grant(&pool).await.expect("grant");
-    let (stale, _) = db::create_device_grant(&pool).await.expect("grant");
+    let (expired, _) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
+    let (stale, _) = db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     sqlx::query(
-        "UPDATE device_grants SET expires_at = CASE device_code
-             WHEN $1 THEN now() - interval '1 second'
+        "UPDATE device_grants SET expires_at = CASE device_code_hash
+             WHEN sha256(convert_to($1, 'UTF8')) THEN now() - interval '1 second'
              ELSE now() - interval '1 day' END
-         WHERE device_code IN ($1, $2)",
+         WHERE device_code_hash IN (sha256(convert_to($1, 'UTF8')), sha256(convert_to($2, 'UTF8')))",
     )
     .bind(&expired)
     .bind(&stale)
@@ -11053,7 +11411,9 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
     .await
     .expect("expire");
     // Both pruning paths: a new grant, and storage maintenance.
-    db::create_device_grant(&pool).await.expect("grant");
+    db::create_device_grant(&pool, &device_client())
+        .await
+        .expect("grant");
     let report = db::run_storage_maintenance(
         &pool,
         db::StorageRetention {
@@ -11066,13 +11426,13 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
     .expect("maintenance");
     assert_eq!(report.device_grants, 0, "the stale grant went at start");
     assert_eq!(
-        db::poll_device_grant(&pool, &expired, "device")
+        db::poll_device_grant(&pool, &expired, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Expired
     );
     assert_eq!(
-        db::poll_device_grant(&pool, &stale, "device")
+        db::poll_device_grant(&pool, &stale, &device_client())
             .await
             .expect("poll"),
         db::DeviceStatus::Unknown,
@@ -11123,7 +11483,7 @@ async fn password_attempts_are_bounded_per_account_name() {
             None
         );
     }
-    let throttled = |result: Result<Option<String>, db::DbError>| match result {
+    let throttled = |result: Result<Option<db::VerifiedAccount>, db::DbError>| match result {
         Err(db::DbError::LoginThrottled(retry)) => {
             assert!(
                 (1..=db::LOGIN_ATTEMPT_WINDOW.as_secs()).contains(&retry.seconds()),
@@ -11143,9 +11503,13 @@ async fn password_attempts_are_bounded_per_account_name() {
         db::issue_app_password(&pool, "alice", "correct horse", "laptop").await,
         Err(db::DbError::LoginThrottled(_))
     ));
-    let session = db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
+    let session = db::create_web_session(
+        &pool,
+        &e6ircd::db::VerifiedAccount::established("alice"),
+        None,
+    )
+    .await
+    .expect("session");
     assert!(matches!(
         db::change_local_password(&pool, "alice", "correct horse", "new password", &session).await,
         Err(db::DbError::LoginThrottled(_))
@@ -11505,13 +11869,13 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
         db::verify_credentials(&pool, "ALICE_AWAY", "administrator password")
             .await
             .expect("verify"),
-        Some("Alice".to_string())
+        Some(db::VerifiedAccount::established("Alice"))
     );
     assert_eq!(
         db::verify_local_password(&pool, "a2", "administrator password")
             .await
             .expect("verify"),
-        Some("Alice".to_string())
+        Some(db::VerifiedAccount::established("Alice"))
     );
     assert!(matches!(
         db::create_account_with_contact(&pool, "Alice_away", "pw", None).await,
@@ -11657,6 +12021,34 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
     assert_eq!(
         db::list_nick_registrations(&pool).await.expect("list"),
         db::NickRegistrations::default()
+    );
+}
+
+/// The app-password exchange mints for the account the password verified as,
+/// not for the login text: a grouped nick verified, cleared its attempt
+/// window, and was then answered as bad credentials because the mint looked up
+/// the nick as an account name.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_app_password_exchanged_through_a_grouped_nick_is_the_accounts() {
+    let (pool, _) =
+        alice_and_bob("an_app_password_exchanged_through_a_grouped_nick_is_the_accounts").await;
+    assert_eq!(
+        db::group_nick(&pool, "alice", "Alice_Away")
+            .await
+            .expect("group"),
+        db::NickGroupOutcome::Grouped
+    );
+    let app_password =
+        db::issue_app_password(&pool, "alice_away", "administrator password", "laptop")
+            .await
+            .expect("a verified grouped nick exchanges its account's password");
+    assert_eq!(
+        db::verify_credentials(&pool, "Alice", &app_password)
+            .await
+            .expect("verify"),
+        Some(db::VerifiedAccount::established("Alice")),
+        "the app password is Alice's"
     );
 }
 
@@ -12740,7 +13132,7 @@ async fn a_failed_credential_use_record_fails_both_password_checks() {
     .execute(&pool)
     .await
     .expect("trigger");
-    let failed_write = |outcome: Result<Option<String>, db::DbError>| matches!(outcome, Err(error) if error.to_string().contains("last_used_at is not writable"));
+    let failed_write = |outcome: Result<Option<db::VerifiedAccount>, db::DbError>| matches!(outcome, Err(error) if error.to_string().contains("last_used_at is not writable"));
     assert!(
         failed_write(db::verify_credentials(&pool, "user", &app_password).await),
         "an app-password login reported success past a failed write"

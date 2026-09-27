@@ -2916,13 +2916,10 @@ pub async fn issue_app_password(
     password: &str,
     label: &str,
 ) -> Result<String, DbError> {
-    if verify_local_password(pool, account, password)
-        .await?
-        .is_none()
-    {
+    let Some(verified) = verify_local_password(pool, account, password).await? else {
         return Err(DbError::BadCredentials);
-    }
-    issue_app_password_for_account(pool, account, label).await
+    };
+    issue_app_password_for_account(pool, &verified, label).await
 }
 
 /// Mint an app password for an account whose browser session has already been
@@ -2932,10 +2929,10 @@ pub async fn issue_app_password(
 /// the same cap, lock, hashing, and storage transaction.
 pub async fn issue_app_password_for_account(
     pool: &PgPool,
-    account: &str,
+    account: &VerifiedAccount,
     label: &str,
 ) -> Result<String, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
+    let folded = CaseMapping::Rfc1459.casefold(account.name());
     let mut secret_bytes = [0u8; 32];
     use argon2::password_hash::rand_core::RngCore;
     OsRng.fill_bytes(&mut secret_bytes);
@@ -3354,10 +3351,23 @@ async fn handle_request(
         // bound lives at the `ARGON2_PERMITS` choke point regardless), so make the
         // invariant load-bearing rather than shipping a second copy of the logic.
         DbRequest::VerifyPassword { .. } => unreachable!("offloaded by run_worker"),
-        DbRequest::VerifyToken { conn, token } => {
+        DbRequest::VerifyToken {
+            conn,
+            token,
+            authzid,
+        } => {
             // A bearer token is only ever presented by SASL OAUTHBEARER.
             let origin = crate::core::CredentialOrigin::Sasl;
             let outcome = match api_token_account(pool, &token).await {
+                // e6irc never lets one account act as another: a GS2
+                // authorization identity must name the token's own account.
+                Ok(Some(account))
+                    if authzid
+                        .as_deref()
+                        .is_some_and(|authzid| !CaseMapping::Rfc1459.eq(authzid, &account)) =>
+                {
+                    VerifyOutcome::Rejected
+                }
                 Ok(Some(account)) => VerifyOutcome::Verified(account),
                 Ok(None) => VerifyOutcome::Rejected,
                 Err(e) => {
@@ -4107,6 +4117,12 @@ pub enum LinkOutcome {
     AlreadyYours,
     /// The identity belongs to a different account — refused.
     Conflict,
+    /// The browser session that started the link has ended (signed out,
+    /// revoked, expired) or is not the account's — refused.
+    SessionEnded,
+    /// The browser session has not proved its person within
+    /// [`STEP_UP_WINDOW`] — refused.
+    SessionNotRecent,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -4230,13 +4246,19 @@ pub async fn unlink_oidc_identity(
     Ok(UnlinkIdentityOutcome::Unlinked)
 }
 
-/// Attach an OIDC `(issuer, subject)` to `account`. Because the pair is
-/// globally unique, an identity already owned by another account is a hard
-/// [`LinkOutcome::Conflict`], never a silent move. A suspended account cannot
-/// gain a login identity: the account is resolved through the same active-only
-/// lock every other credential mutation uses.
+/// Attach an OIDC `(issuer, subject)` to `account`, for the browser session
+/// `session` that asked. Because the pair is globally unique, an identity
+/// already owned by another account is a hard [`LinkOutcome::Conflict`], never
+/// a silent move. A suspended account cannot gain a login identity: the account
+/// is resolved through the same active-only lock every other credential
+/// mutation uses. The session is checked in the same transaction as the insert
+/// — live, the account's, and within [`STEP_UP_WINDOW`] of proving its person
+/// — and held (`FOR SHARE`) until it commits, so a sign-out or password change
+/// that ends it cannot interleave: the link lands before the session ends, or
+/// not at all.
 pub async fn link_oidc_identity(
     pool: &PgPool,
+    session: &str,
     account: &str,
     issuer: &str,
     subject: &str,
@@ -4244,6 +4266,23 @@ pub async fn link_oidc_identity(
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let account_id = lock_active_account_id(&mut transaction, &folded).await?;
+    let recent: Option<bool> = sqlx::query_scalar(
+        "SELECT authenticated_at > now() - make_interval(secs => $3)
+         FROM web_sessions
+         WHERE token_hash = $1 AND account_id = $2 AND expires_at > now()
+         FOR SHARE",
+    )
+    .bind(token_hash(session))
+    .bind(account_id)
+    .bind(STEP_UP_WINDOW.as_secs_f64())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    match recent {
+        None => return Ok(LinkOutcome::SessionEnded),
+        Some(false) => return Ok(LinkOutcome::SessionNotRecent),
+        Some(true) => {}
+    }
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
          ON CONFLICT (issuer, subject) DO NOTHING RETURNING id",
@@ -6735,7 +6774,7 @@ async fn handle_create_account(
 
 async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOutcome {
     match verify_credentials(pool, account, password).await {
-        Ok(Some(account)) => VerifyOutcome::Verified(account),
+        Ok(Some(account)) => VerifyOutcome::Verified(account.into_name()),
         Ok(None) => VerifyOutcome::Rejected,
         Err(DbError::LoginThrottled(retry_after)) => VerifyOutcome::Throttled(retry_after),
         Err(e) => {
@@ -6747,11 +6786,35 @@ async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOu
 
 // ---- device authorization grant (RFC 8628) ------------------------------
 
+/// The client a device grant was started for (RFC 8628 §3.1 `client_id`):
+/// 1–64 visible ASCII characters, RFC 6749's `VSCHAR`. There is no client
+/// registry — every device client is public — so the identifier binds a grant
+/// to whoever started it (a poll naming another is refused, RFC 6749 §4.1.3)
+/// and labels the personal access token it mints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceClientId(String);
+
+impl DeviceClientId {
+    pub fn parse(raw: &str) -> Option<Self> {
+        (!raw.is_empty()
+            && raw.len() <= 64
+            && raw.bytes().all(|byte| (0x20..=0x7e).contains(&byte)))
+        .then(|| Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// State of a device grant when polled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceStatus {
     /// Not yet approved by a user.
     Pending,
+    /// Polled sooner than the grant's interval since its last poll. The
+    /// interval has grown by [`DEVICE_POLL_SLOW_DOWN_SECONDS`] (RFC 8628 §3.5).
+    SlowDown,
     /// Approved; the grant is consumed and a freshly-minted API token returned.
     /// Consuming the grant and minting the token happen in one transaction, so
     /// an approved grant is never destroyed by a token-mint failure.
@@ -6763,9 +6826,18 @@ pub enum DeviceStatus {
     Denied,
     /// The grant window elapsed.
     Expired,
-    /// No such grant (bad or already-consumed device code).
+    /// No such grant (bad or already-consumed device code), or one another
+    /// client started.
     Unknown,
 }
+
+/// How long a device waits between polls when a grant starts: RFC 8628 §3.2
+/// `interval`, advertised by `/device/start` from this same value.
+pub const DEVICE_POLL_INTERVAL_SECONDS: u16 = 5;
+
+/// How much a poll sooner than its grant's interval lengthens the interval
+/// (RFC 8628 §3.5 `slow_down`).
+pub const DEVICE_POLL_SLOW_DOWN_SECONDS: i32 = 5;
 
 /// How long a device grant may be approved and polled: RFC 8628 `expires_in`,
 /// advertised by `/device/start` from this same value.
@@ -6780,7 +6852,10 @@ const DEVICE_GRANT_EXPIRED_RETENTION_SECONDS: i32 = 600;
 /// Start a device grant: a secret `device_code` the client polls with and
 /// a short `user_code` the user enters to approve. Valid for
 /// [`DEVICE_GRANT_LIFETIME_SECONDS`].
-pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbError> {
+pub async fn create_device_grant(
+    pool: &PgPool,
+    client: &DeviceClientId,
+) -> Result<(String, String), DbError> {
     use argon2::password_hash::rand_core::RngCore;
     // URL-safe: a device code in a form body spelled with `+` would arrive as
     // a space from any client that does not percent-encode it.
@@ -6811,12 +6886,17 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
         .execute(pool)
         .await
         .map_err(query_error)?;
+    // Only the code's digest is kept, as for every other bearer: a read of
+    // this table cannot collect an approved grant's token.
     sqlx::query(
-        "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ($1, $2, now() + make_interval(secs => $3))",
+        "INSERT INTO device_grants
+             (device_code_hash, user_code, client_id, poll_interval_seconds, expires_at)
+         VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
     )
-    .bind(&device_code)
+    .bind(token_hash(&device_code))
     .bind(&user_code)
+    .bind(client.as_str())
+    .bind(i32::from(DEVICE_POLL_INTERVAL_SECONDS))
     .bind(i32::from(DEVICE_GRANT_LIFETIME_SECONDS))
     .execute(pool)
     .await
@@ -6869,9 +6949,15 @@ pub async fn approve_device_grant(
     })
 }
 
-/// Poll a grant; if approved and valid, atomically consume it and mint the
-/// caller's API token (labelled `token_label`) in the same transaction,
-/// returning the token in [`DeviceStatus::Approved`].
+/// Poll a grant for `client`; if approved and valid, atomically consume it and
+/// mint the caller's API token (labelled with the client's identifier) in the
+/// same transaction, returning the token in [`DeviceStatus::Approved`].
+///
+/// A grant is `client`'s only if that client started it; another's code is
+/// [`DeviceStatus::Unknown`]. Each poll is paced (RFC 8628 §3.5): one that
+/// arrives sooner than the grant's interval after the previous poll is
+/// answered [`DeviceStatus::SlowDown`], whatever the grant's state, and
+/// lengthens the interval by [`DEVICE_POLL_SLOW_DOWN_SECONDS`].
 ///
 /// Consume-and-mint is one transaction on purpose: if the mint fails for a
 /// transient reason (a database error), the transaction rolls back and the
@@ -6885,15 +6971,59 @@ pub async fn approve_device_grant(
 pub async fn poll_device_grant(
     pool: &PgPool,
     device_code: &str,
-    token_label: &str,
+    client: &DeviceClientId,
 ) -> Result<DeviceStatus, DbError> {
+    let code_hash = token_hash(device_code);
     let mut tx = pool.begin().await.map_err(query_error)?;
+    // Record the poll, and lengthen the interval of one that came too soon.
+    // The row lock this takes also orders concurrent polls of one code.
+    let paced: Option<(bool, bool)> = sqlx::query_as(
+        "WITH polled AS (
+             SELECT id,
+                    last_polled_at IS NOT NULL
+                        AND now() < last_polled_at
+                                    + make_interval(secs => poll_interval_seconds)
+                        AS too_soon
+             FROM device_grants
+             WHERE device_code_hash = $1 AND client_id = $2
+             FOR UPDATE
+         )
+         UPDATE device_grants g
+         SET last_polled_at = now(),
+             poll_interval_seconds = CASE
+                 WHEN polled.too_soon
+                 THEN LEAST(g.poll_interval_seconds + $3, $4)
+                 ELSE g.poll_interval_seconds
+             END
+         FROM polled
+         WHERE g.id = polled.id
+         RETURNING polled.too_soon, g.expires_at > now()",
+    )
+    .bind(&code_hash)
+    .bind(client.as_str())
+    .bind(DEVICE_POLL_SLOW_DOWN_SECONDS)
+    .bind(i32::from(DEVICE_GRANT_LIFETIME_SECONDS))
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(query_error)?;
+    match paced {
+        None => return Ok(DeviceStatus::Unknown),
+        Some((true, _)) => {
+            tx.commit().await.map_err(query_error)?;
+            return Ok(DeviceStatus::SlowDown);
+        }
+        Some((false, false)) => {
+            tx.commit().await.map_err(query_error)?;
+            return Ok(DeviceStatus::Expired);
+        }
+        Some((false, true)) => {}
+    }
     let approved: Option<String> = sqlx::query_scalar(
         "DELETE FROM device_grants g USING accounts a
-         WHERE g.device_code = $1 AND g.account_id = a.id AND g.expires_at > now()
+         WHERE g.device_code_hash = $1 AND g.account_id = a.id
          RETURNING a.name",
     )
-    .bind(device_code)
+    .bind(&code_hash)
     .fetch_optional(&mut *tx)
     .await
     .map_err(query_error)?;
@@ -6904,7 +7034,7 @@ pub async fn poll_device_grant(
         let token = match mint_api_token_under_cap(
             &mut tx,
             &account,
-            token_label,
+            client.as_str(),
             crate::identity::ApiTokenScopes::device_access(),
             crate::identity::ApiTokenLifetimeDays::DEFAULT,
         )
@@ -6941,18 +7071,9 @@ pub async fn poll_device_grant(
         tx.commit().await.map_err(query_error)?;
         return Ok(DeviceStatus::Approved(token));
     }
-    let row: Option<(bool,)> =
-        sqlx::query_as("SELECT expires_at > now() FROM device_grants WHERE device_code = $1")
-            .bind(device_code)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
+    // The recorded poll commits with the answer.
     tx.commit().await.map_err(query_error)?;
-    Ok(match row {
-        Some((true,)) => DeviceStatus::Pending,
-        Some((false,)) => DeviceStatus::Expired,
-        None => DeviceStatus::Unknown,
-    })
+    Ok(DeviceStatus::Pending)
 }
 
 /// Aggregate server counts for the admin API: `(accounts, registered
@@ -7368,6 +7489,42 @@ struct CredentialVerificationRow {
     credential_id: i64,
 }
 
+/// The account a credential was verified as: the account's stored name, as the
+/// store answered it — never the login text that was presented, which may be a
+/// grouped nick or another casing of it. What grants lasting authority (an app
+/// password, a browser session) takes only this, so a verification and the
+/// grant that follows cannot name two different things: minting with the
+/// presented text once answered a verified grouped nick with a 401, after the
+/// verification had already cleared the name's attempt window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAccount(String);
+
+impl VerifiedAccount {
+    /// An account whose identity another authority established — one just
+    /// created from the caller's own password, an OpenID Connect identity, a
+    /// live browser session. `name` is the account's stored name, as that
+    /// authority resolved it.
+    pub fn established(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_name(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedAccount {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Verify an account password or app password.
 ///
 /// Every attempt costs two Argon2 computations under one permit, whether or
@@ -7378,7 +7535,7 @@ pub async fn verify_credentials(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedAccount>, DbError> {
     let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
@@ -7392,7 +7549,7 @@ async fn verify_any_credential(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedAccount>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let display_name: Option<String> =
         sqlx::query_scalar("SELECT name FROM accounts WHERE name_folded = $1 AND (flags & $2) = 0")
@@ -7421,7 +7578,7 @@ async fn verify_any_credential(
         return Ok(None);
     };
     record_credential_use(pool, id).await?;
-    Ok(Some(display_name))
+    Ok(Some(VerifiedAccount(display_name)))
 }
 
 /// Record that credential `credential_id` just verified, for the credential
@@ -7443,7 +7600,7 @@ pub async fn verify_local_password(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedAccount>, DbError> {
     let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
@@ -7457,7 +7614,7 @@ async fn verify_primary_password(
     pool: &PgPool,
     account: &str,
     password: &str,
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<VerifiedAccount>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let row: Option<CredentialVerificationRow> = sqlx::query_as(
         "SELECT a.name AS display_name, c.argon2_hash, c.id AS credential_id FROM accounts a
@@ -7491,7 +7648,7 @@ async fn verify_primary_password(
     .await?;
     if matched.is_some() {
         record_credential_use(pool, credential_id).await?;
-        Ok(Some(display_name))
+        Ok(Some(VerifiedAccount(display_name)))
     } else {
         Ok(None)
     }
@@ -9600,7 +9757,7 @@ pub const MAX_BROWSER_SESSIONS_PER_ACCOUNT: usize = 32;
 /// caller; only its SHA-256 is stored. The session expires after 14 days.
 pub async fn create_web_session(
     pool: &PgPool,
-    account: &str,
+    account: &VerifiedAccount,
     user_agent: Option<&SessionUserAgent>,
 ) -> Result<String, DbError> {
     create_web_session_with_identity(pool, account, OidcSessionIdentity::default(), user_agent)
@@ -9612,10 +9769,11 @@ pub async fn create_web_session(
 /// in.
 pub async fn create_web_session_with_identity(
     pool: &PgPool,
-    account: &str,
+    account: &VerifiedAccount,
     identity: OidcSessionIdentity<'_>,
     user_agent: Option<&SessionUserAgent>,
 ) -> Result<String, DbError> {
+    let account = account.name();
     let OidcSessionIdentity {
         id_token,
         provider,

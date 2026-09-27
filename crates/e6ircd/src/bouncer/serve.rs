@@ -1958,7 +1958,7 @@ async fn verify_plain(
     // fail closed, but surface the error instead of silently masking it as a
     // bad password.
     match crate::db::verify_credentials(pool, account, &credentials.password).await {
-        Ok(Some(name)) => PlainVerification::Accepted(name, network),
+        Ok(Some(name)) => PlainVerification::Accepted(name.into_name(), network),
         Ok(None) => PlainVerification::Rejected,
         Err(crate::db::DbError::LoginThrottled(retry_after)) => {
             PlainVerification::Throttled(retry_after)

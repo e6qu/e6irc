@@ -265,7 +265,7 @@ pub(crate) async fn nickserv_drop(
         eprintln!("NickServ DROP: no network registry; account deletion is unavailable");
         return AccountDropOutcome::Unavailable;
     };
-    let account_id = match crate::db::account_id_by_name(pool, &verified).await {
+    let account_id = match crate::db::account_id_by_name(pool, verified.name()).await {
         Ok(Some(account_id)) => account_id,
         Ok(None) => return AccountDropOutcome::Rejected,
         Err(error) => {
@@ -273,7 +273,7 @@ pub(crate) async fn nickserv_drop(
             return AccountDropOutcome::Unavailable;
         }
     };
-    match deletion.delete(&verified, account_id, true).await {
+    match deletion.delete(verified.name(), account_id, true).await {
         Ok(_) => AccountDropOutcome::Dropped,
         Err(AccountDeletionError::Refused(reason)) => AccountDropOutcome::Refused(reason),
         Err(AccountDeletionError::NotFound) => AccountDropOutcome::Rejected,

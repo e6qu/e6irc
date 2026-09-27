@@ -20,15 +20,21 @@ struct DeviceStartResponse {
     expires_in: u16,
 }
 
+/// A device access token response (RFC 6749 §5.1).
 #[derive(serde::Serialize)]
 struct DeviceTokenResponse {
     access_token: String,
     token_type: &'static str,
+    expires_in: u64,
+    scope: String,
 }
 
+/// An OAuth error response body (RFC 6749 §5.2).
 #[derive(serde::Serialize)]
-struct DeviceErrorResponse<'a> {
-    error: &'a str,
+struct DeviceErrorResponse {
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_description: Option<&'static str>,
 }
 
 #[derive(serde::Serialize)]
@@ -296,12 +302,89 @@ struct ServerInfoResponse {
 
 // ---- device authorization grant (RFC 8628) ------------------------------
 
-/// Start a device grant. No auth: the client is not yet a principal, but each
-/// call inserts a live `device_grants` row that pruning cannot touch for 10
-/// minutes — `RateLimited` caps the per-address rate (`limits.auth_rate_burst`,
-/// on unless the operator turned it off) so an anonymous flood can't
-/// accumulate rows unboundedly.
-pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLimited) -> Response {
+/// The grant type a device access token request names (RFC 8628 §3.4).
+const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// The scope every device grant issues: [`crate::identity::ApiTokenScopes::device_access`],
+/// spelled as an OAuth scope (RFC 6749 §3.3).
+fn device_scope() -> String {
+    crate::identity::ApiTokenScopes::device_access()
+        .iter()
+        .map(crate::identity::ApiTokenScope::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An OAuth error response (RFC 6749 §5.2, which RFC 8628 §3.5 extends): a 400
+/// with a JSON `error` code, never cached.
+fn oauth_error(code: &'static str, description: Option<&'static str>) -> Response {
+    let mut response = (
+        StatusCode::BAD_REQUEST,
+        axum::Json(DeviceErrorResponse {
+            error: code,
+            error_description: description,
+        }),
+    )
+        .into_response();
+    no_store(response.headers_mut());
+    response
+}
+
+/// An OAuth parameter as RFC 6749 §3.1 reads it: one sent without a value is
+/// treated as omitted.
+fn oauth_parameter(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// The device authorization request (RFC 8628 §3.1), a form body. Parameters
+/// this endpoint does not define are ignored, as RFC 6749 §3.1 requires; one
+/// sent twice is refused.
+#[derive(Deserialize)]
+pub(super) struct DeviceStartForm {
+    client_id: Option<String>,
+    scope: Option<String>,
+}
+
+/// Start a device grant (RFC 8628 §3.1–3.2). No auth: the client is not yet a
+/// principal, but each call inserts a live `device_grants` row that pruning
+/// cannot touch for 10 minutes — `RateLimited` caps the per-address rate
+/// (`limits.auth_rate_burst`, on unless the operator turned it off) so an
+/// anonymous flood can't accumulate rows unboundedly.
+pub(super) async fn device_start(
+    State(state): State<Arc<AppState>>,
+    _rl: RateLimited,
+    form: Result<Form<DeviceStartForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let Ok(Form(form)) = form else {
+        return oauth_error(
+            "invalid_request",
+            Some("send client_id as application/x-www-form-urlencoded, each parameter once"),
+        );
+    };
+    let Some(client) = oauth_parameter(form.client_id) else {
+        return oauth_error("invalid_request", Some("client_id is required"));
+    };
+    let Some(client) = crate::db::DeviceClientId::parse(&client) else {
+        return oauth_error(
+            "invalid_request",
+            Some("client_id is 1-64 visible ASCII characters"),
+        );
+    };
+    // The scope a device grant issues is fixed. A request may name it (in any
+    // order), but not ask for more or less than it gets.
+    if let Some(requested) = oauth_parameter(form.scope) {
+        let mut requested: Vec<&str> = requested.split(' ').collect();
+        requested.sort_unstable();
+        let issued = device_scope();
+        let mut issued: Vec<&str> = issued.split(' ').collect();
+        issued.sort_unstable();
+        if requested != issued {
+            return oauth_error(
+                "invalid_scope",
+                Some("a device grant issues exactly the scope 'read write irc'"),
+            );
+        }
+    }
     let Some(verification_uri) = device_verification_uri(state.public_url.as_deref()) else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -310,12 +393,12 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
         );
     };
     let pool = require_pool!(state);
-    match crate::db::create_device_grant(pool).await {
+    match crate::db::create_device_grant(pool, &client).await {
         Ok((device_code, user_code)) => json_no_store(DeviceStartResponse {
             device_code,
             user_code,
             verification_uri,
-            interval: 5,
+            interval: crate::db::DEVICE_POLL_INTERVAL_SECONDS,
             expires_in: crate::db::DEVICE_GRANT_LIFETIME_SECONDS,
         }),
         Err(e) => {
@@ -333,40 +416,70 @@ fn device_verification_uri(public_url: Option<&str>) -> Option<String> {
     public_url.map(|url| format!("{}/device", url.trim_end_matches('/')))
 }
 
+/// The device access token request (RFC 8628 §3.4), a form body. Parameters
+/// this endpoint does not define are ignored, as RFC 6749 §3.1 requires; one
+/// sent twice is refused.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct DeviceTokenReq {
-    pub(super) device_code: String,
+pub(super) struct DeviceTokenForm {
+    grant_type: Option<String>,
+    device_code: Option<String>,
+    client_id: Option<String>,
 }
 
-/// Poll for the token. RFC 8628 error codes on the not-yet-ready cases.
+/// Poll for the token (RFC 8628 §3.4–3.5): the token on approval, otherwise
+/// one of RFC 8628's error codes as a 400 with a JSON body.
 pub(super) async fn device_token(
     State(state): State<Arc<AppState>>,
     // Unauthenticated and each poll opens a DB transaction in `poll_device_grant`
     // *before* validating the code, so an anonymous flood of bogus codes would
     // saturate the connection pool. Rate-limit per client IP like every sibling.
     _rl: RateLimited,
-    JsonBody(req): JsonBody<DeviceTokenReq>,
+    form: Result<Form<DeviceTokenForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let pool = require_pool!(state);
-    let oauth_err = |code: &str| {
-        (
-            StatusCode::BAD_REQUEST,
-            axum::Json(DeviceErrorResponse { error: code }),
-        )
-            .into_response()
+    let Ok(Form(form)) = form else {
+        return oauth_error(
+            "invalid_request",
+            Some(
+                "send grant_type, device_code and client_id as \
+                 application/x-www-form-urlencoded, each parameter once",
+            ),
+        );
     };
+    let (Some(grant_type), Some(device_code), Some(client)) = (
+        oauth_parameter(form.grant_type),
+        oauth_parameter(form.device_code),
+        oauth_parameter(form.client_id),
+    ) else {
+        return oauth_error(
+            "invalid_request",
+            Some("grant_type, device_code and client_id are required"),
+        );
+    };
+    if grant_type != DEVICE_CODE_GRANT_TYPE {
+        return oauth_error("unsupported_grant_type", None);
+    }
+    // No grant was ever started for a client identifier that does not parse.
+    let Some(client) = crate::db::DeviceClientId::parse(&client) else {
+        return oauth_error("invalid_grant", None);
+    };
+    let pool = require_pool!(state);
     // The grant is consumed and the token minted in one transaction inside
     // `poll_device_grant`, so a mint failure can't destroy an approved grant.
-    match crate::db::poll_device_grant(pool, &req.device_code, "device").await {
+    match crate::db::poll_device_grant(pool, &device_code, &client).await {
         Ok(crate::db::DeviceStatus::Approved(token)) => json_no_store(DeviceTokenResponse {
             access_token: token,
-            token_type: "bearer",
+            token_type: "Bearer",
+            expires_in: u64::from(crate::identity::ApiTokenLifetimeDays::DEFAULT.value()) * 86_400,
+            scope: device_scope(),
         }),
-        Ok(crate::db::DeviceStatus::Pending) => oauth_err("authorization_pending"),
-        Ok(crate::db::DeviceStatus::Denied) => oauth_err("access_denied"),
-        Ok(crate::db::DeviceStatus::Expired) => oauth_err("expired_token"),
-        Ok(crate::db::DeviceStatus::Unknown) => oauth_err("invalid_grant"),
+        Ok(crate::db::DeviceStatus::Pending) => oauth_error("authorization_pending", None),
+        Ok(crate::db::DeviceStatus::SlowDown) => oauth_error(
+            "slow_down",
+            Some("polled sooner than the interval; it is now 5 seconds longer"),
+        ),
+        Ok(crate::db::DeviceStatus::Denied) => oauth_error("access_denied", None),
+        Ok(crate::db::DeviceStatus::Expired) => oauth_error("expired_token", None),
+        Ok(crate::db::DeviceStatus::Unknown) => oauth_error("invalid_grant", None),
         Err(e) => {
             eprintln!("http: device poll failed: {e}");
             problem(
@@ -3037,12 +3150,53 @@ mod token_request_tests {
         );
     }
 
-    #[test]
-    fn device_requests_reject_unknown_fields() {
+    /// A form body as the device endpoints extract it.
+    async fn oauth_form<T: serde::de::DeserializeOwned + Send>(body: &'static str) -> Option<T> {
+        use axum::extract::FromRequest;
+        let request = axum::http::Request::post("/")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        Form::<T>::from_request(request, &())
+            .await
+            .ok()
+            .map(|Form(form)| form)
+    }
+
+    /// RFC 6749 §3.1: an OAuth endpoint ignores parameters it does not
+    /// define, and refuses one sent twice.
+    #[tokio::test]
+    async fn device_oauth_forms_ignore_unknown_parameters_and_refuse_repeated_ones() {
+        let form: DeviceTokenForm = oauth_form(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code\
+             &device_code=code&client_id=e6irc-cli&extension=1",
+        )
+        .await
+        .expect("an unknown parameter is ignored");
+        assert_eq!(form.device_code.as_deref(), Some("code"));
+        assert_eq!(form.grant_type.as_deref(), Some(DEVICE_CODE_GRANT_TYPE));
         assert!(
-            serde_json::from_str::<DeviceTokenReq>(r#"{"device_code":"code","extra":true}"#)
-                .is_err()
+            oauth_form::<DeviceTokenForm>("device_code=a&device_code=b")
+                .await
+                .is_none()
         );
+        assert!(
+            oauth_form::<DeviceStartForm>("client_id=a&client_id=b")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            oauth_parameter(Some(String::new())),
+            None,
+            "empty is omitted"
+        );
+    }
+
+    #[test]
+    fn device_approval_rejects_unknown_fields() {
         assert!(
             serde_json::from_str::<DeviceApproveReq>(r#"{"user_code":"ABCD-EFGH","extra":true}"#)
                 .is_err()
@@ -3066,10 +3220,21 @@ mod token_request_tests {
 
         let token = serde_json::to_string(&DeviceTokenResponse {
             access_token: "secret".into(),
-            token_type: "bearer",
+            token_type: "Bearer",
+            expires_in: 2_592_000,
+            scope: device_scope(),
         })
         .unwrap();
-        assert_eq!(token, r#"{"access_token":"secret","token_type":"bearer"}"#);
+        assert_eq!(
+            token,
+            r#"{"access_token":"secret","token_type":"Bearer","expires_in":2592000,"scope":"read write irc"}"#
+        );
+        let error = serde_json::to_string(&DeviceErrorResponse {
+            error: "slow_down",
+            error_description: None,
+        })
+        .unwrap();
+        assert_eq!(error, r#"{"error":"slow_down"}"#);
     }
 }
 

@@ -1507,21 +1507,38 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/auth/device/start": {
                 "post": { "summary": "Begin an RFC 8628 device authorization grant",
-                    "responses": { "200": { "description": "device_code, user_code, verification_uri" },
+                    "description": "RFC 8628 §3.1: a form body naming the client. Parameters the endpoint does not define are ignored (RFC 6749 §3.1); one sent twice is refused. Every device grant issues the scope `read write irc`; a request may name exactly that scope.",
+                    "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["client_id"],
+                            "properties": {
+                                "client_id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[\\x20-\\x7E]+$", "description": "The client starting the grant; the grant is bound to it and its token is labelled with it." },
+                                "scope": { "type": "string", "description": "Optional; if sent, exactly `read write irc` in any order." }
+                            }
+                        }
+                    } } },
+                    "responses": { "200": { "description": "RFC 8628 §3.2: device_code, user_code, verification_uri, expires_in, and interval (the seconds a device waits between polls)" },
+                        "400": { "description": "RFC 6749 §5.2 error: invalid_request (not a form, a repeated parameter, or a missing or malformed client_id) or invalid_scope" },
                         "503": { "description": "database or absolute public URL unavailable" } } }
             },
             "/api/v1/auth/device/token": {
                 "post": { "summary": "Poll for the device grant's token",
-                    "requestBody": { "required": true, "content": { "application/json": {
+                    "description": "RFC 8628 §3.4: a form body. Parameters the endpoint does not define are ignored (RFC 6749 §3.1); one sent twice is refused. Each device code's polls are paced: one sooner than the grant's interval after the previous poll is answered `slow_down` and lengthens the interval by 5 seconds (§3.5).",
+                    "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": {
                         "schema": {
-                            "type": "object", "additionalProperties": false,
-                            "required": ["device_code"],
-                            "properties": { "device_code": { "type": "string", "minLength": 1 } }
+                            "type": "object",
+                            "required": ["grant_type", "device_code", "client_id"],
+                            "properties": {
+                                "grant_type": { "type": "string", "enum": ["urn:ietf:params:oauth:grant-type:device_code"] },
+                                "device_code": { "type": "string", "minLength": 1 },
+                                "client_id": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The client that started the grant; another client's device code is `invalid_grant`." }
+                            }
                         }
                     } } },
-                    "responses": { "200": { "description": "access_token once approved" },
+                    "responses": { "200": { "description": "RFC 6749 §5.1 once approved: access_token, token_type Bearer, expires_in, and scope" },
                         "503": { "description": "no database configured, or the database is unavailable" },
-                        "400": { "description": "RFC 8628 error: authorization_pending, expired_token, invalid_grant, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
+                        "400": { "description": "RFC 8628 §3.5 error: authorization_pending (poll again after the interval), slow_down (the interval grew by 5 seconds), expired_token, invalid_grant (unknown, consumed, or another client's device code), invalid_request, unsupported_grant_type, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
             },
             "/api/v1/auth/device/approve": {
                 "post": {
@@ -1604,7 +1621,7 @@ fn operations() -> serde_json::Value {
                             "required": ["new_password"],
                             "properties": {
                                 "current_password": { "type": "string", "minLength": 1, "maxLength": 512 },
-                                "new_password": { "type": "string", "minLength": 1, "maxLength": 512 }
+                                "new_password": { "type": "string", "minLength": 8, "maxLength": 512, "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes." }
                             }
                         }
                     } } },
@@ -2069,7 +2086,7 @@ fn operations() -> serde_json::Value {
                             "additionalProperties": false,
                             "properties": {
                                 "account": { "type": "string", "maxLength": 64 },
-                                "password": { "type": "string", "maxLength": 512 },
+                                "password": { "type": "string", "minLength": 8, "maxLength": 512, "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes." },
                                 "contact_email": { "type": ["string", "null"], "maxLength": 254 },
                                 "administrator": { "type": "boolean", "default": false }
                             }

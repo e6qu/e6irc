@@ -240,13 +240,17 @@ authenticated browser session.
 
 **Flow.**
 
-1. The client posts to `/api/v1/auth/device/start` and receives a device code,
-   human user code, verification URI, expiry, and polling interval.
+1. The client posts its `client_id` as a form to `/api/v1/auth/device/start`
+   (RFC 8628 §3.1) and receives a device code, human user code, verification
+   URI, expiry, and polling interval.
 2. It displays the verification URI and code; the server’s advertised
    `/device` page exists and is usable.
 3. The user signs in in a browser, reviews the code, and approves it through a
    CSRF-protected form/API.
-4. The client polls `/api/v1/auth/device/token`, respecting the interval.
+4. The client polls `/api/v1/auth/device/token` with the RFC 8628 §3.4 form
+   (`grant_type`, `device_code`, its `client_id`), respecting the interval:
+   a poll sooner than it is answered `slow_down` and the interval grows by 5
+   seconds.
 5. An approved code is atomically consumed while the personal access token is
    minted; replay cannot create a second token.
 
@@ -255,7 +259,9 @@ consumed, or unapproved codes receive their specified error. Polling and start
 are rate-limited; live grants are bounded and stale grants are pruned.
 
 **Security and observability.** Device and user codes are random, bounded,
-short-lived, and stored separately from the resulting token. Approval is
+short-lived, and stored separately from the resulting token; the device code
+is stored only as its SHA-256, and a grant answers only the client that
+started it. Approval is
 session-authenticated and CSRF-protected; polling metrics use fixed outcomes
 without codes, tokens, or account names. A bearer cannot approve a grant.
 

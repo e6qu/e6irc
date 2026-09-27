@@ -1938,6 +1938,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const passwordField = (label, name, autocomplete) => {
         const { label: field, control: input } = labelledControl("input", name, label);
         input.type = "password"; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
+        if (autocomplete === "new-password") input.minLength = 8;
         addRevealControl(input);
         return field;
       };

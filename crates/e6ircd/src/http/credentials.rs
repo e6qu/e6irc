@@ -559,7 +559,12 @@ pub(super) async fn create_session_app_password(
         return response;
     }
     app_password_issue_response(
-        crate::db::issue_app_password_for_account(pool_of(&state), &account, &request.label).await,
+        crate::db::issue_app_password_for_account(
+            pool_of(&state),
+            &crate::db::VerifiedAccount::established(account.as_str()),
+            &request.label,
+        )
+        .await,
         request.label,
     )
 }
@@ -603,8 +608,8 @@ pub(super) async fn change_password(
     if let Some(detail) = req
         .current_password
         .as_deref()
-        .and_then(password_input_error)
-        .or_else(|| password_input_error(&req.new_password))
+        .and_then(presented_password_error)
+        .or_else(|| new_password_error(&req.new_password))
     {
         return problem(StatusCode::BAD_REQUEST, "Invalid password", Some(detail));
     }

@@ -452,16 +452,31 @@ pub(super) fn validate_label(label: &str) -> Option<Response> {
         .map(|detail| problem(StatusCode::BAD_REQUEST, "Invalid label", Some(&detail)))
 }
 
+/// The bound on a login's account name and presented password, checked before
+/// any Argon2 work ([`presented_password_error`]).
 pub(super) fn credential_input_error(account: &str, password: &str) -> Option<&'static str> {
     if account.is_empty() || account.len() > MAX_ACCOUNT_LEN {
         return Some("Account names must contain 1–64 bytes.");
     }
-    password_input_error(password)
+    presented_password_error(password)
 }
 
-/// The password rule IRC `REGISTER` and NickServ `REGISTER` apply too
-/// ([`crate::identity::NewPassword`]).
-pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
+/// The bound on a password presented for *verification* — a login, the
+/// app-password exchange, a re-authentication, a change's current password:
+/// 1–512 bytes. It is not the rule for a password being set
+/// ([`new_password_error`]): an account whose password predates that rule
+/// still signs in with it.
+pub(super) fn presented_password_error(password: &str) -> Option<&'static str> {
+    if password.is_empty() || password.len() > 512 {
+        Some("Passwords must contain 1–512 bytes.")
+    } else {
+        None
+    }
+}
+
+/// The rule for a password being *set*, which IRC `REGISTER` and NickServ
+/// `REGISTER` apply too ([`crate::identity::NewPassword`]).
+pub(super) fn new_password_error(password: &str) -> Option<&'static str> {
     crate::identity::NewPassword::parse(password)
         .err()
         .map(crate::identity::PasswordRefusal::explanation)
@@ -926,7 +941,7 @@ pub(super) async fn create_account_lifecycle(
             "The account must be a valid IRC nickname of at most 64 bytes.".into(),
         ));
     }
-    if let Some(detail) = password_input_error(password) {
+    if let Some(detail) = new_password_error(password) {
         return Err((StatusCode::BAD_REQUEST, detail.into()));
     }
     if let Some(detail) = state.unclaimable_account_name(account) {
@@ -2575,7 +2590,7 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        if let Some(detail) = password_input_error(&form.password) {
+        if let Some(detail) = new_password_error(&form.password) {
             return bootstrap_response(
                 &state,
                 form.account,
@@ -2623,18 +2638,23 @@ mod pages {
         }
         state.bootstrap_available.store(false, Ordering::Release);
         let user_agent = super::session_user_agent(&headers);
-        let token =
-            match crate::db::create_web_session(pool, &form.account, user_agent.as_ref()).await {
-                Ok(token) => token,
-                Err(error) => {
-                    eprintln!("bootstrap session creation failed: {error}");
-                    return problem(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Administrator created; session storage failed",
-                        Some("Sign in with the administrator account to continue."),
-                    );
-                }
-            };
+        let token = match crate::db::create_web_session(
+            pool,
+            &crate::db::VerifiedAccount::established(form.account.as_str()),
+            user_agent.as_ref(),
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("bootstrap session creation failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Administrator created; session storage failed",
+                    Some("Sign in with the administrator account to continue."),
+                );
+            }
+        };
         authenticated_redirect(
             &token,
             "/console",
@@ -2773,7 +2793,7 @@ mod pages {
                 StatusCode::FORBIDDEN,
             );
         }
-        if let Some(detail) = password_input_error(&form.password) {
+        if let Some(detail) = new_password_error(&form.password) {
             return invitation_response(
                 &state,
                 token,
@@ -2814,7 +2834,12 @@ mod pages {
             }
         };
         let user_agent = super::session_user_agent(&headers);
-        let session = match crate::db::create_web_session(pool, &account, user_agent.as_ref()).await
+        let session = match crate::db::create_web_session(
+            pool,
+            &crate::db::VerifiedAccount::established(account.as_str()),
+            user_agent.as_ref(),
+        )
+        .await
         {
             Ok(session) => session,
             Err(error) => {
@@ -4252,16 +4277,29 @@ mod cookie_tests {
 
 #[cfg(test)]
 mod credential_input_tests {
-    use super::{credential_input_error, password_input_error};
+    use super::{credential_input_error, new_password_error, presented_password_error};
 
     #[test]
     fn credential_fields_are_bounded_before_argon2() {
         assert_eq!(credential_input_error("alice", "secret"), None);
         assert!(credential_input_error("", "secret").is_some());
         assert!(credential_input_error(&"a".repeat(65), "secret").is_some());
-        assert!(password_input_error("").is_some());
-        assert!(password_input_error(&"p".repeat(513)).is_some());
-        assert_eq!(password_input_error(&"p".repeat(512)), None);
+        assert!(presented_password_error("").is_some());
+        assert!(presented_password_error(&"p".repeat(513)).is_some());
+        assert_eq!(presented_password_error(&"p".repeat(512)), None);
+    }
+
+    /// The eight-character floor governs a password being set; one being
+    /// verified — an older account's short password — is still admitted.
+    #[test]
+    fn only_a_password_being_set_must_be_eight_characters() {
+        assert_eq!(presented_password_error("hunter2"), None);
+        assert_eq!(
+            new_password_error("hunter2"),
+            Some("Passwords must be at least 8 characters and at most 512 bytes.")
+        );
+        assert_eq!(new_password_error("hunter22"), None);
+        assert!(new_password_error(&"p".repeat(513)).is_some());
     }
 }
 

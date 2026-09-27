@@ -288,7 +288,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asynchronous answer — held (`emit_deferred_labeled`) or not
     (`emit_labeled_unheld`) — is gathered with what the command answered on the
     spot into the one labeled response.
-  - `NewPassword` — a password an account may be given (1–512 bytes) is parsed
+  - `NewPassword` — a password an account may be given (8 characters to 512 bytes) is parsed
     once; account creation takes only this type, and the REST/web validators
     call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
     cannot store a password another surface refuses to verify (an empty one
@@ -1780,7 +1780,14 @@ Principal tables (columns abridged):
   `accounts(id)` ON DELETE CASCADE (migration 0065). A grant lives
   `DEVICE_GRANT_LIFETIME_SECONDS` (the advertised `expires_in`) and is pruned
   only a grace period after expiry, so a late poll is answered RFC 8628
-  `expired_token` rather than `invalid_grant`.
+  `expired_token` rather than `invalid_grant`. The device code is a bearer
+  secret and is stored only as its SHA-256 (`device_code_hash`, migration
+  0092, which hashed the codes of pending grants in place with the built-in
+  `sha256()`), like every other bearer. A grant records the `client_id` that
+  started it — a poll naming another client is `invalid_grant` — and paces its
+  polls: `poll_interval_seconds` (5 to start) and `last_polled_at`; a poll
+  sooner than the interval after the last is answered `slow_down` and adds 5
+  seconds to the interval (RFC 8628 §3.5).
 - `bnc_read_markers` (BIGINT account_id, network, target, timestamp) —
   per-account, per-BNC-network read position, the source for
   `draft/read-marker` on the attach listener. Distinct from `read_markers`
@@ -1976,8 +1983,11 @@ the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge — including the password rule
-(`NewPassword`, 1–512 bytes, which the web and REST API apply too): `REGISTER`
-refuses an empty password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
+(`NewPassword`: at least 8 characters, the NIST SP 800-63B floor, and at most
+512 bytes, which the web forms and REST API apply too, NickServ `REGISTER` and a
+password change included; a password set before the floor still verifies):
+`REGISTER`
+refuses a shorter password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
 one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
 account after with `NEED_NICK`; the capability's advertised value states
 the policy (`before-connect`, `email-required`) so a client knows the rules
@@ -2063,6 +2073,17 @@ provider-verified email claim.
   spends the per-address authentication budget like the start. A refused
   callback leaves the cookie alone, so an attacker who learns a victim's
   `state` cannot burn the victim's login.
+- The two flows that grant or prove authority over an existing account — a
+  link and a re-authentication — carry a `BoundSession`: the account and the
+  SHA-256 of the browser session that started the flow (never its token). No
+  such flow can be built unbound, and its callback acts only when this browser
+  presents that same session again. A link then checks the session in the
+  transaction that inserts the identity — live, the account's, and within
+  `STEP_UP_WINDOW` of proving its person — holding its row until the insert
+  commits; a re-authentication marks only that session. A cookie stolen while
+  recently authenticated therefore cannot start a link and finish it after its
+  owner signed out or changed the password: the callback is refused (`403`)
+  and links nothing.
 - The session-bound CSRF value never travels in a URL, where it would reach
   browser history and proxy access logs for the session's lifetime. Linking an
   identity is a `POST` carrying the `X-E6IRC-CSRF` header like every other
@@ -2141,7 +2162,9 @@ Personal access tokens are hashed at rest, expire after a caller-selected
 `read` for safe API methods and `write` for mutations; administrator routes
 also require both the `administrator` grant and the account's current durable
 or configured administrator authority. IRC SASL OAUTHBEARER independently
-requires `irc`. Device authorization issues `read`/`write`/`irc`, never
+requires `irc`, and its GS2 header is parsed, not skipped (RFC 7628 §3.1): an
+authorization identity (`a=`) that does not name the token's own account is
+refused, as a PLAIN `authzid` naming another account is. Device authorization issues `read`/`write`/`irc`, never
 administrator authority. Token issuance and device approval require the
 browser session plus its `X-E6IRC-CSRF` value, so an existing bearer cannot
 mint a broader replacement. Every unsafe cookie-authenticated REST method
@@ -4168,7 +4191,19 @@ that refuses and closes can make the client's next registration write fail
 first; the client then reads what the server sent before it left (for at most
 two seconds) and reports that refusal, not the broken pipe.
 
-`e6irc login` implements the RFC 8628 device flow: it prints the verification
+The two device endpoints speak RFC 8628 as written: `/api/v1/auth/device/start`
+takes a form with a required `client_id` (and an optional `scope`, which may
+only name the fixed `read write irc`), and `/api/v1/auth/device/token` a form
+with `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `device_code`
+and `client_id` (§3.4). Parameters they do not define are ignored and a
+repeated one is refused, as RFC 6749 §3.1 requires; errors are RFC 6749 §5.2
+JSON (`invalid_request`, `unsupported_grant_type`, `invalid_grant`,
+`invalid_scope`) and §3.5's `authorization_pending`, `slow_down`,
+`access_denied` and `expired_token`, each a 400. The token response is RFC
+6749 §5.1's: `access_token`, `token_type` `Bearer`, `expires_in` and
+`scope`. Every answer is `Cache-Control: no-store`.
+
+`e6irc login` implements the RFC 8628 device flow as client `e6irc-cli`: it prints the verification
 URI and user code, honors the server's polling interval/slow-down/expiry
 contract, and atomically stores the issued bearer token without printing it.
 The shared cache includes the issuing API origin so `api` cannot silently send

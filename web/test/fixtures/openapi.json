@@ -255,7 +255,9 @@
                     ]
                   },
                   "password": {
+                    "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes.",
                     "maxLength": 512,
+                    "minLength": 8,
                     "type": "string"
                   }
                 },
@@ -10106,8 +10108,9 @@
                     "type": "string"
                   },
                   "new_password": {
+                    "description": "At least 8 characters (NIST SP 800-63B) and at most 512 bytes.",
                     "maxLength": 512,
-                    "minLength": 1,
+                    "minLength": 8,
                     "type": "string"
                   }
                 },
