@@ -1181,7 +1181,9 @@ async fn a_restart_restores_the_whole_configured_buffer() {
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
          SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :restored ' || n,
-                '2026-01-01T00:00:00.000Z'
+                -- Stamped now: a line older than history retention is, rightly,
+                -- not replayed, so a fixed date would age out of this test.
+                to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(STORED)
@@ -4030,7 +4032,8 @@ async fn the_backlog_cap_holds_across_restarts() {
     // A buffer already at the cap, as a long-running network leaves it.
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, line, sent_at)
-         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n, '2026-01-01T00:00:00.000Z'
+         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n,
+                to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM generate_series(1, $1) n",
     )
     .bind(CAP as i32)
