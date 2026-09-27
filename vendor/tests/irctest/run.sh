@@ -69,20 +69,11 @@ GREEN_TESTS=(
     irctest/server_tests/websocket.py
     irctest/server_tests/regressions.py
 )
-# Tests of the green list that assume a behaviour e6ircd deliberately differs
-# from, each with its reason; removing one needs a written reason.
-GREEN_DESELECTS=(
-    # testQuit expects the comment of a QUIT sent one second after connecting.
-    # e6ircd applies Solanum's anti_spam_exit_message_time at the five minutes
-    # Libera runs (DESIGN 7.6): so young a connection leaves as "Client Quit".
-    # irctest's Solanum runs its code default, 0, which switches it off.
-    --deselect irctest/server_tests/quit.py::ChannelQuitTestCase::testQuit
-)
 # The green list's skips are held to expected-skips.txt: irctest skips what a
 # server does not advertise, so a lost capability would otherwise stay green.
 green=false
 if (( $# == 0 )); then
-    set -- "${GREEN_DESELECTS[@]}" "${GREEN_TESTS[@]}"
+    set -- "${GREEN_TESTS[@]}"
     green=true
 fi
 report=$(mktemp)

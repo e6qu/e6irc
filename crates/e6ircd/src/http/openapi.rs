@@ -893,6 +893,12 @@ fn operations() -> serde_json::Value {
             "max_connections_per_ip": { "type": ["integer", "null"], "minimum": 1 },
             "command_burst": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "command_rate": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "anti_spam_exit_message_time_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": crate::config::MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS,
+                "description": "How long a connection must have been open before its QUIT comment is shown (Solanum's anti_spam_exit_message_time); a younger non-operator connection leaves as \"Client Quit\". 0 shows every comment. Applied without a restart."
+            },
             "trusted_proxies": { "type": "array", "items": { "type": "string" } },
             "auth_rate_burst": {
                 "oneOf": [{ "type": "integer", "minimum": 1 }, { "const": "off" }],

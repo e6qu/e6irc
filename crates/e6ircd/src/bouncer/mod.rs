@@ -4178,7 +4178,8 @@ pub struct Buffer {
     /// ring evicts, so an attaching client is brought to it before the
     /// replay begins and reads each replayed line in the state it was said
     /// in (§10.1). `None` while the oldest lines are ones restored from
-    /// storage, whose state was not stored with them.
+    /// rows stored before migration 0096, whose nick was not stored with them
+    /// ([`restored_head`]).
     head: Option<IrcSessionState>,
     /// How the network names things and what it said of itself, which the
     /// head reads its lines with.
@@ -4366,6 +4367,40 @@ impl Buffer {
             resumed: honoured,
         }
     }
+}
+
+/// The session's state as of the oldest of the restored lines, from the own
+/// nicks they were stored with, oldest first: the nick of the first line said
+/// under one. The lines before it were said before the session had a nick —
+/// the bouncer's own notices before the upstream welcomed it — which no nick
+/// changes, so an attach brought to that nick before them reads each line as
+/// it was said. A line stored before migration 0096 recorded no nick, so a
+/// restore that begins in such lines knows no state (`None`) and its replay
+/// starts at the current nick. The channels are not stored: the head joins
+/// none, and learns each from the lines it evicts, as the in-memory head does
+/// from its own.
+fn restored_head<'a>(
+    own_nicks: impl Iterator<Item = &'a crate::db::StoredOwnNick>,
+    names: e6irc_client::NetworkNames,
+    features: UpstreamFeatures,
+) -> Option<IrcSessionState> {
+    use crate::db::StoredOwnNick;
+    let mut head = IrcSessionState {
+        names,
+        features,
+        ..IrcSessionState::following_channels()
+    };
+    for own_nick in own_nicks {
+        match own_nick {
+            StoredOwnNick::NotRecorded => return None,
+            StoredOwnNick::NoNick => {}
+            StoredOwnNick::Nick(nick) => {
+                head.nick = Some(nick.clone());
+                break;
+            }
+        }
+    }
+    Some(head)
 }
 
 /// How many reply lines one attachment may have waiting: a `/LIST` of a large
@@ -5106,17 +5141,26 @@ impl NetworkHandle {
     /// of `older`.
     ///
     /// Each stored line comes with the time it was stored under, which it is
-    /// stamped with when it carries no `time` of its own. A network's
-    /// registration burst, which builds before this one retained, is left in
-    /// storage: replayed, its ISUPPORT would undo the bouncer's own (§10.4).
-    pub fn preload_front(&self, older: Vec<(String, String)>) {
-        let older: Vec<(String, String)> = older
+    /// stamped with when it carries no `time` of its own, and the session's
+    /// own nick when it was said, which the ring's head takes from the oldest
+    /// line restored ([`restored_head`]). A network's registration burst,
+    /// which builds before this one retained, is left in storage: replayed,
+    /// its ISUPPORT would undo the bouncer's own (§10.4).
+    pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) {
+        let older: Vec<crate::db::StoredBacklogLine> = older
             .into_iter()
-            .filter(|(line, _)| !is_registration_burst_line(line))
+            .filter(|stored| !is_registration_burst_line(&stored.line))
             .collect();
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         let room = buf.cap.saturating_sub(buf.entries.len());
-        for (line, stored_at) in older.iter().rev().take(room) {
+        // The own nicks of the lines restored, newest first.
+        let mut restored = Vec::new();
+        for crate::db::StoredBacklogLine {
+            line,
+            stored_at,
+            own_nick,
+        } in older.iter().rev().take(room)
+        {
             // Each restored line takes the position just below the current
             // oldest: older than everything pushed, in storage order.
             let seq = buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1;
@@ -5130,11 +5174,14 @@ impl NetworkHandle {
             if buf.bytes + line.len() > buf.byte_cap {
                 break;
             }
-            // The state these lines were said in was not stored with them.
-            buf.head = None;
             buf.bytes += line.len();
             buf.entries
                 .push_front(RingEntry::Line(BufferedLine { seq, line }));
+            restored.push(own_nick);
+        }
+        if !restored.is_empty() {
+            let (names, features) = (buf.names.clone(), buf.features.clone());
+            buf.head = restored_head(restored.into_iter().rev(), names, features);
         }
     }
 
@@ -7634,6 +7681,25 @@ where
 mod tests {
     use super::*;
 
+    /// A backlog row stored at `stored_at` before migration 0096, which
+    /// recorded no nick with it.
+    fn stored_line(line: impl Into<String>, stored_at: &str) -> crate::db::StoredBacklogLine {
+        stored_under(line, stored_at, crate::db::StoredOwnNick::NotRecorded)
+    }
+
+    /// A backlog row stored at `stored_at` with `own_nick` recorded.
+    fn stored_under(
+        line: impl Into<String>,
+        stored_at: &str,
+        own_nick: crate::db::StoredOwnNick,
+    ) -> crate::db::StoredBacklogLine {
+        crate::db::StoredBacklogLine {
+            line: line.into(),
+            stored_at: stored_at.into(),
+            own_nick,
+        }
+    }
+
     /// `lines` as they were emitted, without the `time` the bouncer stamps
     /// on every line it takes in.
     fn untimed<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Vec<String> {
@@ -9913,10 +9979,9 @@ mod tests {
         // an attaching client as two lines just because it arrived through
         // `preload_front` rather than `emit_line`.
         let (handle, _ends) = NetworkHandle::channels(16);
-        handle.preload_front(vec![(
-            ":a!a@bridge PRIVMSG #c :hi\r\n:nickserv!s@svc PRIVMSG victim :send me your password"
-                .to_string(),
-            "2026-01-01T00:00:00.000Z".to_string(),
+        handle.preload_front(vec![stored_line(
+            ":a!a@bridge PRIVMSG #c :hi\r\n:nickserv!s@svc PRIVMSG victim :send me your password",
+            "2026-01-01T00:00:00.000Z",
         )]);
         let snapshot = handle.buffer_snapshot();
         assert_eq!(snapshot.len(), 1, "one stored row stays one line");
@@ -10633,8 +10698,8 @@ mod tests {
     fn a_restored_backlog_fills_only_the_bytes_left() {
         let (handle, _ends) = NetworkHandle::channels(10);
         let big = format!("@+x={} :n!u@h PRIVMSG #c :old", "t".repeat(2_000));
-        let stored: Vec<(String, String)> = (0..10)
-            .map(|i| (format!("{big}{i}"), "2026-01-01T00:00:00.000Z".to_string()))
+        let stored: Vec<crate::db::StoredBacklogLine> = (0..10)
+            .map(|i| stored_line(format!("{big}{i}"), "2026-01-01T00:00:00.000Z"))
             .collect();
         handle.preload_front(stored);
         let buffer = handle.buffer.lock().expect("buffer");
@@ -10766,7 +10831,7 @@ mod tests {
         assert!(resumed_from_empty.resumed);
 
         ends.emit_line("live".into());
-        let stored = |line: &str| (line.to_string(), "2026-01-01T00:00:00.000Z".to_string());
+        let stored = |line: &str| stored_line(line, "2026-01-01T00:00:00.000Z");
         handle.preload_front(vec![stored("older"), stored("old")]);
         let replay = handle.subscribe_with_replay_snapshot(None).replay;
         assert_eq!(replayed(&replay), ["older", "old", "live"]);
@@ -10872,6 +10937,16 @@ mod tests {
         (client, task)
     }
 
+    /// Attach with default capabilities, read everything the attach writes
+    /// (server-time tags stripped) and let it finish.
+    async fn attach_to_completion(handle: NetworkHandle) -> String {
+        let (mut client, task) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
+        let output = untimed(attach_output(&mut client).await.lines()).join("\n");
+        drop(client);
+        task.await.expect("attach task").expect("attach");
+        output
+    }
+
     /// On a `CASEMAPPING=ascii` network `dev[m]` and `dev{m}` are two people
     /// and `#a[`, `#a{` two channels: another user's NICK or JOIN is not ours,
     /// and leaving one channel leaves only that one.
@@ -10917,9 +10992,9 @@ mod tests {
         ends.emit_line(":peer!u@h PRIVMSG #room :untimed".to_string());
         ends.emit_line("@time=2026-01-02T03:04:05.006Z :peer!u@h PRIVMSG #room :timed".to_string());
         ends.emit_line("@time=nonsense;+x=y :peer!u@h PRIVMSG #room :bad time".to_string());
-        handle.preload_front(vec![(
-            ":peer!u@h PRIVMSG #room :stored".to_string(),
-            "2025-12-31T23:59:59.999Z".to_string(),
+        handle.preload_front(vec![stored_line(
+            ":peer!u@h PRIVMSG #room :stored",
+            "2025-12-31T23:59:59.999Z",
         )]);
         let lines = handle.buffer_snapshot();
         assert_eq!(
@@ -11024,7 +11099,7 @@ mod tests {
 
         // A burst an older build stored is not restored into the ring either.
         let (restored, _ends) = NetworkHandle::channels(8);
-        let stored = |line: &str| (line.to_string(), "2026-01-01T00:00:00.000Z".to_string());
+        let stored = |line: &str| stored_line(line, "2026-01-01T00:00:00.000Z");
         restored.preload_front(vec![
             stored(":up 005 alice CHATHISTORY=1000 :are supported by this server"),
             stored(":up 372 alice :- motd"),
@@ -11150,10 +11225,7 @@ mod tests {
                 ":bob!u@h PRIVMSG #room :after",
             ],
         );
-        let (mut client, task) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
-        let output = untimed(attach_output(&mut client).await.lines()).join("\n");
-        drop(client);
-        task.await.expect("attach task").expect("attach");
+        let output = attach_to_completion(handle).await;
         in_order(
             &output,
             &[
@@ -11171,6 +11243,72 @@ mod tests {
         assert_eq!(output.matches(" JOIN ").count(), 1, "{output}");
         assert_eq!(output.matches(" NICK ").count(), 2, "{output}");
         // Nothing was asked of the upstream: the session knew the channel.
+        drop(ends);
+    }
+
+    /// A backlog restored from storage after a restart starts its replay
+    /// under the nick its oldest line was said under, as an in-memory ring
+    /// does: the rows record it (migration 0096). The bouncer's own notices
+    /// from before the upstream welcomed the session recorded none, and the
+    /// nick of the line after them is theirs. It used to start at the current
+    /// nick, so the old nick's lines read as a stranger's.
+    #[tokio::test]
+    async fn a_restored_replay_starts_from_the_nick_its_oldest_line_was_said_under() {
+        use crate::db::StoredOwnNick::{Nick, NoNick};
+        let at = "2026-01-01T00:00:00.000Z";
+        let (handle, ends) = NetworkHandle::channels(8);
+        handle.preload_front(vec![
+            stored_under(":*bnc* NOTICE * :connecting", at, NoNick),
+            stored_under(":peer!u@h PRIVMSG alice :hello", at, Nick("alice".into())),
+            stored_under(":alice!u@h NICK :bob", at, Nick("alice".into())),
+            stored_under(":peer!u@h PRIVMSG bob :again", at, Nick("bob".into())),
+        ]);
+        ends.begin_irc_session("bob".to_string());
+        let output = attach_to_completion(handle).await;
+        in_order(
+            &output,
+            &[
+                ":bnc.test 001 bob :",
+                ":bob NICK :alice",
+                ":*bnc* NOTICE * :connecting",
+                ":peer!u@h PRIVMSG alice :hello",
+                ":alice!u@h NICK :bob",
+                ":peer!u@h PRIVMSG bob :again",
+            ],
+        );
+        assert_eq!(output.matches(" NICK ").count(), 2, "{output}");
+        drop(ends);
+    }
+
+    /// Rows stored before migration 0096 recorded no nick: a replay that
+    /// begins in them starts at the current nick, as every restored replay did
+    /// before, and a row that recorded one after them does not stand in for
+    /// them.
+    #[tokio::test]
+    async fn a_restored_replay_of_rows_without_a_recorded_nick_starts_at_the_current_nick() {
+        let at = "2026-01-01T00:00:00.000Z";
+        let (handle, ends) = NetworkHandle::channels(8);
+        handle.preload_front(vec![
+            stored_line(":peer!u@h PRIVMSG alice :hello", at),
+            stored_line(":alice!u@h NICK :bob", at),
+            stored_under(
+                ":peer!u@h PRIVMSG bob :again",
+                at,
+                crate::db::StoredOwnNick::Nick("bob".into()),
+            ),
+        ]);
+        ends.begin_irc_session("bob".to_string());
+        let output = attach_to_completion(handle).await;
+        in_order(
+            &output,
+            &[
+                ":bnc.test 001 bob :",
+                ":peer!u@h PRIVMSG alice :hello",
+                ":alice!u@h NICK :bob",
+                ":peer!u@h PRIVMSG bob :again",
+            ],
+        );
+        assert_eq!(output.matches(" NICK ").count(), 1, "{output}");
         drop(ends);
     }
 
@@ -11197,10 +11335,7 @@ mod tests {
             ends.emit_session_line(format!(":peer99!u@h PRIVMSG #c99 :late {n}"))
                 .expect("tracked");
         }
-        let (mut client, task) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
-        let output = untimed(attach_output(&mut client).await.lines()).join("\n");
-        drop(client);
-        task.await.expect("attach task").expect("attach");
+        let output = attach_to_completion(handle).await;
         assert!(
             ends.commands.try_recv().is_err(),
             "the attach asked the upstream for what the session knew"

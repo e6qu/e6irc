@@ -280,6 +280,27 @@ impl CoreIngress {
         self.directories.history_retention.set_days(days);
     }
 
+    /// Apply `limits.anti_spam_exit_message_time_seconds` to every `QUIT`
+    /// from now on: every shard reads the one cell this sets.
+    pub(crate) fn set_anti_spam_exit_message_time_seconds(&self, seconds: u64) {
+        self.directories
+            .anti_spam_exit_message_time
+            .set_seconds(seconds);
+    }
+
+    /// Apply what of a stored settings revision the core follows live: the
+    /// history retention and the QUIT-comment delay. The one way a revision
+    /// reaches the running core, whether a console save here or another
+    /// writer's revision adopted here, so no path can apply one without the
+    /// other ([`crate::config::ManagedConfig::requires_restart_to_reach`]
+    /// names the same settings).
+    pub(crate) fn adopt_live_settings(&self, settings: &crate::config::ManagedConfig) {
+        self.set_history_retention_days(settings.storage.history_retention_days);
+        self.set_anti_spam_exit_message_time_seconds(
+            settings.limits.anti_spam_exit_message_time_seconds,
+        );
+    }
+
     /// The history retention cell, for the bouncer's backlogs.
     pub(crate) fn history_retention(&self) -> HistoryRetention {
         self.directories.history_retention.clone()
@@ -5487,6 +5508,52 @@ mod ingress_tests {
         assert_eq!(replayed(&shards.drain(1)), ["early"]);
         shards.line(1, &format!("CHATHISTORY AFTER alice {} 10", at(2_000)));
         assert_eq!(replayed(&shards.drain(1)), ["late"]);
+    }
+
+    /// `limits.anti_spam_exit_message_time_seconds` is Libera's five minutes
+    /// until it is set, `0` shows every QUIT comment, and a change of it
+    /// applies to the next QUIT on every shard, without a restart.
+    #[test]
+    fn the_quit_comment_delay_is_followed_live_on_every_shard() {
+        set_clock_ms(0);
+        let mut shards = Shards::new();
+        let there = shards.owned[0];
+        for (conn, nick) in [(2, "alice"), (1, "bob"), (3, "carol"), (4, "dave")] {
+            shards.client(conn, nick, "");
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(2);
+        let quit = |shards: &mut Shards, conn: u64| {
+            shards.line(conn, "QUIT :bye");
+            shards
+                .drain(2)
+                .into_iter()
+                .filter(|line| line.contains(" QUIT "))
+                .collect::<Vec<_>>()
+        };
+        set_clock_ms(300_000 - 1);
+        assert_eq!(
+            quit(&mut shards, 1),
+            [":bob!bob@host.test QUIT :Client Quit"],
+            "younger than the default five minutes"
+        );
+        let mut settings =
+            crate::config::ManagedConfig::from_config(&crate::config::Config::default(), None)
+                .expect("managed");
+        settings.limits.anti_spam_exit_message_time_seconds = 0;
+        shards.ingress.adopt_live_settings(&settings);
+        assert_eq!(
+            quit(&mut shards, 3),
+            [":carol!carol@host.test QUIT :Quit: bye"],
+            "0 shows every comment"
+        );
+        set_clock_ms(300_000);
+        shards.ingress.set_anti_spam_exit_message_time_seconds(600);
+        assert_eq!(
+            quit(&mut shards, 4),
+            [":dave!dave@host.test QUIT :Client Quit"],
+            "older than five minutes, younger than the ten now set"
+        );
     }
 
     /// History retention bounds what the rings serve as it bounds what the

@@ -41,6 +41,12 @@ addr = "{hostname}:{port}"
 [[oper]]
 name = "operuser"
 password = "operpassword"
+
+[limits]
+# Every QUIT comment is shown, however young the connection: irctest's
+# Solanum controller leaves Solanum's anti_spam_exit_message_time at its code
+# default, 0, and testQuit quits a second after connecting.
+anti_spam_exit_message_time_seconds = 0
 """
 
 

@@ -1327,6 +1327,36 @@ pub(crate) struct CoreDirectories {
     pub(crate) flood_exemptions: crate::core::line_meter::FloodExemptions,
     /// How long history is kept.
     pub(crate) history_retention: HistoryRetention,
+    /// How old a connection must be before its QUIT comment is shown.
+    pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
+}
+
+/// How old a connection must be before the comment of its `QUIT` is shown
+/// (`limits.anti_spam_exit_message_time_seconds`, Solanum's
+/// `anti_spam_exit_message_time`). One cell, shared by every shard and set
+/// live when the setting changes, so each `QUIT` reads the value in force.
+/// Until it is set it holds the setting's own default, Libera's five minutes.
+#[derive(Clone)]
+pub(crate) struct AntiSpamExitMessageTime(Arc<std::sync::atomic::AtomicU64>);
+
+impl Default for AntiSpamExitMessageTime {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::config::DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS,
+        )))
+    }
+}
+
+impl AntiSpamExitMessageTime {
+    pub(crate) fn set_seconds(&self, seconds: u64) {
+        self.0.store(seconds, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a connection `age` old leaves with its comment hidden. Zero
+    /// seconds hides none.
+    pub(crate) fn hides_comment_at(&self, age: std::time::Duration) -> bool {
+        age.as_secs() < self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// How long history is kept (`storage.history_retention_days`), for what is
@@ -4633,6 +4663,9 @@ pub(crate) struct ServerState {
     flood_exemptions: crate::core::line_meter::FloodExemptions,
     /// How long history is kept, shared with every shard and the bouncer.
     history_retention: HistoryRetention,
+    /// How old a connection must be before its QUIT comment is shown, shared
+    /// with every shard.
+    pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
@@ -5735,6 +5768,7 @@ impl ServerState {
             census: directories.census,
             flood_exemptions: directories.flood_exemptions,
             history_retention: directories.history_retention,
+            anti_spam_exit_message_time: directories.anti_spam_exit_message_time,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,

@@ -909,6 +909,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .map_err(io::Error::other)?;
     let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders)
         .with_command_flood(command_flood);
+    // Followed live from here on (`CoreIngress::adopt_live_settings`).
+    core_tx
+        .set_anti_spam_exit_message_time_seconds(config.limits.anti_spam_exit_message_time_seconds);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,

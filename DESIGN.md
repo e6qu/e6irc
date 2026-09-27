@@ -1455,10 +1455,15 @@ subset's exact behavior.
   member of a `+g` channel, to the operators otherwise, in Solanum's shape:
   `710 <channel> <channel> <nick!user@host> :has asked for an invite.` `QUIT` with no comment
   leaves as `Quit: <nick>`, `QUIT :` with an empty reason; a connection younger
-  than Solanum's `anti_spam_exit_message_time` — five minutes, as Solanum's
-  reference configuration and Libera run it (`ANTI_SPAM_EXIT_MESSAGE_TIME_MS`,
-  a named constant like the knock delays) — leaves as `Client Quit` whatever
-  it said, unless it is an operator. PART of a channel
+  than Solanum's `anti_spam_exit_message_time` leaves as `Client Quit` whatever
+  it said, unless it is an operator. It is the console-owned
+  `limits.anti_spam_exit_message_time_seconds`: five minutes unless stated, as
+  Solanum's reference configuration and Libera run it; `0` shows every comment,
+  as Solanum's code default does (irctest runs e6ircd so); at most an hour,
+  since a longer window no longer deters a spammer, who need stay only once,
+  and hides every short session's parting words. The core reads it at each
+  `QUIT` from one cell every shard shares, so a change applies without a
+  restart. PART of a channel
   that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
   cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
@@ -3020,7 +3025,13 @@ above the trait, provides for every network kind:
   MARKREAD position follows each JOIN, before its member list, when
   negotiated. A bridge, whose provider has no member list to ask, gets a
   minimal NAMES reply naming the session alone. A backlog restored from
-  storage carries no state of its own, so a replay beginning in it starts at
+  storage after a restart starts at the nick its oldest line was said under:
+  each `bnc_buffer` row records the session's own nick as of that line
+  (`own_nick`, migration 0096; none for the bouncer's notices before the
+  upstream welcomed the session, whose replay takes the nick of the first line
+  after them). Its channels are not stored, so that head joins none and learns
+  each from the lines it evicts. A row stored before 0096 recorded nothing
+  (`own_nick_recorded` false), and a replay beginning in such rows starts at
   the current nick. Every line
   the bouncer makes from the upstream's names fits one IRC line: a prefix
   drops its user and host, or a PART its reason, when the names need the room,
@@ -5142,8 +5153,11 @@ Layers, bottom to top:
   trigger notifying `e6irc_server_settings_changed`, as 0077 does for
   credentials) and every running server adopts a later revision it hears
   (`settings_watch`): the snapshot the console and the maintenance loops read
-  is replaced and the BNC attach listener is brought to what it says — exactly
-  what a console save in that process applies, and nothing restart-only. A
+  is replaced, the core takes the settings it follows live (history retention
+  and `limits.anti_spam_exit_message_time_seconds`, through the one
+  `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
+  what it says — exactly what a console save in that process applies, and
+  nothing restart-only. A
   save that still finds its revision stale reloads the stored row before it
   answers (`db::save_managed_config_over`), so the conflict it reports is one
   the administrator can read and a retry from it commits; the snapshot used to

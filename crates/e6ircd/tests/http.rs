@@ -2906,6 +2906,15 @@ async fn openapi_spec_is_served() {
     ] {
         assert_eq!(limits_schema[field]["minimum"], 1, "{field}");
     }
+    // Zero switches it off; the bound is the one the configuration holds.
+    assert_eq!(
+        limits_schema["anti_spam_exit_message_time_seconds"]["minimum"],
+        0
+    );
+    assert_eq!(
+        limits_schema["anti_spam_exit_message_time_seconds"]["maximum"],
+        e6ircd::config::MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS
+    );
     // On by default, so off has a spelling of its own.
     assert_eq!(
         limits_schema["auth_rate_burst"]["oneOf"],

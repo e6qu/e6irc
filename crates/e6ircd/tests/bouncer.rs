@@ -4968,7 +4968,7 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
                 .expect("read");
             if lines
                 .iter()
-                .any(|(line, _)| line.contains("a direct message"))
+                .any(|stored| stored.line.contains("a direct message"))
             {
                 return lines;
             }
@@ -4979,8 +4979,8 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
     .expect("the backlog was never persisted");
     let read_up_to = stored
         .iter()
-        .find(|(line, _)| line.contains("second read"))
-        .map(|(_, sent_at)| sent_at.clone())
+        .find(|stored| stored.line.contains("second read"))
+        .map(|stored| stored.stored_at.clone())
         .expect("stored");
     e6ircd::db::set_bnc_read_marker(
         &pool,
