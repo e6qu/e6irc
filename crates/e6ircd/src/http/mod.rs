@@ -475,9 +475,14 @@ pub(super) fn presented_password_error(password: &str) -> Option<&'static str> {
 }
 
 /// The rule for a password being *set*, which IRC `REGISTER` and NickServ
-/// `REGISTER` apply too ([`crate::identity::NewPassword`]).
-pub(super) fn new_password_error(password: &str) -> Option<&'static str> {
-    crate::identity::NewPassword::parse(password)
+/// `REGISTER` apply too, from the same `policy`
+/// ([`crate::identity::PasswordPolicy`]).
+pub(super) fn new_password_error(
+    policy: &crate::identity::PasswordPolicy,
+    password: &str,
+) -> Option<String> {
+    policy
+        .new_password(password)
         .err()
         .map(crate::identity::PasswordRefusal::explanation)
 }
@@ -970,8 +975,8 @@ pub(super) async fn create_account_lifecycle(
             "The account must be a valid IRC nickname of at most 64 bytes.".into(),
         ));
     }
-    if let Some(detail) = new_password_error(password) {
-        return Err((StatusCode::BAD_REQUEST, detail.into()));
+    if let Some(detail) = new_password_error(&state.core_tx.password_policy(), password) {
+        return Err((StatusCode::BAD_REQUEST, detail));
     }
     if let Some(detail) = state.unclaimable_account_name(account) {
         return Err((StatusCode::CONFLICT, detail.into()));
@@ -2493,6 +2498,7 @@ mod pages {
         bootstrap_state: String,
         account: String,
         error: Option<String>,
+        minimum_password_length: usize,
     }
 
     fn bootstrap_state_cookie_name(secure: bool) -> &'static str {
@@ -2561,6 +2567,7 @@ mod pages {
             bootstrap_state: bootstrap_state.clone(),
             account,
             error,
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         });
         *response.status_mut() = status;
         let secure = if state.secure_cookies { "; Secure" } else { "" };
@@ -2639,13 +2646,8 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        if let Some(detail) = new_password_error(&form.password) {
-            return bootstrap_response(
-                &state,
-                form.account,
-                Some(detail.into()),
-                StatusCode::BAD_REQUEST,
-            );
+        if let Some(detail) = new_password_error(&state.core_tx.password_policy(), &form.password) {
+            return bootstrap_response(&state, form.account, Some(detail), StatusCode::BAD_REQUEST);
         }
         if form.password != form.password_confirmation {
             return bootstrap_response(
@@ -2721,6 +2723,7 @@ mod pages {
         administrator: bool,
         expires_at: String,
         error: Option<String>,
+        minimum_password_length: usize,
     }
 
     fn invitation_state_cookie_name(secure: bool) -> &'static str {
@@ -2754,6 +2757,7 @@ mod pages {
             administrator: preview.administrator,
             expires_at: preview.expires_at,
             error,
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         });
         *response.status_mut() = status;
         let secure = if state.secure_cookies { "; Secure" } else { "" };
@@ -2842,12 +2846,12 @@ mod pages {
                 StatusCode::FORBIDDEN,
             );
         }
-        if let Some(detail) = new_password_error(&form.password) {
+        if let Some(detail) = new_password_error(&state.core_tx.password_policy(), &form.password) {
             return invitation_response(
                 &state,
                 token,
                 preview,
-                Some(detail.into()),
+                Some(detail),
                 StatusCode::BAD_REQUEST,
             );
         }
@@ -3162,6 +3166,7 @@ mod pages {
     #[template(path = "console_account.html")]
     struct ConsoleAccount {
         shell: ConsoleShell,
+        minimum_password_length: usize,
     }
 
     /// The browser behind a server-rendered page: its account, the session that
@@ -3265,6 +3270,7 @@ mod pages {
         };
         render_private(ConsoleAccount {
             shell: console_shell(actor, "account"),
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         })
     }
 
@@ -3297,6 +3303,7 @@ mod pages {
     #[template(path = "console_accounts.html")]
     struct ConsoleAccounts {
         shell: ConsoleShell,
+        minimum_password_length: usize,
     }
 
     #[derive(Template)]
@@ -3457,9 +3464,13 @@ mod pages {
         })
     }
 
-    pub async fn console_accounts(AdminPageActor(actor): AdminPageActor) -> Response {
+    pub async fn console_accounts(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor(actor): AdminPageActor,
+    ) -> Response {
         render_private(ConsoleAccounts {
             shell: console_shell(actor, "accounts"),
+            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
         })
     }
 
@@ -4338,17 +4349,21 @@ mod credential_input_tests {
         assert_eq!(presented_password_error(&"p".repeat(512)), None);
     }
 
-    /// The eight-character floor governs a password being set; one being
-    /// verified — an older account's short password — is still admitted.
+    /// The minimum — eight characters unless configured — governs a password
+    /// being set; one being verified — an older account's short password —
+    /// is still admitted.
     #[test]
-    fn only_a_password_being_set_must_be_eight_characters() {
+    fn only_a_password_being_set_must_meet_the_minimum() {
+        let policy = crate::identity::PasswordPolicy::default();
         assert_eq!(presented_password_error("hunter2"), None);
         assert_eq!(
-            new_password_error("hunter2"),
+            new_password_error(&policy, "hunter2").as_deref(),
             Some("Passwords must be at least 8 characters and at most 512 bytes.")
         );
-        assert_eq!(new_password_error("hunter22"), None);
-        assert!(new_password_error(&"p".repeat(513)).is_some());
+        assert_eq!(new_password_error(&policy, "hunter22"), None);
+        assert!(new_password_error(&policy, &"p".repeat(513)).is_some());
+        policy.set_minimum_chars(1);
+        assert_eq!(new_password_error(&policy, "sesame"), None);
     }
 }
 

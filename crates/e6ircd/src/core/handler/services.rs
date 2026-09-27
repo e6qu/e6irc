@@ -210,10 +210,10 @@ fn nickserv_register(state: &mut ServerState, conn: ConnId, args: &[&str]) {
             return;
         }
     };
-    let password = match crate::identity::NewPassword::parse(password) {
+    let password = match state.password_policy.new_password(password) {
         Ok(password) => password,
         Err(refusal) => {
-            state.service_notice(conn, "NickServ", refusal.explanation());
+            state.service_notice(conn, "NickServ", &refusal.explanation());
             return;
         }
     };

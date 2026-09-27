@@ -197,9 +197,10 @@ impl Default for StorageConfig {
     }
 }
 
-/// `draft/account-registration` policy, advertised as the capability's value
-/// so a client knows the rules before it tries.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// Account registration policy: what the `draft/account-registration`
+/// capability advertises, so a client knows the rules before it tries, and the
+/// rule every surface holds a new password to.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationConfig {
     /// Allow REGISTER before the connection completes registration
@@ -211,6 +212,27 @@ pub struct RegistrationConfig {
     /// verification mail, so this only enforces that one was supplied.
     #[serde(default)]
     pub require_email: bool,
+    /// The shortest a password being set may be, in characters: IRC and
+    /// NickServ `REGISTER`, the web and the REST API all apply it. Eight
+    /// unless stated (NIST SP 800-63B); from 1 to
+    /// [`crate::identity::MAX_MINIMUM_PASSWORD_CHARS`]. Applied live; a
+    /// password set before is verified as it was stored.
+    #[serde(default = "default_minimum_password_length")]
+    pub minimum_password_length: usize,
+}
+
+const fn default_minimum_password_length() -> usize {
+    crate::identity::DEFAULT_MINIMUM_PASSWORD_CHARS
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        Self {
+            before_connect: false,
+            require_email: false,
+            minimum_password_length: default_minimum_password_length(),
+        }
+    }
 }
 
 fn default_max_hot_channels() -> usize {
@@ -761,8 +783,10 @@ impl ManagedConfig {
     /// The one definition of which settings apply live, so the answer an
     /// administrator is given cannot drift from what the process does: the BNC
     /// attach listener is rebound in place, the observability sampler and
-    /// storage maintenance each re-read their settings every cycle, and the
-    /// core reads `limits.anti_spam_exit_message_time_seconds` at each `QUIT`
+    /// storage maintenance each re-read their settings every cycle, the core
+    /// reads `limits.anti_spam_exit_message_time_seconds` at each `QUIT`, and
+    /// every surface that sets a password reads
+    /// `registration.minimum_password_length` from one cell
     /// ([`crate::core::CoreIngress::adopt_live_settings`]). Everything else is
     /// read once, at start. (Storage used to be missing here, so a
     /// retention-only change was reported as needing a restart it did not.)
@@ -774,6 +798,8 @@ impl ManagedConfig {
         reached_live.storage = next.storage.clone();
         reached_live.limits.anti_spam_exit_message_time_seconds =
             next.limits.anti_spam_exit_message_time_seconds;
+        reached_live.registration.minimum_password_length =
+            next.registration.minimum_password_length;
         reached_live != *next
     }
 
@@ -2571,6 +2597,18 @@ impl Config {
                 crate::db::StartupDatabaseWait::from_seconds(database.startup_wait_seconds)
         {
             return Err(ConfigError::Invalid(error));
+        }
+        if !(1..=crate::identity::MAX_MINIMUM_PASSWORD_CHARS)
+            .contains(&self.registration.minimum_password_length)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "registration.minimum_password_length must be from 1 to {} characters (it is \
+                 {}); a longer minimum would refuse every password some scripts can fit in \
+                 {} bytes",
+                crate::identity::MAX_MINIMUM_PASSWORD_CHARS,
+                self.registration.minimum_password_length,
+                crate::identity::MAX_PASSWORD_LEN,
+            )));
         }
         if self.limits.anti_spam_exit_message_time_seconds > MAX_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS
         {
@@ -4385,6 +4423,50 @@ mod tests {
         )
     }
 
+    /// `registration.minimum_password_length` is NIST's eight when unstated,
+    /// may be as little as one, and a value outside its bounds is refused by
+    /// name at start and on a console save alike.
+    #[test]
+    fn the_password_minimum_defaults_to_eight_and_is_bounded() {
+        let document = |registration: &str| {
+            Config::from_table(
+                toml::from_str(&format!(
+                    "server_name = \"irc.example\"\nnetwork_name = \"example\"\n\
+                     [[listeners]]\naddr = \"127.0.0.1:6667\"\n\
+                     [database]\nurl = \"postgres://localhost/e6irc\"\n\
+                     [registration]\n{registration}\n"
+                ))
+                .expect("document"),
+                &[],
+            )
+        };
+        let unstated = document("").expect("valid");
+        assert_eq!(unstated.registration.minimum_password_length, 8);
+        let one = document("minimum_password_length = 1").expect("valid");
+        assert_eq!(one.registration.minimum_password_length, 1);
+        let longest = document(&format!(
+            "minimum_password_length = {}",
+            crate::identity::MAX_MINIMUM_PASSWORD_CHARS
+        ))
+        .expect("the bound itself is valid");
+        for refused in [0, crate::identity::MAX_MINIMUM_PASSWORD_CHARS + 1] {
+            let error = document(&format!("minimum_password_length = {refused}"))
+                .expect_err("outside the bounds")
+                .to_string();
+            assert!(
+                error.contains("registration.minimum_password_length must be from 1 to 128"),
+                "{error}"
+            );
+        }
+        let mut managed = ManagedConfig::from_config(&longest, None).expect("managed");
+        managed.registration.minimum_password_length += 1;
+        let refusal = managed
+            .validate(standalone_context())
+            .expect_err("the console save is refused too")
+            .to_string();
+        assert!(refusal.contains("minimum_password_length"), "{refusal}");
+    }
+
     /// `limits.anti_spam_exit_message_time_seconds` is Libera's five minutes
     /// when unstated, `0` switches it off, and a value past the bound is
     /// refused by name at start and on a console save alike.
@@ -4943,6 +5025,12 @@ require_sasl_from = ["::ffff:192.0.2.0/120", "2001:db8::/32"]"#,
                  name=\"anti_spam_exit_message_time_seconds\" \
                  placeholder=\"{DEFAULT_ANTI_SPAM_EXIT_MESSAGE_TIME_SECONDS}\""
             ),
+            format!(
+                "min=\"1\" max=\"{}\" name=\"registration_minimum_password_length\" \
+                 placeholder=\"{}\"",
+                crate::identity::MAX_MINIMUM_PASSWORD_CHARS,
+                crate::identity::DEFAULT_MINIMUM_PASSWORD_CHARS
+            ),
         ] {
             assert!(form.contains(&control), "the form lacks {control}");
         }
@@ -5418,6 +5506,10 @@ account_claim = "preferred_username"
         let mut quit_comments = current.clone();
         quit_comments.limits.anti_spam_exit_message_time_seconds = 0;
         assert!(!current.requires_restart_to_reach(&quit_comments));
+        // Every surface that sets a password reads it from one cell.
+        let mut password_minimum = current.clone();
+        password_minimum.registration.minimum_password_length = 1;
+        assert!(!current.requires_restart_to_reach(&password_minimum));
 
         // Read once, at start.
         let mut renamed = retention.clone();

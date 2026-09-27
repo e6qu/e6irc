@@ -279,6 +279,7 @@ async fn verify_password_roundtrip() {
         reply,
         DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         }
     );
@@ -1326,7 +1327,8 @@ async fn verify_records_credential_last_used() {
     assert_eq!(
         db::verify_credentials(&pool, "lu", &app)
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         Some(db::VerifiedAccount::established("lu"))
     );
     let after = db::list_credentials(&pool, "lu").await.expect("list");
@@ -1339,7 +1341,8 @@ async fn verify_records_credential_last_used() {
     assert_eq!(
         db::verify_credentials(&pool, "lu", "wrong")
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         None
     );
 }
@@ -1381,7 +1384,8 @@ async fn revoke_credential_cannot_delete_the_primary_password() {
     assert_eq!(
         db::verify_credentials(&pool, "rc", "pw")
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         Some(db::VerifiedAccount::established("rc"))
     );
     // The app password IS revocable.
@@ -1472,7 +1476,8 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     assert_eq!(
         db::verify_credentials(&pool, "rotate", &app)
             .await
-            .expect("app verify"),
+            .expect("app verify")
+            .map(|signed_in| signed_in.account),
         Some(db::VerifiedAccount::established("rotate")),
         "rotating the primary must not silently revoke independent app passwords"
     );
@@ -7571,6 +7576,7 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         db::api_token_account(&pool, &token)
             .await
             .expect("resolve token")
+            .map(|signed_in| signed_in.account.into_name())
             .as_deref(),
         Some("devacct"),
         "the minted token resolves to the approving account"
@@ -8104,7 +8110,8 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(
         db::verify_credentials(&pool, "Bob", "bob password")
             .await
-            .expect("credential query"),
+            .expect("credential query")
+            .map(|signed_in| signed_in.account),
         None
     );
     assert_eq!(
@@ -8122,7 +8129,8 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(
         db::api_token_account(&pool, &token)
             .await
-            .expect("token lookup"),
+            .expect("token lookup")
+            .map(|signed_in| signed_in.account.into_name()),
         None
     );
     assert!(matches!(
@@ -8152,7 +8160,8 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(
         db::verify_credentials(&pool, "Bob", "bob password")
             .await
-            .expect("credential query"),
+            .expect("credential query")
+            .map(|signed_in| signed_in.account),
         Some(db::VerifiedAccount::established("Bob")),
         "reactivation restores durable credentials but not revoked bearers"
     );
@@ -8518,7 +8527,8 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     assert_eq!(
         db::api_token_account(&pool, &api_token)
             .await
-            .expect("token"),
+            .expect("token")
+            .map(|signed_in| signed_in.account.into_name()),
         None
     );
     let residues: (i64, i64, i64, i64) = sqlx::query_as(
@@ -9454,7 +9464,9 @@ async fn corrupt_stored_password_hash_is_a_store_fault_not_a_wrong_password() {
     for password in ["correct password", "wrong password"] {
         assert!(
             matches!(
-                db::verify_credentials(&pool, "Alice", password).await,
+                db::verify_credentials(&pool, "Alice", password)
+                    .await
+                    .map(|verified| verified.map(|signed_in| signed_in.account)),
                 Err(db::DbError::Hash(_))
             ),
             "SASL/IDENTIFY verification must report the damaged hash"
@@ -9529,7 +9541,8 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     assert_eq!(
         db::verify_credentials(&pool, "alice", &app_password)
             .await
-            .expect("app password verify"),
+            .expect("app password verify")
+            .map(|signed_in| signed_in.account),
         None,
         "the app password no longer opens the account"
     );
@@ -9795,6 +9808,7 @@ async fn migration_0059_revokes_app_passwords_it_cannot_name_and_says_so() {
         db::verify_credentials(&pool, "alice", "primary")
             .await
             .expect("verify")
+            .map(|signed_in| signed_in.account)
             .as_deref(),
         Some("Alice")
     );
@@ -9831,6 +9845,7 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
             db::verify_credentials(&pool, "ALICE", secret)
                 .await
                 .expect("verify")
+                .map(|signed_in| signed_in.account)
                 .as_deref(),
             Some("Alice")
         );
@@ -9864,14 +9879,16 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
         assert_eq!(
             db::verify_credentials(&pool, "alice", wrong)
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
     assert_eq!(
         db::verify_credentials(&pool, "nobody", &secrets[0])
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         None,
         "an app password opens only its own account"
     );
@@ -11907,7 +11924,8 @@ async fn password_attempts_are_bounded_per_account_name() {
         assert_eq!(
             db::verify_credentials(&pool, "alice", "typo")
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
@@ -11922,7 +11940,8 @@ async fn password_attempts_are_bounded_per_account_name() {
         assert_eq!(
             db::verify_credentials(&pool, "alice", "guess")
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
@@ -11937,7 +11956,9 @@ async fn password_attempts_are_bounded_per_account_name() {
         _ => false,
     };
     assert!(throttled(
-        db::verify_credentials(&pool, "Alice", "correct horse").await
+        db::verify_credentials(&pool, "Alice", "correct horse")
+            .await
+            .map(|verified| verified.map(|signed_in| signed_in.account))
     ));
     assert!(throttled(
         db::verify_local_password(&pool, "alice", "correct horse").await
@@ -11962,6 +11983,7 @@ async fn password_attempts_are_bounded_per_account_name() {
         db::verify_credentials(&pool, "bob", "bob password")
             .await
             .expect("verify")
+            .map(|signed_in| signed_in.account)
             .as_deref(),
         Some("bob")
     );
@@ -11971,12 +11993,15 @@ async fn password_attempts_are_bounded_per_account_name() {
         assert_eq!(
             db::verify_credentials(&pool, "nobody", "guess")
                 .await
-                .expect("verify"),
+                .expect("verify")
+                .map(|signed_in| signed_in.account),
             None
         );
     }
     assert!(throttled(
-        db::verify_credentials(&pool, "nobody", "guess").await
+        db::verify_credentials(&pool, "nobody", "guess")
+            .await
+            .map(|verified| verified.map(|signed_in| signed_in.account))
     ));
     // Once the window has passed the account is admitted again.
     sqlx::query(
@@ -11990,6 +12015,7 @@ async fn password_attempts_are_bounded_per_account_name() {
         db::verify_credentials(&pool, "alice", "correct horse")
             .await
             .expect("verify")
+            .map(|signed_in| signed_in.account)
             .as_deref(),
         Some("alice")
     );
@@ -12311,7 +12337,8 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
     assert_eq!(
         db::verify_credentials(&pool, "ALICE_AWAY", "administrator password")
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         Some(db::VerifiedAccount::established("Alice"))
     );
     assert_eq!(
@@ -12489,7 +12516,8 @@ async fn an_app_password_exchanged_through_a_grouped_nick_is_the_accounts() {
     assert_eq!(
         db::verify_credentials(&pool, "Alice", &app_password)
             .await
-            .expect("verify"),
+            .expect("verify")
+            .map(|signed_in| signed_in.account),
         Some(db::VerifiedAccount::established("Alice")),
         "the app password is Alice's"
     );
@@ -13577,7 +13605,11 @@ async fn a_failed_credential_use_record_fails_both_password_checks() {
     .expect("trigger");
     let failed_write = |outcome: Result<Option<db::VerifiedAccount>, db::DbError>| matches!(outcome, Err(error) if error.to_string().contains("last_used_at is not writable"));
     assert!(
-        failed_write(db::verify_credentials(&pool, "user", &app_password).await),
+        failed_write(
+            db::verify_credentials(&pool, "user", &app_password)
+                .await
+                .map(|verified| verified.map(|signed_in| signed_in.account))
+        ),
         "an app-password login reported success past a failed write"
     );
     assert!(
@@ -13770,6 +13802,117 @@ async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
     assert_eq!(markers, ["#ok"]);
 }
 
+/// A sign-in names the credential that verified — the account password, one
+/// app password, a personal access token — and migration 0097 announces the
+/// revocation of an app password or a token by that name, so what it signed
+/// in can end whichever process revoked it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_sign_in_names_its_credential_and_its_revocation_is_announced() {
+    use e6ircd::identity::{CredentialId, IssuedCredential};
+    let url =
+        support::test_db("a_sign_in_names_its_credential_and_its_revocation_is_announced").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "first password", None)
+        .await
+        .expect("alice");
+    let first_secret = db::issue_app_password(&pool, "alice", "first password", "laptop")
+        .await
+        .expect("app password");
+    let second_secret = db::issue_app_password(&pool, "alice", "first password", "phone")
+        .await
+        .expect("app password");
+    let token = db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc client",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Irc])
+            .expect("scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("token");
+    let signed_in_with = async |secret: &str| {
+        let signed_in = db::verify_credentials(&pool, "alice", secret)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert_eq!(signed_in.account.name(), "Alice");
+        signed_in.credential
+    };
+    assert_eq!(
+        signed_in_with("first password").await,
+        CredentialId::AccountPassword
+    );
+    let (CredentialId::Issued(first), CredentialId::Issued(second)) = (
+        signed_in_with(&first_secret).await,
+        signed_in_with(&second_secret).await,
+    ) else {
+        panic!("an app password signs in as itself");
+    };
+    assert!(matches!(first, IssuedCredential::AppPassword(_)));
+    assert!(matches!(second, IssuedCredential::AppPassword(_)));
+    assert_ne!(first, second);
+    let signed_in = db::api_token_account(&pool, &token)
+        .await
+        .expect("token lookup")
+        .expect("an IRC token");
+    let CredentialId::Issued(token @ IssuedCredential::ApiToken(token_id)) = signed_in.credential
+    else {
+        panic!("a token signs in as itself: {:?}", signed_in.credential);
+    };
+
+    let every = [first, second, token];
+    let stored = async || {
+        let mut stored: Vec<IssuedCredential> = db::issued_credentials_stored(&pool, &every)
+            .await
+            .expect("stored")
+            .into_iter()
+            .collect();
+        stored.sort_unstable();
+        stored
+    };
+    assert_eq!(stored().await, every.to_vec());
+
+    let mut listener = db::CredentialChangeListener::connect(&url)
+        .await
+        .expect("listen");
+    let mut revoked = async || loop {
+        let change = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+            .await
+            .expect("an announcement")
+            .expect("listener");
+        if let db::CredentialChange::IssuedRevoked(credential) = change {
+            return credential;
+        }
+    };
+    let IssuedCredential::AppPassword(first_id) = first else {
+        unreachable!("matched above");
+    };
+    assert!(
+        db::revoke_credential(&pool, "alice", first_id)
+            .await
+            .expect("revoke")
+    );
+    assert_eq!(revoked().await, first);
+    assert!(
+        db::delete_api_token(&pool, "alice", token_id)
+            .await
+            .expect("revoke")
+    );
+    assert_eq!(revoked().await, token);
+    assert_eq!(
+        stored().await,
+        vec![second],
+        "what a listener that missed the announcements reads"
+    );
+    // The other app password still signs in, as itself.
+    assert_eq!(
+        signed_in_with(&second_secret).await,
+        CredentialId::Issued(second)
+    );
+}
+
 /// Migration 0095 counts every change of an account's authority — its
 /// suspension flipping, its primary password added, replaced or removed, by
 /// whichever path — and nothing else, and announces each created account,
@@ -13825,6 +13968,7 @@ async fn account_authority_changes_are_counted_and_announced() {
     db::verify_credentials(&pool, "alice", "first password")
         .await
         .expect("verify")
+        .map(|signed_in| signed_in.account)
         .expect("verified");
     db::issue_app_password(&pool, "alice", "first password", "laptop")
         .await

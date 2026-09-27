@@ -288,11 +288,14 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asynchronous answer — held (`emit_deferred_labeled`) or not
     (`emit_labeled_unheld`) — is gathered with what the command answered on the
     spot into the one labeled response.
-  - `NewPassword` — a password an account may be given (8 characters to 512 bytes) is parsed
-    once; account creation takes only this type, and the REST/web validators
-    call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
-    cannot store a password another surface refuses to verify (an empty one
-    was storable through `REGISTER` and could then never be logged in to).
+  - `NewPassword` — a password an account may be given (the configured
+    minimum, 8 characters unless stated, to 512 bytes) is parsed once, by the
+    one `PasswordPolicy` every surface shares; account creation takes only
+    this type, and the REST/web validators call the same parser, so IRC
+    `REGISTER`, NickServ `REGISTER` and the web cannot store a password
+    another surface refuses to verify (an empty one was storable through
+    `REGISTER` and could then never be logged in to), nor hold one to a
+    different minimum.
   - `MemberModes::sigils` — the one renderer of a member's rank sigils,
     honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
     copy that ignored the capability.
@@ -572,6 +575,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     lane, and a lease is refused to a credential check that began before the
     revocation. Attachments to shared and configured networks, which do not
     stop with the account, once stayed open (§9).
+  - `CredentialId` — an IRC session's login and an attachment's lease carry
+    the credential that signed them in, from the verification that named it,
+    so revoking an app password or a personal access token ends exactly what
+    it opened. Neither recorded it, and a revoked credential's sessions and
+    attachments stayed open for as long as they lived (§9.1).
   - `AuthorityLedger` — a change of an account's authority is applied on
     every server serving the database, each exactly once: the accounts row
     counts each change (`authority_generation`, migration 0095), the server
@@ -1795,13 +1803,15 @@ Principal tables (columns abridged):
   holds at most the names tried within one window.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
-  revocable, shown once at creation
+  revocable, shown once at creation; an app password's deletion is announced
+  by id (migration 0097), ending what it signed in (§9.1)
 - `oidc_identities` (issuer, subject) → account_id, UNIQUE(issuer, subject)
 - `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
   creation/expiry, bounded user agent, optional OIDC identity/session metadata)
 - `api_tokens` (hashed PATs, scopes, expiry) — at most 32 unexpired tokens per
   account, counted under the account-row lock; an expired token holds no slot
-  while it waits for storage maintenance to delete it.
+  while it waits for storage maintenance to delete it. A deletion is
+  announced by digest (migration 0077) and by id (migration 0097).
 - `channels` (registered channels: founder, successor, flags, topic
   retention, mlock). The founder reference is `ON DELETE RESTRICT` (migration
   0071): a channel is never account-owned data, so no account deletion can
@@ -2128,10 +2138,17 @@ the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge — including the password rule
-(`NewPassword`: at least 8 characters, the NIST SP 800-63B floor, and at most
-512 bytes, which the web forms and REST API apply too, NickServ `REGISTER` and a
-password change included; a password set before the floor still verifies):
-`REGISTER`
+(`NewPassword`: at least `registration.minimum_password_length` characters and
+at most 512 bytes, which the web forms and REST API apply too, NickServ
+`REGISTER` and a password change included; a password set before the floor
+still verifies). The minimum is console-owned: 8 unless stated, the NIST SP
+800-63B floor; at least 1, since the empty password no login surface accepts;
+at most 128, a quarter of the 512-byte bound, so a password that meets it fits
+in every script, a character being at most four UTF-8 bytes. Every surface
+reads it from one `PasswordPolicy` cell, which a console save or another
+writer's revision sets live (`CoreIngress::adopt_live_settings`), and the web
+forms render it as their `minlength`. irctest runs e6ircd at 1, as the services
+it drives elsewhere accept its short passwords. `REGISTER`
 refuses a shorter password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
 one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
 account after with `NEED_NICK`; the capability's advertised value states
@@ -2294,10 +2311,17 @@ provider-verified email claim.
 | Mechanism | For | Notes |
 |---|---|---|
 | SASL **PLAIN** | every existing IRC client | password = local password **or** an app password generated in the web UI. |
-| SASL **OAUTHBEARER** (RFC 7628) | e6irc-cli/tui and OAuth-capable clients | client obtains a token via the provider's **device authorization grant**; server validates signature/claims via cached JWKS (or introspection if configured) and maps (iss, sub) → account. |
+| SASL **OAUTHBEARER** (RFC 7628) | e6irc-cli/tui and OAuth-capable clients | the bearer is a personal access token with the `irc` grant, which e6irc's own **device authorization grant** (RFC 8628) mints for a client or the web UI issues; the server looks its hash up (§9.4). |
 | NickServ `IDENTIFY` | legacy clients without SASL | same credential check as PLAIN. Like PLAIN, it takes the account name or any nick grouped to the account. |
 
 Client-certificate fingerprint login is explicitly out of scope for v1 (not selected).
+
+A session keeps the credential that signed it in (`CredentialId`): the account
+password, one app password, or one personal access token — the verification
+names which, by row id — and so does a bouncer attachment's `AccountLease`.
+Revoking an app password or a token ends exactly what it signed in, whichever
+process revokes it (§9.1); the account's sessions signed in with its password
+or another credential stay. `REGISTER` signs in with the password it just set.
 
 ### 9.4 REST API authentication
 
@@ -2493,6 +2517,25 @@ sweep without its gate: attachments are revoked on the mutation lane, and every
 core shard closes the account's sessions and refuses a verdict for a
 credential check queued before the change (`EndAccountSessions`); a check
 queued afterwards reads the new credentials.
+
+Revoking one app password or one personal access token ends the IRC sessions
+and bouncer attachments that credential signed in (`CredentialId`, §9.3),
+whichever process revoked it, and nothing else the account holds. The
+deletion of its row is the revocation — by its endpoint, recovery, storage
+maintenance's pruning of an expired token, or the account's deletion — and
+migration 0097's triggers announce it on `e6irc_credential_changed` as
+`app_password:<id>` or `api_token:<id>`. The account-authority listener hears
+it and, with nothing to re-read or record (a revoked credential cannot sign in
+again), revokes the attachments whose lease holds it — the client is told the
+app password it signed in with was revoked — and has every core shard close
+each session it signed in with `ERROR :Closing Link: … (App password revoked)`
+or `(Personal access token revoked)`. A check of the credential queued before
+that is refused when its verdict lands, as after a password change (the shard's
+credential epoch), and the attach listener's `RevocationTicket` refuses the
+lease of one under way. The core counts, in one directory every shard shares,
+the credentials its live sessions signed in with; after the listener's
+connection is lost it asks which of those and of the attachments' are still
+stored and ends what the others signed in.
 
 Several servers may serve one database, and each of them ends the account's
 sessions and attachments, whichever server committed the change
@@ -4710,6 +4753,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   session in the same transaction, then every live IRC session and bouncer
   attachment of the account (§9); app passwords and personal access tokens
   are separately managed and left unchanged, and the response says so.
+  Revoking one of those, by any process, ends exactly the IRC sessions and
+  attachments it signed in, and refuses a check of it already under way
+  (§9.1).
   Console pages authenticate by browser session only: a bearer — whatever its
   scopes — gets 401, and suspension or an unavailable database surface as
   their problem documents, not a login redirect.
@@ -5153,9 +5199,10 @@ Layers, bottom to top:
   trigger notifying `e6irc_server_settings_changed`, as 0077 does for
   credentials) and every running server adopts a later revision it hears
   (`settings_watch`): the snapshot the console and the maintenance loops read
-  is replaced, the core takes the settings it follows live (history retention
-  and `limits.anti_spam_exit_message_time_seconds`, through the one
-  `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
+  is replaced, the core takes the settings it follows live (history retention,
+  `limits.anti_spam_exit_message_time_seconds` and
+  `registration.minimum_password_length`, which the web shares, through the
+  one `CoreIngress::adopt_live_settings`) and the BNC attach listener is brought to
   what it says — exactly what a console save in that process applies, and
   nothing restart-only. A
   save that still finds its revision stale reloads the stored row before it

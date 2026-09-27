@@ -136,7 +136,11 @@ async fn attach_relays_over_the_loopback_driver() {
             {
                 let revocations = e6ircd::bouncer::AccountRevocations::new();
                 revocations
-                    .lease(revocations.ticket(), "attacher")
+                    .lease(
+                        revocations.ticket(),
+                        "attacher",
+                        e6ircd::identity::CredentialId::AccountPassword,
+                    )
                     .expect("nothing revoked it")
             },
             e6ircd::bouncer::Greeting {

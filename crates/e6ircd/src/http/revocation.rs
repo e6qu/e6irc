@@ -193,6 +193,10 @@ impl CredentialWatch {
                     // A suspension or deletion also ends the account's browser
                     // credentials, which are announced themselves.
                     Ok(CredentialChange::Account(_)) => {}
+                    // An app password or token's IRC sessions and
+                    // attachments: the account-authority watcher's. A token's
+                    // chat sockets hear its `Changed` announcement.
+                    Ok(CredentialChange::IssuedRevoked(_)) => {}
                     Err(error) => {
                         eprintln!("http: credential-change listener lost: {error}");
                         break;

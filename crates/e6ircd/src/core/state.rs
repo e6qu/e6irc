@@ -1010,7 +1010,7 @@ impl PublicUser {
             host: session.host.clone(),
             real_ip: session.real_ip,
             realname: session.realname().expect("registered").to_string(),
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             away: session.away.clone(),
             oper: session.oper.is_some(),
             bot: session.bot,
@@ -1030,7 +1030,7 @@ impl PublicUser {
             && Some(self.user.as_str()) == session.user()
             && self.host == session.host
             && Some(self.realname.as_str()) == session.realname()
-            && self.account == session.account
+            && self.account.as_deref() == session.account()
             && self.away == session.away
             && self.oper == session.oper.is_some()
             && self.bot == session.bot
@@ -1329,6 +1329,75 @@ pub(crate) struct CoreDirectories {
     pub(crate) history_retention: HistoryRetention,
     /// How old a connection must be before its QUIT comment is shown.
     pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
+    /// The issued credentials live sessions signed in with.
+    pub(crate) signed_in_credentials: SignedInCredentials,
+    /// The rule for a password being set, shared with the web and the REST
+    /// API.
+    pub(crate) password_policy: crate::identity::PasswordPolicy,
+}
+
+/// A session's login: the account, and the credential that signed it in.
+#[derive(Debug, Clone)]
+struct Login {
+    account: String,
+    credential: crate::identity::CredentialId,
+}
+
+/// What a credential verdict is refused for, once it no longer stands
+/// ([`ServerState::end_credentials`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum EndedSignIns {
+    /// Every credential of the account: its password changed.
+    Account(AccountKey),
+    /// One app password or personal access token: it was revoked.
+    Credential(crate::identity::IssuedCredential),
+}
+
+/// The app passwords and personal access tokens live sessions on every shard
+/// signed in with, each counted once per session. A listener that missed
+/// revocations while its connection was down reads which of these are still
+/// stored ([`crate::account_authority`]); nothing else is held long enough to
+/// need asking about.
+#[derive(Clone, Default)]
+pub(crate) struct SignedInCredentials(
+    Arc<std::sync::Mutex<HashMap<crate::identity::IssuedCredential, usize>>>,
+);
+
+impl SignedInCredentials {
+    fn hold(&self, credential: crate::identity::CredentialId) {
+        if let crate::identity::CredentialId::Issued(issued) = credential {
+            *self
+                .0
+                .lock()
+                .expect("signed-in credentials poisoned")
+                .entry(issued)
+                .or_default() += 1;
+        }
+    }
+
+    fn release(&self, credential: crate::identity::CredentialId) {
+        let crate::identity::CredentialId::Issued(issued) = credential else {
+            return;
+        };
+        let mut held = self.0.lock().expect("signed-in credentials poisoned");
+        let std::collections::hash_map::Entry::Occupied(mut entry) = held.entry(issued) else {
+            unreachable!("a session's issued credential is held while it is signed in");
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
+
+    /// Every issued credential a live session signed in with.
+    pub(crate) fn held(&self) -> Vec<crate::identity::IssuedCredential> {
+        self.0
+            .lock()
+            .expect("signed-in credentials poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
 }
 
 /// How old a connection must be before the comment of its `QUIT` is shown
@@ -1842,12 +1911,13 @@ pub(crate) struct Session {
     /// multi-line CAP replies, and `cap-notify` it cannot turn off.
     pub cap_302: bool,
     pub caps: Caps,
-    /// Services account this connection is authenticated to. Written only by
+    /// Services account this connection is authenticated to, with the
+    /// credential that signed it in. Written only by
     /// [`ServerState::set_account`] and [`ServerState::clear_account`]: a
     /// login changes the connection's identity (see
     /// [`ServerState::conn_identity`]), and what the old identity owned must
     /// be dealt with in the same step.
-    account: Option<String>,
+    login: Option<Login>,
     pub sasl: SaslState,
     /// A SASL credential verify is genuinely outstanding (dispatched, reply not
     /// yet seen). Unlike `sasl == Verifying`, this survives an `AUTHENTICATE *`
@@ -2273,7 +2343,12 @@ impl Session {
 
     /// The services account this connection is logged in to.
     pub fn account(&self) -> Option<&str> {
-        self.account.as_deref()
+        self.login.as_ref().map(|login| login.account.as_str())
+    }
+
+    /// The credential that signed this connection in to its account.
+    pub fn signed_in_with(&self) -> Option<crate::identity::CredentialId> {
+        self.login.as_ref().map(|login| login.credential)
     }
 
     /// The current nick, in either registration state (`None` before NICK).
@@ -2398,7 +2473,7 @@ impl Session {
     /// Who this session is to a channel's masks, given its `prefix()` (taken
     /// by the caller so the subject can borrow it).
     pub(crate) fn mask_subject<'a>(&'a self, prefix: &'a str) -> MaskSubject<'a> {
-        MaskSubject::new(prefix, self.real_ip, self.account.as_deref())
+        MaskSubject::new(prefix, self.real_ip, self.account())
     }
 
     /// `nick!user@host` — total on a registered session (its nick/user exist by
@@ -4666,20 +4741,27 @@ pub(crate) struct ServerState {
     /// How old a connection must be before its QUIT comment is shown, shared
     /// with every shard.
     pub(crate) anti_spam_exit_message_time: AntiSpamExitMessageTime,
+    /// The rule `REGISTER` and NickServ `REGISTER` hold a new password to,
+    /// shared with every shard, the web and the REST API.
+    pub(crate) password_policy: crate::identity::PasswordPolicy,
     effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
     /// verification already in flight cannot re-authenticate after the
     /// suspension event has run.
     pub suspended_accounts: HashSet<AccountKey>,
-    /// Advances each time an account's sessions end for a credential change
-    /// ([`Self::end_credentials`]); a queued credential check records it
-    /// ([`Session::verify_epoch`]).
+    /// Advances each time an account's sessions, or an issued credential's,
+    /// end for a credential change ([`Self::end_credentials`]); a queued
+    /// credential check records it ([`Session::verify_epoch`]).
     credential_epoch: u64,
-    /// The epoch each account's credentials last changed at, kept while a
-    /// credential check queued before it may still land — which is all a
-    /// verdict compares ([`Self::credentials_ended_since`]).
-    credentials_ended: HashMap<AccountKey, u64>,
+    /// The epoch each account's credentials, or each issued credential, last
+    /// ended at, kept while a credential check queued before it may still
+    /// land — which is all a verdict compares
+    /// ([`Self::credentials_ended_since`]).
+    credentials_ended: HashMap<EndedSignIns, u64>,
+    /// The issued credentials this shard's sessions signed in with, in the
+    /// count every shard shares.
+    signed_in_credentials: SignedInCredentials,
     /// Accounts permanently deleted while this process runs. A write already
     /// in flight when one was deleted (MARKREAD, NickServ GROUP or SET
     /// ENFORCE) can answer after its mirror was emptied; the confirmation adds
@@ -4919,7 +5001,7 @@ impl ServerState {
             host: session.host.clone(),
             real_ip: session.real_ip,
             realname: session.realname().expect("registered member").to_string(),
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             away: session.away.is_some(),
             oper: session.oper.is_some(),
             bot: session.bot,
@@ -4932,7 +5014,7 @@ impl ServerState {
         ChannelActor {
             recipient: self.local_recipient(conn),
             identity: self.local_member_identity(conn),
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
             bot: session.bot,
@@ -5677,6 +5759,14 @@ impl ServerState {
         });
     }
 
+    pub(crate) fn broadcast_credential_sessions_ended(
+        &mut self,
+        credential: crate::identity::IssuedCredential,
+    ) {
+        self.effects
+            .push(CoreEffect::BroadcastCredentialSessionsEnded { credential });
+    }
+
     pub(crate) fn broadcast_account_sessions_ended(
         &mut self,
         account: String,
@@ -5744,6 +5834,7 @@ impl ServerState {
             suspended_accounts: HashSet::new(),
             credential_epoch: 0,
             credentials_ended: HashMap::new(),
+            signed_in_credentials: directories.signed_in_credentials,
             deleted_accounts: HashSet::new(),
             db_tx,
             started_at,
@@ -5769,6 +5860,7 @@ impl ServerState {
             flood_exemptions: directories.flood_exemptions,
             history_retention: directories.history_retention,
             anti_spam_exit_message_time: directories.anti_spam_exit_message_time,
+            password_policy: directories.password_policy,
             census_reported: (0, 0),
             history: HotHistory::default(),
             emitting_deferred: None,
@@ -5984,10 +6076,12 @@ impl ServerState {
             .unwrap_or_default()
     }
 
-    /// `conn` is no longer logged in to `account`: drop it from the index,
-    /// and the account's entry once it is empty.
-    fn forget_account_session(&mut self, account: &str, conn: ConnId) {
-        let key = self.account_key(account);
+    /// `conn` is no longer logged in with `login`: drop it from the account
+    /// index, and the account's entry once it is empty, and let go of the
+    /// credential it signed in with.
+    fn forget_login(&mut self, login: &Login, conn: ConnId) {
+        self.signed_in_credentials.release(login.credential);
+        let key = self.account_key(&login.account);
         let std::collections::hash_map::Entry::Occupied(mut entry) =
             self.account_sessions.entry(key)
         else {
@@ -6118,22 +6212,37 @@ impl ServerState {
         }
     }
 
-    /// Whether `account`'s credentials changed after `conn` queued the check
-    /// whose verdict is landing: that verdict speaks for credentials that no
-    /// longer stand, and is refused.
-    pub(crate) fn credentials_ended_since(&self, conn: ConnId, account: &str) -> bool {
+    /// Whether `account`'s credentials changed, or the issued `credential`
+    /// was revoked, after `conn` queued the check whose verdict is landing:
+    /// that verdict speaks for a credential that no longer stands, and is
+    /// refused.
+    pub(crate) fn credentials_ended_since(
+        &self,
+        conn: ConnId,
+        account: &str,
+        credential: crate::identity::CredentialId,
+    ) -> bool {
         let Some(session) = self.sessions.get(&conn) else {
             return false;
         };
-        self.credentials_ended
-            .get(&self.account_key(account))
-            .is_some_and(|ended| *ended > session.verify_epoch)
+        let ended_since = |key: &EndedSignIns| {
+            self.credentials_ended
+                .get(key)
+                .is_some_and(|ended| *ended > session.verify_epoch)
+        };
+        ended_since(&EndedSignIns::Account(self.account_key(account)))
+            || matches!(
+                credential,
+                crate::identity::CredentialId::Issued(issued)
+                    if ended_since(&EndedSignIns::Credential(issued))
+            )
     }
 
-    /// `account`'s credentials changed: a verdict for any check queued before
-    /// now is refused when it lands. Changes no check still outstanding
-    /// predates are forgotten.
-    pub(crate) fn end_credentials(&mut self, account: AccountKey) {
+    /// `ended` — an account's credentials, or one issued credential — no
+    /// longer stands: a verdict for any check queued before now is refused
+    /// when it lands. Changes no check still outstanding predates are
+    /// forgotten.
+    pub(crate) fn end_credentials(&mut self, ended: EndedSignIns) {
         self.credential_epoch += 1;
         let oldest_outstanding = self
             .sessions
@@ -6144,9 +6253,8 @@ impl ServerState {
         match oldest_outstanding {
             None => self.credentials_ended.clear(),
             Some(oldest) => {
-                self.credentials_ended.retain(|_, ended| *ended > oldest);
-                self.credentials_ended
-                    .insert(account, self.credential_epoch);
+                self.credentials_ended.retain(|_, at| *at > oldest);
+                self.credentials_ended.insert(ended, self.credential_epoch);
             }
         }
     }
@@ -6699,7 +6807,7 @@ impl ServerState {
     /// it lasts exactly as long as the party it was with.
     pub fn conn_identity(&self, conn: ConnId) -> String {
         match self.sessions.get(&conn) {
-            Some(s) => match &s.account {
+            Some(s) => match s.account() {
                 Some(account) => self.casemap.casefold(account),
                 None => format!("~{}", self.casemap.casefold(s.nick().unwrap_or(""))),
             },
@@ -6776,7 +6884,7 @@ impl ServerState {
                 cap_negotiating: false,
                 cap_302: false,
                 caps: Caps::default(),
-                account: None,
+                login: None,
                 sasl: SaslState::default(),
                 sasl_verify: None,
                 sasl_buf: String::new(),
@@ -7454,7 +7562,7 @@ impl ServerState {
     pub(crate) fn originator(&self, conn: ConnId) -> Originator {
         let session = &self.sessions[&conn];
         Originator {
-            account: session.account.clone(),
+            account: session.account().map(str::to_owned),
             bot: session.bot,
         }
     }
@@ -7749,8 +7857,8 @@ impl ServerState {
             }
         }
         let session = self.sessions.remove(&conn).expect("checked above");
-        if let Some(account) = &session.account {
-            self.forget_account_session(account, conn);
+        if let Some(login) = &session.login {
+            self.forget_login(login, conn);
         }
         self.memberships.release(conn);
         for key in session.monitoring.keys() {
@@ -7769,7 +7877,7 @@ impl ServerState {
             // the prior occupant's DM rings until LRU eviction — a privacy leak.
             // An authenticated identity is an account (stable, DB-backed) and is
             // deliberately retained.
-            if session.account.is_none() {
+            if session.login.is_none() {
                 self.release_unauthenticated_identity(nick);
             }
         }
@@ -7789,18 +7897,26 @@ impl ServerState {
     /// conversations kept under it — or the next person to take the nick would
     /// read them. A session already logged in keeps nothing under `~nick`, so
     /// changing accounts releases nothing.
-    pub(crate) fn set_account(&mut self, conn: ConnId, account: String) {
+    pub(crate) fn set_account(
+        &mut self,
+        conn: ConnId,
+        account: String,
+        credential: crate::identity::CredentialId,
+    ) {
         let key = self.account_key(&account);
         let session = self.sessions.get_mut(&conn).expect("session logging in");
         let released = session
-            .account
+            .login
             .is_none()
             .then(|| session.nick().map(str::to_owned))
             .flatten();
         let mask = session.login_mask();
-        let previous = session.account.replace(account.clone());
+        let previous = session.login.replace(Login {
+            account: account.clone(),
+            credential,
+        });
         if let Some(previous) = previous {
-            self.forget_account_session(&previous, conn);
+            self.forget_login(&previous, conn);
         }
         self.numeric(
             conn,
@@ -7829,6 +7945,7 @@ impl ServerState {
             enforcement.settle(nick);
         }
         self.account_sessions.entry(key).or_default().insert(conn);
+        self.signed_in_credentials.hold(credential);
         if let Some(nick) = released {
             self.release_unauthenticated_identity(&nick);
         }
@@ -7840,10 +7957,10 @@ impl ServerState {
     pub(crate) fn clear_account(&mut self, conn: ConnId) {
         let session = self.sessions.get_mut(&conn).expect("session logging out");
         let mask = session.login_mask();
-        let Some(previous) = session.account.take() else {
+        let Some(previous) = session.login.take() else {
             return;
         };
-        self.forget_account_session(&previous, conn);
+        self.forget_login(&previous, conn);
         self.numeric(
             conn,
             RPL_LOGGEDOUT,
@@ -8549,17 +8666,37 @@ mod session_store_tests {
         register(&mut state, ConnId(2), "bob");
         register(&mut state, ConnId(3), "carol");
         check(&state);
-        state.set_account(ConnId(1), "Alice".into());
-        state.set_account(ConnId(2), "alice".into());
-        state.set_account(ConnId(3), "carol".into());
+        state.set_account(
+            ConnId(1),
+            "Alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
+        state.set_account(
+            ConnId(2),
+            "alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
+        state.set_account(
+            ConnId(3),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         check(&state);
         assert_eq!(indexed(&state, "ALICE"), vec![ConnId(1), ConnId(2)]);
         // Changing account moves the connection between entries.
-        state.set_account(ConnId(2), "carol".into());
+        state.set_account(
+            ConnId(2),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         check(&state);
         assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
         // Re-setting the same account is idempotent.
-        state.set_account(ConnId(2), "Carol".into());
+        state.set_account(
+            ConnId(2),
+            "Carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         check(&state);
         assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
         state.clear_account(ConnId(1));
@@ -8588,13 +8725,25 @@ mod session_store_tests {
         register(&mut state, ConnId(2), "bob");
         step(&mut state);
         assert_eq!(state.user_counts().users, 2);
-        state.set_account(ConnId(1), "Alice".into());
+        state.set_account(
+            ConnId(1),
+            "Alice".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         step(&mut state);
         assert_eq!(state.identity_nick("alice"), "alice");
-        state.set_account(ConnId(2), "carol".into());
+        state.set_account(
+            ConnId(2),
+            "carol".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         step(&mut state);
         assert_eq!(state.identity_nick("carol"), "bob");
-        state.set_account(ConnId(2), "ALICE".into());
+        state.set_account(
+            ConnId(2),
+            "ALICE".into(),
+            crate::identity::CredentialId::AccountPassword,
+        );
         step(&mut state);
         assert_eq!(state.identity_nick("carol"), "carol", "no one is carol now");
         crate::core::handler::dispatch(&mut state, ConnId(2), b"MODE bob +i");

@@ -314,12 +314,29 @@ impl TestServer {
 
 /// Identify a connection to an account via the NickServ flow.
 fn identify(s: &mut TestServer, conn: ConnId, account: &str) {
+    identify_with(
+        s,
+        conn,
+        account,
+        e6ircd::identity::CredentialId::AccountPassword,
+    );
+}
+
+/// Identify a connection to an account via the NickServ flow, with the store
+/// answering that `credential` verified.
+fn identify_with(
+    s: &mut TestServer,
+    conn: ConnId,
+    account: &str,
+    credential: e6ircd::identity::CredentialId,
+) {
     s.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
+            credential,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -1744,6 +1761,7 @@ fn sasl_abort_then_reauth_does_not_cross_wire_the_stale_verify() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2133,6 +2151,7 @@ fn sasl_plain_success_flow() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -2179,6 +2198,7 @@ fn sasl_login(s: &mut TestServer, conn: ConnId, account: &str) {
         conn,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3174,7 +3194,9 @@ fn nickserv_register_creates_account() {
             conn: alice,
             name: "alice".into(),
             contact_email: None,
-            password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("hunter22")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -3215,7 +3237,8 @@ fn account_registration_persists_only_valid_normalized_contact_email() {
                 e6ircd::identity::ContactEmail::parse("Alice+IRC@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("correct-horse-battery")
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("correct-horse-battery")
                 .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::RegisterCommand,
         }]
@@ -3278,7 +3301,9 @@ fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
                 e6ircd::identity::ContactEmail::parse("Alice@example.com")
                     .expect("valid contact email")
             ),
-            password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
+            password: e6ircd::identity::PasswordPolicy::default()
+                .new_password("hunter22")
+                .expect("valid password"),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
@@ -3349,6 +3374,7 @@ fn overlapping_identify_is_refused_not_silently_dropped() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3378,6 +3404,7 @@ fn nickserv_identify_flow() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3417,6 +3444,7 @@ fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "eve".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3431,6 +3459,7 @@ fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3485,6 +3514,7 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -3749,6 +3779,7 @@ fn labeled_identify_verdict_carries_the_label() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -3918,6 +3949,7 @@ fn chanserv_register_flow() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4143,6 +4175,7 @@ fn chanserv_flags_rejects_an_unknown_flag() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4226,6 +4259,7 @@ fn chanserv_register_requires_op() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -4389,6 +4423,7 @@ fn whox_full_fields_with_account() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5543,6 +5578,7 @@ fn account_notify_and_tag() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5597,6 +5633,7 @@ fn account_tag_on_mode_and_kick_but_not_server_lines() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -5643,6 +5680,7 @@ fn account_notify_fires_on_post_registration_sasl() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -9531,7 +9569,9 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
                 conn: alice,
                 name: "alice".into(),
                 contact_email: None,
-                password: e6ircd::identity::NewPassword::parse("hunter22").expect("valid password"),
+                password: e6ircd::identity::PasswordPolicy::default()
+                    .new_password("hunter22")
+                    .expect("valid password"),
                 origin: e6ircd::core::AccountOrigin::RegisterCommand,
             }],
             "REGISTER {arg} must register the caller's own nick"
@@ -10145,6 +10185,7 @@ fn an_identify_in_flight_at_the_deadline_defers_the_rename() {
         conn: late,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14309,6 +14350,7 @@ fn account_tag_value_is_escaped() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "a\\b".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14673,6 +14715,7 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
         conn: late,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14737,6 +14780,7 @@ fn sasl_authenticated_unregistered(s: &mut TestServer, id: u64, account: &str) -
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -14824,6 +14868,7 @@ fn a_password_change_ends_the_accounts_sessions_and_its_in_flight_verdicts() {
         conn: raced,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -14845,6 +14890,86 @@ fn a_password_change_ends_the_accounts_sessions_and_its_in_flight_verdicts() {
     );
 }
 
+/// Revoking app password A ends exactly the sessions A signed in — not the
+/// account's session signed in with its password, nor one signed in with app
+/// password B — and refuses a verdict for a check of A queued before the
+/// revocation, while a check of B queued alongside it still logs in.
+#[test]
+fn revoking_an_app_password_ends_exactly_the_sessions_it_signed_in() {
+    use e6ircd::core::AdminReply;
+    use e6ircd::identity::{CredentialId, IssuedCredential};
+    const APP_A: IssuedCredential = IssuedCredential::AppPassword(11);
+    const APP_B: IssuedCredential = IssuedCredential::AppPassword(12);
+    let mut server = TestServer::new();
+    let with_password = server.register(10, "AlicePw");
+    identify(&mut server, with_password, "Alice");
+    let with_a = server.register(20, "AliceA");
+    identify_with(&mut server, with_a, "Alice", CredentialId::Issued(APP_A));
+    let with_b = server.register(30, "AliceB");
+    identify_with(&mut server, with_b, "Alice", CredentialId::Issued(APP_B));
+    // Checks of A and of B queued before the revocation, landing after it.
+    let raced_a = server.register(40, "RacedA");
+    server.line(raced_a, "PRIVMSG NickServ :IDENTIFY Alice app-password-a");
+    server.db_requests();
+    let raced_b = server.register(50, "RacedB");
+    server.line(raced_b, "PRIVMSG NickServ :IDENTIFY Alice app-password-b");
+    server.db_requests();
+
+    let ended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::EndCredentialSessions { credential: APP_A },
+    );
+    assert!(
+        matches!(&ended, AdminReply::Ok(message) if message.contains("Disconnected 1")),
+        "{ended:?}"
+    );
+    let out = server.drain(with_a);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with("ERROR :Closing Link")
+                && line.contains("App password revoked")),
+        "{out:#?}"
+    );
+    for kept in [with_password, with_b] {
+        server.line(kept, "PING :still-here");
+        let out = server.drain(kept);
+        assert!(
+            out.iter().any(|line| line.contains(" PONG "))
+                && !out.iter().any(|l| l.starts_with("ERROR")),
+            "{out:#?}"
+        );
+    }
+
+    let verdict = |credential| e6ircd::core::DbReply::PasswordVerified {
+        account: "Alice".into(),
+        credential: CredentialId::Issued(credential),
+        origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+    };
+    server.core.handle(Input::DbReply {
+        conn: raced_a,
+        reply: verdict(APP_A),
+    });
+    assert!(
+        server
+            .drain(raced_a)
+            .iter()
+            .any(|line| line.contains("Invalid password")),
+        "a verdict for the revoked app password is refused"
+    );
+    server.core.handle(Input::DbReply {
+        conn: raced_b,
+        reply: verdict(APP_B),
+    });
+    server.line(raced_b, "WHOIS RacedB");
+    assert!(
+        server
+            .drain(raced_b)
+            .iter()
+            .any(|line| line.contains(" 330 ") && line.contains("Alice")),
+        "another app password's verdict still logs in"
+    );
+}
+
 #[test]
 fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
     let mut server = TestServer::new();
@@ -14856,6 +14981,7 @@ fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "Alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -17189,6 +17315,7 @@ fn labeled_identify_with_echo_keeps_the_echo_in_its_response() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -17215,6 +17342,7 @@ fn every_login_path_sends_900_and_logout_sends_901() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
@@ -17262,6 +17390,7 @@ fn sasl_success_sends_900_exactly_once() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -17286,6 +17415,7 @@ fn labeled_authenticate_is_answered_by_its_verdict() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
@@ -17337,6 +17467,7 @@ fn authenticate_during_verification_ends_the_attempt_once() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            credential: e6ircd::identity::CredentialId::AccountPassword,
             origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
