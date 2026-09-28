@@ -1,9 +1,9 @@
 //! What an upstream session has told the bouncer about each channel it is in
 //! beyond the membership itself: the topic and the member list, followed line
-//! by line. The session's live state and the ring's head state (§10.1) keep
-//! one each, so an attaching client is shown a channel's topic and members
-//! from what the bouncer already knows — the soju and ZNC way — instead of
-//! the upstream being asked again for every channel on every attach.
+//! by line. The session's live state (§10.1) keeps them, so an attaching
+//! client is shown a channel's topic and members from what the bouncer already
+//! knows — the soju and ZNC way — instead of the upstream being asked again
+//! for every channel on every attach.
 
 use std::collections::HashMap;
 

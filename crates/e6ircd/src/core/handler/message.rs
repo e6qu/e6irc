@@ -5,16 +5,11 @@ use crate::core::state::SpeakRefusal;
 
 // ---- messaging ----------------------------------------------------------
 
-/// A CTCP message is \x01-delimited; ACTION (/me) is exempt from +C.
+/// A CTCP message is \x01-delimited; ACTION (/me) is exempt from +C. See
+/// [`crate::sanitize::is_ctcp_request`], which the bridges and the bouncer's
+/// backlog read too.
 pub(super) fn is_blocked_ctcp(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.first() == Some(&0x01) && !is_ctcp_action(text)
-}
-
-/// Whether `text` is a CTCP whose tag is exactly `ACTION`; see
-/// [`crate::sanitize::ctcp_action`], which the bridges read too.
-fn is_ctcp_action(text: &str) -> bool {
-    crate::sanitize::ctcp_action(text).is_some()
+    crate::sanitize::is_ctcp_request(text)
 }
 
 /// Yield the unique, non-empty targets of a comma-separated target list,

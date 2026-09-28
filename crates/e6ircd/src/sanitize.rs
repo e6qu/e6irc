@@ -114,6 +114,14 @@ pub(crate) fn ctcp_action(text: &str) -> Option<&str> {
     Some(rest.strip_suffix('\u{1}').unwrap_or(rest))
 }
 
+/// Whether `text` is a CTCP other than [`ctcp_action`] (`\x01VERSION\x01`,
+/// `\x01PING 1\x01`, a DCC offer): a request its recipient's client answers.
+/// One predicate, read by the core's `+C` check, the bridges' outbound
+/// translation and the bouncer's backlog, which keeps none of them.
+pub(crate) fn is_ctcp_request(text: &str) -> bool {
+    text.starts_with('\u{1}') && ctcp_action(text).is_none()
+}
+
 /// What an echo shows in place of a [`sensitive_service_command`].
 pub(crate) const SENSITIVE_SERVICE_COMMAND_REDACTED: &str = "[sensitive services command redacted]";
 
