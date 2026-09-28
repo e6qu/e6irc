@@ -1552,7 +1552,6 @@ macro_rules! problem_extractor {
         }
     };
 }
-pub(crate) use problem_extractor;
 
 /// A query string, rejected as a problem document rather than axum's plain-text
 /// default. Every query struct is `deny_unknown_fields`, so a stray parameter

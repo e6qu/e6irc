@@ -80,6 +80,7 @@ pub fn session(name: &'static str, sendq_bytes: usize) -> (SessionLink, EdgeSess
         edge_gone: AtomicBool::new(false),
         writer_failure: OnceLock::new(),
         close: OnceLock::new(),
+        killed_at: OnceLock::new(),
     });
     (
         SessionLink {
@@ -124,13 +125,15 @@ struct Shared {
     writer_failure: OnceLock<SendFailure>,
     /// The WebSocket close frame this session's `End` carries.
     close: OnceLock<CloseFrame>,
+    /// The buffer sequence number of the line a `Kill` sent, when one did.
+    killed_at: OnceLock<u64>,
 }
 
 /// A WebSocket close frame: its code and the reason a client can show.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseFrame {
     pub code: u16,
-    pub reason: &'static str,
+    pub reason: std::borrow::Cow<'static, str>,
 }
 
 /// The edge's end of a session is gone, so the core's end can send nothing
@@ -236,7 +239,10 @@ impl SessionLink {
     pub fn kill(&mut self, line: Output) {
         drop(self.buffer.take_queued());
         match self.buffer.try_push(line) {
-            Ok(_) | Err(PushError::Closed(_)) => {}
+            Ok(sequence) => {
+                self.shared.killed_at.get_or_init(|| sequence);
+            }
+            Err(PushError::Closed(_)) => {}
             // This end is the buffer's only producer, and it was just emptied.
             Err(PushError::Full(_)) => unreachable!("an emptied buffer admits any one line"),
         }
@@ -352,6 +358,56 @@ impl SessionLink {
     /// sends once what is buffered is written. The first close set stands.
     pub fn close_on_end(&self, frame: CloseFrame) {
         self.shared.close.get_or_init(|| frame);
+    }
+
+    /// Follow what the edge reports written, to carry it on: the edge's end
+    /// of a link whose core is in another process reports each `Drained` it
+    /// sees here across the process boundary. Its `Drained` wakes the watch,
+    /// so this session wakes nothing else.
+    pub fn watch_drained(&self) -> DrainedWatch {
+        let wake = Arc::new(Notify::new());
+        self.wake_on_drained(wake.clone());
+        DrainedWatch {
+            shared: self.shared.clone(),
+            wake,
+            reported: 0,
+        }
+    }
+}
+
+/// What the edge has written of one session's output, followed
+/// ([`SessionLink::watch_drained`]).
+pub struct DrainedWatch {
+    shared: Arc<Shared>,
+    wake: Arc<Notify>,
+    reported: u64,
+}
+
+impl DrainedWatch {
+    /// The bytes written since the last call, waiting until there are some;
+    /// `None` once the edge's end is gone and everything it wrote has been
+    /// said. A writer's batch is one report, however many lines it held.
+    pub async fn next(&mut self) -> Option<u64> {
+        loop {
+            // Gone is read first: everything written before the end went is
+            // then in the count read after it.
+            let gone = self.shared.edge_gone.load(Ordering::SeqCst);
+            let written = self.shared.written.arm();
+            if written > self.reported {
+                let delta = written - self.reported;
+                self.reported = written;
+                return Some(delta);
+            }
+            if gone {
+                return None;
+            }
+            self.wake.notified().await;
+        }
+    }
+
+    /// How the edge's writer failed, once it has.
+    pub fn writer_failure(&self) -> Option<SendFailure> {
+        self.shared.writer_failure.get().cloned()
     }
 }
 
@@ -510,7 +566,25 @@ impl EdgeSession {
     /// The close frame the core's `End` carried, once it has ended the
     /// session with one ([`SessionLink::close_on_end`]).
     pub fn close_frame(&self) -> Option<CloseFrame> {
-        self.shared.close.get().copied()
+        self.shared.close.get().cloned()
+    }
+
+    /// Whether `envelope` is the final line a `Kill` sent: the backlog before
+    /// it was discarded.
+    pub fn is_final(&self, envelope: &Envelope<Output>) -> bool {
+        self.shared.killed_at.get() == Some(&envelope.seq)
+    }
+
+    /// Bytes taken out of the buffer and not yet reported written: the most
+    /// a report may still say.
+    pub fn unreported(&self) -> u64 {
+        self.taken - self.written
+    }
+
+    /// Whether the core exempts this session's lines from the meter, as it
+    /// changes: what an edge in another process is told.
+    pub fn flood_exemption(&self) -> FloodExemption {
+        self.shared.exemption.clone()
     }
 
     /// This session's command allowance of `flood`'s shape, exempt while the
@@ -694,9 +768,9 @@ mod tests {
         let (core, edge) = waiting_session("t", 100);
         let frame = CloseFrame {
             code: 1008,
-            reason: "policy",
+            reason: "policy".into(),
         };
-        core.close_on_end(frame);
+        core.close_on_end(frame.clone());
         drop(core);
         assert_eq!(edge.close_frame(), Some(frame));
     }

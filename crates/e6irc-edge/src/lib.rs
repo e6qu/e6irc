@@ -11,8 +11,12 @@
 pub mod address;
 pub mod certificate;
 pub mod connection;
+pub mod core_link;
+pub mod http;
 pub mod lingering_close;
 pub mod link;
 pub mod meter;
 pub mod peer_write;
+pub mod process;
+pub mod proxy_protocol;
 pub mod websocket;

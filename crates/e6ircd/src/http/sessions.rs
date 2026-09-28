@@ -260,7 +260,7 @@ impl ValidatedLiveConnectionQuery {
         forced_account: Option<&str>,
     ) -> crate::core::LiveConnectionQuery {
         crate::core::LiveConnectionQuery {
-            before_id: self.before_id,
+            before_key: self.before_id,
             exact_nick: self.nick.clone(),
             exact_account: forced_account
                 .map(str::to_owned)
@@ -290,7 +290,7 @@ pub(super) fn validate_live_connection_query(
     let before_id = super::device::positive_admin_cursor(
         params.before_id,
         "Invalid live-connection cursor",
-        "The before_id cursor must be a positive live-connection id.",
+        "The before_id cursor must be a positive next_before_id value from an earlier page.",
     )?
     .map(|id| id as u64);
     let nick = super::device::exact_filter(
@@ -413,7 +413,7 @@ fn live_connection_page_response(page: crate::core::LiveConnectionPage) -> Respo
             .into_iter()
             .map(live_connection_response)
             .collect(),
-        next_before_id: page.next_before_id.map(|id| id.to_string()),
+        next_before_id: page.next_before_key.map(|key| key.to_string()),
     })
 }
 

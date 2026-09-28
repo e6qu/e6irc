@@ -1330,6 +1330,33 @@ pub(crate) struct CoreDirectories {
     /// The rule for a password being set, shared with the web and the REST
     /// API.
     pub(crate) password_policy: crate::identity::PasswordPolicy,
+    /// The order of the connection directory.
+    pub(crate) directory_keys: DirectoryKeys,
+}
+
+/// Where a session sorts in the connection directory: a key the core gives it
+/// when the session's shard opens it, from one count every shard shares, so
+/// every key given after a cursor was handed out sorts after it — a directory
+/// walk misses no connection, whichever edge or shard it opened on (DESIGN
+/// §2). The connection identifier is the session's wire identity and promises
+/// no order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DirectoryKey(u64);
+
+impl DirectoryKey {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The one count every shard gives [`DirectoryKey`]s from, starting at 1.
+#[derive(Clone, Default)]
+pub(crate) struct DirectoryKeys(Arc<std::sync::atomic::AtomicU64>);
+
+impl DirectoryKeys {
+    fn next(&self) -> DirectoryKey {
+        DirectoryKey(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+    }
 }
 
 /// A session's login: the account, the credential that signed it in, and,
@@ -1824,6 +1851,8 @@ impl PendingServiceReply {
 
 pub(crate) struct Session {
     output: SessionOutput,
+    /// Where the session sorts in the connection directory.
+    pub(crate) directory_key: DirectoryKey,
     pub host: String,
     /// The address the connection came from, fixed when it opened: what a
     /// D-line, an address-shaped K-line and a channel ban on an address or
@@ -4774,6 +4803,8 @@ pub(crate) struct ServerState {
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub(crate) whowas: WhowasDirectory,
     census: Census,
+    /// Where each session opened here sorts in the connection directory.
+    directory_keys: DirectoryKeys,
     /// What this shard last added to the [`Census`]: connections, channels.
     census_reported: (usize, usize),
     /// Hot history rings, keyed by channel or direct-message conversation,
@@ -5792,6 +5823,7 @@ impl ServerState {
             pending_server_bans: HashSet::new(),
             whowas: directories.whowas,
             census: directories.census,
+            directory_keys: directories.directory_keys,
             drained: Arc::default(),
             history_retention: directories.history_retention,
             anti_spam_exit_message_time: directories.anti_spam_exit_message_time,
@@ -6840,6 +6872,7 @@ impl ServerState {
             conn,
             Session {
                 output: SessionOutput::new(tx, self.drained.clone()),
+                directory_key: self.directory_keys.next(),
                 limit_key: e6irc_edge::address::PeerLimitKey::for_session_host(&host),
                 real_ip: host
                     .parse::<std::net::IpAddr>()

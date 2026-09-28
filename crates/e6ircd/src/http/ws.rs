@@ -13,32 +13,51 @@ use e6irc_edge::websocket::{MAX_IRC_WS_MESSAGE, UiMessage, WsFrameMode};
 
 use crate::bouncer::SessionAuthority;
 
-/// JSON can escape one input byte as six ASCII bytes. Bound the UI envelope
-/// before deserialization while admitting every wire-sized composer command.
-const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
+/// The largest `/ws/ui` message read: the edge's bound, which admits every
+/// wire-sized composer command however JSON escapes it.
+const MAX_UI_WS_FRAME: usize = e6irc_edge::websocket::MAX_UI_WS_MESSAGE;
 
 /// A WebSocket upgrade request, rejected as a problem document rather than
 /// axum's plain-text default: a plain `GET /ws/irc` is a `400` (or `426` for a
-/// wrong version) in the same shape as every other refusal.
-pub(super) struct UpgradeRequest(WebSocketUpgrade);
+/// wrong version) in the same shape as every other refusal. An edge forwards
+/// an upgrade it will complete itself only once it has checked it is one
+/// (DESIGN §19.1); the core then authorizes it without a socket.
+pub(super) enum UpgradeRequest {
+    /// This process completes the upgrade on the connection it arrived on.
+    Here(WebSocketUpgrade),
+    /// The edge the request came over completes it.
+    Edge(super::edge::EdgeUpgrade),
+}
 
-problem_extractor!(
-    UpgradeRequest => WebSocketUpgrade,
-    [],
-    |upgrade| UpgradeRequest(upgrade),
-    |rejection: &axum::extract::ws::rejection::WebSocketUpgradeRejection| problem(
-        rejection.status(),
-        "Invalid WebSocket upgrade",
-        Some(&rejection.body_text()),
-    ),
-);
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for UpgradeRequest {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(edge) = parts.extensions.get::<super::edge::EdgeUpgrade>() {
+            return Ok(Self::Edge(*edge));
+        }
+        WebSocketUpgrade::from_request_parts(parts, state)
+            .await
+            .map(Self::Here)
+            .map_err(|rejection| {
+                problem(
+                    rejection.status(),
+                    "Invalid WebSocket upgrade",
+                    Some(&rejection.body_text()),
+                )
+            })
+    }
+}
 
 pub(super) async fn ws_irc(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     upgraded: Option<axum::extract::Extension<crate::net::UpgradedStream>>,
     headers: axum::http::HeaderMap,
-    UpgradeRequest(ws): UpgradeRequest,
+    upgrade: UpgradeRequest,
 ) -> Response {
     // Enforce the same per-IP connection cap the raw IRC listeners apply,
     // keyed on the real client IP (X-Forwarded-For behind a trusted proxy) so
@@ -52,15 +71,6 @@ pub(super) async fn ws_irc(
     ) {
         Ok(ip) => ip,
         Err(refusal) => return refusal.into(),
-    };
-    // The stream under this connection, to close properly once the socket is
-    // done with. Every connection the HTTP listeners serve carries it.
-    let Some(stream) = upgraded.and_then(|upgraded| upgraded.claim()) else {
-        return problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Connection cannot be upgraded",
-            Some("The connection's stream is not available to the WebSocket."),
-        );
     };
     // Umode +Z: this listener never terminates TLS, so a connection is secure
     // only when a trusted proxy says its client reached it over HTTPS.
@@ -94,6 +104,52 @@ pub(super) async fn ws_irc(
                 .find(|p| *p == "binary.ircv3.net" || *p == "text.ircv3.net")
                 .map(String::from)
         });
+    let ws = match upgrade {
+        UpgradeRequest::Here(ws) => ws,
+        UpgradeRequest::Edge(edge) => {
+            // The edge frames the socket; the core keeps the session's slot
+            // until the edge opens it.
+            let Some(upgrades) = state.edge_upgrades.as_ref() else {
+                return problem(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "Not an edge-mode server",
+                    None,
+                );
+            };
+            upgrades.grant(
+                edge.conn,
+                crate::edge_link::UpgradeGrant::Irc {
+                    guard,
+                    address: ip.ip(),
+                    transport,
+                },
+            );
+            let mut grant = vec![
+                (e6irc_edge::core_link::headers::GRANT, "irc".to_owned()),
+                (
+                    e6irc_edge::core_link::headers::GRANT_ADDRESS,
+                    ip.to_string(),
+                ),
+                (
+                    e6irc_edge::core_link::headers::GRANT_TRANSPORT,
+                    transport.as_str().to_owned(),
+                ),
+            ];
+            if let Some(protocol) = chosen {
+                grant.push((e6irc_edge::core_link::headers::GRANT_PROTOCOL, protocol));
+            }
+            return super::edge::grant_response(&grant);
+        }
+    };
+    // The stream under this connection, to close properly once the socket is
+    // done with. Every connection the HTTP listeners serve carries it.
+    let Some(stream) = upgraded.and_then(|upgraded| upgraded.claim()) else {
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Connection cannot be upgraded",
+            Some("The connection's stream is not available to the WebSocket."),
+        );
+    };
     let mode = match chosen.as_deref() {
         Some("binary.ircv3.net") => WsFrameMode::Binary,
         Some("text.ircv3.net") => WsFrameMode::Text,
@@ -375,7 +431,7 @@ pub(super) async fn ws_ui(
     headers: axum::http::HeaderMap,
     Authenticated(account, credential): Authenticated,
     QueryParams(params): QueryParams<UiParams>,
-    UpgradeRequest(ws): UpgradeRequest,
+    upgrade: UpgradeRequest,
 ) -> Response {
     if let Err(refusal) = require_same_origin_upgrade(&state, &headers) {
         return refusal.into();
@@ -395,26 +451,42 @@ pub(super) async fn ws_ui(
         .credential_watch
         .lease(pool_of(&state), credential.revocable())
         .await;
-    let store = pool_of(&state).clone();
-    let resume = params.after.as_deref().map(ReplayRequest::from_cursor);
-    let sendq_bytes = state.sendq_bytes;
-    ws.max_message_size(MAX_UI_WS_FRAME)
-        .max_frame_size(MAX_UI_WS_FRAME)
-        .on_upgrade(move |socket| {
-            serve_ui(
-                handle,
-                socket,
-                UiSocketAuthority {
-                    composer,
-                    credential,
-                    store,
-                },
-                slot,
-                resume,
-                crate::bouncer::ATTACH_LIVENESS_INTERVAL,
-                sendq_bytes,
-            )
-        })
+    let grant = UiGrant {
+        handle,
+        authority: UiSocketAuthority {
+            composer,
+            credential,
+            store: pool_of(&state).clone(),
+        },
+        slot,
+        resume: params.after.as_deref().map(ReplayRequest::from_cursor),
+        liveness: crate::bouncer::ATTACH_LIVENESS_INTERVAL,
+        sendq_bytes: state.sendq_bytes,
+    };
+    match upgrade {
+        UpgradeRequest::Here(ws) => ws
+            .max_message_size(MAX_UI_WS_FRAME)
+            .max_frame_size(MAX_UI_WS_FRAME)
+            .on_upgrade(move |socket| serve_ui(grant, socket)),
+        UpgradeRequest::Edge(edge) => {
+            let Some(upgrades) = state.edge_upgrades.as_ref() else {
+                return problem(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "Not an edge-mode server",
+                    None,
+                );
+            };
+            let liveness = grant.liveness.as_millis().to_string();
+            upgrades.grant(
+                edge.conn,
+                crate::edge_link::UpgradeGrant::Ui(Box::new(grant)),
+            );
+            super::edge::grant_response(&[
+                (e6irc_edge::core_link::headers::GRANT, "ui".to_owned()),
+                (e6irc_edge::core_link::headers::GRANT_LIVENESS_MS, liveness),
+            ])
+        }
+    }
 }
 
 /// What a returning client asked replay to start from.
@@ -801,8 +873,10 @@ impl UiSocket {
     /// End the socket with a close frame, once what was sent is written. The
     /// session ends when this end goes; nothing sent after is delivered.
     fn close(&mut self, code: u16, reason: &'static str) {
-        self.link
-            .close_on_end(e6irc_edge::link::CloseFrame { code, reason });
+        self.link.close_on_end(e6irc_edge::link::CloseFrame {
+            code,
+            reason: reason.into(),
+        });
     }
 
     /// The client's next message; `None` once the client has gone.
@@ -811,27 +885,36 @@ impl UiSocket {
     }
 }
 
-/// Serve one live chat socket as a session of the core link: the edge's half
-/// (`e6irc_edge::websocket::serve_ui_socket`) holds the WebSocket, and
-/// [`ws_ui_conn`] is the core's; each ends the other. `sendq_bytes` bounds
-/// what the link buffers.
-///
-/// `liveness` bounds how long a silent peer is believed: after one interval
-/// without a frame the edge sends it a WebSocket Ping, and after a second it
-/// is given up on. A browser answers Ping by itself, so a live peer on a quiet
-/// network costs one small frame per interval, and a half-open connection — a
-/// laptop that slept, a NAT that forgot the flow — stops holding its task, its
-/// socket, and its place in the attached-client count.
-pub(super) async fn serve_ui(
-    handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
-    socket: WebSocket,
-    authority: UiSocketAuthority,
-    slot: Option<UiSocketSlot>,
-    resume: Option<ReplayRequest>,
-    liveness: std::time::Duration,
-    sendq_bytes: usize,
+/// A live chat socket the core authorized: the network, what its client may
+/// do and until when, its place among the account's sockets, where replay
+/// resumes, how long a silent peer is believed, and what its link buffers.
+pub(crate) struct UiGrant {
+    pub(super) handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
+    pub(super) authority: UiSocketAuthority,
+    pub(super) slot: Option<UiSocketSlot>,
+    pub(super) resume: Option<ReplayRequest>,
+    /// After one interval without a frame the edge sends the peer a WebSocket
+    /// Ping, and after a second it is given up on. A browser answers Ping by
+    /// itself, so a live peer on a quiet network costs one small frame per
+    /// interval, and a half-open connection — a laptop that slept, a NAT that
+    /// forgot the flow — stops holding its task, its socket, and its place in
+    /// the attached-client count.
+    pub(super) liveness: std::time::Duration,
+    pub(super) sendq_bytes: usize,
+}
+
+/// The two halves of a granted live chat socket as a session of the core
+/// link: the edge's end of its link and the queue its client's messages go
+/// to, for the edge's half (`e6irc_edge::websocket::serve_ui_socket`), and
+/// the core's half, [`ws_ui_conn`]. Each ends the other.
+fn ui_halves(
+    grant: UiGrant,
+) -> (
+    e6irc_edge::link::EdgeSession,
+    e6irc_queue::Sender<UiMessage>,
+    impl Future<Output = ()> + Send + 'static,
 ) {
-    let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", sendq_bytes);
+    let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", grant.sendq_bytes);
     // The client's messages the core has not taken: at most one of the largest
     // it reads, as the socket read one at a time.
     let (sender, inbound) = e6irc_queue::weighted_queue(
@@ -840,12 +923,39 @@ pub(super) async fn serve_ui(
             capacity: MAX_UI_WS_FRAME,
             policy: e6irc_queue::Policy::Fifo,
         },
-        UiMessage::weight,
+        e6irc_edge::core_link::remote::ui_message_weight,
     );
+    let core = ws_ui_conn(
+        grant.handle,
+        UiSocket { link, inbound },
+        grant.authority,
+        grant.slot,
+        grant.resume,
+    );
+    (edge, sender, core)
+}
+
+/// Serve one live chat socket in this process, both halves together.
+pub(super) async fn serve_ui(grant: UiGrant, socket: WebSocket) {
+    let liveness = grant.liveness;
+    let (edge, sender, core) = ui_halves(grant);
     tokio::join!(
         e6irc_edge::websocket::serve_ui_socket(socket, edge, sender, liveness),
-        ws_ui_conn(handle, UiSocket { link, inbound }, authority, slot, resume),
+        core,
     );
+}
+
+/// Start the core's half of a live chat socket an edge holds: what the link
+/// server opens its `Ui` session with.
+pub(crate) fn open_granted_ui(
+    grant: UiGrant,
+) -> (
+    e6irc_edge::link::EdgeSession,
+    e6irc_queue::Sender<UiMessage>,
+) {
+    let (edge, sender, core) = ui_halves(grant);
+    tokio::spawn(core);
+    (edge, sender)
 }
 
 #[derive(Debug)]
@@ -1623,23 +1733,25 @@ mod ui_socket_bound_tests {
                     opened.lock().expect("watches").push(watch);
                     ws.on_upgrade(move |socket| {
                         serve_ui(
-                            handle,
-                            socket,
-                            UiSocketAuthority {
-                                composer: ComposerAuthority::MaySend,
-                                credential,
-                                // No store: a stopped network finds the
-                                // credential unverifiable and says it is
-                                // unavailable, at once.
-                                store: sqlx::postgres::PgPoolOptions::new()
-                                    .acquire_timeout(std::time::Duration::from_millis(1))
-                                    .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-                                    .expect("lazy pool"),
+                            UiGrant {
+                                handle,
+                                authority: UiSocketAuthority {
+                                    composer: ComposerAuthority::MaySend,
+                                    credential,
+                                    // No store: a stopped network finds the
+                                    // credential unverifiable and says it is
+                                    // unavailable, at once.
+                                    store: sqlx::postgres::PgPoolOptions::new()
+                                        .acquire_timeout(std::time::Duration::from_millis(1))
+                                        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                                        .expect("lazy pool"),
+                                },
+                                slot,
+                                resume: None,
+                                liveness: LIVENESS,
+                                sendq_bytes: 64 * 512,
                             },
-                            slot,
-                            None,
-                            LIVENESS,
-                            64 * 512,
+                            socket,
                         )
                     })
                 }

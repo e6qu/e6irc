@@ -19,6 +19,7 @@ use e6irc_queue::Receiver;
 
 mod announcements;
 mod credential_change;
+pub(crate) mod roster;
 mod secret_rotation;
 mod url;
 pub(crate) use announcements::{
@@ -74,6 +75,9 @@ pub enum DbError {
     InvalidNetworkAutojoin(String),
     /// Persisted server settings do not decode into the closed typed schema.
     InvalidServerSettings(String),
+    /// The roster of edges holds, or would be given, a value outside its
+    /// schema.
+    InvalidRoster(String),
     /// A database-wide secret re-seal could not prove every value readable.
     SecretRotation(String),
     /// Persisted token scopes are outside the closed authorization model.
@@ -182,6 +186,7 @@ impl std::fmt::Display for DbError {
             Self::InvalidServerSettings(error) => {
                 write!(f, "invalid persisted server settings: {error}")
             }
+            Self::InvalidRoster(error) => write!(f, "invalid roster of edges: {error}"),
             Self::SecretRotation(error) => write!(f, "secret rotation failed: {error}"),
             Self::InvalidApiTokenScopes(error) => {
                 write!(f, "invalid persisted personal access token scopes: {error}")

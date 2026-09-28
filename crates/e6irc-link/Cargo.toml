@@ -1,0 +1,13 @@
+[package]
+name = "e6irc-link"
+description = "The core link's wire codec: length-prefixed binary frames between an edge and the core (no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# DESIGN §19.2: a hand-written codec with no new dependency. Both crates are
+# already in the workspace: the protocol crate for the client line bound, and
+# bytes (the version every other crate takes) for the frame buffers.
+[dependencies]
+e6irc-proto = { path = "../e6irc-proto" }
+bytes = { version = "1.12.1", default-features = false }

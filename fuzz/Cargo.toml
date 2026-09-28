@@ -17,6 +17,9 @@ libfuzzer-sys = { version = "0.4.13" }
 e6irc-proto = { path = "../crates/e6irc-proto" }
 e6ircd = { path = "../crates/e6ircd" }
 e6irc-queue = { path = "../crates/e6irc-queue" }
+e6irc-link = { path = "../crates/e6irc-link" }
+# Already in the tree through every crate; the link codec decodes from a BytesMut.
+bytes = { version = "1.12.1", default-features = false }
 e6irc-client = { path = "../crates/e6irc-client" }
 e6irc-tui = { path = "../crates/e6irc-tui" }
 
@@ -100,5 +103,11 @@ doc = false
 [[bin]]
 name = "chathistory_window"
 path = "fuzz_targets/chathistory_window.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "link_frames"
+path = "fuzz_targets/link_frames.rs"
 test = false
 doc = false

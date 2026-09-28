@@ -75,10 +75,13 @@ pub(crate) enum ErrorKind {
     /// A listener could not be set up from its configuration: an unreadable
     /// or mismatched certificate, say. Not a peer's failure.
     Configuration,
+    /// A core link to an edge was refused, broke the protocol, or failed
+    /// (DESIGN §19.2).
+    Link,
 }
 
 impl ErrorKind {
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 11;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Accept,
         Self::ConnectionSetup,
@@ -90,6 +93,7 @@ impl ErrorKind {
         Self::Bouncer,
         Self::Http,
         Self::Configuration,
+        Self::Link,
     ];
 
     const fn index(self) -> usize {
@@ -104,6 +108,7 @@ impl ErrorKind {
             Self::Bouncer => 7,
             Self::Http => 8,
             Self::Configuration => 9,
+            Self::Link => 10,
         }
     }
 
@@ -119,6 +124,7 @@ impl ErrorKind {
             Self::Bouncer => "bouncer",
             Self::Http => "http",
             Self::Configuration => "configuration",
+            Self::Link => "link",
         }
     }
 }
@@ -133,6 +139,7 @@ impl From<e6irc_edge::connection::TransportError> for ErrorKind {
             TransportError::TlsHandshake => Self::TlsHandshake,
             TransportError::Read => Self::Read,
             TransportError::Write => Self::Write,
+            TransportError::Http => Self::Http,
         }
     }
 }

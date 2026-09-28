@@ -119,6 +119,8 @@ pub enum PeerRefusal {
     TlsHandshakeTimedOut,
     HttpHeaderTimedOut,
     UnusableForwardedFor,
+    /// A listener that reads the PROXY protocol got no header it accepts.
+    ProxyHeader,
 }
 
 impl PeerRefusal {
@@ -133,6 +135,7 @@ impl PeerRefusal {
             Self::UnusableForwardedFor => {
                 "request from a trusted proxy refused: its X-Forwarded-For is misconfigured"
             }
+            Self::ProxyHeader => "connection refused: no PROXY protocol header it could take",
         }
     }
 }
@@ -236,24 +239,59 @@ impl PeerRefusalLog {
     }
 }
 
-/// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
-/// limiter is a no-op; otherwise it refuses connections beyond the cap
-/// and releases the slot when the connection's guard drops.
+/// The proxies whose word about their clients is believed (`trusted_proxies`):
+/// a forwarded address, or a PROXY protocol header. Shared, so an edge can
+/// follow the list its core gives it at each link.
+#[derive(Clone, Default)]
+pub struct TrustedProxies(Arc<std::sync::RwLock<Vec<ipnet::IpNet>>>);
+
+impl TrustedProxies {
+    pub fn new(networks: Vec<ipnet::IpNet>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(networks)))
+    }
+
+    /// Follow a new list.
+    pub fn set(&self, networks: Vec<ipnet::IpNet>) {
+        *self.0.write().expect("trusted proxies lock") = networks;
+    }
+
+    /// Whether `peer`, in its canonical spelling, is a trusted proxy.
+    pub fn contains(&self, peer: std::net::IpAddr) -> bool {
+        let peer = ClientIp::new(peer).ip();
+        self.0
+            .read()
+            .expect("trusted proxies lock")
+            .iter()
+            .any(|network| network.contains(&peer))
+    }
+}
+
+/// Per-IP concurrent-connection cap. With no cap (`None`) it refuses nobody;
+/// otherwise it refuses connections beyond the cap and releases the slot when
+/// the connection's guard drops. Every slot is counted either way, so a cap
+/// set later ([`ConnLimiter::set_max`]: an edge following the core's limit)
+/// counts the connections already open.
 #[derive(Clone)]
 pub struct ConnLimiter {
-    counts: Arc<std::sync::Mutex<std::collections::HashMap<PeerLimitKey, usize>>>,
-    max_per_ip: Option<usize>,
+    state: Arc<std::sync::Mutex<LimiterState>>,
     /// Per-peer admission failures are summarised here rather than logged one
     /// line per attempt; it travels with the limiter because every listener
     /// that admits peers (IRC, WS-IRC, BNC) already shares this one value.
     refusals: Arc<PeerRefusalLog>,
 }
 
+struct LimiterState {
+    counts: std::collections::HashMap<PeerLimitKey, usize>,
+    max_per_ip: Option<usize>,
+}
+
 impl ConnLimiter {
     pub fn new(max_per_ip: Option<usize>) -> Self {
         Self {
-            counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            max_per_ip,
+            state: Arc::new(std::sync::Mutex::new(LimiterState {
+                counts: std::collections::HashMap::new(),
+                max_per_ip,
+            })),
             refusals: Arc::new(PeerRefusalLog::new(PEER_REFUSAL_LOG_WINDOW)),
         }
     }
@@ -263,31 +301,35 @@ impl ConnLimiter {
         &self.refusals
     }
 
+    /// Change the cap. Connections already over a lowered cap keep their
+    /// slots; new ones are refused until the count is under it.
+    pub fn set_max(&self, max_per_ip: Option<usize>) {
+        self.state.lock().expect("conn limiter poisoned").max_per_ip = max_per_ip;
+    }
+
     /// Reserve a slot for `client`'s [`PeerLimitKey`], or `None` if that key
     /// is already at the cap.
     pub fn try_acquire(&self, client: ClientIp) -> Option<ConnGuard> {
         let ip = client.limit_key();
-        let Some(max) = self.max_per_ip else {
-            return Some(ConnGuard { limiter: None, ip });
-        };
-        let mut counts = self.counts.lock().expect("conn limiter poisoned");
-        let count = counts.entry(ip).or_insert(0);
-        if *count >= max {
+        let mut state = self.state.lock().expect("conn limiter poisoned");
+        let max = state.max_per_ip;
+        let count = state.counts.entry(ip).or_insert(0);
+        if max.is_some_and(|max| *count >= max) {
             return None;
         }
         *count += 1;
         Some(ConnGuard {
-            limiter: Some(self.clone()),
+            limiter: self.clone(),
             ip,
         })
     }
 
     fn release(&self, ip: PeerLimitKey) {
-        let mut counts = self.counts.lock().expect("conn limiter poisoned");
-        if let Some(c) = counts.get_mut(&ip) {
+        let mut state = self.state.lock().expect("conn limiter poisoned");
+        if let Some(c) = state.counts.get_mut(&ip) {
             *c -= 1;
             if *c == 0 {
-                counts.remove(&ip);
+                state.counts.remove(&ip);
             }
         }
     }
@@ -295,15 +337,13 @@ impl ConnLimiter {
 
 /// Releases its per-IP slot when the connection ends (on drop).
 pub struct ConnGuard {
-    limiter: Option<ConnLimiter>,
+    limiter: ConnLimiter,
     ip: PeerLimitKey,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        if let Some(limiter) = &self.limiter {
-            limiter.release(self.ip);
-        }
+        self.limiter.release(self.ip);
     }
 }
 
@@ -349,6 +389,22 @@ mod tests {
             PeerLimitKey::for_session_host("local"),
             SessionLimitKey::InProcess("local".to_string())
         );
+    }
+
+    /// A cap set after connections opened counts them: an edge that learns
+    /// the core's limit only once linked refuses past it at once.
+    #[test]
+    fn a_cap_set_later_counts_the_connections_already_open() {
+        let client = ClientIp::new("198.51.100.4".parse().unwrap());
+        let limiter = ConnLimiter::new(None);
+        let first = limiter.try_acquire(client).expect("no cap");
+        let _second = limiter.try_acquire(client).expect("no cap");
+        limiter.set_max(Some(2));
+        assert!(limiter.try_acquire(client).is_none(), "two are open");
+        drop(first);
+        let _third = limiter.try_acquire(client).expect("one slot freed");
+        limiter.set_max(None);
+        let _fourth = limiter.try_acquire(client).expect("the cap is gone");
     }
 
     #[test]

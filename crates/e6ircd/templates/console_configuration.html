@@ -38,6 +38,7 @@
       </div></section>
       <section class="settings-section"><div class="section-copy"><h2>IRC listeners</h2><p>Raw, TLS, and dedicated WebSocket endpoints. Listener changes are checked now and applied after restart.</p></div><div class="field-grid">
         <label class="field field-wide"><span>Listener definitions</span><textarea name="listeners" rows="5" spellcheck="false" required></textarea><small>One per line: <code>address | plain</code>, <code>address | websocket</code>, or <code>address | tls | certificate path | private-key path</code>.</small></label>
+        <div class="runtime-status field-wide" data-configuration-edge-listeners hidden></div>
       </div></section>
       <section class="settings-section"><div class="section-copy"><h2>Web and administrator access</h2><p>The HTTP bind and database remain bootstrap settings. Public identity, cookie policy, and administrator grants are UI-managed.</p></div><div class="field-grid">
         <label class="field field-wide"><span>Public URL</span><input type="url" name="public_url" placeholder="https://irc.example.com" /><small>Used for OpenID Connect callbacks and device authorization.</small></label>
