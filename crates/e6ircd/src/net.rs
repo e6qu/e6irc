@@ -1373,8 +1373,9 @@ async fn serve(
                 critical_tx.clone(),
             ));
         }
-        let (csrf_keys, csrf_warning) = crate::http::CsrfKeys::for_keyring(secret_key.as_deref());
-        if let Some(warning) = csrf_warning {
+        let (browser_keys, browser_keys_warning) =
+            crate::http::BrowserStateKeys::for_keyring(secret_key.as_deref());
+        if let Some(warning) = browser_keys_warning {
             eprintln!("{warning}");
         }
         Some(Arc::new(crate::http::AppState {
@@ -1393,8 +1394,7 @@ async fn serve(
             oidc_providers: config.oidc_providers.clone(),
             application_release_revision: config.application_release_revision.clone(),
             monitoring_token_digest,
-            oidc_flow_key: crate::secret::SecretKey::generate(),
-            spent_oidc_flows: crate::http::SpentFlows::new(),
+            oidc_flow_key: browser_keys.oidc_flow,
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),
             sendq_bytes: config.sendq_bytes,
@@ -1403,7 +1403,7 @@ async fn serve(
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
             configured_admin_accounts: configured_administrators.clone(),
-            csrf_keys,
+            csrf_keys: browser_keys.csrf,
             trusted_proxies: trusted_proxies.clone(),
             auth_rate_burst: config.limits.auth_rate_burst.burst(),
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),

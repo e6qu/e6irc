@@ -44,7 +44,6 @@ use history::*;
 use networks::*;
 use observation::*;
 use oidc::*;
-pub(crate) use oidc_provider::SpentFlows;
 use openapi::*;
 pub(crate) use preflight::PreflightLimiter;
 use preflight::PreflightPermit;
@@ -112,16 +111,12 @@ pub struct AppState {
     /// SHA-256 of the deployment-owned token for the machine-readable
     /// application observation endpoint. The plaintext is never retained.
     pub(crate) monitoring_token_digest: Option<[u8; 32]>,
-    /// Per-startup key sealing each in-flight OpenID Connect authorization
-    /// into the browser's own state cookie, so the server holds no per-flow
-    /// state an anonymous flood could exhaust. Unlike `csrf_keys` it is not
-    /// derived from the master key: a restart ends the flows begun before it,
-    /// which is what keeps `spent_oidc_flows`, held in memory, a complete
-    /// record of the flows this key's cookies could still replay.
-    pub oidc_flow_key: crate::secret::SecretKey,
-    /// Authorization flows whose callback has been answered, so a kept copy
-    /// of a flow cookie cannot be answered again.
-    pub(crate) spent_oidc_flows: SpentFlows,
+    /// The keys sealing each in-flight OpenID Connect authorization into the
+    /// browser's own state cookie, so the server holds no per-flow state an
+    /// anonymous flood could exhaust (see [`BrowserStateKeys`]). A flow is
+    /// answered once: its code exchange first records it as spent in
+    /// PostgreSQL, which every process shares (`db::spend_oidc_flow`).
+    pub oidc_flow_key: crate::secret::SecretKeyring,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: crate::core::CoreIngress,
     /// Shared connection-id allocator (with every other ingress transport).
@@ -394,44 +389,61 @@ impl AppState {
     }
 }
 
-/// The keys of the session-bound CSRF token: `HMAC-SHA256(key, session)`.
+/// The keys of the browser state the server issues and later takes back: the
+/// session-bound CSRF token of every form, and the sealed cookie of an OpenID
+/// Connect sign-in in progress.
 ///
-/// Derived from the master secret key (HKDF,
-/// [`crate::secret::DerivedKeyPurpose::FormCsrf`]), so every process
-/// configured with that key issues and accepts the same tokens: a form open in
-/// a browser still posts after a restart, or after a standby takes over from a
-/// crashed process. During a key rotation a token issued under a previous key
+/// Both are derived from the master secret key (HKDF, a
+/// [`crate::secret::DerivedKeyPurpose`] each), so every process configured
+/// with that key issues and accepts the same values: a form open in a browser
+/// still posts, and a sign-in begun before a restart or a standby's takeover
+/// still completes. During a key rotation a value issued under a previous key
 /// is still accepted, and new ones are issued under the primary. Without a
-/// master key the key is the process's own and a restart invalidates every
-/// open form, which startup says once.
-pub struct CsrfKeys(crate::secret::DerivedKeys);
+/// master key the keys are the process's own, which startup says once.
+pub struct BrowserStateKeys {
+    pub csrf: CsrfKeys,
+    pub oidc_flow: crate::secret::SecretKeyring,
+}
 
-impl CsrfKeys {
+impl BrowserStateKeys {
     /// What a deployment without a master key is told once at startup.
     const PROCESS_SCOPED_WARNING: &'static str = "e6ircd: no secret key is configured, so \
-        the key of form CSRF tokens is this process's own: forms open in a browser stop \
-        posting after a restart or a standby's takeover";
+        the keys of browser state are this process's own: forms open in a browser stop \
+        posting, and OpenID Connect sign-ins in progress fail, after a restart or a \
+        standby's takeover";
 
     /// The keys for this deployment, with the warning to log when they are
     /// the process's own.
     pub(crate) fn for_keyring(
         keyring: Option<&crate::secret::SecretKeyring>,
     ) -> (Self, Option<&'static str>) {
+        use crate::secret::{DerivedKeyPurpose, SecretKey, SecretKeyring};
         match keyring {
             Some(keyring) => (
-                Self(keyring.derive(crate::secret::DerivedKeyPurpose::FormCsrf)),
+                Self {
+                    csrf: CsrfKeys(keyring.derive(DerivedKeyPurpose::FormCsrf)),
+                    oidc_flow: keyring.derive(DerivedKeyPurpose::OidcFlow),
+                },
                 None,
             ),
             None => (
-                Self(crate::secret::DerivedKeys::random()),
+                Self {
+                    csrf: CsrfKeys(SecretKeyring::single(SecretKey::generate())),
+                    oidc_flow: SecretKeyring::single(SecretKey::generate()),
+                },
                 Some(Self::PROCESS_SCOPED_WARNING),
             ),
         }
     }
+}
 
-    fn token_under(key: &[u8; 32], session: &str) -> String {
-        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
-        let tag = aws_lc_rs::hmac::sign(&key, session.as_bytes());
+/// The keys of the session-bound CSRF token: `HMAC-SHA256(key, session)`,
+/// issued under the primary and accepted under any (see [`BrowserStateKeys`]).
+pub struct CsrfKeys(crate::secret::SecretKeyring);
+
+impl CsrfKeys {
+    fn token_under(key: &crate::secret::SecretKey, session: &str) -> String {
+        let tag = key.hmac_sha256(session.as_bytes());
         tag.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 
@@ -5328,8 +5340,8 @@ mod readiness_tests {
 }
 
 #[cfg(test)]
-mod csrf_key_tests {
-    use super::CsrfKeys;
+mod browser_state_key_tests {
+    use super::{BrowserStateKeys, CsrfKeys};
     use crate::secret::{SecretKey, SecretKeyring};
 
     fn keyring(primary: &SecretKey, previous: &[&SecretKey]) -> SecretKeyring {
@@ -5341,22 +5353,27 @@ mod csrf_key_tests {
         .expect("distinct keys")
     }
 
+    fn csrf(keyring: &SecretKeyring) -> CsrfKeys {
+        let (keys, warning) = BrowserStateKeys::for_keyring(Some(keyring));
+        assert_eq!(warning, None);
+        keys.csrf
+    }
+
     /// A form rendered by one process posts to another configured with the
     /// same master key: a restart, or a standby's takeover, does not turn every
     /// open form into a CSRF refusal.
     #[test]
     fn a_form_token_from_one_process_is_accepted_by_another_with_the_same_key() {
         let master = SecretKey::generate();
-        let (first, first_warning) = CsrfKeys::for_keyring(Some(&keyring(&master, &[])));
-        let (second, second_warning) = CsrfKeys::for_keyring(Some(&keyring(&master, &[])));
-        assert_eq!((first_warning, second_warning), (None, None));
+        let first = csrf(&keyring(&master, &[]));
+        let second = csrf(&keyring(&master, &[]));
         let token = first.token("session-token");
         assert!(second.valid("session-token", &token));
         assert!(
             !second.valid("another-session", &token),
             "bound to its session"
         );
-        let (other, _) = CsrfKeys::for_keyring(Some(&keyring(&SecretKey::generate(), &[])));
+        let other = csrf(&keyring(&SecretKey::generate(), &[]));
         assert!(!other.valid("session-token", &token), "bound to its key");
     }
 
@@ -5367,26 +5384,46 @@ mod csrf_key_tests {
     fn a_rotation_accepts_the_previous_keys_token_and_issues_under_the_primary() {
         let old = SecretKey::generate();
         let new = SecretKey::generate();
-        let (before, _) = CsrfKeys::for_keyring(Some(&keyring(&old, &[])));
-        let (rotated, _) = CsrfKeys::for_keyring(Some(&keyring(&new, &[&old])));
-        let (after, _) = CsrfKeys::for_keyring(Some(&keyring(&new, &[])));
+        let before = csrf(&keyring(&old, &[]));
+        let rotated = csrf(&keyring(&new, &[&old]));
+        let after = csrf(&keyring(&new, &[]));
         assert!(rotated.valid("session", &before.token("session")));
         assert_eq!(rotated.token("session"), after.token("session"));
         assert!(!before.valid("session", &rotated.token("session")));
     }
 
-    /// Without a master key each process has its own key, and startup is
-    /// given the one line that says forms will not survive a restart.
+    /// The form and sign-in keys are derived for their own purposes: neither
+    /// is the other, nor the master key that seals credentials.
     #[test]
-    fn without_a_master_key_the_key_is_the_process_own_and_startup_says_so() {
-        let (first, warning) = CsrfKeys::for_keyring(None);
-        let (second, _) = CsrfKeys::for_keyring(None);
-        assert_eq!(warning, Some(CsrfKeys::PROCESS_SCOPED_WARNING));
+    fn form_and_sign_in_keys_are_distinct_from_each_other_and_the_master_key() {
+        let master = keyring(&SecretKey::generate(), &[]);
+        let (keys, _) = BrowserStateKeys::for_keyring(Some(&master));
+        let sealed = keys.oidc_flow.seal("flow", b"context");
+        assert!(master.open(&sealed, b"context").is_err());
+        let as_csrf = SecretKeyring::single(
+            SecretKey::from_base64(&keys.oidc_flow.primary().to_base64()).expect("a key"),
+        );
+        assert_ne!(
+            CsrfKeys(as_csrf).token("session"),
+            keys.csrf.token("session")
+        );
+    }
+
+    /// Without a master key each process has its own keys, and startup is
+    /// given the one line that says forms and sign-ins will not survive a
+    /// restart.
+    #[test]
+    fn without_a_master_key_the_keys_are_the_process_own_and_startup_says_so() {
+        let (first, warning) = BrowserStateKeys::for_keyring(None);
+        let (second, _) = BrowserStateKeys::for_keyring(None);
+        assert_eq!(warning, Some(BrowserStateKeys::PROCESS_SCOPED_WARNING));
         assert!(
-            warning.is_some_and(|text| text.contains("restart")),
+            warning.is_some_and(|text| text.contains("restart") && text.contains("OpenID Connect")),
             "{warning:?}"
         );
-        assert!(first.valid("session", &first.token("session")));
-        assert!(!second.valid("session", &first.token("session")));
+        assert!(first.csrf.valid("session", &first.csrf.token("session")));
+        assert!(!second.csrf.valid("session", &first.csrf.token("session")));
+        let sealed = first.oidc_flow.seal("flow", b"context");
+        assert!(second.oidc_flow.open(&sealed, b"context").is_err());
     }
 }

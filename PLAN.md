@@ -112,8 +112,11 @@ connected, joins and sends nothing, and takes the configured nickname back —
 NickServ `REGAIN` with SASL, and `MONITOR` or `ISON` otherwise. A definite
 services refusal parks it at once; a holder that outlasts five minutes, or an
 alternative that is taken too, is the `nickname_in_use` refusal on its
-schedule. The CSRF token's key is derived from the master secret key, so open
-pages keep posting across a restart and a standby's takeover.
+schedule. The CSRF token's key and the OpenID Connect flow cookie's key are
+derived from the master secret key, so open pages keep posting and sign-ins in
+progress complete across a restart and a standby's takeover; a flow is still
+answered once, because its code exchange first records it as spent in
+PostgreSQL (migration 0099), which every process shares.
 
 The chat client's network dialog does not gate saving on a connection test:
 **Test connection** is an optional diagnostic that says `QUIT` when it is done.

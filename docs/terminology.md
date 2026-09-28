@@ -647,9 +647,10 @@ is a commit's hash.
 computes them, and a session's CSRF token is one.
 
 **HMAC-based key derivation function (HKDF)** — RFC 5869's way to derive
-independent keys from one secret: the CSRF token's key is derived from the
-master secret key with its own info string, so every process holding that key
-issues and accepts the same tokens.
+independent keys from one secret: the CSRF token's key and the key sealing an
+OpenID Connect sign-in's state cookie are each derived from the master secret
+key with an info string of their own, so every process holding that key
+issues and accepts the same values.
 
 **Random number generator (RNG)** — keys, tokens, and nonces come from the
 operating system's cryptographically secure one; the reconnect backoff

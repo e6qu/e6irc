@@ -979,6 +979,9 @@ pub struct StorageMaintenanceReport {
     pub api_tokens: u64,
     pub device_grants: u64,
     pub logout_tokens: u64,
+    /// OpenID Connect flows recorded as answered, past the time the flow
+    /// itself would have expired.
+    pub spent_oidc_flows: u64,
     pub account_invitations: u64,
     /// Temporary server bans past their expiry. Every shard already stopped
     /// enforcing each one when it lapsed; this removes the row.
@@ -1013,6 +1016,7 @@ impl StorageMaintenanceReport {
             api_tokens,
             device_grants,
             logout_tokens,
+            spent_oidc_flows,
             account_invitations,
             server_bans,
             observability_samples,
@@ -1027,6 +1031,7 @@ impl StorageMaintenanceReport {
         self.api_tokens += api_tokens;
         self.device_grants += device_grants;
         self.logout_tokens += logout_tokens;
+        self.spent_oidc_flows += spent_oidc_flows;
         self.account_invitations += account_invitations;
         self.server_bans += server_bans;
         self.observability_samples += observability_samples;
@@ -1044,6 +1049,7 @@ impl StorageMaintenanceReport {
             MaintenanceCollection::ApiTokens => &mut self.api_tokens,
             MaintenanceCollection::DeviceGrants => &mut self.device_grants,
             MaintenanceCollection::LogoutTokens => &mut self.logout_tokens,
+            MaintenanceCollection::SpentOidcFlows => &mut self.spent_oidc_flows,
             MaintenanceCollection::AccountInvitations => &mut self.account_invitations,
             MaintenanceCollection::ServerBans => &mut self.server_bans,
             MaintenanceCollection::ObservabilitySamples => &mut self.observability_samples,
@@ -1100,6 +1106,7 @@ pub enum MaintenanceCollection {
     ApiTokens,
     DeviceGrants,
     LogoutTokens,
+    SpentOidcFlows,
     AccountInvitations,
     ServerBans,
     ObservabilitySamples,
@@ -1108,7 +1115,7 @@ pub enum MaintenanceCollection {
 }
 
 impl MaintenanceCollection {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Messages,
         Self::BncBuffer,
         Self::AuditLog,
@@ -1116,6 +1123,7 @@ impl MaintenanceCollection {
         Self::ApiTokens,
         Self::DeviceGrants,
         Self::LogoutTokens,
+        Self::SpentOidcFlows,
         Self::AccountInvitations,
         Self::ServerBans,
         Self::ObservabilitySamples,
@@ -1132,6 +1140,7 @@ impl MaintenanceCollection {
             Self::ApiTokens => "api_tokens",
             Self::DeviceGrants => "device_grants",
             Self::LogoutTokens => "oidc_logout_tokens",
+            Self::SpentOidcFlows => "oidc_spent_flows",
             Self::AccountInvitations => "account_invitations",
             Self::ServerBans => "server_bans",
             Self::ObservabilitySamples => "observability_samples",
@@ -1196,6 +1205,12 @@ impl MaintenanceCollection {
                      SELECT ctid FROM oidc_logout_tokens
                      WHERE expires_at <= now()
                      ORDER BY expires_at, issuer, jti LIMIT $1))"
+            }
+            Self::SpentOidcFlows => {
+                "DELETE FROM oidc_spent_flows WHERE state_digest = ANY(ARRAY(
+                     SELECT state_digest FROM oidc_spent_flows
+                     WHERE expires_at <= now()
+                     ORDER BY expires_at LIMIT $1))"
             }
             Self::AccountInvitations => {
                 "DELETE FROM account_invitations WHERE id = ANY(ARRAY(
@@ -10382,6 +10397,27 @@ pub async fn session_identity(
     .fetch_optional(pool)
     .await
     .map_err(query_error)
+}
+
+/// Record the OpenID Connect authorization flow whose OAuth `state` is
+/// `state` as answered, until `expires_at` (Unix seconds), when the flow
+/// itself would have expired. `true` when this call spent it; `false` when it
+/// already was, by this process or any other sharing the database — a kept
+/// copy of its cookie. One statement, so two callbacks racing for one flow
+/// cannot both win. The state is stored as its SHA-256.
+pub async fn spend_oidc_flow(pool: &PgPool, state: &str, expires_at: u64) -> Result<bool, DbError> {
+    let expires_at = i64::try_from(expires_at)
+        .map_err(|_| DbError::InvalidDatabaseTimestamp("flow expiry exceeds BIGINT".into()))?;
+    let inserted = sqlx::query(
+        "INSERT INTO oidc_spent_flows (state_digest, expires_at)
+         VALUES ($1, to_timestamp($2)) ON CONFLICT DO NOTHING",
+    )
+    .bind(token_hash(state))
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(inserted.rows_affected() == 1)
 }
 
 /// Atomically consumes a signed back-channel logout token and revokes only
