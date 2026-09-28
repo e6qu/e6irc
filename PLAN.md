@@ -1534,7 +1534,7 @@ configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
 fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
-Status: phases 0, 1 and 2 done; phase 3 is the next to build; every other
+Status: phases 0, 1, 2 and 3 done; phase 4 is the next to build; every other
 phase is scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
@@ -1587,7 +1587,7 @@ phase is scheduled in the order below.
   the client's messages as `Message`, and a close frame on `End`. The
   `/ws/irc` and `/ws/ui` upgrade handlers stay in e6ircd until upgrade
   authorization (phase 3).
-- **Phase 3 — process boundary.** The `e6irc-link` codec and its
+- **Phase 3 — process boundary (done).** The `e6irc-link` codec and its
   `link_frames` fuzz target; `e6ircd edge`; the mutual-TLS link and
   `e6ircd edge-credentials`; the epoch fence; `/readyz`-based discovery; HTTP
   proxying and upgrade authorization; edge configuration from `Welcome`; the
@@ -1601,6 +1601,21 @@ phase is scheduled in the order below.
   so does a link reset. DESIGN §4, §8, §9.4, §17. *Green because* behaviour is
   identical except for the process boundary, and the first process-level
   tests run on Linux, macOS and Windows.
+  As built (DESIGN §19.1, "Phase 3 as built"): `e6ircd edge` runs the edge's
+  own accept, framing and write code against `RemoteCorePort`, which feeds
+  each session's in-process link pair from the core link's frames; the core
+  serves links on `[edge_link]` (`edge_link.rs`), one TLS stream per shard,
+  and has no listeners of its own in edge mode. The `/ws/irc` and `/ws/ui`
+  upgrades are authorized by the core's own handlers over the HTTP link pool
+  (grant headers, not an `HttpRequest` frame) and completed at the edge;
+  HTTP serving moved to `e6irc_edge::http`. Slots are 14 bits, keeping
+  identifiers inside the HTTP boundary's signed 64-bit range, and an
+  edge-mode core counts its own sessions in slot 0. `Open` carries the kind,
+  address and transport; the TLS facts and the cut identifier join it with
+  the phase that reads them, under a new link version. The zero-drop suite's
+  first scenarios need no PostgreSQL and run in the `test` job on all six
+  cells; the roster and the `/ws/ui` and attach scenarios run in `db-tests`,
+  and irctest's green list runs a second time through an edge.
 - **Phase 4 — graceful rebuild.** Session records, channel replicas,
   acknowledge after effect with retained lines, the graceful cut and
   rebuild, re-authorization, durable ring epochs and `ReplayCursor`s, paced

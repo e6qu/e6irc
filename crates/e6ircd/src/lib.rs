@@ -10,6 +10,8 @@ pub mod bouncer;
 pub mod config;
 pub mod core;
 pub mod db;
+pub mod edge_credentials;
+pub mod edge_link;
 pub mod egress;
 pub mod environment_config;
 pub mod http;

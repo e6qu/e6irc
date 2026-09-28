@@ -28,7 +28,7 @@ use e6irc_queue::{Receiver, Sender};
 /// take them: the credit its reader at the edge waits for. As much as one read
 /// of its socket framed before, so the edge reads ahead no further than the
 /// attachment itself used to.
-const ATTACH_INBOUND_BYTES: usize = 8 * 1024;
+pub(crate) const ATTACH_INBOUND_BYTES: usize = 8 * 1024;
 
 /// What the edge hands an attachment: a framed line, or how the client's side
 /// ended (the `Line`, `OverlongLine` and `Closed` frames).

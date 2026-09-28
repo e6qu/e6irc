@@ -515,7 +515,7 @@ fn operations() -> serde_json::Value {
                 "required": ["at_ms", "component", "severity", "message"],
                 "properties": {
                     "at_ms": { "type": "integer", "minimum": 0 },
-                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http", "configuration"] },
+                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http", "configuration", "link"] },
                     "severity": { "const": "error" },
                     "message": { "const": "An operational error was recorded." }
                 }
@@ -1032,8 +1032,14 @@ fn operations() -> serde_json::Value {
             "type": "object", "additionalProperties": false, "required": ["revision", "updated_by", "updated_at", "settings", "runtime"],
             "properties": {
                 "revision": { "type": "integer", "minimum": 0 }, "updated_by": { "type": "string" }, "updated_at": { "type": "string" }, "settings": configuration_settings_schema,
-                "runtime": { "type": "object", "additionalProperties": false, "required": ["bound_bnc_addr", "http_bind", "has_master_key", "master_key_count", "release_revision", "network_drivers"],
-                    "properties": { "bound_bnc_addr": { "type": ["string", "null"] }, "http_bind": { "type": ["string", "null"] }, "has_master_key": { "type": "boolean" }, "master_key_count": { "type": "integer", "minimum": 0 }, "release_revision": { "type": ["string", "null"] }, "network_drivers": { "type": "array", "items": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] } } }
+                "runtime": { "type": "object", "additionalProperties": false, "required": ["bound_bnc_addr", "http_bind", "has_master_key", "master_key_count", "release_revision", "network_drivers", "edge_mode", "edges"],
+                    "properties": { "bound_bnc_addr": { "type": ["string", "null"] }, "http_bind": { "type": ["string", "null"] }, "has_master_key": { "type": "boolean" }, "master_key_count": { "type": "integer", "minimum": 0 }, "release_revision": { "type": ["string", "null"] }, "network_drivers": { "type": "array", "items": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] } },
+                        "edge_mode": { "type": "boolean", "description": "Whether the listeners are the linked edges' own configuration (edge mode); the settings' listeners then apply to single-process mode and are not changed here." },
+                        "edges": { "type": "array", "maxItems": 16383, "description": "The edges linked now, with the listeners each reports; empty in single-process mode.", "items": {
+                            "type": "object", "additionalProperties": false, "required": ["name", "slot", "link_version", "upgrade_needed", "linked_at", "listeners"],
+                            "properties": { "name": { "type": "string" }, "slot": { "type": "integer", "minimum": 1, "maximum": 16383 }, "link_version": { "type": "integer", "minimum": 0 }, "upgrade_needed": { "type": "boolean" }, "linked_at": { "type": "string" },
+                                "listeners": { "type": "array", "maxItems": 64, "items": { "type": "object", "additionalProperties": false, "required": ["kind", "addr", "tls", "proxy_protocol"],
+                                    "properties": { "kind": { "type": "string", "enum": ["irc", "websocket", "http", "attach"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "proxy_protocol": { "type": "boolean" } } } } } } } }
                 }
             }
         }),
@@ -1169,7 +1175,7 @@ fn operations() -> serde_json::Value {
             },
             "/readyz": {
                 "get": { "summary": "Core and PostgreSQL readiness probe", "responses": {
-                    "200": { "description": "this process serves (role \"serving\") and all configured dependencies are ready" },
+                    "200": { "description": "this process serves (role \"serving\") and all configured dependencies are ready; in edge mode `edges` gives this core's link version and each linked edge's, with whether it must be upgraded before the next core release" },
                     "503": { "description": "the core heartbeat is stale, PostgreSQL is unavailable, or the serving lease is unconfirmed (lease \"unconfirmed\": no renewal reached the database within the fence; the process keeps its clients and resumes when one does), or this process is a standby (role \"standby\", naming the serving lease's holder)" } } }
             },
             "/api/v1/monitoring/observation": {
@@ -1346,7 +1352,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/connections": {
                 "get": {
                     "summary": "Filter and page your live IRC connections",
-                    "description": "Returns only registered connections currently authenticated to the caller. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. IDs identify exact live resources; before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
+                    "description": "Returns only registered connections currently authenticated to the caller. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. IDs identify exact live resources and promise no order; pages run newest-first in the order the server opened the connections, and before_id takes the page's next_before_id cursor, selecting strictly older connections, so a connection opened during a walk cannot duplicate into, or go missing from, an older page.",
                     "security": authenticated,
                     "parameters": own_connection_parameters,
                     "responses": {
@@ -2240,7 +2246,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/admin/connections": {
                 "get": {
                     "summary": "Filter and page all live IRC connections (admin only)",
-                    "description": "Returns a bounded newest-first projection of registered clients across TCP, TLS, WebSocket, and the local in-process transport. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. Nick and account filters use RFC1459 case-folding. before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
+                    "description": "Returns a bounded newest-first projection of registered clients across TCP, TLS, WebSocket, and the local in-process transport. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. Nick and account filters use RFC1459 case-folding. IDs identify exact live resources and promise no order; pages run newest-first in the order the server opened the connections, and before_id takes the page's next_before_id cursor, selecting strictly older connections, so a connection opened during a walk cannot duplicate into, or go missing from, an older page.",
                     "security": authenticated,
                     "parameters": admin_connection_parameters,
                     "responses": {

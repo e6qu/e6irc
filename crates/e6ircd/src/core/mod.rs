@@ -1033,6 +1033,30 @@ impl Input {
 /// The core as the edge's sessions reach it in the single process: each
 /// session opened, line framed and end reported becomes an [`Input`] on the
 /// owning shard's queue, and the awaited push is the line's credit.
+impl CoreIngress {
+    /// The `Open` of `conn`'s session with a send-queue bound of
+    /// `sendq_bytes`, and the edge's end of its link: what every session opens
+    /// with, whether its edge is in this process or another.
+    pub(crate) fn open_input(
+        &self,
+        conn: ConnId,
+        host: String,
+        transport: ConnectionTransport,
+        sendq_bytes: usize,
+    ) -> (Input, EdgeSession) {
+        let (tx, edge) = send_queue("sendq", sendq_bytes);
+        (
+            Input::Open {
+                conn,
+                tx,
+                host,
+                transport,
+            },
+            edge,
+        )
+    }
+}
+
 impl e6irc_edge::connection::CorePort for CoreIngress {
     async fn open(
         &self,
@@ -1041,15 +1065,8 @@ impl e6irc_edge::connection::CorePort for CoreIngress {
         transport: ConnectionTransport,
         sendq_bytes: usize,
     ) -> Option<EdgeSession> {
-        let (tx, edge) = send_queue("sendq", sendq_bytes);
-        let opened = self
-            .push(Input::Open {
-                conn,
-                tx,
-                host,
-                transport,
-            })
-            .await;
+        let (open, edge) = self.open_input(conn, host, transport, sendq_bytes);
+        let opened = self.push(open).await;
         opened.ok().map(|_sequence| edge)
     }
 
@@ -1267,12 +1284,16 @@ impl LiveConnectionPageSize {
     }
 }
 
-/// Validated filters for a bounded live-connection snapshot. Connection ids
-/// increase for the process lifetime, so `before_id` gives newest-first
-/// keyset pagination that concurrent accepts cannot disturb.
+/// Validated filters for a bounded live-connection snapshot, newest first.
+/// The page runs in directory-key order (`state::DirectoryKey`), never
+/// connection-identifier order: an identifier promises uniqueness and no
+/// order, while a directory key given after a cursor was handed out always
+/// sorts after it, so keyset pagination by `before_key` misses no connection
+/// that opens during a walk, on any edge or shard.
 #[derive(Debug, Clone)]
 pub struct LiveConnectionQuery {
-    pub before_id: Option<u64>,
+    /// Only connections whose directory key is below this.
+    pub before_key: Option<u64>,
     pub exact_nick: Option<String>,
     pub exact_account: Option<String>,
     pub transport: Option<ConnectionTransport>,
@@ -1284,6 +1305,9 @@ pub struct LiveConnectionQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConnectionInfo {
     pub id: u64,
+    /// Where it sorts in the directory: the cursor a page after it starts
+    /// before.
+    pub directory_key: u64,
     pub nick: String,
     pub user: String,
     pub host: String,
@@ -1298,7 +1322,8 @@ pub struct LiveConnectionInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConnectionPage {
     pub entries: Vec<LiveConnectionInfo>,
-    pub next_before_id: Option<u64>,
+    /// The directory key the next page starts before, when there is one.
+    pub next_before_key: Option<u64>,
 }
 
 /// The outcome of an [`AdminRequest`], returned over its oneshot reply.

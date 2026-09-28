@@ -11,7 +11,7 @@
 //! whatever it sends. The meter is here, where the socket is, because "the
 //! reader stops reading" can only happen where the reading is. An IRC operator
 //! is exempt (Solanum's `no_oper_flood`): the core pushes the session's
-//! [`FloodExemption`] over its link ([`crate::link::CoreEnd::set_flood_exempt`]).
+//! [`FloodExemption`] over its link ([`crate::link::SessionLink::set_flood_exempt`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,17 +107,33 @@ impl CommandFlood {
 
 /// Whether one session's lines are metered: the flag the core sets over the
 /// session's link when the session becomes, or stops being, an IRC operator,
-/// and the edge reads only when the session's bucket is empty.
+/// and the edge reads only when the session's bucket is empty. A change is
+/// also announced ([`FloodExemption::changed`]), for the task that carries it
+/// to an edge in another process.
 #[derive(Clone, Default)]
-pub struct FloodExemption(Arc<AtomicBool>);
+pub struct FloodExemption(Arc<ExemptionState>);
+
+#[derive(Default)]
+struct ExemptionState {
+    exempt: AtomicBool,
+    changed: tokio::sync::Notify,
+}
 
 impl FloodExemption {
     pub(crate) fn set(&self, exempt: bool) {
-        self.0.store(exempt, Ordering::Relaxed);
+        self.0.exempt.store(exempt, Ordering::Relaxed);
+        self.0.changed.notify_one();
     }
 
-    fn exempt(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+    /// Whether the session is exempt now.
+    pub fn exempt(&self) -> bool {
+        self.0.exempt.load(Ordering::Relaxed)
+    }
+
+    /// Resolves after the next change, or at once for one since the last
+    /// wait.
+    pub async fn changed(&self) {
+        self.0.changed.notified().await;
     }
 }
 

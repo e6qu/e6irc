@@ -14559,8 +14559,8 @@ fn live_connection_pages_are_bounded_filterable_and_stable() {
     server.line(carol, "OPER god letmein");
     server.drain(carol);
 
-    let query = |before_id, page_size| LiveConnectionQuery {
-        before_id,
+    let query = |before_key, page_size| LiveConnectionQuery {
+        before_key,
         exact_nick: None,
         exact_account: None,
         transport: None,
@@ -14583,17 +14583,20 @@ fn live_connection_pages_are_bounded_filterable_and_stable() {
             .collect::<Vec<_>>(),
         [30, 20]
     );
-    assert_eq!(first.next_before_id, Some(20));
+    assert_eq!(first.next_before_key, Some(first.entries[1].directory_key));
     assert_eq!(first.entries[0].transport, ConnectionTransport::Local);
     assert_eq!(first.entries[0].idle_seconds, 0);
 
-    // A new connection accepted after page one is newer than its cursor and
-    // therefore cannot duplicate into page two.
+    // A connection opened after page one sorts after its cursor, whatever its
+    // identifier — one from another edge's slot may be lower than every
+    // identifier already listed — so it neither duplicates into page two nor
+    // takes a place there that would push an older one out.
     register(&mut server, 40, "Delta", ConnectionTransport::Tls);
+    register(&mut server, 5, "Echo", ConnectionTransport::Tcp);
     let AdminReply::Connections(second) = core_admin(
         &mut server,
         e6ircd::core::AdminRequest::ListConnections {
-            query: query(first.next_before_id, 2),
+            query: query(first.next_before_key, 2),
         },
     ) else {
         panic!("expected second live-connection page");
@@ -14606,7 +14609,7 @@ fn live_connection_pages_are_bounded_filterable_and_stable() {
             .collect::<Vec<_>>(),
         [10]
     );
-    assert_eq!(second.next_before_id, None);
+    assert_eq!(second.next_before_key, None);
 
     for filtered in [
         LiveConnectionQuery {
@@ -14748,7 +14751,7 @@ fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
     );
 
     let query = LiveConnectionQuery {
-        before_id: None,
+        before_key: None,
         exact_nick: None,
         exact_account: Some("alice".into()),
         transport: None,

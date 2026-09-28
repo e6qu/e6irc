@@ -24,6 +24,7 @@ mod attach_link;
 pub use account_lease::{
     AccountLease, AccountRevocations, AccountRevoked, Revocation, RevocationTicket,
 };
+pub(crate) use attach_link::ATTACH_INBOUND_BYTES;
 pub use attach_link::{AttachLink, AttachPort, ClientLines};
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;

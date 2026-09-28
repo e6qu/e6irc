@@ -283,7 +283,10 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
     session
         .core
         .core_tx
-        .closed(conn, e6irc_edge::connection::SessionClosed::Stopped(reason))
+        .closed(
+            conn,
+            e6irc_edge::connection::SessionClosed::Stopped(reason.into()),
+        )
         .await;
     outcome
 }

@@ -355,6 +355,13 @@ pub struct Config {
     /// Database retention and expired-resource cleanup policy.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Edge mode (DESIGN §19): where edges link to this core, and the core's
+    /// link credentials. With it, the client listeners and their certificates
+    /// are the edges' own configuration (`e6ircd edge`), and this process
+    /// binds none of them; `[[listeners]]` and `[bnc]` apply to
+    /// single-process mode.
+    #[serde(default)]
+    pub edge_link: Option<crate::edge_link::EdgeLinkConfig>,
     /// Which keys the document this configuration was read from states, so a
     /// console-owned setting it states can be held to the stored value
     /// ([`ManagedConfig::bootstrap_drift`]) while one it leaves unstated is
@@ -397,11 +404,39 @@ fn left_out_of(document: &toml::Table) -> Vec<&'static str> {
             .get("http")
             .and_then(toml::Value::as_table)
             .is_some_and(|http| !http.contains_key("public_url"));
+    // In edge mode the listeners are the edges': the core needs none.
+    let edge_mode = document.contains_key("edge_link");
     LEFT_TO_STORED_SETTINGS
         .into_iter()
         .filter(|key| !document.contains_key(*key))
+        .filter(|key| !(edge_mode && *key == "listeners"))
         .chain(public_url_left.then_some(LEFT_TO_STORED_PUBLIC_URL))
         .collect()
+}
+
+/// A document in edge mode states no client listener: those are the edges'
+/// (DESIGN §19.6, decision D9), and one stated here would be a listener no
+/// process binds.
+fn refuse_listeners_in_edge_mode(document: &toml::Table) -> Result<(), ConfigError> {
+    if !document.contains_key("edge_link") {
+        return Ok(());
+    }
+    let stated: Vec<&str> = ["listeners", "bnc"]
+        .into_iter()
+        .filter(|key| document.contains_key(*key))
+        .collect();
+    if stated.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid(format!(
+        "[edge_link] runs this core in edge mode, where the client listeners belong to the \
+         edges' own configuration (e6ircd edge); remove {} (they apply to single-process mode)",
+        stated
+            .iter()
+            .map(|key| format!("[{key}]"))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    )))
 }
 
 /// The keys a configuration document states, as opposed to leaving them to a
@@ -2044,6 +2079,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             observability: ObservabilityConfig::default(),
             storage: StorageConfig::default(),
+            edge_link: None,
             stated: StatedSettings::Everything,
             left_to_stored_settings: Vec::new(),
         }
@@ -2127,6 +2163,7 @@ impl Config {
         // the wrong shape keeps the position the refusal reports it by.
         let mut config: Self = toml::from_str(&text).map_err(ConfigError::Parse)?;
         let document: toml::Table = toml::from_str(&text).map_err(ConfigError::Parse)?;
+        refuse_listeners_in_edge_mode(&document)?;
         config.stated = StatedSettings::of_document(&document, &[]);
         config.left_to_stored_settings = left_out_of(&document);
         Self::checked(config)
@@ -2138,6 +2175,7 @@ impl Config {
     /// builder filled with its own defaults rather than an operator's
     /// statement, so they are not held to the stored console settings.
     pub fn from_table(table: toml::Table, defaulted: &[&str]) -> Result<Self, ConfigError> {
+        refuse_listeners_in_edge_mode(&table)?;
         let stated = StatedSettings::of_document(&table, defaulted);
         let left_to_stored_settings = left_out_of(&table);
         let mut config: Self = table.try_into().map_err(ConfigError::Parse)?;
@@ -2408,10 +2446,21 @@ impl Config {
                 }
             )));
         }
-        if self.listeners.is_empty() && !self.left_to_stored_settings.contains(&"listeners") {
+        if self.listeners.is_empty()
+            && !self.left_to_stored_settings.contains(&"listeners")
+            && self.edge_link.is_none()
+        {
             return Err(ConfigError::Invalid(
                 "at least one [[listeners]] required".into(),
             ));
+        }
+        // Each core shard has one session stream on every edge's link.
+        if self.edge_link.is_some() && self.core_workers > usize::from(e6irc_link::MAX_STREAMS) {
+            return Err(ConfigError::Invalid(format!(
+                "core_workers must be at most {} in edge mode: each core shard is one session \
+                 stream of every edge's link",
+                e6irc_link::MAX_STREAMS
+            )));
         }
         // A websocket listener is served by plain axum (like the [http]
         // listener) with TLS terminated by a front proxy; it cannot itself

@@ -31,6 +31,7 @@ a design target rather than current behavior.
 | [First production boot](deployment-and-recovery.md#first-production-boot) | Proven | Actual daemon against an isolated empty PostgreSQL container proves migrations, import, readiness, and IRC traffic; CI also inspects the production image | — |
 | [Deploy a release](deployment-and-recovery.md#deploy-a-release) | Proven | Six-platform builds, deterministic package test, image shape, and publication contract | Tag publication itself runs only for a matching release tag |
 | [Restart without losing durable state](deployment-and-recovery.md#restart-without-losing-durable-state) | Proven | Chromium gracefully restarts the real daemon and proves session/network/runtime/backlog recovery | — |
+| [Run the core behind an edge](deployment-and-recovery.md#run-the-core-behind-an-edge) | Partially proven | Real core and edge processes over mutual TLS on six OS/architecture cells: every transport and HTTP through an edge, a killed, stopped and reset core closing loudly and relinking, per-address limits across edges, the PROXY protocol; PostgreSQL `/ws/ui`, attach and roster scenarios; irctest through an edge | A core restart still closes clients until the graceful rebuild (phase 4) |
 | [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Proven | Named PostgreSQL stop/start under real daemon, probe, database-backed HTTP, and hot IRC traffic proves bounded failure and recovery | — |
 | [Back up and restore PostgreSQL](deployment-and-recovery.md#back-up-and-restore-postgresql) | Proven | Guarded shell contract plus real custom-format PostgreSQL archive, destructive proof mutation, transactional restore, and daemon reboot journey | External master-key/config backup storage remains the operator’s responsibility |
 | [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Keyring/open/seal/wrong-key startup and CLI tests plus atomic PostgreSQL all-secret rotation/rollback/audit proof | Irrecoverable key loss still requires a key backup or explicit credential replacement |
@@ -164,9 +165,9 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 |---|---|
 | `lint` | `tools/gate.sh` — formatting, shell syntax of every script, every structural guard (locked builds, one Rust toolchain, image pins, migration integrity, no-op, dead-public, duplication, no-deferral, fuzz lock, journeys, client capabilities, template accessibility, API-first) and every guard's contract test, the backup/restore, load-sweep, qualification, and native-packaging self-tests; then warnings in all-feature, default, and per-feature compilation, the dead-code build, and frontend unit tests/build |
 | `deny` | licenses, advisories, bans (including one version of each network stack), and dependency-source policy, for the workspace and for the separate `fuzz/` package |
-| `test` | all-feature workspace behavior, plus the daemon's unit tests and HTTP suite in the default-feature build, on six OS/architecture cells |
+| `test` | all-feature workspace behavior, plus the daemon's unit tests and HTTP suite in the default-feature build, on six OS/architecture cells; this includes the zero-drop suite's process-level edge scenarios (real `e6ircd` and `e6ircd edge` processes) |
 | `coverage` | all-feature workspace line-coverage regression floor |
-| `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/`ws_scope`/CLI journeys |
+| `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/`ws_scope`/serving-lease and takeover/edge-tier roster, `/ws/ui` and attach/CLI journeys |
 | `cross-browser` | the complete OIDC, console, network, and chat browser journey repeated in Firefox and WebKit against the real daemon, PostgreSQL, and a local live upstream |
 | `visual-regression` | Chromium visual snapshots and axe accessibility checks of the chat and console shells against the development server |
 | `postgres-recovery` | isolated empty PostgreSQL first boot plus live stop/start degradation and recovery under HTTP and IRC traffic |
@@ -174,10 +175,10 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | real pseudo-terminal render/message/terminal-restore journey (the deterministic archive contract runs in `lint`) |
 | `shauth-sso` | exact external single-sign-on/logout integration |
-| `irctest`, `irctest-services` | IRC and services conformance |
+| `irctest`, `irctest-services` | IRC and services conformance; the green list runs twice, in one process and through an edge |
 | `matrix-bridge` | bidirectional live bridge behavior |
 | `loom` | queue concurrency interleavings |
-| `fuzz-smoke` | parser, tag escaping, stateful core, multi-client core, and hostile TUI server output |
+| `fuzz-smoke` | parser, tag escaping, stateful core, multi-client core, core-link frames, and hostile TUI server output |
 | `size-report` | informational release binary-size visibility |
 | `ci-ok` | the single required check: it needs every job above and fails unless each one succeeded, so a failed, cancelled, or skipped job cannot merge green; the release workflow publishes only from a `main` commit whose CI run concluded successfully |
 
@@ -194,6 +195,6 @@ every binary's `--version` on its own target's runner (it must name the
 version and commit built), attests each deterministic archive, checks that the complete six-file set
 arrived, writes sorted SHA-256 checksums, and creates the GitHub release.
 
-The PostgreSQL BNC and `/ws/ui` ignored integration suites belong in
-`db-tests`; the workflow invokes them explicitly. “Ignored” in their source
+The PostgreSQL BNC, `/ws/ui`, serving-lease and edge-tier ignored integration
+suites belong in `db-tests`; the workflow invokes them explicitly. “Ignored” in their source
 means they need the supplied database environment, not that CI may omit them.

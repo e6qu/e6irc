@@ -873,17 +873,30 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "bytes",
+ "e6irc-link",
  "e6irc-proto",
  "e6irc-queue",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tower",
+]
+
+[[package]]
+name = "e6irc-link"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "e6irc-proto",
 ]
 
 [[package]]
@@ -948,6 +961,7 @@ dependencies = [
  "bytes",
  "e6irc-client",
  "e6irc-edge",
+ "e6irc-link",
  "e6irc-proto",
  "e6irc-queue",
  "futures-util",

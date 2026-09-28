@@ -176,9 +176,10 @@ jobs:
   db-tests:
     runs-on: ubuntu-24.04
     # Every PostgreSQL suite runs here single-threaded, one after another
-    # (about 13 minutes in total as of sweep 4); the bound leaves room for
-    # the suites to grow without cutting off the last step mid-run.
-    timeout-minutes: 25
+    # (about 13 minutes in total as of sweep 4, before the serving-lease and
+    # edge-tier suites joined); the bound leaves room for the suites to grow
+    # without cutting off the last step mid-run.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
@@ -211,6 +212,15 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - run: cargo test --locked -p e6ircd --test ws_scope -- --ignored --test-threads=1
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+      # The serving lease, standby and takeover (DESIGN §18), and the edge
+      # tier's PostgreSQL half: the `core_edges` roster, `/ws/ui` and bouncer
+      # attach through an edge (DESIGN §19).
+      - run: cargo test --locked -p e6ircd --test high_availability -- --ignored --test-threads=1
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+      - run: cargo test --locked -p e6ircd --test edge_tier -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - name: Start dex (mock connector)
@@ -447,7 +457,9 @@ jobs:
   # written reason. run.sh holds the skipped tests to expected-skips.txt.
   irctest:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Two runs of the green list, in one process and through an edge, each
+    # within the 15 minutes one run was bounded by.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
@@ -472,6 +484,13 @@ jobs:
         run: |
           pip install -r ../irctest/requirements.txt "pytest-timeout==2.4.0"
           vendor/tests/irctest/run.sh ../irctest "$(command -v python)"
+      # The same list with every client reaching the core through an
+      # `e6ircd edge` over the mutual-TLS core link (DESIGN §19): the process
+      # boundary changes nothing a client can see.
+      - name: Run irctest green list through an edge
+        env:
+          E6IRC_IRCTEST_EDGE: "1"
+        run: vendor/tests/irctest/run.sh ../irctest "$(command -v python)"
 
   # The persistence-backed half of the conformance suite: the suites marked
   # `services` need an account store, so they run against a real PostgreSQL

@@ -1559,7 +1559,6 @@ macro_rules! problem_extractor {
         }
     };
 }
-pub(crate) use problem_extractor;
 
 /// A query string, rejected as a problem document rather than axum's plain-text
 /// default. Every query struct is `deny_unknown_fields`, so a stray parameter
@@ -2196,94 +2195,20 @@ async fn require_active_account(
     }
 }
 
-/// A trusted proxy passed on an `X-Forwarded-For` entry that is not an address
-/// before any client address, reading from the right: the chain it vouches for
-/// is broken there (nginx writes `unix:` for a client on a Unix socket), what
-/// lies left of the entry is only what the client wrote, and no client address
-/// can be told.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct UnusableForwardedFor {
-    /// The trusted proxy that sent it.
-    proxy: ClientIp,
-    /// The entry, as sent.
-    entry: String,
-}
-
-impl std::fmt::Display for UnusableForwardedFor {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Header text is printable ASCII, but only the proxy's own share of it
-        // is its: bound what a client can put in the log line.
-        let entry: String = self.entry.chars().take(64).collect();
-        write!(
-            formatter,
-            "entry {entry:?} is not an address; the proxy must forward its \
-             client's address (for nginx, `$proxy_add_x_forwarded_for` on a TCP listener)"
-        )
-    }
-}
-
-/// Resolve the real client IP: if the socket peer is a trusted proxy, take the
-/// rightmost non-trusted `X-Forwarded-For` entry (the client the proxy chain
-/// received from); otherwise the peer is the client. `X-Forwarded-For` is only consulted for
-/// trusted peers so a direct client cannot spoof its IP with the header. An
-/// entry that is not an address, reached before that client, refuses the
-/// request ([`UnusableForwardedFor`]): skipping it would walk on into entries
-/// the client wrote.
-pub(super) fn client_ip(
-    peer: std::net::IpAddr,
-    headers: &axum::http::HeaderMap,
-    trusted: &[ipnet::IpNet],
-) -> Result<ClientIp, UnusableForwardedFor> {
-    // Every address is judged in its canonical spelling: a dual-stack listener
-    // presents an IPv4 proxy mapped, and a proxy may forward a mapped client.
-    let peer = ClientIp::new(peer);
-    let is_trusted = |address: ClientIp| trusted.iter().any(|net| net.contains(&address.ip()));
-    if !is_trusted(peer) {
-        return Ok(peer);
-    }
-    // Concatenate *every* X-Forwarded-For header in header order before scanning
-    // right-to-left for the first non-trusted entry (the real client the trusted
-    // proxy chain saw). Reading only the first header (`get`) would miss the
-    // trusted proxy's appended entry when a proxy emits a *separate* header
-    // rather than merging, letting a client-supplied earlier header win — a
-    // spoofed key that collapses per-IP rate limits/bans. Whole-string rsplit
-    // over the joined value handles both the merged and multi-header forms.
-    let joined = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect::<Vec<_>>()
-        .join(",");
-    // A header with no entries at all names no client, as no header does.
-    if joined.trim().is_empty() {
-        return Ok(peer);
-    }
-    for part in joined.rsplit(',') {
-        let Some(ip) = parse_forwarded_ip(part) else {
-            return Err(UnusableForwardedFor {
-                proxy: peer,
-                entry: part.trim().to_string(),
-            });
-        };
-        if !is_trusted(ip) {
-            return Ok(ip);
-        }
-    }
-    Ok(peer)
-}
-
-/// [`client_ip`], with its refusal answered: a `400` naming the problem, and a
-/// line in the log — one a minute per proxy — naming the proxy's
-/// misconfiguration for the operator.
+/// [`client_ip`] (`e6irc_edge::address`), with its refusal answered: a `400`
+/// naming the problem, and a line in the log — one a minute per proxy —
+/// naming the proxy's misconfiguration for the operator.
+///
+/// [`client_ip`]: e6irc_edge::address::client_ip
 pub(super) fn resolve_client_ip(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     trusted: &[ipnet::IpNet],
     refusals: &PeerRefusalLog,
 ) -> ResponseResult<ClientIp> {
-    client_ip(peer, headers, trusted).map_err(|unusable| {
+    e6irc_edge::address::client_ip(peer, headers, trusted).map_err(|unusable| {
         refusals.note(
-            unusable.proxy,
+            unusable.proxy(),
             PeerRefusal::UnusableForwardedFor,
             Some(&unusable),
         );
@@ -2297,51 +2222,6 @@ pub(super) fn resolve_client_ip(
         )
         .into()
     })
-}
-
-/// Whether a request reached this server over HTTPS, which only a trusted
-/// proxy can say: the direct peer must be in `trusted`, and every
-/// `X-Forwarded-Proto` entry it passed on — all headers, all comma-separated
-/// values — must be `https`. A client's own `https` to which a plaintext hop
-/// appended `http` is plaintext, and so is an entry that is not text, a
-/// request with no such header, or one from any other peer: the HTTP listener
-/// itself never terminates TLS.
-pub(super) fn forwarded_https(
-    peer: std::net::IpAddr,
-    headers: &axum::http::HeaderMap,
-    trusted: &[ipnet::IpNet],
-) -> bool {
-    let peer = ClientIp::new(peer);
-    if !trusted.iter().any(|net| net.contains(&peer.ip())) {
-        return false;
-    }
-    let mut entries = headers
-        .get_all("x-forwarded-proto")
-        .iter()
-        .flat_map(|value| value.to_str().unwrap_or("").split(','))
-        .map(str::trim)
-        .peekable();
-    entries.peek().is_some() && entries.all(|entry| entry.eq_ignore_ascii_case("https"))
-}
-
-/// Parse one `X-Forwarded-For` entry to an IP, tolerating the `ip:port` and
-/// bracketed-IPv6 forms some proxies emit (`203.0.113.9:443`, `[2001:db8::1]`,
-/// `[2001:db8::1]:443`). A bare `parse::<IpAddr>()` rejects all of those, which
-/// would make `client_ip` refuse every request from such a proxy. Returns
-/// `None` only for an entry that is not an address.
-fn parse_forwarded_ip(entry: &str) -> Option<ClientIp> {
-    let s = entry.trim();
-    let address = if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-        Some(ip) // bare IPv4 or unbracketed IPv6
-    } else if let Ok(sock) = s.parse::<std::net::SocketAddr>() {
-        Some(sock.ip()) // ip:port or [ip]:port
-    } else {
-        // `[ip]` with no port.
-        s.strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .and_then(|inner| inner.parse::<std::net::IpAddr>().ok())
-    };
-    address.map(ClientIp::new)
 }
 
 /// Hard ceiling on the auth-rate bucket map. The age-based retain below only

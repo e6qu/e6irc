@@ -14,7 +14,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use e6irc_proto::framing::{LineBuffer, LineEvent};
@@ -149,33 +148,47 @@ impl Drop for ConnectionTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId(pub u64);
 
-/// One process-wide source of live connection identifiers.
+/// One process-wide source of live connection identifiers: a session's wire
+/// identity.
 ///
-/// Production seeds this counter from the operating system's cryptographically
-/// secure random number generator on every boot. All ingress paths share the
-/// allocator, so identifiers remain ordered for keyset pagination, cannot
-/// collide within a process, and do not predictably name a different
-/// connection after a restart. Exhaustion is an explicit error instead of
-/// wrapping onto an existing identifier.
+/// It promises that an identifier is unique, never reused and unpredictable,
+/// and nothing about order: the connection directory pages by the directory
+/// key the core allocates when a session opens (DESIGN §19.2), never by this.
+/// Production seeds the count from the operating system's cryptographically
+/// secure random number generator on every boot (in edge mode, within the
+/// edge's slot, at every link), so an identifier does not predictably name a
+/// different connection after a restart; all ingress paths share one
+/// allocator, so identifiers cannot collide within a process. Exhaustion of
+/// the range is an explicit error instead of wrapping onto an existing
+/// identifier.
 #[derive(Debug)]
 pub struct ConnectionIdAllocator {
-    next: AtomicU64,
+    range: std::sync::Mutex<(u64, u64)>,
 }
 
 impl ConnectionIdAllocator {
+    /// Allocate from `first` up to the top of the identifier space.
     pub fn new(first: NonZeroU64) -> Self {
         Self {
-            next: AtomicU64::new(first.get()),
+            range: std::sync::Mutex::new((first.get(), u64::MAX)),
         }
     }
 
+    /// Start again at `first`, allocating below `end`: an edge's count in the
+    /// slot a core just gave it.
+    pub fn restart_at(&self, (first, end): (NonZeroU64, u64)) {
+        *self.range.lock().expect("identifier range lock") = (first.get(), end);
+    }
+
     pub fn allocate(&self) -> Result<ConnId, ConnectionIdExhausted> {
-        self.next
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map(ConnId)
-            .map_err(|_| ConnectionIdExhausted)
+        let mut range = self.range.lock().expect("identifier range lock");
+        let (next, end) = *range;
+        let after = next
+            .checked_add(1)
+            .filter(|after| *after <= end)
+            .ok_or(ConnectionIdExhausted)?;
+        range.0 = after;
+        Ok(ConnId(next))
     }
 }
 
@@ -232,6 +245,8 @@ pub enum TransportError {
     TlsHandshake,
     Read,
     Write,
+    /// An HTTP connection failed mid-request.
+    Http,
 }
 
 /// Where the transport counts what happens to its connections: e6ircd's
@@ -295,7 +310,7 @@ pub enum SessionClosed {
     WriterPanicked,
     /// A session that is its own edge — the bouncer's in-process `local`
     /// session — ended itself, for the reason given.
-    Stopped(&'static str),
+    Stopped(std::borrow::Cow<'static, str>),
 }
 
 impl std::fmt::Display for SessionClosed {
@@ -400,29 +415,33 @@ pub struct AcceptContext<C> {
     pub limiter: ConnLimiter,
     pub telemetry: Arc<dyn TransportTelemetry>,
     pub connections: ConnectionTasks,
+    /// Every connection starts with a PROXY protocol header naming its
+    /// client, believed from these proxies only ([`crate::proxy_protocol`]).
+    pub proxy_protocol: Option<crate::address::TrustedProxies>,
 }
 
 fn spawn_accepted<C: CorePort>(
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
     context: &AcceptContext<C>,
 ) {
     let refusals = context.limiter.refusals().clone();
-    let client = ClientIp::new(peer.ip());
-    let Some(guard) = context.limiter.try_acquire(client) else {
-        refusals.note(client, PeerRefusal::PerIpLimit, None);
-        context.telemetry.record_connection_rejected();
-        return;
-    };
-    let conn = match context.next_conn.allocate() {
-        Ok(conn) => conn,
-        Err(error) => {
-            refusals.note(client, PeerRefusal::ConnectionIdExhausted, Some(&error));
-            context
-                .telemetry
-                .record_error(TransportError::ConnectionSetup);
-            return;
-        }
+    let limiter = context.limiter.clone();
+    let next_conn = context.next_conn.clone();
+    let proxy_protocol = context.proxy_protocol.clone();
+    // Without the PROXY protocol the client is known at accept, and one over
+    // its limit costs no task.
+    let admitted = match proxy_protocol {
+        Some(_) => None,
+        None => match admit(
+            &limiter,
+            &next_conn,
+            ClientIp::new(peer.ip()),
+            &*context.telemetry,
+        ) {
+            Some(admitted) => Some(admitted),
+            None => return,
+        },
     };
     let core_tx = context.core_tx.clone();
     let tls = context.tls.clone();
@@ -430,6 +449,38 @@ fn spawn_accepted<C: CorePort>(
     let sendq_bytes = context.sendq_bytes;
     let task = context.connections.task();
     tokio::spawn(async move {
+        let (peer, (guard, conn)) =
+            match (admitted, proxy_protocol) {
+                (Some(admitted), _) => (peer, admitted),
+                (None, Some(trusted)) => {
+                    let client =
+                        match crate::proxy_protocol::relayed_client(&mut stream, peer, &trusted)
+                            .await
+                        {
+                            Ok(client) => client,
+                            Err(error) => {
+                                telemetry.record_error(TransportError::ConnectionSetup);
+                                refusals.note(
+                                    ClientIp::new(peer.ip()),
+                                    PeerRefusal::ProxyHeader,
+                                    Some(&error),
+                                );
+                                return;
+                            }
+                        };
+                    match admit(
+                        &limiter,
+                        &next_conn,
+                        ClientIp::new(client.ip()),
+                        &*telemetry,
+                    ) {
+                        Some(admitted) => (client, admitted),
+                        None => return,
+                    }
+                }
+                (None, None) => unreachable!("admitted at accept without the PROXY protocol"),
+            };
+        let client = ClientIp::new(peer.ip());
         let _guard = guard;
         if let Err(e) = stream.set_nodelay(true) {
             refusals.note(client, PeerRefusal::SocketSetup, Some(&e));
@@ -474,6 +525,30 @@ fn spawn_accepted<C: CorePort>(
             }
         }
     });
+}
+
+/// A connection from `client` admitted: its per-address slot and its
+/// identifier, or `None`, refused and noted.
+fn admit(
+    limiter: &ConnLimiter,
+    next_conn: &ConnectionIdAllocator,
+    client: ClientIp,
+    telemetry: &dyn TransportTelemetry,
+) -> Option<(crate::address::ConnGuard, ConnId)> {
+    let refusals = limiter.refusals();
+    let Some(guard) = limiter.try_acquire(client) else {
+        refusals.note(client, PeerRefusal::PerIpLimit, None);
+        telemetry.record_connection_rejected();
+        return None;
+    };
+    match next_conn.allocate() {
+        Ok(conn) => Some((guard, conn)),
+        Err(error) => {
+            refusals.note(client, PeerRefusal::ConnectionIdExhausted, Some(&error));
+            telemetry.record_error(TransportError::ConnectionSetup);
+            None
+        }
+    }
 }
 
 /// The bounds on what a connection is sent: its SendQ capacity in bytes, how
@@ -731,6 +806,7 @@ where
 mod tests {
     use super::*;
     use std::pin::Pin;
+    use std::sync::atomic::Ordering;
 
     /// Counts nothing: what these tests check is how a writer ends.
     struct Uncounted;
