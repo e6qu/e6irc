@@ -23,8 +23,8 @@
 //! Any panic is the finding: one worker serves every client, so a panic
 //! reached through any connection takes down all of them.
 
-use e6irc_queue::{Config, Policy, Receiver, queue};
-use e6ircd::core::{ConnId, ConnectionTransport, Core, CoreConfig, HistoryRow, Input, Output};
+use e6irc_queue::{Config, Policy, queue};
+use e6ircd::core::{ConnId, ConnectionTransport, Core, CoreConfig, EdgeSession, HistoryRow, Input};
 use libfuzzer_sys::fuzz_target;
 
 /// Advances on every read, so events get distinct timestamps and the
@@ -70,7 +70,7 @@ fuzz_target!(|data: &[u8]| {
         db_tx,
     );
 
-    let mut rxs: Vec<Receiver<Output>> = Vec::new();
+    let mut rxs: Vec<EdgeSession> = Vec::new();
     for id in 0..CONNS {
         let (tx, rx) = e6ircd::core::send_queue("fuzz-sendq", 256 * 512);
         rxs.push(rx);

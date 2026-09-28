@@ -19,6 +19,10 @@
 //!   number; [`queue`] weighs every event 1. Depth, capacity, the watermarks
 //!   and every admission decision are in that one unit, so a queue cannot be
 //!   bounded in one unit and reported or paced in another.
+//! - **Progress reported elsewhere**: [`Progress`] carries what a consumer has
+//!   done with what it took (a send queue's bytes written, DESIGN §19.2) back
+//!   to a producer that keeps its own account of the bound, with a wake that
+//!   cannot be lost.
 
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
@@ -239,8 +243,10 @@ struct PushWaiter {
 
 /// The one admission rule: an event of `weight` fits a queue holding `load`
 /// when the total stays within `capacity`, or when the queue is empty (see
-/// [`weighted_queue`]).
-fn fits(load: usize, weight: usize, capacity: usize) -> bool {
+/// [`weighted_queue`]). Public so that an account kept of a queue elsewhere —
+/// the core's mirror of a send queue the edge holds (DESIGN §19.1) — admits by
+/// this rule and no copy of it.
+pub fn fits(load: usize, weight: usize, capacity: usize) -> bool {
     load == 0 || load.saturating_add(weight) <= capacity
 }
 
@@ -775,6 +781,54 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
+/// A count of progress one side makes and another reads — the bytes a
+/// consumer has written of what a producer sent it (DESIGN §19.2, `Drained`) —
+/// with a wake that cannot be lost.
+///
+/// The count only grows. The reader asks to be woken by the next advance with
+/// [`Progress::arm`]. The count and the arming share one atomic word (the
+/// arming its lowest bit), so every arm and every advance falls in one order:
+/// an arm before an advance is seen by that advance, which answers it with a
+/// wake, and an arm after it reads a count that includes it. A reader that
+/// arms, finds no progress it can use, and waits therefore never sleeps past
+/// an advance. Two separate atomics cannot promise this — loom finds the
+/// interleaving where each side misses the other — so there is one.
+#[derive(Debug)]
+pub struct Progress {
+    /// The count shifted up one bit, and the arming in bit 0.
+    word: AtomicU64,
+}
+
+const ARMED: u64 = 1;
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            word: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Progress {
+    /// Add `amount` to the count. `true` when the reader armed since it was
+    /// last told to wake, and must be woken now; each arming is answered once.
+    pub fn advance(&self, amount: u64) -> bool {
+        let before = self.word.fetch_add(amount << 1, Ordering::SeqCst);
+        before & ARMED != 0 && self.word.fetch_and(!ARMED, Ordering::SeqCst) & ARMED != 0
+    }
+
+    /// Ask to be woken by the next advance, and read the count: an advance
+    /// this reading does not include answers the arming.
+    pub fn arm(&self) -> u64 {
+        self.word.fetch_or(ARMED, Ordering::SeqCst) >> 1
+    }
+
+    /// The count, without asking to be woken.
+    pub fn get(&self) -> u64 {
+        self.word.load(Ordering::SeqCst) >> 1
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
@@ -791,6 +845,16 @@ mod tests {
             0,
             "a queue bound must not become an eager per-queue allocation"
         );
+    }
+
+    #[test]
+    fn progress_answers_each_arming_once_and_only_after_it() {
+        let progress = Progress::default();
+        assert!(!progress.advance(3), "nobody asked to be woken");
+        assert_eq!(progress.arm(), 3);
+        assert!(progress.advance(4), "the arming is answered");
+        assert!(!progress.advance(5), "and only once");
+        assert_eq!(progress.get(), 12);
     }
     use std::future::Future;
     use std::pin::pin;
@@ -1571,6 +1635,69 @@ mod loom_tests {
             assert_eq!(loom::future::block_on(rx.pop()), None);
             t1.join().unwrap();
             t2.join().unwrap();
+        });
+    }
+
+    /// [`Progress`]'s handshake: an advance racing an arm is either seen by
+    /// the arming read or answers the arming with a wake, in every
+    /// interleaving — so a reader that arms, reads too little and sleeps is
+    /// always woken by the advance it missed.
+    #[test]
+    fn progress_loses_no_wake_under_all_interleavings() {
+        loom::model(|| {
+            let progress = Arc::new(Progress::default());
+            let advancer = progress.clone();
+            let writer = loom::thread::spawn(move || advancer.advance(5));
+            let seen = progress.arm();
+            let woke = writer.join().unwrap();
+            assert!(seen == 5 || woke, "an advance neither seen nor woken");
+            assert_eq!(progress.get(), 5);
+        });
+    }
+
+    /// The remote send queue's protocol (DESIGN §19.2), whole: a producer
+    /// admits by its own account — what it sent less the progress the
+    /// consumer reported written — by the one [`fits`] rule, and pushes into
+    /// the consumer's queue bounded at the same capacity; the consumer pops,
+    /// then reports. The consumer's bound never refuses what the producer's
+    /// account admitted, whatever the interleaving, because what the
+    /// consumer still holds never exceeds what the producer counts in flight.
+    #[test]
+    fn a_reported_bound_never_admits_what_the_consumers_queue_refuses() {
+        const CAPACITY: usize = 4;
+        bounded_model(|| {
+            let (tx, mut rx) = weighted_queue::<usize>(
+                Config {
+                    name: "loom-reported-bound",
+                    capacity: CAPACITY,
+                    policy: Policy::Fifo,
+                },
+                |weight| *weight,
+            );
+            let written = Arc::new(Progress::default());
+            let reported = written.clone();
+            let consumer = loom::thread::spawn(move || {
+                let mut consumed = 0;
+                while let Some(envelope) = loom::future::block_on(rx.pop()) {
+                    consumed += envelope.payload;
+                    reported.advance(envelope.payload as u64);
+                }
+                consumed
+            });
+            let mut sent = 0u64;
+            let mut admitted = 0;
+            for weight in [3, 2, 3] {
+                let in_flight = usize::try_from(sent - written.get()).unwrap();
+                if !fits(in_flight, weight, CAPACITY) {
+                    continue;
+                }
+                tx.try_push(weight)
+                    .expect("the consumer's bound admits what the account admitted");
+                sent += weight as u64;
+                admitted += weight;
+            }
+            drop(tx);
+            assert_eq!(consumer.join().unwrap(), admitted);
         });
     }
 

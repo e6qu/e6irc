@@ -418,7 +418,7 @@ pub async fn verify_attached_client(
     let (client, server) = tokio::io::duplex(64 * 1024);
     let attached = tokio::spawn(async move {
         let end = super::attach(
-            server,
+            super::attach_link::over_stream(server).await,
             super::ClientInput::default(),
             &handle,
             super::AttachCaps {

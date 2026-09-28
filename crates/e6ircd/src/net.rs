@@ -23,7 +23,7 @@ use crate::serving_lease::{self, AcquireRefusal, HolderId, ServingLease};
 use e6irc_edge::address::{ClientIp, ConnGuard, ConnLimiter, PeerRefusal, PeerRefusalLog};
 use e6irc_edge::certificate::{CertificateReloads, Hangups, install_crypto_provider};
 use e6irc_edge::connection::{
-    AcceptContext, CLOSING_DRAIN, ConnectionTasks, accept_loop, bind_listener, tls_handshake,
+    AcceptContext, CLOSING_DRAIN, ConnectionTasks, accept_loop, bind_listener,
 };
 use e6irc_queue::{Policy, Receiver, queue};
 
@@ -415,34 +415,18 @@ struct BncListenerState {
 /// accepting clients.
 pub struct BncListenerController {
     state: tokio::sync::Mutex<Option<BncListenerState>>,
-    registry: Arc<crate::bouncer::Registry>,
-    pool: sqlx::PgPool,
-    server_name: String,
-    limiter: ConnLimiter,
+    attach: BncAttachContext,
     telemetry: Arc<Telemetry>,
     certificates: CertificateReloads,
-    connections: ConnectionTasks,
 }
 
 impl BncListenerController {
-    fn new(
-        registry: Arc<crate::bouncer::Registry>,
-        pool: sqlx::PgPool,
-        server_name: String,
-        limiter: ConnLimiter,
-        telemetry: Arc<Telemetry>,
-        certificates: CertificateReloads,
-        connections: ConnectionTasks,
-    ) -> Self {
+    fn new(attach: BncAttachContext, certificates: CertificateReloads) -> Self {
         Self {
             state: tokio::sync::Mutex::new(None),
-            registry,
-            pool,
-            server_name,
-            limiter,
-            telemetry,
+            telemetry: attach.telemetry.clone(),
+            attach,
             certificates,
-            connections,
         }
     }
 
@@ -471,18 +455,7 @@ impl BncListenerController {
         let bound = listener.local_addr().inspect_err(|_error| {
             self.telemetry.record_error(ErrorKind::ConnectionSetup);
         })?;
-        let task = spawn_bnc_listener(
-            listener,
-            acceptor,
-            BncAttachContext {
-                registry: self.registry.clone(),
-                pool: self.pool.clone(),
-                server_name: self.server_name.clone(),
-                limiter: self.limiter.clone(),
-                telemetry: self.telemetry.clone(),
-                connections: self.connections.clone(),
-            },
-        );
+        let task = spawn_bnc_listener(listener, acceptor, self.attach.clone());
         let replacement = BncListenerState {
             requested: requested.clone(),
             bound,
@@ -506,6 +479,7 @@ impl BncListenerController {
 }
 
 /// What every attach connection is served with.
+#[derive(Clone)]
 struct BncAttachContext {
     registry: Arc<crate::bouncer::Registry>,
     pool: sqlx::PgPool,
@@ -513,8 +487,16 @@ struct BncAttachContext {
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
     connections: ConnectionTasks,
+    /// Attach sessions draw identifiers from the one allocator every session
+    /// does, so a session's identifier names one session of any kind.
+    next_conn: Arc<ConnectionIdAllocator>,
+    sendq_bytes: usize,
 }
 
+/// Accept attaching clients on `listener` as the edge accepts every client
+/// (`e6irc_edge::connection::accept_loop`), each served as a session of the
+/// core link whose other end is the attach logic (`bouncer::bnc_serve`,
+/// through an `AttachPort`).
 fn spawn_bnc_listener(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
@@ -527,84 +509,36 @@ fn spawn_bnc_listener(
         limiter,
         telemetry,
         connections,
+        next_conn,
+        sendq_bytes,
     } = context;
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    let client = ClientIp::new(peer.ip());
-                    let Some(guard) = limiter.try_acquire(client) else {
-                        telemetry.record_connection_rejected();
-                        limiter
-                            .refusals()
-                            .note(client, PeerRefusal::PerIpLimit, None);
-                        continue;
-                    };
-                    let registry = registry.clone();
-                    let server_name = server_name.clone();
-                    let pool = pool.clone();
-                    let telemetry = telemetry.clone();
-                    let refusals = limiter.refusals().clone();
-                    let tls = tls.clone();
-                    let task = connections.task();
-                    tokio::spawn(async move {
-                        let _task = task;
-                        let _guard = guard;
-                        if let Err(e) = stream.set_nodelay(true) {
-                            telemetry.record_error(ErrorKind::ConnectionSetup);
-                            refusals.note(client, PeerRefusal::SocketSetup, Some(&e));
-                            return;
-                        }
-                        let served = match tls {
-                            // Attaching clients authenticate with their account
-                            // password; off loopback that only ever travels
-                            // inside TLS (config refuses anything else).
-                            Some(acceptor) => {
-                                let Some(stream) = tls_handshake(
-                                    &acceptor,
-                                    stream,
-                                    client,
-                                    &refusals,
-                                    &*telemetry,
-                                )
-                                .await
-                                else {
-                                    return;
-                                };
-                                crate::bouncer::bnc_serve(
-                                    stream,
-                                    registry,
-                                    &pool,
-                                    &server_name,
-                                    client,
-                                )
-                                .await
-                            }
-                            None => {
-                                crate::bouncer::bnc_serve(
-                                    stream,
-                                    registry,
-                                    &pool,
-                                    &server_name,
-                                    client,
-                                )
-                                .await
-                            }
-                        };
-                        if let Err(e) = served {
-                            telemetry.record_error(ErrorKind::Bouncer);
-                            eprintln!("bnc connection from {peer} failed: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    telemetry.record_error(ErrorKind::Accept);
-                    eprintln!("bnc accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+    let serving = telemetry.clone();
+    let port = crate::bouncer::AttachPort::new(move |link, client| {
+        let registry = registry.clone();
+        let pool = pool.clone();
+        let server_name = server_name.clone();
+        let telemetry = serving.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
+            {
+                telemetry.record_error(ErrorKind::Bouncer);
+                eprintln!("bnc connection from {client} failed: {e}");
             }
-        }
-    })
+        });
+    });
+    tokio::spawn(accept_loop(
+        listener,
+        AcceptContext {
+            tls,
+            core_tx: port,
+            next_conn,
+            sendq_bytes,
+            limiter,
+            telemetry,
+            connections,
+        },
+    ))
 }
 
 /// Unix-epoch milliseconds. Message timestamps are stamped from this, and
@@ -1292,13 +1226,17 @@ async fn serve(
     ));
     let bnc_listener = match (&pool, &bnc_registry) {
         (Some(pool), Some(registry)) => Some(Arc::new(BncListenerController::new(
-            registry.clone(),
-            pool.clone(),
-            config.server_name.clone(),
-            limiter.clone(),
-            telemetry.clone(),
+            BncAttachContext {
+                registry: registry.clone(),
+                pool: pool.clone(),
+                server_name: config.server_name.clone(),
+                limiter: limiter.clone(),
+                telemetry: telemetry.clone(),
+                connections: connections.clone(),
+                next_conn: next_conn.clone(),
+                sendq_bytes: config.sendq_bytes,
+            },
             certificates.clone(),
-            connections.clone(),
         ))),
         _ => None,
     };
@@ -1389,8 +1327,9 @@ async fn serve(
                 critical_tx.clone(),
             ));
         }
-        let (csrf_keys, csrf_warning) = crate::http::CsrfKeys::for_keyring(secret_key.as_deref());
-        if let Some(warning) = csrf_warning {
+        let (browser_keys, browser_keys_warning) =
+            crate::http::BrowserStateKeys::for_keyring(secret_key.as_deref());
+        if let Some(warning) = browser_keys_warning {
             eprintln!("{warning}");
         }
         Some(Arc::new(crate::http::AppState {
@@ -1409,8 +1348,7 @@ async fn serve(
             oidc_providers: config.oidc_providers.clone(),
             application_release_revision: config.application_release_revision.clone(),
             monitoring_token_digest,
-            oidc_flow_key: crate::secret::SecretKey::generate(),
-            spent_oidc_flows: crate::http::SpentFlows::new(),
+            oidc_flow_key: browser_keys.oidc_flow,
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),
             sendq_bytes: config.sendq_bytes,
@@ -1419,7 +1357,7 @@ async fn serve(
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
             configured_admin_accounts: configured_administrators.clone(),
-            csrf_keys,
+            csrf_keys: browser_keys.csrf,
             trusted_proxies: trusted_proxies.clone(),
             auth_rate_burst: config.limits.auth_rate_burst.burst(),
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2136,13 +2074,13 @@ mod tests {
             },
             Arc::new(Telemetry::new()),
         ));
-        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+        let Input::Open { mut tx, .. } = core_rx.pop().await.expect("Open event").payload else {
             panic!("expected Open");
         };
         // Far more than both kernel buffers hold: the writer parks mid-write.
         let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
         for _ in 0..4096 {
-            if tx.0.try_push(Output(line.clone())).is_err() {
+            if tx.0.output(Output(line.clone())).is_err() {
                 break;
             }
         }
@@ -2502,15 +2440,19 @@ mod tests {
             .expect("registry"),
         );
         let controller = BncListenerController::new(
-            registry,
-            sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
-                .expect("lazy pool"),
-            "bnc.test".into(),
-            ConnLimiter::new(None),
-            telemetry.clone(),
+            BncAttachContext {
+                registry,
+                pool: sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+                    .expect("lazy pool"),
+                server_name: "bnc.test".into(),
+                limiter: ConnLimiter::new(None),
+                telemetry: telemetry.clone(),
+                connections: ConnectionTasks::default(),
+                next_conn: Arc::new(ConnectionIdAllocator::new(std::num::NonZeroU64::MIN)),
+                sendq_bytes: 64 * 512,
+            },
             CertificateReloads::default(),
-            ConnectionTasks::default(),
         );
         let missing = std::env::temp_dir().join(format!("e6irc-missing-{}", std::process::id()));
         let requested = BncConfig {
@@ -2548,7 +2490,7 @@ mod tests {
             Outbound::with_sendq(64 * 512),
             Arc::new(Telemetry::new()),
         ));
-        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+        let Input::Open { mut tx, .. } = core_rx.pop().await.expect("Open event").payload else {
             panic!("expected Open");
         };
         let (mut client_read, mut client_write) = client.into_split();
@@ -2562,7 +2504,7 @@ mod tests {
             drop(client_write.shutdown().await);
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        tx.0.try_push(Output(bytes::Bytes::from_static(
+        tx.0.output(Output(bytes::Bytes::from_static(
             b"ERROR :Closing Link: 127.0.0.1 (Killed)\r\n",
         )))
         .expect("room");
@@ -2615,7 +2557,7 @@ mod tests {
             },
             Arc::new(Telemetry::new()),
         ));
-        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+        let Input::Open { mut tx, .. } = core_rx.pop().await.expect("Open event").payload else {
             panic!("expected Open");
         };
         tokio::spawn(trickle(client_read));
@@ -2627,7 +2569,7 @@ mod tests {
         });
         let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
         for _ in 0..100 {
-            tx.0.try_push(Output(line.clone())).expect("room");
+            tx.0.output(Output(line.clone())).expect("room");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(tx);
@@ -2728,6 +2670,82 @@ mod tests {
         );
     }
 
+    /// The credit a line waits for is room in the core's queue, granted first
+    /// come first served (DESIGN §19.2): a session streaming lines into a
+    /// full core waits in line like any other, so a quiet session's one line
+    /// is taken after at most the noisy session's line that was already
+    /// waiting — one session cannot starve the rest.
+    #[tokio::test]
+    async fn a_noisy_session_cannot_starve_a_quiet_one_of_credit() {
+        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-credit",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::single(core_tx);
+        let telemetry = Arc::new(Telemetry::new());
+        let unmetered = || {
+            e6irc_edge::meter::LineMeter::new(
+                None,
+                e6irc_edge::meter::FloodExemption::default(),
+                tokio::time::Instant::now(),
+            )
+        };
+        let (mut noisy_client, noisy_server) = tokio::io::duplex(1024 * 1024);
+        noisy_client
+            .write_all("PING :noise\r\n".repeat(1000).as_bytes())
+            .await
+            .expect("write");
+        let noisy = {
+            let (ingress, telemetry) = (ingress.clone(), telemetry.clone());
+            let meter = unmetered();
+            tokio::spawn(async move {
+                read_loop(noisy_server, ConnId(1), &ingress, meter, &*telemetry).await;
+            })
+        };
+        // The noisy session has filled the queue and waits for room.
+        while core_rx.depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (mut quiet_client, quiet_server) = tokio::io::duplex(1024);
+        quiet_client
+            .write_all(b"PING :quiet\r\n")
+            .await
+            .expect("write");
+        let quiet = {
+            let (ingress, telemetry) = (ingress.clone(), telemetry.clone());
+            let meter = unmetered();
+            tokio::spawn(async move {
+                read_loop(quiet_server, ConnId(2), &ingress, meter, &*telemetry).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut before_quiet = 0;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), core_rx.pop())
+                .await
+                .expect("an event")
+                .expect("ingress open");
+            match event.payload {
+                Input::Line {
+                    conn: ConnId(2), ..
+                } => break,
+                Input::Line {
+                    conn: ConnId(1), ..
+                } => before_quiet += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            before_quiet <= 2,
+            "{before_quiet} noisy lines were admitted ahead of the quiet one"
+        );
+        noisy.abort();
+        quiet.abort();
+        drop((noisy_client, quiet_client));
+    }
+
     /// A client streaming lines — PONGs, before it has even registered — gets
     /// no more of them into the core's queue than its command allowance: past
     /// its bucket its reader stops reading the socket until a token is back,
@@ -2747,7 +2765,12 @@ mod tests {
             .await
             .expect("write");
         let telemetry = Telemetry::new();
-        let reader = read_loop(server, ConnId(1), &ingress, &telemetry);
+        let meter = e6irc_edge::meter::LineMeter::new(
+            e6irc_edge::connection::CorePort::command_flood(&ingress),
+            e6irc_edge::meter::FloodExemption::default(),
+            tokio::time::Instant::now(),
+        );
+        let reader = read_loop(server, ConnId(1), &ingress, meter, &telemetry);
         tokio::pin!(reader);
         let queued = |rx: &mut Receiver<Input>| {
             std::iter::from_fn(|| rx.try_pop())

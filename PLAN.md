@@ -112,8 +112,11 @@ connected, joins and sends nothing, and takes the configured nickname back —
 NickServ `REGAIN` with SASL, and `MONITOR` or `ISON` otherwise. A definite
 services refusal parks it at once; a holder that outlasts five minutes, or an
 alternative that is taken too, is the `nickname_in_use` refusal on its
-schedule. The CSRF token's key is derived from the master secret key, so open
-pages keep posting across a restart and a standby's takeover.
+schedule. The CSRF token's key and the OpenID Connect flow cookie's key are
+derived from the master secret key, so open pages keep posting and sign-ins in
+progress complete across a restart and a standby's takeover; a flow is still
+answered once, because its code exchange first records it as spent in
+PostgreSQL (migration 0099), which every process shares.
 
 The chat client's network dialog does not gate saving on a connection test:
 **Test connection** is an optional diagnostic that says `QUIT` when it is done.
@@ -1531,8 +1534,8 @@ configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
 fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
-Status: phases 0 and 1 done; phase 2 is the next to build; every other phase
-is scheduled in the order below.
+Status: phases 0, 1 and 2 done; phase 3 is the next to build; every other
+phase is scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
   tier's invariants), §19 (the design and its settled decisions), a §18
@@ -1553,13 +1556,37 @@ is scheduled in the order below.
   `tools/check-edge-isolation.sh`: no sqlx or other PostgreSQL client, no
   `e6ircd` and no `reqwest` in any dependency kind, feature or target, with
   its contract test run against a scratch workspace.
-- **Phase 2 — in-process link.** The core reaches connections only through
-  link frames: the remote send queue with `Drained` accounting, credits,
-  `Kill` and `End`, pacing woken by `Drained`; bouncer attach and `/ws/ui`
-  become link session kinds; the flood meter moves to the edge. DESIGN §7.2.
-  *Green because* every existing test, irctest included, runs through the
-  in-process edge with "SendQ exceeded", pacing and the closing drain
-  unchanged.
+- **Phase 2 — in-process link (done).** The core reaches connections only
+  through link frames: the remote send queue with `Drained` accounting,
+  credits, `Kill` and `End`, pacing woken by `Drained`; bouncer attach and
+  `/ws/ui` become link session kinds; the flood meter moves to the edge.
+  DESIGN §7.2. *Green because* every existing test, irctest included, runs
+  through the in-process edge with "SendQ exceeded", pacing and the closing
+  drain unchanged.
+  As built (DESIGN §19.1, "Phase 2 as built"): `e6irc_edge::link` gives each
+  session's link two ends — the core's `SessionLink`, the remote send queue
+  counting every byte until the edge reports it written, and the edge's
+  `EdgeSession`, the bounded buffer its writer drains — and every session that
+  reaches a core shard (TCP, TLS, `/ws/irc`, the `local` driver's) opens and
+  speaks through them and `CorePort`; `Drained` travels through the
+  loom-verified `e6irc_queue::Progress`, wakes a paced reply's turn, and
+  replaces the 20 ms pacing reminder; a credit in process is room in the
+  shard's queue, granted first come first served; the meter
+  (`e6irc_edge::meter`) is the edge's, with each session's exemption set on
+  its link; the `/ws/irc` connection loop is the edge's. The one visible
+  change is the one DESIGN §2 prescribes: a client that stops reading is cut
+  at `sendq_bytes` unwritten, not up to twice that. Bouncer attach and
+  `/ws/ui` are link session kinds (`Attach`, `Ui`) whose output keeps exactly
+  the backpressure their sockets gave — the core's end waits for room and
+  for what it wrote to be on the socket, bounded by the 30 s write deadline,
+  and never kills for "SendQ exceeded" — settled by the maintainer. The
+  attach listener accepts and serves through the edge's own loops over an
+  `AttachPort`, each session's lines on a per-session inbound queue that is
+  their credit; `/ws/ui`'s connection loop and its Ping liveness are the
+  edge's, with DESIGN §19.2 defining its frames: a text message as `Output`,
+  the client's messages as `Message`, and a close frame on `End`. The
+  `/ws/irc` and `/ws/ui` upgrade handlers stay in e6ircd until upgrade
+  authorization (phase 3).
 - **Phase 3 — process boundary.** The `e6irc-link` codec and its
   `link_frames` fuzz target; `e6ircd edge`; the mutual-TLS link and
   `e6ircd edge-credentials`; the epoch fence; `/readyz`-based discovery; HTTP

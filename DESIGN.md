@@ -547,7 +547,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - *Monotonic watermarks are seeded, never a zero sentinel* — a session's
     `idle_since`/`last_received`/`last_ping_sent` are all initialized from the
     open-time `MonoMillis`, never `MonoMillis(0)`, and a connection's command
-    token bucket (`TokenBucket` in `core/line_meter.rs`) starts full with its
+    token bucket (`TokenBucket` in `e6irc_edge::meter`) starts full with its
     refill mark at the `Instant` it was made. Because the mono
     clock's epoch is process start, a zero is indistinguishable from a real early
     reading, so a `now − 0 = uptime` computation misbehaves in the first moments
@@ -771,12 +771,16 @@ e6irc/
 │   ├── e6irc-proto/          # IRC message model, parser, tag escaping, casemapping,
 │   │                         #   numerics, ISUPPORT, framing, SASL limits/PLAIN (no I/O)
 │   ├── e6irc-queue/          # custom bounded queue: the core↔DB and SendQ
-│   │                         #   communication primitive (§7.3); loom-verified,
+│   │                         #   communication primitive (§7.3), and the
+│   │                         #   progress count a send queue's writes are
+│   │                         #   reported back by; loom-verified,
 │   │                         #   step-schedulable for deterministic tests
 │   ├── e6irc-edge/           # the connection-holding edge (§19): accept, TLS
 │   │                         #   and certificate reload, client addresses,
-│   │                         #   line and WebSocket framing, every write to a
-│   │                         #   client; no database dependency (§2)
+│   │                         #   line and WebSocket framing, the command-flood
+│   │                         #   meter, every write to a client, and each
+│   │                         #   session's end of the in-process core link;
+│   │                         #   no database dependency (§2)
 │   ├── e6ircd/               # the monolithic server binary
 │   ├── e6irc-client/         # client library: connection, TLS, SASL (SCRAM-
 │   │                         #   SHA-512/256, PLAIN, OAUTHBEARER), chathistory helpers
@@ -1036,14 +1040,25 @@ strip = "symbols"
 - Where it lives: everything that holds a client connection — listening,
   the batched accept, TLS termination and certificate reload, the client's
   canonical address and per-address slot, the read and write loops, the
-  closing drain and lingering close, WebSocket framing — is the `e6irc-edge`
-  crate (§19.1); what a line means is the core's. A connection reaches the
-  core only through `CorePort` (open, framed lines, end), which e6ircd
-  implements over the core's ingress (`core::CoreIngress`).
+  command-flood meter, the send-queue buffer, the closing drain and lingering
+  close, WebSocket framing and the `/ws/irc` and `/ws/ui` connection loops,
+  and the attach listener's accept and serve loops — is the `e6irc-edge`
+  crate (§19.1); what a line means is the core's. A session reaches the core
+  only through the core link's frames: `CorePort` carries what goes edge to
+  core (open, framed lines, end), which e6ircd implements over the core's
+  ingress (`core::CoreIngress`) and, for bouncer attaches, over the attach
+  logic (`bouncer::AttachPort`), and each session's link (`e6irc_edge::link`)
+  carries its output, its end and its flood exemption to the edge and the
+  edge's reports of what it wrote back. The bouncer's in-process `local`
+  session opens through the same port and link as a socket does.
 - Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
-  through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
-  the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
+  through a **bounded** per-connection queue of `Bytes` (SendQ): the buffer at
+  the edge, the bound in the core, which counts a line from the moment it is
+  sent until the edge reports it written to the client socket (`Drained`), so
+  a line the writer has taken but the socket has not is still counted (§2).
+  Past the bound → the classic ircd answer: kill the slow client with a
+  "SendQ exceeded" quit.
   No unbounded buffering, no silent drops. As in Solanum, the killed client's
   backlog is discarded: its closing `ERROR :Closing Link: <host> (SendQ
   exceeded)` is the one line it is still sent, where draining a full SendQ to
@@ -1057,14 +1072,21 @@ strip = "symbols"
   bytes, a few dozen maximum-size lines are what overrun it. Output held
   behind a deferred reply (§11) is counted in the same bytes against the same
   bound. The queue is made only by `core::send_queue`, which weighs each line
-  by its length (`e6irc_queue::weighted_queue`), so no connection can be given
-  a queue measured in anything else.
+  by its length (`e6irc_edge::link::weight`, the one weight the core's count
+  and the edge's buffer share, admitted by `e6irc_queue::fits`), so no
+  connection can be given a queue measured in anything else. Before the bound
+  moved to the socket, a writer took the whole queue out in one batch before
+  writing it, and a client that stopped reading could hold that batch and a
+  second full queue behind it: twice `sendq_bytes` before the kill.
 - The replies a client cannot bound — `LIST` of every channel, and a `WHO *`
   or a `WHO` of a large channel — are paced instead (`SAFELIST`): their rows
   go out only while the client's SendQ is under half full — in bytes, the
   line that crosses the half being the last of a turn — and the rest follow
-  as the client reads — on the next event its shard handles, or on the
-  worker's own `PaceReplies` reminder every 20 ms while it is otherwise idle.
+  as the client reads — on the next event its shard handles, or, while the
+  worker is otherwise idle, on its own `PaceReplies` reminder, which the
+  edge's report that the client's socket took more (`Drained`) wakes. Asking
+  for a turn's room arms the wake (`e6irc_queue::Progress`), so a report that
+  lands between the reading and the wait still wakes the worker.
   Other traffic keeps flowing beside the rows, and a labeled one stays one
   labeled batch across its turns. A second `LIST` aborts the first (`/LIST
   aborted`), so a connection paces at most one. A bare `NAMES` — every
@@ -1117,16 +1139,18 @@ strip = "symbols"
   write deadline above counts only a stall, so without this total a client
   reading a byte at a time held a killed session's socket, task and per-IP
   slot for about an hour. The core ending a session stops its reader at once
-  (the transport learns it from the send queue's senders going, not from the
-  queue running dry), so nothing more the client sends is pushed for, or
-  metered against, a session the core has forgotten. Once everything is
+  (the transport learns it from the session's link ending — `End`, or `Kill`,
+  which discards the backlog and sends the closing line — not from the queue
+  running dry), so nothing more the client sends is pushed for, or metered
+  against, a session the core has forgotten. Once everything is
   written, the socket closes lingering (`lingering_close`, as an HTTP refusal
   does, §12): its write half is shut, and what the client is still sending is
   read and discarded for at most 2 s or 8 MiB, since closing on unread input
   sends a reset that can destroy the closing `ERROR` in the client's stack. The
   same holds for `/ws/irc` (§13.4).
-- RecvQ/flood control: every line a connection sends is metered where it
-  enters the core (`core/line_meter.rs`), by a token bucket per connection with
+- RecvQ/flood control: every line a connection sends is metered at the edge
+  as it is handed to the core (`e6irc_edge::meter`), where its reader is, by a
+  token bucket per connection with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
   20` per second). Every line spends one — PING and PONG, and lines sent before
   registration, included — whether it arrives over TCP, `/ws/irc`, or from the
@@ -1138,8 +1162,11 @@ strip = "symbols"
   it registers, can no longer monopolise its shard. A WebSocket or bouncer
   session past its allowance keeps receiving what the core sends it; only its
   input waits. IRC operators are exempt (Solanum's `no_oper_flood`): the shard
-  owning the session publishes its operator status after each of its lines,
-  and the reader consults it only when its bucket is empty. The allowance
+  owning the session sets its exemption on the session's link after each of
+  its lines that changes its operator status, and the reader consults it only
+  when its bucket is empty — one flag per session, where a set of every
+  exempt connection behind one process-wide lock was consulted before. The
+  allowance
   covers a registration with capability negotiation and SASL, a full
   `draft/multiline` batch (32 lines plus its `BATCH` pair) and a paste within
   the burst without any pause; a longer paste or autojoin is paced at 20 lines
@@ -1147,7 +1174,10 @@ strip = "symbols"
   to live in the core and apply only to registered sessions' non-keepalive
   commands, after each line was already queued, so it bounded nothing a
   connection could put in the queue ahead of it; before that it was off by
-  default with a fixed one-token-per-second refill. Two
+  default with a fixed one-token-per-second refill. A client streaming into a
+  full core waits for room in the core's queue — the credit its line needs —
+  in line with every other session, first come first served, so one cannot
+  starve the rest. Two
   per-address bounds are off unless configured: `limits.max_connections_per_ip`
   caps simultaneous connections from one address (the excess is refused at
   accept), and `limits.registration_burst` throttles account creation
@@ -2122,8 +2152,8 @@ secrets are not selected at all.
 A supervised five-minute storage-maintenance worker applies the live
 UI-managed `[storage]` policy independently of monitoring. Each collection —
 expired message-history rows, audit events, browser sessions, personal access
-tokens, device grants, consumed OpenID Connect logout tokens, and
-expired/revoked/consumed account invitations — is its own statement and
+tokens, device grants, consumed OpenID Connect logout tokens, spent OpenID
+Connect sign-in flows, and expired/revoked/consumed account invitations — is its own statement and
 transaction, deleting at most 10,000 rows named by primary key
 (`= ANY(ARRAY(… ORDER BY … LIMIT))`). A failing collection is reported by table
 after the others commit, so one refused delete cannot roll back another.
@@ -2347,23 +2377,30 @@ provider-verified email claim.
 - An in-flight OIDC authorization is held by the browser, not the server:
   `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
   verifier, nonce, ten-minute expiry, link target, and silent flag into the
-  `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under a
-  per-startup key and a flow-specific associated-data context. The key is not
-  derived from the master key, as the CSRF key is: the record of spent flows
-  below is held in memory, and a flow that survived a restart would outlive
-  that record. The callback admits only the
+  `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under keys
+  derived from the master secret key (HKDF-SHA256, an info string of its
+  own, previous keys still opening during a rotation, like the CSRF key) and
+  a flow-specific associated-data context, so a sign-in begun before a
+  restart or a standby's takeover (§18) completes after it. A deployment with
+  no master key seals under a key of the process's own, and startup says
+  once, with the CSRF key, that open forms and sign-ins in progress do not
+  survive a restart. The callback admits only the
   sealed flow whose `state` equals the returned one (constant-time), for that
   provider, before its expiry. An anonymous flood of starts therefore holds no
   server capacity a real login needs — the earlier bounded in-memory table
   refused every login with a 503 once 4096 anonymous starts filled it.
-  Replay is bounded twice: the authorization code is single-use at the
-  provider and bound to the flow's PKCE verifier, and every callback that
-  proves the binding clears the cookie *and* records the flow's `state` as
-  spent until the flow would have expired, so a kept copy of the cookie is
-  refused rather than making this server call the token endpoint with its
-  client secret again. The record is bounded (65,536 flows; past that, the one
-  closest to its own expiry is forgotten first), so no volume of logins can
-  fill it or refuse a real one, and a restart ends every flow. The callback
+  A flow is answered once: the authorization code is single-use at the
+  provider and bound to the flow's PKCE verifier, every callback that proves
+  the binding clears the cookie, and before the token endpoint is called the
+  code exchange records the flow as spent in PostgreSQL (`oidc_spent_flows`,
+  the SHA-256 of its `state` until the flow would have expired, one
+  `INSERT … ON CONFLICT DO NOTHING` that refuses when it inserted nothing).
+  Every process shares that record, so a kept copy of the cookie is refused
+  by this process, a restarted one, or a standby, rather than making any of
+  them call the token endpoint with the client secret again; storage
+  maintenance deletes the expired rows (§8). The record used to be in
+  memory, which a restart emptied — acceptable only while a restart also
+  ended every flow. The callback
   spends the per-address authentication budget like the start. A refused
   callback leaves the cookie alone, so an attacker who learns a victim's
   `state` cannot burn the victim's login.
@@ -2593,7 +2630,8 @@ An account may hold 32 live chat sockets (`/ws/ui`, one per browser tab). The
 browser can read a close frame but not a refused upgrade — which the chat
 client shows once and does not retry by itself. A silent peer is sent a
 WebSocket Ping after `ATTACH_LIVENESS_INTERVAL` (120 s) and detached after a
-second silent interval, the same rule as an attached IRC client (§10.1).
+second silent interval, the same rule as an attached IRC client (§10.1); the
+edge that holds the socket keeps it (§19.1).
 A chat socket also ends with the credential that opened it. The browser
 session or personal access token is authorized once, at the upgrade, but the
 socket lives for hours, so it holds a lease on that credential and is closed
@@ -3466,7 +3504,7 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   an attached client's, a reply-correlation `PING`, a rejoin, a `PONG`, a
   keepalive, a `CAP REQ` — is paced, as ZNC and soju pace theirs, by a token
   bucket of the local driver's line-meter shape
-  (`core::line_meter::TokenBucket`) sized to the flood allowance of Solanum
+  (`e6irc_edge::meter::TokenBucket`) sized to the flood allowance of Solanum
   and its ircd-ratbox ancestors: `UPSTREAM_LINE_BURST` = 5 lines at once
   (`client_flood_burst_max`), then `UPSTREAM_LINES_PER_SECOND` = 2 a second
   (the `client_flood_message_num` Solanum drains a registered client's queue
@@ -5696,9 +5734,10 @@ same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
 Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
-(the `e6irc-edge` crate, "Phase 1 as built" below) has landed, and phase 2 is
-next. Until a phase lands, the rest of this document describes the running
-system; §19.9 lists the sections each phase rewrites.
+(the `e6irc-edge` crate) and phase 2 (the in-process link) have landed —
+"Phase 1 as built" and "Phase 2 as built" below — and phase 3 is next. Until a phase lands, the rest of this
+document describes the running system; §19.9 lists the sections each phase
+rewrites.
 
 ### 19.1 The split
 
@@ -5772,12 +5811,97 @@ system; §19.9 lists the sections each phase rewrites.
   report the end — which e6ircd implements over `CoreIngress` by pushing the
   very `Input` it pushed before, and counts through `TransportTelemetry`,
   which e6ircd's telemetry implements as the error kinds of the same name.
-  Phase 2 puts the link's frames behind `CorePort` and moves the meter.
-  Still in e6ircd, each until the phase that moves it: the `/ws/irc` and
-  `/ws/ui` upgrade handlers and connection loops and the attach listener's
-  accept loop (phase 2, as link session kinds), and X-Forwarded-For
-  resolution (`http::oidc::client_ip`) with HTTP admission (phase 3, HTTP
-  proxying).
+- **Phase 2 as built.** Every session reaches the core only through the
+  link's frames, carried in memory (`e6irc_edge::link`): those of the `Irc`
+  kind — IRC over TCP, TLS and `/ws/irc`, and the bouncer's in-process
+  `local` session — which reach a core shard, and the `Attach` and `Ui`
+  kinds, which reach the bouncer:
+  - *Frames are calls.* `session` opens a session's link and gives its two
+    ends. The core's end, `SessionLink`, sends `Output` (one line, admitted by
+    the bound), `Kill` (the backlog the edge has not taken discarded, then one
+    final line past the bound) and the flood exemption, and dropping it is
+    `End`. The edge's end, `EdgeSession`, is the send-queue buffer its writer
+    takes lines from, reports `Drained` (bytes written to the client socket),
+    and sees the session over at once when the core's end goes. `Open`,
+    `Line`, `OverlongLine` and `Closed` go through `CorePort`, whose `push`
+    awaits room in the shard's queue.
+  - *The remote send queue is the core's end.* It counts every byte sent
+    until the edge reports it written, and admits by `e6irc_queue::fits`, the
+    queue's own rule, over one weight (`link::weight`). The buffer is bounded
+    at the same size by the same rule, the edge's own cap; since it never
+    holds more than the core counts in flight, it never refuses what the
+    count admitted, and a refusal (`OutputRefused::EdgeOverrun`) is that
+    invariant broken: asserted in debug builds, a counted SendQ kill in
+    release. This is the one change a client can see: a client that stops
+    reading is killed once `sendq_bytes` are unwritten, where the writer's
+    batch, taken out of the old queue whole before it was written, let it
+    hold up to twice that.
+  - *`Drained` in process* is exact and immediate: each written batch (a
+    vectored write and its flush; a `/ws/irc` frame; a line the `local`
+    session reads, being its own writer) is reported as written, through an
+    `e6irc_queue::Progress`, which keeps the count and the core's request
+    to be woken in one atomic word, so an arm and an advance are always
+    ordered and no wake is lost — loom verifies it, and found the
+    interleaving that lost one when they were two words. Coalescing reports
+    (every 64 KiB or 50 ms) is for the wire, and comes with it.
+  - *Pacing is woken by `Drained`.* A paced reply's turn arms its session's
+    wake as it reads its room, and the edge's next report wakes the shard's
+    worker (a `Notify` per shard), which then takes its `PaceReplies` turn.
+    The 20 ms reminder is gone: a turn is due exactly when the client has
+    read, or when the pages it waits on arrive, which are events.
+  - *Credits in process* are the room a line's push awaits in its shard's
+    queue, granted first come first served by the queue's line of waiting
+    producers, so a session out of room waits behind the ones before it and
+    none can starve the rest. The `Credit` frame bounds what a link buffers
+    between two processes; it is the process boundary's, as is the 30 s
+    unread-link reset.
+  - *The meter is at the edge* (`e6irc_edge::meter`: `CommandFlood`,
+    `TokenBucket`, `LineMeter`), built from the flood shape the port gives
+    (`CorePort::command_flood`). The core sets a session's exemption on its
+    link when its operator status changes; the process-wide set of exempt
+    connections behind one lock is gone.
+  - *The `/ws/irc` connection loop* is the edge's
+    (`e6irc_edge::websocket::serve_irc_socket`), as the TCP and TLS loops
+    are.
+  - *`Closed` is typed* (`SessionClosed`: the client closed, a read failed, a
+    message was too big, a write failed or stalled, the writer panicked, a
+    `local` session stopped), and its text is the quit reason the core has
+    always shown; the attach logic reads the kind, never the text.
+  - *Bouncer attach is the `Attach` kind.* The attach listener accepts
+    through the edge's own accept loop and serves each connection with
+    `serve_conn`, TLS and framing and writes included, over an `AttachPort`
+    (`bouncer::attach_link`): `Open` hands the session to the attach logic,
+    each line goes to the session's own inbound queue — 8 KiB of lines, what
+    one read of its socket framed before, whose room is the line's credit —
+    and `Closed` ends its input with the reason. The attach logic reads lines
+    (`ClientLines`) and writes a byte stream (`link::LineWriter`) as it did its
+    socket; its sessions are not metered, as they were not.
+  - *`/ws/ui` is the `Ui` kind.* The upgrade handler stays in e6ircd until
+    upgrade authorization (phase 3) and then runs the two halves together:
+    `e6irc_edge::websocket::serve_ui_socket` holds the WebSocket, and the
+    core's `ws_ui_conn` reaches it through a `UiSocket`. The socket's
+    WebSocket Ping liveness moved to the edge with it (§19.2).
+  - *Attach and `/ws/ui` keep their backpressure exactly.* Neither had a send
+    queue: each wrote to its socket, waiting for the socket to take it, and a
+    client that stopped reading for the 30 s write deadline was given up on
+    (an attach as too slow). Their links are `link::waiting_session`s: the
+    core's end waits for room and never refuses a line for the bound, and a
+    write that waited for the socket — an attach flush, a `/ws/ui` frame —
+    waits until the edge reports everything written, so neither buffers more
+    ahead of its client than it did, and no "SendQ exceeded" is added. The
+    wait is bounded by the same deadline; the edge's writer failing ends it
+    as the socket write would have (`EdgeSession::writer_failed`), a stall as
+    a stall.
+  - *Two things an operator can see move with the transport.* A failed read
+    or write on an attach connection is now also counted as the `read` or
+    `write` error it is, as on every connection the edge holds, beside the
+    `bouncer` error the attachment ending counts; and an attach connection
+    closes lingering, as every connection the edge holds does, so its last
+    line is not reset away.
+
+  Still in e6ircd: the `/ws/irc` and `/ws/ui` upgrade handlers, and
+  X-Forwarded-For resolution (`http::oidc::client_ip`) with HTTP admission
+  (phase 3, HTTP proxying and upgrade authorization).
 
 ### 19.2 The core link
 
@@ -5797,6 +5921,19 @@ system; §19.9 lists the sections each phase rewrites.
   `Attach` (bouncer attach logic), `Ui` (`ws_ui_conn`), `Upstream` (an
   edge-held outbound IRC socket, §19.4) and `Local` (the socketless home of a
   `local` driver session, D13).
+- **Frames by kind.** `Irc` and `Attach` carry IRC lines both ways. A `Ui`
+  session carries WebSocket messages: its `Output` is one text message, the
+  client's messages reach the core as `Message` frames (a text message, or
+  the fact of a binary one, which the core refuses by kind), and its `End`
+  may carry a close frame (a code and a reason the client can show), which
+  the edge sends once what is buffered is written. A `Ui` session's
+  WebSocket Ping liveness is the edge's: after one interval without a frame
+  the client is sent a Ping, and after a second it is given up on (`Closed`);
+  the interval travels with `Open`. `Attach` and `Ui` output is
+  backpressured, not killed: the core's end waits for room, bounded by the
+  write deadline, as their sockets were written. Their lines and messages
+  run on a credit of their own session's inbound queue, since they reach the
+  bouncer, not a shard.
 - **Connection identifiers.** A session's `ConnId` is `edge slot (16 bits) |
   counter (48 bits)`. The core assigns the slot when an edge first registers
   and records it in the roster (§19.3); each edge seeds its counter randomly

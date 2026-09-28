@@ -210,18 +210,21 @@ const OIDC_FLOW_TTL: Duration = Duration::from_secs(600);
 const OIDC_FLOW_CONTEXT: &[u8] = b"oidc-authorization-flow";
 
 /// An authorization-code flow a browser is in the middle of, carried *by that
-/// browser* in its HttpOnly state cookie, sealed with the process's flow key
-/// ([`AppState::oidc_flow_key`]). The server keeps nothing per flow, so no
-/// number of anonymous `/start` requests can exhaust anything a real login
-/// needs.
+/// browser* in its HttpOnly state cookie, sealed with the flow keys derived
+/// from the master key ([`AppState::oidc_flow_key`]), so a sign-in begun
+/// before a restart or a standby's takeover completes after it. The server
+/// keeps nothing per flow until its callback, so no number of anonymous
+/// `/start` requests can exhaust anything a real login needs.
 ///
 /// Sealing makes every field authentic and secret: the browser cannot read
 /// the PKCE verifier or nonce, nor rewrite the provider, the account a link
-/// attaches to, or the expiry. Replay is bounded without server state: the
-/// authorization code a callback exchanges is single-use at the provider and
-/// bound to this flow's PKCE verifier, every callback that proves the binding
-/// clears the cookie, and a cookie outlives neither [`OIDC_FLOW_TTL`] nor the
-/// process (the key is regenerated at startup).
+/// attaches to, or the expiry. A flow is answered once: the authorization
+/// code is single-use at the provider and bound to this flow's PKCE verifier,
+/// every callback that proves the binding clears the cookie, and the code
+/// exchange first records the flow as spent in PostgreSQL
+/// ([`crate::db::spend_oidc_flow`]), which every process shares, so a kept
+/// copy of the cookie never makes any of them call the token endpoint again
+/// within [`OIDC_FLOW_TTL`].
 #[derive(Serialize, Deserialize)]
 struct OidcFlow {
     provider: String,
@@ -297,7 +300,7 @@ fn session_digest(session: &str) -> String {
 /// Why a callback's flow cookie was not admitted.
 #[derive(Debug, PartialEq, Eq)]
 enum FlowRefusal {
-    /// No cookie, a cookie this process did not seal, or one whose `state`
+    /// No cookie, one not sealed under this deployment's flow keys, or one whose `state`
     /// differs from the callback's: the response is not this browser's.
     Unbound,
     Expired,
@@ -326,7 +329,7 @@ fn unix_now() -> u64 {
 }
 
 impl OidcFlow {
-    fn seal(&self, key: &crate::secret::SecretKey) -> String {
+    fn seal(&self, key: &crate::secret::SecretKeyring) -> String {
         key.seal(
             &serde_json::to_string(self).expect("a flow serializes"),
             OIDC_FLOW_CONTEXT,
@@ -337,7 +340,7 @@ impl OidcFlow {
     /// `state` equals the one the provider returned (constant-time), it is for
     /// this provider, and it has not expired.
     fn open(
-        key: &crate::secret::SecretKey,
+        key: &crate::secret::SecretKeyring,
         cookie: Option<&str>,
         provider: &str,
         returned_state: &str,
@@ -364,30 +367,20 @@ impl OidcFlow {
         Ok(flow)
     }
 
-    /// The browser's flow for this callback, read from its state cookie, and
-    /// spent: a flow is answered once, so a kept copy of the cookie cannot
-    /// make this server call the provider again.
+    /// The browser's flow for this callback, read from its state cookie.
     fn from_callback(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         provider: &str,
         returned_state: &str,
     ) -> Result<Self, FlowRefusal> {
-        let now = unix_now();
-        let flow = Self::open(
+        Self::open(
             &state.oidc_flow_key,
             cookie_value(headers, oidc_state_cookie_name(state.secure_cookies)).as_deref(),
             provider,
             returned_state,
-            now,
-        )?;
-        if !state
-            .spent_oidc_flows
-            .spend(&flow.state, flow.expires_at, now)
-        {
-            return Err(FlowRefusal::Spent);
-        }
-        Ok(flow)
+            unix_now(),
+        )
     }
 }
 
@@ -658,6 +651,20 @@ async fn complete_flow(
             None,
         );
     };
+    // Answered once, by whichever process gets here first: a kept copy of the
+    // cookie never makes this server present its client secret again.
+    match crate::db::spend_oidc_flow(&pool, &flow.state, flow.expires_at).await {
+        Ok(true) => {}
+        Ok(false) => return FlowRefusal::Spent.response(),
+        Err(error) => {
+            eprintln!("oidc: recording the spent flow failed: {error}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Login state could not be recorded",
+                None,
+            );
+        }
+    }
     let ProviderClient { client, http } =
         match discover_client_or_bad_gateway(state, provider).await {
             Ok(provider_client) => provider_client,
@@ -2615,7 +2622,7 @@ mod domain_policy_tests {
 
     #[test]
     fn a_sealed_flow_opens_only_for_its_state_provider_and_lifetime() {
-        let key = crate::secret::SecretKey::generate();
+        let key = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
         let sealed = flow(1_000).seal(&key);
         assert!(!sealed.contains("verifier") && !sealed.contains("alice"));
         let FlowPurpose::Link(bound) = flow(1_000).purpose else {
@@ -2664,14 +2671,50 @@ mod domain_policy_tests {
     }
 
     #[test]
+    fn a_flow_sealed_by_one_process_opens_in_another_with_the_same_master_key() {
+        use crate::secret::{SecretKey, SecretKeyring};
+        let copy = |key: &SecretKey| SecretKey::from_base64(&key.to_base64()).expect("a key");
+        let old = SecretKey::generate();
+        let flow_keys = |ring: &SecretKeyring| {
+            crate::http::BrowserStateKeys::for_keyring(Some(ring))
+                .0
+                .oidc_flow
+        };
+        let first = flow_keys(&SecretKeyring::single(copy(&old)));
+        let sealed = flow(1_000).seal(&first);
+        let restarted = flow_keys(&SecretKeyring::single(copy(&old)));
+        assert!(
+            OidcFlow::open(&restarted, Some(&sealed), "corp", "returned-state", 999).is_ok(),
+            "a flow begun before a restart or a takeover completes after it"
+        );
+        let new = SecretKey::generate();
+        let rotated = flow_keys(&SecretKeyring::new(copy(&new), vec![copy(&old)]).expect("ring"));
+        assert!(
+            OidcFlow::open(&rotated, Some(&sealed), "corp", "returned-state", 999).is_ok(),
+            "a flow sealed under the previous key opens during a rotation"
+        );
+        let issued = flow(1_000).seal(&rotated);
+        let after = flow_keys(&SecretKeyring::single(new));
+        assert!(
+            OidcFlow::open(&after, Some(&issued), "corp", "returned-state", 999).is_ok(),
+            "a rotated ring seals under its primary"
+        );
+        assert_eq!(
+            OidcFlow::open(&after, Some(&sealed), "corp", "returned-state", 999).err(),
+            Some(FlowRefusal::Unbound),
+            "a key dropped from the ring opens nothing"
+        );
+    }
+
+    #[test]
     fn a_flow_cannot_be_forged_or_carried_across_keys_or_contexts() {
-        let key = crate::secret::SecretKey::generate();
+        let key = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
         let sealed = flow(1_000).seal(&key);
-        let other = crate::secret::SecretKey::generate();
+        let other = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
         assert_eq!(
             OidcFlow::open(&other, Some(&sealed), "corp", "returned-state", 0).err(),
             Some(FlowRefusal::Unbound),
-            "a flow from before a restart (or another process) is refused"
+            "a flow sealed under another deployment's keys is refused"
         );
         let mut tampered = sealed.clone().into_bytes();
         let last = tampered.len() - 3;

@@ -5,6 +5,8 @@
 //! driver (which echoes each command back as a line) and exercises the
 //! shared `attach` path against it — no external service required.
 
+#[path = "support/attach_link.rs"]
+mod attach_link;
 #[path = "support/deadline.rs"]
 mod deadline;
 
@@ -129,7 +131,7 @@ async fn attach_relays_over_the_loopback_driver() {
     let attach_handle = handle.clone();
     tokio::spawn(async move {
         attach(
-            server,
+            attach_link::over_stream(server).await,
             e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
