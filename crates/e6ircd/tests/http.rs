@@ -106,11 +106,18 @@ async fn link_identity(
     linked
 }
 
+/// One `Connection: close` exchange. Bounded: a server that never answers or
+/// never closes fails the test instead of hanging it.
 async fn request(addr: std::net::SocketAddr, req: &str) -> (u16, String, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
-    stream.write_all(req.as_bytes()).await.expect("write");
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("read");
+    let buf = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(req.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        buf
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no complete HTTP response from {addr} within a minute"));
     let split = buf
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -11602,11 +11609,13 @@ fn oidc_callback(query: &str, cookie: &str) -> String {
 }
 
 /// A sign-in in progress survives a restart or a standby's takeover, and is
-/// still answered once. Two processes share one database and one master key:
-/// a flow begun on one completes its callback on the other (the flow key is
-/// derived from the master key), and a kept copy of a flow cookie the first
-/// already answered is refused by the second (the spent record is in
-/// PostgreSQL), before either presents the client secret again.
+/// still answered once. Two processes share one database and one master key,
+/// one after the other (the second serves only once the first has given the
+/// serving lease back): a flow begun on the first completes its callback on
+/// the second (the flow key is derived from the master key), and a kept copy
+/// of a flow cookie the first already answered is refused by the second (the
+/// spent record is in PostgreSQL), before either presents the client secret
+/// again.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn an_oidc_flow_survives_a_restart_and_is_still_answered_once() {
@@ -11643,29 +11652,39 @@ async fn an_oidc_flow_survives_a_restart_and_is_still_answered_once() {
         config.internal_upstreams = e6ircd::egress::InternalUpstreams::Allow;
         config
     };
-    let first = net::start(process())
-        .await
-        .expect("start the first process")
-        .http_addr
-        .expect("http");
-    wait_http_ready(first).await;
+    let start = |config| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(60), net::start(config))
+            .await
+            .expect("the process serves within a minute")
+            .expect("start the process")
+    };
+    let first = start(process()).await;
+    let first_http = first.http_addr.expect("http");
+    wait_http_ready(first_http).await;
 
     // Answered on the first process: the code exchange is reached (this
     // provider cannot complete one), so the flow is spent.
-    let (kept, state) = begin_oidc_flow(first, "/api/v1/auth/oidc/corp/start").await;
+    let (kept, state) = begin_oidc_flow(first_http, "/api/v1/auth/oidc/corp/start").await;
     let answered = oidc_callback(&format!("code=c&state={state}"), &kept);
-    let (status, _, body) = request(first, &answered).await;
+    let (status, _, body) = request(first_http, &answered).await;
     assert_eq!(status, 401, "{body}");
     assert!(body.contains("Code exchange failed"), "{body}");
+    // Begun on the first process, answered by the second.
+    let (pending, pending_state) =
+        begin_oidc_flow(first_http, "/api/v1/auth/oidc/corp/start").await;
 
-    // A second process: the restarted one, or the standby that took over.
-    let second = net::start(process())
-        .await
-        .expect("start the second process")
-        .http_addr
-        .expect("http");
-    wait_http_ready(second).await;
-    let (status, headers, body) = request(second, &answered).await;
+    // A restart, or a standby's takeover: the first process stops and gives
+    // the serving lease back before the second serves.
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(60), first.shutdown.run())
+            .await
+            .expect("the first process stops within a minute"),
+        net::ShutdownOutcome::Flushed
+    );
+    let second = start(process()).await;
+    let second_http = second.http_addr.expect("http");
+    wait_http_ready(second_http).await;
+    let (status, headers, body) = request(second_http, &answered).await;
     assert_eq!(status, 401, "{body}");
     assert!(body.contains("Login state already used"), "{body}");
     assert!(
@@ -11674,10 +11693,9 @@ async fn an_oidc_flow_survives_a_restart_and_is_still_answered_once() {
     );
 
     // A flow begun before the restart completes after it.
-    let (cookie, state) = begin_oidc_flow(first, "/api/v1/auth/oidc/corp/start").await;
     let (status, _, body) = request(
-        second,
-        &oidc_callback(&format!("code=c&state={state}"), &cookie),
+        second_http,
+        &oidc_callback(&format!("code=c&state={pending_state}"), &pending),
     )
     .await;
     assert_eq!(status, 401, "{body}");
