@@ -476,10 +476,12 @@ serves: it binds only its HTTP health answers and takes the lease over when
 the holder stops or dies. **Active/standby** is this arrangement; active/active
 (several processes serving one database) is not supported.
 
-**Fence** — what keeps a process that has lost the lease from acting as if it
-held it: the holder stops serving when it cannot confirm a renewal in time,
-and PostgreSQL refuses its new connections and ends its open ones at a
-takeover.
+**Fence** — what keeps a process that may have lost the lease from acting as
+if it held it: a holder that cannot confirm a renewal in time reports its
+lease unconfirmed and is not ready, keeping its clients until a renewal says
+whether the lease is still its own (it resumes) or another's (it stops
+serving); PostgreSQL refuses a non-holder's new connections and ends the
+previous holder's open ones at a takeover.
 
 **Universally unique identifier (UUID)** — a 128-bit random identifier; a
 process names itself as a lease holder by one.
@@ -503,6 +505,11 @@ with backpressure so a full core queue pauses socket reads.
 
 **`e6irc-proto`** — the protocol crate: message model, parser, tag escaping,
 casemapping, numerics, and time formatting.
+
+**`e6irc-edge`** — the crate that holds client connections: accept, TLS and
+certificate reload, client addresses and per-address limits, line and
+WebSocket framing, and every write to a client. It has no database
+dependency, which `tools/check-edge-isolation.sh` holds (see "Edge tier").
 
 **CLI / TUI** — the command-line client (`e6irc-cli`) and the terminal user
 interface client (`e6irc-tui`).
@@ -664,6 +671,146 @@ while it is overloaded.
 
 **Multi-producer single-consumer (MPSC)** — a queue many tasks send into and
 one task receives from, as `e6irc-queue` is.
+
+---
+
+## Edge tier
+
+The connection-holding tier that lets the serving process be replaced without
+closing a client connection (DESIGN §19).
+
+**Edge** — a process (`e6ircd edge`, or the same code in process) that holds
+client sockets and speaks the core link. It interprets nothing past framing,
+holds no chat state of its own, and stores what the core writes to it. Not
+the older sense of "boundary": DESIGN says boundary for that.
+
+**Core** — the serving process (the [serving lease](#history-and-persistence)
+holder) seen from the edges: everything that interprets a line.
+
+**Core port** — `CorePort`, the edge's only way to reach the core: open a
+session with its send queue, hand over framed lines, report the end. In the
+single process e6ircd implements it over the core's own ingress; the core link
+takes its place across processes.
+
+**Edge mode** and **single-process mode** — edges as separate processes
+(opt-in), or the default one process with the edge in it over an in-memory
+link. Both run the same code.
+
+**Core link** — the authenticated stream between an edge and the core: TCP
+carrying TLS 1.3 with mutual certificates, one stream per core shard, framed
+by the `e6irc-link` codec. It carries many client sessions, never one link
+per client.
+
+**Mutual TLS** — TLS in which both ends present a certificate. Every core link
+uses it, loopback included; `e6ircd edge-credentials` issues the certificates
+from a deployment-private certificate authority.
+
+**Epoch fence** — the edge's rule that it speaks to at most one core: the one
+presenting the highest serving-lease epoch the edge has accepted. A lower
+epoch is refused and a higher one replaces the current link, so a core that
+lost the lease cannot write to a client (the edge-side counterpart of the
+database [fence](#history-and-persistence)).
+
+**Session record** — the core-written, edge-stored, versioned description of
+one client session (registration, login, capabilities, modes, paced replies
+in progress and the rest the core needs to resume it). Opaque to the edge
+past a small header.
+
+**Channel replica** — the core-written copy of one channel's state (name,
+creation time, topic, modes, lists, the edge's own members and their ranks),
+held by every edge that hosts a member of that channel. A channel's state
+therefore lives with its members.
+
+**Upstream record** — the session record of an edge-held bouncer upstream:
+the upstream nick, confirmed channels, naming rules, the reply router's
+pending queue and the rest the `irc` driver needs to resume without
+registering again.
+
+**Revision** — the counter every session record and channel replica carries;
+at a rebuild the highest revision of a channel's replicas wins.
+
+**Cut** — the marker a stopping core sends every edge once it has quiesced:
+"everything up to here is final". It carries the **cut state**, the small
+global state no session owns (WHOWAS, the LUSERS maximum). A crash leaves no
+cut.
+
+**Rebuild** — a new core reconstructing live state from the edges' records and
+replicas and from PostgreSQL, gracefully (after a cut) or after a crash; the
+two are one recovery path.
+
+**Roster** — the `core_edges` table naming every edge a core has linked, with
+its slot and last epoch and cut; a new core waits for the edges it names.
+
+**Edge slot** — the 16-bit number the core assigns an edge, forming the high
+bits of every connection identifier that edge allocates, so edges allocate
+identifiers without asking a core.
+
+**Gap** — the pause between one core stopping and the next resuming its
+sessions. Clients see no disconnect; their lines are buffered at the edge.
+
+**Core-absence limit** — how long an edge holds paused clients without any
+core (`edge.core_absence_limit`, 10 minutes by default) before closing them
+with an explicit `ERROR`.
+
+**Credit** — the core's grant of shard-queue room to a link stream; an edge
+out of credits stops reading client sockets, which is the client's
+backpressure.
+
+**Remote send queue** — the core's byte-accurate account of a session's
+output that the edge has not yet written to the client socket. It holds the
+"SendQ exceeded" bound and the paced replies' half-full rule across the
+process boundary.
+
+**Acknowledge after effect** — the rule for the core's input
+acknowledgement: a line is acknowledged only once its effect is emitted,
+recorded, or refused. A line that only accumulates core memory (an open
+multiline batch, SASL chunks) is marked **retained for replay** instead, and
+is replayed to the next core.
+
+**Input of unknown fate** — lines past the acknowledgement when a core
+crashes: their effect may or may not have been emitted. They are not replayed
+(at most once), and the client is told how many with
+`NOTE * INPUT_UNCONFIRMED`.
+
+**Catch-up lines** — after a crash, the MODE, TOPIC or list changes a
+rebuilding core sends to the members on edges whose replica lagged the highest
+revision. The only server-originated output of a rebuild; a correction, never
+a reset.
+
+**Handover** (edge) — passing live sockets and their session state from an
+edge to its successor on the same host, by descriptor passing or an in-place
+re-execution. **Handover stop** (core) — a core stop in edge mode that
+quiesces, sends the cut and releases the lease without closing a client; the
+**final stop** (`e6ircd stop --final`) is the one that closes clients.
+
+**Overlap drain** — an edge upgrade in which the old edge keeps serving its
+existing connections while the new one takes new ones; the old edge exits
+when its last session closes or at an operator-chosen deadline.
+
+**Kernel TLS** — the operating-system kernel encrypting and decrypting TLS
+records on a socket after userspace completed the handshake (Linux's `tls`
+upper-layer protocol). A kernel-TLS socket is plaintext to userspace, so an
+edge can hand it over.
+
+**Warm standby** — a standby core holding read-only **observer links** to the
+edges, receiving every record and replica as it is written, so a takeover
+uploads only what changed. Edges find standbys through the **standby
+registry**: a row per standby beside the serving lease, naming its
+observer-link address, heartbeated and expiring as the lease is; the holder
+pushes the current list to its edges.
+
+**Directory key** — the monotonic number the core allocates each session at
+`Open`, which the connection directory pages by, so a walk never misses a
+connection opened on another edge. The slot-prefixed connection identifier
+stays the session's wire identity and carries no order across edges.
+
+**PROXY protocol / PROXY** — the header a TCP load balancer prepends to a
+connection to pass on the client's address (version 2 is binary). An edge
+listener may accept it, as the typed counterpart of X-Forwarded-For.
+
+**Service Control Manager** — the Windows component that starts and stops
+services. A service process cannot hand itself to a successor under it, so an
+edge run there upgrades by overlap drain.
 
 ---
 

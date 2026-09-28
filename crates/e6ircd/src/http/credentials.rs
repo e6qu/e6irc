@@ -189,7 +189,7 @@ pub(super) async fn export_me(
     let (chunks, body) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let _slot = slot;
-        pump_export(export, chunks, crate::peer_write::PEER_WRITE_DEADLINE).await;
+        pump_export(export, chunks, e6irc_edge::peer_write::PEER_WRITE_DEADLINE).await;
     });
     let mut response = (
         [
@@ -240,11 +240,11 @@ async fn pump_export(
             }
         };
         let failed = next.is_err();
-        match crate::peer_write::within_send_deadline(deadline, chunks.send(next)).await {
+        match e6irc_edge::peer_write::within_send_deadline(deadline, chunks.send(next)).await {
             Ok(()) if !failed => {}
             // Ended with its error, or the client went away.
-            Ok(()) | Err(crate::peer_write::SendFailure::Transport) => return,
-            Err(crate::peer_write::SendFailure::Stalled) => {
+            Ok(()) | Err(e6irc_edge::peer_write::SendFailure::Transport) => return,
+            Err(e6irc_edge::peer_write::SendFailure::Stalled) => {
                 eprintln!(
                     "http: account export abandoned: the client read nothing for {}s",
                     deadline.as_secs()

@@ -2,11 +2,15 @@
 set -euo pipefail
 
 root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-bin="$root/target/debug/e6irc-qualification"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
 cargo build --locked -p e6irc-qualification
+# Where cargo put it: `CARGO_TARGET_DIR` or a configured target directory
+# moves it out of the workspace's `target/`.
+target_directory="$(cargo metadata --locked --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+bin="$target_directory/debug/e6irc-qualification"
 
 probe() {
   local name="$1" report="$2"

@@ -103,6 +103,189 @@ async fn register_on(addr: std::net::SocketAddr, nick: &str) {
         .expect("register on the serving process");
 }
 
+/// Poll `/readyz` until its `lease` is `lease` and its `ready` is `ready`,
+/// within `bound`; the body.
+async fn until_readiness(
+    port: u16,
+    lease: &str,
+    ready: bool,
+    bound: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + bound;
+    loop {
+        let answer = http_get(port, "/readyz").await;
+        if let Ok((_, body)) = &answer
+            && let Ok(readiness) = serde_json::from_str::<serde_json::Value>(body)
+            && readiness["lease"] == lease
+            && readiness["ready"] == ready
+        {
+            let status = answer.as_ref().map(|(status, _)| *status).unwrap_or(0);
+            assert_eq!(
+                status == 200,
+                readiness["ready"] == true,
+                "the status and `ready` agree: {readiness}"
+            );
+            return readiness;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/readyz on port {port} did not report the lease {lease} (ready: {ready}) within \
+             {bound:?}: {answer:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// No critical failure (a lost lease among them) within a second.
+async fn no_critical_failure(shutdown: &mut net::ShutdownHandle) {
+    if let Ok(failure) =
+        tokio::time::timeout(Duration::from_secs(1), shutdown.wait_for_critical_failure()).await
+    {
+        panic!("the server stopped serving: {failure}");
+    }
+}
+
+/// A registered client in `channel`, kept connected.
+async fn joined_client(
+    addr: std::net::SocketAddr,
+    nick: &str,
+    channel: &str,
+) -> e6irc_client::Connection {
+    let mut client = e6irc_client::Connection::connect(&addr.to_string())
+        .await
+        .expect("connect to the serving process");
+    client
+        .register(&e6irc_client::Identity {
+            nick,
+            username: nick,
+            realname: nick,
+            server_password: None,
+        })
+        .await
+        .expect("register on the serving process");
+    client
+        .send_line(&format!("JOIN {channel}"))
+        .await
+        .expect("join");
+    until_message(&mut client, |message| message.command == "366").await;
+    client
+}
+
+/// Read until a message `wanted` accepts, within ten seconds.
+async fn until_message(
+    client: &mut e6irc_client::Connection,
+    wanted: impl Fn(&e6irc_client::OwnedMessage) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = client
+                .next_message()
+                .await
+                .expect("read")
+                .expect("the server keeps the connection");
+            if wanted(&message) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the awaited message within ten seconds");
+}
+
+/// The client is still connected and answered: a `PING` comes back.
+async fn still_talks(client: &mut e6irc_client::Connection, token: &str) {
+    client
+        .send_line(&format!("PING :{token}"))
+        .await
+        .expect("send");
+    until_message(client, |message| {
+        message.command == "PONG" && message.params.last().is_some_and(|last| last == token)
+    })
+    .await;
+}
+
+async fn lease_epoch(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT epoch FROM serving_lease WHERE id = 1")
+        .fetch_one(pool)
+        .await
+        .expect("the lease row")
+}
+
+/// A relay in front of PostgreSQL whose every connection can be cut at once:
+/// a database outage as the serving process sees it. While cut, a new
+/// connection is closed as it is accepted.
+struct CuttableProxy {
+    /// The test database's URL through the relay.
+    url: db::DatabaseUrl,
+    state: std::sync::Arc<std::sync::Mutex<ProxyState>>,
+}
+
+struct ProxyState {
+    up: bool,
+    relays: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl CuttableProxy {
+    /// A relay to the database `real` names, and `real` through it.
+    async fn to(real: &str) -> Self {
+        let (_, after_scheme) = real.split_once("://").expect("a URL");
+        let authority = after_scheme.split(['/', '?']).next().expect("an authority");
+        let host_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host_port)| host_port)
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay");
+        let relayed = format!(
+            "127.0.0.1:{}",
+            listener.local_addr().expect("relay address").port()
+        );
+        let url = real
+            .replacen(&host_port, &relayed, 1)
+            .parse()
+            .expect("the relayed URL");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ProxyState {
+            up: true,
+            relays: Vec::new(),
+        }));
+        let accepting = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut downstream, _) = listener.accept().await.expect("relay accept");
+                let mut state = accepting.lock().expect("relay state");
+                if !state.up {
+                    drop(downstream);
+                    continue;
+                }
+                let upstream = host_port.clone();
+                state.relays.retain(|relay| !relay.is_finished());
+                state.relays.push(tokio::spawn(async move {
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    drop(tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await);
+                }));
+            }
+        });
+        Self { url, state }
+    }
+
+    /// End every relayed connection and refuse new ones.
+    fn cut(&self) {
+        let mut state = self.state.lock().expect("relay state");
+        state.up = false;
+        for relay in state.relays.drain(..) {
+            relay.abort();
+        }
+    }
+
+    /// Relay new connections again.
+    fn restore(&self) {
+        self.state.lock().expect("relay state").up = true;
+    }
+}
+
 async fn stored_holder(pool: &sqlx::PgPool) -> Option<String> {
     sqlx::query_scalar("SELECT holder_label FROM serving_lease WHERE id = 1")
         .fetch_one(pool)
@@ -219,41 +402,254 @@ async fn a_server_whose_lease_is_taken_drains_and_stops() {
 }
 
 /// A holder that cannot confirm a renewal — here the lease row is held locked,
-/// so every renewal waits — stops serving by its fence, before the lease could
-/// expire and be taken.
+/// so every renewal waits — is fenced by its deadline, before the lease could
+/// expire and be taken: `/readyz` says the lease is unconfirmed, and the
+/// process keeps serving. Once the row is let go the next renewal finds the
+/// lease still its own, at the same epoch, and it resumes.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn a_server_whose_renewals_stall_fences_itself_by_its_deadline() {
     let url = support::test_db("a_server_whose_renewals_stall_fences_itself_by_its").await;
-    let mut running = net::start(server_config(&url, 0)).await.expect("serves");
+    let http_port = free_port();
+    let mut running = net::start(server_config(&url, http_port))
+        .await
+        .expect("serves");
     let observer = db::connect_and_migrate(&url).await.expect("observer");
+    until_readiness(http_port, "held", true, Duration::from_secs(30)).await;
+    let epoch_before = lease_epoch(&observer).await;
     let mut lock = observer.begin().await.expect("transaction");
     sqlx::query("SELECT * FROM serving_lease FOR UPDATE")
         .execute(&mut *lock)
         .await
         .expect("hold the lease row");
     let locked = Instant::now();
-    let failure = tokio::time::timeout(
+    let readiness = until_readiness(
+        http_port,
+        "unconfirmed",
+        false,
         FENCE_AFTER + Duration::from_secs(10),
-        running.shutdown.wait_for_critical_failure(),
     )
-    .await
-    .expect("the fence ends the serving");
+    .await;
     let fenced = locked.elapsed();
-    assert_eq!(failure.task, "serving lease");
-    assert!(failure.reason.contains("fences itself"), "{failure}");
+    assert_eq!(readiness["ready"], false, "{readiness}");
     // The last confirmed renewal was at most one interval before the lock,
-    // and the fence falls FENCE_AFTER after it — before the TTL.
+    // and the fence falls FENCE_AFTER after it — before the TTL. `/readyz`
+    // shows it within its own database probe's bound.
     assert!(
         fenced + RENEW_INTERVAL >= FENCE_AFTER - Duration::from_secs(1)
-            && fenced <= FENCE_AFTER + Duration::from_secs(2),
+            && fenced <= FENCE_AFTER + Duration::from_secs(3),
         "fenced {fenced:?} after the lock"
     );
     assert!(fenced < LEASE_TTL, "fenced {fenced:?}");
+    no_critical_failure(&mut running.shutdown).await;
+    register_on(running.addrs[0], "whilefenced").await;
+
     lock.rollback().await.expect("let the row go");
+    until_readiness(
+        http_port,
+        "held",
+        true,
+        RENEW_INTERVAL + Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(lease_epoch(&observer).await, epoch_before, "the same lease");
+    no_critical_failure(&mut running.shutdown).await;
     tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
         .await
         .expect("the bounded drain ends");
+    assert_eq!(stored_holder(&observer).await, None, "released at the end");
+}
+
+/// A holder whose database becomes unreachable — every connection through a
+/// relay cut, for longer than the fence and the lease's TTL — keeps its IRC
+/// clients and answers `/readyz` 503 with the lease unconfirmed. Nobody took
+/// the lease, so when the database answers again the next renewal finds it
+/// still this holder's: it resumes, `/readyz` answers 200, and a write lands.
+/// What another process committed meanwhile is not missed: a suspension
+/// written during the outage, announced while nothing listened, is read again
+/// once the listener is back, and ends the account's session.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_holder_cut_off_from_its_database_keeps_its_clients_and_resumes() {
+    let real = support::test_db_text("a_holder_cut_off_from_its_database_keeps_its_clien").await;
+    let proxy = CuttableProxy::to(&real).await;
+    let http_port = free_port();
+    let mut running = net::start(server_config(&proxy.url, http_port))
+        .await
+        .expect("serves");
+    let observer = db::connect_and_migrate(&real.parse().expect("URL"))
+        .await
+        .expect("observer");
+    let carol = db::create_account_with_contact(&observer, "carol", "carols-password", None)
+        .await
+        .expect("carol's account");
+    until_readiness(http_port, "held", true, Duration::from_secs(30)).await;
+    let epoch_before = lease_epoch(&observer).await;
+    let mut client = joined_client(running.addrs[0], "throughit", "#ha").await;
+    let mut carols = e6irc_client::Connection::connect(&running.addrs[0].to_string())
+        .await
+        .expect("connect");
+    carols
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "carol",
+                username: "carol",
+                realname: "Carol",
+                server_password: None,
+            },
+            "carol",
+            "carols-password",
+        )
+        .await
+        .expect("carol signs in");
+
+    proxy.cut();
+    let cut = Instant::now();
+    let readiness = until_readiness(
+        http_port,
+        "unconfirmed",
+        false,
+        FENCE_AFTER + Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(readiness["database"], "unavailable", "{readiness}");
+    // Another process suspends carol while the holder cannot hear it.
+    db::set_account_suspended(&observer, carol, true, "the operator", &[])
+        .await
+        .expect("suspended elsewhere")
+        .expect("carol");
+    still_talks(&mut carols, "unheard").await;
+    // Past the lease's TTL too: an expired lease nobody took is still this
+    // holder's.
+    while cut.elapsed() < LEASE_TTL + Duration::from_secs(1) {
+        still_talks(&mut client, "fenced").await;
+        no_critical_failure(&mut running.shutdown).await;
+    }
+
+    proxy.restore();
+    let readiness = until_readiness(
+        http_port,
+        "held",
+        true,
+        RENEW_INTERVAL + Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(readiness["ready"], true, "{readiness}");
+    assert_eq!(readiness["database"], "ready", "{readiness}");
+    assert_eq!(lease_epoch(&observer).await, epoch_before, "the same lease");
+    still_talks(&mut client, "resumed").await;
+    client
+        .send_line("PRIVMSG #ha :written after the outage")
+        .await
+        .expect("send");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let landed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messages WHERE body = 'written after the outage'",
+        )
+        .fetch_one(&observer)
+        .await
+        .expect("count");
+        if landed == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the write never landed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The announcement listener reconnects on its own backoff (at most 30 s)
+    // and reads every account's authority again.
+    let said = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut said = Vec::new();
+        loop {
+            match carols.next_message().await {
+                Ok(Some(message)) => said.push(message.params.join(" ")),
+                Ok(None) | Err(_) => return said,
+            }
+        }
+    })
+    .await
+    .expect("carol's session ends once the suspension is read again");
+    assert!(
+        said.iter().any(|text| text.contains("Account suspended")),
+        "{said:#?}"
+    );
+    no_critical_failure(&mut running.shutdown).await;
+    tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
+        .await
+        .expect("the bounded drain ends");
+    assert_eq!(stored_holder(&observer).await, None, "released at the end");
+}
+
+/// A holder fenced by an outage whose lease another process took meanwhile
+/// finds that out when the database answers again, and only then stops
+/// serving: the drain, naming the new holder, which it does not release.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_holder_fenced_by_an_outage_that_finds_a_takeover_drains() {
+    let real = support::test_db_text("a_holder_fenced_by_an_outage_that_finds_a_takeove").await;
+    let real_url: db::DatabaseUrl = real.parse().expect("URL");
+    let proxy = CuttableProxy::to(&real).await;
+    let http_port = free_port();
+    let mut running = net::start(server_config(&proxy.url, http_port))
+        .await
+        .expect("serves");
+    let observer = db::connect_and_migrate(&real_url).await.expect("observer");
+    until_readiness(http_port, "held", true, Duration::from_secs(30)).await;
+    let mut client = joined_client(running.addrs[0], "splitbrain", "#ha").await;
+
+    proxy.cut();
+    until_readiness(
+        http_port,
+        "unconfirmed",
+        false,
+        FENCE_AFTER + Duration::from_secs(10),
+    )
+    .await;
+    let deadline = Instant::now() + LEASE_TTL + Duration::from_secs(10);
+    while serving_lease::current_holder(&real_url)
+        .await
+        .expect("the lease row")
+        .is_some()
+    {
+        assert!(Instant::now() < deadline, "the lease never expired");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let successor = serving_lease::acquire(
+        &real_url,
+        &serving_lease::HolderId::generate(),
+        "the successor",
+    )
+    .await
+    .expect("an expired lease is taken");
+    // Cut off, the old holder cannot know: it still serves its clients.
+    still_talks(&mut client, "unaware").await;
+    no_critical_failure(&mut running.shutdown).await;
+
+    proxy.restore();
+    let failure = tokio::time::timeout(
+        RENEW_INTERVAL + Duration::from_secs(30),
+        running.shutdown.wait_for_critical_failure(),
+    )
+    .await
+    .expect("the first renewal that reaches the database finds the takeover");
+    assert_eq!(failure.task, "serving lease");
+    assert!(failure.reason.contains("the successor"), "{failure}");
+    tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
+        .await
+        .expect("the bounded drain ends");
+    assert!(
+        stored_holder(&observer)
+            .await
+            .is_some_and(|holder| holder.contains("the successor")),
+        "a lost lease is not released over its new holder"
+    );
+    assert!(
+        successor
+            .release(Duration::from_secs(5))
+            .await
+            .expect("release"),
+        "the successor still held it"
+    );
 }
 
 /// The database fences a holder too: once another process has taken the

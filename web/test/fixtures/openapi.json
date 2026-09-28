@@ -11492,7 +11492,7 @@
             "description": "the request body is larger than 1 MiB (a problem document)"
           },
           "503": {
-            "description": "the core heartbeat is stale or PostgreSQL is unavailable, or this process is a standby (role \"standby\", naming the serving lease's holder)"
+            "description": "the core heartbeat is stale, PostgreSQL is unavailable, or the serving lease is unconfirmed (lease \"unconfirmed\": no renewal reached the database within the fence; the process keeps its clients and resumes when one does), or this process is a standby (role \"standby\", naming the serving lease's holder)"
           }
         },
         "summary": "Core and PostgreSQL readiness probe"

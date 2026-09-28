@@ -177,10 +177,10 @@ impl MaskShape {
 }
 
 /// `net` as a subject's canonical address is matched against it
-/// ([`crate::net::canonical_network`]); a mapped network shorter than `/96` is
+/// ([`e6irc_edge::address::canonical_network`]); a mapped network shorter than `/96` is
 /// refused as [`MaskError::MalformedCidr`] rather than stored half-matchable.
 fn canonical_network(net: ipnet::IpNet) -> Result<ipnet::IpNet, MaskError> {
-    crate::net::canonical_network(net).ok_or(MaskError::MalformedCidr)
+    e6irc_edge::address::canonical_network(net).ok_or(MaskError::MalformedCidr)
 }
 
 /// Who a mask is tested against.

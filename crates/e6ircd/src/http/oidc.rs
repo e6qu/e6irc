@@ -2197,7 +2197,7 @@ async fn require_active_account(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct UnusableForwardedFor {
     /// The trusted proxy that sent it.
-    proxy: crate::net::ClientIp,
+    proxy: ClientIp,
     /// The entry, as sent.
     entry: String,
 }
@@ -2226,12 +2226,11 @@ pub(super) fn client_ip(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     trusted: &[ipnet::IpNet],
-) -> Result<crate::net::ClientIp, UnusableForwardedFor> {
+) -> Result<ClientIp, UnusableForwardedFor> {
     // Every address is judged in its canonical spelling: a dual-stack listener
     // presents an IPv4 proxy mapped, and a proxy may forward a mapped client.
-    let peer = crate::net::ClientIp::new(peer);
-    let is_trusted =
-        |address: crate::net::ClientIp| trusted.iter().any(|net| net.contains(&address.ip()));
+    let peer = ClientIp::new(peer);
+    let is_trusted = |address: ClientIp| trusted.iter().any(|net| net.contains(&address.ip()));
     if !is_trusted(peer) {
         return Ok(peer);
     }
@@ -2273,12 +2272,12 @@ pub(super) fn resolve_client_ip(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     trusted: &[ipnet::IpNet],
-    refusals: &crate::net::PeerRefusalLog,
-) -> ResponseResult<crate::net::ClientIp> {
+    refusals: &PeerRefusalLog,
+) -> ResponseResult<ClientIp> {
     client_ip(peer, headers, trusted).map_err(|unusable| {
         refusals.note(
             unusable.proxy,
-            crate::net::PeerRefusal::UnusableForwardedFor,
+            PeerRefusal::UnusableForwardedFor,
             Some(&unusable),
         );
         problem(
@@ -2305,7 +2304,7 @@ pub(super) fn forwarded_https(
     headers: &axum::http::HeaderMap,
     trusted: &[ipnet::IpNet],
 ) -> bool {
-    let peer = crate::net::ClientIp::new(peer);
+    let peer = ClientIp::new(peer);
     if !trusted.iter().any(|net| net.contains(&peer.ip())) {
         return false;
     }
@@ -2323,7 +2322,7 @@ pub(super) fn forwarded_https(
 /// `[2001:db8::1]:443`). A bare `parse::<IpAddr>()` rejects all of those, which
 /// would make `client_ip` refuse every request from such a proxy. Returns
 /// `None` only for an entry that is not an address.
-fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
+fn parse_forwarded_ip(entry: &str) -> Option<ClientIp> {
     let s = entry.trim();
     let address = if let Ok(ip) = s.parse::<std::net::IpAddr>() {
         Some(ip) // bare IPv4 or unbracketed IPv6
@@ -2335,7 +2334,7 @@ fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
             .and_then(|s| s.strip_suffix(']'))
             .and_then(|inner| inner.parse::<std::net::IpAddr>().ok())
     };
-    address.map(crate::net::ClientIp::new)
+    address.map(ClientIp::new)
 }
 
 /// Hard ceiling on the auth-rate bucket map. The age-based retain below only
@@ -2345,13 +2344,13 @@ fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
 const MAX_AUTH_BUCKETS: usize = 4096;
 
 /// Spend one token from `client`'s auth bucket, keyed by its
-/// [`PeerLimitKey`](crate::net::PeerLimitKey) (an IPv6 client's whole `/64`).
+/// [`PeerLimitKey`] (an IPv6 client's whole `/64`).
 /// A refusal is the whole seconds until the bucket holds a token again, for
 /// the `Retry-After` header; always `Ok` when `auth_rate_burst` is `"off"`. The
 /// bucket refills to full over [`API_RATE_WINDOW`]; fully-refilled entries are
 /// pruned, and the map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow
 /// without bound even under a distinct-IP flood.
-pub(super) fn spend_auth_budget(state: &AppState, client: crate::net::ClientIp) -> Result<(), u64> {
+pub(super) fn spend_auth_budget(state: &AppState, client: ClientIp) -> Result<(), u64> {
     let Some(burst) = state.auth_rate_burst else {
         return Ok(());
     };
