@@ -23,6 +23,7 @@ use e6irc_edge::address::{
 mod channels;
 mod credentials;
 mod device;
+mod edge;
 mod history;
 pub(crate) mod networks;
 mod observation;
@@ -38,6 +39,7 @@ use channels::*;
 pub(crate) use credentials::AccountExportSlots;
 use credentials::*;
 use device::*;
+pub(crate) use edge::{LinkRouters, serve_link};
 use history::*;
 use networks::*;
 use observation::*;
@@ -49,6 +51,7 @@ pub(crate) use revocation::CredentialWatch;
 use sessions::*;
 pub(crate) use ws::UiSocketLimiter;
 use ws::*;
+pub(crate) use ws::{UiGrant, open_granted_ui};
 
 /// The database pool for an unauthenticated endpoint, or a 503 problem
 /// response when the server runs without one. (Authenticated endpoints use
@@ -144,7 +147,7 @@ pub struct AppState {
     /// (see [`CsrfKeys`]).
     pub csrf_keys: CsrfKeys,
     /// Trusted reverse-proxy CIDRs; when the socket peer matches one, the
-    /// client IP is taken from `X-Forwarded-For` (see [`client_ip`]).
+    /// client IP is taken from `X-Forwarded-For` (see [`e6irc_edge::address::client_ip`]).
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Token-bucket size for the auth endpoints per client address
     /// (`limits.auth_rate_burst`, on by default); `None` only when the operator
@@ -186,6 +189,13 @@ pub struct AppState {
     /// Fast presentation state; PostgreSQL remains the transactional authority
     /// that exactly zero accounts exist.
     pub(crate) bootstrap_available: AtomicBool,
+    /// In edge mode (DESIGN §19), the WebSocket upgrades authorized for the
+    /// edges to complete; `None` in single-process mode, where this process
+    /// completes every upgrade itself.
+    pub(crate) edge_upgrades: Option<Arc<crate::edge_link::EdgeUpgrades>>,
+    /// In edge mode, the edges linked now, as `/readyz` and the console show
+    /// them.
+    pub(crate) linked_edges: Option<Arc<crate::edge_link::LinkedEdges>>,
 }
 
 /// Where the server keeps durable state, and the always-on network registry
@@ -264,6 +274,14 @@ pub(crate) fn bootstrap_token_digest(token: &str) -> [u8; 32] {
         .expect("SHA-256 output is always 32 bytes")
 }
 
+/// Whether `presented` is the monitoring token `expected` is the digest of,
+/// compared in constant time: the one check every monitoring route — the
+/// core's and an edge's metrics listener — makes.
+pub fn monitoring_token_matches(expected: &[u8; 32], presented: &str) -> bool {
+    let actual = bootstrap_token_digest(presented);
+    aws_lc_rs::constant_time::verify_slices_are_equal(expected, &actual).is_ok()
+}
+
 fn monitoring_token_digest(token: &str) -> Result<[u8; 32], String> {
     if token.chars().count() < 32
         || token
@@ -277,7 +295,7 @@ fn monitoring_token_digest(token: &str) -> Result<[u8; 32], String> {
     Ok(bootstrap_token_digest(token))
 }
 
-pub(crate) fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, String> {
+pub fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, String> {
     let Some(token) = crate::environment_config::optional(
         &crate::environment_config::process_environment,
         "E6IRC_MONITORING_TOKEN",
@@ -1147,6 +1165,7 @@ mod problem_contract_tests {
         ("channels.rs", include_str!("channels.rs")),
         ("credentials.rs", include_str!("credentials.rs")),
         ("device.rs", include_str!("device.rs")),
+        ("edge.rs", include_str!("edge.rs")),
         ("history.rs", include_str!("history.rs")),
         ("mod.rs", include_str!("mod.rs")),
         ("networks.rs", include_str!("networks.rs")),
@@ -1364,6 +1383,82 @@ struct Readiness {
     core: &'static str,
     database: &'static str,
     lease: &'static str,
+    /// In edge mode, this core's link version and each linked edge's: an edge
+    /// whose newest version is older must be upgraded before the next core
+    /// release. Readiness never waits for an edge: edges dial the core that
+    /// is ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edges: Option<EdgesReadiness>,
+}
+
+#[derive(Serialize)]
+struct EdgesReadiness {
+    link_version: u16,
+    linked: Vec<LinkedEdgeReadiness>,
+}
+
+#[derive(Serialize)]
+struct LinkedEdgeReadiness {
+    name: String,
+    link_version: u16,
+    upgrade_needed: bool,
+}
+
+/// The edges part of `/readyz`, in edge mode.
+fn edges_readiness(state: &AppState) -> Option<EdgesReadiness> {
+    let edges = state.linked_edges.as_ref()?;
+    Some(EdgesReadiness {
+        link_version: e6irc_link::LINK_VERSION,
+        linked: edges
+            .views()
+            .into_iter()
+            .map(|edge| LinkedEdgeReadiness {
+                upgrade_needed: edge.upgrade_needed(),
+                name: edge.name.to_string(),
+                link_version: edge.newest_version,
+            })
+            .collect(),
+    })
+}
+
+/// The edge-tier metrics, in edge mode: this core's link version, and each
+/// linked edge's newest version and whether it must be upgraded before the
+/// next core release. One series per linked edge, as many as there are
+/// connection slots at most.
+fn edge_metrics(state: &AppState) -> String {
+    let Some(edges) = state.linked_edges.as_ref() else {
+        return String::new();
+    };
+    let mut out = format!(
+        "# HELP e6irc_core_link_version The core-link version this core speaks.\n\
+         # TYPE e6irc_core_link_version gauge\n\
+         e6irc_core_link_version {}\n",
+        e6irc_link::LINK_VERSION
+    );
+    let views = edges.views();
+    out.push_str(
+        "# HELP e6irc_edge_link_version The newest core-link version each linked edge speaks.\n\
+         # TYPE e6irc_edge_link_version gauge\n",
+    );
+    for edge in &views {
+        out.push_str(&format!(
+            "e6irc_edge_link_version{{edge=\"{}\"}} {}\n",
+            edge.name, edge.newest_version
+        ));
+    }
+    out.push_str(
+        "# HELP e6irc_edge_upgrade_needed Whether each linked edge must be upgraded before the \
+         next core release.\n\
+         # TYPE e6irc_edge_upgrade_needed gauge\n",
+    );
+    for edge in &views {
+        out.push_str(&format!(
+            "e6irc_edge_upgrade_needed{{edge=\"{}\"}} {}\n",
+            edge.name,
+            u8::from(edge.upgrade_needed())
+        ));
+    }
+    out
 }
 
 const READINESS_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1483,6 +1578,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
                 "not_configured",
                 crate::serving_lease::LeaseStanding::as_str,
             ),
+            edges: edges_readiness(&state),
         }),
     )
         .into_response()
@@ -1580,7 +1676,7 @@ async fn admin_metrics(State(state): State<Arc<AppState>>, _admin: AdminAccount)
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state.telemetry.prometheus(networks, connected),
+        state.telemetry.prometheus(networks, connected) + &edge_metrics(&state),
     )
         .into_response();
     no_store(response.headers_mut());
@@ -2040,7 +2136,7 @@ const MAX_CONCURRENT_REQUESTS: usize = 1024;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The per-address in-flight request count, keyed by the [`PeerLimitKey`] of
-/// the client address the request resolves to ([`client_ip`]: the socket peer,
+/// the client address the request resolves to ([`e6irc_edge::address::client_ip`]: the socket peer,
 /// or the forwarded client behind a trusted proxy).
 pub(crate) struct RequestAdmission {
     trusted_proxies: Vec<ipnet::IpNet>,
@@ -3661,6 +3757,10 @@ mod pages {
     #[template(path = "console_configuration.html")]
     struct ConsoleConfiguration {
         shell: ConsoleShell,
+        /// Edge mode (DESIGN §19, decision D9): the listeners and their
+        /// certificates are the edges', shown as they report them, with no
+        /// field to change them.
+        edge_mode: bool,
     }
 
     pub async fn console_configuration(
@@ -3670,6 +3770,7 @@ mod pages {
         let _config = require_managed_config!(state);
         render_private(ConsoleConfiguration {
             shell: console_shell(actor, "configuration"),
+            edge_mode: state.linked_edges.is_some(),
         })
     }
 
@@ -3830,6 +3931,51 @@ mod pages {
         match network_operations_response(&state, &account, &name, enabled, runtime).await {
             Ok(response) => super::json_no_store(response),
             Err(response) => response.into(),
+        }
+    }
+
+    #[cfg(test)]
+    mod console_configuration_tests {
+        use super::{ConsoleConfiguration, ConsoleShell};
+        use askama::Template;
+
+        fn page(edge_mode: bool) -> String {
+            ConsoleConfiguration {
+                shell: ConsoleShell {
+                    account: "root".into(),
+                    csrf: "csrf".into(),
+                    is_admin: true,
+                    active: "configuration",
+                },
+                edge_mode,
+            }
+            .render()
+            .expect("the page renders")
+        }
+
+        /// In edge mode the listeners and their certificates are the edges'
+        /// (decision D9): the page shows them as the edges report them and
+        /// offers no field to change them; in single-process mode it offers
+        /// the fields and no edge view.
+        #[test]
+        fn edge_mode_shows_listeners_read_only_with_no_field_to_change_them() {
+            let listener_fields = [
+                "name=\"listeners\"",
+                "name=\"bnc_enabled\"",
+                "name=\"bnc_addr\"",
+                "name=\"bnc_tls_cert_path\"",
+                "name=\"bnc_tls_key_path\"",
+            ];
+            let edge = page(true);
+            assert!(edge.contains("data-configuration-edge-listeners"), "{edge}");
+            for field in listener_fields {
+                assert!(!edge.contains(field), "edge mode renders {field}");
+            }
+            let single = page(false);
+            assert!(!single.contains("data-configuration-edge-listeners"));
+            for field in listener_fields {
+                assert!(single.contains(field), "single-process mode lacks {field}");
+            }
         }
     }
 
@@ -4463,17 +4609,8 @@ mod invitation_url_tests {
 }
 
 #[cfg(test)]
-mod client_ip_tests {
+mod request_admission_tests {
     use e6irc_edge::address::ClientIp;
-
-    /// The client a request resolves to, when it resolves to one.
-    fn client_ip(
-        peer: std::net::IpAddr,
-        headers: &axum::http::HeaderMap,
-        trusted: &[ipnet::IpNet],
-    ) -> ClientIp {
-        super::client_ip(peer, headers, trusted).expect("a resolvable forwarded chain")
-    }
 
     /// The in-flight request bound charges a client's whole IPv6 `/64`.
     #[test]
@@ -4492,203 +4629,8 @@ mod client_ip_tests {
         assert!(admission.admit(client("2001:db8:0:1::1")).is_some());
     }
 
-    fn xff(value: &str) -> axum::http::HeaderMap {
-        let mut h = axum::http::HeaderMap::new();
-        h.insert("x-forwarded-for", value.parse().unwrap());
-        h
-    }
-    fn ip(s: &str) -> std::net::IpAddr {
-        s.parse().unwrap()
-    }
     fn client(s: &str) -> ClientIp {
-        ClientIp::new(ip(s))
-    }
-    fn net(s: &str) -> ipnet::IpNet {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn untrusted_peer_ignores_forwarded_header() {
-        // A direct (untrusted) client can spoof X-Forwarded-For; we must use
-        // the real socket peer, never the header, or rate limits are bypassed.
-        let trusted = [net("10.0.0.0/8")];
-        let got = client_ip(ip("203.0.113.7"), &xff("1.2.3.4"), &trusted);
-        assert_eq!(got, client("203.0.113.7"));
-    }
-
-    #[test]
-    fn trusted_proxy_uses_rightmost_untrusted_forwarded_entry() {
-        // Behind a trusted proxy, the client is the rightmost `X-Forwarded-For` entry that
-        // isn't itself a trusted hop — a client-appended left entry can't
-        // impersonate someone else.
-        let trusted = [net("10.0.0.0/8")];
-        let got = client_ip(
-            ip("10.0.0.1"),
-            &xff("9.9.9.9, 203.0.113.7, 10.0.0.2"),
-            &trusted,
-        );
-        assert_eq!(got, client("203.0.113.7"));
-    }
-
-    /// A WebSocket is secure (umode +Z) only when a trusted proxy says every
-    /// hop was HTTPS: a direct client's own header, a mixed chain, or a
-    /// missing header is plaintext.
-    #[test]
-    fn only_a_trusted_all_https_forwarded_proto_is_secure() {
-        let trusted = [net("10.0.0.0/8")];
-        let proto = |values: &[&str]| {
-            let mut headers = axum::http::HeaderMap::new();
-            for value in values {
-                headers.append("x-forwarded-proto", value.parse().expect("header"));
-            }
-            headers
-        };
-        let secure = |peer: &str, values: &[&str]| {
-            super::oidc::forwarded_https(ip(peer), &proto(values), &trusted)
-        };
-        assert!(secure("10.0.0.1", &["https"]));
-        assert!(secure("10.0.0.1", &["HTTPS", "https"]));
-        assert!(!secure("203.0.113.7", &["https"]), "untrusted peer");
-        assert!(!secure("10.0.0.1", &["https, http"]), "a plaintext hop");
-        assert!(!secure("10.0.0.1", &["https", "http"]), "a plaintext hop");
-        assert!(!secure("10.0.0.1", &[]), "no header");
-    }
-
-    #[test]
-    fn trusted_proxy_without_header_falls_back_to_peer() {
-        let trusted = [net("10.0.0.0/8")];
-        let got = client_ip(ip("10.0.0.1"), &axum::http::HeaderMap::new(), &trusted);
-        assert_eq!(got, client("10.0.0.1"));
-    }
-
-    #[test]
-    fn all_forwarded_entries_trusted_falls_back_to_peer() {
-        let trusted = [net("10.0.0.0/8")];
-        let got = client_ip(ip("10.0.0.1"), &xff("10.0.0.9, 10.0.0.8"), &trusted);
-        assert_eq!(got, client("10.0.0.1"));
-    }
-
-    #[test]
-    fn multiple_forwarded_headers_are_joined_in_order() {
-        // A proxy that appends a *separate* X-Forwarded-For header rather than
-        // merging: the client-supplied first header must not win over the
-        // proxy's appended one. The real client (the appended header's rightmost
-        // untrusted entry) is returned, not the spoofed 6.6.6.6 in the first.
-        let trusted = [net("10.0.0.0/8")];
-        let mut h = axum::http::HeaderMap::new();
-        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
-        h.append("x-forwarded-for", "203.0.113.7, 10.0.0.2".parse().unwrap());
-        assert_eq!(
-            client_ip(ip("10.0.0.1"), &h, &trusted),
-            client("203.0.113.7")
-        );
-    }
-
-    #[test]
-    fn port_annotated_and_bracketed_forwarded_entries_are_parsed() {
-        // Some proxies emit `ip:port` / `[ip6]:port`. A bare IpAddr parse would
-        // reject these and skip past the real client to a spoofable entry or the
-        // proxy IP; the resolver must recover the address.
-        let trusted = [net("10.0.0.0/8")];
-        // Rightmost non-trusted entry is a port-annotated IPv4 client.
-        assert_eq!(
-            client_ip(
-                ip("10.0.0.1"),
-                &xff("1.2.3.4, 203.0.113.7:52833, 10.0.0.2"),
-                &trusted
-            ),
-            client("203.0.113.7"),
-        );
-        // Bracketed IPv6 with a port.
-        assert_eq!(
-            client_ip(
-                ip("10.0.0.1"),
-                &xff("[2001:db8::5]:443, 10.0.0.2"),
-                &trusted
-            ),
-            client("2001:db8::5"),
-        );
-        // Bracketed IPv6 with no port.
-        assert_eq!(
-            client_ip(ip("10.0.0.1"), &xff("[2001:db8::9]"), &trusted),
-            client("2001:db8::9"),
-        );
-        // A port-annotated *trusted* hop is still recognized as trusted (parsed,
-        // then matched), so it's skipped rather than mis-returned as the client.
-        assert_eq!(
-            client_ip(ip("10.0.0.1"), &xff("203.0.113.7, 10.0.0.2:9000"), &trusted),
-            client("203.0.113.7"),
-        );
-    }
-
-    /// A dual-stack listener presents an IPv4 proxy or client in its mapped
-    /// IPv6 spelling. The trusted-proxy match, each forwarded entry, and the
-    /// resolved key are all judged in the canonical IPv4 form, or a mapped
-    /// proxy is not recognised as trusted and every client behind it collapses
-    /// onto the proxy's address.
-    #[test]
-    fn mapped_ipv4_peers_and_entries_are_canonical() {
-        let trusted = [net("10.0.0.0/8")];
-        let got = client_ip(ip("::ffff:10.0.0.1"), &xff("203.0.113.7"), &trusted);
-        assert_eq!(got, client("203.0.113.7"));
-        assert_eq!(got.ip(), ip("203.0.113.7"));
-        assert_eq!(
-            client_ip(
-                ip("::ffff:10.0.0.1"),
-                &xff("::ffff:203.0.113.7, ::ffff:10.0.0.2"),
-                &trusted
-            )
-            .ip(),
-            ip("203.0.113.7"),
-        );
-        assert_eq!(
-            client_ip(ip("::ffff:198.51.100.4"), &xff("1.2.3.4"), &trusted).ip(),
-            ip("198.51.100.4"),
-            "an untrusted mapped peer is its own IPv4 address"
-        );
-        assert_eq!(client("::ffff:192.0.2.1").to_string(), "192.0.2.1");
-    }
-    /// An entry a trusted proxy passed on that is not an address — nginx
-    /// writes `unix:` for a client on a Unix socket — breaks the chain it
-    /// vouches for: what lies left of it is only what the client wrote.
-    /// Skipping it let a client choose its own address (its per-IP slots, its
-    /// authentication budget, a ban it evades); the request is refused.
-    #[test]
-    fn an_unusable_forwarded_entry_before_the_client_is_refused() {
-        let trusted = [net("10.0.0.0/8")];
-        for chain in [
-            "6.6.6.6, unix:",
-            "6.6.6.6, unix:, 10.0.0.2",
-            "6.6.6.6,, 10.0.0.2",
-            "6.6.6.6, garbage",
-        ] {
-            let refused = super::client_ip(ip("10.0.0.1"), &xff(chain), &trusted)
-                .expect_err("the chain is broken before any client address");
-            assert!(
-                refused.to_string().contains("is not an address"),
-                "{refused}"
-            );
-        }
-        // Past the client's own address nothing further left is read, so an
-        // unusable entry there is the client's own business.
-        assert_eq!(
-            client_ip(
-                ip("10.0.0.1"),
-                &xff("unix:, 203.0.113.7, 10.0.0.2"),
-                &trusted
-            ),
-            client("203.0.113.7")
-        );
-        // A header with no entries names no client, as no header does.
-        assert_eq!(
-            client_ip(ip("10.0.0.1"), &xff(" "), &trusted),
-            client("10.0.0.1")
-        );
-        // An untrusted peer's header is never read.
-        assert_eq!(
-            client_ip(ip("203.0.113.9"), &xff("unix:"), &trusted),
-            client("203.0.113.9")
-        );
+        ClientIp::new(s.parse().expect("an address"))
     }
 }
 

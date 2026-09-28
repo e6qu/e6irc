@@ -24,7 +24,15 @@ const USAGE: &str = "usage:\n  \
                                      probe the running server's /healthz (or\n  \
                                      /readyz); exit 0 only on HTTP 200. The\n  \
                                      address is --addr, else E6IRC_HTTP_ADDR,\n  \
-                                     else that variable's default\n\
+                                     else that variable's default\n  \
+    e6ircd edge [--config <path>]   hold client connections for a core in\n  \
+                                     another process (default e6irc-edge.toml)\n  \
+    e6ircd edge-credentials init --dir <dir>\n  \
+                                     write the core link's certificate\n  \
+                                     authority and the core's certificate\n  \
+    e6ircd edge-credentials issue --dir <dir> --edge <name>\n  \
+                                     write one edge's certificate, signed by\n  \
+                                     that authority\n\
 <configuration> is one of:\n  \
     --config <path>                 a TOML file (default: e6irc.toml)\n  \
     --config-from-environment       the E6IRC_* variables a container is\n  \
@@ -49,6 +57,8 @@ fn main() -> ExitCode {
         Some("recover-administrator") => recover_administrator(&args[1..]),
         Some("check-config") => check_config(&args[1..]),
         Some("healthcheck") => healthcheck(&args[1..]),
+        Some("edge") => edge(&args[1..]),
+        Some("edge-credentials") => edge_credentials(&args[1..]),
         Some("--version") => version(&args[1..]),
         _ => run(&args),
     }
@@ -68,6 +78,97 @@ fn version(args: &[String]) -> ExitCode {
         e6ircd::BUILD_REVISION
     );
     ExitCode::SUCCESS
+}
+
+/// `e6ircd edge`: hold client connections for a core in another process
+/// (DESIGN §19). Runs until a shutdown signal, then closes its clients,
+/// loudly.
+fn edge(args: &[String]) -> ExitCode {
+    const CONTEXT: &str = "e6ircd edge";
+    let path = match args {
+        [] => PathBuf::from("e6irc-edge.toml"),
+        [flag, path] if flag == "--config" => PathBuf::from(path),
+        _ => return usage_error(),
+    };
+    let config = match std::fs::read_to_string(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|text| {
+            toml::from_str::<e6irc_edge::process::EdgeConfig>(&text)
+                .map_err(|error| describe_parse_error(error, Some(&text)))
+        }) {
+        Ok(config) => config,
+        Err(failure) => {
+            eprintln!("{CONTEXT}: {failure} ({})", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async {
+        let mut signals = match ShutdownSignals::install() {
+            Ok(signals) => signals,
+            Err(error) => {
+                eprintln!("{CONTEXT}: cannot install the shutdown signal handlers: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // The core's own monitoring token, read by the core's own rule.
+        let monitoring = match e6ircd::http::monitoring_token_digest_from_env() {
+            Ok(digest) => digest.map(|digest| {
+                e6irc_edge::metrics::MonitoringToken::new(move |presented| {
+                    e6ircd::http::monitoring_token_matches(&digest, presented)
+                })
+            }),
+            Err(error) => {
+                eprintln!("{CONTEXT}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match e6irc_edge::process::run(config, signals.received(), monitoring).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{CONTEXT}: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// `e6ircd edge-credentials init|issue`: the core link's certificates
+/// ([`e6ircd::edge_credentials`]).
+fn edge_credentials(args: &[String]) -> ExitCode {
+    const CONTEXT: &str = "e6ircd edge-credentials";
+    let written = match args {
+        [command, flag, dir] if command == "init" && flag == "--dir" => {
+            e6ircd::edge_credentials::init(std::path::Path::new(dir))
+        }
+        [command, dir_flag, dir, edge_flag, edge]
+            if command == "issue" && dir_flag == "--dir" && edge_flag == "--edge" =>
+        {
+            match e6irc_link::EdgeName::new(edge) {
+                Ok(edge) => e6ircd::edge_credentials::issue(std::path::Path::new(dir), &edge),
+                Err(error) => {
+                    eprintln!("{CONTEXT}: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        _ => return usage_error(),
+    };
+    match written {
+        Ok(paths) => {
+            for path in paths {
+                println!("wrote {}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{CONTEXT}: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The whole probe -- connect, write, read -- must finish inside this, so a
@@ -522,6 +623,9 @@ fn run(args: &[String]) -> ExitCode {
                 let mut running = *running;
                 for addr in &running.addrs {
                     println!("listening on {addr}");
+                }
+                if let Some(addr) = running.http_addr {
+                    println!("http listening on {addr}");
                 }
                 // Run until a termination signal arrives, then shut down
                 // gracefully: stop accepting, notify clients, flush the PG write

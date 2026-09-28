@@ -62,8 +62,7 @@ fn authorized(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
     else {
         return false;
     };
-    let actual = super::bootstrap_token_digest(token);
-    aws_lc_rs::constant_time::verify_slices_are_equal(expected, &actual).is_ok()
+    super::monitoring_token_matches(expected, token)
 }
 
 fn unauthorized() -> Response {

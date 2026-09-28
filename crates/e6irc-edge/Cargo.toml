@@ -11,6 +11,9 @@ license.workspace = true
 [dependencies]
 e6irc-proto = { path = "../e6irc-proto" }
 e6irc-queue = { path = "../e6irc-queue" }
+# The core link's frames (DESIGN §19.2), for an edge whose core is another
+# process.
+e6irc-link = { path = "../e6irc-link" }
 # The versions and features e6ircd takes (its manifest records each publish
 # date against the 24h cooldown); cargo unifies them into one build.
 bytes = { version = "1.12.1", default-features = false }
@@ -41,9 +44,17 @@ rustls-pki-types = { version = "1.15.0", default-features = false, features = [
     "std",
     "alloc",
 ] }
-# SHA-256 of a certificate file's contents, to tell one version from another.
+# SHA-256 of a certificate file's contents, to tell one version from another,
+# and the random seed of an edge's connection-identifier count.
 aws-lc-rs = { version = "1.17.3", default-features = false, features = [
     "aws-lc-sys",
+] }
+# rustls-webpki 0.103.15 is already in the tree as rustls's certificate
+# verifier; named here because a core checks that an edge's certificate, which
+# the handshake verified, is issued for the edge its `Hello` names
+# (`core_link::tls::names_edge`), and rustls exposes no name check for a client.
+rustls-webpki = { version = "0.103.15", default-features = false, features = [
+    "std",
 ] }
 serde = { version = "1.0.228", default-features = false, features = [
     "std",
@@ -51,8 +62,29 @@ serde = { version = "1.0.228", default-features = false, features = [
 ] }
 # Operator-written address ranges, read in the canonical client spelling.
 ipnet = { version = "2.12.0", features = ["serde"] }
-# The WebSocket a `/ws/irc` or `/ws/ui` connection is framed on.
-axum = { version = "0.8.9", default-features = false, features = ["ws"] }
+# The WebSocket a `/ws/irc` or `/ws/ui` connection is framed on, and the
+# router every HTTP listener serves (`http::serve_http`); the features e6ircd
+# takes.
+axum = { version = "0.8.9", default-features = false, features = [
+    "http1",
+    "tokio",
+    "ws",
+] }
+# hyper 1.10.1, hyper-util 0.1.20 and tower 0.5.3 are already in the tree
+# through axum (and hyper's client through openidconnect's reqwest); named here
+# for the explicit HTTP serve loop, whose connection builder carries a timer so
+# the header-read timeout applies, and for the client an edge forwards its
+# HTTP to the core with over its link (DESIGN §19.1, "Plain HTTP").
+hyper = { version = "1.10.1", default-features = false, features = [
+    "http1",
+    "server",
+    "client",
+] }
+hyper-util = { version = "0.1.20", default-features = false, features = [
+    "tokio",
+    "service",
+] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 # tokio-tungstenite 0.29.0 (2026-03-17), already in the tree as the stack axum
 # serves WebSockets through, and held with it (e6ircd's manifest says why):
 # `/ws/irc` names its error type to tell a message over the size ceiling

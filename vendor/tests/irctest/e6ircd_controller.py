@@ -12,6 +12,13 @@ and managed-settings tables before each server so every test starts clean and
 imports that case's ephemeral listener and policy. Without it, the server runs
 DB-less exactly as before (the no-account green list).
 
+Set E6IRC_IRCTEST_EDGE=1 to run every case through an edge (DESIGN §19): the
+controller mints link credentials with `e6ircd edge-credentials`, starts a core
+in edge mode (`[edge_link]`, no listeners of its own) and an `e6ircd edge`
+holding the case's listeners, so each client reaches the core over the
+mutual-TLS core link. The server under test is the pair: either one exiting
+fails the case, and stopping the server stops both.
+
 Pinned against irctest commit a468d9fcd64abc72b02ecb20f4f8612fd72c8829
 (see vendor/tests/libera-snapshot/PROVENANCE.md for the vendoring policy; the
 irctest checkout itself is fetched, not vendored).
@@ -26,6 +33,7 @@ from irctest.basecontrollers import BaseServerController, DirectoryBasedControll
 from irctest.runner import NotImplementedByController
 
 _DB_URL = os.environ.get("E6IRC_IRCTEST_DB")
+_EDGE = os.environ.get("E6IRC_IRCTEST_EDGE") == "1"
 
 TEMPLATE_CONFIG = """
 server_name = "My.Little.Server"
@@ -35,9 +43,7 @@ description = "test server"
 motd = ["Welcome to the irctest server"]
 nicklen = 32
 
-[[listeners]]
-addr = "{hostname}:{port}"
-
+{listeners}
 [[oper]]
 name = "operuser"
 password = "operpassword"
@@ -61,10 +67,51 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
     # which the base DirectoryBasedController.registerUser drives.
     nickserv = "NickServ"
 
+    # The core behind the edge, when the case runs through one (`self.proc`
+    # is then the edge, which holds the port the case connects to).
+    core_proc: Optional[subprocess.Popen] = None
+
     def create_config(self) -> None:
         super().create_config()
         with self.open_file("e6irc.toml"):
             pass
+
+    def check_is_alive(self) -> None:
+        super().check_is_alive()
+        if self.core_proc is not None:
+            self.core_proc.poll()
+            if self.core_proc.returncode is not None:
+                raise RuntimeError(
+                    f"the core behind the edge returned {self.core_proc.returncode}"
+                )
+
+    def _stop_core(self) -> None:
+        if self.core_proc is None:
+            return
+        self.core_proc.terminate()
+        try:
+            self.core_proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.core_proc.kill()
+            self.core_proc.wait(10)
+        self.core_proc = None
+
+    def kill_proc(self) -> None:
+        super().kill_proc()
+        self._stop_core()
+
+    def terminate(self) -> None:
+        super().terminate()
+        self._stop_core()
+
+    def _credentials(self, *args: str) -> None:
+        assert self.directory
+        subprocess.run(
+            [self.binary_name, "edge-credentials", *args],
+            cwd=self.directory,
+            check=True,
+            capture_output=True,
+        )
 
     def wait_for_services(self) -> None:
         # Integrated services come up with the server, so there is nothing
@@ -140,16 +187,23 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
         self.create_config()
         assert self.directory
 
-        config = TEMPLATE_CONFIG.format(hostname=hostname, port=port)
+        listeners = f'[[listeners]]\naddr = "{hostname}:{port}"\n'
         # A websocket-IRC transport is served by a dedicated listener at the
         # requested host:port (served at the root path, which is what irctest's
         # WebSocketClientMock connects to: ws://host:port).
         if websocket_port is not None:
-            config += (
+            listeners += (
                 "\n[[listeners]]\n"
                 f'addr = "{websocket_hostname}:{websocket_port}"\n'
                 "websocket = true\n"
             )
+        link_hostname, link_port = (None, None)
+        if _EDGE:
+            # The listeners are the edge's; the core only links.
+            link_hostname, link_port = self.get_hostname_and_port()
+            config = TEMPLATE_CONFIG.format(listeners="")
+        else:
+            config = TEMPLATE_CONFIG.format(listeners=listeners)
         # draft/account-registration policy, which irctest varies per test case.
         config += (
             "\n[registration]\n"
@@ -180,10 +234,37 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
             )
             config += f'\n[database]\nurl = "{_DB_URL}"\n'
 
+        if _EDGE:
+            self._credentials("init", "--dir", "credentials")
+            self._credentials("issue", "--dir", "credentials", "--edge", "irctest")
+            config += (
+                "\n[edge_link]\n"
+                f'addr = "{link_hostname}:{link_port}"\n'
+                "ca = 'credentials/ca.pem'\n"
+                "cert = 'credentials/core.pem'\n"
+                "key = 'credentials/core-key.pem'\n"
+            )
+            with self.open_file("edge.toml") as fd:
+                fd.write(
+                    "[edge]\n"
+                    'name = "irctest"\n'
+                    f'core = ["{link_hostname}:{link_port}"]\n'
+                    "ca = 'credentials/ca.pem'\n"
+                    "cert = 'credentials/edge-irctest.pem'\n"
+                    "key = 'credentials/edge-irctest-key.pem'\n" + listeners
+                )
+
         with self.open_file("e6irc.toml") as fd:
             fd.write(config)
+        command = [self.binary_name, "--config", str(self.directory / "e6irc.toml")]
+        if not _EDGE:
+            self.proc = self.execute(command)
+            return
+        self.core_proc = self.execute(command, cwd=self.directory, proc_name="core")
         self.proc = self.execute(
-            [self.binary_name, "--config", str(self.directory / "e6irc.toml")],
+            [self.binary_name, "edge", "--config", str(self.directory / "edge.toml")],
+            cwd=self.directory,
+            proc_name="edge",
         )
 
 

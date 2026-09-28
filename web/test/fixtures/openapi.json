@@ -1300,6 +1300,86 @@
                             "null"
                           ]
                         },
+                        "edge_mode": {
+                          "description": "Whether the listeners are the linked edges' own configuration (edge mode); the settings' listeners then apply to single-process mode and are not changed here.",
+                          "type": "boolean"
+                        },
+                        "edges": {
+                          "description": "The edges linked now, with the listeners each reports; empty in single-process mode.",
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "link_version": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "linked_at": {
+                                "type": "string"
+                              },
+                              "listeners": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "addr": {
+                                      "type": "string"
+                                    },
+                                    "certificate": {
+                                      "description": "The certificate chain's path on the edge's host for a listener that terminates TLS; null for a plaintext one.",
+                                      "maxLength": 4096,
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
+                                    "kind": {
+                                      "enum": [
+                                        "irc",
+                                        "websocket",
+                                        "http",
+                                        "attach"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "proxy_protocol": {
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind",
+                                    "addr",
+                                    "certificate",
+                                    "proxy_protocol"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 64,
+                                "type": "array"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "slot": {
+                                "maximum": 16383,
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "upgrade_needed": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "name",
+                              "slot",
+                              "link_version",
+                              "upgrade_needed",
+                              "linked_at",
+                              "listeners"
+                            ],
+                            "type": "object"
+                          },
+                          "maxItems": 16383,
+                          "type": "array"
+                        },
                         "has_master_key": {
                           "type": "boolean"
                         },
@@ -1339,7 +1419,9 @@
                         "has_master_key",
                         "master_key_count",
                         "release_revision",
-                        "network_drivers"
+                        "network_drivers",
+                        "edge_mode",
+                        "edges"
                       ],
                       "type": "object"
                     },
@@ -3351,7 +3433,7 @@
     },
     "/api/v1/admin/connections": {
       "get": {
-        "description": "Returns a bounded newest-first projection of registered clients across TCP, TLS, WebSocket, and the local in-process transport. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. Nick and account filters use RFC1459 case-folding. before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
+        "description": "Returns a bounded newest-first projection of registered clients across TCP, TLS, WebSocket, and the local in-process transport. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. Nick and account filters use RFC1459 case-folding. IDs identify exact live resources and promise no order; pages run newest-first in the order the server opened the connections, and before_id takes the page's next_before_id cursor, selecting strictly older connections, so a connection opened during a walk cannot duplicate into, or go missing from, an older page.",
         "parameters": [
           {
             "in": "query",
@@ -3937,7 +4019,8 @@
                               "database",
                               "bouncer",
                               "http",
-                              "configuration"
+                              "configuration",
+                              "link"
                             ],
                             "type": "string"
                           },
@@ -7365,7 +7448,7 @@
     },
     "/api/v1/me/connections": {
       "get": {
-        "description": "Returns only registered connections currently authenticated to the caller. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. IDs identify exact live resources; before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
+        "description": "Returns only registered connections currently authenticated to the caller. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. IDs identify exact live resources and promise no order; pages run newest-first in the order the server opened the connections, and before_id takes the page's next_before_id cursor, selecting strictly older connections, so a connection opened during a walk cannot duplicate into, or go missing from, an older page.",
         "parameters": [
           {
             "in": "query",
@@ -11483,7 +11566,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "this process serves (role \"serving\") and all configured dependencies are ready"
+            "description": "this process serves (role \"serving\") and all configured dependencies are ready; in edge mode `edges` gives this core's link version and each linked edge's, with whether it must be upgraded before the next core release"
           },
           "408": {
             "description": "the request passed the 30-second deadline (a problem document)"

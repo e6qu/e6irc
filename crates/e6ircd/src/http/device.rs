@@ -266,6 +266,64 @@ struct ConfigurationRuntimeResponse {
     master_key_count: usize,
     release_revision: Option<String>,
     network_drivers: Vec<&'static str>,
+    /// Whether this core runs in edge mode (DESIGN §19), where the listeners
+    /// and their certificates are the edges' own configuration: shown here
+    /// as the linked edges report them, and not changed here. The stored
+    /// listeners apply to single-process mode.
+    edge_mode: bool,
+    edges: Vec<ConfigurationEdgeResponse>,
+}
+
+/// One linked edge, as the console shows it.
+#[derive(serde::Serialize)]
+struct ConfigurationEdgeResponse {
+    name: String,
+    slot: u16,
+    link_version: u16,
+    upgrade_needed: bool,
+    linked_at: String,
+    listeners: Vec<ConfigurationEdgeListener>,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigurationEdgeListener {
+    kind: &'static str,
+    addr: std::net::SocketAddr,
+    /// The certificate chain's path on the edge's host, for a TLS listener.
+    certificate: Option<String>,
+    proxy_protocol: bool,
+}
+
+fn configuration_edges(state: &AppState) -> Vec<ConfigurationEdgeResponse> {
+    let Some(edges) = &state.linked_edges else {
+        return Vec::new();
+    };
+    edges
+        .views()
+        .into_iter()
+        .map(|edge| ConfigurationEdgeResponse {
+            upgrade_needed: edge.upgrade_needed(),
+            name: edge.name.to_string(),
+            slot: edge.slot.get(),
+            link_version: edge.newest_version,
+            linked_at: e6irc_proto::time::server_time(edge.linked_at),
+            listeners: edge
+                .listeners
+                .iter()
+                .map(|listener| ConfigurationEdgeListener {
+                    kind: match listener.kind {
+                        e6irc_link::ListenerKind::Irc => "irc",
+                        e6irc_link::ListenerKind::WebSocketIrc => "websocket",
+                        e6irc_link::ListenerKind::Http => "http",
+                        e6irc_link::ListenerKind::Attach => "attach",
+                    },
+                    addr: listener.addr,
+                    certificate: listener.certificate.clone(),
+                    proxy_protocol: listener.proxy_protocol,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -1349,6 +1407,8 @@ pub(super) async fn admin_configuration(
             master_key_count: state.secret_key.as_ref().map_or(0, |keys| keys.key_count()),
             release_revision: state.application_release_revision.clone(),
             network_drivers,
+            edge_mode: state.linked_edges.is_some(),
+            edges: configuration_edges(&state),
         },
     })
 }
@@ -1782,6 +1842,23 @@ pub(super) async fn admin_patch_configuration(
         );
     }
     let settings = body.settings.apply_to(&current.settings);
+    // In edge mode the listeners are the edges' (DESIGN §19.6, decision D9):
+    // the stored ones apply to single-process mode, and are not changed from
+    // a console that could not apply them.
+    if state.linked_edges.is_some()
+        && (settings.listeners != current.settings.listeners
+            || settings.bnc() != current.settings.bnc())
+    {
+        return problem(
+            StatusCode::CONFLICT,
+            "Listeners belong to the edges",
+            Some(
+                "This server runs in edge mode: each edge's own configuration names its \
+                 listeners and certificates. Send the listeners and the attach listener back \
+                 unchanged; they apply to single-process mode.",
+            ),
+        );
+    }
     if let Err(error) = settings.validate(state.bootstrap_context()) {
         return problem(
             StatusCode::BAD_REQUEST,

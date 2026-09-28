@@ -20,11 +20,13 @@ use crate::core::{
 };
 use crate::observability::{ErrorKind, Telemetry};
 use crate::serving_lease::{self, AcquireRefusal, HolderId, ServingLease};
-use e6irc_edge::address::{ClientIp, ConnGuard, ConnLimiter, PeerRefusal, PeerRefusalLog};
+use e6irc_edge::address::ConnLimiter;
 use e6irc_edge::certificate::{CertificateReloads, Hangups, install_crypto_provider};
 use e6irc_edge::connection::{
     AcceptContext, CLOSING_DRAIN, ConnectionTasks, accept_loop, bind_listener,
 };
+use e6irc_edge::http::{HttpAdmission, serve_http};
+pub(crate) use e6irc_edge::http::{HttpStreamReclaim, UpgradedStream};
 use e6irc_queue::{Policy, Receiver, queue};
 
 /// How often the liveness reaper tick fires (seconds); the reaper's own
@@ -33,32 +35,35 @@ const REAP_TICK_MILLIS: u64 = 15_000;
 const TIMER_WHEEL_RESOLUTION_MILLIS: u64 = 1_000;
 const TIMER_WHEEL_SLOTS: usize = 64;
 
-fn random_connection_id_start() -> io::Result<NonZeroU64> {
+/// This process's own connection identifiers, from a random start. In edge
+/// mode the edges allocate theirs within the slots the core gives them
+/// (DESIGN §19.2), so the core's own sessions (the `local` driver's) count
+/// within slot 0, which no edge is ever given: the two cannot collide.
+fn connection_ids(edge_mode: bool) -> io::Result<ConnectionIdAllocator> {
     use aws_lc_rs::rand::SecureRandom;
 
     let mut bytes = [0u8; 8];
     aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| io::Error::other("system RNG failed while seeding connection identifiers"))?;
+    let random = u64::from_le_bytes(bytes);
+    if edge_mode {
+        // Slot 0 ends where slot 1 begins; the start is in its lower half, so
+        // the upper half is left to count through.
+        let end = e6irc_link::Slot::new(1).expect("slot 1").first_id();
+        let first = NonZeroU64::new((random & (end / 2 - 1)) | 1).expect("an odd start");
+        let ids = ConnectionIdAllocator::new(first);
+        ids.restart_at((first, end));
+        return Ok(ids);
+    }
     // Keep the top two bits clear: cursor input is parsed as signed SQL-style
     // int64 at the HTTP boundary, while the remaining 62 random/counter bits
     // still leave more connection identifiers than one process can consume.
-    let value = (u64::from_le_bytes(bytes) & (u64::MAX >> 2)) | 1;
-    NonZeroU64::new(value)
-        .ok_or_else(|| io::Error::other("connection identifier seed was unexpectedly zero"))
+    let value = (random & (u64::MAX >> 2)) | 1;
+    let first = NonZeroU64::new(value)
+        .ok_or_else(|| io::Error::other("connection identifier seed was unexpectedly zero"))?;
+    Ok(ConnectionIdAllocator::new(first))
 }
-
-/// How long a client may take to send one request's complete header block.
-/// hyper starts the same timer the moment a kept-alive connection goes idle
-/// (waiting for the next request's headers), so this is also the idle
-/// keep-alive timeout: a connection that sends nothing for this long is closed.
-const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// HTTP connections one address may hold open at once. A browser opens a
-/// handful per origin; this leaves room for many behind one address. A
-/// trusted reverse proxy is exempt — every client behind it shares its
-/// address — and its clients are bounded per request, by forwarded address.
-const MAX_HTTP_CONNECTIONS_PER_IP: usize = 128;
 
 /// Requests one client address may have in the HTTP service at once (see
 /// `http::RequestAdmission`). A browser opens a handful of connections per
@@ -116,6 +121,8 @@ pub struct Running {
     pub http_addr: Option<SocketAddr>,
     /// Bound BNC listener address, when configured.
     pub bnc_addr: Option<SocketAddr>,
+    /// In edge mode, the bound address edges link to.
+    pub edge_link_addr: Option<SocketAddr>,
     /// Drives the graceful-shutdown sequence (stop accepting, notify clients,
     /// flush the PG write queue). Held by `main` and consumed on a signal.
     pub shutdown: ShutdownHandle,
@@ -169,6 +176,9 @@ pub struct ShutdownHandle {
     bnc_registry: Option<Arc<crate::bouncer::Registry>>,
     /// Every client connection's task, waited for once the core has stopped.
     connections: ConnectionTasks,
+    /// In edge mode, the links to the edges, ended once the core has stopped
+    /// so each sends what its sessions were last given.
+    edge_links: Option<Arc<crate::edge_link::LinkServer>>,
     /// The serving lease, given back last — after the flush, so nothing this
     /// process writes can land after a standby has taken over. `None` without
     /// a database.
@@ -318,7 +328,12 @@ impl ShutdownHandle {
         // 4. The core is gone, and with it every session's send queue: each
         //    connection now delivers what it is still owed — its closing
         //    ERROR — and closes. Wait for that, bounded, or dropping the
-        //    runtime would cancel the writes.
+        //    runtime would cancel the writes. In edge mode each link is one
+        //    of these: it sends what its sessions were last given, then
+        //    closes, and the edge delivers it.
+        if let Some(links) = self.edge_links.take() {
+            links.end_links();
+        }
         let unclosed = self
             .connections
             .drained_within(connection_drain_timeout)
@@ -512,21 +527,7 @@ fn spawn_bnc_listener(
         next_conn,
         sendq_bytes,
     } = context;
-    let serving = telemetry.clone();
-    let port = crate::bouncer::AttachPort::new(move |link, client| {
-        let registry = registry.clone();
-        let pool = pool.clone();
-        let server_name = server_name.clone();
-        let telemetry = serving.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
-            {
-                telemetry.record_error(ErrorKind::Bouncer);
-                eprintln!("bnc connection from {client} failed: {e}");
-            }
-        });
-    });
+    let port = attach_port(registry, pool, server_name, telemetry.clone());
     tokio::spawn(accept_loop(
         listener,
         AcceptContext {
@@ -537,15 +538,40 @@ fn spawn_bnc_listener(
             limiter,
             telemetry,
             connections,
+            proxy_protocol: None,
         },
     ))
+}
+
+/// The attach logic as a session of the core link reaches it: each session
+/// opened is served by `bouncer::bnc_serve`, whichever edge accepted it.
+fn attach_port(
+    registry: Arc<crate::bouncer::Registry>,
+    pool: sqlx::PgPool,
+    server_name: String,
+    telemetry: Arc<Telemetry>,
+) -> crate::bouncer::AttachPort {
+    crate::bouncer::AttachPort::new(move |link, client| {
+        let registry = registry.clone();
+        let pool = pool.clone();
+        let server_name = server_name.clone();
+        let telemetry = telemetry.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
+            {
+                telemetry.record_error(ErrorKind::Bouncer);
+                eprintln!("bnc connection from {client} failed: {e}");
+            }
+        });
+    })
 }
 
 /// Unix-epoch milliseconds. Message timestamps are stamped from this, and
 /// `server-time` is specified to millisecond precision — a whole-second clock
 /// would give every message in the same second an identical `time=` tag,
 /// which CHATHISTORY cannot page through.
-fn wall_clock() -> e6irc_proto::time::Millis {
+pub(crate) fn wall_clock() -> e6irc_proto::time::Millis {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970")
@@ -570,13 +596,16 @@ fn mono_clock() -> e6irc_proto::time::MonoMillis {
 /// Whether the process serves HTTP: the `[http]` listener, or a WebSocket IRC
 /// listener, which is served by the same application state.
 fn serves_http(config: &Config) -> bool {
-    config.http.is_some() || config.listeners.iter().any(|listener| listener.websocket)
+    config.http.is_some()
+        || config.edge_link.is_some()
+        || config.listeners.iter().any(|listener| listener.websocket)
 }
 
 /// What [`start`] reads from outside the configuration document that needs
 /// neither the network nor the database, judged by the very functions `start`
-/// uses: the monitoring token from the environment and every TLS certificate
-/// and key pair the configuration names. `e6ircd check-config` runs this after
+/// uses: the monitoring token from the environment, every TLS certificate
+/// and key pair the configuration names, and the core-link credentials of
+/// `[edge_link]`. `e6ircd check-config` runs this after
 /// the parse-and-validate [`Config::load`] does, so a configuration it passes
 /// cannot fail `start` over a malformed variable or an unreadable key file.
 /// (With a database, the listeners and `[bnc]` in force come from the stored
@@ -592,6 +621,10 @@ pub fn check_offline(config: &Config) -> io::Result<()> {
     }
     if serves_http(config) {
         crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
+    }
+    if let Some(edge_link) = &config.edge_link {
+        e6irc_edge::core_link::tls::LinkCredentials::load(&edge_link.credentials)?
+            .core_acceptor()?;
     }
     crate::config::load_configured_certificates(config)
 }
@@ -844,7 +877,7 @@ impl StandbyHealth {
         Ok(Self(AbortOnDrop(tokio::spawn(serve_http(
             listener,
             router,
-            HttpAdmission::new(trusted_proxies),
+            HttpAdmission::new(e6irc_edge::address::TrustedProxies::new(trusted_proxies)),
             Arc::new(Telemetry::new()),
         )))))
     }
@@ -1057,7 +1090,7 @@ async fn serve(
         listeners.push(watcher.abort_handle());
     }
 
-    let next_conn = Arc::new(ConnectionIdAllocator::new(random_connection_id_start()?));
+    let next_conn = Arc::new(connection_ids(config.edge_link.is_some())?);
 
     // An account's authority changed by another process (`e6ircd
     // recover-administrator`, a hand-written row) is followed here (DESIGN
@@ -1224,8 +1257,10 @@ async fn serve(
         tokio::spawn(certificates.clone().run(hangups)),
         critical_tx.clone(),
     ));
-    let bnc_listener = match (&pool, &bnc_registry) {
-        (Some(pool), Some(registry)) => Some(Arc::new(BncListenerController::new(
+    // In edge mode the attach listener is the edges' (their own
+    // configuration); the core serves the attach sessions they open.
+    let bnc_listener = match (&pool, &bnc_registry, &config.edge_link) {
+        (Some(pool), Some(registry), None) => Some(Arc::new(BncListenerController::new(
             BncAttachContext {
                 registry: registry.clone(),
                 pool: pool.clone(),
@@ -1242,10 +1277,14 @@ async fn serve(
     };
     let mut bnc_addr = None;
     if let Some(bnc) = &config.bnc {
-        let controller = bnc_listener
-            .as_ref()
-            .expect("config validation guarantees [database] when [bnc] is set");
-        bnc_addr = Some(controller.enable(bnc).await?);
+        match &bnc_listener {
+            Some(controller) => bnc_addr = Some(controller.enable(bnc).await?),
+            None => eprintln!(
+                "e6ircd: the stored attach listener ({}) applies to single-process mode; in \
+                 edge mode each edge's own configuration names its attach listener",
+                bnc.addr
+            ),
+        }
     }
     if let (Some(pool), Some(settings)) = (&pool, &managed_config) {
         let sampler = tokio::spawn(crate::observability::run_sampler(
@@ -1285,6 +1324,13 @@ async fn serve(
             ));
         }
     }
+
+    // Edge mode's shared state: the upgrades the core authorizes for its edges
+    // to complete, and the edges linked now.
+    let edge_mode = config.edge_link.as_ref().map(|_| EdgeModeState {
+        upgrades: Arc::default(),
+        edges: Arc::default(),
+    });
 
     // One shared HTTP `AppState`, built when either the HTTP server or any
     // dedicated websocket-IRC listener needs it, so both serve against the same
@@ -1407,6 +1453,8 @@ async fn serve(
                 .as_ref()
                 .map(|bootstrap| crate::http::bootstrap_token_digest(&bootstrap.token)),
             bootstrap_available: std::sync::atomic::AtomicBool::new(bootstrap_available),
+            edge_upgrades: edge_mode.as_ref().map(|mode| mode.upgrades.clone()),
+            linked_edges: edge_mode.as_ref().map(|mode| mode.edges.clone()),
         }))
     } else {
         None
@@ -1422,7 +1470,9 @@ async fn serve(
             let http_task = tokio::spawn(serve_http(
                 listener,
                 crate::http::router(state.clone()),
-                HttpAdmission::for_state(&state),
+                HttpAdmission::new(e6irc_edge::address::TrustedProxies::new(
+                    state.trusted_proxies.clone(),
+                )),
                 telemetry.clone(),
             ));
             listeners.push(supervise_listener(
@@ -1610,7 +1660,76 @@ async fn serve(
     }
 
     let mut addrs = Vec::new();
-    for listener_config in &config.listeners {
+    let mut edge_links = None;
+    let mut edge_link_addr = None;
+    if let (Some(edge_link), Some(mode)) = (&config.edge_link, &edge_mode) {
+        let credentials =
+            e6irc_edge::core_link::tls::LinkCredentials::load(&edge_link.credentials)?;
+        let listener = bind_listener(edge_link.addr)?;
+        edge_link_addr = Some(listener.local_addr()?);
+        let flood =
+            crate::core::CommandFlood::new(config.limits.command_burst, config.limits.command_rate)
+                .map_err(io::Error::other)?;
+        let server = Arc::new(crate::edge_link::LinkServer::new(
+            crate::edge_link::LinkServerParts {
+                acceptor: credentials.core_acceptor()?,
+                epoch: lease.as_ref().map_or(0, ServingLease::epoch),
+                terms: e6irc_link::EdgeTerms {
+                    trusted_proxies: config
+                        .limits
+                        .trusted_proxies
+                        .iter()
+                        .map(|network| (network.network(), network.prefix_len()))
+                        .collect(),
+                    max_connections_per_ip: config
+                        .limits
+                        .max_connections_per_ip
+                        .map(|limit| u32::try_from(limit).unwrap_or(u32::MAX)),
+                    sendq_bytes: u32::try_from(config.sendq_bytes).map_err(|_| {
+                        io::Error::other("sendq_bytes is past what a core link carries")
+                    })?,
+                    command_flood: Some(e6irc_link::CommandFloodTerms {
+                        burst: flood.burst(),
+                        rate: flood.rate(),
+                    }),
+                    line_credit: crate::edge_link::line_credit(config.core_queue),
+                },
+                sendq_bytes: config.sendq_bytes,
+                core_tx: core_tx.clone(),
+                attach: match (&pool, &bnc_registry) {
+                    (Some(pool), Some(registry)) => Some(attach_port(
+                        registry.clone(),
+                        pool.clone(),
+                        config.server_name.clone(),
+                        telemetry.clone(),
+                    )),
+                    _ => None,
+                },
+                upgrades: mode.upgrades.clone(),
+                limiter: limiter.clone(),
+                telemetry: telemetry.clone(),
+                connections: connections.clone(),
+                edges: mode.edges.clone(),
+                pool: pool.clone(),
+                http: app_state.as_ref().map(crate::http::LinkRouters::for_state),
+            },
+        ));
+        eprintln!(
+            "e6ircd: edge mode: edges link at {}",
+            edge_link_addr.expect("bound above")
+        );
+        listeners.push(supervise_listener(
+            "core link listener",
+            tokio::spawn(crate::edge_link::serve(listener, server.clone())),
+            critical_tx.clone(),
+        ));
+        edge_links = Some(server);
+    }
+    for listener_config in config
+        .listeners
+        .iter()
+        .filter(|_| config.edge_link.is_none())
+    {
         let listener = bind_listener(listener_config.addr)?;
         addrs.push(listener.local_addr()?);
         if listener_config.websocket {
@@ -1623,7 +1742,9 @@ async fn serve(
             let ws_task = tokio::spawn(serve_http(
                 listener,
                 crate::http::ws_irc_router(state.clone()),
-                HttpAdmission::for_state(&state),
+                HttpAdmission::new(e6irc_edge::address::TrustedProxies::new(
+                    state.trusted_proxies.clone(),
+                )),
                 telemetry.clone(),
             ));
             listeners.push(supervise_listener(
@@ -1647,6 +1768,7 @@ async fn serve(
                 limiter: limiter.clone(),
                 telemetry: telemetry.clone(),
                 connections: connections.clone(),
+                proxy_protocol: None,
             },
         ));
         listeners.push(supervise_listener(
@@ -1660,6 +1782,7 @@ async fn serve(
         addrs,
         http_addr,
         bnc_addr,
+        edge_link_addr,
         shutdown: ShutdownHandle {
             listeners,
             core_tx: Some(core_tx),
@@ -1669,9 +1792,16 @@ async fn serve(
             bnc_listener,
             bnc_registry,
             connections,
+            edge_links,
             lease: lease.take(),
         },
     })
+}
+
+/// Edge mode's state shared by the HTTP service and the link listener.
+struct EdgeModeState {
+    upgrades: Arc<crate::edge_link::EdgeUpgrades>,
+    edges: Arc<crate::edge_link::LinkedEdges>,
 }
 
 /// The registered channels (`(name_folded, founder)` rows) whose names JOIN
@@ -1683,185 +1813,6 @@ fn unjoinable_registered_channels(founders: &[(String, String)]) -> Vec<&str> {
         .map(|(name, _)| name.as_str())
         .filter(|name| crate::sanitize::ChannelName::parse(name).is_err())
         .collect()
-}
-
-/// Who may open an HTTP connection: at most [`MAX_HTTP_CONNECTIONS_PER_IP`]
-/// from one address, except a trusted reverse proxy. One instance per
-/// listener — an HTTP connection is not an IRC session, and must not spend the
-/// IRC listeners' per-address budget.
-struct HttpAdmission {
-    connections: ConnLimiter,
-    trusted_proxies: Vec<ipnet::IpNet>,
-}
-
-impl HttpAdmission {
-    fn new(trusted_proxies: Vec<ipnet::IpNet>) -> Self {
-        Self {
-            connections: ConnLimiter::new(Some(MAX_HTTP_CONNECTIONS_PER_IP)),
-            trusted_proxies,
-        }
-    }
-
-    fn for_state(state: &crate::http::AppState) -> Self {
-        Self::new(state.trusted_proxies.clone())
-    }
-}
-
-/// Serve HTTP/1.1 (with WebSocket upgrades) on `listener`.
-///
-/// Written out rather than `axum::serve`, which builds its connection builder
-/// without a timer: hyper then silently drops its header-read timeout, and a
-/// peer that sends half a header block — or holds a kept-alive connection idle
-/// — keeps its socket and task forever. Here every connection has a timer and
-/// [`HTTP_HEADER_READ_TIMEOUT`], its writes are bounded by
-/// [`e6irc_edge::peer_write::PEER_WRITE_DEADLINE`] (so a client that asks for a
-/// large response and stops reading loses the connection instead of holding
-/// it), and the per-address connection cap is applied at accept, before any
-/// work is spent on the peer.
-async fn serve_http(
-    listener: TcpListener,
-    router: axum::Router,
-    admission: HttpAdmission,
-    telemetry: Arc<Telemetry>,
-) {
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // Transient accept errors (EMFILE etc.) must not kill the
-                // listener; retrying is the correct handling.
-                telemetry.record_error(ErrorKind::Accept);
-                eprintln!("http accept error: {error}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let client = ClientIp::new(peer.ip());
-        let guard = if admission
-            .trusted_proxies
-            .iter()
-            .any(|net| net.contains(&client.ip()))
-        {
-            None
-        } else {
-            match admission.connections.try_acquire(client) {
-                Some(guard) => Some(guard),
-                None => {
-                    telemetry.record_connection_rejected();
-                    admission
-                        .connections
-                        .refusals()
-                        .note(client, PeerRefusal::PerIpLimit, None);
-                    continue;
-                }
-            }
-        };
-        let refusals = admission.connections.refusals().clone();
-        tokio::spawn(serve_http_connection(
-            stream,
-            peer,
-            router.clone(),
-            guard,
-            refusals,
-            telemetry.clone(),
-            e6irc_edge::peer_write::PEER_WRITE_DEADLINE,
-        ));
-    }
-}
-
-async fn serve_http_connection(
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-    router: axum::Router,
-    _guard: Option<ConnGuard>,
-    refusals: Arc<PeerRefusalLog>,
-    telemetry: Arc<Telemetry>,
-    write_deadline: std::time::Duration,
-) {
-    use tower::ServiceExt;
-    let client = ClientIp::new(peer.ip());
-    if let Err(error) = stream.set_nodelay(true) {
-        telemetry.record_error(ErrorKind::ConnectionSetup);
-        refusals.note(client, PeerRefusal::SocketSetup, Some(&error));
-        return;
-    }
-    // Whether this connection has carried a request: hyper reports the same
-    // header timeout for a peer that never finished its first request and for
-    // a kept-alive connection that sat idle after one, and only the first is a
-    // refusal. A reverse proxy holding idle upstream connections hit the second
-    // every ten seconds and filled the log with "refused" lines.
-    let served_a_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let served_flag = served_a_request.clone();
-    // Every write — a response body, an upgraded WebSocket's frames — fails
-    // once the peer has taken nothing for `write_deadline`, which ends the
-    // connection ([`e6irc_edge::peer_write`]). A refusal answered before the
-    // request was read (a body over the limit) closes without a reset that
-    // would discard the answer ([`e6irc_edge::lingering_close`]). The stream is
-    // lent to hyper reclaimably, so an upgraded connection's own task can
-    // close it the same way when it is done with it.
-    let (stream, reclaim) =
-        e6irc_edge::lingering_close::Reclaimable::new(e6irc_edge::peer_write::DeadlineWriter::new(
-            e6irc_edge::lingering_close::LingeringClose::new(stream),
-            write_deadline,
-        ));
-    let upgraded = UpgradedStream(Arc::new(std::sync::Mutex::new(Some(reclaim))));
-    // `ConnectInfo` so handlers see the socket peer (rate limiting, and the
-    // forwarded-address resolution behind a trusted proxy).
-    let service = router.map_request(move |mut request: axum::http::Request<_>| {
-        served_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(peer));
-        request.extensions_mut().insert(upgraded.clone());
-        request
-    });
-    let served = hyper::server::conn::http1::Builder::new()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
-        .serve_connection(
-            hyper_util::rt::TokioIo::new(stream),
-            hyper_util::service::TowerToHyperService::new(service),
-        )
-        .with_upgrades()
-        .await;
-    match served {
-        Ok(()) => {}
-        // An idle kept-alive connection closed at the bound: ordinary.
-        Err(error)
-            if error.is_timeout()
-                && served_a_request.load(std::sync::atomic::Ordering::Relaxed) => {}
-        Err(error) if error.is_timeout() => {
-            refusals.note(client, PeerRefusal::HttpHeaderTimedOut, None);
-        }
-        // A peer that resets or abandons its connection mid-request: counted,
-        // not logged per occurrence.
-        Err(_) => telemetry.record_error(ErrorKind::Http),
-    }
-}
-
-/// The stream under an HTTP connection, as every request on it is handed it
-/// (a request extension). hyper drops an upgraded connection's stream without
-/// shutting it down, which with unread input is a reset that can destroy the
-/// last frames written; the handler that takes the upgrade claims this, and
-/// gets the stream back when the upgraded socket is dropped, to close it
-/// properly ([`e6irc_edge::lingering_close::close_within_bound`]).
-#[derive(Clone)]
-pub(crate) struct UpgradedStream(Arc<std::sync::Mutex<Option<HttpStreamReclaim>>>);
-
-/// The stream an HTTP connection serves.
-pub(crate) type HttpStream = e6irc_edge::peer_write::DeadlineWriter<
-    e6irc_edge::lingering_close::LingeringClose<tokio::net::TcpStream>,
->;
-
-/// Resolves to the HTTP connection's stream once hyper has dropped it.
-pub(crate) type HttpStreamReclaim = tokio::sync::oneshot::Receiver<HttpStream>;
-
-impl UpgradedStream {
-    /// Claim the stream for the upgrade this request asks for; `None` once
-    /// claimed (a connection is upgraded at most once).
-    pub(crate) fn claim(&self) -> Option<HttpStreamReclaim> {
-        self.0.lock().expect("upgraded stream lock").take()
-    }
 }
 
 async fn core_worker(
@@ -1892,6 +1843,28 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+    /// In edge mode the core's own sessions count within slot 0, which no
+    /// edge is given, so they cannot take an identifier an edge allocates.
+    #[test]
+    fn an_edge_mode_core_counts_its_own_sessions_in_slot_zero() {
+        let slot_one = e6irc_link::Slot::new(1).expect("slot 1").first_id();
+        for _ in 0..64 {
+            let id = connection_ids(true)
+                .expect("identifiers")
+                .allocate()
+                .expect("an identifier");
+            assert!(id.0 < slot_one / 2, "{} is in slot 0's lower half", id.0);
+        }
+        let id = connection_ids(false)
+            .expect("identifiers")
+            .allocate()
+            .expect("an identifier");
+        assert!(
+            id.0 < 1 << 62,
+            "the single process keeps the top two bits clear"
+        );
+    }
+
     /// A channel registered under a name the channel-name rule now refuses
     /// (a formatting control, say) is named at startup rather than preloaded
     /// silently as a registration no one can use.
@@ -1911,51 +1884,6 @@ mod tests {
     use crate::core::Input;
     use e6irc_queue::Sender;
     use std::pin::Pin;
-
-    /// A client that asks for a large response and never reads it held its
-    /// connection (and a slot of its address's connection cap) for as long as
-    /// it liked: nothing bounded a stalled body write. The connection now ends
-    /// once the client has taken nothing for the write deadline.
-    #[tokio::test]
-    async fn an_http_client_that_stops_reading_a_large_response_loses_the_connection() {
-        use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
-        const BODY: usize = 32 * 1024 * 1024;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address");
-        let client = tokio::net::TcpSocket::new_v4().expect("socket");
-        client.set_recv_buffer_size(4096).expect("receive buffer");
-        let mut client = client.connect(address).await.expect("connect");
-        let (stream, peer) = listener.accept().await.expect("accept");
-        socket2::SockRef::from(&stream)
-            .set_send_buffer_size(4096)
-            .expect("send buffer");
-        let router =
-            axum::Router::new().route("/large", axum::routing::get(|| async { vec![b'x'; BODY] }));
-        let telemetry = Arc::new(Telemetry::new());
-        let served = tokio::spawn(serve_http_connection(
-            stream,
-            peer,
-            router,
-            None,
-            Arc::new(PeerRefusalLog::new(Duration::from_secs(60))),
-            telemetry,
-            Duration::from_millis(200),
-        ));
-        client
-            .write_all(b"GET /large HTTP/1.1\r\nhost: test\r\n\r\n")
-            .await
-            .expect("request");
-        // The client never reads; the server's write stalls within the first
-        // few hundred kilobytes and must give up.
-        tokio::time::timeout(Duration::from_secs(20), served)
-            .await
-            .expect("a stalled response write ends the connection")
-            .expect("the connection task");
-        drop(client);
-    }
 
     #[tokio::test]
     async fn critical_task_outcomes_preserve_exit_and_panic_provenance() {
@@ -2197,6 +2125,7 @@ mod tests {
             bnc_listener: None,
             bnc_registry: None,
             connections: ConnectionTasks::default(),
+            edge_links: None,
             lease: None,
         }
     }

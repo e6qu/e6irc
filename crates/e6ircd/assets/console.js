@@ -1160,16 +1160,19 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (!Number.isSafeInteger(revision) || revision < 0) {
       throw new Error("The configuration revision is invalid. Reload and try again.");
     }
-    const bnc_addr = fields.has("bnc_enabled") ? fieldValue(fields, "bnc_addr") : null;
-    if (fields.has("bnc_enabled") && !bnc_addr) {
+    // Edge mode: the listeners are the edges'; the stored ones go back as
+    // they were loaded.
+    const stored = form.dataset.edgeModeListeners ? JSON.parse(form.dataset.edgeModeListeners) : null;
+    const bnc_addr = stored ? stored.bnc_addr : fields.has("bnc_enabled") ? fieldValue(fields, "bnc_addr") : null;
+    if (!stored && fields.has("bnc_enabled") && !bnc_addr) {
       throw new Error("BNC listen address must be host:port when the listener is enabled.");
     }
     const bncCertificate = optionalValue(String(fields.get("bnc_tls_cert_path") || ""));
     const bncKey = optionalValue(String(fields.get("bnc_tls_key_path") || ""));
-    if (Boolean(bncCertificate) !== Boolean(bncKey)) {
+    if (!stored && Boolean(bncCertificate) !== Boolean(bncKey)) {
       throw new Error("The BNC listener's TLS certificate and private-key paths go together: give both, or neither.");
     }
-    const bnc_tls = bnc_addr && bncCertificate ? { cert_path: bncCertificate, key_path: bncKey } : null;
+    const bnc_tls = stored ? stored.bnc_tls : bnc_addr && bncCertificate ? { cert_path: bncCertificate, key_path: bncKey } : null;
     return {
       revision,
       settings: {
@@ -1184,7 +1187,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         max_hot_channels: positiveInteger(fields, "max_hot_channels", "Hot channels"),
         max_history_ring_bytes: positiveInteger(fields, "max_history_ring_bytes", "History bytes per channel"),
         max_hot_history_bytes: positiveInteger(fields, "max_hot_history_bytes", "History bytes in all"),
-        listeners: parseListeners(String(fields.get("listeners") || "")),
+        listeners: stored ? stored.listeners : parseListeners(String(fields.get("listeners") || "")),
         registration: {
           before_connect: fields.has("registration_before_connect"),
           require_email: fields.has("registration_require_email"),
@@ -1549,11 +1552,29 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "motd", apiCollection(settings, "motd", "configuration").join("\n"));
     configurationValue(form, "storage_history_retention_days", settings.storage.history_retention_days);
     configurationValue(form, "storage_audit_retention_days", settings.storage.audit_retention_days);
-    configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
-    configurationValue(form, "bnc_addr", settings.bnc_addr);
-    configurationValue(form, "bnc_tls_cert_path", settings.bnc_tls ? settings.bnc_tls.cert_path : null);
-    configurationValue(form, "bnc_tls_key_path", settings.bnc_tls ? settings.bnc_tls.key_path : null);
-    configurationValue(form, "listeners", configurationListeners(apiCollection(settings, "listeners", "configuration")));
+    // Edge mode (DESIGN §19, decision D9): the page has no listener fields;
+    // the listeners and their certificates are the edges', shown as they
+    // report them, and the stored ones go back as they were loaded.
+    const edgeListeners = root.querySelector("[data-configuration-edge-listeners]");
+    if (Boolean(edgeListeners) !== (runtime.edge_mode === true)) {
+      throw new Error("The server's edge mode changed since this page was loaded. Reload and try again.");
+    }
+    if (edgeListeners) {
+      form.dataset.edgeModeListeners = JSON.stringify({ listeners: settings.listeners, bnc_addr: settings.bnc_addr, bnc_tls: settings.bnc_tls });
+      const edges = apiCollection(runtime, "edges", "configuration runtime");
+      const described = edges.map((edge) => {
+        const listeners = apiCollection(edge, "listeners", "edge").map((listener) => append(element("li"), element("code", "", listener.addr), document.createTextNode(` ${listener.kind}${listener.proxy_protocol ? ", PROXY protocol" : ""}`), ...(listener.certificate === null ? [document.createTextNode(", plaintext")] : [document.createTextNode(", TLS with "), element("code", "", listener.certificate)])));
+        return append(element("div"), element("strong", "", edge.name), element("span", "tag", `slot ${edge.slot} · link version ${edge.link_version}${edge.upgrade_needed ? " · upgrade needed" : ""}`), listeners.length ? append(element("ul"), ...listeners) : element("p", "", "No listeners."));
+      });
+      edgeListeners.replaceChildren(...(described.length ? described : [element("p", "", "No edge is linked.")]));
+    } else {
+      delete form.dataset.edgeModeListeners;
+      configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
+      configurationValue(form, "bnc_addr", settings.bnc_addr);
+      configurationValue(form, "bnc_tls_cert_path", settings.bnc_tls ? settings.bnc_tls.cert_path : null);
+      configurationValue(form, "bnc_tls_key_path", settings.bnc_tls ? settings.bnc_tls.key_path : null);
+      configurationValue(form, "listeners", configurationListeners(apiCollection(settings, "listeners", "configuration")));
+    }
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
@@ -1569,8 +1590,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationChecked(form, "registration_require_email", settings.registration.require_email);
     configurationValue(form, "registration_minimum_password_length", settings.registration.minimum_password_length);
     const bncStatus = root.querySelector("[data-configuration-bnc-status]");
-    bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
-    if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
+    if (bncStatus) {
+      bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
+      if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
+    }
 
     const csrf = root.dataset.csrf || "";
     const networks = apiCollection(settings, "networks", "configuration").map((network) => {

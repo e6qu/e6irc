@@ -641,27 +641,23 @@ pub(crate) fn connection_list_entries(
     };
     let mut newest = BinaryHeap::with_capacity(fetch_limit + 1);
     for (&connection_id, session) in &state.sessions {
-        if query
-            .before_id
-            .is_some_and(|before_id| connection_id.0 >= before_id)
+        let key = session.directory_key.get();
+        if query.before_key.is_some_and(|before| key >= before)
             || !live_connection_matches(state, session, &filter)
         {
             continue;
         }
-        newest.push(Reverse(connection_id.0));
+        newest.push(Reverse((key, connection_id.0)));
         if newest.len() > fetch_limit {
             newest.pop();
         }
     }
     let now = (state.config.mono_clock)();
-    let mut connection_ids: Vec<u64> = newest
+    let mut newest: Vec<(u64, u64)> = newest.into_iter().map(|Reverse(entry)| entry).collect();
+    newest.sort_unstable_by(|left, right| right.cmp(left));
+    newest
         .into_iter()
-        .map(|Reverse(connection_id)| connection_id)
-        .collect();
-    connection_ids.sort_unstable_by(|left, right| right.cmp(left));
-    connection_ids
-        .into_iter()
-        .map(|connection_id| {
+        .map(|(directory_key, connection_id)| {
             let session = &state.sessions[&crate::core::ConnId(connection_id)];
             let mut channels: Vec<String> = session
                 .channels
@@ -671,6 +667,7 @@ pub(crate) fn connection_list_entries(
             channels.sort();
             crate::core::LiveConnectionInfo {
                 id: connection_id,
+                directory_key,
                 nick: session.nick().unwrap_or("*").to_string(),
                 user: session.user().unwrap_or("*").to_string(),
                 host: session.host.clone(),
@@ -717,12 +714,12 @@ fn connection_page(
     mut entries: Vec<crate::core::LiveConnectionInfo>,
 ) -> crate::core::LiveConnectionPage {
     let page_size = query.page_size.value();
-    entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.id));
-    let next_before_id = (entries.len() > page_size).then(|| entries[page_size - 1].id);
+    entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.directory_key));
+    let next_before_key = (entries.len() > page_size).then(|| entries[page_size - 1].directory_key);
     entries.truncate(page_size);
     crate::core::LiveConnectionPage {
         entries,
-        next_before_id,
+        next_before_key,
     }
 }
 

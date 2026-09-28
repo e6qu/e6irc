@@ -76,10 +76,10 @@ pub async fn send_irc_line(
 }
 
 /// Close the socket with `code` and a reason the client can show.
-pub async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str) {
+pub async fn send_close(socket: &mut WebSocket, code: u16, reason: std::borrow::Cow<'static, str>) {
     let close = axum::extract::ws::CloseFrame {
         code,
-        reason: reason.into(),
+        reason: reason.into_owned().into(),
     };
     drop(send_frame(socket, WsMessage::Close(Some(close))).await);
 }
@@ -232,7 +232,7 @@ pub async fn serve_irc_socket<C: CorePort>(
         Ended::ClientGone { reason, close } => {
             core.closed(conn, reason).await;
             if let Some((code, text)) = close
-                && tokio::time::timeout(CLOSING_DRAIN, send_close(&mut socket, code, text))
+                && tokio::time::timeout(CLOSING_DRAIN, send_close(&mut socket, code, text.into()))
                     .await
                     .is_err()
             {
@@ -267,25 +267,16 @@ fn read_failure(error: axum::Error, telemetry: &dyn TransportTelemetry) -> Ended
 }
 
 /// One message a `/ws/ui` client sent, as the edge hands it to the core (the
-/// `Ui` session kind's inbound frame, DESIGN §19.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UiMessage {
-    /// A text message: a composer request.
-    Text(String),
-    /// A binary message, which the core refuses by its kind alone; its bytes
-    /// are not carried.
-    Binary,
-}
+/// `Ui` session kind's inbound frame, DESIGN §19.2): a text message (a
+/// composer request), or the fact of a binary one, which the core refuses by
+/// its kind alone. What it weighs against the queues it waits in is
+/// [`crate::core_link::remote::ui_message_weight`].
+pub use e6irc_link::UiMessage;
 
-impl UiMessage {
-    /// What one message holds against its session's inbound queue.
-    pub fn weight(&self) -> usize {
-        match self {
-            Self::Text(text) => text.len(),
-            Self::Binary => 1,
-        }
-    }
-}
+/// The largest `/ws/ui` message the edge reads (the link's own bound on a
+/// `Message`): JSON can escape one input byte as six ASCII bytes, so a
+/// wire-sized composer command fits with room for its envelope.
+pub const MAX_UI_WS_MESSAGE: usize = e6irc_link::MAX_UI_MESSAGE_LEN;
 
 /// How a `/ws/ui` socket's loop ended.
 enum UiEnded {
