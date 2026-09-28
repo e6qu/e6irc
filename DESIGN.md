@@ -3279,9 +3279,10 @@ above the trait, provides for every network kind:
   other than `ACTION` (`VERSION`, `PING`, a DCC offer), which is a question to
   the clients attached when it is asked — replayed, every client that
   attached later answered it again, hours afterwards and once per attach,
-  which neither ZNC nor soju does; and a channel's topic and member list
-  (331–333, 353, 366), which is state the session follows and an attaching
-  client is told from the session — retained, the member lists that follow
+  which neither ZNC nor soju does; and a channel's modes, topic and member
+  list (324, 328, 329, 331–333, 353, 366: what follows our own `JOIN`), which
+  is state the session follows and an attaching client is told from the
+  session — retained, the member lists that follow
   every rejoin after a reconnect (hundreds of lines on a heavy user's
   channels) evicted the conversation the backlog exists to keep. Each is told
   live, at the ring's position; rows an older build stored of them stay in

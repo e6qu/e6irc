@@ -226,8 +226,9 @@ const QUERIES: &[Query] = &[
 const RPL_AWAY: u16 = 301;
 
 /// Numerics that follow our own `JOIN` of a channel: its state, told to every
-/// attached client, not a reply to whoever asked to join.
-const JOIN_BURST: &[u16] = &[324, 328, 329, 332, 333, 353, 366];
+/// attached client, not a reply to whoever asked to join — and, being state,
+/// never kept in the backlog (`super::told_live_only`).
+pub(super) const JOIN_BURST: &[u16] = &[324, 328, 329, 331, 332, 333, 353, 366];
 
 /// The query a command line is, when it is one. `MODE` is a query only when it
 /// changes nothing: a bare `MODE <target>`, or a list mode named with no mask.

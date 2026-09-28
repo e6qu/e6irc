@@ -4652,10 +4652,6 @@ pub(crate) fn without_tag(line: &str, key: &str) -> String {
     }
 }
 
-/// The numerics that state a channel as the session now finds it — its topic
-/// (331–333) and member list (353, 366) — which follow our own `JOIN`.
-const CHANNEL_STATE_NUMERICS: &[&str] = &["331", "332", "333", "353", "366"];
-
 /// Whether a line published to a network is told live only: to whoever is
 /// attached now, at the ring's position, and never retained in the ring, the
 /// stored backlog or CHATHISTORY. The one rule every way into and out of the
@@ -4667,8 +4663,10 @@ const CHANNEL_STATE_NUMERICS: &[&str] = &["331", "332", "333", "353", "366"];
 ///   question to the clients attached when it was asked. Replayed, every
 ///   client that attached later answered it again — hours after it was asked,
 ///   once per attach — as neither ZNC nor soju ever does.
-/// - A channel's topic and member list: the state the session follows, which
-///   an attaching client is told from the session itself (§10.1). Retained,
+/// - A channel's state as the numerics that follow our own `JOIN` state it
+///   ([`replies::JOIN_BURST`]: its modes, topic and member list): what the
+///   session follows, which an attaching client is told from the session
+///   itself (§10.1). Retained,
 ///   the member lists that follow every rejoin after a reconnect — hundreds of
 ///   lines on a heavy user's channels — evicted the conversation the backlog
 ///   exists to keep, and a replay showed a member list long out of date.
@@ -4682,7 +4680,12 @@ pub(crate) fn told_live_only(line: &str) -> bool {
             .params
             .get(1)
             .is_some_and(|text| crate::sanitize::is_ctcp_request(text)),
-        command => CHANNEL_STATE_NUMERICS.contains(&command),
+        command => {
+            command.len() == 3
+                && command
+                    .parse::<u16>()
+                    .is_ok_and(|code| replies::JOIN_BURST.contains(&code))
+        }
     }
 }
 
