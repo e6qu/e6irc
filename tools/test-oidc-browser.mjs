@@ -121,6 +121,14 @@ admin_accounts = ["kilgore"]
 [database]
 url = ${JSON.stringify(databaseURL)}
 
+[limits]
+# One automated administrator walks every console page in seconds; each page
+# spends its load plus one administrator API read per directory it shows, so
+# the default 60 a minute (a person's pace) runs out mid-journey and a read the
+# journey asserts on answers 429 instead. The throttle itself is proven by the
+# HTTP suite, not here.
+administrator_api_rate_burst = 1000
+
 [secrets]
 key_file = ${JSON.stringify(secretKeyPath)}
 
