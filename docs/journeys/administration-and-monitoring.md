@@ -114,7 +114,13 @@ Database failure is an error state, not an empty directory. Self-suspension,
 self-demotion, and suspending or demoting the last active effective
 durable-or-configured administrator are explicit conflicts.
 Channel registry, server-ban, and audit-table read failures retain their table
-structure, announce the API problem, and offer an explicit in-place retry.
+structure, announce the API problem, and offer an explicit in-place retry; a
+page-level load failure (overview, configuration, account directory) is
+cleared by the retry that succeeds, and the overview heading says the overview
+is unavailable rather than still loading. A session that ended while the page
+was open is said once, with a Sign in link, rather than as a retry that cannot
+succeed. A filter value with surrounding spaces is refused in the form, before
+the page, which refuses it too, is asked.
 Invalid stored network configuration prevents reactivation before the durable
 state changes. A post-commit core/runtime reconciliation failure reports the
 exact safe partial state so retry can reconcile it.
@@ -135,8 +141,13 @@ region role, purpose-specific accessible name, and focusability so Safari does
 not strand overflow content outside the keyboard path or a refresh rename the
 wrong directory. The shared confirmation dialog repeats the initiating action
 and severity, submits with that exact control's name/value, and resets before
-each opening so Escape cannot inherit a previous confirmation. On phones, the
-active route scrolls into the horizontal navigation viewport on load.
+each opening so Escape cannot inherit a previous confirmation. A form that
+created something (an account, an invitation, a ban, an operator, an identity
+provider, a server network) is emptied once the server accepts it, so no
+password or client secret stays in the page; the success line names what
+changed, and focus stays in the page's main region when the refreshed rows
+replace the pressed button. Every time is shown as UTC in one form. On phones,
+the active route scrolls into the horizontal navigation viewport on load.
 
 **Evidence.** Proven by PostgreSQL cursor/filter/posture and atomic bearer
 revocation tests; ordered-core late-verdict/disconnect tests; exact-owner
@@ -157,7 +168,15 @@ policy controls, confirms both actions in the audit explorer, and exercises a
 transient audit-directory API failure followed by the rendered Retry control.
 Playwright runs the production console runtime to prove named confirmation,
 submitter preservation, safe repeat cancellation, active phone-route
-visibility, and distinct dynamic account/invitation table regions under axe.
+visibility, and distinct dynamic account/invitation table regions under axe;
+it also proves that created-item forms empty themselves while the settings
+form keeps its unsaved edits through another form's save, that a Retry clears
+the failure it recovers, that an ended session is announced once with Sign in,
+that a change whose list then fails to reload is not reported as success, that
+server-ban rows show UTC times and keep focus in the page after a removal,
+that filters refuse surrounding spaces, that each account row stacks its
+actions, and that a secondary button-link stays legible on hover in both
+themes.
 
 ## Inspect and terminate live connections
 

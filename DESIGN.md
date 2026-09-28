@@ -4430,7 +4430,25 @@ opening so Escape can never inherit an earlier confirmation. Every API-backed
 form also crosses one shared in-flight submission guard: the initiating action
 gains a visible and accessible progress state, every submit control in that form
 is disabled, and keyboard, pointer, or synthetic resubmission cannot issue a
-second mutation until the first operation and its view refresh finish. On phone layouts,
+second mutation until the first operation and its view refresh finish. The one
+request helper every form mutation crosses settles the form the moment the
+server accepts it: a form that creates something is reset (so a password,
+token or client secret does not stay in the page, and a second press cannot
+create it twice), and a form that edits a stored resource loses its secrets and
+its unsaved-edit marks. The refresh that follows fills an edit form without
+typing over fields the person changed and has not saved, so saving one form on
+the configuration page no longer discards unsaved edits in another. When the
+refresh rebuilds the row whose button was pressed, focus moves to the page's
+main region rather than the document. A success says what changed ("Server
+ban on `*@bad.example` removed."), never a bare "Updated.", and a change whose
+view then fails to reload says so instead of success: the refresh serializer
+hands each caller the outcome of the run that covers its request. A page's
+load failure offers Retry and is cleared by the load that succeeds. A `401`
+from any read or change means the session ended: the page says so once, with a
+Sign in link, and stops its timers, instead of offering a Retry that cannot
+succeed. Every time the console shows is the same form in one zone,
+`2026-09-28 14:05:09 UTC`. Directory filter fields refuse surrounding spaces
+in the browser, since the page refuses such a filter outright. On phone layouts,
 the active route is brought into the horizontal console-navigation viewport on
 load. The console works
 in the default build and `embed-web`; its private pages permit only that
