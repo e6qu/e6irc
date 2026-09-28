@@ -688,9 +688,15 @@ the older sense of "boundary": DESIGN says boundary for that.
 holder) seen from the edges: everything that interprets a line.
 
 **Core port** — `CorePort`, the edge's only way to reach the core: open a
-session with its send queue, hand over framed lines, report the end. In the
-single process e6ircd implements it over the core's own ingress; the core link
-takes its place across processes.
+session and receive the edge's end of its session link, hand over framed
+lines, report the end. In the single process e6ircd implements it over the
+core's own ingress; the core link takes its place across processes.
+
+**Session link** — one session's two ends of the core link, as one process
+carries it (`e6irc_edge::link`): the core's end (`SessionLink`), its remote
+send queue and the frames the core sends the edge, and the edge's end
+(`EdgeSession`), the send-queue buffer its writer drains and the reports of
+what it wrote. Dropping the core's end ends the session.
 
 **Edge mode** and **single-process mode** — edges as separate processes
 (opt-in), or the default one process with the edge in it over an in-memory
@@ -754,7 +760,8 @@ with an explicit `ERROR`.
 
 **Credit** — the core's grant of shard-queue room to a link stream; an edge
 out of credits stops reading client sockets, which is the client's
-backpressure.
+backpressure. In one process a credit is the room a line's push awaits in the
+shard's queue itself.
 
 **Remote send queue** — the core's byte-accurate account of a session's
 output that the edge has not yet written to the client socket. It holds the

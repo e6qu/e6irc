@@ -8,9 +8,7 @@ use super::*;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
-use e6irc_edge::websocket::{
-    MAX_IRC_WS_MESSAGE, WsFrameMode, send_close, send_frame, send_irc_line, write_failure_reason,
-};
+use e6irc_edge::websocket::{MAX_IRC_WS_MESSAGE, WsFrameMode, send_close, send_frame};
 
 use crate::bouncer::SessionAuthority;
 
@@ -145,34 +143,15 @@ pub(super) struct WsIrcConnection {
     _task: e6irc_edge::connection::ConnectionTask,
 }
 
-/// How a `/ws/irc` connection's loop ended.
-enum WsIrcEnd {
-    /// The core ended the session; what it still queued is owed.
-    SessionOver,
-    /// The client closed, or its side failed or overran the message ceiling;
-    /// the core is told why.
-    ClientEnded {
-        reason: String,
-        /// The close frame owed to the client, if any.
-        close: Option<(u16, &'static str)>,
-    },
-    /// A frame could not be written; the core is told why.
-    WriteFailed(&'static str),
-    /// The core is gone.
-    CoreGone,
-}
-
-/// Bridge one WebSocket to the IRC core: each inbound text frame is one
-/// IRC line; each core Output line is one outbound text frame. Mirrors
-/// the TCP connection path (`e6irc_edge::connection::serve_conn`) over the
-/// WS transport. A single task owns the socket and selects between inbound
-/// frames and the drained SendQ — no split, so no extra dependency.
+/// Serve one `/ws/irc` connection through the edge
+/// ([`e6irc_edge::websocket::serve_irc_socket`]), holding its per-IP slot and
+/// its place among the tasks shutdown waits for until it ends; then close the
+/// stream under it lingering, when the socket was left cleanly.
 pub(super) async fn ws_irc_conn(
     state: Arc<AppState>,
-    mut socket: WebSocket,
+    socket: WebSocket,
     connection: WsIrcConnection,
 ) {
-    use crate::core::Input;
     let WsIrcConnection {
         conn,
         ip,
@@ -181,156 +160,31 @@ pub(super) async fn ws_irc_conn(
         stream,
         ..
     } = connection;
-    let (out_tx, mut out_rx) = crate::core::send_queue("ws-sendq", state.sendq_bytes);
-    // The core ends the session by dropping its end of the send queue.
-    let session_over = out_rx.senders_gone();
-    if state
-        .core_tx
-        .push(Input::Open {
-            conn,
-            tx: out_tx,
-            // The real client IP (X-Forwarded-For only via a trusted proxy),
-            // exactly as the raw-TCP path uses `peer.ip()`. A literal here would
-            // give every WS user the same hostmask, letting a banned user evade
-            // KLINE/DLINE through /ws/irc and making per-user host bans impossible.
-            host: ip.to_string(),
-            transport,
-        })
-        .await
-        .is_err()
-    {
+    let session = e6irc_edge::websocket::IrcSocketSession {
+        conn,
+        // The real client IP (X-Forwarded-For only via a trusted proxy),
+        // exactly as the raw-TCP path uses `peer.ip()`. A literal here would
+        // give every WS user the same hostmask, letting a banned user evade
+        // KLINE/DLINE through /ws/irc and making per-user host bans impossible.
+        host: ip.to_string(),
+        transport,
+        mode,
+        sendq_bytes: state.sendq_bytes,
+    };
+    let end = e6irc_edge::websocket::serve_irc_socket(
+        socket,
+        session,
+        state.core_tx.clone(),
+        &*state.telemetry,
+    )
+    .await;
+    if end == e6irc_edge::websocket::IrcSocketEnd::Abandoned {
         return;
     }
-    let core_tx = state.core_tx.clone();
-    let mut meter = core_tx.line_meter(conn);
-    let end = loop {
-        // Past its command allowance the connection is not read until a
-        // token is back, while what the core sends it keeps flowing.
-        let blocked = meter.blocked_until(tokio::time::Instant::now());
-        tokio::select! {
-            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
-            // The core ended the session (QUIT, KILL, SendQ, shutdown): the
-            // client is not read from again, and what it is owed is sent below.
-            () = session_over.wait() => break WsIrcEnd::SessionOver,
-            // Outbound: a core Output line becomes one text frame.
-            out = out_rx.pop() => {
-                let Some(env) = out else { break WsIrcEnd::SessionOver };
-                if let Err(failure) = send_irc_line(&mut socket, mode, &env.payload.0).await {
-                    state
-                        .telemetry
-                        .record_error(crate::observability::ErrorKind::Write);
-                    break WsIrcEnd::WriteFailed(write_failure_reason(&failure));
-                }
-            }
-            // Inbound: frame(s) -> lines -> core.
-            frame = socket.recv(), if blocked.is_none() => {
-                let data: Vec<u8> = match frame {
-                    Some(Ok(WsMessage::Text(t))) => t.as_bytes().to_vec(),
-                    Some(Ok(WsMessage::Binary(b))) => b.to_vec(),
-                    // Tungstenite queues matching Pong and Close replies while
-                    // reading control frames; the next read flushes them.
-                    Some(Ok(_)) => continue,
-                    Some(Err(error)) => break read_failure(&state, error),
-                    None => break WsIrcEnd::ClientEnded {
-                        reason: "Connection closed".into(),
-                        close: None,
-                    },
-                };
-                // IRCv3 WebSocket messages are already framed: one message is
-                // one IRC line, with no CR/LF terminator. Feed the whole value
-                // to the parser so an embedded delimiter is rejected as one
-                // malformed command rather than forged into a second command.
-                // A message over the line limit is refused (417) under its
-                // label when one is recoverable, and the connection kept, as
-                // an over-long TCP line is.
-                let event = if e6irc_proto::message::client_frame_fits(&data) {
-                    e6irc_proto::framing::LineEvent::Line(data)
-                } else {
-                    e6irc_proto::framing::LineEvent::too_long(&data)
-                };
-                let input = Input::framed(conn, event);
-                meter.spend().await;
-                if core_tx.push(input).await.is_err() {
-                    break WsIrcEnd::CoreGone;
-                }
-            }
-        }
-    };
-    match end {
-        WsIrcEnd::SessionOver => {
-            // Everything still queued, then a normal close, within the bound a
-            // finished session's output has on every transport.
-            let delivered = tokio::time::timeout(e6irc_edge::connection::CLOSING_DRAIN, async {
-                while let Some(env) = out_rx.pop().await {
-                    send_irc_line(&mut socket, mode, &env.payload.0).await?;
-                }
-                send_frame(
-                    &mut socket,
-                    WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-                        code: axum::extract::ws::close_code::NORMAL,
-                        reason: "".into(),
-                    })),
-                )
-                .await
-            })
-            .await;
-            if !matches!(delivered, Ok(Ok(()))) {
-                return;
-            }
-        }
-        WsIrcEnd::ClientEnded { reason, close } => {
-            // Queue closure means the core is already gone, which has already
-            // closed this connection's authoritative state.
-            drop(core_tx.push(Input::Closed { conn, reason }).await);
-            if let Some((code, text)) = close {
-                let closed = tokio::time::timeout(
-                    e6irc_edge::connection::CLOSING_DRAIN,
-                    send_close(&mut socket, code, text),
-                )
-                .await;
-                if closed.is_err() {
-                    return;
-                }
-            }
-        }
-        WsIrcEnd::WriteFailed(reason) => {
-            drop(
-                core_tx
-                    .push(Input::Closed {
-                        conn,
-                        reason: reason.into(),
-                    })
-                    .await,
-            );
-            return;
-        }
-        WsIrcEnd::CoreGone => return,
-    }
-    // The socket is done with; its stream comes back when it is dropped, and
+    // The socket is done with; its stream comes back once it is dropped, and
     // is closed without letting unread input reset away the last frames.
-    drop(socket);
     if let Ok(mut stream) = stream.await {
         e6irc_edge::lingering_close::close_within_bound(&mut stream).await;
-    }
-}
-
-/// How a failed read ends the connection: a message past the ceiling is
-/// closed with 1009 (message too big); anything else is a broken connection.
-fn read_failure(state: &AppState, error: axum::Error) -> WsIrcEnd {
-    use tokio_tungstenite::tungstenite::Error as Tungstenite;
-    let error = error.into_inner();
-    if let Some(Tungstenite::Capacity(_)) = error.downcast_ref::<Tungstenite>() {
-        return WsIrcEnd::ClientEnded {
-            reason: "Message too big".into(),
-            close: Some((axum::extract::ws::close_code::SIZE, "Message too big")),
-        };
-    }
-    state
-        .telemetry
-        .record_error(crate::observability::ErrorKind::Read);
-    WsIrcEnd::ClientEnded {
-        reason: format!("Read error: {error}"),
-        close: None,
     }
 }
 

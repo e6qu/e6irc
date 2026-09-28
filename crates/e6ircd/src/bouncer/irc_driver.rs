@@ -1108,14 +1108,14 @@ const KEEPALIVE_TOKEN: &str = "e6bnc-keepalive";
 /// Every line one session writes upstream, paced to the upstream's flood
 /// allowance ([`UPSTREAM_LINE_BURST`], [`UPSTREAM_LINES_PER_SECOND`]) and each
 /// bounded by [`super::UPSTREAM_WRITE_DEADLINE`].
-struct UpstreamPacer(crate::core::line_meter::TokenBucket);
+struct UpstreamPacer(e6irc_edge::meter::TokenBucket);
 
 impl UpstreamPacer {
     fn new() -> Self {
         let allowance =
             crate::core::CommandFlood::new(UPSTREAM_LINE_BURST, UPSTREAM_LINES_PER_SECOND)
                 .expect("the upstream allowance is a valid bucket");
-        Self(crate::core::line_meter::TokenBucket::new(
+        Self(e6irc_edge::meter::TokenBucket::new(
             allowance,
             tokio::time::Instant::now(),
         ))

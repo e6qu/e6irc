@@ -1,10 +1,16 @@
 //! WebSocket framing for IRC over WebSocket (`/ws/irc`, DESIGN §13.4) and the
 //! live web UI socket (`/ws/ui`, DESIGN §13.2): the message ceiling, the frame
 //! mode the ircv3 subprotocol fixes, and every frame written within the peer
-//! write deadline ([`crate::peer_write`]).
+//! write deadline ([`crate::peer_write`]) — and a `/ws/irc` connection's
+//! whole life ([`serve_irc_socket`]).
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
+use e6irc_proto::framing::LineEvent;
 
+use crate::connection::{
+    CLOSING_DRAIN, ConnId, ConnectionTransport, CorePort, TransportError, TransportTelemetry,
+    hand_over,
+};
 use crate::peer_write::{PEER_WRITE_DEADLINE, SendFailure, within_send_deadline};
 
 /// The largest WebSocket message `/ws/irc` reads. IRCv3 WebSocket carries one
@@ -84,4 +90,185 @@ pub async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str)
         reason: reason.into(),
     };
     drop(send_frame(socket, WsMessage::Close(Some(close))).await);
+}
+
+/// One `/ws/irc` session as it reaches the core: its identifier, the address
+/// its client is shown under, how it arrived, its frame mode and its
+/// send-queue bound.
+pub struct IrcSocketSession {
+    pub conn: ConnId,
+    /// The client's canonical address (`ClientIp`'s spelling): the subject
+    /// server bans match and WHOIS shows, so a `/ws/irc` user cannot evade a
+    /// K-line or D-line by coming in over the web.
+    pub host: String,
+    pub transport: ConnectionTransport,
+    pub mode: WsFrameMode,
+    pub sendq_bytes: usize,
+}
+
+/// How a `/ws/irc` connection's socket was left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrcSocketEnd {
+    /// Everything owed was sent, closing frame included: the stream under it
+    /// is closed lingering ([`crate::lingering_close`]), so unread input does
+    /// not reset away the last frames.
+    Finished,
+    /// The socket failed, stalled past its bound, or the core is gone: the
+    /// stream is dropped as it is.
+    Abandoned,
+}
+
+/// How a `/ws/irc` connection's loop ended.
+enum Ended {
+    /// The core ended the session; what it still queued is owed.
+    SessionOver,
+    /// The client closed, or its side failed or overran the message ceiling;
+    /// the core is told why.
+    ClientGone {
+        reason: String,
+        /// The close frame owed to the client, if any.
+        close: Option<(u16, &'static str)>,
+    },
+    /// A frame could not be written; the core is told why.
+    WriteFailed(&'static str),
+    /// The core is gone.
+    CoreGone,
+}
+
+/// Serve one `/ws/irc` connection until it ends: each inbound text or binary
+/// message is one IRC line to the core, metered as a TCP client's lines are;
+/// each line the core sends is one outbound frame, reported written
+/// (`Drained`) once sent. The IRC-over-WebSocket counterpart of
+/// [`crate::connection::serve_conn`]: one task owns the socket and selects
+/// between inbound frames and the session's send-queue buffer, so a client
+/// past its command allowance keeps receiving while its input waits.
+pub async fn serve_irc_socket<C: CorePort>(
+    mut socket: WebSocket,
+    session: IrcSocketSession,
+    core: C,
+    telemetry: &dyn TransportTelemetry,
+) -> IrcSocketEnd {
+    let IrcSocketSession {
+        conn,
+        host,
+        transport,
+        mode,
+        sendq_bytes,
+    } = session;
+    let Some(mut edge) = core.open(conn, host, transport, sendq_bytes).await else {
+        return IrcSocketEnd::Abandoned;
+    };
+    // The core ends the session by ending its link (`End` or `Kill`).
+    let session_over = edge.session_over();
+    let mut meter = edge.line_meter(core.command_flood());
+    let end = loop {
+        // Past its command allowance the connection is not read until a
+        // token is back, while what the core sends it keeps flowing.
+        let blocked = meter.blocked_until(tokio::time::Instant::now());
+        tokio::select! {
+            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
+            // The core ended the session (QUIT, KILL, SendQ, shutdown): the
+            // client is not read from again, and what it is owed is sent below.
+            () = session_over.wait() => break Ended::SessionOver,
+            // Outbound: a core Output line becomes one frame.
+            out = edge.take() => {
+                let Some(envelope) = out else { break Ended::SessionOver };
+                let line = envelope.payload.0;
+                if let Err(failure) = send_irc_line(&mut socket, mode, &line).await {
+                    telemetry.record_error(TransportError::Write);
+                    break Ended::WriteFailed(write_failure_reason(&failure));
+                }
+                edge.written(line.len());
+            }
+            // Inbound: one message -> one line -> the core.
+            frame = socket.recv(), if blocked.is_none() => {
+                let data: Vec<u8> = match frame {
+                    Some(Ok(WsMessage::Text(text))) => text.as_bytes().to_vec(),
+                    Some(Ok(WsMessage::Binary(bytes))) => bytes.to_vec(),
+                    // Tungstenite queues matching Pong and Close replies while
+                    // reading control frames; the next read flushes them.
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => break read_failure(error, telemetry),
+                    None => break Ended::ClientGone {
+                        reason: "Connection closed".into(),
+                        close: None,
+                    },
+                };
+                // IRCv3 WebSocket messages are already framed: one message is
+                // one IRC line, with no CR/LF terminator. Feed the whole value
+                // to the parser so an embedded delimiter is rejected as one
+                // malformed command rather than forged into a second command.
+                // A message over the line limit is refused (417) under its
+                // label when one is recoverable, and the connection kept, as
+                // an over-long TCP line is.
+                let event = if e6irc_proto::message::client_frame_fits(&data) {
+                    LineEvent::Line(data)
+                } else {
+                    LineEvent::too_long(&data)
+                };
+                if !hand_over(&core, &mut meter, conn, &mut vec![event]).await {
+                    break Ended::CoreGone;
+                }
+            }
+        }
+    };
+    match end {
+        Ended::SessionOver => {
+            // Everything still queued, then a normal close, within the bound a
+            // finished session's output has on every transport.
+            let delivered = tokio::time::timeout(CLOSING_DRAIN, async {
+                while let Some(envelope) = edge.take().await {
+                    let line = envelope.payload.0;
+                    send_irc_line(&mut socket, mode, &line).await?;
+                    edge.written(line.len());
+                }
+                send_frame(
+                    &mut socket,
+                    WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::close_code::NORMAL,
+                        reason: "".into(),
+                    })),
+                )
+                .await
+            })
+            .await;
+            if !matches!(delivered, Ok(Ok(()))) {
+                return IrcSocketEnd::Abandoned;
+            }
+        }
+        Ended::ClientGone { reason, close } => {
+            core.closed(conn, reason).await;
+            if let Some((code, text)) = close
+                && tokio::time::timeout(CLOSING_DRAIN, send_close(&mut socket, code, text))
+                    .await
+                    .is_err()
+            {
+                return IrcSocketEnd::Abandoned;
+            }
+        }
+        Ended::WriteFailed(reason) => {
+            core.closed(conn, reason.into()).await;
+            return IrcSocketEnd::Abandoned;
+        }
+        Ended::CoreGone => return IrcSocketEnd::Abandoned,
+    }
+    IrcSocketEnd::Finished
+}
+
+/// How a failed read ends the connection: a message past the ceiling is
+/// closed with 1009 (message too big); anything else is a broken connection.
+fn read_failure(error: axum::Error, telemetry: &dyn TransportTelemetry) -> Ended {
+    use tokio_tungstenite::tungstenite::Error as Tungstenite;
+    let error = error.into_inner();
+    if let Some(Tungstenite::Capacity(_)) = error.downcast_ref::<Tungstenite>() {
+        return Ended::ClientGone {
+            reason: "Message too big".into(),
+            close: Some((axum::extract::ws::close_code::SIZE, "Message too big")),
+        };
+    }
+    telemetry.record_error(TransportError::Read);
+    Ended::ClientGone {
+        reason: format!("Read error: {error}"),
+        close: None,
+    }
 }

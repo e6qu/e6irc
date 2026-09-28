@@ -1,53 +1,131 @@
-//! Every connection's command allowance, spent where its lines enter the core
-//! (DESIGN §7.2).
+//! Every session's command allowance, spent at the edge as each of its lines
+//! is handed to the core (DESIGN §7.2, §19.1).
 //!
-//! Each line a connection sends — PING and PONG included, and before it has
+//! Each line a session sends — PING and PONG included, and before it has
 //! registered — spends one token of its bucket ([`CommandFlood`]: `burst`
 //! tokens at most, `rate` regained per second). An empty bucket does not close
-//! the connection: the task reading it stops reading until a token is back, so
+//! the session: the task reading it stops reading until a token is back, so
 //! what the client sends too fast waits in its own socket buffers, as Solanum
-//! parses a client's receive queue only as fast as its allowance. One
-//! connection's lines therefore occupy at most its bucket's worth of the core's
-//! queue, whatever it sends. An IRC operator is exempt (Solanum's
-//! `no_oper_flood`): the core records which connections are, in
-//! [`FloodExemptions`].
+//! parses a client's receive queue only as fast as its allowance. One session's
+//! lines therefore occupy at most its bucket's worth of the core's queue,
+//! whatever it sends. The meter is here, where the socket is, because "the
+//! reader stops reading" can only happen where the reading is. An IRC operator
+//! is exempt (Solanum's `no_oper_flood`): the core pushes the session's
+//! [`FloodExemption`] over its link ([`crate::link::CoreEnd::set_flood_exempt`]).
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::time::{Duration, Instant};
 
-use super::state::{CommandFlood, ConnId};
+/// The most tokens a bucket may hold or regain a second. Configured values
+/// past it are refused, so the arithmetic below cannot overflow a `u32`.
+pub const MAX_COMMAND_FLOOD_TOKENS: usize = 10_000;
 
-/// The connections whose lines are not metered — its IRC operators. Written by
-/// the core shard that owns each session as its operator status changes, read
-/// by a connection's reader only when its bucket is empty.
-#[derive(Clone, Default)]
-pub(crate) struct FloodExemptions(Arc<Mutex<HashSet<ConnId>>>);
+/// A validated command-flood bucket shape: `burst` tokens at most, refilling
+/// `rate` per second. Constructed only through [`CommandFlood::new`], so a
+/// bucket that never refills (`rate = 0`), that never admits a line
+/// (`burst = 0`), or that cannot hold one second of its own rate
+/// (`burst < rate`) cannot reach a session's line meter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandFlood {
+    burst: u32,
+    rate: u32,
+}
 
-impl FloodExemptions {
-    pub(crate) fn set(&self, conn: ConnId, exempt: bool) {
-        let mut exempt_connections = self.0.lock().expect("flood exemptions poisoned");
-        if exempt {
-            exempt_connections.insert(conn);
-        } else {
-            exempt_connections.remove(&conn);
+/// Why a burst/rate pair is not a usable flood bucket; the message names the
+/// configuration keys because the configuration validator reports it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandFloodError {
+    RateZero,
+    BurstZero,
+    BurstBelowRate { burst: usize, rate: usize },
+    AboveMaximum { maximum: usize },
+}
+
+impl std::fmt::Display for CommandFloodError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateZero => {
+                write!(
+                    f,
+                    "limits.command_rate must be at least 1 (0 never refills the bucket)"
+                )
+            }
+            Self::BurstZero => write!(
+                f,
+                "limits.command_burst must be at least 1 (0 never admits a line)"
+            ),
+            Self::BurstBelowRate { burst, rate } => write!(
+                f,
+                "limits.command_burst ({burst}) must be at least limits.command_rate ({rate}): \
+                 the bucket must hold one second of its own refill"
+            ),
+            Self::AboveMaximum { maximum } => write!(
+                f,
+                "limits.command_burst and limits.command_rate must be at most {maximum}"
+            ),
         }
     }
+}
 
-    fn contains(&self, conn: ConnId) -> bool {
-        self.0
-            .lock()
-            .expect("flood exemptions poisoned")
-            .contains(&conn)
+impl std::error::Error for CommandFloodError {}
+
+impl CommandFlood {
+    pub fn new(burst: usize, rate: usize) -> Result<Self, CommandFloodError> {
+        let maximum = MAX_COMMAND_FLOOD_TOKENS;
+        if rate == 0 {
+            return Err(CommandFloodError::RateZero);
+        }
+        if burst == 0 {
+            return Err(CommandFloodError::BurstZero);
+        }
+        if burst < rate {
+            return Err(CommandFloodError::BurstBelowRate { burst, rate });
+        }
+        if burst > maximum || rate > maximum {
+            return Err(CommandFloodError::AboveMaximum { maximum });
+        }
+        let narrow =
+            |value: usize| u32::try_from(value).expect("bounded by MAX_COMMAND_FLOOD_TOKENS");
+        Ok(Self {
+            burst: narrow(burst),
+            rate: narrow(rate),
+        })
+    }
+
+    /// The bucket's capacity: the tokens a fresh session starts with.
+    pub const fn burst(self) -> u32 {
+        self.burst
+    }
+
+    /// Tokens regained per second of elapsed monotonic time.
+    pub const fn rate(self) -> u32 {
+        self.rate
+    }
+}
+
+/// Whether one session's lines are metered: the flag the core sets over the
+/// session's link when the session becomes, or stops being, an IRC operator,
+/// and the edge reads only when the session's bucket is empty.
+#[derive(Clone, Default)]
+pub struct FloodExemption(Arc<AtomicBool>);
+
+impl FloodExemption {
+    pub(crate) fn set(&self, exempt: bool) {
+        self.0.store(exempt, Ordering::Relaxed);
+    }
+
+    fn exempt(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
 /// A token bucket of one [`CommandFlood`] shape: `burst` tokens at most,
-/// `rate` regained per second. A connection's [`LineMeter`] spends one per
+/// `rate` regained per second. A session's [`LineMeter`] spends one per
 /// line it hands the core; the bouncer's `irc` driver spends one per line it
 /// writes to an upstream, whose own flood limit is the same shape.
-pub(crate) struct TokenBucket {
+pub struct TokenBucket {
     flood: CommandFlood,
     tokens: u32,
     /// The instant through which regained tokens have been credited. It
@@ -58,7 +136,7 @@ pub(crate) struct TokenBucket {
 
 impl TokenBucket {
     /// A full bucket at `now`.
-    pub(crate) fn new(flood: CommandFlood, now: Instant) -> Self {
+    pub fn new(flood: CommandFlood, now: Instant) -> Self {
         Self {
             flood,
             tokens: flood.burst(),
@@ -68,7 +146,7 @@ impl TokenBucket {
 
     /// When the next token is there: `None` now, or the instant it is
     /// regained.
-    pub(crate) fn blocked_until(&mut self, now: Instant) -> Option<Instant> {
+    pub fn blocked_until(&mut self, now: Instant) -> Option<Instant> {
         let rate = u64::from(self.flood.rate());
         let elapsed_ms = u64::try_from(now.saturating_duration_since(self.refilled_to).as_millis())
             .unwrap_or(u64::MAX);
@@ -92,7 +170,7 @@ impl TokenBucket {
     }
 
     /// Spend a token, waiting until one is regained when the bucket is empty.
-    pub(crate) async fn spend(&mut self) {
+    pub async fn spend(&mut self) {
         while let Some(until) = self.blocked_until(Instant::now()) {
             tokio::time::sleep_until(until).await;
         }
@@ -100,37 +178,30 @@ impl TokenBucket {
     }
 }
 
-/// One connection's allowance, held by the task that hands its lines to the
+/// One session's allowance, held by the edge task that hands its lines to the
 /// core.
 pub struct LineMeter {
-    conn: ConnId,
-    /// `None` only for an ingress built without a bucket: the test harnesses',
-    /// which pipeline whole scripted sessions at once.
+    /// `None` only for a core that meters nothing: the test harnesses', which
+    /// pipeline whole scripted sessions at once.
     bucket: Option<TokenBucket>,
-    exemptions: FloodExemptions,
+    exemption: FloodExemption,
 }
 
 impl LineMeter {
-    /// A fresh connection's meter: its bucket full, whenever the process
+    /// A fresh session's meter: its bucket full, whenever the process
     /// started.
-    pub(crate) fn new(
-        conn: ConnId,
-        flood: Option<CommandFlood>,
-        exemptions: FloodExemptions,
-        now: Instant,
-    ) -> Self {
+    pub fn new(flood: Option<CommandFlood>, exemption: FloodExemption, now: Instant) -> Self {
         Self {
-            conn,
             bucket: flood.map(|flood| TokenBucket::new(flood, now)),
-            exemptions,
+            exemption,
         }
     }
 
     /// When the next line may go: `None` now, or the instant the next token
     /// is regained.
-    pub(crate) fn blocked_until(&mut self, now: Instant) -> Option<Instant> {
+    pub fn blocked_until(&mut self, now: Instant) -> Option<Instant> {
         let until = self.bucket.as_mut()?.blocked_until(now)?;
-        (!self.exemptions.contains(self.conn)).then_some(until)
+        (!self.exemption.exempt()).then_some(until)
     }
 
     fn take(&mut self) {
@@ -141,7 +212,7 @@ impl LineMeter {
 
     /// Spend a token for one line, waiting until one is regained when the
     /// bucket is empty.
-    pub(crate) async fn spend(&mut self) {
+    pub async fn spend(&mut self) {
         while let Some(until) = self.blocked_until(Instant::now()) {
             tokio::time::sleep_until(until).await;
         }
@@ -155,9 +226,8 @@ mod tests {
 
     fn meter(burst: usize, rate: usize, start: Instant) -> LineMeter {
         LineMeter::new(
-            ConnId(1),
             Some(CommandFlood::new(burst, rate).expect("valid bucket")),
-            FloodExemptions::default(),
+            FloodExemption::default(),
             start,
         )
     }
@@ -223,29 +293,28 @@ mod tests {
     }
 
     #[test]
-    fn an_exempt_connection_is_never_blocked_and_loses_the_exemption_with_its_status() {
+    fn an_exempt_session_is_never_blocked_and_loses_the_exemption_with_its_status() {
         let start = Instant::now();
-        let exemptions = FloodExemptions::default();
+        let exemption = FloodExemption::default();
         let mut meter = LineMeter::new(
-            ConnId(7),
             Some(CommandFlood::new(1, 1).expect("valid bucket")),
-            exemptions.clone(),
+            exemption.clone(),
             start,
         );
         assert!(spend_at(&mut meter, start));
         assert!(!spend_at(&mut meter, start));
-        exemptions.set(ConnId(7), true);
+        exemption.set(true);
         for _ in 0..1000 {
             assert!(spend_at(&mut meter, start));
         }
-        exemptions.set(ConnId(7), false);
+        exemption.set(false);
         assert!(!spend_at(&mut meter, start));
     }
 
     #[test]
-    fn an_unmetered_ingress_never_blocks() {
+    fn an_unmetered_core_never_blocks() {
         let start = Instant::now();
-        let mut meter = LineMeter::new(ConnId(1), None, FloodExemptions::default(), start);
+        let mut meter = LineMeter::new(None, FloodExemption::default(), start);
         for _ in 0..10_000 {
             assert!(spend_at(&mut meter, start));
         }
@@ -263,5 +332,23 @@ mod tests {
             Duration::from_millis(500),
             "the third line waited for the token regained half a second on"
         );
+    }
+
+    #[test]
+    fn a_bucket_shape_is_refused_by_the_rule_it_breaks() {
+        assert_eq!(CommandFlood::new(1, 0), Err(CommandFloodError::RateZero));
+        assert_eq!(CommandFlood::new(0, 1), Err(CommandFloodError::BurstZero));
+        assert_eq!(
+            CommandFlood::new(1, 2),
+            Err(CommandFloodError::BurstBelowRate { burst: 1, rate: 2 })
+        );
+        assert_eq!(
+            CommandFlood::new(MAX_COMMAND_FLOOD_TOKENS + 1, 1),
+            Err(CommandFloodError::AboveMaximum {
+                maximum: MAX_COMMAND_FLOOD_TOKENS
+            })
+        );
+        let flood = CommandFlood::new(40, 20).expect("the default shape");
+        assert_eq!((flood.burst(), flood.rate()), (40, 20));
     }
 }
