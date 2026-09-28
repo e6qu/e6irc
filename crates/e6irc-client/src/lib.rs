@@ -2385,6 +2385,28 @@ impl Connection {
         }
     }
 
+    /// Load the latest bounded history of a conversation that is not joined —
+    /// a direct conversation with `target` — as
+    /// [`Connection::join_with_latest_history`] loads a channel's: `count`
+    /// lines, or the server's 005 `CHATHISTORY` limit when that is smaller. A
+    /// refused history request is an error.
+    pub async fn latest_history(
+        &mut self,
+        target: &str,
+        count: usize,
+    ) -> io::Result<Vec<ClientEvent>> {
+        let loaded = within(
+            self.response_deadline,
+            "answering a history request",
+            self.latest_page(target, count, Vec::new()),
+        )
+        .await?;
+        match loaded.refusal {
+            None => Ok(loaded.events),
+            Some(refusal) => Err(io::Error::other(refusal.to_string())),
+        }
+    }
+
     async fn join_history(
         &mut self,
         target: &str,
