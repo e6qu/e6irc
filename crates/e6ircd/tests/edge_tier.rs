@@ -114,6 +114,7 @@ fn hello(edge: &str) -> Hello {
         slot: None,
         highest_epoch: 0,
         listeners: Vec::new(),
+        cut: None,
     }
 }
 
@@ -154,6 +155,21 @@ async fn the_core_welcomes_with_its_terms_and_refuses_each_hello_it_cannot_link_
         .await
         .expect("welcomed");
     assert_eq!(second.slot, Slot::new(2).expect("slot"));
+    // An edge of the release before speaks version 1 only: the core speaks it
+    // too, and admits it to serve at once, as that version knows no other way.
+    let older = say_hello(
+        link,
+        &credentials.edge("edge-b"),
+        Hello {
+            versions: VersionRange::new(1, 1).expect("range"),
+            ..hello("edge-b")
+        },
+    )
+    .await
+    .expect("welcomed");
+    assert_eq!(older.version, 1);
+    assert_eq!(older.admission, e6irc_link::Admission::Serve);
+    assert_eq!(e6irc_link::OLDEST_SPOKEN, e6irc_link::LINK_VERSION - 1);
 
     let refused = |result: Result<e6irc_link::Welcome, String>| result.expect_err("refused");
     let too_new = VersionRange::new(e6irc_link::LINK_VERSION + 1, e6irc_link::LINK_VERSION + 2)

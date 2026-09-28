@@ -175,6 +175,7 @@ impl CorePort for AttachPort {
         conn: ConnId,
         host: String,
         _transport: ConnectionTransport,
+        _tls: Option<e6irc_link::TlsFacts>,
         sendq_bytes: usize,
     ) -> Option<EdgeSession> {
         let address = host
@@ -255,6 +256,7 @@ where
             peer: "192.0.2.1:6697".parse().expect("test peer"),
             transport: ConnectionTransport::Tcp,
             task: e6irc_edge::connection::ConnectionTasks::default().task(),
+            tls: None,
         },
         port,
         e6irc_edge::connection::Outbound::with_sendq(64 * 1024),
@@ -286,6 +288,7 @@ mod tests {
                 ConnId(7),
                 "192.0.2.9".into(),
                 ConnectionTransport::Tcp,
+                None,
                 4096,
             )
             .await
@@ -318,6 +321,7 @@ mod tests {
                     ConnId(conn),
                     "192.0.2.9".into(),
                     ConnectionTransport::Tcp,
+                    None,
                     4096,
                 )
                 .await
@@ -344,6 +348,7 @@ mod tests {
                 ConnId(3),
                 "192.0.2.9".into(),
                 ConnectionTransport::Tcp,
+                None,
                 4096,
             )
             .await

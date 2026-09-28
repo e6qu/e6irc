@@ -43,6 +43,7 @@ where
             peer: "192.0.2.1:6697".parse().expect("test peer"),
             transport: ConnectionTransport::Tcp,
             task: ConnectionTasks::default().task(),
+            tls: None,
         },
         port,
         Outbound::with_sendq(64 * 1024),

@@ -578,6 +578,19 @@ async fn clients_of_every_transport_are_served_through_an_edge_process() {
     alice.send("WHOIS bob").await;
     let whois = alice.until(" 311 ").await;
     assert!(whois.contains(" 127.0.0.1 "), "{whois}");
+    // The TLS the edge terminated is named to the user itself, from the
+    // facts its `Open` carried (link version 2), and not to anyone else.
+    let secure = alice.until(" 671 ").await;
+    assert!(
+        secure.ends_with(":is using a secure connection"),
+        "{secure}"
+    );
+    bob.send("WHOIS bob").await;
+    let secure = bob.until(" 671 ").await;
+    assert!(
+        secure.contains(":is using a secure connection [TLSv1.3, TLS13_"),
+        "{secure}"
+    );
 
     let (status, _, body) = http(web, &get("/api/v1/server")).await;
     assert_eq!(status, 200, "{body}");

@@ -1937,6 +1937,7 @@ mod tests {
             conn: ConnId(1),
             peer,
             transport: crate::core::ConnectionTransport::Tcp,
+            tls: None,
             task: ConnectionTasks::default().task(),
         }
     }
@@ -2552,6 +2553,7 @@ mod tests {
                 tx: out_tx,
                 host: "host.test".into(),
                 transport: crate::core::ConnectionTransport::Tcp,
+                tls: None,
             })
             .await
             .expect("open");

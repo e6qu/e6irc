@@ -462,6 +462,7 @@ async fn serve_connection(server: Arc<LinkServer>, tcp: tokio::net::TcpStream, p
         slot: admitted.registration.view.slot,
         streams: server.streams,
         terms: server.terms.clone(),
+        admission: e6irc_link::Admission::Serve,
     };
     if let Err(error) = write_frame(&mut tls, &CoreFrame::Welcome(welcome)).await {
         server.telemetry.record_error(ErrorKind::Link);
@@ -644,6 +645,8 @@ struct CoreSession {
 struct SessionStream {
     server: Arc<LinkServer>,
     index: u16,
+    /// The link version the edge's link speaks.
+    version: u16,
     /// The edge's slot: every session it opens is numbered in it.
     slot: Slot,
     out: mpsc::Sender<CoreFrame>,
@@ -670,6 +673,7 @@ impl SessionStream {
         let stream = Arc::new(SessionStream {
             server: server.clone(),
             index,
+            version: registration.view.version,
             slot: registration.view.slot,
             out: out.clone(),
             sessions: Arc::default(),
@@ -748,6 +752,16 @@ impl SessionStream {
     async fn read<R: AsyncRead + Unpin>(self: Arc<Self>, read_half: R) -> io::Result<()> {
         let mut reader = FrameReader::new(read_half);
         while let Some(frame) = reader.next::<EdgeFrame>().await? {
+            if frame.since() > self.version {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "core link: a frame of link version {} on a link of version {}",
+                        frame.since(),
+                        self.version
+                    ),
+                ));
+            }
             match frame {
                 EdgeFrame::Open(session, open) => self.open(session, open).await,
                 EdgeFrame::Line(session, line) => {
@@ -769,6 +783,17 @@ impl SessionStream {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "core link: Hello after the handshake",
+                    ));
+                }
+                EdgeFrame::Paused
+                | EdgeFrame::Upload(..)
+                | EdgeFrame::RecordUpload(..)
+                | EdgeFrame::ReplicaUpload(_)
+                | EdgeFrame::CutUpload(_)
+                | EdgeFrame::UploadDone => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "core link: a frame of a cut this core did not make",
                     ));
                 }
             }
@@ -853,7 +878,7 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                self.open_irc(session, ClientIp::new(address), transport, guard);
+                self.open_irc(session, ClientIp::new(address), transport, None, guard);
             }
             SessionKind::Irc => {
                 let Some(guard) = self.server.limiter.try_acquire(client) else {
@@ -871,7 +896,7 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                self.open_irc(session, client, transport, guard);
+                self.open_irc(session, client, transport, open.tls, guard);
             }
             SessionKind::Attach => {
                 let Some(port) = self.server.attach.clone() else {
@@ -900,7 +925,13 @@ impl SessionStream {
                     return;
                 };
                 let edge = port
-                    .open(conn, client.to_string(), transport, self.server.sendq_bytes)
+                    .open(
+                        conn,
+                        client.to_string(),
+                        transport,
+                        open.tls,
+                        self.server.sendq_bytes,
+                    )
                     .await
                     .expect("the attach port always opens");
                 let window = u32::try_from(crate::bouncer::ATTACH_INBOUND_BYTES).expect("small");
@@ -973,12 +1004,14 @@ impl SessionStream {
         session: SessionId,
         client: ClientIp,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         guard: e6irc_edge::address::ConnGuard,
     ) {
         let (input, edge) = self.server.core_tx.open_input(
             ConnId(session.get()),
             client.to_string(),
             transport,
+            tls,
             self.server.sendq_bytes,
         );
         if self.pusher.send(input).is_err() {

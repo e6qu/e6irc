@@ -266,6 +266,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             conn,
             LOCAL_SESSION_HOST.into(),
             crate::core::ConnectionTransport::Local,
+            None,
             session.core.sendq_bytes,
         )
         .await

@@ -663,6 +663,8 @@ pub enum Input {
         tx: SendQueue,
         host: String,
         transport: ConnectionTransport,
+        /// What the TLS its edge terminated negotiated, when it did.
+        tls: Option<e6irc_link::TlsFacts>,
     },
     /// One complete line from the connection (terminator stripped).
     Line {
@@ -1042,6 +1044,7 @@ impl CoreIngress {
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         sendq_bytes: usize,
     ) -> (Input, EdgeSession) {
         let (tx, edge) = send_queue("sendq", sendq_bytes);
@@ -1051,6 +1054,7 @@ impl CoreIngress {
                 tx,
                 host,
                 transport,
+                tls,
             },
             edge,
         )
@@ -1063,9 +1067,10 @@ impl e6irc_edge::connection::CorePort for CoreIngress {
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         sendq_bytes: usize,
     ) -> Option<EdgeSession> {
-        let (open, edge) = self.open_input(conn, host, transport, sendq_bytes);
+        let (open, edge) = self.open_input(conn, host, transport, tls, sendq_bytes);
         let opened = self.push(open).await;
         opened.ok().map(|_sequence| edge)
     }
@@ -3140,7 +3145,8 @@ impl Core {
                 tx,
                 host,
                 transport,
-            } => self.state.open(conn, tx, host, transport),
+                tls,
+            } => self.state.open(conn, tx, host, transport, tls),
             Input::Line { conn, line } => {
                 handler::dispatch(&mut self.state, conn, &line);
                 // A line is what makes (or unmakes) an IRC operator, whose
@@ -4059,6 +4065,7 @@ mod ingress_tests {
             output_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         (session, output_rx)
     }
@@ -4169,6 +4176,7 @@ mod ingress_tests {
             second_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         let check = |first: &Core, second: &Core| {
             for core in [first, second] {
@@ -4557,7 +4565,7 @@ mod ingress_tests {
         let conn = ConnId(2);
         first
             .state
-            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp, None);
         for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
             first.handle(Input::Line {
                 conn,
@@ -4713,6 +4721,7 @@ mod ingress_tests {
                     tx,
                     host: "host.test".into(),
                     transport: ConnectionTransport::Tcp,
+                    tls: None,
                 })
                 .await
                 .expect("open");
@@ -4949,6 +4958,7 @@ mod ingress_tests {
                 tx,
                 host: "host.test".into(),
                 transport: ConnectionTransport::Tcp,
+                tls: None,
             });
             if !caps.is_empty() {
                 self.line(conn, &format!("CAP REQ :{caps}"));
@@ -7052,7 +7062,7 @@ mod ingress_tests {
         let (tx, mut edge) = crate::core::send_queue("edge-link-test", sendq_bytes);
         let conn = ConnId(conn);
         core.state
-            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp, None);
         for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
             core.handle(Input::Line {
                 conn,
@@ -7501,12 +7511,14 @@ mod ingress_tests {
             alice_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         second.state.open(
             ConnId(1),
             bob_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         for (core, conn, nick, rx) in [
             (&mut first, ConnId(2), "alice", &mut alice_rx),
@@ -7617,6 +7629,7 @@ mod ingress_tests {
             alice_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         for line in [
             "CAP LS 302",
@@ -7637,7 +7650,7 @@ mod ingress_tests {
             let (tx, mut rx) = crate::core::send_queue("who-member-output", 128 * 512);
             second
                 .state
-                .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+                .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp, None);
             for line in [
                 format!("NICK member{index}"),
                 format!("USER member{index} 0 * :member{index}"),
@@ -7725,12 +7738,14 @@ mod ingress_tests {
             alice_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         second.state.open(
             ConnId(1),
             bob_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         for (core, conn, nick) in [
             (&mut first, ConnId(2), "alice"),
@@ -8095,6 +8110,7 @@ mod ingress_tests {
             out_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         let (sender_tx, _sender_rx) = crate::core::send_queue("local-member-sendq", 64 * 512);
         first.state.open(
@@ -8102,6 +8118,7 @@ mod ingress_tests {
             sender_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         first.handle(Input::Line {
             conn: ConnId(2),
@@ -8171,6 +8188,7 @@ mod ingress_tests {
             peer_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         let key = first.state.chan_key("#chat");
         let mut channel = Channel::for_test("#chat", ChanModes::default());
@@ -8194,6 +8212,7 @@ mod ingress_tests {
             joiner_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         second.handle(Input::Line {
             conn: ConnId(1),

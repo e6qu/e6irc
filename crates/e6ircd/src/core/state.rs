@@ -995,6 +995,8 @@ pub(crate) struct PublicUser {
     pub(crate) registered_only: bool,
     /// Umode +Z: the connection is TLS end to end ([`Session::secure`]).
     pub(crate) secure: bool,
+    /// What the TLS the edge terminated negotiated ([`Session::tls`]).
+    pub(crate) tls: Option<e6irc_link::TlsFacts>,
     pub(crate) signon: e6irc_proto::time::Millis,
     pub(crate) idle_since: IdleSince,
 }
@@ -1016,6 +1018,7 @@ impl PublicUser {
             wallops: session.wallops,
             registered_only: session.registered_only,
             secure: session.secure(),
+            tls: session.tls.clone(),
             signon: session.signon,
             idle_since: session.idle_since.clone(),
         }
@@ -1036,6 +1039,7 @@ impl PublicUser {
             && self.wallops == session.wallops
             && self.registered_only == session.registered_only
             && self.secure == session.secure()
+            && self.tls == session.tls
             && self.signon == session.signon
     }
 
@@ -1864,6 +1868,9 @@ pub(crate) struct Session {
     /// host it opened with (a later SETHOST changes only what is shown).
     limit_key: e6irc_edge::address::SessionLimitKey,
     pub transport: crate::core::ConnectionTransport,
+    /// What the TLS its edge terminated negotiated, when the edge terminated
+    /// TLS for it: fixed when it opened.
+    pub(crate) tls: Option<e6irc_link::TlsFacts>,
     /// Registration state and the identity fields, as one sum type (see
     /// [`Registration`]): a registered connection *has* a nick/user/realname.
     reg: Registration,
@@ -6862,6 +6869,7 @@ impl ServerState {
         tx: crate::core::SendQueue,
         host: String,
         transport: crate::core::ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
     ) {
         let opened_at = (self.config.mono_clock)();
         // The shown host rides as a middle parameter (WHO, WHOIS): an IPv6
@@ -6880,6 +6888,7 @@ impl ServerState {
                     .map(|address| address.to_canonical()),
                 host,
                 transport,
+                tls,
                 reg: Registration::Registering {
                     nick: None,
                     user: None,
@@ -8229,6 +8238,7 @@ mod session_store_tests {
             tx,
             "host.test".into(),
             crate::core::ConnectionTransport::Tcp,
+            None,
         );
     }
 

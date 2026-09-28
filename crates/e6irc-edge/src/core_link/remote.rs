@@ -406,6 +406,7 @@ impl Link {
             slot: Some(self.welcome.slot),
             highest_epoch: self.welcome.epoch,
             listeners: Vec::new(),
+            cut: None,
         };
         let (connection, welcome) = connect(&self.connector, self.core, hello).await?;
         if welcome.epoch != self.welcome.epoch {
@@ -570,6 +571,7 @@ impl RemoteCore {
             slot,
             highest_epoch: epoch.highest(),
             listeners,
+            cut: None,
         };
         let (first, welcome) = connect(
             &dialing.connector,
@@ -659,8 +661,9 @@ impl RemoteCore {
             });
             let reader_link = link.clone();
             let telemetry = self.shared.telemetry.clone();
+            let version = link.welcome.version;
             let reader = tokio::spawn(async move {
-                if let Err(error) = read_stream(read_half, &stream, &*telemetry).await {
+                if let Err(error) = read_stream(read_half, &stream, version, &*telemetry).await {
                     eprintln!("e6ircd edge: core link read failed: {error}");
                 }
                 reader_link.end();
@@ -715,6 +718,7 @@ impl RemoteCore {
                 kind: SessionKind::Ui,
                 address,
                 transport: transport_of(transport),
+                tls: None,
             },
         );
         if stream.out.send(open).await.is_err() {
@@ -883,6 +887,7 @@ async fn relay_ui(
 async fn read_stream<R>(
     read_half: R,
     stream: &LinkStream,
+    version: u16,
     telemetry: &dyn TransportTelemetry,
 ) -> std::io::Result<()>
 where
@@ -890,6 +895,15 @@ where
 {
     let mut reader = FrameReader::new(read_half);
     while let Some(frame) = reader.next::<CoreFrame>().await? {
+        if frame.since() > version {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "core link: a frame of link version {} on a link of version {version}",
+                    frame.since()
+                ),
+            ));
+        }
         match frame {
             CoreFrame::Output(session, bytes) => {
                 let overrun = {
@@ -987,6 +1001,18 @@ where
                     "core link: a handshake frame after the handshake",
                 ));
             }
+            CoreFrame::Pause
+            | CoreFrame::Resume
+            | CoreFrame::Ack(..)
+            | CoreFrame::Record(..)
+            | CoreFrame::Replica(_)
+            | CoreFrame::CutState(_)
+            | CoreFrame::Cut(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "core link: a frame of a cut this edge holds nothing for",
+                ));
+            }
         }
     }
     Ok(())
@@ -1022,6 +1048,7 @@ impl CorePort for RemoteCorePort {
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         _sendq_bytes: usize,
     ) -> Option<EdgeSession> {
         let Some(link) = self.core.linked_within(OPEN_WAIT).await else {
@@ -1055,6 +1082,8 @@ impl CorePort for RemoteCorePort {
                 kind: self.kind,
                 address,
                 transport: transport_of(transport),
+                // A version 1 core reads no TLS facts.
+                tls: tls.filter(|_| link.welcome.version >= 2),
             },
         );
         // A link that ends here closes the session loudly as it tears down.

@@ -124,6 +124,7 @@ async fn a_core_below_the_accepted_epoch_is_refused_and_dialing_goes_on() {
                     command_flood: None,
                     line_credit: 16,
                 },
+                admission: e6irc_link::Admission::Serve,
             };
             write_frame(&mut tls, &CoreFrame::Welcome(welcome))
                 .await
