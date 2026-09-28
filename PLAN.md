@@ -1534,8 +1534,10 @@ configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
 fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
-Status: phases 0 and 1 done; phase 2 is the next to build; every other phase
-is scheduled in the order below.
+Status: phases 0, 1 and 2 done — phase 2 for every session that reaches a
+core shard, with bouncer attach and `/ws/ui` as link session kinds before the
+maintainer (the phase 2 entry says what needs deciding); phase 3 is the next
+to build; every other phase is scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
   tier's invariants), §19 (the design and its settled decisions), a §18
@@ -1556,13 +1558,32 @@ is scheduled in the order below.
   `tools/check-edge-isolation.sh`: no sqlx or other PostgreSQL client, no
   `e6ircd` and no `reqwest` in any dependency kind, feature or target, with
   its contract test run against a scratch workspace.
-- **Phase 2 — in-process link.** The core reaches connections only through
-  link frames: the remote send queue with `Drained` accounting, credits,
-  `Kill` and `End`, pacing woken by `Drained`; bouncer attach and `/ws/ui`
-  become link session kinds; the flood meter moves to the edge. DESIGN §7.2.
-  *Green because* every existing test, irctest included, runs through the
-  in-process edge with "SendQ exceeded", pacing and the closing drain
-  unchanged.
+- **Phase 2 — in-process link (done).** The core reaches connections only
+  through link frames: the remote send queue with `Drained` accounting,
+  credits, `Kill` and `End`, pacing woken by `Drained`; bouncer attach and
+  `/ws/ui` become link session kinds; the flood meter moves to the edge.
+  DESIGN §7.2. *Green because* every existing test, irctest included, runs
+  through the in-process edge with "SendQ exceeded", pacing and the closing
+  drain unchanged.
+  As built (DESIGN §19.1, "Phase 2 as built"): `e6irc_edge::link` gives each
+  session's link two ends — the core's `SessionLink`, the remote send queue
+  counting every byte until the edge reports it written, and the edge's
+  `EdgeSession`, the bounded buffer its writer drains — and every session that
+  reaches a core shard (TCP, TLS, `/ws/irc`, the `local` driver's) opens and
+  speaks through them and `CorePort`; `Drained` travels through the
+  loom-verified `e6irc_queue::Progress`, wakes a paced reply's turn, and
+  replaces the 20 ms pacing reminder; a credit in process is room in the
+  shard's queue, granted first come first served; the meter
+  (`e6irc_edge::meter`) is the edge's, with each session's exemption set on
+  its link; the `/ws/irc` connection loop is the edge's. The one visible
+  change is the one DESIGN §2 prescribes: a client that stops reading is cut
+  at `sendq_bytes` unwritten, not up to twice that. Bouncer attach and
+  `/ws/ui` are not link sessions: neither reaches a core shard nor has a send
+  queue today, so as session kinds each needs an output bound — the SendQ kill
+  the IRC kind has, or backpressure bounded by the write deadline as their
+  sockets give today — and `/ws/ui` needs frames for WebSocket messages, close
+  codes and Ping liveness that DESIGN §19.2 does not define. That choice is
+  the maintainer's.
 - **Phase 3 — process boundary.** The `e6irc-link` codec and its
   `link_frames` fuzz target; `e6ircd edge`; the mutual-TLS link and
   `e6ircd edge-credentials`; the epoch fence; `/readyz`-based discovery; HTTP

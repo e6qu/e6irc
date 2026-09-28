@@ -1321,8 +1321,6 @@ pub(crate) struct CoreDirectories {
     pub(crate) topics: RetainedTopicDirectory,
     pub(crate) channel_options: ChannelOptionsDirectory,
     pub(crate) nick_registrations: NickRegistrationDirectory,
-    /// Which connections their readers let past the line meter.
-    pub(crate) flood_exemptions: crate::core::line_meter::FloodExemptions,
     /// How long history is kept.
     pub(crate) history_retention: HistoryRetention,
     /// How old a connection must be before its QUIT comment is shown.
@@ -1474,89 +1472,6 @@ impl HistoryRetention {
                 days.saturating_mul(DAY_MS),
             ))),
         }
-    }
-}
-
-/// A validated command-flood bucket shape: `burst` tokens at most, refilling
-/// `rate` per second. Constructed only through [`CommandFlood::new`], so a
-/// bucket that never refills (`rate = 0`), that never admits a line
-/// (`burst = 0`), or that cannot hold one second of its own rate
-/// (`burst < rate`) cannot reach a connection's line meter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandFlood {
-    burst: u32,
-    rate: u32,
-}
-
-/// Why a burst/rate pair is not a usable flood bucket; the message names the
-/// configuration keys because the configuration validator reports it verbatim.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandFloodError {
-    RateZero,
-    BurstZero,
-    BurstBelowRate { burst: usize, rate: usize },
-    AboveMaximum { maximum: usize },
-}
-
-impl std::fmt::Display for CommandFloodError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RateZero => {
-                write!(
-                    f,
-                    "limits.command_rate must be at least 1 (0 never refills the bucket)"
-                )
-            }
-            Self::BurstZero => write!(
-                f,
-                "limits.command_burst must be at least 1 (0 never admits a line)"
-            ),
-            Self::BurstBelowRate { burst, rate } => write!(
-                f,
-                "limits.command_burst ({burst}) must be at least limits.command_rate ({rate}): \
-                 the bucket must hold one second of its own refill"
-            ),
-            Self::AboveMaximum { maximum } => write!(
-                f,
-                "limits.command_burst and limits.command_rate must be at most {maximum}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CommandFloodError {}
-
-impl CommandFlood {
-    pub fn new(burst: usize, rate: usize) -> Result<Self, CommandFloodError> {
-        let maximum = crate::config::MAX_COMMAND_FLOOD_TOKENS;
-        if rate == 0 {
-            return Err(CommandFloodError::RateZero);
-        }
-        if burst == 0 {
-            return Err(CommandFloodError::BurstZero);
-        }
-        if burst < rate {
-            return Err(CommandFloodError::BurstBelowRate { burst, rate });
-        }
-        if burst > maximum || rate > maximum {
-            return Err(CommandFloodError::AboveMaximum { maximum });
-        }
-        let narrow =
-            |value: usize| u32::try_from(value).expect("bounded by MAX_COMMAND_FLOOD_TOKENS");
-        Ok(Self {
-            burst: narrow(burst),
-            rate: narrow(rate),
-        })
-    }
-
-    /// The bucket's capacity: the tokens a fresh session starts with.
-    pub const fn burst(self) -> u32 {
-        self.burst
-    }
-
-    /// Tokens regained per second of elapsed monotonic time.
-    pub const fn rate(self) -> u32 {
-        self.rate
     }
 }
 
@@ -2030,9 +1945,9 @@ pub(crate) struct Session {
     /// would write a persisted marker the client never asked to associate with the
     /// account (same reason the DM-history identity key is not back-filled).
     pub anon_read_markers: HashMap<MarkerTarget, e6irc_proto::time::Millis>,
-    /// Whether this connection's reader is told it is exempt from the line
-    /// meter ([`crate::core::line_meter`]): what `oper` was when it was last
-    /// published there.
+    /// Whether the edge has been told, over this connection's link, that its
+    /// lines are exempt from the meter (`e6irc_edge::meter`): what `oper` was
+    /// when it was last set there.
     flood_exempt: bool,
     /// When the user last spoke, for "seconds idle" (see [`IdleSince`]).
     /// (WHOIS *signon*, a real timestamp, is `signon`.)
@@ -4751,9 +4666,11 @@ pub(crate) struct ServerState {
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
-    /// The line meter's exemptions, which this shard publishes for its own
-    /// sessions ([`Self::sync_flood_exemption`]).
-    flood_exemptions: crate::core::line_meter::FloodExemptions,
+    /// Woken when the edge reports output written (`Drained`) for a session
+    /// that asked, so its paced replies take their turn as soon as its client
+    /// has made room ([`SessionOutput::paced_room`]); the shard's worker
+    /// waits on it while it paces.
+    pub(crate) drained: Arc<tokio::sync::Notify>,
     /// How long history is kept, shared with every shard and the bouncer.
     history_retention: HistoryRetention,
     /// How old a connection must be before its QUIT comment is shown, shared
@@ -5875,7 +5792,7 @@ impl ServerState {
             pending_server_bans: HashSet::new(),
             whowas: directories.whowas,
             census: directories.census,
-            flood_exemptions: directories.flood_exemptions,
+            drained: Arc::default(),
             history_retention: directories.history_retention,
             anti_spam_exit_message_time: directories.anti_spam_exit_message_time,
             password_policy: directories.password_policy,
@@ -6922,7 +6839,7 @@ impl ServerState {
         let prev = self.sessions.insert(
             conn,
             Session {
-                output: SessionOutput::new(tx),
+                output: SessionOutput::new(tx, self.drained.clone()),
                 limit_key: e6irc_edge::address::PeerLimitKey::for_session_host(&host),
                 real_ip: host
                     .parse::<std::net::IpAddr>()
@@ -7071,7 +6988,7 @@ impl ServerState {
                 _ => {}
             }
         }
-        let Some(session) = self.sessions.get(&conn) else {
+        let Some(session) = self.sessions.output_mut(&conn) else {
             return; // events may race a close; the session is gone
         };
         let byte_count = bytes.strip_suffix(b"\r\n").unwrap_or(&bytes).len();
@@ -7827,7 +7744,7 @@ impl ServerState {
         let exempt = session.oper.is_some();
         if session.flood_exempt != exempt {
             session.flood_exempt = exempt;
-            self.flood_exemptions.set(conn, exempt);
+            session.output.set_flood_exempt(exempt);
         }
     }
 
@@ -7859,9 +7776,6 @@ impl ServerState {
         };
         // Its paced LIST and WHO replies go with the session itself.
         self.pacing.remove(&conn);
-        if session.flood_exempt {
-            self.flood_exemptions.set(conn, false);
-        }
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the

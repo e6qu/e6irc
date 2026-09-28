@@ -12,7 +12,6 @@ mod banmask;
 mod handler;
 pub(crate) mod history_request;
 mod hot_history;
-pub(crate) mod line_meter;
 mod list;
 mod middle;
 mod paced;
@@ -31,9 +30,9 @@ pub(crate) const REGISTRATION_TIMEOUT: std::time::Duration =
 pub(crate) use timer::TimerWheel;
 
 pub use e6irc_edge::connection::{ConnectionIdAllocator, ConnectionTransport, Output};
-pub use state::{
-    ChannelOwner, CommandFlood, CommandFloodError, ConnId, CoreConfig, dm_conversation_key,
-};
+pub use e6irc_edge::link::EdgeSession;
+pub use e6irc_edge::meter::{CommandFlood, CommandFloodError};
+pub use state::{ChannelOwner, ConnId, CoreConfig, dm_conversation_key};
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -139,8 +138,9 @@ pub struct CoreIngress {
     count: CoreShardCount,
     directories: CoreDirectories,
     traffic: Arc<CrossShardTraffic>,
-    /// Every connection's command allowance ([`line_meter`]); `None` only for
-    /// the test harnesses' ingress, which nothing meters.
+    /// The shape of every session's command allowance, which the edge meters
+    /// (`e6irc_edge::meter`); `None` only for the test harnesses' ingress,
+    /// which nothing meters.
     command_flood: Option<CommandFlood>,
 }
 
@@ -220,17 +220,6 @@ impl CoreIngress {
             command_flood: Some(flood),
             ..self
         }
-    }
-
-    /// A new connection's meter, which whatever hands its lines to this
-    /// ingress spends a token of for each ([`line_meter`]).
-    pub(crate) fn line_meter(&self, conn: ConnId) -> line_meter::LineMeter {
-        line_meter::LineMeter::new(
-            conn,
-            self.command_flood,
-            self.directories.flood_exemptions.clone(),
-            tokio::time::Instant::now(),
-        )
     }
 
     pub async fn push(&self, input: Input) -> Result<u64, Box<Input>> {
@@ -667,7 +656,8 @@ pub enum Input {
     /// own traffic — which shutdown must drain — from input arriving from
     /// outside, which shutdown stops taking.
     FromShard(Box<Input>),
-    /// A connection was accepted; `tx` is its send queue.
+    /// A connection was accepted (the link's `Open` frame); `tx` is the
+    /// core's end of its link, with its remote send queue.
     Open {
         conn: ConnId,
         tx: SendQueue,
@@ -872,9 +862,10 @@ pub enum Input {
     Tick {
         now: e6irc_proto::time::MonoMillis,
     },
-    /// A worker's own reminder, every [`PACE_INTERVAL`] while it has a LIST
-    /// or WHO reply being paced out and nothing else to do: the reply's
-    /// client may have read enough for more of its rows.
+    /// A worker's own reminder, once the edge has reported output written
+    /// (`Drained`) for a session with a LIST or WHO reply being paced out and
+    /// the worker has nothing else to do: the reply's client has read, so it
+    /// may have room for more of its rows.
     PaceReplies,
     /// Read markers storage maintenance deleted as past the history
     /// retention, broadcast to every shard so its mirror drops them too. The
@@ -1039,20 +1030,18 @@ impl Input {
     }
 }
 
-/// The core as the edge's connections reach it in the single process: each
+/// The core as the edge's sessions reach it in the single process: each
 /// session opened, line framed and end reported becomes an [`Input`] on the
-/// owning shard's queue, as it always was.
+/// owning shard's queue, and the awaited push is the line's credit.
 impl e6irc_edge::connection::CorePort for CoreIngress {
-    type Meter = line_meter::LineMeter;
-
     async fn open(
         &self,
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
         sendq_bytes: usize,
-    ) -> Option<Receiver<Output>> {
-        let (tx, rx) = send_queue("sendq", sendq_bytes);
+    ) -> Option<EdgeSession> {
+        let (tx, edge) = send_queue("sendq", sendq_bytes);
         let opened = self
             .push(Input::Open {
                 conn,
@@ -1061,28 +1050,17 @@ impl e6irc_edge::connection::CorePort for CoreIngress {
                 transport,
             })
             .await;
-        opened.ok().map(|_sequence| rx)
+        opened.ok().map(|_sequence| edge)
     }
 
-    fn line_meter(&self, conn: ConnId) -> Self::Meter {
-        CoreIngress::line_meter(self, conn)
+    fn command_flood(&self) -> Option<CommandFlood> {
+        self.command_flood
     }
 
-    /// Drain framed line events into the core queue as [`Input`] lines.
-    async fn push_framed(
-        &self,
-        meter: &mut Self::Meter,
-        conn: ConnId,
-        events: &mut Vec<e6irc_proto::framing::LineEvent>,
-    ) -> bool {
-        for event in events.drain(..) {
-            let input = Input::framed(conn, event);
-            meter.spend().await;
-            if self.push(input).await.is_err() {
-                return false;
-            }
-        }
-        true
+    async fn push(&self, conn: ConnId, event: e6irc_proto::framing::LineEvent) -> bool {
+        CoreIngress::push(self, Input::framed(conn, event))
+            .await
+            .is_ok()
     }
 
     async fn closed(&self, conn: ConnId, reason: String) {
@@ -2517,26 +2495,22 @@ pub enum AccountDropOutcome {
     Unavailable,
 }
 
-/// The core's end of one connection's send queue: bounded in the bytes its
-/// lines hold (`sendq_bytes`), like Solanum's class `sendq`, never in their
-/// number — a count lets a few maximum-size lines pin as much as a thousand
-/// short ones. Made only by [`send_queue`], so no connection can be given a
-/// queue measured in anything else.
+/// The core's end of one connection's link: its remote send queue, bounded
+/// in the bytes its lines hold (`sendq_bytes`), like Solanum's class `sendq`,
+/// never in their number — a count lets a few maximum-size lines pin as much
+/// as a thousand short ones — and measured at the client socket: a line
+/// counts until the edge reports it written (DESIGN §2, §19.1). Made only by
+/// [`send_queue`], so no connection can be given a queue measured in anything
+/// else.
 #[derive(Debug)]
-pub struct SendQueue(pub(crate) Sender<Output>);
+pub struct SendQueue(pub(crate) e6irc_edge::link::SessionLink);
 
-/// A connection's send queue of `bytes` bytes (named `name` in diagnostics):
-/// the core's end, and the receiver its writer drains.
-pub fn send_queue(name: &'static str, bytes: usize) -> (SendQueue, Receiver<Output>) {
-    let (tx, rx) = e6irc_queue::weighted_queue(
-        e6irc_queue::Config {
-            name,
-            capacity: bytes,
-            policy: e6irc_queue::Policy::Fifo,
-        },
-        |output: &Output| output.0.len(),
-    );
-    (SendQueue(tx), rx)
+/// A connection's link with a send queue of `bytes` bytes (named `name` in
+/// diagnostics): the core's end, and the edge's end its writer drains and
+/// reports written.
+pub fn send_queue(name: &'static str, bytes: usize) -> (SendQueue, EdgeSession) {
+    let (link, edge) = e6irc_edge::link::session(name, bytes);
+    (SendQueue(link), edge)
 }
 
 /// Output withheld behind a deferred reply (see `Session::deferred_replies`),
@@ -2763,12 +2737,6 @@ pub(crate) enum CoreWorkerExit {
 /// it has stopped, and [`CoreWorkerExit::Backlogged`] says so loudly.
 pub(crate) const CROSS_SHARD_BACKLOG_LIMIT: usize = 65_536;
 
-/// How long a worker with a LIST or WHO reply being paced out waits, idle,
-/// before giving it another turn. Each turn fills the client's send queue up
-/// to half its `sendq_bytes` ([`SessionOutput::paced_room`]), however many rows
-/// that is.
-pub(crate) const PACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// One core and the only queue allowed to drive its state transitions.
 pub(crate) struct CoreWorker {
     core: Core,
@@ -2830,15 +2798,17 @@ impl CoreWorker {
             };
             // A LIST or WHO reply being paced out needs a turn once its
             // client has read some of it, even if nothing else happens
-            // meanwhile.
+            // meanwhile: the edge's report of output written wakes it. Each
+            // turn fills the client's send queue up to half its `sendq_bytes`
+            // ([`SessionOutput::paced_room`]), however many rows that is.
             let pacing = !self.core.state.pacing.is_empty();
-            let pace = tokio::time::sleep(PACE_INTERVAL);
+            let drained = self.core.state.drained.clone();
             let mut paced = false;
             let popped = tokio::select! {
                 envelope = self.receiver.pop() => Some(envelope),
                 () = room => None,
                 () = &mut changed, if self.stopping => None,
-                () = pace, if pacing => {
+                () = drained.notified(), if pacing => {
                     paced = true;
                     None
                 }
@@ -3692,31 +3662,40 @@ pub(crate) enum Written {
 }
 
 impl SessionOutput {
-    pub(crate) fn new(tx: SendQueue) -> Self {
+    /// The output of a session opened on the shard `drained` wakes.
+    pub(crate) fn new(tx: SendQueue, drained: Arc<tokio::sync::Notify>) -> Self {
+        tx.0.wake_on_drained(drained);
         Self {
             tx,
             said_goodbye: false,
         }
     }
 
-    /// Queue one line. A full send queue means the client is too slow and the
-    /// connection must die — the classic SendQ-exceeded kill. Never silently
-    /// dropped.
-    pub(crate) fn write(&self, line: WireLine) -> Result<Written, SendqExceeded> {
+    /// Queue one line. A line past the bound means the client is too slow and
+    /// the connection must die — the classic SendQ-exceeded kill. Never
+    /// silently dropped.
+    pub(crate) fn write(&mut self, line: WireLine) -> Result<Written, SendqExceeded> {
         if self.said_goodbye {
             return Ok(Written::AfterGoodbye);
         }
-        match self.tx.0.try_push(Output(line.0)) {
-            Ok(_) => Ok(Written::Queued),
-            Err(PushError::Full(_)) => Err(SendqExceeded),
-            // Receiver gone: the I/O task is already dead. On the common
-            // reader-first close a `Closed{conn}` event is already in flight to
-            // us. On a writer-first close (write half RSTs while the read half
-            // hangs) there is no such event and outbound lines are dropped for
-            // now — but the liveness reaper PINGs the idle session and reaps it
-            // once the PONG deadline passes, so this can't leave a permanent
-            // zombie.
-            Err(PushError::Closed(_)) => Ok(Written::Queued),
+        match self.tx.0.output(Output(line.0)) {
+            Ok(e6irc_edge::link::Sent::Buffered) => Ok(Written::Queued),
+            // The edge's end is gone: the I/O task is already dead. On the
+            // common reader-first close a `Closed{conn}` event is already in
+            // flight to us. On a writer-first close (write half RSTs while the
+            // read half hangs) there is no such event and outbound lines are
+            // dropped for now — but the liveness reaper PINGs the idle session
+            // and reaps it once the PONG deadline passes, so this can't leave a
+            // permanent zombie.
+            Ok(e6irc_edge::link::Sent::EdgeGone) => Ok(Written::Queued),
+            Err(e6irc_edge::link::OutputRefused::OverBound) => Err(SendqExceeded),
+            // The edge's buffer refused what this account admitted: the
+            // account is wrong, a core bug. The session cannot be trusted to
+            // any bound now, so it goes as a SendQ kill does, counted.
+            Err(e6irc_edge::link::OutputRefused::EdgeOverrun) => {
+                debug_assert!(false, "the edge refused output the send queue admitted");
+                Err(SendqExceeded)
+            }
         }
     }
 
@@ -3724,13 +3703,12 @@ impl SessionOutput {
     /// paced reply (a LIST, a long WHO) may occupy, leaving the other half for
     /// whatever else the connection is sent meanwhile. Solanum's SAFELIST
     /// bound. A paced reply sends while any room is left, so it may pass the
-    /// half by at most the one line that crossed it.
+    /// half by at most the one line that crossed it. Asking is what a paced
+    /// reply does before each turn, so it arms the wake: the edge's next
+    /// report of output written wakes this shard for the next turn.
     pub(crate) fn paced_room(&self) -> usize {
-        self.tx
-            .0
-            .capacity()
-            .div_ceil(2)
-            .saturating_sub(self.tx.0.depth())
+        let in_flight = self.tx.0.arm_drained_wake();
+        self.tx.0.capacity().div_ceil(2).saturating_sub(in_flight)
     }
 
     /// Queue the connection's closing line; nothing is written after it.
@@ -3740,12 +3718,22 @@ impl SessionOutput {
         self.said_goodbye = true;
     }
 
-    /// Discard everything still queued, then queue the closing line — which
-    /// the emptied queue always has room for. For a connection killed because
-    /// it could not take what it was sent.
+    /// Discard everything the edge has not yet taken, then send the closing
+    /// line past the bound (the link's `Kill`). For a connection killed
+    /// because it could not take what it was sent. One already told goodbye
+    /// keeps that goodbye: it is the last line, and discarding it would leave
+    /// none.
     pub(crate) fn discard_backlog_for_goodbye(&mut self, line: WireLine) {
-        drop(self.tx.0.take_queued());
-        self.write_goodbye(line);
+        if !self.said_goodbye {
+            self.tx.0.kill(Output(line.0));
+        }
+        self.said_goodbye = true;
+    }
+
+    /// Whether the edge meters this connection's lines: an IRC operator's are
+    /// exempt.
+    pub(crate) fn set_flood_exempt(&self, exempt: bool) {
+        self.tx.0.set_flood_exempt(exempt);
     }
 }
 
@@ -3926,8 +3914,7 @@ mod wire_line_tests {
 mod ingress_tests {
     use super::{
         ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
-        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, Output, ReplayError,
-        SessionOwner,
+        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -4038,7 +4025,7 @@ mod ingress_tests {
     fn open_session_on_first(
         first: &mut Core,
         name: &'static str,
-    ) -> (SessionOwner, Receiver<Output>) {
+    ) -> (SessionOwner, crate::core::EdgeSession) {
         let (output_tx, output_rx) = crate::core::send_queue(name, 2 * 512);
         let session = SessionOwner::new(ConnId(2), CoreShardId(0));
         first.state.open(
@@ -4231,7 +4218,7 @@ mod ingress_tests {
         assert_eq!(second.shard, CoreShardId(1));
     }
 
-    async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
+    async fn next_output(rx: &mut crate::core::EdgeSession) -> Envelope<super::Output> {
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.pop())
             .await
             .expect("core test timed out waiting for output")
@@ -4539,7 +4526,7 @@ mod ingress_tests {
     }
 
     /// Open and register `nick` as connection 2 on the first shard.
-    fn register_on_first(first: &mut Core, nick: &str) -> (ConnId, Receiver<Output>) {
+    fn register_on_first(first: &mut Core, nick: &str) -> (ConnId, crate::core::EdgeSession) {
         let (tx, rx) = crate::core::send_queue("registered-on-first-output", 64 * 512);
         let conn = ConnId(2);
         first
@@ -4692,7 +4679,7 @@ mod ingress_tests {
     impl LivePair {
         /// Connect and register `nick` as connection `conn` (its shard is
         /// `conn % 2`), returning its output.
-        async fn client(&self, conn: u64, nick: &str) -> Receiver<Output> {
+        async fn client(&self, conn: u64, nick: &str) -> crate::core::EdgeSession {
             let (tx, mut rx) = crate::core::send_queue("live-pair-client", 4096 * 512);
             self.ingress
                 .push(Input::Open {
@@ -4735,7 +4722,7 @@ mod ingress_tests {
     }
 
     /// The next output line containing `needle`.
-    async fn await_line(rx: &mut Receiver<Output>, needle: &str) -> String {
+    async fn await_line(rx: &mut crate::core::EdgeSession, needle: &str) -> String {
         loop {
             let line = next_output(rx).await.payload.0;
             let line = String::from_utf8_lossy(&line).trim_end().to_string();
@@ -4839,7 +4826,7 @@ mod ingress_tests {
         cores: Vec<Core>,
         /// A channel each shard owns: `owned[0]` by shard 0, `owned[1]` by shard 1.
         owned: [&'static str; 2],
-        outputs: std::collections::HashMap<u64, Receiver<Output>>,
+        outputs: std::collections::HashMap<u64, crate::core::EdgeSession>,
         /// Each shard's requests to the database worker (there is none).
         database: Vec<Receiver<super::DbRequest>>,
         /// What the server outside the core hands it live: history retention.
@@ -7028,6 +7015,222 @@ mod ingress_tests {
         }
     }
 
+    /// Open and register `nick` as `conn` on `core`, with a send queue of
+    /// `sendq_bytes`, its welcome read as a client that keeps up reads it.
+    fn registered_with_sendq(
+        core: &mut Core,
+        conn: u64,
+        nick: &str,
+        sendq_bytes: usize,
+    ) -> crate::core::EdgeSession {
+        let (tx, mut edge) = crate::core::send_queue("edge-link-test", sendq_bytes);
+        let conn = ConnId(conn);
+        core.state
+            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+        for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
+            core.handle(Input::Line {
+                conn,
+                line: line.into_bytes(),
+            });
+        }
+        while edge.try_pop().is_some() {}
+        edge
+    }
+
+    fn wire(line: &Envelope<super::Output>) -> String {
+        String::from_utf8_lossy(&line.payload.0)
+            .trim_end()
+            .to_string()
+    }
+
+    /// The send-queue bound is measured at the client socket (DESIGN §2): a
+    /// line the edge's writer has taken but not yet written — a socket that
+    /// stopped taking bytes mid-write — still counts, so a client that stops
+    /// reading is killed for SendQ exceeded once that much is unwritten,
+    /// however empty the edge's buffer is. Its closing `ERROR` is the one
+    /// line it is still sent.
+    #[test]
+    fn output_taken_but_not_written_counts_against_the_send_queue() {
+        const SENDQ: usize = 2048;
+        let mut core = single_core();
+        let mut slow = registered_with_sendq(&mut core, 1, "slow", SENDQ);
+        let _talker = registered_with_sendq(&mut core, 2, "talker", 64 * 512);
+        let text = "x".repeat(300);
+        let mut taken = Vec::new();
+        for _ in 0..20 {
+            core.handle(Input::Line {
+                conn: ConnId(2),
+                line: format!("PRIVMSG slow :{text}").into_bytes(),
+            });
+            // The writer takes everything, and the socket takes none of it.
+            while let Some(line) = slow.try_take() {
+                taken.push(line);
+            }
+        }
+        let closing = taken.pop().expect("the closing line");
+        assert!(
+            wire(&closing).starts_with("ERROR :Closing Link:")
+                && wire(&closing).ends_with("(SendQ exceeded)"),
+            "{}",
+            wire(&closing)
+        );
+        let unwritten: usize = taken.iter().map(|line| line.payload.0.len()).sum();
+        assert!(
+            unwritten <= SENDQ && taken.len() < 20,
+            "{unwritten} bytes of {} messages",
+            taken.len()
+        );
+        assert!(!core.state.sessions.contains_key(&ConnId(1)));
+    }
+
+    /// The other side of the same rule: a client whose socket takes what it
+    /// is sent frees the room as the edge reports it written, and is never
+    /// killed however much passes through a small send queue.
+    #[test]
+    fn output_reported_written_frees_its_room() {
+        const SENDQ: usize = 2048;
+        let mut core = single_core();
+        let mut reader = registered_with_sendq(&mut core, 1, "reader", SENDQ);
+        let _talker = registered_with_sendq(&mut core, 2, "talker", 64 * 512);
+        let text = "x".repeat(300);
+        let mut received = 0;
+        for _ in 0..200 {
+            core.handle(Input::Line {
+                conn: ConnId(2),
+                line: format!("PRIVMSG reader :{text}").into_bytes(),
+            });
+            while let Some(line) = reader.try_take() {
+                assert!(wire(&line).contains("PRIVMSG reader"), "{}", wire(&line));
+                reader.written(line.payload.0.len());
+                received += 1;
+            }
+        }
+        assert_eq!(received, 200);
+        assert!(core.state.sessions.contains_key(&ConnId(1)));
+    }
+
+    /// The core pushes a session's flood exemption over its link: the edge's
+    /// meter for it lets an IRC operator's lines past an empty bucket, and
+    /// stops once the session is no longer one.
+    #[test]
+    fn an_operators_exemption_reaches_the_edges_meter_over_the_link() {
+        let (db, _db_rx) = queue(Config {
+            name: "exemption-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut config = core_config();
+        config.opers = vec![("admin".into(), "secret".into())];
+        let mut core = Core::new(config, db);
+        let edge = registered_with_sendq(&mut core, 1, "oper", 64 * 512);
+        let mut meter = edge.line_meter(Some(
+            crate::core::CommandFlood::new(1, 1).expect("valid bucket"),
+        ));
+        let now = tokio::time::Instant::now();
+        assert!(meter.blocked_until(now).is_none());
+        spend_now(&mut meter);
+        assert!(meter.blocked_until(now).is_some(), "the bucket is empty");
+        let line = |core: &mut Core, line: &str| {
+            core.handle(Input::Line {
+                conn: ConnId(1),
+                line: line.as_bytes().to_vec(),
+            });
+        };
+        line(&mut core, "OPER admin secret");
+        assert!(
+            meter.blocked_until(now).is_none(),
+            "an operator's lines are not metered"
+        );
+        line(&mut core, "MODE oper -o");
+        assert!(
+            meter.blocked_until(now).is_some(),
+            "the exemption ends with the status"
+        );
+    }
+
+    /// Spend a token of a meter that has one, without waiting for one.
+    fn spend_now(meter: &mut e6irc_edge::meter::LineMeter) {
+        let mut spend = std::pin::pin!(meter.spend());
+        let waker = std::task::Waker::noop();
+        assert!(
+            spend
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(waker))
+                .is_ready(),
+            "a token was there"
+        );
+    }
+
+    /// A paced LIST is woken by the edge's report of output written, and by
+    /// nothing else: with nothing more happening on the shard, rows the
+    /// client has room for follow as soon as its writer reports the last
+    /// ones written, and none follow while they are only taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paced_list_is_woken_by_output_written() {
+        const SENDQ: usize = 4096;
+        let (tx, rx) = queue(Config {
+            name: "paced-list-worker",
+            capacity: 1024,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::single(tx);
+        let mut core = single_core();
+        let mut lister = registered_with_sendq(&mut core, 1, "lister", SENDQ);
+        let mut member = registered_with_sendq(&mut core, 2, "member", 1024 * 1024);
+        for room in 0..200 {
+            core.handle(Input::Line {
+                conn: ConnId(2),
+                line: format!("JOIN #room{room:03}").into_bytes(),
+            });
+            while member.try_pop().is_some() {}
+        }
+        let worker = tokio::spawn(CoreWorker::new(core, rx, ingress.clone()).run());
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"LIST".to_vec(),
+            })
+            .await
+            .expect("worker alive");
+        let take = |lister: &mut crate::core::EdgeSession| {
+            std::iter::from_fn(|| lister.try_take()).collect::<Vec<_>>()
+        };
+        let mut rows = 0;
+        let mut ended = false;
+        let mut turns = 0;
+        while !ended {
+            // A turn's rows arrive; with them taken and none written, no
+            // further turn comes, however long the shard is left alone.
+            let mut turn = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while turn.is_empty() {
+                assert!(tokio::time::Instant::now() < deadline, "no turn came");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                turn = take(&mut lister);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            turn.extend(take(&mut lister));
+            let bytes: usize = turn.iter().map(|line| line.payload.0.len()).sum();
+            rows += turn
+                .iter()
+                .filter(|line| wire(line).contains(" 322 "))
+                .count();
+            ended = turn.iter().any(|line| wire(line).contains(" 323 "));
+            assert!(
+                (ended || bytes >= SENDQ / 2)
+                    && bytes <= SENDQ / 2 + e6irc_proto::message::MAX_LINE_LEN,
+                "a turn fills half the send queue, and no more: {bytes} bytes"
+            );
+            turns += 1;
+            // The socket takes them: the report alone wakes the next turn.
+            lister.written(bytes);
+        }
+        assert_eq!(rows, 200);
+        assert!(turns > 2, "{turns} turns");
+        ingress.broadcast_shutdown().await.expect("worker alive");
+        worker.await.expect("worker stops");
+    }
+
     #[test]
     fn an_effect_for_this_shard_is_handled_inline_and_never_returned_for_routing() {
         let mut core = single_core();
@@ -7236,7 +7439,7 @@ mod ingress_tests {
     }
 
     /// Read `rx` up to and including the line that ends with `end`.
-    async fn output_until(rx: &mut Receiver<super::Output>, end: &str) -> Vec<String> {
+    async fn output_until(rx: &mut crate::core::EdgeSession, end: &str) -> Vec<String> {
         let mut lines = Vec::new();
         loop {
             let line =

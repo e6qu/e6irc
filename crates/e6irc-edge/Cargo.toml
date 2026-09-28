@@ -53,6 +53,11 @@ serde = { version = "1.0.228", default-features = false, features = [
 ipnet = { version = "2.12.0", features = ["serde"] }
 # The WebSocket a `/ws/irc` or `/ws/ui` connection is framed on.
 axum = { version = "0.8.9", default-features = false, features = ["ws"] }
+# tokio-tungstenite 0.29.0 (2026-03-17), already in the tree as the stack axum
+# serves WebSockets through, and held with it (e6ircd's manifest says why):
+# `/ws/irc` names its error type to tell a message over the size ceiling
+# (closed with 1009) from a broken connection.
+tokio-tungstenite = { version = "0.29.0", default-features = false }
 
 [dev-dependencies]
 # Paused time for the deadline and lingering-close tests.

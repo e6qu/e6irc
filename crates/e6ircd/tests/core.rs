@@ -11,7 +11,7 @@ use e6irc_queue::{Config, Policy, Receiver, queue};
 fn test_mono() -> MonoMillis {
     MonoMillis::from_millis(1_000_000_000)
 }
-use e6ircd::core::{ConnId, Core, CoreConfig, Input, Output};
+use e6ircd::core::{ConnId, Core, CoreConfig, EdgeSession, Input};
 
 /// A test connection's send queue: the 256 lines it held when it counted
 /// lines, at a full 512-byte line each, so every reply that fitted then fits.
@@ -30,7 +30,7 @@ struct TestServer {
     core: Core,
     /// Each connection's send queue, in bytes (the configured `sendq_bytes`).
     sendq_bytes: usize,
-    conns: Vec<(ConnId, Receiver<Output>)>,
+    conns: Vec<(ConnId, EdgeSession)>,
     db_rx: Receiver<e6ircd::core::DbRequest>,
     channel_service_route: Option<(e6ircd::core::ChannelOwner, e6ircd::core::SessionOwner)>,
     /// Where the last queued TOPIC persistence request came from, so its

@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
-use e6irc_queue::Receiver;
+use e6irc_edge::connection::CorePort;
 
 use super::irc_driver::{JoinedChannels, UpstreamControl};
 use super::upstream_identity::AutojoinChannel;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
-use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
+use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, EdgeSession};
 
 /// The in-process network's name — the driver `kind`, the session host, and the
 /// network a slash-less BNC attach defaults to (DESIGN §10.4: bare = `local`).
@@ -136,33 +136,40 @@ struct Welcome {
 }
 
 /// The in-process session's lines to the core, metered like any client's
-/// (`core::line_meter`): an owner's paste is paced, not refused.
+/// (`e6irc_edge::meter`): an owner's paste is paced, not refused.
 struct CoreLines<'a> {
     core: &'a CoreIngress,
     conn: ConnId,
-    meter: crate::core::line_meter::LineMeter,
+    meter: e6irc_edge::meter::LineMeter,
 }
 
 impl<'a> CoreLines<'a> {
-    fn new(core: &'a CoreIngress, conn: ConnId) -> Self {
+    fn new(core: &'a CoreIngress, conn: ConnId, edge: &EdgeSession) -> Self {
         Self {
             core,
             conn,
-            meter: core.line_meter(conn),
+            meter: edge.line_meter(core.command_flood()),
         }
     }
 
     /// Queue one line for the core. `false` means the core is gone.
     async fn say(&mut self, line: String) -> bool {
-        self.meter.spend().await;
-        self.core
-            .push(Input::Line {
-                conn: self.conn,
-                line: line.into_bytes(),
-            })
-            .await
-            .is_ok()
+        let mut events = vec![e6irc_proto::framing::LineEvent::Line(line.into_bytes())];
+        e6irc_edge::connection::hand_over(self.core, &mut self.meter, self.conn, &mut events).await
     }
+}
+
+/// The core's next line to the in-process session, its CRLF stripped — only
+/// the frame's, not all trailing whitespace, since a trailing parameter may
+/// end in spaces. The session is its own writer, so taking a line is writing
+/// it ([`EdgeSession::pop`]). `None` once the core has ended the session.
+async fn next_output(edge: &mut EdgeSession) -> Option<String> {
+    let line = edge.pop().await?.payload.0;
+    Some(
+        String::from_utf8_lossy(&line)
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+    )
 }
 
 /// Read the core's replies until it welcomes the session under the configured
@@ -173,18 +180,15 @@ impl<'a> CoreLines<'a> {
 async fn await_welcome(
     session: &LocalSession,
     lines: &mut CoreLines<'_>,
-    out_rx: &mut Receiver<Output>,
+    edge: &mut EdgeSession,
     ends: &DriverEnds,
 ) -> Result<Welcome, super::SessionOutcome> {
     use super::SessionOutcome::{Dropped, RegistrationRejected, Stopped};
     let mut capabilities_acknowledged = false;
     loop {
-        let Some(envelope) = out_rx.pop().await else {
+        let Some(line) = next_output(edge).await else {
             return Err(Dropped(super::NetworkFailure::ConnectionLost));
         };
-        let line = String::from_utf8_lossy(&envelope.payload.0)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
         let Ok(parsed) = e6irc_proto::message::Message::parse(&line) else {
             ends.emit_line(line);
             continue;
@@ -255,22 +259,20 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             return Stopped;
         }
     };
-    let (out_tx, mut out_rx) = crate::core::send_queue("local-sendq", session.core.sendq_bytes);
-    if session
+    let Some(mut edge) = session
         .core
         .core_tx
-        .push(Input::Open {
+        .open(
             conn,
-            tx: out_tx,
-            host: LOCAL_SESSION_HOST.into(),
-            transport: crate::core::ConnectionTransport::Local,
-        })
+            LOCAL_SESSION_HOST.into(),
+            crate::core::ConnectionTransport::Local,
+            session.core.sendq_bytes,
+        )
         .await
-        .is_err()
-    {
+    else {
         return Stopped; // core shutting down
-    }
-    let outcome = drive_session(session, ends, conn, &mut out_rx).await;
+    };
+    let outcome = drive_session(session, ends, conn, &mut edge).await;
     // The one way out of an opened core session, whatever ended it: close it
     // rather than leave it — holding the nickname — for the core's liveness
     // reaper. Queue closure here already means the core is gone.
@@ -278,16 +280,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
         Stopped => "local driver stopped",
         _ => "local driver session ended",
     };
-    drop(
-        session
-            .core
-            .core_tx
-            .push(Input::Closed {
-                conn,
-                reason: reason.into(),
-            })
-            .await,
-    );
+    session.core.core_tx.closed(conn, reason.into()).await;
     outcome
 }
 
@@ -296,10 +289,10 @@ async fn drive_session(
     session: &LocalSession,
     ends: &mut DriverEnds,
     conn: ConnId,
-    out_rx: &mut Receiver<Output>,
+    edge: &mut EdgeSession,
 ) -> super::SessionOutcome {
     use super::SessionOutcome::Stopped;
-    let mut lines = CoreLines::new(&session.core.core_tx, conn);
+    let mut lines = CoreLines::new(&session.core.core_tx, conn, edge);
     // Register in-process. Queueing NICK and USER is only a request: the core
     // answers like any server, and it is the welcome that makes a session. The
     // capability request holds registration until `CAP END`, so the core has
@@ -318,7 +311,7 @@ async fn drive_session(
         _ = ends.stop_signal() => Err(Stopped),
         welcome = tokio::time::timeout(
             WELCOME_DEADLINE,
-            await_welcome(session, &mut lines, out_rx, ends),
+            await_welcome(session, &mut lines, edge, ends),
         ) => welcome.unwrap_or(Err(super::SessionOutcome::Dropped(
             super::NetworkFailure::RegistrationTimedOut,
         ))),
@@ -363,13 +356,8 @@ async fn drive_session(
         tokio::select! {
             () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
             // Core output -> buffer + broadcast (attach playback/live).
-            out = out_rx.pop() => match out {
-                Some(env) => {
-                    // Strip only the frame's CRLF, not all trailing whitespace —
-                    // a trailing param may end in spaces.
-                    let line = String::from_utf8_lossy(&env.payload.0)
-                        .trim_end_matches(['\r', '\n'])
-                        .to_string();
+            out = next_output(edge) => match out {
+                Some(line) => {
                     let message = e6irc_proto::message::Message::parse(&line)
                         .ok()
                         .map(|parsed| e6irc_client::OwnedMessage::from(&parsed));
@@ -501,8 +489,9 @@ async fn drive_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{Input, Output, SendQueue};
     use bytes::Bytes;
-    use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
+    use e6irc_queue::{Config as QueueConfig, Policy, Receiver, Sender, queue};
     use tokio::sync::broadcast;
 
     fn core_queue(capacity: usize) -> (Sender<Input>, Receiver<Input>) {
@@ -555,7 +544,7 @@ mod tests {
 
     /// Read the session's registration as the core would, up to answering
     /// its capability request, which the core does before anything else.
-    async fn open_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {
+    async fn open_registration(core_rx: &mut Receiver<Input>) -> SendQueue {
         let open = core_rx.pop().await.expect("Open event").payload;
         let Input::Open { tx, .. } = open else {
             panic!("expected Open");
@@ -572,13 +561,13 @@ mod tests {
             };
             assert_eq!(String::from_utf8(line).unwrap(), expected);
         }
-        tx.0
+        tx
     }
 
-    async fn finish_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {
-        let tx = open_registration(core_rx).await;
+    async fn finish_registration(core_rx: &mut Receiver<Input>) -> SendQueue {
+        let mut tx = open_registration(core_rx).await;
         core_says(
-            &tx,
+            &mut tx,
             ":e6.example CAP * ACK :account-tag echo-message message-tags server-time",
         )
         .await;
@@ -596,11 +585,11 @@ mod tests {
         ] {
             let (core_tx, mut core_rx) = core_queue(8);
             let (handle, _events, task) = spawn_session(core_tx, Vec::new());
-            let out_tx = open_registration(&mut core_rx).await;
+            let mut out_tx = open_registration(&mut core_rx).await;
             if let Some(answer) = answer {
-                core_says(&out_tx, answer).await;
+                core_says(&mut out_tx, answer).await;
             }
-            core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+            core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
             assert!(
                 matches!(
                     stopped(task).await,
@@ -614,11 +603,21 @@ mod tests {
         }
     }
 
-    async fn core_says(out_tx: &Sender<Output>, line: &str) {
-        out_tx
-            .push(Output(Bytes::from(format!("{line}\r\n"))))
-            .await
-            .expect("local output queue");
+    /// Send `line` to the session over its link, waiting for the session to
+    /// read enough of what came before for it to fit: the session reports
+    /// each line written as it reads it.
+    async fn core_says(out_tx: &mut SendQueue, line: &str) {
+        let line = Output(Bytes::from(format!("{line}\r\n")));
+        loop {
+            match out_tx.0.output(line.clone()) {
+                Ok(sent) => {
+                    assert_eq!(sent, e6irc_edge::link::Sent::Buffered);
+                    return;
+                }
+                Err(e6irc_edge::link::OutputRefused::OverBound) => tokio::task::yield_now().await,
+                Err(refused) => panic!("{refused:?}"),
+            }
+        }
     }
 
     /// A refused nickname used to look like a connection that was made and
@@ -643,8 +642,8 @@ mod tests {
         ] {
             let (core_tx, mut core_rx) = core_queue(8);
             let (handle, _events, task) = spawn_session(core_tx, vec!["#room".into()]);
-            let out_tx = finish_registration(&mut core_rx).await;
-            core_says(&out_tx, reply).await;
+            let mut out_tx = finish_registration(&mut core_rx).await;
+            core_says(&mut out_tx, reply).await;
             let super::super::SessionOutcome::RegistrationRejected(rejection) = stopped(task).await
             else {
                 panic!("{reply} was not read as a registration refusal");
@@ -681,11 +680,11 @@ mod tests {
         NetworkHandle,
         broadcast::Receiver<super::super::DriverEvent>,
         tokio::task::JoinHandle<super::super::SessionOutcome>,
-        Sender<Output>,
+        SendQueue,
     ) {
         let (core_tx, mut core_rx) = core_queue(8);
         let (handle, mut events, task) = spawn_session(core_tx, Vec::new());
-        let out_tx = finish_registration(&mut core_rx).await;
+        let mut out_tx = finish_registration(&mut core_rx).await;
         // Queueing NICK and USER is a request, not a registration.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -695,7 +694,7 @@ mod tests {
             ),
             "the driver reported a session before the core welcomed it"
         );
-        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
         assert!(matches!(
             events.recv().await,
             Ok(super::super::DriverEvent::Session(
@@ -722,8 +721,8 @@ mod tests {
             core_tx,
             vec!["#room".into(), "#other".into(), "#third".into()],
         );
-        let out_tx = finish_registration(&mut core_rx).await;
-        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let mut out_tx = finish_registration(&mut core_rx).await;
+        core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
         let Input::Line { line, .. } = core_rx.pop().await.expect("join").payload else {
             panic!("expected the autojoin line");
         };
@@ -741,8 +740,8 @@ mod tests {
             core_tx.clone(),
             (0..9).map(|n| format!("#{n}{}", "r".repeat(58))).collect(),
         );
-        let out_tx = finish_registration(&mut core_rx).await;
-        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let mut out_tx = finish_registration(&mut core_rx).await;
+        core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
         while core_tx.depth() == 0 {
             tokio::task::yield_now().await;
         }
@@ -760,13 +759,10 @@ mod tests {
 
     #[tokio::test]
     async fn pong_failure_stops_when_the_core_is_gone() {
-        let (core_rx, _handle, _events, task, out_tx) = connected_session().await;
+        let (core_rx, _handle, _events, task, mut out_tx) = connected_session().await;
         drop(core_rx);
 
-        out_tx
-            .push(Output(Bytes::from_static(b"PING :keepalive\r\n")))
-            .await
-            .expect("local output queue");
+        core_says(&mut out_tx, "PING :keepalive").await;
         assert!(matches!(
             stopped(task).await,
             super::super::SessionOutcome::Stopped
@@ -798,9 +794,9 @@ mod tests {
     /// found it, so the reconnect met its own ghost.
     #[tokio::test]
     async fn a_session_past_the_channel_limit_closes_its_core_session() {
-        let (mut core_rx, _handle, _events, task, out_tx) = connected_session().await;
+        let (mut core_rx, _handle, _events, task, mut out_tx) = connected_session().await;
         for n in 0..=super::super::MAX_TRACKED_CHANNELS {
-            core_says(&out_tx, &format!(":alice!ident@local JOIN #c{n}")).await;
+            core_says(&mut out_tx, &format!(":alice!ident@local JOIN #c{n}")).await;
         }
         assert!(matches!(
             stopped(task).await,
@@ -855,7 +851,7 @@ mod tests {
     /// it. Nothing is synthesized in its place.
     #[tokio::test]
     async fn client_tags_reach_the_core_and_the_core_echoes_the_message() {
-        let (mut core_rx, handle, mut events, _task, out_tx) = connected_session().await;
+        let (mut core_rx, handle, mut events, _task, mut out_tx) = connected_session().await;
         for (line, echoed) in [
             (
                 "@+draft/reply=m0;+draft/react=:+1: TAGMSG #room",
@@ -870,8 +866,8 @@ mod tests {
             assert_eq!(handle.send_from(3, line), super::super::SendOutcome::Sent);
             let (heard, barrier) = core_heard(&mut core_rx).await;
             assert_eq!(heard, line);
-            core_says(&out_tx, echoed).await;
-            core_says(&out_tx, &barrier).await;
+            core_says(&mut out_tx, echoed).await;
+            core_says(&mut out_tx, &barrier).await;
             assert_eq!(next_echo(&mut events).await, (echoed.to_string(), 3));
         }
         let welcome = super::super::serve::welcome_to("bnc.test", LOCAL_NETWORK, &handle, "alice")
@@ -884,15 +880,19 @@ mod tests {
     /// and no echo is made up for a message nobody received.
     #[tokio::test]
     async fn a_refused_message_is_not_echoed() {
-        let (mut core_rx, handle, mut events, _task, out_tx) = connected_session().await;
+        let (mut core_rx, handle, mut events, _task, mut out_tx) = connected_session().await;
         assert_eq!(
             handle.send_from(3, "PRIVMSG #nowhere :hello"),
             super::super::SendOutcome::Sent
         );
         let (heard, barrier) = core_heard(&mut core_rx).await;
         assert_eq!(heard, "PRIVMSG #nowhere :hello");
-        core_says(&out_tx, ":e6.example 403 alice #nowhere :No such channel").await;
-        core_says(&out_tx, &barrier).await;
+        core_says(
+            &mut out_tx,
+            ":e6.example 403 alice #nowhere :No such channel",
+        )
+        .await;
+        core_says(&mut out_tx, &barrier).await;
         // The next message's echo is the next one published.
         assert_eq!(
             handle.send_from(4, "PRIVMSG #room :again"),
@@ -904,8 +904,8 @@ mod tests {
         assert_eq!(heard, "PRIVMSG #room :again");
         let echo =
             "@time=2026-01-01T00:00:03.000Z;msgid=m3 :alice!ident@local PRIVMSG #room :again";
-        core_says(&out_tx, echo).await;
-        core_says(&out_tx, &barrier).await;
+        core_says(&mut out_tx, echo).await;
+        core_says(&mut out_tx, &barrier).await;
         assert_eq!(next_echo(&mut events).await, (echo.to_string(), 4));
     }
 
@@ -916,8 +916,12 @@ mod tests {
     /// it on every attach after. It is the session's end, said as a notice.
     #[tokio::test]
     async fn the_cores_error_ends_the_session_and_reaches_no_client() {
-        let (_core_rx, handle, mut events, task, out_tx) = connected_session().await;
-        core_says(&out_tx, "ERROR :Closing Link: local (Killed (oper (bye)))").await;
+        let (_core_rx, handle, mut events, task, mut out_tx) = connected_session().await;
+        core_says(
+            &mut out_tx,
+            "ERROR :Closing Link: local (Killed (oper (bye)))",
+        )
+        .await;
         let super::super::SessionOutcome::ClosedByUpstream(closed) = stopped(task).await else {
             panic!("the core's ERROR is the session's end");
         };
@@ -957,21 +961,25 @@ mod tests {
             let second = session_once(&session, &mut ends).await;
             (first, second)
         });
-        let out_tx = finish_registration(&mut core_rx).await;
-        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let mut out_tx = finish_registration(&mut core_rx).await;
+        core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
         let Input::Line { line, .. } = core_rx.pop().await.expect("join").payload else {
             panic!("expected the autojoin line");
         };
         assert_eq!(String::from_utf8(line).unwrap(), "JOIN #configured");
-        core_says(&out_tx, ":alice!ident@local JOIN #configured").await;
-        core_says(&out_tx, ":alice!ident@local JOIN #Runtime").await;
-        core_says(&out_tx, "ERROR :Closing Link: local (Killed (oper (bye)))").await;
+        core_says(&mut out_tx, ":alice!ident@local JOIN #configured").await;
+        core_says(&mut out_tx, ":alice!ident@local JOIN #Runtime").await;
+        core_says(
+            &mut out_tx,
+            "ERROR :Closing Link: local (Killed (oper (bye)))",
+        )
+        .await;
         assert!(matches!(
             core_rx.pop().await.expect("close").payload,
             Input::Closed { .. }
         ));
-        let out_tx = finish_registration(&mut core_rx).await;
-        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let mut out_tx = finish_registration(&mut core_rx).await;
+        core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
         let Input::Line { line, .. } = core_rx.pop().await.expect("rejoin").payload else {
             panic!("expected the rejoin line");
         };
