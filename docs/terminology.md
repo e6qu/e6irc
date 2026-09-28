@@ -696,7 +696,15 @@ core's own ingress; the core link takes its place across processes.
 carries it (`e6irc_edge::link`): the core's end (`SessionLink`), its remote
 send queue and the frames the core sends the edge, and the edge's end
 (`EdgeSession`), the send-queue buffer its writer drains and the reports of
-what it wrote. Dropping the core's end ends the session.
+what it wrote. Dropping the core's end ends the session. A **waiting
+session** (bouncer attach, `/ws/ui`) is one whose core end waits for room
+instead of refusing a line over the bound: backpressure, as a socket written
+directly gave, never "SendQ exceeded".
+
+**Session kind** — what a core-link session carries and where it goes: `Irc`
+(IRC lines, to a core shard), `Attach` (IRC lines, to the bouncer's attach
+logic), `Ui` (WebSocket messages, to the web client's live socket), and the
+later `Upstream` and `Local`.
 
 **Edge mode** and **single-process mode** — edges as separate processes
 (opt-in), or the default one process with the edge in it over an in-memory
