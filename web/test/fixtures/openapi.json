@@ -1323,6 +1323,14 @@
                                     "addr": {
                                       "type": "string"
                                     },
+                                    "certificate": {
+                                      "description": "The certificate chain's path on the edge's host for a listener that terminates TLS; null for a plaintext one.",
+                                      "maxLength": 4096,
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
                                     "kind": {
                                       "enum": [
                                         "irc",
@@ -1334,15 +1342,12 @@
                                     },
                                     "proxy_protocol": {
                                       "type": "boolean"
-                                    },
-                                    "tls": {
-                                      "type": "boolean"
                                     }
                                   },
                                   "required": [
                                     "kind",
                                     "addr",
-                                    "tls",
+                                    "certificate",
                                     "proxy_protocol"
                                   ],
                                   "type": "object"

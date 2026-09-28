@@ -175,7 +175,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | real pseudo-terminal render/message/terminal-restore journey (the deterministic archive contract runs in `lint`) |
 | `shauth-sso` | exact external single-sign-on/logout integration |
-| `irctest`, `irctest-services` | IRC and services conformance; the green list runs twice, in one process and through an edge |
+| `irctest`, `irctest-edge`, `irctest-services` | IRC and services conformance; the green list runs in one process (`irctest`) and, in parallel, through an edge (`irctest-edge`) |
 | `matrix-bridge` | bidirectional live bridge behavior |
 | `loom` | queue concurrency interleavings |
 | `fuzz-smoke` | parser, tag escaping, stateful core, multi-client core, core-link frames, and hostile TUI server output |

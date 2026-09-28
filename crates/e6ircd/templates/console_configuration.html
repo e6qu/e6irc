@@ -29,6 +29,11 @@
         <label class="field"><span>Message history retention</span><input type="number" min="1" max="3650" name="storage_history_retention_days" required /><small>Days, from 1 to 3650; channel history and bouncer history alike.</small></label>
         <label class="field"><span>Audit retention</span><input type="number" min="1" max="3650" name="storage_audit_retention_days" required /><small>Days, from 1 to 3650.</small></label>
       </div></section>
+{% if edge_mode %}
+      <section class="settings-section"><div class="section-copy"><h2>Listeners and certificates</h2><p>This server runs in edge mode: each edge's own configuration names its IRC, web and attach listeners and their certificates, and is changed there. They are shown here as the linked edges report them.</p></div><div class="field-grid">
+        <div class="runtime-status field-wide" data-configuration-edge-listeners></div>
+      </div></section>
+{% else %}
       <section class="settings-section"><div class="section-copy"><h2>BNC attach listener</h2><p>Enable the raw IRC endpoint clients use to attach to their always-on networks. Attaching clients send their account password, so any address other than loopback requires a TLS certificate.</p></div><div class="field-grid">
         <label class="check field-wide"><input type="checkbox" name="bnc_enabled" /><span><strong>Accept BNC client connections</strong><small>Network management and web chat remain available while this is off.</small></span></label>
         <label class="field field-wide"><span>Listen address</span><input name="bnc_addr" placeholder="127.0.0.1:6697" inputmode="url" /><small>The replacement address is bound before the current listener is stopped. Without a certificate it must be a loopback address.</small></label>
@@ -38,8 +43,8 @@
       </div></section>
       <section class="settings-section"><div class="section-copy"><h2>IRC listeners</h2><p>Raw, TLS, and dedicated WebSocket endpoints. Listener changes are checked now and applied after restart.</p></div><div class="field-grid">
         <label class="field field-wide"><span>Listener definitions</span><textarea name="listeners" rows="5" spellcheck="false" required></textarea><small>One per line: <code>address | plain</code>, <code>address | websocket</code>, or <code>address | tls | certificate path | private-key path</code>.</small></label>
-        <div class="runtime-status field-wide" data-configuration-edge-listeners hidden></div>
       </div></section>
+{% endif %}
       <section class="settings-section"><div class="section-copy"><h2>Web and administrator access</h2><p>The HTTP bind and database remain bootstrap settings. Public identity, cookie policy, and administrator grants are UI-managed.</p></div><div class="field-grid">
         <label class="field field-wide"><span>Public URL</span><input type="url" name="public_url" placeholder="https://irc.example.com" /><small>Used for OpenID Connect callbacks and device authorization.</small></label>
         <label class="check field-wide"><input type="checkbox" name="secure_cookies" /><span><strong>Require secure session cookies</strong><small>Enable for HTTPS deployments.</small></span></label>

@@ -457,9 +457,7 @@ jobs:
   # written reason. run.sh holds the skipped tests to expected-skips.txt.
   irctest:
     runs-on: ubuntu-24.04
-    # Two runs of the green list, in one process and through an edge, each
-    # within the 15 minutes one run was bounded by.
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
@@ -484,13 +482,40 @@ jobs:
         run: |
           pip install -r ../irctest/requirements.txt "pytest-timeout==2.4.0"
           vendor/tests/irctest/run.sh ../irctest "$(command -v python)"
-      # The same list with every client reaching the core through an
-      # `e6ircd edge` over the mutual-TLS core link (DESIGN §19): the process
-      # boundary changes nothing a client can see.
+
+  # The same green list with every client reaching the core through an
+  # `e6ircd edge` over the mutual-TLS core link (DESIGN §19): the process
+  # boundary changes nothing a client can see. Its own job, in parallel with
+  # the single-process run; the link adds about a tenth to the run's time.
+  irctest-edge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --locked -p e6ircd
+      - name: Check out pinned irctest
+        run: |
+          # Retry the clone: a transient GitHub hiccup should not fail the job.
+          for attempt in 1 2 3; do
+            rm -rf ../irctest
+            git clone https://github.com/progval/irctest ../irctest && break
+            [ "$attempt" = 3 ] && { echo "irctest clone failed after 3 attempts"; exit 1; }
+            sleep 5
+          done
+          git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
       - name: Run irctest green list through an edge
         env:
           E6IRC_IRCTEST_EDGE: "1"
-        run: vendor/tests/irctest/run.sh ../irctest "$(command -v python)"
+        run: |
+          pip install -r ../irctest/requirements.txt "pytest-timeout==2.4.0"
+          vendor/tests/irctest/run.sh ../irctest "$(command -v python)"
 
   # The persistence-backed half of the conformance suite: the suites marked
   # `services` need an account store, so they run against a real PostgreSQL
@@ -730,6 +755,7 @@ jobs:
         native-client-journeys,
         shauth-sso,
         irctest,
+        irctest-edge,
         irctest-services,
         matrix-bridge,
         loom,

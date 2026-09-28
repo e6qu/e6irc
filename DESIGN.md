@@ -5678,7 +5678,8 @@ Layers, bottom to top:
   of its own; `e6ircd edge --config <file>` runs an edge, whose `[edge]`
   names it, the cores it dials and its credentials, and whose
   `[[listeners]]`, `[http]` and `[attach]` are its client ports, each with
-  an optional `proxy_protocol = true`. A core restart still closes every
+  an optional `proxy_protocol = true`, and whose `[metrics]` serves its own
+  metrics to the monitoring token. A core restart still closes every
   client loudly, and the edge relinks to the next lease holder by itself.
   Systemd units, container and Kubernetes shapes are the deployment phase's
   (`PLAN.md` phase 9).
@@ -6040,7 +6041,12 @@ phase rewrites.
     with `Retry-After`; one whose link connection fails before the answer is
     answered `502`. The authorization travels over the HTTP pool rather than
     as an `HttpRequest` frame: it is an HTTP request with an HTTP answer, and
-    the pool already carries those.
+    the pool already carries those. The link's headers are one namespace,
+    `e6irc-edge-`, and the edge removes every header in it — not only the
+    ones this release defines — from what a client sends before forwarding
+    and from every answer it relays, so a client can neither forge an
+    upgrade, an address or a grant nor read one
+    (`a_client_cannot_forge_the_link_s_headers`).
   - *HTTP serving moved to the edge crate* (`e6irc_edge::http`): the
     connection-capped accept, the header timeout and the write deadline,
     which the core's own `[http]` and WebSocket IRC listeners, a standby's
@@ -6063,10 +6069,12 @@ phase rewrites.
     `[edge_link]` (and `[http]`, for itself); each edge's configuration
     names its listeners, their certificates and its web and attach ports,
     reports them in `Hello`, and binds them at start, accepting once its
-    first link is made. The console shows each linked edge's listeners
-    read-only beside the stored definitions, which apply to single-process
-    mode and are sent back unchanged; a change of them is refused (409) in
-    edge mode.
+    first link is made; a TLS listener reports its certificate's path. The
+    console in edge mode renders no listener or attach-listener field: it
+    shows each linked edge's listeners and certificates read-only, as the
+    edges report them, and sends the stored definitions (which apply to
+    single-process mode) back unchanged. An API write that changes them is
+    refused (409).
   - *Loud ends.* When the link is lost — a crash, a kill, a reset — the edge
     closes every session it carried: IRC clients with `ERROR :Closing Link:
     <host> (server restarting)`, `/ws/ui` clients with close 1012, and the
@@ -6081,8 +6089,18 @@ phase rewrites.
     an edge. Metrics: `e6irc_core_link_version`,
     `e6irc_edge_link_version{edge}`, `e6irc_edge_upgrade_needed{edge}`, and
     the `link` error kind for a link that failed its handshake, broke the
-    protocol or ended by error. The edge process logs its own counters once
-    a minute; serving them over HTTP is part of the deployment phase (9).
+    protocol or ended by error. The edge serves its own metrics
+    (`e6irc_edge::metrics`) on a listener of its own, `[metrics]`, at
+    `/metrics`, in the core's exposition format and naming, to a scraper
+    presenting the monitoring token (`E6IRC_MONITORING_TOKEN`, checked by
+    the core's own rule) as a Bearer credential; an edge configured with
+    `[metrics]` and no token refuses to start. The listener is not the web
+    port, whose every request is the core's (D17), so a scrape answers while
+    no core is linked: `e6irc_edge_linked`, `e6irc_edge_core_epoch`,
+    `e6irc_edge_links_total`, `e6irc_edge_connections`,
+    `e6irc_edge_link_version`, `e6irc_connections_rejected_total` and
+    `e6irc_errors_total{kind}`, each labelled with the edge's name. The edge
+    also logs what failed, once a minute when anything did.
   - *The zero-drop suite's first scenarios* (`crates/e6ircd/tests/zero_drop.rs`)
     start real `e6ircd` and `e6ircd edge` processes and run in the `test`
     job on Linux, macOS and Windows: TCP, TLS and `/ws/irc` clients and HTTP
@@ -6150,7 +6168,13 @@ phase rewrites.
   transport, TLS facts, WebSocket mode), `Line` (with an input sequence
   number), `OverlongLine`, `Closed` (with a reason), `Drained` (bytes written
   to the client socket), `RecordUpload` and `ReplicaUpload` (rebuild only),
-  `UpstreamLine`, `HttpRequest` (upgrade authorization).
+  `UpstreamLine`. Upgrade authorization is no frame: the edge forwards the
+  upgrade request over its HTTP link connections, marked with the
+  identifier it will open the session under, and the core's own handler
+  answers — a refusal as it answers any client, an authorization as `200`
+  with grant headers the edge completes the upgrade by (§19.1, "Phase 3 as
+  built"). Every link header is in the `e6irc-edge-` namespace, which the
+  edge strips from what clients send and from what it relays to them.
 - **Frames, core to edge**: `Welcome` (epoch, chosen version, slot, and the
   configuration the edge follows: `trusted_proxies`, limits, the attach
   listener's state, send-queue size, flood shape), `Output` (bytes, plus the

@@ -10,13 +10,13 @@
 //! pre-filters by, each session's send-queue bound and command-flood shape.
 //! It binds its listeners at once, and accepts on them once it has first
 //! linked: a connection identifier needs the slot, and a session the terms,
-//! that only a core gives.
+//! that only a core gives. Its metrics listener (`[metrics]`) serves from the
+//! start, linked or not ([`crate::metrics`]).
 
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use e6irc_link::{EdgeName, ListenerKind, ListenerReport, SessionKind};
 use serde::Deserialize;
@@ -25,13 +25,14 @@ use tokio::sync::mpsc;
 use crate::address::{ConnLimiter, TrustedProxies};
 use crate::certificate::{CertificateReloads, Hangups, TlsConfig, install_crypto_provider};
 use crate::connection::{
-    AcceptContext, ConnectionIdAllocator, ConnectionTasks, TransportError, TransportTelemetry,
-    accept_loop, bind_listener,
+    AcceptContext, ConnectionIdAllocator, ConnectionTasks, TransportTelemetry, accept_loop,
+    bind_listener,
 };
 use crate::core_link::remote::{Dialing, Link, RemoteCore};
 use crate::core_link::tls::{LinkCredentialFiles, LinkCredentials};
 use crate::core_link::web::EdgeWeb;
 use crate::http::{HttpAdmission, serve_http};
+use crate::metrics::{EdgeMetrics, EdgeTelemetry, MonitoringToken};
 
 /// How long a stopping edge waits for its clients to be sent their closing
 /// line and closed.
@@ -53,6 +54,9 @@ pub struct EdgeConfig {
     /// The bouncer attach listener.
     #[serde(default)]
     pub attach: Option<EdgeAttach>,
+    /// Where the edge serves its own metrics.
+    #[serde(default)]
+    pub metrics: Option<EdgeMetricsListener>,
 }
 
 /// Who the edge is and how it reaches the core.
@@ -105,6 +109,33 @@ pub struct EdgeAttach {
     pub proxy_protocol: bool,
 }
 
+/// The edge's metrics listener: `/metrics`, for a scraper presenting the
+/// deployment's monitoring token.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeMetricsListener {
+    pub addr: SocketAddr,
+}
+
+/// A TLS listener's certificate path as the core's console shows it: the
+/// configuration's own text, which TOML makes UTF-8, within the link's bound.
+fn certificate_path(tls: &TlsConfig) -> io::Result<String> {
+    let path = tls.cert_path.to_str().ok_or_else(|| {
+        invalid(format!(
+            "the certificate path {} is not UTF-8",
+            tls.cert_path.display()
+        ))
+    })?;
+    if path.len() > e6irc_link::MAX_CERTIFICATE_PATH_LEN {
+        return Err(invalid(format!(
+            "a certificate path takes at most {} bytes: {}",
+            e6irc_link::MAX_CERTIFICATE_PATH_LEN,
+            tls.cert_path.display()
+        )));
+    }
+    Ok(path.to_owned())
+}
+
 /// Why an edge's configuration cannot run.
 fn invalid(what: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, what.to_string())
@@ -133,84 +164,6 @@ impl EdgeConfig {
             ));
         }
         Ok(name)
-    }
-}
-
-/// What the edge counts, said every [`TELEMETRY_REPORT_INTERVAL`] when any
-/// of it changed: the edge serves no metrics of its own.
-#[derive(Default)]
-struct EdgeTelemetry {
-    errors: [AtomicU64; ERROR_KINDS],
-    rejected: AtomicU64,
-}
-
-fn error_index(kind: TransportError) -> usize {
-    match kind {
-        TransportError::Accept => 0,
-        TransportError::ConnectionSetup => 1,
-        TransportError::TlsHandshake => 2,
-        TransportError::Read => 3,
-        TransportError::Write => 4,
-        TransportError::Http => 5,
-    }
-}
-
-const ERROR_KINDS: usize = 6;
-
-const ERROR_LABELS: [&str; ERROR_KINDS] = [
-    "accept",
-    "connection setup",
-    "TLS handshake",
-    "read",
-    "write",
-    "HTTP",
-];
-
-impl TransportTelemetry for EdgeTelemetry {
-    fn record_error(&self, kind: TransportError) {
-        self.errors[error_index(kind)].fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_connection_rejected(&self) {
-        self.rejected.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-impl EdgeTelemetry {
-    async fn report(self: Arc<Self>, name: EdgeName) {
-        // Each error kind's count, then the connections refused by limit.
-        let mut said = [0u64; ERROR_KINDS + 1];
-        let mut interval = tokio::time::interval(TELEMETRY_REPORT_INTERVAL);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let mut now = [0u64; ERROR_KINDS + 1];
-            for (index, count) in self.errors.iter().enumerate() {
-                now[index] = count.load(Ordering::Relaxed);
-            }
-            now[ERROR_KINDS] = self.rejected.load(Ordering::Relaxed);
-            if now == said {
-                continue;
-            }
-            let mut parts: Vec<String> = ERROR_LABELS
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| now[*index] > said[*index])
-                .map(|(index, label)| format!("{} {label} errors", now[index] - said[index]))
-                .collect();
-            if now[ERROR_KINDS] > said[ERROR_KINDS] {
-                parts.push(format!(
-                    "{} connections refused by limit",
-                    now[ERROR_KINDS] - said[ERROR_KINDS]
-                ));
-            }
-            eprintln!(
-                "e6ircd edge {name}: in the last {}s: {}",
-                TELEMETRY_REPORT_INTERVAL.as_secs(),
-                parts.join(", ")
-            );
-            said = now;
-        }
     }
 }
 
@@ -244,9 +197,24 @@ enum Bound {
 }
 
 /// Run an edge until `stop` resolves, then close its clients, loudly, and
-/// return.
-pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Result<()> {
+/// return. `monitoring` checks the Bearer credential a metrics scrape
+/// presents; `[metrics]` without it is refused, since a listener no scraper
+/// could read would be a silent one.
+pub async fn run(
+    config: EdgeConfig,
+    stop: impl Future<Output = ()>,
+    monitoring: Option<MonitoringToken>,
+) -> io::Result<()> {
     let name = config.validate()?;
+    let metrics_listener = match (&config.metrics, monitoring) {
+        (Some(metrics), Some(token)) => Some((bind_listener(metrics.addr)?, token)),
+        (Some(_), None) => {
+            return Err(invalid(
+                "[metrics] needs E6IRC_MONITORING_TOKEN: a scrape presents it as a Bearer                  credential",
+            ));
+        }
+        (None, _) => None,
+    };
     let hangups = Hangups::install()?;
     install_crypto_provider();
     let credentials = LinkCredentials::load(&config.edge.credentials)?;
@@ -258,7 +226,7 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
     // left to the system.
     let mut report = |listener: &tokio::net::TcpListener,
                       kind: ListenerKind,
-                      tls: bool,
+                      tls: Option<&TlsConfig>,
                       proxy_protocol: bool|
      -> io::Result<()> {
         let addr = listener.local_addr()?;
@@ -274,7 +242,7 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
         reports.push(ListenerReport {
             kind,
             addr,
-            tls,
+            certificate: tls.map(certificate_path).transpose()?,
             proxy_protocol,
         });
         Ok(())
@@ -285,7 +253,7 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
             report(
                 &socket,
                 ListenerKind::WebSocketIrc,
-                false,
+                None,
                 listener.proxy_protocol,
             )?;
             bound.push(Bound::WebSocketIrc(socket, listener.clone()));
@@ -293,7 +261,7 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
             report(
                 &socket,
                 ListenerKind::Irc,
-                listener.tls.is_some(),
+                listener.tls.as_ref(),
                 listener.proxy_protocol,
             )?;
             bound.push(Bound::Irc(socket, listener.clone()));
@@ -301,7 +269,7 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
     }
     if let Some(http) = &config.http {
         let socket = bind_listener(http.addr)?;
-        report(&socket, ListenerKind::Http, false, http.proxy_protocol)?;
+        report(&socket, ListenerKind::Http, None, http.proxy_protocol)?;
         bound.push(Bound::Http(socket, http.clone()));
     }
     if let Some(attach) = &config.attach {
@@ -309,7 +277,7 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
         report(
             &socket,
             ListenerKind::Attach,
-            attach.tls.is_some(),
+            attach.tls.as_ref(),
             attach.proxy_protocol,
         )?;
         bound.push(Bound::Attach(socket, attach.clone()));
@@ -328,10 +296,34 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
         });
     }
     let telemetry = Arc::new(EdgeTelemetry::default());
-    let reporting = tokio::spawn(telemetry.clone().report(name.clone()));
+    let reporting = tokio::spawn(
+        telemetry
+            .clone()
+            .report(name.clone(), TELEMETRY_REPORT_INTERVAL),
+    );
     let reloading = tokio::spawn(certificates.clone().run(hangups));
     let ids = Arc::new(ConnectionIdAllocator::new(NonZeroU64::MIN));
     let core = RemoteCore::new(telemetry.clone(), ids.clone());
+    let connections = ConnectionTasks::default();
+    let metrics = match metrics_listener {
+        Some((socket, token)) => {
+            println!("metrics listening on {}", socket.local_addr()?);
+            let metrics = Arc::new(EdgeMetrics {
+                name: name.clone(),
+                telemetry: telemetry.clone(),
+                core: core.clone(),
+                connections: connections.clone(),
+                token,
+            });
+            Some(tokio::spawn(serve_http(
+                socket,
+                metrics.router(),
+                HttpAdmission::new(TrustedProxies::default()),
+                telemetry.clone(),
+            )))
+        }
+        None => None,
+    };
     let (linked, mut links) = mpsc::unbounded_channel();
     let maintaining = tokio::spawn(core.clone().maintain(
         Dialing {
@@ -349,22 +341,26 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
             maintaining.abort();
             reporting.abort();
             reloading.abort();
+            if let Some(metrics) = &metrics {
+                metrics.abort();
+            }
             eprintln!("e6ircd edge {name}: stopping before it first linked");
             return Ok(());
         }
     };
     let trusted = TrustedProxies::default();
     let limiter = ConnLimiter::new(None);
+    telemetry.record_link();
     follow(&first, &trusted, &limiter);
     let following = {
-        let (trusted, limiter) = (trusted.clone(), limiter.clone());
+        let (trusted, limiter, telemetry) = (trusted.clone(), limiter.clone(), telemetry.clone());
         tokio::spawn(async move {
             while let Some(link) = links.recv().await {
+                telemetry.record_link();
                 follow(&link, &trusted, &limiter);
             }
         })
     };
-    let connections = ConnectionTasks::default();
     let dyn_telemetry: Arc<dyn TransportTelemetry> = telemetry.clone();
     let sendq_bytes = first.welcome().terms.sendq_bytes as usize;
     let mut accepting = Vec::new();
@@ -457,5 +453,8 @@ pub async fn run(config: EdgeConfig, stop: impl Future<Output = ()>) -> io::Resu
     }
     reporting.abort();
     reloading.abort();
+    if let Some(metrics) = &metrics {
+        metrics.abort();
+    }
     Ok(())
 }

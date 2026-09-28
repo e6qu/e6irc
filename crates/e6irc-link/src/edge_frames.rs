@@ -21,6 +21,9 @@ const DRAINED: u8 = 0x07;
 /// The most listeners an edge reports in its `Hello`.
 pub const MAX_LISTENERS: usize = 64;
 
+/// The most bytes of a listener's certificate path an edge reports.
+pub const MAX_CERTIFICATE_PATH_LEN: usize = 4096;
+
 /// The most bytes of a failed read's description a `Closed` carries; the edge
 /// shortens a longer one on a character boundary.
 pub const MAX_CLOSED_TEXT_LEN: usize = 512;
@@ -82,12 +85,14 @@ pub enum Stream {
     Http,
 }
 
-/// One listener an edge accepts on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One listener an edge accepts on, as its configuration names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerReport {
     pub kind: ListenerKind,
     pub addr: SocketAddr,
-    pub tls: bool,
+    /// The certificate chain's path on the edge's host, for a listener that
+    /// terminates TLS; `None` for a plaintext one.
+    pub certificate: Option<String>,
     pub proxy_protocol: bool,
 }
 
@@ -203,7 +208,9 @@ impl crate::sealed::Codec for EdgeFrame {
                             ListenerKind::Attach => 3,
                         });
                         w.socket(listener.addr);
-                        w.bool(listener.tls);
+                        w.option(listener.certificate.as_ref(), |w, path| {
+                            w.text("listener certificate", path, MAX_CERTIFICATE_PATH_LEN)
+                        })?;
                         w.bool(listener.proxy_protocol);
                         Ok(())
                     },
@@ -331,7 +338,9 @@ impl crate::sealed::Codec for EdgeFrame {
                     Ok(ListenerReport {
                         kind,
                         addr: r.socket("listener address")?,
-                        tls: r.bool("listener TLS")?,
+                        certificate: r.option("listener certificate", |r| {
+                            r.text("listener certificate", MAX_CERTIFICATE_PATH_LEN)
+                        })?,
                         proxy_protocol: r.bool("listener PROXY protocol")?,
                     })
                 })?;

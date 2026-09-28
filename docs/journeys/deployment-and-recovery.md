@@ -247,9 +247,10 @@ configuration and each edge's configuration.
    core's terms, and then accepts clients.
 5. Clients connect to the edge exactly as to a single process: IRC over TCP
    and TLS, `/ws/irc`, `/ws/ui`, bouncer attach and every HTTP route.
-6. The operator reads `/readyz` (`edges`), the link-version metrics and the
-   console's configuration page, which shows each linked edge's listeners
-   read-only.
+6. The operator reads `/readyz` (`edges`), the link-version metrics, each
+   edge's own `/metrics` on its `[metrics]` listener, and the console's
+   configuration page, which in edge mode has no listener field and shows
+   each linked edge's listeners and certificates as it reports them.
 
 **Visible failures and recovery.** A core that stops or crashes closes every
 client loudly: `ERROR :Closing Link: <host> (server restarting)` from the
@@ -264,7 +265,11 @@ the core across every edge, is told so in its `ERROR`.
 **Security and observability.** Every link is mutual TLS 1.3, loopback
 included, and a core and an edge certificate cannot stand in for each other.
 A PROXY header is believed only from the core's trusted proxies; any other
-peer on such a listener is refused. `/readyz` lists the linked edges and
+peer on such a listener is refused. The link's own headers are one
+namespace the edge strips from every client request and every answer, so a
+client can neither forge an upgrade, address or grant nor read one. An
+edge's metrics need the monitoring token, and an edge configured to serve
+them without one refuses to start. `/readyz` lists the linked edges and
 whether one needs an upgrade; `e6irc_core_link_version`,
 `e6irc_edge_link_version` and `e6irc_edge_upgrade_needed` are served, and a
 failed link counts as the `link` error kind.
@@ -275,9 +280,13 @@ graceful rebuild is `PLAN.md` phase 4).
 `a_killed_core_closes_every_session_loudly_and_the_next_core_serves`,
 `a_stopped_core_closes_every_session_with_its_own_error`,
 `a_link_reset_closes_its_sessions_loudly_on_both_sides`,
-`the_per_address_limit_holds_across_edges` and
-`a_proxy_protocol_listener_shows_the_relayed_client` run real core and edge
-processes on Linux, macOS and Windows.
+`the_per_address_limit_holds_across_edges`,
+`a_proxy_protocol_listener_shows_the_relayed_client`,
+`a_client_cannot_forge_the_link_s_headers` and
+`an_edge_serves_its_metrics_to_the_monitoring_token` run real core and edge
+processes on Linux, macOS and Windows;
+`edge_mode_shows_listeners_read_only_with_no_field_to_change_them` holds the
+console page.
 `the_core_welcomes_with_its_terms_and_refuses_each_hello_it_cannot_link_by_name`,
 `issued_credentials_link_and_name_their_edge`,
 `the_two_roles_and_two_deployments_do_not_mix` and

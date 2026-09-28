@@ -114,7 +114,19 @@ fn edge(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match e6irc_edge::process::run(config, signals.received()).await {
+        // The core's own monitoring token, read by the core's own rule.
+        let monitoring = match e6ircd::http::monitoring_token_digest_from_env() {
+            Ok(digest) => digest.map(|digest| {
+                e6irc_edge::metrics::MonitoringToken::new(move |presented| {
+                    e6ircd::http::monitoring_token_matches(&digest, presented)
+                })
+            }),
+            Err(error) => {
+                eprintln!("{CONTEXT}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match e6irc_edge::process::run(config, signals.received(), monitoring).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{CONTEXT}: {error}");

@@ -37,16 +37,56 @@ pub mod headers {
     /// A live chat socket's liveness interval, in milliseconds.
     pub const GRANT_LIVENESS_MS: &str = "e6irc-edge-grant-liveness-ms";
 
-    /// Every header of this set, which the edge removes from what a client
-    /// sends.
-    pub const ALL: [&str; 8] = [
-        CLIENT,
-        UPGRADE,
-        LISTENER,
-        GRANT,
-        GRANT_ADDRESS,
-        GRANT_TRANSPORT,
-        GRANT_PROTOCOL,
-        GRANT_LIVENESS_MS,
-    ];
+    /// What every link header's name starts with. The edge removes every
+    /// header so named from what a client sends and from what it relays to a
+    /// client, not only the ones above, so a header a later release adds is
+    /// never one a client could forge or read.
+    const PREFIX: &str = "e6irc-edge-";
+
+    /// Remove every link header from `headers`.
+    pub fn strip(headers: &mut axum::http::HeaderMap) {
+        let named: Vec<axum::http::HeaderName> = headers
+            .keys()
+            .filter(|name| name.as_str().starts_with(PREFIX))
+            .cloned()
+            .collect();
+        for name in named {
+            headers.remove(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::headers;
+
+    /// Every header in the link's namespace goes, including one no release
+    /// has defined yet; every other header stays.
+    #[test]
+    fn stripping_removes_the_whole_link_namespace_and_nothing_else() {
+        let mut map = axum::http::HeaderMap::new();
+        for name in [
+            headers::CLIENT,
+            headers::UPGRADE,
+            headers::LISTENER,
+            headers::GRANT,
+            headers::GRANT_ADDRESS,
+            headers::GRANT_TRANSPORT,
+            headers::GRANT_PROTOCOL,
+            headers::GRANT_LIVENESS_MS,
+            "e6irc-edge-not-yet-defined",
+        ] {
+            map.append(name, "forged".parse().expect("a header value"));
+        }
+        map.append(headers::GRANT, "twice".parse().expect("a header value"));
+        map.insert(
+            "x-forwarded-for",
+            "203.0.113.9".parse().expect("a header value"),
+        );
+        headers::strip(&mut map);
+        assert_eq!(
+            map.keys().map(|name| name.as_str()).collect::<Vec<_>>(),
+            ["x-forwarded-for"]
+        );
+    }
 }

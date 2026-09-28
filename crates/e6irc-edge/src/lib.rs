@@ -16,6 +16,7 @@ pub mod http;
 pub mod lingering_close;
 pub mod link;
 pub mod meter;
+pub mod metrics;
 pub mod peer_write;
 pub mod process;
 pub mod proxy_protocol;

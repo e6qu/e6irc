@@ -28,8 +28,8 @@ use bytes::{Buf, BufMut, BytesMut};
 
 pub use core_frames::{CloseFrame, CommandFloodTerms, CoreFrame, Credit, EdgeTerms, Welcome};
 pub use edge_frames::{
-    ClosedReason, EdgeFrame, Hello, ListenerKind, ListenerReport, MAX_CLOSED_TEXT_LEN, Open, Role,
-    SessionKind, Stream, Transport, UiMessage, WriteFailure,
+    ClosedReason, EdgeFrame, Hello, ListenerKind, ListenerReport, MAX_CERTIFICATE_PATH_LEN,
+    MAX_CLOSED_TEXT_LEN, Open, Role, SessionKind, Stream, Transport, UiMessage, WriteFailure,
 };
 
 /// This release's core-link version.

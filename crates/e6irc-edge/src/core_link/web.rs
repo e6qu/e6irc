@@ -174,7 +174,7 @@ impl EdgeWeb {
 }
 
 /// A problem document, as the core answers its own refusals.
-fn problem(status: StatusCode, title: &str, detail: &str) -> Response<Body> {
+pub(crate) fn problem(status: StatusCode, title: &str, detail: &str) -> Response<Body> {
     let body = format!(
         "{{\"type\":\"about:blank\",\"title\":{},\"status\":{},\"detail\":{}}}",
         json_string(title),
@@ -209,9 +209,10 @@ fn json_string(text: &str) -> String {
 /// The request's headers as they go to the core: without the hops', without
 /// any link header a client sent, with the client's address.
 fn forwarded_headers(headers: &mut HeaderMap, client: SocketAddr, websocket_irc: bool) {
-    for name in HOP_BY_HOP.into_iter().chain(headers::ALL) {
+    for name in HOP_BY_HOP {
         headers.remove(name);
     }
+    headers::strip(headers);
     headers.insert(
         headers::CLIENT,
         HeaderValue::from_str(&crate::address::ClientIp::new(client.ip()).to_string())
@@ -246,9 +247,16 @@ async fn handle(
     let mut request = Request::from_parts(parts, body);
     forwarded_headers(request.headers_mut(), client, web.websocket_irc);
     match web.http.send(request).await {
-        Ok(response) => response.map(Body::new),
+        Ok(response) => relayed(response),
         Err(error) => unanswered(&*web.telemetry, error),
     }
+}
+
+/// The core's answer as the client gets it: without any link header, which
+/// is the edge's alone to read.
+fn relayed(mut response: Response<hyper::body::Incoming>) -> Response<Body> {
+    headers::strip(response.headers_mut());
+    response.map(Body::new)
 }
 
 /// The answer to a request the core did not answer.
@@ -319,7 +327,7 @@ async fn upgrade(
         .map(str::to_owned);
     let Some(grant) = grant else {
         // A refusal: the client gets the core's answer.
-        return answer.map(Body::new);
+        return relayed(answer);
     };
     let text = |name: &str| {
         answer

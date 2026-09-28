@@ -1038,8 +1038,8 @@ fn operations() -> serde_json::Value {
                         "edges": { "type": "array", "maxItems": 16383, "description": "The edges linked now, with the listeners each reports; empty in single-process mode.", "items": {
                             "type": "object", "additionalProperties": false, "required": ["name", "slot", "link_version", "upgrade_needed", "linked_at", "listeners"],
                             "properties": { "name": { "type": "string" }, "slot": { "type": "integer", "minimum": 1, "maximum": 16383 }, "link_version": { "type": "integer", "minimum": 0 }, "upgrade_needed": { "type": "boolean" }, "linked_at": { "type": "string" },
-                                "listeners": { "type": "array", "maxItems": 64, "items": { "type": "object", "additionalProperties": false, "required": ["kind", "addr", "tls", "proxy_protocol"],
-                                    "properties": { "kind": { "type": "string", "enum": ["irc", "websocket", "http", "attach"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "proxy_protocol": { "type": "boolean" } } } } } } } }
+                                "listeners": { "type": "array", "maxItems": 64, "items": { "type": "object", "additionalProperties": false, "required": ["kind", "addr", "certificate", "proxy_protocol"],
+                                    "properties": { "kind": { "type": "string", "enum": ["irc", "websocket", "http", "attach"] }, "addr": { "type": "string" }, "certificate": { "type": ["string", "null"], "maxLength": 4096, "description": "The certificate chain's path on the edge's host for a listener that terminates TLS; null for a plaintext one." }, "proxy_protocol": { "type": "boolean" } } } } } } } }
                 }
             }
         }),

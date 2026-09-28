@@ -274,6 +274,14 @@ pub(crate) fn bootstrap_token_digest(token: &str) -> [u8; 32] {
         .expect("SHA-256 output is always 32 bytes")
 }
 
+/// Whether `presented` is the monitoring token `expected` is the digest of,
+/// compared in constant time: the one check every monitoring route — the
+/// core's and an edge's metrics listener — makes.
+pub fn monitoring_token_matches(expected: &[u8; 32], presented: &str) -> bool {
+    let actual = bootstrap_token_digest(presented);
+    aws_lc_rs::constant_time::verify_slices_are_equal(expected, &actual).is_ok()
+}
+
 fn monitoring_token_digest(token: &str) -> Result<[u8; 32], String> {
     if token.chars().count() < 32
         || token
@@ -287,7 +295,7 @@ fn monitoring_token_digest(token: &str) -> Result<[u8; 32], String> {
     Ok(bootstrap_token_digest(token))
 }
 
-pub(crate) fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, String> {
+pub fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, String> {
     let Some(token) = crate::environment_config::optional(
         &crate::environment_config::process_environment,
         "E6IRC_MONITORING_TOKEN",
@@ -3749,6 +3757,10 @@ mod pages {
     #[template(path = "console_configuration.html")]
     struct ConsoleConfiguration {
         shell: ConsoleShell,
+        /// Edge mode (DESIGN §19, decision D9): the listeners and their
+        /// certificates are the edges', shown as they report them, with no
+        /// field to change them.
+        edge_mode: bool,
     }
 
     pub async fn console_configuration(
@@ -3758,6 +3770,7 @@ mod pages {
         let _config = require_managed_config!(state);
         render_private(ConsoleConfiguration {
             shell: console_shell(actor, "configuration"),
+            edge_mode: state.linked_edges.is_some(),
         })
     }
 
@@ -3918,6 +3931,51 @@ mod pages {
         match network_operations_response(&state, &account, &name, enabled, runtime).await {
             Ok(response) => super::json_no_store(response),
             Err(response) => response.into(),
+        }
+    }
+
+    #[cfg(test)]
+    mod console_configuration_tests {
+        use super::{ConsoleConfiguration, ConsoleShell};
+        use askama::Template;
+
+        fn page(edge_mode: bool) -> String {
+            ConsoleConfiguration {
+                shell: ConsoleShell {
+                    account: "root".into(),
+                    csrf: "csrf".into(),
+                    is_admin: true,
+                    active: "configuration",
+                },
+                edge_mode,
+            }
+            .render()
+            .expect("the page renders")
+        }
+
+        /// In edge mode the listeners and their certificates are the edges'
+        /// (decision D9): the page shows them as the edges report them and
+        /// offers no field to change them; in single-process mode it offers
+        /// the fields and no edge view.
+        #[test]
+        fn edge_mode_shows_listeners_read_only_with_no_field_to_change_them() {
+            let listener_fields = [
+                "name=\"listeners\"",
+                "name=\"bnc_enabled\"",
+                "name=\"bnc_addr\"",
+                "name=\"bnc_tls_cert_path\"",
+                "name=\"bnc_tls_key_path\"",
+            ];
+            let edge = page(true);
+            assert!(edge.contains("data-configuration-edge-listeners"), "{edge}");
+            for field in listener_fields {
+                assert!(!edge.contains(field), "edge mode renders {field}");
+            }
+            let single = page(false);
+            assert!(!single.contains("data-configuration-edge-listeners"));
+            for field in listener_fields {
+                assert!(single.contains(field), "single-process mode lacks {field}");
+            }
         }
     }
 

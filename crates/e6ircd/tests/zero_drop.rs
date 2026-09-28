@@ -37,10 +37,23 @@ struct Process {
 
 impl Process {
     fn spawn(name: &'static str, args: &[&std::ffi::OsStr], dir: &Path) -> Self {
+        Self::spawn_with(name, args, dir, &[])
+    }
+
+    /// [`Process::spawn`], with `environment` set for it (and nothing else of
+    /// e6irc's own inherited).
+    fn spawn_with(
+        name: &'static str,
+        args: &[&std::ffi::OsStr],
+        dir: &Path,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_e6ircd"));
         for variable in e6ircd::db::LIBPQ_ENVIRONMENT {
             command.env_remove(variable);
         }
+        command.env_remove("E6IRC_MONITORING_TOKEN");
+        command.envs(environment.iter().copied());
         let mut child = command
             .args(args)
             .current_dir(dir)
@@ -234,6 +247,19 @@ impl Deployment {
     /// Start edge `name` linking to `core`, with `listeners` in its
     /// configuration.
     async fn edge(&self, name: &'static str, core: SocketAddr, listeners: &str) -> Process {
+        let mut process = self.edge_process(name, core, listeners, &[]);
+        process.until("accepting clients", 1).await;
+        process
+    }
+
+    /// Spawn edge `name` without waiting for it, with `environment`.
+    fn edge_process(
+        &self,
+        name: &'static str,
+        core: SocketAddr,
+        listeners: &str,
+        environment: &[(&str, &str)],
+    ) -> Process {
         let config = self.write(
             &format!("{name}.toml"),
             &format!(
@@ -246,13 +272,12 @@ impl Deployment {
                  {listeners}"
             ),
         );
-        let mut process = Process::spawn(
+        Process::spawn_with(
             name,
             &["edge".as_ref(), "--config".as_ref(), config.as_os_str()],
             &self.dir,
-        );
-        process.until("accepting clients", 1).await;
-        process
+            environment,
+        )
     }
 }
 
@@ -839,4 +864,123 @@ async fn a_proxy_protocol_listener_shows_the_relayed_client() {
     let mut unannounced = Client::tcp("unannounced", plain).await;
     unannounced.send("NICK unannounced").await;
     assert_eq!(unannounced.until_closed().await, Vec::<String>::new());
+}
+
+/// A client cannot forge what only the edge and the core say to each other:
+/// a request naming its own upgrade identifier, client address or grant is
+/// forwarded without them, so the core does not authorize an upgrade the
+/// client never made and the answer carries no grant; and nothing of the
+/// link's namespace reaches a client in any answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_cannot_forge_the_link_s_headers() {
+    let deployment = Deployment::new("forged", &["edge-a"]);
+    let _trusted = deployment.tls_certificate();
+    let core = deployment.core("core.toml", "127.0.0.1:0", "").await;
+    let mut edge = deployment.edge("edge-a", core.link, listeners()).await;
+    let (_, _, web) = addresses(&mut edge).await;
+
+    let forged = |path: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: irc.zero.test\r\nConnection: close\r\n\
+             e6irc-edge-upgrade: 4611686018427387905\r\n\
+             e6irc-edge-client: 203.0.113.9\r\n\
+             e6irc-edge-grant: irc\r\n\
+             e6irc-edge-grant-address: 203.0.113.9\r\n\
+             e6irc-edge-grant-transport: wss\r\n\r\n"
+        )
+    };
+    // Unforged, the core would take an upgrade identifier as the edge asking
+    // it to authorize `/ws/irc`, and answer 200 with a grant.
+    let (status, head, body) = http(web, &forged("/ws/irc")).await;
+    assert_ne!(
+        status, 200,
+        "a forged upgrade was authorized: {head}\n{body}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("e6irc-edge-"),
+        "a link header reached the client: {head}"
+    );
+    let (status, head, body) = http(web, &forged("/api/v1/server")).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !head.to_ascii_lowercase().contains("e6irc-edge-"),
+        "a link header reached the client: {head}"
+    );
+}
+
+/// An edge serves its own metrics on `[metrics]`, in the core's format, to a
+/// scraper holding the monitoring token, linked or not; one configured
+/// without the token refuses to start rather than serve what no scraper can
+/// read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edge_serves_its_metrics_to_the_monitoring_token() {
+    const TOKEN: &str = "zero-drop-monitoring-token-0123456789";
+    let deployment = Deployment::new("metrics", &["edge-a", "edge-b"]);
+    let _trusted = deployment.tls_certificate();
+    let mut core = deployment.core("core.toml", "127.0.0.1:0", "").await;
+    let metrics = "[metrics]\naddr = \"127.0.0.1:0\"\n";
+
+    let mut refused = deployment.edge_process(
+        "edge-b",
+        core.link,
+        &format!("{}{metrics}", listeners()),
+        &[],
+    );
+    refused.until("E6IRC_MONITORING_TOKEN", 1).await;
+
+    let mut edge = deployment.edge_process(
+        "edge-a",
+        core.link,
+        &format!("{}{metrics}", listeners()),
+        &[("E6IRC_MONITORING_TOKEN", TOKEN)],
+    );
+    edge.until("accepting clients", 1).await;
+    let (plain, _, _) = addresses(&mut edge).await;
+    let scrape_at = edge.address("metrics listening on ").await;
+    let scrape = |token: Option<&str>| {
+        let authorization = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        format!("GET /metrics HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n{authorization}\r\n")
+    };
+
+    let (status, head, _) = http(scrape_at, &scrape(None)).await;
+    assert_eq!(status, 401, "{head}");
+    let (status, _, _) = http(
+        scrape_at,
+        &scrape(Some("not-the-token-0123456789abcdef0123")),
+    )
+    .await;
+    assert_eq!(status, 401);
+
+    let mut alice = Client::tcp("alice", plain).await;
+    alice.register().await;
+    let (status, head, body) = http(scrape_at, &scrape(Some(TOKEN))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        head.contains("text/plain; version=0.0.4"),
+        "the core's exposition format: {head}"
+    );
+    for series in [
+        "e6irc_edge_linked{edge=\"edge-a\"} 1",
+        "e6irc_edge_links_total{edge=\"edge-a\"} 1",
+        "e6irc_edge_connections{edge=\"edge-a\"} 1",
+        "e6irc_edge_core_epoch{edge=\"edge-a\"} 0",
+        "e6irc_connections_rejected_total{edge=\"edge-a\"} 0",
+        "e6irc_errors_total{edge=\"edge-a\",kind=\"tls_handshake\"} 0",
+        "# TYPE e6irc_edge_link_version gauge",
+    ] {
+        assert!(body.contains(series), "{series} missing from:\n{body}");
+    }
+
+    core.process.kill();
+    drop(alice.until_closed().await);
+    edge.until("sessions were closed as the server restarting", 1)
+        .await;
+    let (status, _, body) = http(scrape_at, &scrape(Some(TOKEN))).await;
+    assert_eq!(status, 200, "a scrape is answered while no core is linked");
+    assert!(
+        body.contains("e6irc_edge_linked{edge=\"edge-a\"} 0"),
+        "{body}"
+    );
 }

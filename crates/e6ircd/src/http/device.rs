@@ -289,7 +289,8 @@ struct ConfigurationEdgeResponse {
 struct ConfigurationEdgeListener {
     kind: &'static str,
     addr: std::net::SocketAddr,
-    tls: bool,
+    /// The certificate chain's path on the edge's host, for a TLS listener.
+    certificate: Option<String>,
     proxy_protocol: bool,
 }
 
@@ -317,7 +318,7 @@ fn configuration_edges(state: &AppState) -> Vec<ConfigurationEdgeResponse> {
                         e6irc_link::ListenerKind::Attach => "attach",
                     },
                     addr: listener.addr,
-                    tls: listener.tls,
+                    certificate: listener.certificate.clone(),
                     proxy_protocol: listener.proxy_protocol,
                 })
                 .collect(),

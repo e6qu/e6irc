@@ -110,7 +110,8 @@ impl ConnectionTasks {
         ConnectionTask(self.clone())
     }
 
-    fn live(&self) -> usize {
+    /// How many connection tasks are live.
+    pub fn live(&self) -> usize {
         self.0.live.load(std::sync::atomic::Ordering::SeqCst)
     }
 

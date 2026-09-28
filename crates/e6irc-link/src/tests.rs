@@ -20,13 +20,13 @@ fn hello() -> Hello {
             ListenerReport {
                 kind: ListenerKind::Irc,
                 addr: "0.0.0.0:6697".parse().expect("address"),
-                tls: true,
+                certificate: Some("/etc/e6irc/tls/fullchain.pem".into()),
                 proxy_protocol: false,
             },
             ListenerReport {
                 kind: ListenerKind::Http,
                 addr: "[::]:8080".parse().expect("address"),
-                tls: false,
+                certificate: None,
                 proxy_protocol: true,
             },
         ],
@@ -298,7 +298,7 @@ fn listener_addresses_keep_their_family() {
     let report = ListenerReport {
         kind: ListenerKind::Attach,
         addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6698),
-        tls: false,
+        certificate: None,
         proxy_protocol: false,
     };
     round_trip(vec![EdgeFrame::Hello(Hello {

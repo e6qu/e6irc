@@ -1615,8 +1615,20 @@ phase is scheduled in the order below.
   the phase that reads them, under a new link version. The zero-drop suite's
   first scenarios need no PostgreSQL and run in the `test` job on all six
   cells; the roster and the `/ws/ui` and attach scenarios run in `db-tests`,
-  and irctest's green list runs a second time through an edge.
-- **Phase 4 — graceful rebuild.** Session records, channel replicas,
+  and irctest's green list runs a second time through an edge, in its own
+  `irctest-edge` job. Settled by the maintainer at review: the edge serves
+  its own metrics now (`[metrics]`, the monitoring token, the core's format)
+  rather than in phase 9, since edge mode is usable from this release; the
+  console in edge mode renders no listener field and shows each edge's
+  listeners and certificates as reported; the link's headers are one
+  namespace a client can neither send nor read; request admission stays the
+  core's.
+- **Phase 4 — graceful rebuild.** PostgreSQL 18 installed natively on the
+  macOS and Windows runners (D15), since this is the first phase whose
+  zero-drop scenarios need it; `Open` gains the connection's TLS facts and
+  `Hello` the cut identifier, with the roster's last cut, under link
+  version 2 (the core then accepts 1 and 2, exercising the N−1 path).
+  Session records, channel replicas,
   acknowledge after effect with retained lines, the graceful cut and
   rebuild, re-authorization, durable ring epochs and `ReplayCursor`s, paced
   replies resumed, `local` driver sessions homed on an edge, the handover and

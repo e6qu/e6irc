@@ -276,9 +276,13 @@ impl Edge {
         ))
         .expect("an edge configuration");
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(e6irc_edge::process::run(config, async move {
-            drop(stopped.await);
-        }));
+        let task = tokio::spawn(e6irc_edge::process::run(
+            config,
+            async move {
+                drop(stopped.await);
+            },
+            None,
+        ));
         let edge = Self {
             web,
             attach,
@@ -625,6 +629,11 @@ async fn the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners() {
         .map(|listener| listener["kind"].as_str().expect("kind"))
         .collect();
     assert_eq!(kinds, ["irc", "http", "attach"], "{body}");
+    // Plaintext listeners, as edge-a's configuration names them: no
+    // certificate (a TLS listener reports its certificate's path).
+    for listener in reported["listeners"].as_array().expect("listeners") {
+        assert_eq!(listener["certificate"], serde_json::Value::Null, "{body}");
+    }
     let mut settings = configuration["settings"].clone();
     settings["listeners"] =
         serde_json::json!([{ "addr": "127.0.0.1:6667", "tls": null, "websocket": false }]);

@@ -1552,11 +1552,29 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "motd", apiCollection(settings, "motd", "configuration").join("\n"));
     configurationValue(form, "storage_history_retention_days", settings.storage.history_retention_days);
     configurationValue(form, "storage_audit_retention_days", settings.storage.audit_retention_days);
-    configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
-    configurationValue(form, "bnc_addr", settings.bnc_addr);
-    configurationValue(form, "bnc_tls_cert_path", settings.bnc_tls ? settings.bnc_tls.cert_path : null);
-    configurationValue(form, "bnc_tls_key_path", settings.bnc_tls ? settings.bnc_tls.key_path : null);
-    configurationValue(form, "listeners", configurationListeners(apiCollection(settings, "listeners", "configuration")));
+    // Edge mode (DESIGN §19, decision D9): the page has no listener fields;
+    // the listeners and their certificates are the edges', shown as they
+    // report them, and the stored ones go back as they were loaded.
+    const edgeListeners = root.querySelector("[data-configuration-edge-listeners]");
+    if (Boolean(edgeListeners) !== (runtime.edge_mode === true)) {
+      throw new Error("The server's edge mode changed since this page was loaded. Reload and try again.");
+    }
+    if (edgeListeners) {
+      form.dataset.edgeModeListeners = JSON.stringify({ listeners: settings.listeners, bnc_addr: settings.bnc_addr, bnc_tls: settings.bnc_tls });
+      const edges = apiCollection(runtime, "edges", "configuration runtime");
+      const described = edges.map((edge) => {
+        const listeners = apiCollection(edge, "listeners", "edge").map((listener) => append(element("li"), element("code", "", listener.addr), document.createTextNode(` ${listener.kind}${listener.proxy_protocol ? ", PROXY protocol" : ""}`), ...(listener.certificate === null ? [document.createTextNode(", plaintext")] : [document.createTextNode(", TLS with "), element("code", "", listener.certificate)])));
+        return append(element("div"), element("strong", "", edge.name), element("span", "tag", `slot ${edge.slot} · link version ${edge.link_version}${edge.upgrade_needed ? " · upgrade needed" : ""}`), listeners.length ? append(element("ul"), ...listeners) : element("p", "", "No listeners."));
+      });
+      edgeListeners.replaceChildren(...(described.length ? described : [element("p", "", "No edge is linked.")]));
+    } else {
+      delete form.dataset.edgeModeListeners;
+      configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
+      configurationValue(form, "bnc_addr", settings.bnc_addr);
+      configurationValue(form, "bnc_tls_cert_path", settings.bnc_tls ? settings.bnc_tls.cert_path : null);
+      configurationValue(form, "bnc_tls_key_path", settings.bnc_tls ? settings.bnc_tls.key_path : null);
+      configurationValue(form, "listeners", configurationListeners(apiCollection(settings, "listeners", "configuration")));
+    }
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
@@ -1572,28 +1590,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationChecked(form, "registration_require_email", settings.registration.require_email);
     configurationValue(form, "registration_minimum_password_length", settings.registration.minimum_password_length);
     const bncStatus = root.querySelector("[data-configuration-bnc-status]");
-    bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
-    if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
-    // Edge mode: the listeners are the edges' own configuration, shown as they
-    // report them; the stored ones apply to single-process mode and are sent
-    // back unchanged.
-    const edgeListeners = root.querySelector("[data-configuration-edge-listeners]");
-    edgeListeners.hidden = !runtime.edge_mode;
-    for (const name of ["listeners", "bnc_addr", "bnc_tls_cert_path", "bnc_tls_key_path"]) form.elements[name].readOnly = runtime.edge_mode;
-    form.elements.bnc_enabled.disabled = runtime.edge_mode;
-    if (runtime.edge_mode) {
-      form.dataset.edgeModeListeners = JSON.stringify({ listeners: settings.listeners, bnc_addr: settings.bnc_addr, bnc_tls: settings.bnc_tls });
-    } else {
-      delete form.dataset.edgeModeListeners;
-    }
-    if (runtime.edge_mode) {
-      const edges = apiCollection(runtime, "edges", "configuration runtime");
-      const described = edges.map((edge) => {
-        const listeners = apiCollection(edge, "listeners", "edge").map((listener) => `${listener.addr} ${listener.kind}${listener.tls ? " tls" : ""}${listener.proxy_protocol ? " proxy-protocol" : ""}`);
-        return append(element("div"), element("strong", "", edge.name), element("span", "tag", `slot ${edge.slot} · link version ${edge.link_version}${edge.upgrade_needed ? " · upgrade needed" : ""}`), element("code", "", listeners.length ? listeners.join(", ") : "no listeners"));
-      });
-      edgeListeners.replaceChildren(element("p", "", "Edge mode: each edge's own configuration names its listeners and certificates, shown here as the linked edges report them. The definitions above apply to single-process mode."), ...(described.length ? described : [element("p", "", "No edge is linked.")]));
-      bncStatus.replaceChildren(element("span", "dot off"), document.createTextNode("Edge mode: each edge's configuration names its attach listener."));
+    if (bncStatus) {
+      bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
+      if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
     }
 
     const csrf = root.dataset.csrf || "";
