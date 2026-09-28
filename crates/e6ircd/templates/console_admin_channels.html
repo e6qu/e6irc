@@ -24,12 +24,12 @@
     <form class="field-grid" method="get" action="/console/admin/channels">
       <label class="field">
         <span>Channel name</span>
-        <input name="name" value="{{ name }}" maxlength="50" autocomplete="off"
+        <input name="name" value="{{ name }}" maxlength="50" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off"
                placeholder="#operations" />
       </label>
       <label class="field">
         <span>Founder account</span>
-        <input name="founder" value="{{ founder }}" maxlength="64" autocomplete="off"
+        <input name="founder" value="{{ founder }}" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off"
                placeholder="alice" />
       </label>
       <label class="field">

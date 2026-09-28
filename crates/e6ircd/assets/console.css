@@ -283,6 +283,9 @@ a.rowlink:hover { text-decoration: underline; }
   background: var(--panel); border: 1px solid var(--border); border-radius: 0.5rem; user-select: all; }
 .provider-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; margin: 1rem 0; }
 .secondary-link { background: transparent; color: var(--accent); }
+/* A secondary button-link keeps its accent text on hover; the primary hover
+   fill under it left accent text on the accent-strong fill, unreadable. */
+.button-link.secondary-link:hover { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
 .identity-list { display: grid; gap: 0.6rem; margin-top: 1rem; }
 .identity-list article { display: flex; justify-content: space-between; align-items: center;
   gap: 1rem; padding: 0.75rem 0.85rem; background: var(--panel-subtle);

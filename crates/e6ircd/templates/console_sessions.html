@@ -37,12 +37,12 @@
       {% endif %}
         <label class="field">
           <span>Nickname</span>
-          <input name="nick" maxlength="64" autocomplete="off" placeholder="alice" />
+          <input name="nick" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off" placeholder="alice" />
         </label>
         {% if !own %}
           <label class="field">
             <span>Account</span>
-            <input name="account" maxlength="64" autocomplete="off" placeholder="alice" />
+            <input name="account" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off" placeholder="alice" />
           </label>
         {% endif %}
         <label class="field">

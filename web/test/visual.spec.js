@@ -103,7 +103,11 @@ async function consoleStyles() {
   return readFile(new URL("../../crates/e6ircd/assets/console.css", import.meta.url), "utf8");
 }
 
-async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
+// `apiFailures` lists [method, URL prefix, message, status?] requests that fail, each
+// once, the way a transient API outage does: the first matching request is
+// refused and a Retry then reaches the stub. A test adds more at run time by
+// pushing onto window.consoleApiFailures.
+async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}, apiFailures = []) {
   const runtime = await readFile(new URL("../../crates/e6ircd/assets/console.js", import.meta.url), "utf8");
   await page.route("**/console.js", (route) => route.fulfill({
     contentType: "text/javascript",
@@ -134,6 +138,12 @@ async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
           sessionStorage.setItem("consoleApiMutations", JSON.stringify(window.consoleApiMutations));
         }
         if (window.consoleApiGate) await window.consoleApiGate;
+        window.consoleApiFailures ??= ${JSON.stringify(apiFailures)};
+        const failure = window.consoleApiFailures.findIndex(([failing, prefix]) => failing === method && url.startsWith(prefix));
+        if (failure >= 0) {
+          const [, , message, status = 503] = window.consoleApiFailures.splice(failure, 1)[0];
+          throw Object.assign(new Error(message), { status });
+        }
         const match = Object.entries(responses).find(([prefix]) => url.startsWith(prefix));
         return match ? match[1] : {};
       };`,
@@ -275,7 +285,7 @@ test("console mutations expose progress and reject duplicate submissions", async
   await expect(chosenAction).toBeEnabled();
   await expect(chosenAction).not.toHaveAttribute("data-submitting");
   await expect(chosenAction).not.toHaveAttribute("aria-label");
-  await expect(page.getByRole("status")).toHaveText("Updated.");
+  await expect(page.getByRole("status")).toHaveText("Server ban on *@bad.example added and enforced.");
   await expect.poll(() => page.evaluate(() => window.consoleApiRequests.length)).toBe(2);
 });
 
@@ -545,6 +555,236 @@ test("console server-network form masks a token and forgets credentials when the
   await expect(serverPassword).toBeDisabled();
   await kind.selectOption("irc");
   await expect(serverPassword).toHaveValue("");
+});
+
+// The administrator configuration as GET /api/v1/admin/configuration answers
+// it, reduced to what the console page reads.
+const consoleConfiguration = () => ({
+  revision: 4, updated_by: "root", updated_at: "2026-09-28T09:30:05Z",
+  settings: {
+    server_name: "irc.example.test", network_name: "ExampleNet", description: "Example", motd: ["Welcome"],
+    storage: { history_retention_days: 30, audit_retention_days: 365 },
+    listeners: [], bnc_addr: null, bnc_tls: null, public_url: null, secure_cookies: false, admin_accounts: ["root"],
+    nicklen: 30, sendq_bytes: 1048576, core_queue: 4096, core_workers: 2, max_hot_channels: 1024,
+    max_history_ring_bytes: 65536, max_hot_history_bytes: 1048576,
+    limits: {
+      max_connections_per_ip: null, command_burst: 10, command_rate: 2, anti_spam_exit_message_time_seconds: 300,
+      auth_rate_burst: 20, api_rate_burst: 240, administrator_api_rate_burst: 60, registration_burst: null,
+      trusted_proxies: [], require_sasl: false, require_sasl_from: [],
+    },
+    observability: { enabled: true, sample_interval_seconds: 15, retention_hours: 24 },
+    registration: { before_connect: false, require_email: false, minimum_password_length: 8 },
+    networks: [], opers: [], oidc_providers: [], credentials_from_bootstrap: false,
+  },
+  runtime: {
+    http_bind: "127.0.0.1:8080", release_revision: null, master_key_count: 1, has_master_key: true, edge_mode: false,
+    bound_bnc_addr: null, network_drivers: ["irc", "local"],
+  },
+});
+
+test("a console form that created something starts empty, and an edit form keeps what was typed in it", async ({ page }) => {
+  const body = await consoleTemplate("console_configuration.html", { "shell.csrf": "test-csrf" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {
+    "/api/v1/admin/configuration": consoleConfiguration(),
+  });
+  const settings = page.locator("form[data-api-configuration-patch]");
+  const hostname = settings.getByLabel("Server hostname");
+  await expect(hostname).toHaveValue("irc.example.test");
+  // Changed, and not yet saved, when another form on the page is used.
+  await hostname.fill("irc.changed.example");
+
+  const operators = page.locator("form[data-api-oper-create]");
+  await operators.getByLabel("Operator name").fill("opal");
+  await operators.getByLabel("New password").fill("operator-secret");
+  await operators.getByRole("button", { name: "Add operator" }).click();
+  await expect(page.locator("#configuration-api-result")).toHaveText("added IRC operator opal");
+  // The operator form is empty again: the password does not stay in the page,
+  // and a second press cannot add the operator twice.
+  await expect(operators.getByLabel("Operator name")).toHaveValue("");
+  await expect(operators.getByLabel("New password")).toHaveValue("");
+  // The refresh after it did not type the stored hostname over the new one.
+  await expect(hostname).toHaveValue("irc.changed.example");
+
+  await settings.getByRole("button", { name: "Save configuration" }).click();
+  await expect(page.locator("#configuration-api-result")).toHaveText("Configuration saved.");
+  const saved = await page.evaluate(() => window.consoleApiMutations.at(-1));
+  expect(saved.method).toBe("PATCH");
+  expect(saved.json.settings.server_name).toBe("irc.changed.example");
+  // Once saved, the form shows what the server stores (this stub stores
+  // nothing, so the refresh brings the old name back).
+  await expect(hostname).toHaveValue("irc.example.test");
+});
+
+test("a console page's load failure goes away with the Retry that recovers it", async ({ page }) => {
+  const body = await consoleTemplate("console_configuration.html", { "shell.csrf": "test-csrf" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {
+    "/api/v1/admin/configuration": consoleConfiguration(),
+  }, [["GET", "/api/v1/admin/configuration", "Configuration inventory unavailable"]]);
+  const result = page.locator("#configuration-api-result");
+  await expect(result).toContainText("Configuration inventory unavailable");
+  await result.getByRole("button", { name: "Retry" }).click();
+  await expect(page.getByLabel("Server hostname")).toHaveValue("irc.example.test");
+  // The failure and its Retry used to stay beside the data they had loaded.
+  await expect(result).toHaveText("");
+  await expect(result.getByRole("button")).toHaveCount(0);
+});
+
+test("the overview says it is unavailable, not still loading, when it fails", async ({ page }) => {
+  const body = await consoleTemplate("console.html");
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {}, [
+    ["GET", "/api/v1/admin/stats", "Statistics unavailable"],
+  ]);
+  await expect(page.locator("#overview-api-result")).toContainText("Statistics unavailable");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Overview unavailable");
+});
+
+test("a bridge editor that failed to load offers Retry, then the form", async ({ page }) => {
+  const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
+  const network = {
+    kind: "discord", name: "team", addr: "", tls: true, nick: "", username: null, realname: null,
+    autojoin: ["123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, enabled: true, configured: false,
+  };
+  await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network }, [
+    ["GET", "/api/v1/me/networks/team", "Network registry unavailable"],
+  ]);
+  const result = page.locator("#network-api-result");
+  await expect(result).toContainText("Network registry unavailable");
+  await expect(page.getByRole("button", { name: "Save bridge" })).toBeHidden();
+  await result.getByRole("button", { name: "Retry" }).click();
+  await expect(page.getByRole("button", { name: "Save bridge" })).toBeVisible();
+  await expect(result).toHaveText("");
+
+  // A saved credential does not stay in its box.
+  await page.locator('[name="sasl_password"]').fill("new-bot-token");
+  await page.getByRole("button", { name: "Save bridge", exact: true }).click();
+  await expect(result).toHaveText("Bridge saved; its connection was replaced.");
+  await expect(page.locator('[name="sasl_password"]')).toHaveValue("");
+});
+
+test("server bans show UTC times, say what changed, and keep keyboard focus in the page", async ({ page }) => {
+  const body = await consoleTemplate("console_bans.html", { "shell.csrf": "test-csrf", limit: "50" });
+  const shell = await readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8");
+  const confirmDialog = shell.match(/<dialog class="confirm-dialog"[\s\S]*?<\/dialog>/)[0];
+  await mountConsoleRuntime(page, `<main id="console-main" tabindex="-1">${body}</main>${confirmDialog}`, await consoleStyles(), {
+    "/api/v1/admin/bans": { bans: [{
+      id: 3, kind: "kline", mask: "*@bad.example", reason: "abuse", set_by: "root",
+      created_at: "2026-09-28T09:30:05Z", expires_at: null,
+    }], next_before_id: null },
+  });
+  const rows = page.locator("[data-api-admin-ban-list]");
+  await expect(rows.getByRole("cell", { name: "2026-09-28 09:30:05 UTC" })).toBeVisible();
+
+  const create = page.locator("form[data-api-ban-create]");
+  await create.getByLabel("Mask").fill("*@worse.example");
+  await create.getByLabel("Reason").fill("spam");
+  await create.getByRole("button", { name: "Add and enforce ban" }).click();
+  await expect(page.locator("#ban-api-result")).toHaveText("Server ban on *@worse.example added and enforced.");
+  await expect(create.getByLabel("Mask")).toHaveValue("");
+  await expect(create.getByLabel("Reason")).toHaveValue("");
+
+  await rows.getByRole("button", { name: "Remove" }).focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("dialog", { name: "Confirm action" }).getByRole("button", { name: "Remove" }).click();
+  await expect(page.locator("#ban-api-result")).toHaveText("Server ban on *@bad.example removed.");
+  // The refresh rebuilt the row the pressed button was in; focus stays in the
+  // page's main region instead of falling to the document.
+  await expect(page.locator("#console-main")).toBeFocused();
+});
+
+test("a change whose list then fails to refresh does not report plain success", async ({ page }) => {
+  const body = await consoleTemplate("console_networks.html", { "shell.csrf": "test-csrf" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {
+    "/api/v1/me/networks": { networks: [ircNetwork("libera")] },
+  });
+  await expect(page.getByRole("button", { name: "Disable" })).toBeVisible();
+  await page.evaluate(() => window.consoleApiFailures.push(["GET", "/api/v1/me/networks", "Network list unavailable"]));
+  await page.getByRole("button", { name: "Disable" }).click();
+  await expect(page.locator("#network-api-result")).toHaveText("The change was saved, but the updated data could not be loaded.");
+});
+
+test("a session that ended says so once, with the way to sign in, instead of offering Retry", async ({ page }) => {
+  const body = await consoleTemplate("console_networks.html", { "shell.csrf": "test-csrf" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {}, [
+    ["GET", "/api/v1/me/networks", "Authentication required", 401],
+    ["GET", "/api/v1/me/networks", "Authentication required", 401],
+  ]);
+  const notice = page.getByRole("alert");
+  await expect(notice).toContainText("Your session has ended");
+  await expect(notice.getByRole("link", { name: "Sign in again" })).toHaveAttribute("href", "/login");
+  // A second refusal does not add a second notice.
+  await page.getByRole("button", { name: "Retry" }).click();
+  await expect.poll(() => page.evaluate(() => window.consoleApiFailures.length)).toBe(0);
+  await expect(page.getByRole("alert")).toHaveCount(1);
+});
+
+test("a directory filter refuses surrounding spaces before the page is asked", async ({ page }) => {
+  const body = await consoleTemplate("console_audit.html", { limit: "50" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), { "/api/v1/admin/audit": { audit: [], next_before_id: null } });
+  const actor = page.getByLabel("Actor");
+  await actor.fill("alice ");
+  // The page refuses a filter that would have to be trimmed, as a JSON
+  // problem document with no way back; the browser now refuses it in the form.
+  expect(await actor.evaluate((input) => input.validity.patternMismatch)).toBe(true);
+  await actor.fill("alice");
+  expect(await actor.evaluate((input) => input.validity.valid)).toBe(true);
+});
+
+test("the account directory stacks each row's actions and its delete confirmation", async ({ page }) => {
+  const body = await consoleTemplate("console_accounts.html", { "shell.csrf": "test-csrf", minimum_password_length: "8" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {
+    "/api/v1/admin/accounts": { accounts: [{
+      id: 8, name: "guest", created_at: "2026-08-19T12:00:00Z", current: false, suspended: false, administrator: false,
+      administrator_sources: { durable: false, configuration: false },
+      authentication: { local_password: true, oidc_identities: 0, app_passwords: 0, browser_sessions: 0, api_tokens: 0 },
+      resources: { networks: 0, founded_channels: 0 },
+    }], next_before_id: null },
+    "/api/v1/admin/invitations": { invitations: [], next_before_id: null },
+  });
+  const suspend = page.getByRole("button", { name: "Suspend" });
+  const confirmation = page.getByLabel("Type guest to delete");
+  const remove = page.getByRole("button", { name: "Delete permanently" });
+  await expect(remove).toBeVisible();
+  await expect(page.getByRole("cell", { name: "2026-08-19 12:00:00 UTC" })).toBeVisible();
+  // One column of controls: the typed confirmation sits between the state
+  // buttons and the button it arms, not in one line beside them.
+  const [suspendBox, confirmationBox, removeBox] = await Promise.all([suspend.boundingBox(), confirmation.boundingBox(), remove.boundingBox()]);
+  expect(confirmationBox.y).toBeGreaterThan(suspendBox.y + suspendBox.height - 1);
+  expect(removeBox.y).toBeGreaterThan(confirmationBox.y + confirmationBox.height - 1);
+  await expectAccessible(page);
+});
+
+test("a secondary button-link stays legible under the pointer in both themes", async ({ page }) => {
+  const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
+  await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": {
+    kind: "discord", name: "team", addr: "", tls: true, nick: "", username: null, realname: null,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, enabled: true, configured: false,
+  } });
+  const link = page.getByRole("link", { name: "All integrations" });
+  const contrast = () => link.evaluate((node) => {
+    const channels = (value) => {
+      const probe = document.createElement("canvas").getContext("2d");
+      probe.fillStyle = value;
+      probe.fillRect(0, 0, 1, 1);
+      return Array.from(probe.getImageData(0, 0, 1, 1).data.slice(0, 3));
+    };
+    const luminance = (rgb) => {
+      const [r, g, b] = rgb.map((channel) => channel / 255).map((channel) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const style = getComputedStyle(node);
+    const transparent = (value) => value === "transparent" || value === "rgba(0, 0, 0, 0)";
+    let background = style.backgroundColor;
+    for (let parent = node.parentElement; parent && transparent(background); parent = parent.parentElement) {
+      background = getComputedStyle(parent).backgroundColor;
+    }
+    const [light, dark] = [luminance(channels(style.color)), luminance(channels(background))].sort((a, b) => b - a);
+    return (light + 0.05) / (dark + 0.05);
+  });
+  for (const colorScheme of ["light", "dark"]) {
+    await page.emulateMedia({ colorScheme, reducedMotion: "reduce" });
+    await link.hover();
+    expect(await contrast()).toBeGreaterThanOrEqual(4.5);
+  }
 });
 
 test("network picker renders the empty account state", async ({ page }) => {
