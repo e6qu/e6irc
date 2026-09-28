@@ -384,7 +384,9 @@ These are project-wide rules, enforced in review and (where possible) CI:
     inventory row.
   - `ConnectionIdAllocator`/`LiveConnectionPageSize` — every production
     ingress transport draws from one randomly boot-seeded, non-wrapping ID
-    source, and live-state queries can retain only a typed bounded page plus
+    source (in edge mode, each edge within its slot), which promises
+    uniqueness and unpredictability but no order; live-state queries page by
+    the core's directory key and can retain only a typed bounded page plus
     one cursor sentinel. Disconnect mutations carry the selected ID to the
     shared teardown path and owner mutations recheck its authenticated account;
     mutable nick reuse cannot redirect a stale control to another client.
@@ -775,12 +777,16 @@ e6irc/
 │   │                         #   progress count a send queue's writes are
 │   │                         #   reported back by; loom-verified,
 │   │                         #   step-schedulable for deterministic tests
+│   ├── e6irc-link/           # the core link's frames and their codec (§19.2):
+│   │                         #   I/O-free, link versions, edge names and slots
 │   ├── e6irc-edge/           # the connection-holding edge (§19): accept, TLS
-│   │                         #   and certificate reload, client addresses,
-│   │                         #   line and WebSocket framing, the command-flood
-│   │                         #   meter, every write to a client, and each
-│   │                         #   session's end of the in-process core link;
-│   │                         #   no database dependency (§2)
+│   │                         #   and certificate reload, client addresses and
+│   │                         #   the PROXY protocol, line and WebSocket
+│   │                         #   framing, the command-flood meter, every write
+│   │                         #   to a client, HTTP serving, the edge's end of
+│   │                         #   the core link in process and across processes,
+│   │                         #   and the `e6ircd edge` process; no database
+│   │                         #   dependency (§2)
 │   ├── e6ircd/               # the monolithic server binary
 │   ├── e6irc-client/         # client library: connection, TLS, SASL (SCRAM-
 │   │                         #   SHA-512/256, PLAIN, OAUTHBEARER), chathistory helpers
@@ -1050,7 +1056,11 @@ strip = "symbols"
   logic (`bouncer::AttachPort`), and each session's link (`e6irc_edge::link`)
   carries its output, its end and its flood exemption to the edge and the
   edge's reports of what it wrote back. The bouncer's in-process `local`
-  session opens through the same port and link as a socket does.
+  session opens through the same port and link as a socket does. In edge
+  mode the port is the core link across processes
+  (`e6irc_edge::core_link::remote`), and each session's link is fed from its
+  frames: the same code, with a network between its two ends (§19.1, "Phase
+  3 as built").
 - Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ): the buffer at
@@ -2136,6 +2146,10 @@ Principal tables (columns abridged):
   (migration 0098, §18). `serving_lease_register_backend` is the pool's
   after-connect fence; a trigger announces every change of holder on
   `e6irc_serving_lease`.
+- `core_edges` (edge name, slot, last serving-lease epoch, link and unlink
+  times) — the roster of edges a serving core has linked (migration 0100,
+  §19.1 "Phase 3 as built"): written when an edge links and when its link
+  ends, never per session, so an edge keeps its slot across links and cores.
 - `audit_log` (stable id, actor, action, target, detail, creation time for
   privileged oper/control-plane actions). Exact actor/action/target queries use
   `(filter, id DESC)` indexes and paginate with `id < before_id`; a concurrently
@@ -2593,7 +2607,11 @@ independent of total connections.
 
 Every ingress path shares one non-wrapping connection-ID allocator seeded from
 the operating system's cryptographically secure random number generator at
-boot. Disconnect requests carry the immutable ID
+boot (in edge mode, each edge's within the slot the core gave it, §19.2). An
+identifier promises nothing about order, so the directory pages by the
+monotonic directory key the core gives each session when it opens: a walk
+never misses a connection opened after its first page, on any edge. The
+cursor, `before_id` in the API, carries that key. Disconnect requests carry the immutable ID
 resolved by the directory instead of a mutable nick, closing both nick-reuse
 and predictable post-restart stale-form targeting. JSON renders IDs and cursors
 as decimal strings so JavaScript cannot round a 64-bit resource identifier.
@@ -5196,7 +5214,9 @@ The snapshot is the sole source for:
   masked by a healthy one) or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
   query deadline (one shared probe, its answer reused for a second), or the
-  serving lease is unconfirmed (`lease`, §18).
+  serving lease is unconfirmed (`lease`, §18). In edge mode it also reports
+  the linked edges and their link versions (`edges`, §19.1), which never
+  fail it.
 
 The production image carries no HTTP client, so a container `HEALTHCHECK`
 cannot be a `curl`. `e6ircd healthcheck [--ready]
@@ -5282,19 +5302,26 @@ Layers, bottom to top:
    actual-daemon journey owns an isolated empty PostgreSQL container so it can
    prove first-boot migrations/import and stop/start recovery under simultaneous
    readiness, database-backed HTTP, and hot IRC traffic.
-6. **Journey acceptance**: the scenarios in `docs/journeys/` map outcomes to
+6. **Process-level edge tier**: the zero-drop suite
+   (`crates/e6ircd/tests/zero_drop.rs`) starts real `e6ircd` and `e6ircd
+   edge` processes linked over mutual TLS and drives TCP, TLS, `/ws/irc` and
+   HTTP clients through them — exact, in-order delivery of a numbered
+   stream, a killed and a stopped core, a link reset, per-address limits
+   across edges, the PROXY protocol — on Linux, macOS and Windows (§19.11);
+   irctest's green list also runs through an edge.
+7. **Journey acceptance**: the scenarios in `docs/journeys/` map outcomes to
    direct real-server integration tests. The matrix identifies partial
    journeys where adjacent layers are proven separately.
-7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
+8. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
    running `e6ircd` + Postgres (in CI, a GitHub Actions `postgres` service
    container); IRC flows exercised over real sockets, including TLS.
-8. **Released settings rows**: `tests/fixtures/server_settings/` holds the
+9. **Released settings rows**: `tests/fixtures/server_settings/` holds the
    managed configuration each release stored, captured by that release's own
    code and named `<its last migration>-<release>.json`; a PostgreSQL test
    loads every one through today's migrations. A change to the stored shape
    adds the previous release's fixture. The deploy of `c51261725b5d`
    crash-looped on a `null` that no fresh-row test could hold (migration 0067).
-9. **UI tests**: Playwright drives real OIDC and local-password authentication
+10. **UI tests**: Playwright drives real OIDC and local-password authentication
    through Chromium, Firefox, and WebKit; exact Shauth qualification uses
    Chromium. Firefox runs with `browser.tabs.remote.useCrossOriginOpenerPolicy`
    off: pages send `Cross-Origin-Opener-Policy: same-origin`, and the context
@@ -5314,7 +5341,7 @@ Layers, bottom to top:
    operations data, visits every administrator directory, mutates and audits a
    server ban, verifies queue monitoring in HTML and JSON, then gracefully
    restarts the daemon and proves session/network/backlog recovery.
-10. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
+11. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
    duplicate-proof exact fan-out sequence delivery, and latency percentiles;
    any client, socket, malformed sequence, missing/duplicate delivery, or
    supplied-threshold failure is a nonzero process exit. CI exercises 64
@@ -5628,14 +5655,26 @@ Layers, bottom to top:
   everything after it, including deliveries that arrive from other shards
   while they drain. Durable
   network/history state is continuously persisted; there is no separate
-  driver-checkpoint format. In edge mode a stop is a handover instead (§19.3):
-  it closes no client, and `e6ircd stop --final` is the only stop that does.
+  driver-checkpoint format. In edge mode a stop still closes every client
+  with the core's own `ERROR` before its links end; the handover stop that
+  closes none, with `e6ircd stop --final` as the one that does, is the
+  graceful rebuild's (§19.3, `PLAN.md` phase 4).
 - Main owns and supervises the core and PostgreSQL worker join handles while
   serving; listener join handles have explicit supervisors. Any unexpected
   completion or panic names the failed task, initiates the same bounded drain,
   and makes the process exit non-zero. HTTP-to-core control requests have a
   five-second reply deadline, so even a live but wedged core cannot hold an
   API request forever.
+- **Edge mode** (§19) is operable from phase 3: `e6ircd edge-credentials`
+  mints the link's certificates; the core's `[edge_link]` names the link
+  address and its credentials, and it then has no `[[listeners]]` or `[bnc]`
+  of its own; `e6ircd edge --config <file>` runs an edge, whose `[edge]`
+  names it, the cores it dials and its credentials, and whose
+  `[[listeners]]`, `[http]` and `[attach]` are its client ports, each with
+  an optional `proxy_protocol = true`. A core restart still closes every
+  client loudly, and the edge relinks to the next lease holder by itself.
+  Systemd units, container and Kubernetes shapes are the deployment phase's
+  (`PLAN.md` phase 9).
 - BNC listener, observability-sampling and storage-retention changes apply
   live in the serving process, whichever process wrote them. Core
   identity/limits, IRC listeners, OIDC,
@@ -5680,8 +5719,9 @@ Layers, bottom to top:
   a container that has no file to point at. `check-config` judges everything
   start would refuse that needs neither the network nor the database, through
   the functions start itself uses (`net::check_offline`): parse and
-  validation, the `E6IRC_MONITORING_TOKEN` rule, and every configured TLS
-  certificate/key pair read and matched. Agreement with the stored
+  validation, the `E6IRC_MONITORING_TOKEN` rule, every configured TLS
+  certificate/key pair read and matched, and the core-link credentials of
+  `[edge_link]`. Agreement with the stored
   console-owned settings needs the database and is judged by start alone; a
   passing `check-config` of a database-backed configuration says so on stderr
   rather than implying it. Every environment read in the daemon
@@ -5727,10 +5767,12 @@ same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
 Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
-(the `e6irc-edge` crate) and phase 2 (the in-process link) have landed —
-"Phase 1 as built" and "Phase 2 as built" below — and phase 3 is next. Until a phase lands, the rest of this
-document describes the running system; §19.9 lists the sections each phase
-rewrites.
+(the `e6irc-edge` crate), phase 2 (the in-process link) and phase 3 (the
+process boundary: `e6ircd edge` and the core link between processes) have
+landed — "Phase 1 as built", "Phase 2 as built" and "Phase 3 as built" below —
+and phase 4 (the graceful rebuild) is next. Until a phase lands, the rest of
+this document describes the running system; §19.9 lists the sections each
+phase rewrites.
 
 ### 19.1 The split
 
@@ -5892,9 +5934,157 @@ rewrites.
     closes lingering, as every connection the edge holds does, so its last
     line is not reset away.
 
-  Still in e6ircd: the `/ws/irc` and `/ws/ui` upgrade handlers, and
-  X-Forwarded-For resolution (`http::oidc::client_ip`) with HTTP admission
-  (phase 3, HTTP proxying and upgrade authorization).
+- **Phase 3 as built.** An edge can be a process of its own, `e6ircd edge`,
+  linked to the core over the network; the single process is unchanged, and
+  a core restart or a link reset still closes every session, loudly.
+  - *The codec* is the `e6irc-link` crate: I/O-free, depending on
+    `e6irc-proto` and `bytes` only, every frame `u32 length | u8 kind | u64
+    session | payload`, session 0 being the link's own frames. `EdgeFrame`
+    (`Hello`, `Open`, `Line`, `OverlongLine`, `Message`, `Closed`,
+    `Drained`) and `CoreFrame` (`Welcome`, `Refused`, `Output`, `Kill`,
+    `End`, `FloodExempt`, `Credit`) are the vocabulary; a frame of the other
+    direction's kinds, a field past its bound or a frame past
+    `MAX_FRAME_LEN` is a decode error, never a guess. The `link_frames` fuzz
+    target holds three properties: no input panics the decoder, every frame
+    decoded re-encodes to exactly its bytes, and decoding does not depend on
+    how the stream is split into reads.
+  - *Link versions.* `LINK_VERSION` is 1. `Hello` carries the edge's range;
+    `negotiate` picks the core's own version or the one before it, and a
+    range outside those is refused with both named and the upgrade the edge
+    needs. `Hello` carries a role, and the observer role (§19.8) is refused
+    by name ("this core serves no observer link: the warm standby's observer
+    role is not built into this release") rather than taken as serving.
+  - *Mutual TLS.* `e6ircd edge-credentials init --dir <dir>` writes a
+    deployment's certificate authority and the core's certificate; `issue
+    --dir <dir> --edge <name>` one edge's. Neither overwrites a file; keys
+    are written owner-only on Unix. A core certificate names
+    `core.e6irc.invalid` for server authentication, an edge's names
+    `<name>.edge.e6irc.invalid` for client authentication, so one cannot
+    stand in for the other; TLS 1.3 only (`core_link::tls`). The core checks
+    that the certificate names the edge the `Hello` says it is.
+  - *Streams.* An edge opens one session stream per core shard — the shard
+    a session's identifier maps to (`conn % shards`) — each its own TCP
+    connection, plus HTTP connections (below). The first session stream
+    registers the edge; every stream of one link ends together.
+  - *The epoch fence* is `EdgeEpoch`: the edge keeps the highest serving-lease
+    epoch it has accepted, tells it in `Hello`, and refuses a `Welcome` below
+    it. A core without a database has no lease and says epoch 0.
+  - *Discovery.* The edge's `[edge] core` lists addresses — a name that
+    resolves to every core host, a Service, a load balancer that
+    health-checks `/readyz` — tried in turn every 250 ms while unlinked. Only
+    the lease holder binds its link listener (`[edge_link]`), so only it
+    answers.
+  - *The roster* is `core_edges` (§8): the core gives an edge its slot at
+    registration — the one the roster holds for it, else the one it asks for
+    when free, else the lowest free — and records the link and its end. A
+    core without a database keeps it in memory. Slots are 14 bits (1 to
+    16,383), not 16, so a slot-prefixed identifier keeps the top two bits
+    clear that the HTTP boundary's signed 64-bit reading needs; slot 0 is
+    never given to an edge, and an edge-mode core counts its own sessions
+    (the `local` driver's) in it, so the two cannot collide.
+  - *Edge configuration from `Welcome`.* The core's terms — its trusted
+    proxies, the per-address connection limit, the send-queue size, the
+    flood shape and the line credit — reach the edge in `Welcome`, and every
+    link follows them (`EdgeTerms`). They are restart-only settings of the
+    core, so a core's terms are fixed while it serves.
+  - *Per-address limits* are the core's (D10): it takes each session's
+    per-address slot at `Open` and refuses one past the limit with `Refused`,
+    which the edge turns into `ERROR :Closing Link: <host> (Too many
+    connections from your address)`; the edge applies the same limit to its
+    own connections first, as a pre-filter.
+  - *The directory key.* The core gives each session a monotonic
+    `DirectoryKey` when it opens (`CoreDirectories`), and the connection
+    directory pages by it (`LiveConnectionQuery::before_key`), so a walk
+    never misses a session opened on another edge. `ConnectionIdAllocator`
+    and `LiveConnectionQuery` now document that an identifier promises no
+    order; the REST cursor keeps its name, `before_id`, and carries a key.
+  - *Credits.* An `Irc` session's line spends one of its stream's line
+    credits; the core grants `min(core_queue, 1024)` at `Welcome` and
+    returns each as it moves a line into the shard's queue. Out of credits,
+    the stream's readers wait in turn on a fair semaphore, so one noisy
+    session cannot starve the rest. `Attach` and `Ui` sessions run on their
+    own session's credit in bytes: the size of their inbound queue, returned
+    as the bouncer takes each line or message.
+  - *`Drained` on the wire* is sent for each batch the writer reports, as in
+    process; nothing coalesces it further yet, because each batch is already
+    one vectored write. A peer that takes nothing of a link write for 30 s
+    has stopped reading (`LINK_WRITE_DEADLINE`), and the writer ends the
+    link.
+  - *`Open` carries what the core reads now*: the kind, the client's
+    address and the transport. The connection's TLS facts and the cut
+    identifier join `Open` and `Hello` with the phases that read them
+    (session records, phase 4), each with a new link version.
+  - *Plain HTTP and upgrade authorization.* The edge's `[http]` port is an
+    axum router of the edge's own (`core_link::web`): `/healthz` answered
+    locally; every other request forwarded as HTTP/1.1 over a pool of HTTP
+    link connections (`Hello` with the `Http` stream; at most 32 kept idle),
+    hop-by-hop headers stripped and the client's address added
+    (`e6irc-edge-client`); an upgrade of `/ws/irc` or `/ws/ui` forwarded the
+    same way, marked with the identifier the edge will open it under
+    (`e6irc-edge-upgrade`). The core's own handlers answer: a refusal is its
+    ordinary answer, relayed; an authorization is 200 with grant headers
+    (kind, address, transport, subprotocol, the `/ws/ui` liveness interval),
+    after which the edge completes the upgrade and opens the session under
+    that identifier, and the core claims the grant it keeps for 30 s — an
+    `Open` of a WebSocket kind without one is refused. So authentication,
+    `require_same_origin_upgrade`, the per-address slot and the credential
+    lease stay the core's, exactly as for a request it serves itself. A
+    request finding no core waits 10 s (`OPEN_WAIT`) and is answered `503`
+    with `Retry-After`; one whose link connection fails before the answer is
+    answered `502`. The authorization travels over the HTTP pool rather than
+    as an `HttpRequest` frame: it is an HTTP request with an HTTP answer, and
+    the pool already carries those.
+  - *HTTP serving moved to the edge crate* (`e6irc_edge::http`): the
+    connection-capped accept, the header timeout and the write deadline,
+    which the core's own `[http]` and WebSocket IRC listeners, a standby's
+    health listener and the edge's web port all serve through. The core
+    still resolves X-Forwarded-For (`http::oidc::client_ip`) for requests
+    the edge forwards, from the client address the link conveys, and keeps
+    its per-address request admission, because both judge requests it
+    serves.
+  - *The PROXY protocol, version 2* (`e6irc_edge::proxy_protocol`) is read on
+    any edge listener with `proxy_protocol = true` — IRC, WebSocket IRC,
+    the web port, attach — exactly (never a byte of the client's own stream
+    with it), within 10 s, and believed only from a peer in the core's
+    trusted proxies; any other connection on that listener is refused. The
+    core's own listeners do not read it: in edge mode it has none.
+  - *Listeners belong to the edge* (D9). In edge mode the core refuses
+    `[[listeners]]` and `[bnc]` in its configuration and binds only
+    `[edge_link]` (and `[http]`, for itself); each edge's configuration
+    names its listeners, their certificates and its web and attach ports,
+    reports them in `Hello`, and binds them at start, accepting once its
+    first link is made. The console shows each linked edge's listeners
+    read-only beside the stored definitions, which apply to single-process
+    mode and are sent back unchanged; a change of them is refused (409) in
+    edge mode.
+  - *Loud ends.* When the link is lost — a crash, a kill, a reset — the edge
+    closes every session it carried: IRC clients with `ERROR :Closing Link:
+    <host> (server restarting)`, `/ws/ui` clients with close 1012, and the
+    core, where it still runs, ends each session as `Edge link lost`. A
+    graceful core stop ends its links after its own connection drain, so
+    clients read the core's own `ERROR` (`Server shutting down`) first. A
+    session opening with no core linked waits 10 s and is closed as
+    `(server unavailable)`.
+  - *Observability.* `/readyz` gains `edges` in edge mode: the core's link
+    version and each linked edge with its newest version and whether it
+    needs an upgrade before the next core release; readiness never waits for
+    an edge. Metrics: `e6irc_core_link_version`,
+    `e6irc_edge_link_version{edge}`, `e6irc_edge_upgrade_needed{edge}`, and
+    the `link` error kind for a link that failed its handshake, broke the
+    protocol or ended by error. The edge process logs its own counters once
+    a minute; serving them over HTTP is part of the deployment phase (9).
+  - *The zero-drop suite's first scenarios* (`crates/e6ircd/tests/zero_drop.rs`)
+    start real `e6ircd` and `e6ircd edge` processes and run in the `test`
+    job on Linux, macOS and Windows: TCP, TLS and `/ws/irc` clients and HTTP
+    through an edge with a numbered stream delivered exactly and in order;
+    a killed core (every client told `server restarting`, HTTP `503` during
+    the gap, the edge relinking to the next core); a stopped core (Unix);
+    a link reset; the per-address limit across two edges; and the PROXY
+    protocol. None needs PostgreSQL, so D15's native installation is not yet
+    needed; `crates/e6ircd/tests/edge_tier.rs` holds the handshake refusals
+    and, with PostgreSQL, `/ws/ui` and attach through an edge and the roster.
+    irctest's green list also runs through an edge in CI
+    (`E6IRC_IRCTEST_EDGE=1`).
 
 ### 19.2 The core link
 
@@ -5927,7 +6117,7 @@ rewrites.
   write deadline, as their sockets were written. Their lines and messages
   run on a credit of their own session's inbound queue, since they reach the
   bouncer, not a shard.
-- **Connection identifiers.** A session's `ConnId` is `edge slot (16 bits) |
+- **Connection identifiers.** A session's `ConnId` is `edge slot (14 bits, 1 to 16,383) |
   counter (48 bits)`. The core assigns the slot when an edge first registers
   and records it in the roster (§19.3); each edge seeds its counter randomly
   and never wraps. Identifiers stay unique, never reused and unpredictable

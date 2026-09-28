@@ -219,6 +219,75 @@ together. `a_stated_console_setting_must_agree_with_the_stored_revision`
 a shortened administrator list and of a rotated OpenID Connect client secret
 (named, never printed), and that an unstated setting is the console's alone.
 
+## Run the core behind an edge
+
+**Actor and goal.** An operator wants client connections held by a separate
+edge process (`e6ircd edge`), so the serving core can later be replaced
+without the edge's sockets moving (DESIGN §19).
+
+**Preconditions.** One `e6ircd` binary on each host; a directory the
+operator keeps private for the link's certificates; the core's
+configuration and each edge's configuration.
+
+**Flow.**
+
+1. Mint the link credentials: `e6ircd edge-credentials init --dir <dir>`
+   writes the certificate authority and the core's certificate, and
+   `e6ircd edge-credentials issue --dir <dir> --edge <name>` one edge's.
+   Neither overwrites a file.
+2. Give the core `[edge_link]` (the link address and its credentials) and
+   no `[[listeners]]` or `[bnc]`, which edge mode refuses; `check-config`
+   reads the link credentials as start does.
+3. Give each edge an `[edge]` section (its name, the core addresses it dials,
+   its credentials) and its `[[listeners]]`, `[http]` and `[attach]` ports,
+   each optionally behind a load balancer speaking the PROXY protocol
+   version 2 (`proxy_protocol = true`).
+4. Start both, in either order. The edge binds its ports at once, dials the
+   core every 250 ms until it links over mutual TLS, takes its slot and the
+   core's terms, and then accepts clients.
+5. Clients connect to the edge exactly as to a single process: IRC over TCP
+   and TLS, `/ws/irc`, `/ws/ui`, bouncer attach and every HTTP route.
+6. The operator reads `/readyz` (`edges`), the link-version metrics and the
+   console's configuration page, which shows each linked edge's listeners
+   read-only.
+
+**Visible failures and recovery.** A core that stops or crashes closes every
+client loudly: `ERROR :Closing Link: <host> (server restarting)` from the
+edge on a lost link, the core's own `ERROR` on a graceful stop, close 1012 on
+`/ws/ui`; HTTP requests meanwhile wait up to 10 s and are answered `503` with
+`Retry-After`. The edge relinks to the next core by itself. An edge with the
+wrong certificate, an unsupported link version or the observer role is
+refused with the reason named; a lower serving-lease epoch than the edge has
+seen is refused by the edge. A client past the per-address limit, counted by
+the core across every edge, is told so in its `ERROR`.
+
+**Security and observability.** Every link is mutual TLS 1.3, loopback
+included, and a core and an edge certificate cannot stand in for each other.
+A PROXY header is believed only from the core's trusted proxies; any other
+peer on such a listener is refused. `/readyz` lists the linked edges and
+whether one needs an upgrade; `e6irc_core_link_version`,
+`e6irc_edge_link_version` and `e6irc_edge_upgrade_needed` are served, and a
+failed link counts as the `link` error kind.
+
+**Evidence.** Partially proven: a core restart still closes clients (the
+graceful rebuild is `PLAN.md` phase 4).
+`clients_of_every_transport_are_served_through_an_edge_process`,
+`a_killed_core_closes_every_session_loudly_and_the_next_core_serves`,
+`a_stopped_core_closes_every_session_with_its_own_error`,
+`a_link_reset_closes_its_sessions_loudly_on_both_sides`,
+`the_per_address_limit_holds_across_edges` and
+`a_proxy_protocol_listener_shows_the_relayed_client` run real core and edge
+processes on Linux, macOS and Windows.
+`the_core_welcomes_with_its_terms_and_refuses_each_hello_it_cannot_link_by_name`,
+`issued_credentials_link_and_name_their_edge`,
+`the_two_roles_and_two_deployments_do_not_mix` and
+`a_core_below_the_accepted_epoch_is_refused_and_dialing_goes_on` prove the
+link's refusals; with PostgreSQL,
+`a_live_chat_socket_and_an_attach_reach_the_bouncer_through_an_edge` and
+`the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners` prove
+`/ws/ui`, attach, the roster and the console. `fuzz/fuzz_targets/link_frames.rs`
+covers the codec, and irctest's green list runs through an edge in CI.
+
 ## Recover from PostgreSQL interruption
 
 **Actor and goal.** An operator wants an honest failure signal and bounded

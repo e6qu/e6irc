@@ -719,6 +719,16 @@ per client.
 uses it, loopback included; `e6ircd edge-credentials` issues the certificates
 from a deployment-private certificate authority.
 
+**Link version** — the number of the core link's frame vocabulary a release
+speaks (`e6irc_link::LINK_VERSION`). An edge offers a range in `Hello`; a
+core accepts its own version and the one before it, and refuses any other
+edge by naming both, so a core release never forces an edge restart but an
+edge more than one release behind must be upgraded first.
+
+**Observer role** — the `Hello` role of a read-only link from an edge to a
+warm standby (below), reserved in the first link version; a core that serves
+none refuses it by name rather than taking it as a serving link.
+
 **Epoch fence** — the edge's rule that it speaks to at most one core: the one
 presenting the highest serving-lease epoch the edge has accepted. A lower
 epoch is refused and a higher one replaces the current link, so a core that
@@ -755,7 +765,7 @@ two are one recovery path.
 **Roster** — the `core_edges` table naming every edge a core has linked, with
 its slot and last epoch and cut; a new core waits for the edges it names.
 
-**Edge slot** — the 16-bit number the core assigns an edge, forming the high
+**Edge slot** — the number (1 to 16,383) the core assigns an edge, forming the high
 bits of every connection identifier that edge allocates, so edges allocate
 identifiers without asking a core.
 

@@ -36,7 +36,7 @@ piece in isolation does not prove the outcome a user experiences.
 | [Channels and account self-service](channels-and-account.md) | register and govern a channel, manage the private profile and credentials/identities, inspect and terminate sessions |
 | [Administration and monitoring](administration-and-monitoring.md) | bootstrap and managed configuration, directories and policy, traffic/queue/latency/error monitoring, audit, readiness |
 | [Bridges, clients, and automation](bridges-clients-and-automation.md) | local/Matrix/Discord/Slack networks, CLI, TUI, client library, REST automation |
-| [Deployment and recovery](deployment-and-recovery.md) | public service/readiness discovery, first boot, migration, container release, restart, shutdown, secret loss, dependency failure |
+| [Deployment and recovery](deployment-and-recovery.md) | public service/readiness discovery, first boot, migration, container release, restart, shutdown, edge mode, secret loss, dependency failure |
 | [Coverage and product boundaries](coverage.md) | journey-to-test traceability, test layers, external qualification, and claims that are targets rather than shipped behavior |
 
 ## Status vocabulary
