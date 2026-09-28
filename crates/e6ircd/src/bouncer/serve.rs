@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use sqlx::PgPool;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{AccountRevocations, BufferedLine, NetworkConfig, NetworkHandle, OwnerHold, attach};
 use crate::config::NetworkEntry;
@@ -1460,23 +1460,19 @@ enum Registered {
 /// account store, pick the network from the `nick/network` suffix,
 /// greet, and attach. The client's NICK/USER are consumed here (the
 /// driver owns the upstream registration).
-pub(crate) async fn bnc_serve<S>(
-    stream: S,
+pub(crate) async fn bnc_serve(
+    link: super::AttachLink,
     registry: Arc<Registry>,
     pool: &PgPool,
     server_name: &str,
     peer: e6irc_edge::address::ClientIp,
-) -> std::io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut read, write) = tokio::io::split(stream);
+) -> std::io::Result<()> {
     // Every write here is bounded like `attach`'s, so a client that stops
     // reading during registration or its welcome is dropped at the deadline.
-    let mut write = e6irc_edge::peer_write::DeadlineWriter::new(
-        write,
-        e6irc_edge::peer_write::PEER_WRITE_DEADLINE,
-    );
+    let super::AttachLink {
+        mut lines,
+        mut write,
+    } = link;
 
     // Taken before any credential is checked, so a suspension, deletion or
     // password change that lands while this client registers refuses its
@@ -1488,7 +1484,7 @@ where
     // CAP negotiation) must not hold a task + socket indefinitely.
     let (account, credential, network, requested_nick, caps, input) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        handshake(&mut read, &mut write, pool, server_name, peer),
+        handshake(&mut lines, &mut write, pool, server_name, peer),
     )
     .await
     {
@@ -1584,9 +1580,8 @@ where
 
     // Attach: the welcome (registration burst, ISUPPORT, end-of-MOTD) is
     // written there, from the same instant as the replay.
-    let joined = read.unsplit(write.into_inner());
     let end = attach(
-        joined,
+        super::AttachLink { lines, write },
         input,
         &handle,
         caps,
@@ -1794,20 +1789,18 @@ pub(super) fn welcome_to(
 /// Drive registration to a `Registered` verdict. Requires a successful
 /// SASL PLAIN exchange before the client is allowed to attach: an
 /// unauthenticated CAP END or a bad credential closes the connection.
-async fn handshake<R, W>(
-    read: &mut R,
+async fn handshake<W>(
+    lines: &mut super::ClientLines,
     write: &mut W,
     pool: &PgPool,
     server_name: &str,
     peer: e6irc_edge::address::ClientIp,
 ) -> std::io::Result<Registered>
 where
-    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     // The attached session reads on from where the handshake stops.
     let mut input = super::ClientInput::default();
-    let mut buf = vec![0u8; 4096];
     let mut events = Vec::new();
 
     let mut nick: Option<String> = None;
@@ -1836,11 +1829,9 @@ where
         if registered(&nick, have_user, &account, cap_open) {
             break;
         }
-        let n = read.read(&mut buf).await?;
-        if n == 0 {
+        if !lines.next_lines(&mut events).await? {
             return Ok(Registered::Closed);
         }
-        input.framing.feed(&buf[..n], &mut events);
         let mut arrived = std::mem::take(&mut events).into_iter();
         while let Some(ev) = arrived.next() {
             // What follows the line that completed registration is the
@@ -2694,11 +2685,14 @@ mod handshake_tests {
             .expect("lazy pool");
         let (client, server) = tokio::io::duplex(16 * 1024);
         let (mut client_read, mut client_write) = tokio::io::split(client);
-        let (mut server_read, mut server_write) = tokio::io::split(server);
+        let super::super::AttachLink {
+            mut lines,
+            mut write,
+        } = super::super::attach_link::over_stream(server).await;
         let task = tokio::spawn(async move {
             handshake(
-                &mut server_read,
-                &mut server_write,
+                &mut lines,
+                &mut write,
                 &pool,
                 "bnc.example",
                 e6irc_edge::address::ClientIp::new("192.0.2.1".parse().expect("address")),

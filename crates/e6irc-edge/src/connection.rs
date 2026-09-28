@@ -25,6 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::address::{ClientIp, ConnLimiter, PeerRefusal, PeerRefusalLog};
 use crate::link::EdgeSession;
 use crate::meter::{CommandFlood, LineMeter};
+use crate::peer_write::SendFailure;
 
 /// Traditional 512-byte line minus CRLF, plus the 4096-byte client tag
 /// allowance (message-tags spec); the body-only limit is enforced in
@@ -275,7 +276,39 @@ pub trait CorePort: Clone + Send + Sync + 'static {
     /// Tell the core `conn` ended, and why (the `Closed` frame). For a session
     /// the core already ended this is a no-op, and a core that is gone needs
     /// no telling.
-    fn closed(&self, conn: ConnId, reason: String) -> impl Future<Output = ()> + Send;
+    fn closed(&self, conn: ConnId, reason: SessionClosed) -> impl Future<Output = ()> + Send;
+}
+
+/// Why a session ended on the edge's side (the `Closed` frame's reason). Its
+/// text is what the core shows as the session's quit reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionClosed {
+    /// The client closed its sending side.
+    ByClient,
+    /// Reading from the client failed, as the error said.
+    ReadFailed(String),
+    /// A WebSocket message past the ceiling (closed with 1009).
+    MessageTooBig,
+    /// The client could not be written to.
+    WriteFailed(SendFailure),
+    /// The task writing to the client panicked.
+    WriterPanicked,
+    /// A session that is its own edge — the bouncer's in-process `local`
+    /// session — ended itself, for the reason given.
+    Stopped(&'static str),
+}
+
+impl std::fmt::Display for SessionClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ByClient => f.write_str("Connection closed"),
+            Self::ReadFailed(error) => write!(f, "Read error: {error}"),
+            Self::MessageTooBig => f.write_str("Message too big"),
+            Self::WriteFailed(failure) => f.write_str(failure.reason()),
+            Self::WriterPanicked => f.write_str("Write task panicked"),
+            Self::Stopped(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// Hand every framed event in `events` to the core through `core`, spending
@@ -543,13 +576,13 @@ pub async fn serve_conn<S, C: CorePort>(
             .await;
             return;
         }
-        Ok(WriterEnd::Failed(reason)) => reason,
-        Err(_join_error) => "Write task panicked",
+        Ok(WriterEnd::Failed(failure)) => SessionClosed::WriteFailed(failure),
+        Err(_join_error) => SessionClosed::WriterPanicked,
     };
     // A write failed or stalled while the session may still be live; the core
     // must hear of it. For a session it already ended this is a no-op, and a
     // closed queue means the core itself is gone.
-    core_tx.closed(conn, reason.to_string()).await;
+    core_tx.closed(conn, reason).await;
 }
 
 /// Frame `read_half` into lines and hand them to the core, metered by
@@ -569,7 +602,7 @@ pub async fn read_loop<R, C: CorePort>(
     let mut events = Vec::new();
     let reason = loop {
         match read_half.read(&mut buf).await {
-            Ok(0) => break "Connection closed".to_string(),
+            Ok(0) => break SessionClosed::ByClient,
             Ok(n) => {
                 framing.feed(&buf[..n], &mut events);
                 // Nothing more is read until these lines are through the
@@ -580,7 +613,7 @@ pub async fn read_loop<R, C: CorePort>(
             }
             Err(e) => {
                 telemetry.record_error(TransportError::Read);
-                break format!("Read error: {e}");
+                break SessionClosed::ReadFailed(e.to_string());
             }
         }
     };
@@ -593,9 +626,9 @@ enum WriterEnd<W> {
     /// The core ended the session and everything it queued was written; the
     /// writer hands its half of the stream back for the close.
     Drained(W),
-    /// The peer could not be written to, for the reason given — which the
-    /// caller reports to the core as the session's end ([`CorePort::closed`]).
-    Failed(&'static str),
+    /// The peer could not be written to, as said — which the caller reports
+    /// to the core as the session's end ([`CorePort::closed`]).
+    Failed(SendFailure),
 }
 
 /// Drain the session's send-queue buffer to the socket until the core ends
@@ -635,11 +668,9 @@ where
             telemetry.record_error(TransportError::Write);
             // A broken pipe / RST, or a peer that stopped reading while output
             // was queued for it.
-            return WriterEnd::Failed(if crate::peer_write::is_stalled(&error) {
-                "Write timeout"
-            } else {
-                "Write error"
-            });
+            let failure = SendFailure::of(&error);
+            edge.writer_failed(failure.clone());
+            return WriterEnd::Failed(failure);
         }
     }
 }
@@ -812,7 +843,7 @@ mod tests {
 
         assert!(matches!(
             write_loop(FlushFails, edge, Arc::new(Uncounted)).await,
-            WriterEnd::Failed("Write error")
+            WriterEnd::Failed(SendFailure::Transport)
         ));
         assert_eq!(
             core.in_flight(),
@@ -843,7 +874,7 @@ mod tests {
         drop(core);
         match writer.await.expect("writer task") {
             WriterEnd::Drained(sink) => assert_eq!(sink.bytes.len(), 3 * line.len()),
-            WriterEnd::Failed(reason) => panic!("{reason}"),
+            WriterEnd::Failed(failure) => panic!("{failure:?}"),
         }
     }
 

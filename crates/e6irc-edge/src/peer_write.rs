@@ -19,11 +19,77 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// How long one write to a peer may wait for the peer to take it.
 pub const PEER_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Why an outbound frame was not delivered. Either way the connection is over.
-#[derive(Debug)]
+/// Why output was not delivered. Either way the connection is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendFailure {
     Transport,
     Stalled,
+}
+
+impl SendFailure {
+    /// How `error`, from a bounded write, failed.
+    pub fn of(error: &io::Error) -> Self {
+        if is_stalled(error) {
+            Self::Stalled
+        } else {
+            Self::Transport
+        }
+    }
+
+    /// The reason the core is told a session ended for.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Stalled => "Write timeout",
+            Self::Transport => "Write error",
+        }
+    }
+
+    /// This failure as the error a bounded write reports: a stall is
+    /// recognisable with [`is_stalled`], as a [`DeadlineWriter`]'s own is.
+    pub fn into_error(&self) -> io::Error {
+        match self {
+            Self::Stalled => {
+                io::Error::new(io::ErrorKind::TimedOut, WriteStalled(PEER_WRITE_DEADLINE))
+            }
+            Self::Transport => io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the client's connection failed on write",
+            ),
+        }
+    }
+}
+
+/// When a peer must next show a sign of life.
+///
+/// A connection loop is a `select!` whose every turn abandons the read it was
+/// waiting on, so a timeout *started by the read* is restarted by whatever else
+/// ends a turn: output to send, a command from elsewhere, a heartbeat tick. A
+/// silent peer then looks alive for as long as anything else is happening. The
+/// deadline lives here instead, outside the loop's turns, and only
+/// [`Self::restart`] moves it.
+pub struct SilenceDeadline {
+    window: Duration,
+    at: tokio::time::Instant,
+}
+
+impl SilenceDeadline {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            at: tokio::time::Instant::now() + window,
+        }
+    }
+
+    /// The peer was heard from (or was just asked to speak): a full window
+    /// starts now.
+    pub fn restart(&mut self) {
+        self.at = tokio::time::Instant::now() + self.window;
+    }
+
+    /// `read`'s output, or `None` once the whole window has passed in silence.
+    pub async fn bound<T>(&self, read: impl Future<Output = T>) -> Option<T> {
+        tokio::time::timeout_at(self.at, read).await.ok()
+    }
 }
 
 /// Run one framed send, giving up on a peer that has not taken it by
@@ -225,5 +291,11 @@ mod tests {
             io::ErrorKind::TimedOut,
             "some other timeout"
         )));
+        assert!(is_stalled(&SendFailure::Stalled.into_error()));
+        assert!(!is_stalled(&SendFailure::Transport.into_error()));
+        assert_eq!(
+            SendFailure::of(&SendFailure::Stalled.into_error()),
+            SendFailure::Stalled
+        );
     }
 }

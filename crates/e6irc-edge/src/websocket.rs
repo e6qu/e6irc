@@ -6,10 +6,11 @@
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use e6irc_proto::framing::LineEvent;
+use e6irc_queue::PushError;
 
 use crate::connection::{
-    CLOSING_DRAIN, ConnId, ConnectionTransport, CorePort, TransportError, TransportTelemetry,
-    hand_over,
+    CLOSING_DRAIN, ConnId, ConnectionTransport, CorePort, SessionClosed, TransportError,
+    TransportTelemetry, hand_over,
 };
 use crate::peer_write::{PEER_WRITE_DEADLINE, SendFailure, within_send_deadline};
 
@@ -74,15 +75,6 @@ pub async fn send_irc_line(
     }
 }
 
-/// The reason the core is given ([`crate::connection::CorePort::closed`]) for a
-/// frame the client did not take.
-pub fn write_failure_reason(failure: &SendFailure) -> &'static str {
-    match failure {
-        SendFailure::Stalled => "Write timeout",
-        SendFailure::Transport => "Write error",
-    }
-}
-
 /// Close the socket with `code` and a reason the client can show.
 pub async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let close = axum::extract::ws::CloseFrame {
@@ -125,12 +117,12 @@ enum Ended {
     /// The client closed, or its side failed or overran the message ceiling;
     /// the core is told why.
     ClientGone {
-        reason: String,
+        reason: SessionClosed,
         /// The close frame owed to the client, if any.
         close: Option<(u16, &'static str)>,
     },
     /// A frame could not be written; the core is told why.
-    WriteFailed(&'static str),
+    WriteFailed(SendFailure),
     /// The core is gone.
     CoreGone,
 }
@@ -176,7 +168,8 @@ pub async fn serve_irc_socket<C: CorePort>(
                 let line = envelope.payload.0;
                 if let Err(failure) = send_irc_line(&mut socket, mode, &line).await {
                     telemetry.record_error(TransportError::Write);
-                    break Ended::WriteFailed(write_failure_reason(&failure));
+                    edge.writer_failed(failure.clone());
+                    break Ended::WriteFailed(failure);
                 }
                 edge.written(line.len());
             }
@@ -190,7 +183,7 @@ pub async fn serve_irc_socket<C: CorePort>(
                     Some(Ok(_)) => continue,
                     Some(Err(error)) => break read_failure(error, telemetry),
                     None => break Ended::ClientGone {
-                        reason: "Connection closed".into(),
+                        reason: SessionClosed::ByClient,
                         close: None,
                     },
                 };
@@ -246,8 +239,8 @@ pub async fn serve_irc_socket<C: CorePort>(
                 return IrcSocketEnd::Abandoned;
             }
         }
-        Ended::WriteFailed(reason) => {
-            core.closed(conn, reason.into()).await;
+        Ended::WriteFailed(failure) => {
+            core.closed(conn, SessionClosed::WriteFailed(failure)).await;
             return IrcSocketEnd::Abandoned;
         }
         Ended::CoreGone => return IrcSocketEnd::Abandoned,
@@ -262,13 +255,161 @@ fn read_failure(error: axum::Error, telemetry: &dyn TransportTelemetry) -> Ended
     let error = error.into_inner();
     if let Some(Tungstenite::Capacity(_)) = error.downcast_ref::<Tungstenite>() {
         return Ended::ClientGone {
-            reason: "Message too big".into(),
+            reason: SessionClosed::MessageTooBig,
             close: Some((axum::extract::ws::close_code::SIZE, "Message too big")),
         };
     }
     telemetry.record_error(TransportError::Read);
     Ended::ClientGone {
-        reason: format!("Read error: {error}"),
+        reason: SessionClosed::ReadFailed(error.to_string()),
         close: None,
+    }
+}
+
+/// One message a `/ws/ui` client sent, as the edge hands it to the core (the
+/// `Ui` session kind's inbound frame, DESIGN §19.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiMessage {
+    /// A text message: a composer request.
+    Text(String),
+    /// A binary message, which the core refuses by its kind alone; its bytes
+    /// are not carried.
+    Binary,
+}
+
+impl UiMessage {
+    /// What one message holds against its session's inbound queue.
+    pub fn weight(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary => 1,
+        }
+    }
+}
+
+/// How a `/ws/ui` socket's loop ended.
+enum UiEnded {
+    /// The core ended the session; what it sent, then its close frame, are
+    /// owed.
+    SessionOver,
+    /// The client closed, failed, stopped answering, or could not be written
+    /// to: the socket is done with.
+    ClientGone,
+}
+
+/// Serve one `/ws/ui` socket's transport until it ends: each text message the
+/// core sends (`Output`) is one text frame, reported written once sent; each
+/// message the client sends goes to the core over `inbound`, whose room is
+/// the credit it waits for — while it waits the socket is not read, but what
+/// the core sends keeps flowing. The socket's liveness is held here: after
+/// one `liveness` interval without a frame the client is sent a WebSocket
+/// Ping, and after a second it is given up on. Any frame is a sign of life.
+/// When the core ends the session, what it sent goes out, then the close frame
+/// its `End` carries, within [`CLOSING_DRAIN`]; when the client goes, the core
+/// hears it as `inbound` ending.
+pub async fn serve_ui_socket(
+    mut socket: WebSocket,
+    mut edge: crate::link::EdgeSession,
+    inbound: e6irc_queue::Sender<UiMessage>,
+    liveness: std::time::Duration,
+) {
+    let session_over = edge.session_over();
+    let mut silence = crate::peer_write::SilenceDeadline::new(liveness);
+    let mut awaiting_pong = false;
+    // A message the core has no room for yet.
+    let mut held: Option<UiMessage> = None;
+    let ended = loop {
+        tokio::select! {
+            () = session_over.wait() => break UiEnded::SessionOver,
+            out = edge.take() => {
+                let Some(envelope) = out else { break UiEnded::SessionOver };
+                let text = envelope.payload.0;
+                match send_ui_text(&mut socket, &text).await {
+                    Ok(()) => edge.written(text.len()),
+                    Err(failure) => {
+                        edge.writer_failed(failure);
+                        break UiEnded::ClientGone;
+                    }
+                }
+            }
+            () = room_for_held(&inbound, held.as_ref()) => {
+                if let Some(message) = held.take()
+                    && let Err(refused) = inbound.try_push(message)
+                {
+                    match refused {
+                        PushError::Full(message) => held = Some(message),
+                        // The core's end stopped reading: it is ending the
+                        // session.
+                        PushError::Closed(_) => break UiEnded::SessionOver,
+                    }
+                }
+            }
+            frame = silence.bound(socket.recv()), if held.is_none() => {
+                let Some(frame) = frame else {
+                    if awaiting_pong {
+                        break UiEnded::ClientGone;
+                    }
+                    awaiting_pong = true;
+                    silence.restart();
+                    if send_frame(&mut socket, WsMessage::Ping(Default::default())).await.is_err() {
+                        break UiEnded::ClientGone;
+                    }
+                    continue;
+                };
+                awaiting_pong = false;
+                silence.restart();
+                let message = match frame {
+                    Some(Ok(WsMessage::Text(text))) => UiMessage::Text(text.to_string()),
+                    Some(Ok(WsMessage::Binary(_))) => UiMessage::Binary,
+                    // Tungstenite answers a Ping itself, queueing the Pong
+                    // while it reads and flushing it with the next read or
+                    // write.
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break UiEnded::ClientGone,
+                };
+                match inbound.try_push(message) {
+                    Ok(_) => {}
+                    Err(PushError::Full(message)) => held = Some(message),
+                    Err(PushError::Closed(_)) => break UiEnded::SessionOver,
+                }
+            }
+        }
+    };
+    // The core hears the client is gone, or has already gone itself.
+    drop(inbound);
+    if let UiEnded::ClientGone = ended {
+        return;
+    }
+    let delivered = tokio::time::timeout(CLOSING_DRAIN, async {
+        while let Some(envelope) = edge.take().await {
+            let text = envelope.payload.0;
+            send_ui_text(&mut socket, &text).await?;
+            edge.written(text.len());
+        }
+        if let Some(close) = edge.close_frame() {
+            send_close(&mut socket, close.code, close.reason).await;
+        }
+        Ok::<(), SendFailure>(())
+    })
+    .await;
+    drop(delivered);
+}
+
+/// Send one text message the core sent a `/ws/ui` client. The core writes
+/// JSON, which is text.
+async fn send_ui_text(socket: &mut WebSocket, text: &[u8]) -> Result<(), SendFailure> {
+    send_frame(
+        socket,
+        WsMessage::text(String::from_utf8_lossy(text).into_owned()),
+    )
+    .await
+}
+
+/// Resolves once the core has room for `held` (or its end of the queue is
+/// gone); never, when nothing is held.
+async fn room_for_held(inbound: &e6irc_queue::Sender<UiMessage>, held: Option<&UiMessage>) {
+    match held {
+        Some(message) => inbound.room_for(message).await,
+        None => std::future::pending().await,
     }
 }

@@ -280,7 +280,11 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
         Stopped => "local driver stopped",
         _ => "local driver session ended",
     };
-    session.core.core_tx.closed(conn, reason.into()).await;
+    session
+        .core
+        .core_tx
+        .closed(conn, e6irc_edge::connection::SessionClosed::Stopped(reason))
+        .await;
     outcome
 }
 

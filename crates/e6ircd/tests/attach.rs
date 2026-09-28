@@ -2,6 +2,8 @@
 //! (driver connected to an e6ircd-as-upstream), receives buffered +
 //! live traffic, and its sent lines reach the upstream.
 
+#[path = "support/attach_link.rs"]
+mod attach_link;
 #[path = "support/deadline.rs"]
 mod deadline;
 #[path = "support/membership.rs"]
@@ -125,7 +127,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     let attach_handle = handle.clone();
     let attach_task = tokio::spawn(async move {
         let _ = attach(
-            server_side,
+            attach_link::over_stream(server_side).await,
             e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
@@ -222,7 +224,7 @@ async fn two_clients_attach_to_one_always_on_network() {
     for (h, s) in [(handle.clone(), s1), (handle.clone(), s2)] {
         tokio::spawn(async move {
             let _ = attach(
-                s,
+                attach_link::over_stream(s).await,
                 e6ircd::bouncer::ClientInput::default(),
                 &h,
                 Default::default(),
@@ -292,7 +294,7 @@ async fn lagged_attach_is_not_left_open_with_stale_session_state() {
     let attach_handle = handle.clone();
     let task = tokio::spawn(async move {
         attach(
-            server,
+            attach_link::over_stream(server).await,
             e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
@@ -351,7 +353,7 @@ fn attach_client(
     let attach_handle = handle.clone();
     let task = tokio::spawn(async move {
         let _ = attach(
-            server_side,
+            attach_link::over_stream(server_side).await,
             e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             caps,
@@ -591,7 +593,7 @@ async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays(
         let handle = handle.clone();
         let task = tokio::spawn(async move {
             attach(
-                server_side,
+                attach_link::over_stream(server_side).await,
                 e6ircd::bouncer::ClientInput::default(),
                 &handle,
                 Default::default(),

@@ -6,9 +6,10 @@ use super::*;
 
 // ---- ws-irc (IRCv3-over-WebSocket, DESIGN §13.4) -------------------------
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 
-use e6irc_edge::websocket::{MAX_IRC_WS_MESSAGE, WsFrameMode, send_close, send_frame};
+use e6irc_edge::peer_write::{PEER_WRITE_DEADLINE, SendFailure, within_send_deadline};
+use e6irc_edge::websocket::{MAX_IRC_WS_MESSAGE, UiMessage, WsFrameMode};
 
 use crate::bouncer::SessionAuthority;
 
@@ -396,10 +397,11 @@ pub(super) async fn ws_ui(
         .await;
     let store = pool_of(&state).clone();
     let resume = params.after.as_deref().map(ReplayRequest::from_cursor);
+    let sendq_bytes = state.sendq_bytes;
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
         .on_upgrade(move |socket| {
-            ws_ui_conn(
+            serve_ui(
                 handle,
                 socket,
                 UiSocketAuthority {
@@ -410,6 +412,7 @@ pub(super) async fn ws_ui(
                 slot,
                 resume,
                 crate::bouncer::ATTACH_LIVENESS_INTERVAL,
+                sendq_bytes,
             )
         })
 }
@@ -446,20 +449,12 @@ pub(super) struct UiSocketAuthority {
 /// with a policy-violation code and a reason — after the upgrade, because a
 /// browser gives its page no status or body for a refused upgrade, only a
 /// close frame's code and reason.
-///
-/// `liveness` bounds how long a silent peer is believed: after one interval
-/// without a frame it is sent a WebSocket Ping, and after a second it is given
-/// up on. A browser answers Ping by itself, so a live peer on a quiet network
-/// costs one small frame per interval, and a half-open connection — a laptop
-/// that slept, a NAT that forgot the flow — stops holding its task, its socket,
-/// and its place in the attached-client count.
 pub(super) async fn ws_ui_conn(
     handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
-    mut socket: WebSocket,
+    mut socket: UiSocket,
     authority: UiSocketAuthority,
     slot: Option<UiSocketSlot>,
     resume: Option<ReplayRequest>,
-    liveness: std::time::Duration,
 ) {
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
@@ -470,7 +465,7 @@ pub(super) async fn ws_ui_conn(
         store,
     } = authority;
     let Some(_slot) = slot else {
-        send_close(&mut socket, CLOSE_POLICY_VIOLATION, UI_SOCKET_LIMIT_REASON).await;
+        socket.close(CLOSE_POLICY_VIOLATION, UI_SOCKET_LIMIT_REASON);
         return;
     };
 
@@ -523,22 +518,14 @@ pub(super) async fn ws_ui_conn(
     // exists precisely to close this subscribe-timing gap.
     let runtime = handle.runtime_snapshot();
     let mut status_revision = runtime.status_revision;
-    if send_frame(&mut socket, WsMessage::text(runtime_status_event(&runtime)))
-        .await
-        .is_err()
-    {
+    if socket.send(runtime_status_event(&runtime)).await.is_err() {
         return;
     }
 
     // A client that presented a cursor the ring could not honour holds a
     // transcript this replay does not continue: say so first, so it starts
     // over instead of showing the ring twice.
-    if resume.is_some()
-        && !replay.resumed
-        && send_frame(&mut socket, WsMessage::text(replay_full_event()))
-            .await
-            .is_err()
-    {
+    if resume.is_some() && !replay.resumed && socket.send(replay_full_event()).await.is_err() {
         return;
     }
 
@@ -551,12 +538,10 @@ pub(super) async fn ws_ui_conn(
     // snapshot over whatever the replay says, so an aged-out JOIN or a stale
     // PART cannot leave it attached to the wrong conversations.
     if let Some(session) = session_snapshot
-        && send_frame(
-            &mut socket,
-            WsMessage::text(session_event(&session, &features)),
-        )
-        .await
-        .is_err()
+        && socket
+            .send(session_event(&session, &features))
+            .await
+            .is_err()
     {
         return;
     }
@@ -565,12 +550,10 @@ pub(super) async fn ws_ui_conn(
     // JSON line events.
     for entry in &replay.lines {
         let entry_cursor = replay.cursor_at(entry.seq);
-        if send_frame(
-            &mut socket,
-            WsMessage::text(line_event(&entry.line, entry_cursor)),
-        )
-        .await
-        .is_err()
+        if socket
+            .send(line_event(&entry.line, entry_cursor))
+            .await
+            .is_err()
         {
             return;
         }
@@ -580,14 +563,9 @@ pub(super) async fn ws_ui_conn(
     // rows in the detached buffer cannot race and overwrite the fresh result.
     // It carries the ring position after the replay, so a client that saw no
     // line still has a cursor to return with.
-    if send_frame(&mut socket, WsMessage::text(snapshot_event(cursor)))
-        .await
-        .is_err()
-    {
+    if socket.send(snapshot_event(cursor)).await.is_err() {
         return;
     }
-    let mut peer_silence = crate::bouncer::SilenceDeadline::new(liveness);
-    let mut awaiting_pong = false;
     loop {
         tokio::select! {
             // The credential that opened the socket was revoked or expired:
@@ -599,7 +577,7 @@ pub(super) async fn ws_ui_conn(
                     }
                     _ => (CLOSE_POLICY_VIOLATION, UI_SOCKET_CREDENTIAL_ENDED_REASON),
                 };
-                send_close(&mut socket, code, reason).await;
+                socket.close(code, reason);
                 break;
             }
             // Network removed/replaced/disabled: send a typed terminal status
@@ -610,12 +588,7 @@ pub(super) async fn ws_ui_conn(
                     // Stopped with its owner's authority: the socket ends as
                     // its credential, which the client does not retry.
                     if lease.has_ended_now(&store).await {
-                        send_close(
-                            &mut socket,
-                            CLOSE_POLICY_VIOLATION,
-                            UI_SOCKET_CREDENTIAL_ENDED_REASON,
-                        )
-                        .await;
+                        socket.close(CLOSE_POLICY_VIOLATION, UI_SOCKET_CREDENTIAL_ENDED_REASON);
                     } else {
                         send_unavailable(&mut socket).await;
                     }
@@ -624,8 +597,7 @@ pub(super) async fn ws_ui_conn(
             }
             // A reply takes no ring position, so the cursor stays where it is.
             line = replies.recv() => {
-                if send_frame(&mut socket, WsMessage::text(line_event(&line, cursor))).await
-                    .is_err()
+                if socket.send(line_event(&line, cursor)).await.is_err()
                 {
                     break;
                 }
@@ -633,8 +605,7 @@ pub(super) async fn ws_ui_conn(
             ev = events.recv() => match ev {
                 Ok(DriverEvent::Line(entry) | DriverEvent::Notice(entry)) => {
                     cursor = replay.cursor_at(entry.seq);
-                    if send_frame(&mut socket, WsMessage::text(line_event(&entry.line, cursor))).await
-                        .is_err()
+                    if socket.send(line_event(&entry.line, cursor)).await.is_err()
                     {
                         break;
                     }
@@ -649,8 +620,7 @@ pub(super) async fn ws_ui_conn(
                     // would double-render. Echoes from the account's *other*
                     // sessions are real conversation and render normally.
                     if origin != attach_id
-                        && send_frame(&mut socket, WsMessage::text(line_event(&entry.line, cursor))).await
-                            .is_err()
+                        && socket.send(line_event(&entry.line, cursor)).await.is_err()
                     {
                         break;
                     }
@@ -659,8 +629,7 @@ pub(super) async fn ws_ui_conn(
                     if !crate::bouncer::accept_status_revision(&mut status_revision, revision) {
                         continue;
                     }
-                    if send_frame(&mut socket, WsMessage::text(driver_status_event(status))).await
-                        .is_err()
+                    if socket.send(driver_status_event(status)).await.is_err()
                     {
                         break;
                     }
@@ -669,8 +638,7 @@ pub(super) async fn ws_ui_conn(
                     // The features are read now, not carried by the event: a
                     // newer value only repeats what the live 005 lines say.
                     let features = handle.upstream_features();
-                    if send_frame(&mut socket, WsMessage::text(session_event(&session, &features))).await
-                        .is_err()
+                    if socket.send(session_event(&session, &features)).await.is_err()
                     {
                         break;
                     }
@@ -680,8 +648,7 @@ pub(super) async fn ws_ui_conn(
                 // sent at the start could not carry yet.
                 Ok(DriverEvent::Features(features)) => {
                     if let Some(session) = handle.irc_session_snapshot()
-                        && send_frame(&mut socket, WsMessage::text(session_event(&session, &features))).await
-                            .is_err()
+                        && socket.send(session_event(&session, &features)).await.is_err()
                     {
                         break;
                     }
@@ -696,8 +663,7 @@ pub(super) async fn ws_ui_conn(
                     // lines — the ring holds them even though the broadcast
                     // queue dropped them.
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
-                    if send_frame(&mut socket, WsMessage::text(line_event(&notice, cursor))).await
-                        .is_err()
+                    if socket.send(line_event(&notice, cursor)).await.is_err()
                     {
                         break;
                     }
@@ -712,23 +678,8 @@ pub(super) async fn ws_ui_conn(
                     break;
                 }
             },
-            frame = peer_silence.bound(socket.recv()) => {
-                let Some(frame) = frame else {
-                    if awaiting_pong {
-                        break;
-                    }
-                    awaiting_pong = true;
-                    peer_silence.restart();
-                    if send_frame(&mut socket, WsMessage::Ping(Default::default())).await.is_err() {
-                        break;
-                    }
-                    continue;
-                };
-                // Any frame is a sign of life, not only the Pong.
-                awaiting_pong = false;
-                peer_silence.restart();
-                match frame {
-                Some(Ok(WsMessage::Text(t))) => {
+            message = socket.recv() => match message {
+                Some(UiMessage::Text(t)) => {
                     let request = match composer_request(&t, session_authority) {
                         Ok(request) => request,
                         Err(error) => {
@@ -736,7 +687,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: error.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message,
                             });
-                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                            if socket.send(event).await.is_err() {
                                 break;
                             }
                             continue;
@@ -747,7 +698,7 @@ pub(super) async fn ws_ui_conn(
                             request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                             message: "this token is read-only; sending needs the write scope. Nothing was sent",
                         });
-                        if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                        if socket.send(event).await.is_err() {
                             break;
                         }
                         continue;
@@ -755,13 +706,9 @@ pub(super) async fn ws_ui_conn(
                     match handle.send_from(attach_id, &request.line) {
                         crate::bouncer::SendOutcome::Sent => {
                             if let Some(request_id) = request.request_id
-                                && send_frame(
-                                    &mut socket,
-                                    WsMessage::text(composer_result_event(cursor, ComposerResult::Sent(
+                                && socket.send(composer_result_event(cursor, ComposerResult::Sent(
                                         request_id.as_str(),
-                                    ))),
-                                )
-                                .await
+                                    ))).await
                                 .is_err()
                             {
                                 break;
@@ -772,7 +719,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream busy; line not sent, try again",
                             });
-                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                            if socket.send(event).await.is_err() {
                                 break;
                             }
                         }
@@ -785,7 +732,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream registration is parked; reconfigure the network before sending",
                             });
-                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                            if socket.send(event).await.is_err() {
                                 break;
                             }
                         }
@@ -794,26 +741,24 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message(),
                             });
-                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                            if socket.send(event).await.is_err() {
                                 break;
                             }
                         }
                     }
                 }
-                Some(Ok(WsMessage::Binary(_))) => {
+                Some(UiMessage::Binary) => {
                     let event = composer_result_event(cursor, ComposerResult::Rejected {
                         request_id: None,
                         message: "composer requests must be text JSON",
                     });
-                    if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                    if socket.send(event).await.is_err() {
                         break;
                     }
                 }
-                // Tungstenite answers a Ping itself, queueing the Pong while it
-                // reads and flushing it with the next read or write.
-                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
-                Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                }
+                // The client closed, failed or stopped answering: the edge
+                // is done with its socket.
+                None => break,
             },
         }
     }
@@ -821,16 +766,86 @@ pub(super) async fn ws_ui_conn(
 
 /// Tell the client its network cannot be attached to, and close the socket.
 /// The status is terminal for the client whatever the close says.
-async fn send_unavailable(socket: &mut WebSocket) {
-    if send_frame(
-        socket,
-        WsMessage::text(status_event(ConnStatus::Unavailable, None)),
-    )
-    .await
-    .is_ok()
+async fn send_unavailable(socket: &mut UiSocket) {
+    if socket
+        .send(status_event(ConnStatus::Unavailable, None))
+        .await
+        .is_ok()
     {
-        send_close(socket, CLOSE_NORMAL, UI_SOCKET_NETWORK_UNAVAILABLE_REASON).await;
+        socket.close(CLOSE_NORMAL, UI_SOCKET_NETWORK_UNAVAILABLE_REASON);
     }
+}
+
+/// The core's end of one live chat socket, a session of the core link
+/// (DESIGN §19.1): the edge holds the WebSocket and its Ping liveness
+/// (`e6irc_edge::websocket::serve_ui_socket`); this end sends the client its
+/// text messages — each on the socket before the next goes, within the peer
+/// write deadline, as a write to the socket was — and reads the messages the
+/// edge hands over.
+pub(super) struct UiSocket {
+    link: e6irc_edge::link::SessionLink,
+    inbound: e6irc_queue::Receiver<UiMessage>,
+}
+
+impl UiSocket {
+    /// Send one text message, and wait until it is on the client's socket.
+    async fn send(&mut self, text: String) -> Result<(), SendFailure> {
+        within_send_deadline(
+            PEER_WRITE_DEADLINE,
+            self.link
+                .deliver(crate::core::Output(bytes::Bytes::from(text))),
+        )
+        .await
+    }
+
+    /// End the socket with a close frame, once what was sent is written. The
+    /// session ends when this end goes; nothing sent after is delivered.
+    fn close(&mut self, code: u16, reason: &'static str) {
+        self.link
+            .close_on_end(e6irc_edge::link::CloseFrame { code, reason });
+    }
+
+    /// The client's next message; `None` once the client has gone.
+    async fn recv(&mut self) -> Option<UiMessage> {
+        self.inbound.pop().await.map(|envelope| envelope.payload)
+    }
+}
+
+/// Serve one live chat socket as a session of the core link: the edge's half
+/// (`e6irc_edge::websocket::serve_ui_socket`) holds the WebSocket, and
+/// [`ws_ui_conn`] is the core's; each ends the other. `sendq_bytes` bounds
+/// what the link buffers.
+///
+/// `liveness` bounds how long a silent peer is believed: after one interval
+/// without a frame the edge sends it a WebSocket Ping, and after a second it
+/// is given up on. A browser answers Ping by itself, so a live peer on a quiet
+/// network costs one small frame per interval, and a half-open connection — a
+/// laptop that slept, a NAT that forgot the flow — stops holding its task, its
+/// socket, and its place in the attached-client count.
+pub(super) async fn serve_ui(
+    handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
+    socket: WebSocket,
+    authority: UiSocketAuthority,
+    slot: Option<UiSocketSlot>,
+    resume: Option<ReplayRequest>,
+    liveness: std::time::Duration,
+    sendq_bytes: usize,
+) {
+    let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", sendq_bytes);
+    // The client's messages the core has not taken: at most one of the largest
+    // it reads, as the socket read one at a time.
+    let (sender, inbound) = e6irc_queue::weighted_queue(
+        e6irc_queue::Config {
+            name: "ui-inbound",
+            capacity: MAX_UI_WS_FRAME,
+            policy: e6irc_queue::Policy::Fifo,
+        },
+        UiMessage::weight,
+    );
+    tokio::join!(
+        e6irc_edge::websocket::serve_ui_socket(socket, edge, sender, liveness),
+        ws_ui_conn(handle, UiSocket { link, inbound }, authority, slot, resume),
+    );
 }
 
 #[derive(Debug)]
@@ -1607,7 +1622,7 @@ mod ui_socket_bound_tests {
                     );
                     opened.lock().expect("watches").push(watch);
                     ws.on_upgrade(move |socket| {
-                        ws_ui_conn(
+                        serve_ui(
                             handle,
                             socket,
                             UiSocketAuthority {
@@ -1624,6 +1639,7 @@ mod ui_socket_bound_tests {
                             slot,
                             None,
                             LIVENESS,
+                            64 * 512,
                         )
                     })
                 }
