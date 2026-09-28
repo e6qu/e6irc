@@ -339,7 +339,10 @@ async fn second_server_stands_by() {
         .fetch_one(&observer)
         .await
         .expect("epoch");
-    assert_eq!(first.shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        first.shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
     let second = tokio::time::timeout(Duration::from_secs(30), second)
         .await
         .expect("the standby took over at the release, not at the lease's expiry")
@@ -364,7 +367,10 @@ async fn second_server_stands_by() {
         audit[1].contains("previously nobody (released)"),
         "{audit:?}"
     );
-    assert_eq!(second.shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        second.shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
     assert_eq!(stored_holder(&observer).await, None, "released at the end");
 }
 
@@ -391,9 +397,12 @@ async fn a_server_whose_lease_is_taken_drains_and_stops() {
     .expect("the next renewal notices");
     assert_eq!(failure.task, "serving lease");
     assert!(failure.reason.contains("the thief"), "{failure}");
-    tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
-        .await
-        .expect("the bounded drain ends");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        running.shutdown.run(net::StopMode::Final),
+    )
+    .await
+    .expect("the bounded drain ends");
     assert_eq!(
         stored_holder(&observer).await.as_deref(),
         Some("the thief"),
@@ -454,9 +463,12 @@ async fn a_server_whose_renewals_stall_fences_itself_by_its_deadline() {
     .await;
     assert_eq!(lease_epoch(&observer).await, epoch_before, "the same lease");
     no_critical_failure(&mut running.shutdown).await;
-    tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
-        .await
-        .expect("the bounded drain ends");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        running.shutdown.run(net::StopMode::Final),
+    )
+    .await
+    .expect("the bounded drain ends");
     assert_eq!(stored_holder(&observer).await, None, "released at the end");
 }
 
@@ -574,9 +586,12 @@ async fn a_holder_cut_off_from_its_database_keeps_its_clients_and_resumes() {
         "{said:#?}"
     );
     no_critical_failure(&mut running.shutdown).await;
-    tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
-        .await
-        .expect("the bounded drain ends");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        running.shutdown.run(net::StopMode::Final),
+    )
+    .await
+    .expect("the bounded drain ends");
     assert_eq!(stored_holder(&observer).await, None, "released at the end");
 }
 
@@ -634,9 +649,12 @@ async fn a_holder_fenced_by_an_outage_that_finds_a_takeover_drains() {
     .expect("the first renewal that reaches the database finds the takeover");
     assert_eq!(failure.task, "serving lease");
     assert!(failure.reason.contains("the successor"), "{failure}");
-    tokio::time::timeout(Duration::from_secs(60), running.shutdown.run())
-        .await
-        .expect("the bounded drain ends");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        running.shutdown.run(net::StopMode::Final),
+    )
+    .await
+    .expect("the bounded drain ends");
     assert!(
         stored_holder(&observer)
             .await
@@ -785,7 +803,10 @@ async fn a_command_never_migrates_under_a_serving_process() {
         refused.to_string().contains("newer than this binary knows"),
         "{refused}"
     );
-    assert_eq!(running.shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        running.shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
 }
 
 #[cfg(unix)]

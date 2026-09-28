@@ -491,7 +491,7 @@ async fn cli_sasl_login() {
     std::fs::remove_dir_all(token_directory).unwrap();
     drop(observer);
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
     pool.close().await;

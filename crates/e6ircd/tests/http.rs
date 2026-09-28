@@ -1424,7 +1424,7 @@ async fn internal_upstreams_are_refused_unless_the_operator_allows_them() {
         "nothing was created"
     );
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -2563,7 +2563,7 @@ async fn an_autojoin_key_is_sealed_write_only_and_joined_across_a_restart() {
 
     // A restart builds the driver from the stored row, key included.
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
     let running = net::start(config()).await.expect("restart");
@@ -2608,7 +2608,7 @@ async fn an_autojoin_key_is_sealed_write_only_and_joined_across_a_restart() {
         "{details:?}"
     );
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -4127,7 +4127,7 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     );
     drop(pool);
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -4560,7 +4560,7 @@ async fn console_configuration_manages_every_credential_collection() {
     verification_pool.close().await;
 
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -10456,7 +10456,7 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
         .await
         .expect("the first start")
         .shutdown
-        .run()
+        .run(net::StopMode::Final)
         .await;
     let running = net::start(document(false))
         .await
@@ -11676,9 +11676,12 @@ async fn an_oidc_flow_survives_a_restart_and_is_still_answered_once() {
     // A restart, or a standby's takeover: the first process stops and gives
     // the serving lease back before the second serves.
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(60), first.shutdown.run())
-            .await
-            .expect("the first process stops within a minute"),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            first.shutdown.run(e6ircd::net::StopMode::Final)
+        )
+        .await
+        .expect("the first process stops within a minute"),
         net::ShutdownOutcome::Flushed
     );
     let second = start(process()).await;
@@ -11893,7 +11896,7 @@ async fn a_connection_test_of_a_running_network_is_refused() {
     let (status, body) = post_json(http, "/api/v1/me/network-preflight", &token, &test_body).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }

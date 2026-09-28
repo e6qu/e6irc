@@ -2528,7 +2528,10 @@ async fn read_marker_preloaded_after_restart() {
     }
     // A restart: the first process stops (and gives the serving lease back)
     // before the second serves.
-    assert_eq!(running.shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        running.shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
 
     // Second boot on the same database: the marker must be present immediately.
     let running2 = net::start(make_config()).await.expect("restart");
@@ -12249,7 +12252,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     let running = net::start(document(Some(ADMINS), "first-client-secret"))
         .await
         .expect("first start");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
     let imported = db::load_managed_config(&pool).await.expect("imported");
     assert_eq!(imported.revision, 1);
@@ -12262,7 +12265,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     let running = net::start(document(Some(ADMINS), "first-client-secret"))
         .await
         .expect("unchanged restart");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 
     // Removing an administrator from the statement cannot quietly keep them.
     let refused = refusal(document(Some(r#"["alice"]"#), "first-client-secret")).await;
@@ -12296,7 +12299,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     let running = net::start(document(None, "first-client-secret"))
         .await
         .expect("an unstated setting is not a conflict");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
     let current = db::load_managed_config(&pool).await.expect("current");
     assert_eq!(current.settings.admin_accounts, ["carol"]);
     assert_eq!(
@@ -13043,7 +13046,7 @@ async fn nickserv_and_chanserv_services_over_a_real_server() {
     .expect("carol became founder in the live core");
     carol.send("PRIVMSG NickServ :INFO dave").await;
     carol.expect("\x02dave\x02 is not registered.").await;
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 }
 
 /// The target principal a seeded audit row names, by the kind its action

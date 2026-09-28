@@ -6113,6 +6113,125 @@ phase rewrites.
     and, with PostgreSQL, `/ws/ui` and attach through an edge and the roster.
     irctest's green list also runs through an edge in CI
     (`E6IRC_IRCTEST_EDGE=1`).
+- **Phase 4 as built.** A graceful core restart keeps every client: the
+  stopping core cuts its links, the edges hold every session, and the next
+  core rebuilds them from what the edges hold (§19.3). A crash, a kill or a
+  link reset still closes sessions loudly (phase 5).
+  - *Link version 2.* `LINK_VERSION` is 2 and the core accepts 1 and 2. A
+    frame knows the version it first appears in (`since()`), and one newer
+    than the link's is a decode-level refusal. Version 2 adds, after every
+    version 1 field so a version 1 reader's bytes are unchanged: the cut the
+    edge holds in `Hello` (encoded when the `Hello`'s own newest version is
+    2 or more), the admission in `Welcome` (`Serve`, `Hold`, `Upload`),
+    `Open` with the connection's TLS facts as its own kind (the protocol
+    version, the cipher suite, the name the client asked for, the digest of
+    its certificate), and the held-state frames: the core's `Pause`,
+    `Resume`, `Ack`, `Record`, `Replica`, `CutState` and `Cut`, and the
+    edge's `Paused`, `Upload`, `RecordUpload`, `ReplicaUpload`, `CutUpload`
+    and `UploadDone`. A version 1 edge is always served at once and holds
+    nothing: a handover closes its clients with the core's own `ERROR`, as
+    before. WHOIS shows the TLS facts to the user itself and to operators
+    (`671 … :is using a secure connection [TLSv1.3, TLS13_…]`).
+  - *Bodies* (`core::record`). A session's record, a channel's state, a
+    member's entry and the cut state are bodies the edge holds without
+    reading: a format number, the writer's clock origin, then the fields.
+    Every monotonic reading is written as the writer's and moved onto the
+    reader's clock by the difference of the two origins (`ClockOrigin`, the
+    wall clock less the monotonic one, read once per process), so an
+    unchanged session writes the same bytes and is not sent again. A body is
+    cut into parts of at most 512 KiB, at most 1,024 of them. The record is
+    built by destructuring the session whole, every field recorded or named
+    with where it comes from instead, and read back by destructuring the
+    record whole (`rebuild_session`), so a field added to either does not
+    compile until it is placed. Format 1 is every field but the TLS facts,
+    format 2 adds them; a release reads both and writes the one
+    `record_format.written` says — 1 until `e6ircd records advance` (D11),
+    announced so every serving core follows at once — and refuses any other
+    format by number, closing that one session loudly (`server upgrade:
+    session state unreadable`). A core without a database has nowhere to
+    stage the window and writes the newest format.
+  - *Held state, as it changes.* After every event a shard publishes the
+    record and acknowledgement of each session that changed, and each
+    changed channel's replica to every edge hosting one of its members, on
+    the owner shard's stream; a record or acknowledgement follows the output
+    sent before it (`SessionLink::hold_record`, `hold_ack`), so an edge never
+    holds a record ahead of what its client was sent. An edge holds each
+    channel's newest state and its own members' entries; the next core takes
+    the state of the highest revision across edges and the union of the
+    members. A channel rebuilt this way keeps its `created_at`, and its hot
+    history ring is marked not the whole record, so a read falls through to
+    the database at its front.
+  - *Acknowledgement after effect.* The core numbers each session's input
+    lines as its shard handles them, per link; `Ack { through, retained }`
+    says every line through `through` is done with, except the ones an
+    accumulation still holds — the `AUTHENTICATE` chunks of an unfinished
+    SASL exchange and the lines of an open multiline batch — which the edge
+    keeps and replays first on the next link. The retained set is the union
+    of those accumulations' own line lists, so an accumulation cannot hold a
+    line the acknowledgement forgets. A capability negotiation in progress is
+    in the record, and its lines are not retained: replaying them would
+    answer them twice.
+  - *The cut* (`LinkServer::cut`, on `e6ircd stop --handover` or, in edge
+    mode, SIGTERM — D16): the core sends `Pause` on every stream and waits up
+    to 5 s for each `Paused`, which follows every line the edge sent before
+    it; waits up to 10 s until every line is handled, nothing passes between
+    shards and no database round trip is awaited, then closes each session
+    still waiting, loudly (`server restarting: a request did not complete`);
+    cuts every shard, which republishes every record and replica and handles
+    nothing more; lets each stream's pumps send what their sessions were
+    last given (10 s); sends the cut state — WHOWAS, the LUSERS maximum, the
+    account-creation buckets and the edges cut — on the first stream and
+    `Cut { cut, epoch }` on every stream; and records the cut in the roster.
+    Drivers, the core, the database flush and the lease release then run as
+    for any stop, and no client hears a word.
+  - *The edge holds.* An edge whose every stream ended with the same `Cut`
+    holds every session for the next core for at most ten minutes (D12's
+    core-absence limit); any other end closes them loudly, as before. While
+    a stream is not live a client's lines wait: its reader stops at the line
+    it could not send, and the socket's own backpressure holds the rest.
+    Output the edge was given before the cut is still written, and what is
+    written after the cut is reported to the next core, never the last.
+  - *The rebuild* (`RebuildGate`). A core whose roster names a cut waits for
+    the edges it names, at most 30 s; one without a database waits 1 s for
+    an edge presenting a cut. An edge presenting the awaited cut is told
+    `Upload`, one presenting none or another is told `Hold` (or `Serve`, once
+    the rebuild is over) and closes what it holds, loudly — re-admitting a
+    late edge's sessions is phase 5. An uploading edge sends, per stream,
+    each session's `Upload` (kind, address, transport, TLS facts, time since
+    its last line, the bytes not yet written, the lines of unknown fate and
+    whether the client left in the gap) and record, then its replicas and
+    the cut state, then `UploadDone`. The core rebuilds each channel on its
+    owner shard, then each session on its own, in the records' original
+    directory order with new directory keys; re-authorizes every login
+    against the account's standing and the credential's liveness, and every
+    address against the server bans; ends each session whose client left in
+    the gap as that client would have; and sends `Resume`. The edge replays
+    each session's retained lines, numbered afresh, then lets input flow.
+    Two records naming one nick keep it for the one that opened first; a
+    session the per-address limit refuses is closed saying so.
+  - *Stops* (`control`). `e6ircd stop --handover|--final [--pid <pid>]`
+    reaches the server through a local control endpoint named by its process
+    identifier — a Unix socket in `e6ircd-<uid>` under `$XDG_RUNTIME_DIR` or
+    the temporary directory, a directory only that user may enter; a named
+    pipe refusing remote clients on Windows — says which stop it means, and
+    returns once the server has stopped, saying whether cleanly. `--final`
+    closes every client with the core's own `ERROR`; `--handover` in a
+    process that serves its own clients is refused, and that process serves
+    on.
+  - *Evidence.* `core::record`'s tests round-trip records of many shapes in
+    both formats, refuse every format outside the window and every truncated
+    body, and move monotonic readings between origins; the `held_bodies`
+    fuzz target holds that no body panics a reader and that a body read is
+    written back byte for byte. The edge's tests hold the acknowledgement,
+    the handover's count of unconfirmed lines, the replay's numbering and the
+    report of written bytes across a handover. The zero-drop suite's
+    graceful scenarios (`zero_drop.rs`, all six cells) restart a core under
+    TCP, TLS and `/ws/irc` clients — a numbered message stream before and
+    after, a line sent in the gap, a client half way through registering, an
+    open multiline batch, WHOWAS and the LUSERS maximum, a channel's topic,
+    modes and ranks, the TLS facts — with nothing lost, repeated or said;
+    stop with `--final`; refuse a handover without edges; and hand over on
+    SIGTERM.
 
 ### 19.2 The core link
 

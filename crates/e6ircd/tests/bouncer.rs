@@ -1104,7 +1104,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .expect("timeout");
     assert!(persisted, "line was not persisted to the BNC buffer");
     // A restart: server A stops, giving the serving lease back to B.
-    running_a.shutdown.run().await;
+    running_a.shutdown.run(net::StopMode::Final).await;
 
     // Server B: same DB, but the network points at a dead upstream so the
     // only content is the restored backlog. Attaching replays it. The console
@@ -4179,7 +4179,7 @@ async fn the_backlog_cap_holds_across_restarts() {
         })
         .await
         .unwrap_or_else(|_| panic!("the {batch} batch was never fully persisted"));
-        running.shutdown.run().await;
+        running.shutdown.run(net::StopMode::Final).await;
         wait_gone(up, "bncnick").await;
     }
     // A third start trims again.
@@ -4195,7 +4195,7 @@ async fn the_backlog_cap_holds_across_restarts() {
     .await
     .expect("the final start left the backlog over the cap");
     assert_eq!(batch_rows("second").await, 600, "the newest lines are kept");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 }
 
 /// The attach listener's SASL PLAIN is one of the password checks the

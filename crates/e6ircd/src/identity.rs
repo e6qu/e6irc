@@ -135,6 +135,20 @@ impl CredentialAttemptBudget {
         self.used += 1;
         true
     }
+
+    /// The slots spent, as a session's record keeps them: a rebuild resumes
+    /// the budget where it was, so restarting a core buys no guesses.
+    pub(crate) fn used(&self) -> u8 {
+        self.used
+    }
+
+    /// The budget of a session that has spent `used` slots, never past the
+    /// limit.
+    pub(crate) fn resumed(used: u8) -> Self {
+        Self {
+            used: used.min(Self::LIMIT),
+        }
+    }
 }
 
 /// The credential a sign-in presented, which an IRC session and a bouncer

@@ -20,11 +20,12 @@ use e6irc_queue::Receiver;
 mod announcements;
 mod credential_change;
 pub(crate) mod roster;
+pub use roster::advance_record_format;
 mod secret_rotation;
 mod url;
 pub(crate) use announcements::{
-    Announcement, Announcements, CREDENTIAL_CHANGED_CHANNEL, Follower, SERVING_LEASE_CHANNEL,
-    SETTINGS_CHANGED_CHANNEL, follow_announcements,
+    Announcement, Announcements, CREDENTIAL_CHANGED_CHANNEL, Follower, RECORD_FORMAT_CHANNEL,
+    SERVING_LEASE_CHANNEL, SETTINGS_CHANGED_CHANNEL, follow_announcements,
 };
 pub(crate) use credential_change::CredentialChange;
 pub use credential_change::{

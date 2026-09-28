@@ -61,7 +61,7 @@ impl CutId {
 }
 
 /// What the edge knows of a TLS connection it terminated: the protocol
-/// version and cipher suite (their IANA code points), the server name the
+/// version and cipher suite (their registered TLS code points), the server name the
 /// client asked for, and the SHA-256 fingerprint of the client certificate it
 /// presented.
 #[derive(Debug, Clone, PartialEq, Eq)]

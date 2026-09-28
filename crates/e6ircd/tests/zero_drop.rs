@@ -4,13 +4,16 @@
 //! and clients over TCP, TLS and `/ws/irc`, and HTTP, through the edge.
 //!
 //! What a client may see is what this release promises: every line through
-//! the edge exactly once and in order, and a core that goes — stopped,
-//! killed, or cut off by a link reset — closing every session loudly with an
-//! `ERROR`, never silently. A later release keeps the sessions instead; these
-//! scenarios then change their expectation, not their shape.
+//! the edge exactly once and in order; a core stopped with a handover
+//! (`e6ircd stop --handover`, or SIGTERM) leaving every client to the edge for
+//! the next core, which serves on with nothing lost, repeated or said; and a
+//! core that goes without one — stopped with `--final`, killed, or cut off by
+//! a link reset — closing every session loudly with an `ERROR`, never
+//! silently.
 //!
 //! None needs a database, so the suite runs wherever the workspace's tests
-//! run: Linux, macOS and Windows, on both architectures.
+//! run: Linux, macOS and Windows, on both architectures; the scenarios that
+//! need one are in `zero_drop_database.rs`.
 
 #[path = "support/deadline.rs"]
 mod deadline;
@@ -132,7 +135,35 @@ impl Process {
         assert!(sent.success(), "kill -TERM: {sent}");
     }
 
-    #[cfg(unix)]
+    /// `e6ircd stop <mode> --pid <this process>`: whether it succeeded, and
+    /// what it said. It returns once the process has stopped.
+    async fn stop(&mut self, mode: &str) -> (bool, String) {
+        let pid = self.child.id().to_string();
+        let mode = mode.to_owned();
+        // The control listens from the start; the line says it does.
+        self.until("`e6ircd stop` reaches this process at", 1).await;
+        let output = tokio::time::timeout(
+            deadline::HANG,
+            tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+                    .args(["stop", &mode, "--pid", &pid])
+                    .output()
+                    .expect("run e6ircd stop")
+            }),
+        )
+        .await
+        .expect("e6ircd stop returned")
+        .expect("the stop command's thread");
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    }
+
     async fn exited(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + deadline::HANG;
         loop {
@@ -658,13 +689,212 @@ async fn a_killed_core_closes_every_session_loudly_and_the_next_core_serves() {
     assert_eq!(status, 200, "{body}");
 }
 
-/// A core that stops gracefully closes its sessions itself, each with its
-/// own closing `ERROR`, which the edge delivers before closing: the edge has
-/// nothing left to close as restarting.
+/// A graceful restart (DESIGN §19.3): the core stops handing over, the edge
+/// holds every session — TCP, TLS and `/ws/irc` — and the next core on the
+/// link's address rebuilds them from what the edge uploads. No client is
+/// disconnected or told anything: each keeps its nick, its channel with its
+/// topic, modes and ranks, and its TLS facts; a line sent while no core was
+/// there is delivered after, exactly once; and the stream of messages before
+/// and after the restart has no line lost or repeated. A client half way
+/// through registering finishes after; a multiline batch left open is closed
+/// after, and arrives whole; WHOWAS and the LUSERS maximum are kept. The core
+/// is stopped by `e6ircd stop --handover`, the same on every operating system.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_restart_keeps_every_client_of_every_transport() {
+    let deployment = Deployment::new("restart", &["edge-a"]);
+    let trusted = deployment.tls_certificate();
+    let mut core = deployment.core("core.toml", "127.0.0.1:0", "").await;
+    let link = core.link;
+    let mut edge = deployment.edge("edge-a", link, listeners()).await;
+    let (plain, tls, web) = addresses(&mut edge).await;
+
+    let mut alice = Client::tcp("alice", plain).await;
+    let mut bob = Client::tls("bob", tls, trusted).await;
+    let mut carol = WebSocketClient::connect("carol", web).await;
+    alice.register().await;
+    bob.register().await;
+    carol.register().await;
+    alice.join("#zero").await;
+    bob.join("#zero").await;
+    carol.send("JOIN #zero").await;
+    carol.until(" 366 ").await;
+    alice.until("carol!carol@").await;
+    alice.send("TOPIC #zero :kept across restarts").await;
+    alice.send("MODE #zero +lv 10 bob").await;
+    bob.until("MODE #zero +lv 10 bob").await;
+    carol.until("MODE #zero +lv 10 bob").await;
+    for number in 1..=50 {
+        alice
+            .send(&format!("PRIVMSG #zero :message {number}"))
+            .await;
+    }
+    for number in 1..=50 {
+        let expected = format!("PRIVMSG #zero :message {number}");
+        assert!(bob.until("PRIVMSG #zero").await.ends_with(&expected));
+        assert!(carol.until("PRIVMSG #zero").await.ends_with(&expected));
+    }
+
+    // dave has sent NICK, and not USER, when the core stops.
+    let mut dave = Client::tcp("dave", plain).await;
+    dave.send("NICK dave").await;
+    // erin has a multiline batch open.
+    let mut erin = Client::tcp("erin", plain).await;
+    erin.send("CAP LS 302").await;
+    erin.send("CAP REQ :batch draft/multiline").await;
+    erin.until("ACK").await;
+    erin.send("CAP END").await;
+    erin.register().await;
+    erin.join("#zero").await;
+    erin.send("BATCH +ml draft/multiline #zero").await;
+    erin.send("@batch=ml PRIVMSG #zero :first half").await;
+    // frank leaves a WHOWAS entry behind.
+    let mut frank = Client::tcp("frank", plain).await;
+    frank.register().await;
+    frank.send("QUIT :bye").await;
+    frank.until_closed().await;
+    alice.send("LUSERS").await;
+    let most_before = alice.until(" 266 ").await;
+
+    let (stopped, said) = core.process.stop("--handover").await;
+    assert!(stopped, "{said}\n{}", core.process.said());
+    assert!(
+        said.contains("stopping handover") && said.contains("stopped"),
+        "{said}"
+    );
+    assert!(
+        core.process.exited().await.success(),
+        "{}",
+        core.process.said()
+    );
+    edge.until("holding 5 sessions for the next core", 1).await;
+    // Sent while no core is there: the edge holds it for the next.
+    alice.send("PRIVMSG #zero :during the gap").await;
+
+    let mut next = deployment.core("next.toml", &link.to_string(), "").await;
+    edge.until("uploaded 5 sessions", 1).await;
+    next.process.until("rebuilt 5 sessions", 1).await;
+
+    for client in [&mut bob, &mut erin] {
+        let heard = client.until("PRIVMSG #zero").await;
+        assert!(heard.ends_with(":during the gap"), "{heard}");
+    }
+    let heard = carol.until("PRIVMSG #zero").await;
+    assert!(heard.ends_with(":during the gap"), "{heard}");
+    dave.send("USER dave 0 * :dave").await;
+    assert!(dave.until(" 001 ").await.contains(" 001 dave "));
+    erin.send("@batch=ml PRIVMSG #zero :second half").await;
+    erin.send("BATCH -ml").await;
+    // A client without the capability has the batch as its lines.
+    for client in [&mut alice, &mut bob] {
+        let first = client.until("PRIVMSG #zero").await;
+        assert!(first.ends_with(":first half"), "{first}");
+        let second = client.until("PRIVMSG #zero").await;
+        assert!(second.ends_with(":second half"), "{second}");
+    }
+    let first = carol.until("PRIVMSG #zero").await;
+    assert!(first.ends_with(":first half"), "{first}");
+    let second = carol.until("PRIVMSG #zero").await;
+    assert!(second.ends_with(":second half"), "{second}");
+    alice.send("WHOWAS frank").await;
+    assert!(alice.until(" 314 ").await.contains(" frank "));
+    alice.send("LUSERS").await;
+    let most_after = alice.until(" 266 ").await;
+    let most = |line: &str| {
+        line.split_whitespace()
+            .filter_map(|word| word.parse::<u64>().ok())
+            .next_back()
+            .unwrap_or_else(|| panic!("no maximum in {line}"))
+    };
+    assert_eq!(most(&most_after), most(&most_before), "{most_after}");
+
+    for number in 51..=100 {
+        bob.send(&format!("PRIVMSG #zero :message {number}")).await;
+    }
+    for number in 51..=100 {
+        let expected = format!("PRIVMSG #zero :message {number}");
+        let heard = alice.until("PRIVMSG #zero").await;
+        assert!(heard.ends_with(&expected), "alice: {heard} for {expected}");
+        let heard = carol.until("PRIVMSG #zero").await;
+        assert!(heard.ends_with(&expected), "carol: {heard} for {expected}");
+    }
+
+    // The channel is as it was: topic, limit, ranks.
+    carol.send("TOPIC #zero").await;
+    assert!(
+        carol
+            .until(" 332 ")
+            .await
+            .ends_with(":kept across restarts")
+    );
+    carol.send("MODE #zero").await;
+    let modes = carol.until(" 324 ").await;
+    assert!(modes.contains('l') && modes.ends_with(" 10"), "{modes}");
+    carol.send("NAMES #zero").await;
+    let names = carol.until(" 353 ").await;
+    for member in ["@alice", "+bob", "carol"] {
+        assert!(
+            names.split([' ', ':']).any(|name| name == member),
+            "{names}"
+        );
+    }
+    // bob's TLS is still his, from the facts the edge uploaded.
+    bob.send("WHOIS bob").await;
+    let secure = bob.until(" 671 ").await;
+    assert!(
+        secure.contains(":is using a secure connection [TLSv1.3, TLS13_"),
+        "{secure}"
+    );
+    bob.until(" 318 ").await;
+    // Nothing was lost or repeated: each client's next line is the answer to
+    // its own PING.
+    for client in [&mut alice, &mut bob] {
+        client.send("PING :after").await;
+        let pong = client.line().await.expect("a line");
+        assert!(
+            pong.contains(" PONG ") && pong.ends_with(":after"),
+            "{pong}"
+        );
+    }
+    assert!(
+        !edge.said().contains("closed as the server restarting"),
+        "{}",
+        edge.said()
+    );
+}
+
+/// In edge mode SIGTERM is a handover too (D16): what a service manager
+/// sends leaves the clients to the edge.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stopped_core_closes_every_session_with_its_own_error() {
-    let deployment = Deployment::new("stopped", &["edge-a"]);
+async fn a_terminated_core_hands_its_clients_over() {
+    let deployment = Deployment::new("terminated", &["edge-a"]);
+    let _trusted = deployment.tls_certificate();
+    let mut core = deployment.core("core.toml", "127.0.0.1:0", "").await;
+    let link = core.link;
+    let mut edge = deployment.edge("edge-a", link, listeners()).await;
+    let (plain, ..) = addresses(&mut edge).await;
+    let mut alice = Client::tcp("alice", plain).await;
+    alice.register().await;
+
+    core.process.terminate();
+    assert!(
+        core.process.exited().await.success(),
+        "{}",
+        core.process.said()
+    );
+    edge.until("holding 1 sessions for the next core", 1).await;
+    let _next = deployment.core("next.toml", &link.to_string(), "").await;
+    edge.until("uploaded 1 sessions", 1).await;
+    alice.send("PING :resumed").await;
+    assert!(alice.until("PONG").await.ends_with(":resumed"));
+}
+
+/// `e6ircd stop --final` is the stop that closes the clients (D16): each is
+/// told the server is shutting down, in the core's own words, and the edge
+/// has nothing left to hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_stop_closes_every_client_with_the_core_s_error() {
+    let deployment = Deployment::new("final", &["edge-a"]);
     let _trusted = deployment.tls_certificate();
     let mut core = deployment.core("core.toml", "127.0.0.1:0", "").await;
     let mut edge = deployment.edge("edge-a", core.link, listeners()).await;
@@ -674,12 +904,8 @@ async fn a_stopped_core_closes_every_session_with_its_own_error() {
     alice.register().await;
     carol.register().await;
 
-    core.process.terminate();
-    assert!(
-        core.process.exited().await.success(),
-        "{}",
-        core.process.said()
-    );
+    let (stopped, said) = core.process.stop("--final").await;
+    assert!(stopped, "{said}\n{}", core.process.said());
     for (name, closing) in [
         ("alice", alice.until_closed().await),
         ("carol", carol.until_closed().await),
@@ -692,6 +918,43 @@ async fn a_stopped_core_closes_every_session_with_its_own_error() {
     }
     edge.until("0 sessions were closed as the server restarting", 1)
         .await;
+    assert!(core.process.exited().await.success());
+}
+
+/// A process that serves its own clients has no edge to hand them to: a
+/// handover is refused, loudly, and the process serves on; `--final` stops
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handover_is_refused_by_a_process_without_edges() {
+    let deployment = Deployment::new("single", &[]);
+    let config = deployment.write(
+        "single.toml",
+        "server_name = \"irc.zero.test\"\n\
+         network_name = \"ZeroNet\"\n\
+         [[listeners]]\n\
+         addr = \"127.0.0.1:0\"\n",
+    );
+    let mut single = Process::spawn(
+        "the single process",
+        &["--config".as_ref(), config.as_os_str()],
+        &deployment.dir,
+    );
+    let plain = single.address("listening on ").await;
+    let mut alice = Client::tcp("alice", plain).await;
+    alice.register().await;
+
+    let (stopped, said) = single.stop("--handover").await;
+    assert!(!stopped, "{said}");
+    assert!(said.contains("no edge to hand them to"), "{said}");
+    alice.send("PING :still").await;
+    assert!(alice.until("PONG").await.ends_with(":still"));
+
+    let (stopped, said) = single.stop("--final").await;
+    assert!(stopped, "{said}");
+    assert_eq!(
+        alice.until_closed().await.last().map(String::as_str),
+        Some("ERROR :Closing Link: 127.0.0.1 (Server shutting down)")
+    );
 }
 
 /// A relay between an edge and its core that forwards every link

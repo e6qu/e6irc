@@ -668,7 +668,10 @@ async fn the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners() {
 
     // The next core, on the same database, gives edge-a its slot again.
     let first_shutdown = first.shutdown;
-    assert_eq!(first_shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        first_shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
     let _second = database_core(&credentials, url, &link.to_string(), up).await;
     a.until_accepting().await;
     let again: (i32, i64) =
