@@ -93,6 +93,12 @@ pub struct Buffer {
     unread: usize,
     /// Scrollback offset in lines from the bottom (0 = following live).
     scroll: usize,
+    /// Who is known to be in this conversation, for nick completion: keyed by
+    /// the name folded under the network's case mapping, holding the name as
+    /// the server spells it. Filled from NAMES, JOIN and whoever speaks;
+    /// emptied of whoever parts, quits or is kicked. Bounded by
+    /// [`MAX_MEMBERS`], because every name in it came from the server.
+    members: std::collections::HashMap<String, String>,
 }
 
 impl Buffer {
@@ -108,6 +114,34 @@ impl Buffer {
             read_hold: ReadHold::Free,
             unread: 0,
             scroll: 0,
+            members: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Note that `nick` is in this conversation. `false` when the member
+    /// bound refused a new name.
+    fn add_member(&mut self, names: &NetworkNames, nick: &str) -> bool {
+        let folded = names.fold(nick);
+        if let Some(known) = self.members.get_mut(&folded) {
+            nick.clone_into(known);
+            return true;
+        }
+        if self.members.len() >= MAX_MEMBERS {
+            return false;
+        }
+        self.members.insert(folded, nick.to_owned());
+        true
+    }
+
+    fn remove_member(&mut self, names: &NetworkNames, nick: &str) -> bool {
+        self.members.remove(&names.fold(nick)).is_some()
+    }
+
+    /// Re-key the members under a new case mapping.
+    fn refold_members(&mut self, names: &NetworkNames) {
+        let members = std::mem::take(&mut self.members);
+        for nick in members.into_values() {
+            self.members.insert(names.fold(&nick), nick);
         }
     }
 
@@ -199,6 +233,15 @@ pub const SCROLLBACK_LINES: usize = 5_000;
 /// what a remote party can make the client allocate.
 const MAX_BUFFERS: usize = 256;
 
+/// Members remembered per conversation for nick completion. Names arrive from
+/// the server, so this bounds what a remote party can make the client keep.
+pub const MAX_MEMBERS: usize = 10_000;
+
+/// The characters NAMES puts before a member's nickname to show its channel
+/// rank (`@op`, `+voice`, and with multi-prefix several of them). None of
+/// them can begin a nickname.
+const RANK_PREFIXES: &[char] = &['~', '&', '@', '%', '+', '!', '.'];
+
 /// The composer admits the full client message-tag plus traditional-body
 /// allowance. The derived line is then checked against each independent wire
 /// budget, so `/raw @tags ...` works without letting an untagged body borrow
@@ -229,6 +272,25 @@ pub struct App {
     /// Whether the connection has `draft/read-marker` enabled. Without it
     /// the server has no `MARKREAD` to answer, so none is queued.
     read_markers: bool,
+    /// Whether the connection has `echo-message` enabled: the server then
+    /// shows this client's own messages back, with their message ID and
+    /// time, and those — not a local copy — are what the buffer shows.
+    echo_message: bool,
+    /// The member bound has been reported to the user.
+    member_limit_reported: bool,
+    /// The nick completion Tab is cycling through, until another key.
+    completion: Option<Completion>,
+}
+
+/// A nick completion in progress: repeated Tab cycles the candidates in place.
+#[derive(Debug, Clone)]
+struct Completion {
+    /// Byte offset in the composer where the completed word starts.
+    start: usize,
+    /// The names matching the typed prefix, in the order Tab offers them.
+    candidates: Vec<String>,
+    /// The candidate now in the composer.
+    index: usize,
 }
 
 /// What a registered connection tells the UI before its first line: facts of
@@ -241,6 +303,8 @@ pub struct SessionStart {
     pub names: NetworkNames,
     /// Whether `draft/read-marker` is enabled on the connection.
     pub read_markers: bool,
+    /// Whether `echo-message` is enabled on the connection.
+    pub echo_message: bool,
 }
 
 /// A command the UI wants the network layer to perform.
@@ -291,6 +355,9 @@ impl App {
             outbound_limit_reported: false,
             names: NetworkNames::default(),
             read_markers: false,
+            echo_message: false,
+            member_limit_reported: false,
+            completion: None,
         };
         app.begin_session(session);
         app
@@ -305,10 +372,17 @@ impl App {
             nick,
             names,
             read_markers,
+            echo_message,
         } = session;
         self.set_nick(&nick);
         self.connected = true;
         self.read_markers = read_markers;
+        self.echo_message = echo_message;
+        // Membership is what the new connection's NAMES and JOINs say; what
+        // the previous one knew may no longer hold.
+        for buffer in &mut self.buffers {
+            buffer.members.clear();
+        }
         if !read_markers {
             self.pending_read_marker = None;
         }
@@ -551,6 +625,10 @@ impl App {
                 if !self.buffers[idx].accept_msgid(msg.tag("msgid")) {
                     return;
                 }
+                let from_self = self.names.eq(&sender, &self.nick);
+                if from_a_user {
+                    self.note_member(idx, &sender);
+                }
                 self.buffers[idx].push(LogLine::message(&sender, &text));
                 if let Some(raw_time) = msg.tag("time") {
                     if let Some(millis) = e6irc_proto::time::parse_server_time_millis(raw_time) {
@@ -566,7 +644,9 @@ impl App {
                 if idx == self.current && !self.buffers[idx].scrolled_back() {
                     self.buffers[idx].unread = 0;
                     self.queue_current_marker();
-                } else {
+                } else if !from_self {
+                    // What this person said themselves — from another client
+                    // attached to the same network — is not waiting to be read.
                     self.buffers[idx].unread = self.buffers[idx].unread.saturating_add(1);
                 }
             }
@@ -576,6 +656,7 @@ impl App {
                         self.note_buffer_limit();
                         return;
                     };
+                    self.note_member(idx, &sender);
                     self.buffers[idx].push(LogLine::new("*", &format!("{sender} joined")));
                 }
             }
@@ -584,15 +665,18 @@ impl App {
                     && let Some(idx) = self.buffer_index(chan)
                 {
                     self.buffers[idx].push(LogLine::new("*", &format!("{sender} left")));
+                    self.forget_member(Some(idx), &sender);
                 }
             }
             "QUIT" => {
                 self.note_about_user(&sender, &format!("{sender} quit"));
+                self.forget_member(None, &sender);
             }
             "NICK" => {
                 let Some(new_nick) = msg.params.first() else {
                     return;
                 };
+                self.rename_member(&sender, new_nick);
                 if self.names.eq(&sender, &self.nick) {
                     self.nick = new_nick.clone();
                     self.status(format!("you are now known as {new_nick}"));
@@ -611,6 +695,9 @@ impl App {
                     &format!("{kicked} was")
                 };
                 self.note_in(channel, &format!("{who} kicked by {sender}: {reason}"));
+                if let Some(index) = self.conversation_index(channel) {
+                    self.forget_member(Some(index), kicked);
+                }
             }
             "TOPIC" => {
                 let (Some(channel), Some(topic)) = (msg.params.first(), msg.params.get(1)) else {
@@ -688,6 +775,9 @@ impl App {
                 if numeric == "005" {
                     self.adopt_isupport(msg);
                 }
+                if numeric == "353" {
+                    self.adopt_names_reply(msg);
+                }
                 let subject = e6irc_client::numeric_subject(msg).unwrap_or("");
                 let detail = msg.params.get(1..).unwrap_or_default().join(" ");
                 self.note_about(subject, &detail);
@@ -697,6 +787,74 @@ impl App {
             command => {
                 let detail = msg.params.join(" ");
                 self.note_server(&format!("{sender} {command} {detail}"));
+            }
+        }
+    }
+
+    /// Remember `nick` as a member of the conversation at `index`, and say
+    /// once when the member bound stops that.
+    fn note_member(&mut self, index: usize, nick: &str) {
+        if self.buffers[index].add_member(&self.names, nick) || self.member_limit_reported {
+            return;
+        }
+        self.member_limit_reported = true;
+        let name = self.buffers[index].name.clone();
+        self.buffers[index].push(LogLine::new(
+            "*",
+            &format!(
+                "{name} has more than {MAX_MEMBERS} members; nick completion offers only the \
+                 first {MAX_MEMBERS} seen"
+            ),
+        ));
+    }
+
+    /// `nick` left the conversation at `index`, or every conversation when
+    /// `None` (a QUIT). When it is this client that left, it no longer sees
+    /// who is there at all.
+    fn forget_member(&mut self, index: Option<usize>, nick: &str) {
+        let own = self.names.eq(nick, &self.nick);
+        let names = &self.names;
+        for (position, buffer) in self.buffers.iter_mut().enumerate() {
+            if index.is_some_and(|index| index != position) {
+                continue;
+            }
+            if own {
+                buffer.members.clear();
+            } else {
+                buffer.remove_member(names, nick);
+            }
+        }
+    }
+
+    /// `old` is now called `new` wherever it was a member.
+    fn rename_member(&mut self, old: &str, new: &str) {
+        let names = &self.names;
+        for buffer in &mut self.buffers {
+            if buffer.remove_member(names, old) {
+                // It was a member, so there is room for it under its new name.
+                buffer.add_member(names, new);
+            }
+        }
+    }
+
+    /// Take the members a NAMES reply (`353 me = #chan :@op +voice user`)
+    /// lists into that channel's buffer, without their rank prefixes.
+    fn adopt_names_reply(&mut self, msg: &OwnedMessage) {
+        let (Some(channel), Some(listed)) = (msg.params.get(2), msg.params.get(3)) else {
+            return;
+        };
+        let Some(index) = self.conversation_index(channel) else {
+            return;
+        };
+        for entry in listed.split(' ') {
+            // With userhost-in-names an entry is `nick!user@host`.
+            let nick = entry
+                .trim_start_matches(RANK_PREFIXES)
+                .split('!')
+                .next()
+                .unwrap_or_default();
+            if !nick.is_empty() {
+                self.note_member(index, nick);
             }
         }
     }
@@ -712,6 +870,10 @@ impl App {
     /// Say what a new case mapping means: that it is not one this client
     /// knows, and which open buffers it makes one name.
     fn casemapping_changed(&mut self) {
+        let names = &self.names;
+        for buffer in &mut self.buffers {
+            buffer.refold_members(names);
+        }
         if let Some(mapping) = self.names.unrecognised_casemapping() {
             let mapping = mapping.to_owned();
             self.note_server(&format!(
@@ -824,7 +986,7 @@ impl App {
             return;
         };
         let from = self.nick.clone();
-        self.buffers[index].push(LogLine::new(&from, &echo.text));
+        self.buffers[index].push(LogLine::message(&from, &echo.text));
     }
 
     /// Restore editor text when the bounded writer refuses admission. The
@@ -886,6 +1048,7 @@ impl App {
     /// the breaks lost, and sent line by line it would be several messages
     /// the user never saw separately.
     pub fn on_paste(&mut self, text: &str) {
+        self.end_completion();
         if text.contains(['\r', '\n']) {
             let lines = text
                 .split(['\r', '\n'])
@@ -953,6 +1116,83 @@ impl App {
         self.input_limit_reported = false;
     }
 
+    /// Tab: complete the word before the cursor to a member of the
+    /// conversation in view, `nick: ` at the start of the line and `nick `
+    /// elsewhere. Pressed again, it offers the next match in its place.
+    /// `false` when nothing matches: the composer is unchanged.
+    pub fn complete_nick(&mut self) -> bool {
+        if let Some(completion) = &mut self.completion {
+            completion.index = (completion.index + 1) % completion.candidates.len();
+            let replacement =
+                Self::completed(completion.start, &completion.candidates[completion.index]);
+            let start = completion.start;
+            if self.input.len() - (self.input_cursor - start) + replacement.len()
+                > MAX_COMPOSER_BYTES
+            {
+                return false;
+            }
+            self.input
+                .replace_range(start..self.input_cursor, &replacement);
+            self.input_cursor = start + replacement.len();
+            return true;
+        }
+        let start = self.input[..self.input_cursor]
+            .rfind(' ')
+            .map_or(0, |space| space + 1);
+        let prefix = self.names.fold(&self.input[start..self.input_cursor]);
+        if prefix.is_empty() {
+            return false;
+        }
+        let buffer = self.current();
+        // A query's member is the person it is with, whether or not they
+        // have spoken yet.
+        let peer = (buffer.kind == BufferKind::Conversation
+            && !self.names.is_channel(&buffer.name))
+        .then(|| (self.names.fold(&buffer.name), buffer.name.clone()));
+        let mut candidates: Vec<(String, String)> = buffer
+            .members
+            .iter()
+            .map(|(folded, nick)| (folded.clone(), nick.clone()))
+            .chain(peer)
+            .filter(|(folded, nick)| {
+                folded.starts_with(&prefix) && !self.names.eq(nick, &self.nick)
+            })
+            .collect();
+        candidates.sort();
+        candidates.dedup_by(|a, b| a.0 == b.0);
+        let Some((_, first)) = candidates.first() else {
+            return false;
+        };
+        let replacement = Self::completed(start, first);
+        if self.input.len() - (self.input_cursor - start) + replacement.len() > MAX_COMPOSER_BYTES {
+            return false;
+        }
+        self.input
+            .replace_range(start..self.input_cursor, &replacement);
+        self.input_cursor = start + replacement.len();
+        self.completion = Some(Completion {
+            start,
+            candidates: candidates.into_iter().map(|(_, nick)| nick).collect(),
+            index: 0,
+        });
+        true
+    }
+
+    /// What completing to `nick` puts in the composer at byte `start`.
+    fn completed(start: usize, nick: &str) -> String {
+        if start == 0 {
+            format!("{nick}: ")
+        } else {
+            format!("{nick} ")
+        }
+    }
+
+    /// Any key but Tab ends a completion: the next Tab starts afresh from
+    /// whatever word is then before the cursor.
+    pub fn end_completion(&mut self) {
+        self.completion = None;
+    }
+
     /// Handle Enter: produce an action and clear accepted input. Commands are
     /// closed and explicit; a misspelled command is retained for correction
     /// instead of leaking into the active conversation as message text.
@@ -979,7 +1219,7 @@ impl App {
             return match command.as_str() {
                 "help" if arguments.is_empty() => {
                     self.status(
-                        "commands: /join #channel · /msg nick text · /win name|number · /raw LINE · /quit · //text sends /text",
+                        "commands: /join #channel · /msg nick text · /me action · /win name|number · /raw LINE · /quit · //text sends /text · Tab completes a nick",
                     );
                     Action::None
                 }
@@ -990,6 +1230,7 @@ impl App {
                 "join" => self.join_command(line, &arguments),
                 "win" => self.window_command(line, &arguments),
                 "msg" => self.direct_message_command(line, &arguments),
+                "me" => self.action_command(line, &arguments),
                 "raw" => self.raw_command(line, &arguments),
                 "help" => self.refuse_command(line, "usage: /help"),
                 "quit" => self.refuse_command(line, "usage: /quit"),
@@ -1007,8 +1248,14 @@ impl App {
     }
 
     fn join_command(&mut self, input: String, channel: &str) -> Action {
-        if channel.is_empty() || channel.contains(char::is_whitespace) {
-            return self.refuse_command(input, "usage: /join #channel");
+        // One channel per command: `#a,#b` would open a buffer of that name,
+        // and a name that is not a channel on this network (`chat` without
+        // its `#`) a buffer whose lines go to a nickname.
+        if channel.is_empty() || channel.contains([' ', ',']) || !self.names.is_channel(channel) {
+            return self.refuse_command(
+                input,
+                "usage: /join #channel — one channel; a keyed one: /raw JOIN #channel key",
+            );
         }
         if !self.connected {
             return self.refuse_command(input, "not connected — JOIN not sent");
@@ -1079,14 +1326,27 @@ impl App {
         };
         self.current = index;
         self.focus_current();
-        self.outbound_or_restore(
-            input,
-            wire,
-            Some(LocalEcho {
-                target: target.to_owned(),
-                text: text.to_owned(),
-            }),
-        )
+        let echo = self.local_echo(target, text);
+        self.outbound_or_restore(input, wire, echo)
+    }
+
+    /// `/me waves`: a CTCP ACTION to the conversation in view.
+    fn action_command(&mut self, input: String, action: &str) -> Action {
+        if action.is_empty() {
+            return self.refuse_command(input, "usage: /me action");
+        }
+        self.message_outbound(input, format!("\u{1}ACTION {action}\u{1}"))
+    }
+
+    /// The copy of a sent message the buffer shows once the writer queue
+    /// admits it — none when the server echoes messages itself: its echo
+    /// carries the message ID and time a local copy lacks, so history loaded
+    /// after a reconnect cannot show the message a second time.
+    fn local_echo(&self, target: &str, text: &str) -> Option<LocalEcho> {
+        (!self.echo_message).then(|| LocalEcho {
+            target: target.to_owned(),
+            text: text.to_owned(),
+        })
     }
 
     fn raw_command(&mut self, input: String, line: &str) -> Action {
@@ -1117,7 +1377,8 @@ impl App {
         }
         let target = self.current().name.clone();
         let wire = format!("PRIVMSG {target} :{text}");
-        self.outbound_or_restore(input, wire, Some(LocalEcho { target, text }))
+        let echo = self.local_echo(&target, &text);
+        self.outbound_or_restore(input, wire, echo)
     }
 
     fn outbound_or_restore(
@@ -1142,6 +1403,7 @@ impl App {
     }
 
     fn restore_input(&mut self, input: String) {
+        self.completion = None;
         self.input_cursor = input.len();
         self.input = input;
     }
@@ -1157,6 +1419,7 @@ pub(crate) fn test_app(channel: &str, nick: &str) -> App {
             nick: nick.to_owned(),
             names: NetworkNames::default(),
             read_markers: true,
+            echo_message: false,
         },
     )
 }
@@ -1360,6 +1623,7 @@ mod tests {
                 nick: "me".into(),
                 names,
                 read_markers: true,
+                echo_message: false,
             },
         );
         app.on_message(&msg(":op!o@h NOTICE @#c :ops only"));
@@ -1790,6 +2054,7 @@ mod tests {
             nick: "me".into(),
             names: NetworkNames::default(),
             read_markers,
+            echo_message: false,
         };
         let mut app = App::new("#a".into(), session(false));
         app.on_message(&msg(
@@ -2021,5 +2286,220 @@ mod tests {
         app.on_paste(" pasted");
         assert_eq!(app.input(), "x pasted");
         assert_eq!(app.input_cursor(), app.input().len());
+    }
+
+    fn type_line(app: &mut App, line: &str) -> Action {
+        for character in line.chars() {
+            app.on_char(character);
+        }
+        app.on_enter()
+    }
+
+    fn echoing_app(channel: &str, nick: &str) -> App {
+        App::new(
+            channel.to_owned(),
+            SessionStart {
+                nick: nick.to_owned(),
+                names: NetworkNames::default(),
+                read_markers: true,
+                echo_message: true,
+            },
+        )
+    }
+
+    /// On a server that echoes messages, the buffer shows the echo — with its
+    /// message ID — and no local copy. History loaded after a reconnect holds
+    /// the same message; it must not appear a second time, as it did when the
+    /// only copy shown was a local one without an ID.
+    #[test]
+    fn an_own_message_is_shown_once_across_a_history_replay() {
+        let mut app = echoing_app("#c", "me");
+        let Action::Send(outbound) = type_line(&mut app, "hello") else {
+            panic!("message should be queued");
+        };
+        assert_eq!(outbound.line(), "PRIVMSG #c :hello");
+        app.outbound_accepted(&outbound);
+        assert!(
+            app.current().log.is_empty(),
+            "no local copy beside the echo"
+        );
+        let echoed = "msgid=own1;time=2026-09-28T10:00:00.000Z :me!u@h PRIVMSG #c :hello";
+        app.on_message(&msg(&format!("@{echoed}")));
+        // A reconnect's marker-relative history replays it.
+        app.on_message(&msg(&format!("@batch=h1;{echoed}")));
+        let shown: Vec<_> = app
+            .current()
+            .log
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(shown, ["hello"]);
+        // Its time moves the read marker past it, so the next reconnect's
+        // history does not start before it.
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #c timestamp=2026-09-28T10:00:00.000Z")
+        );
+
+        // Without echo-message the local copy is all there is.
+        let mut app = test_app("#c", "me");
+        let Action::Send(outbound) = type_line(&mut app, "hello") else {
+            panic!("message should be queued");
+        };
+        app.outbound_accepted(&outbound);
+        assert_eq!(app.current().log.back().unwrap().text, "hello");
+    }
+
+    /// What this person said from another client attached to the same
+    /// network is not work waiting to be read.
+    #[test]
+    fn an_own_message_elsewhere_is_not_unread() {
+        let mut app = test_app("#home", "me");
+        app.on_message(&msg(":me!u@h PRIVMSG #other :from my phone"));
+        app.on_message(&msg(":me!u@h PRIVMSG friend :also from my phone"));
+        assert_eq!(app.total_unread(), 0);
+        app.on_message(&msg(":alice!u@h PRIVMSG #other :hi"));
+        assert_eq!(app.total_unread(), 1);
+    }
+
+    #[test]
+    fn slash_me_sends_an_action_and_shows_it_as_one() {
+        let mut app = test_app("#c", "me");
+        let Action::Send(outbound) = type_line(&mut app, "/me waves") else {
+            panic!("the action should be queued");
+        };
+        assert_eq!(outbound.line(), "PRIVMSG #c :\u{1}ACTION waves\u{1}");
+        app.outbound_accepted(&outbound);
+        let line = app.current().log.back().unwrap();
+        assert_eq!((line.from.as_str(), line.text.as_str()), ("* me", "waves"));
+        assert_eq!(type_line(&mut app, "/me"), Action::None);
+        assert_eq!(app.input(), "/me", "an empty action is retained");
+    }
+
+    /// `/join` takes one channel of this network: `#a,#b` opened a buffer of
+    /// that name, and `chat` a buffer whose messages went to a nickname.
+    #[test]
+    fn slash_join_takes_exactly_one_channel() {
+        for refused in ["/join chat", "/join #a,#b", "/join #a key"] {
+            let mut app = test_app("#c", "me");
+            assert_eq!(type_line(&mut app, refused), Action::None, "{refused}");
+            assert_eq!(app.input(), refused, "retained for correction");
+            assert_eq!(app.buffers.len(), 1, "{refused} opened a buffer");
+            assert!(
+                app.current()
+                    .log
+                    .back()
+                    .unwrap()
+                    .text
+                    .as_str()
+                    .contains("usage: /join"),
+                "{refused}"
+            );
+        }
+        let mut app = test_app("#c", "me");
+        let Action::Send(outbound) = type_line(&mut app, "/join &local") else {
+            panic!("a local channel is a channel");
+        };
+        assert_eq!(outbound.line(), "JOIN &local");
+    }
+
+    /// Type `word` into an empty composer and press Tab.
+    fn complete(app: &mut App, word: &str) -> bool {
+        app.end_completion();
+        app.clear_input();
+        for character in word.chars() {
+            app.on_char(character);
+        }
+        app.complete_nick()
+    }
+
+    /// Tab completes the word before the cursor to a member of the channel in
+    /// view, as NAMES, JOIN and speech made them known, under the network's
+    /// case mapping; again, it offers the next match in place.
+    #[test]
+    fn tab_completes_and_cycles_channel_members() {
+        let mut app = test_app("#c", "me");
+        app.on_message(&msg(":srv 353 me = #c :@Alice +alicia ~&bob me carl!c@h"));
+        app.on_message(&msg(":dave!d@h JOIN #c"));
+        app.on_message(&msg(":al[ex]!a@h PRIVMSG #c :hi"));
+        app.on_message(&msg(":zed!z@h PRIVMSG #elsewhere :not here"));
+        assert!(complete(&mut app, "al"));
+        assert_eq!(app.input(), "Alice: ");
+        assert!(app.complete_nick());
+        assert_eq!(app.input(), "alicia: ");
+        assert!(app.complete_nick());
+        assert_eq!(app.input(), "al[ex]: ");
+        assert!(app.complete_nick());
+        assert_eq!(app.input(), "Alice: ", "the cycle wraps");
+        assert_eq!(app.input_cursor(), app.input().len());
+        // Under rfc1459, `AL{` is `al[`.
+        assert!(complete(&mut app, "AL{"));
+        assert_eq!(app.input(), "al[ex]: ");
+        // Mid-line, a completion is followed by a space, not a colon; the
+        // rest of the line stays where it was.
+        complete(&mut app, "ask DA now");
+        for _ in 0.." now".len() {
+            app.move_input_left();
+        }
+        assert!(app.complete_nick());
+        assert_eq!(app.input(), "ask dave  now");
+        // Nobody else, not this client itself, and nobody from another channel.
+        for word in ["zed", "me", "x", ""] {
+            assert!(!complete(&mut app, word), "{word}");
+            assert_eq!(app.input(), word);
+        }
+        // carl's userhost-in-names entry is carl.
+        assert!(complete(&mut app, "c"));
+        assert_eq!(app.input(), "carl: ");
+    }
+
+    #[test]
+    fn members_follow_parts_quits_kicks_and_nick_changes() {
+        let mut app = test_app("#c", "me");
+        app.on_message(&msg(":srv 353 me = #c :me ann ben cat dan"));
+        app.on_message(&msg(":ann!a@h PART #c"));
+        app.on_message(&msg(":ben!b@h QUIT :bye"));
+        app.on_message(&msg(":me!m@h KICK #c cat :out"));
+        app.on_message(&msg(":dan!d@h NICK eve"));
+        for gone in ["ann", "ben", "cat", "dan"] {
+            assert!(!complete(&mut app, gone), "{gone} is no longer here");
+        }
+        assert!(complete(&mut app, "ev"));
+        assert_eq!(app.input(), "eve: ");
+        // This client parting forgets everyone there.
+        app.on_message(&msg(":me!m@h PART #c"));
+        assert!(!complete(&mut app, "ev"));
+    }
+
+    /// In a query the person it is with completes before they say anything.
+    #[test]
+    fn tab_completes_the_person_a_query_is_with() {
+        let mut app = test_app("#c", "me");
+        assert!(matches!(
+            type_line(&mut app, "/msg Zoe hi"),
+            Action::Send(_)
+        ));
+        assert_eq!(app.current().name, "Zoe");
+        assert!(complete(&mut app, "z"));
+        assert_eq!(app.input(), "Zoe: ");
+    }
+
+    /// Every member name came from the server, so how many are kept is not the
+    /// server's decision; hitting the bound is said once.
+    #[test]
+    fn members_are_bounded_and_the_bound_is_said_once() {
+        let mut app = test_app("#c", "me");
+        let listed: Vec<String> = (0..MAX_MEMBERS + 10).map(|i| format!("n{i}")).collect();
+        for chunk in listed.chunks(100) {
+            app.on_message(&msg(&format!(":srv 353 me = #c :{}", chunk.join(" "))));
+        }
+        assert_eq!(app.current().members.len(), MAX_MEMBERS);
+        let said = app
+            .current()
+            .log
+            .iter()
+            .filter(|line| line.text.as_str().contains("nick completion offers only"))
+            .count();
+        assert_eq!(said, 1);
     }
 }

@@ -29,6 +29,7 @@ fuzz_target!(|data: &[u8]| {
             nick: "nick".to_string(),
             names: NetworkNames::default(),
             read_markers: true,
+            echo_message: false,
         },
     );
     for line in text.split('\n').take(256) {
