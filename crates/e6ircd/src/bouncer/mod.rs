@@ -20,9 +20,11 @@ use std::future::Future;
 use e6irc_proto::message::MiddleParam;
 
 mod account_lease;
+mod attach_link;
 pub use account_lease::{
     AccountLease, AccountRevocations, AccountRevoked, Revocation, RevocationTicket,
 };
+pub use attach_link::{AttachLink, AttachPort, ClientLines};
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -2026,38 +2028,9 @@ pub(crate) async fn bridge_ws_open(
     }
 }
 
-/// When an upstream must next show a sign of life.
-///
-/// A driver's session loop is a `select!` whose every turn abandons the read it
-/// was waiting on, so a timeout *started by the read* is restarted by whatever
-/// else ends a turn: a downstream command, a heartbeat tick. A silent upstream
-/// then looks alive for as long as anything else is happening. The deadline
-/// lives here instead, outside the loop's turns, and only [`Self::restart`]
-/// moves it.
-pub(crate) struct SilenceDeadline {
-    window: std::time::Duration,
-    at: tokio::time::Instant,
-}
-
-impl SilenceDeadline {
-    pub(crate) fn new(window: std::time::Duration) -> Self {
-        Self {
-            window,
-            at: tokio::time::Instant::now() + window,
-        }
-    }
-
-    /// The upstream was heard from (or was just asked to speak): a full window
-    /// starts now.
-    pub(crate) fn restart(&mut self) {
-        self.at = tokio::time::Instant::now() + self.window;
-    }
-
-    /// `read`'s output, or `None` once the whole window has passed in silence.
-    pub(crate) async fn bound<T>(&self, read: impl Future<Output = T>) -> Option<T> {
-        tokio::time::timeout_at(self.at, read).await.ok()
-    }
-}
+/// When an upstream, an attached client or a gateway must next show a sign
+/// of life; the edge's, since a `/ws/ui` socket's liveness is held there.
+pub(crate) use e6irc_edge::peer_write::SilenceDeadline;
 
 /// One frame's outcome from a bridge gateway socket, after the shared
 /// handling (idle timeout, ping/pong, non-text frames).
@@ -6564,27 +6537,21 @@ pub enum AttachEnd {
 /// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
 /// production).
 ///
-/// Every write to the client is bounded by [`crate::peer_write`]: a client
-/// that stops reading ends its attachment as [`AttachEnd::ClientTooSlow`]
-/// rather than parking the relay, where it would see neither the network's
-/// removal nor its own silence.
-pub async fn attach<S>(
-    stream: S,
+/// The client is reached through its session of the core link (`link`,
+/// [`AttachLink`]). Every write to it is bounded by the peer write deadline
+/// (`e6irc_edge::peer_write`): a client that stops reading ends its attachment
+/// as [`AttachEnd::ClientTooSlow`] rather than parking the relay, where it
+/// would see neither the network's removal nor its own silence.
+pub async fn attach(
+    link: AttachLink,
     input: ClientInput,
     handle: &NetworkHandle,
     caps: AttachCaps,
     authority: AccountLease,
     greeting: Greeting<'_>,
     liveness: std::time::Duration,
-) -> std::io::Result<AttachEnd>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let stream = e6irc_edge::peer_write::DeadlineWriter::new(
-        stream,
-        e6irc_edge::peer_write::PEER_WRITE_DEADLINE,
-    );
-    match relay_attached(stream, input, handle, caps, authority, greeting, liveness).await {
+) -> std::io::Result<AttachEnd> {
+    match relay_attached(link, input, handle, caps, authority, greeting, liveness).await {
         Err(error) if e6irc_edge::peer_write::is_stalled(&error) => Ok(AttachEnd::ClientTooSlow),
         ended => ended,
     }
@@ -6618,24 +6585,24 @@ fn attach_status_notice(runtime: &NetworkRuntimeSnapshot) -> String {
     }
 }
 
-/// [`attach`]'s relay, over a stream whose writes are already bounded.
-async fn relay_attached<S>(
-    stream: e6irc_edge::peer_write::DeadlineWriter<S>,
+/// [`attach`]'s relay, over a link whose writes are already bounded.
+async fn relay_attached(
+    link: AttachLink,
     input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
     mut authority: AccountLease,
     greeting: Greeting<'_>,
     liveness: std::time::Duration,
-) -> std::io::Result<AttachEnd>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+) -> std::io::Result<AttachEnd> {
+    use tokio::io::AsyncWriteExt;
 
     let account = authority.account().to_string();
     let account = account.as_str();
-    let (mut read, mut write) = tokio::io::split(stream);
+    let AttachLink {
+        lines: mut client_lines,
+        mut write,
+    } = link;
     // Revoked between the lease and here: the attachment never begins.
     if let Some(revocation) = authority.revocation() {
         return detach_revoked(&mut write, revocation).await;
@@ -6832,10 +6799,7 @@ where
         account,
         id: attach_id,
     };
-    let ClientInput {
-        mut framing,
-        pending,
-    } = input;
+    let ClientInput { pending } = input;
     for event in pending {
         if let Some(end) = client_event(
             &mut write,
@@ -6849,7 +6813,6 @@ where
             return Ok(end);
         }
     }
-    let mut read_buf = vec![0u8; 8192];
     let mut parsed = Vec::new();
     // Anything the client sends shows it is there; only its silence is timed,
     // and lines written *to* it prove nothing about a half-open socket.
@@ -6981,7 +6944,7 @@ where
                 }
             },
             // Client -> upstream.
-            n = client_silence.bound(read.read(&mut read_buf)) => match n {
+            n = client_silence.bound(client_lines.next_lines(&mut parsed)) => match n {
                 None if awaiting_pong => return Ok(AttachEnd::ClientUnresponsive),
                 None => {
                     awaiting_pong = true;
@@ -6989,11 +6952,10 @@ where
                     write.write_all(ATTACH_LIVENESS_PING).await?;
                     write.flush().await?;
                 }
-                Some(Ok(0)) => return Ok(AttachEnd::ClientClosed),
-                Some(Ok(n)) => {
+                Some(Ok(false)) => return Ok(AttachEnd::ClientClosed),
+                Some(Ok(true)) => {
                     awaiting_pong = false;
                     client_silence.restart();
-                    framing.feed(&read_buf[..n], &mut parsed);
                     for event in parsed.drain(..) {
                         if let Some(end) = client_event(&mut write, event, &attachment, &mut caps, &downstream_session).await? {
                             return Ok(end);
@@ -7006,26 +6968,15 @@ where
     }
 }
 
-/// What a client sent on its stream before [`attach`] took it that nothing
-/// has handled yet: the lines already framed, and the start of one still
-/// arriving. The attach listener's registration handshake frames the same
-/// stream first, and a client need not wait for the welcome before sending —
-/// the lines that arrived in the same read as its `CAP END`, and half of the
-/// next, belong to the attached session. A fresh stream has none.
+/// What a client sent before [`attach`] took it that nothing has handled
+/// yet: the lines the edge framed and handed over with those the registration
+/// handshake read. A client need not wait for the welcome before sending — the
+/// lines that arrived with its `CAP END` belong to the attached session; the
+/// rest of its input it has not handed over yet follows on its link. A fresh
+/// link has none.
+#[derive(Default)]
 pub struct ClientInput {
-    framing: e6irc_proto::framing::LineBuffer,
     pending: Vec<e6irc_proto::framing::LineEvent>,
-}
-
-impl Default for ClientInput {
-    fn default() -> Self {
-        Self {
-            framing: e6irc_proto::framing::LineBuffer::new(
-                e6irc_proto::message::MAX_CLIENT_FRAME_LEN,
-            ),
-            pending: Vec::new(),
-        }
-    }
 }
 
 /// Who an attachment is, for [`client_event`]: the network it is attached to,
@@ -8664,7 +8615,7 @@ mod tests {
         let attached = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             attach(
-                server_side,
+                attach_link::over_stream(server_side).await,
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
@@ -8716,7 +8667,7 @@ mod tests {
                 let handle = handle.clone();
                 async move {
                     attach(
-                        server_side,
+                        attach_link::over_stream(server_side).await,
                         ClientInput::default(),
                         &handle,
                         AttachCaps::default(),
@@ -8772,7 +8723,7 @@ mod tests {
             let handle = handle.clone();
             async move {
                 attach(
-                    server_side,
+                    attach_link::over_stream(server_side).await,
                     ClientInput::default(),
                     &handle,
                     AttachCaps::default(),
@@ -8822,7 +8773,7 @@ mod tests {
         let end = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             attach(
-                server_side,
+                attach_link::over_stream(server_side).await,
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
@@ -8859,7 +8810,7 @@ mod tests {
             .expect("lease");
         let (client_side, server_side) = tokio::io::duplex(4096);
         let attached = attach(
-            server_side,
+            attach_link::over_stream(server_side).await,
             ClientInput::default(),
             &handle,
             AttachCaps::default(),
@@ -8908,7 +8859,7 @@ mod tests {
         let (handle, ends) = NetworkHandle::channels(16);
         let (_client_side, server_side) = tokio::io::duplex(64);
         let attached = attach(
-            server_side,
+            attach_link::over_stream(server_side).await,
             ClientInput::default(),
             &handle,
             AttachCaps::default(),
@@ -10412,7 +10363,7 @@ mod tests {
         let (handle, mut ends) = NetworkHandle::bridge_channels(4);
         let attach = tokio::spawn(async move {
             attach(
-                server,
+                attach_link::over_stream(server).await,
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
@@ -10472,7 +10423,7 @@ mod tests {
         let (handle, _ends) = NetworkHandle::bridge_channels(4);
         let attach = tokio::spawn(async move {
             attach(
-                server,
+                attach_link::over_stream(server).await,
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
@@ -10531,7 +10482,7 @@ mod tests {
         }
         let attach = tokio::spawn(async move {
             attach(
-                server,
+                attach_link::over_stream(server).await,
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
@@ -10633,7 +10584,7 @@ mod tests {
         ends.begin_irc_session("alice".to_string());
         let attach = tokio::spawn(async move {
             attach(
-                server,
+                attach_link::over_stream(server).await,
                 ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
@@ -11072,7 +11023,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 20);
         let task = tokio::spawn(async move {
             attach(
-                server,
+                attach_link::over_stream(server).await,
                 ClientInput::default(),
                 &handle,
                 caps,

@@ -1534,10 +1534,8 @@ configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
 fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
-Status: phases 0, 1 and 2 done — phase 2 for every session that reaches a
-core shard, with bouncer attach and `/ws/ui` as link session kinds before the
-maintainer (the phase 2 entry says what needs deciding); phase 3 is the next
-to build; every other phase is scheduled in the order below.
+Status: phases 0, 1 and 2 done; phase 3 is the next to build; every other
+phase is scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
   tier's invariants), §19 (the design and its settled decisions), a §18
@@ -1578,12 +1576,17 @@ to build; every other phase is scheduled in the order below.
   its link; the `/ws/irc` connection loop is the edge's. The one visible
   change is the one DESIGN §2 prescribes: a client that stops reading is cut
   at `sendq_bytes` unwritten, not up to twice that. Bouncer attach and
-  `/ws/ui` are not link sessions: neither reaches a core shard nor has a send
-  queue today, so as session kinds each needs an output bound — the SendQ kill
-  the IRC kind has, or backpressure bounded by the write deadline as their
-  sockets give today — and `/ws/ui` needs frames for WebSocket messages, close
-  codes and Ping liveness that DESIGN §19.2 does not define. That choice is
-  the maintainer's.
+  `/ws/ui` are link session kinds (`Attach`, `Ui`) whose output keeps exactly
+  the backpressure their sockets gave — the core's end waits for room and
+  for what it wrote to be on the socket, bounded by the 30 s write deadline,
+  and never kills for "SendQ exceeded" — settled by the maintainer. The
+  attach listener accepts and serves through the edge's own loops over an
+  `AttachPort`, each session's lines on a per-session inbound queue that is
+  their credit; `/ws/ui`'s connection loop and its Ping liveness are the
+  edge's, with DESIGN §19.2 defining its frames: a text message as `Output`,
+  the client's messages as `Message`, and a close frame on `End`. The
+  `/ws/irc` and `/ws/ui` upgrade handlers stay in e6ircd until upgrade
+  authorization (phase 3).
 - **Phase 3 — process boundary.** The `e6irc-link` codec and its
   `link_frames` fuzz target; `e6ircd edge`; the mutual-TLS link and
   `e6ircd edge-credentials`; the epoch fence; `/readyz`-based discovery; HTTP

@@ -1041,15 +1041,16 @@ strip = "symbols"
   the batched accept, TLS termination and certificate reload, the client's
   canonical address and per-address slot, the read and write loops, the
   command-flood meter, the send-queue buffer, the closing drain and lingering
-  close, WebSocket framing and the `/ws/irc` connection loop — is the
-  `e6irc-edge` crate (§19.1); what a line means is the core's. A session
-  reaches the core only through the core link's frames: `CorePort` carries
-  what goes edge to core (open, framed lines, end), which e6ircd implements
-  over the core's ingress (`core::CoreIngress`), and each session's link
-  (`e6irc_edge::link`) carries its output, its end and its flood exemption to
-  the edge and the edge's reports of what it wrote back. The bouncer's
-  in-process `local` session opens through the same port and link as a socket
-  does.
+  close, WebSocket framing and the `/ws/irc` and `/ws/ui` connection loops,
+  and the attach listener's accept and serve loops — is the `e6irc-edge`
+  crate (§19.1); what a line means is the core's. A session reaches the core
+  only through the core link's frames: `CorePort` carries what goes edge to
+  core (open, framed lines, end), which e6ircd implements over the core's
+  ingress (`core::CoreIngress`) and, for bouncer attaches, over the attach
+  logic (`bouncer::AttachPort`), and each session's link (`e6irc_edge::link`)
+  carries its output, its end and its flood exemption to the edge and the
+  edge's reports of what it wrote back. The bouncer's in-process `local`
+  session opens through the same port and link as a socket does.
 - Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ): the buffer at
@@ -2629,7 +2630,8 @@ An account may hold 32 live chat sockets (`/ws/ui`, one per browser tab). The
 browser can read a close frame but not a refused upgrade — which the chat
 client shows once and does not retry by itself. A silent peer is sent a
 WebSocket Ping after `ATTACH_LIVENESS_INTERVAL` (120 s) and detached after a
-second silent interval, the same rule as an attached IRC client (§10.1).
+second silent interval, the same rule as an attached IRC client (§10.1); the
+edge that holds the socket keeps it (§19.1).
 A chat socket also ends with the credential that opened it. The browser
 session or personal access token is authorized once, at the upgrade, but the
 socket lives for hours, so it holds a lease on that credential and is closed
@@ -5732,9 +5734,8 @@ same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
 Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
-(the `e6irc-edge` crate) and phase 2 (the in-process link, for every session
-that reaches a core shard) have landed — "Phase 1 as built" and "Phase 2 as
-built" below — and phase 3 is next. Until a phase lands, the rest of this
+(the `e6irc-edge` crate) and phase 2 (the in-process link) have landed —
+"Phase 1 as built" and "Phase 2 as built" below — and phase 3 is next. Until a phase lands, the rest of this
 document describes the running system; §19.9 lists the sections each phase
 rewrites.
 
@@ -5810,10 +5811,11 @@ rewrites.
   report the end — which e6ircd implements over `CoreIngress` by pushing the
   very `Input` it pushed before, and counts through `TransportTelemetry`,
   which e6ircd's telemetry implements as the error kinds of the same name.
-- **Phase 2 as built.** Every session that reaches a core shard — IRC over
-  TCP, TLS and `/ws/irc`, and the bouncer's in-process `local` session —
-  reaches it only through the link's frames, carried in memory
-  (`e6irc_edge::link`):
+- **Phase 2 as built.** Every session reaches the core only through the
+  link's frames, carried in memory (`e6irc_edge::link`): those of the `Irc`
+  kind — IRC over TCP, TLS and `/ws/irc`, and the bouncer's in-process
+  `local` session — which reach a core shard, and the `Attach` and `Ui`
+  kinds, which reach the bouncer:
   - *Frames are calls.* `session` opens a session's link and gives its two
     ends. The core's end, `SessionLink`, sends `Output` (one line, admitted by
     the bound), `Kill` (the backlog the edge has not taken discarded, then one
@@ -5840,8 +5842,8 @@ rewrites.
     `e6irc_queue::Progress`, which keeps the count and the core's request
     to be woken in one atomic word, so an arm and an advance are always
     ordered and no wake is lost — loom verifies it, and found the
-    interleaving that lost one when they were two words. Coalescing reports (every 64 KiB or 50 ms)
-    is for the wire, and comes with it.
+    interleaving that lost one when they were two words. Coalescing reports
+    (every 64 KiB or 50 ms) is for the wire, and comes with it.
   - *Pacing is woken by `Drained`.* A paced reply's turn arms its session's
     wake as it reads its room, and the edge's next report wakes the shard's
     worker (a `Notify` per shard), which then takes its `PaceReplies` turn.
@@ -5860,17 +5862,46 @@ rewrites.
     connections behind one lock is gone.
   - *The `/ws/irc` connection loop* is the edge's
     (`e6irc_edge::websocket::serve_irc_socket`), as the TCP and TLS loops
-    are; its upgrade handler stays in e6ircd until upgrade authorization
-    (phase 3).
+    are.
+  - *`Closed` is typed* (`SessionClosed`: the client closed, a read failed, a
+    message was too big, a write failed or stalled, the writer panicked, a
+    `local` session stopped), and its text is the quit reason the core has
+    always shown; the attach logic reads the kind, never the text.
+  - *Bouncer attach is the `Attach` kind.* The attach listener accepts
+    through the edge's own accept loop and serves each connection with
+    `serve_conn`, TLS and framing and writes included, over an `AttachPort`
+    (`bouncer::attach_link`): `Open` hands the session to the attach logic,
+    each line goes to the session's own inbound queue — 8 KiB of lines, what
+    one read of its socket framed before, whose room is the line's credit —
+    and `Closed` ends its input with the reason. The attach logic reads lines
+    (`ClientLines`) and writes a byte stream (`link::LineWriter`) as it did its
+    socket; its sessions are not metered, as they were not.
+  - *`/ws/ui` is the `Ui` kind.* The upgrade handler stays in e6ircd until
+    upgrade authorization (phase 3) and then runs the two halves together:
+    `e6irc_edge::websocket::serve_ui_socket` holds the WebSocket, and the
+    core's `ws_ui_conn` reaches it through a `UiSocket`. The socket's
+    WebSocket Ping liveness moved to the edge with it (§19.2).
+  - *Attach and `/ws/ui` keep their backpressure exactly.* Neither had a send
+    queue: each wrote to its socket, waiting for the socket to take it, and a
+    client that stopped reading for the 30 s write deadline was given up on
+    (an attach as too slow). Their links are `link::waiting_session`s: the
+    core's end waits for room and never refuses a line for the bound, and a
+    write that waited for the socket — an attach flush, a `/ws/ui` frame —
+    waits until the edge reports everything written, so neither buffers more
+    ahead of its client than it did, and no "SendQ exceeded" is added. The
+    wait is bounded by the same deadline; the edge's writer failing ends it
+    as the socket write would have (`EdgeSession::writer_failed`), a stall as
+    a stall.
+  - *Two things an operator can see move with the transport.* A failed read
+    or write on an attach connection is now also counted as the `read` or
+    `write` error it is, as on every connection the edge holds, beside the
+    `bouncer` error the attachment ending counts; and an attach connection
+    closes lingering, as every connection the edge holds does, so its last
+    line is not reset away.
 
-  The attach listener's connections and `/ws/ui` sockets are not link
-  sessions: neither reaches a core shard or has a send queue — each writes to
-  its socket directly, bounded only by the write deadline — so as link session
-  kinds they need a bound of their own and, for `/ws/ui`, frames that carry
-  WebSocket messages and close codes, which §19.2 does not define. Which bound
-  and which frames is put to the maintainer (`PLAN.md`, phase 2). Still in
-  e6ircd: the upgrade handlers, and X-Forwarded-For resolution
-  (`http::oidc::client_ip`) with HTTP admission (phase 3, HTTP proxying).
+  Still in e6ircd: the `/ws/irc` and `/ws/ui` upgrade handlers, and
+  X-Forwarded-For resolution (`http::oidc::client_ip`) with HTTP admission
+  (phase 3, HTTP proxying and upgrade authorization).
 
 ### 19.2 The core link
 
@@ -5890,6 +5921,19 @@ rewrites.
   `Attach` (bouncer attach logic), `Ui` (`ws_ui_conn`), `Upstream` (an
   edge-held outbound IRC socket, §19.4) and `Local` (the socketless home of a
   `local` driver session, D13).
+- **Frames by kind.** `Irc` and `Attach` carry IRC lines both ways. A `Ui`
+  session carries WebSocket messages: its `Output` is one text message, the
+  client's messages reach the core as `Message` frames (a text message, or
+  the fact of a binary one, which the core refuses by kind), and its `End`
+  may carry a close frame (a code and a reason the client can show), which
+  the edge sends once what is buffered is written. A `Ui` session's
+  WebSocket Ping liveness is the edge's: after one interval without a frame
+  the client is sent a Ping, and after a second it is given up on (`Closed`);
+  the interval travels with `Open`. `Attach` and `Ui` output is
+  backpressured, not killed: the core's end waits for room, bounded by the
+  write deadline, as their sockets were written. Their lines and messages
+  run on a credit of their own session's inbound queue, since they reach the
+  bouncer, not a shard.
 - **Connection identifiers.** A session's `ConnId` is `edge slot (16 bits) |
   counter (48 bits)`. The core assigns the slot when an edge first registers
   and records it in the roster (§19.3); each edge seeds its counter randomly

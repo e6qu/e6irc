@@ -1063,9 +1063,10 @@ impl e6irc_edge::connection::CorePort for CoreIngress {
             .is_ok()
     }
 
-    async fn closed(&self, conn: ConnId, reason: String) {
+    async fn closed(&self, conn: ConnId, reason: e6irc_edge::connection::SessionClosed) {
         // Queue closure means the core has already removed all connection
         // state.
+        let reason = reason.to_string();
         drop(self.push(Input::Closed { conn, reason }).await);
     }
 }
