@@ -1635,12 +1635,31 @@ impl EchoKey {
             && sent.text.starts_with(&self.text)
             && head + sent.text.len() + 2 > e6irc_proto::message::MAX_LINE_LEN
     }
+
+    /// Whether this echo is `sent` with some or all of its formatting taken
+    /// out: a channel that strips colours (Solanum's and InspIRCd's `+c`/`+S`,
+    /// UnrealIRCd's `+S`) delivers, and echoes, the text without them.
+    fn is_stripped_form_of(&self, sent: &Self) -> bool {
+        self.command == sent.command
+            && self.target == sent.target
+            && self.text != sent.text
+            && e6irc_client::strip_formatting(&self.text)
+                == e6irc_client::strip_formatting(&sent.text)
+    }
 }
 
 /// Most lines awaiting their upstream echo. A line the upstream refuses is
 /// never echoed, so its entry would wait forever; the oldest is dropped past
 /// this bound, costing at most the routing of one late echo.
 const MAX_PENDING_ECHOES: usize = 256;
+
+/// How long a line waits for its upstream echo: as long as a command waits for
+/// its replies ([`super::replies::PENDING_REPLY_WINDOW`]). An upstream echoes
+/// within its round trip; a line still waiting past this was refused (a 404, a
+/// 486), and is never echoed. It used to wait until 256 later lines pushed it
+/// out, and an upstream that withdrew `echo-message` meanwhile had every
+/// refused line of the session echoed then, as if it had been delivered.
+const PENDING_ECHO_WINDOW: std::time::Duration = super::replies::PENDING_REPLY_WINDOW;
 
 /// One target's delivery of a message written upstream, awaiting its echo.
 struct PendingEcho {
@@ -1651,6 +1670,8 @@ struct PendingEcho {
     /// is for, so the echo can be made here if the upstream stops echoing.
     line: std::sync::Arc<str>,
     target: String,
+    /// When it was written upstream.
+    sent_at: std::time::Instant,
 }
 
 /// The messages written upstream whose echo has not arrived yet, oldest
@@ -1661,15 +1682,33 @@ struct PendingEchoes(std::collections::VecDeque<PendingEcho>);
 
 impl PendingEchoes {
     fn push(&mut self, pending: PendingEcho) {
+        self.forget_expired(pending.sent_at);
         if self.0.len() == MAX_PENDING_ECHOES {
             self.0.pop_front();
         }
         self.0.push_back(pending);
     }
 
+    /// Stop waiting for what has waited past [`PENDING_ECHO_WINDOW`] at `now`:
+    /// the upstream refused it. Oldest first, so the expired lead.
+    fn forget_expired(&mut self, now: std::time::Instant) {
+        while self
+            .0
+            .front()
+            .is_some_and(|oldest| now.duration_since(oldest.sent_at) > PENDING_ECHO_WINDOW)
+        {
+            self.0.pop_front();
+        }
+    }
+
     /// The attachment that sent the line `echo` echoes, when one is waiting:
-    /// the same text, or failing that the text the upstream had to cut.
+    /// the same text, or failing that the text the upstream had to cut, or
+    /// the text with the formatting the channel strips taken out. Unmatched,
+    /// the echo reached every client as someone's new message — the sender
+    /// saw its own line twice — and the line waited for an echo that had
+    /// come.
     fn take(&mut self, echo: &EchoKey, head: usize) -> Option<u64> {
+        self.forget_expired(std::time::Instant::now());
         let position = self
             .0
             .iter()
@@ -1678,6 +1717,11 @@ impl PendingEchoes {
                 self.0
                     .iter()
                     .position(|pending| echo.is_truncation_of(&pending.key, head))
+            })
+            .or_else(|| {
+                self.0
+                    .iter()
+                    .position(|pending| echo.is_stripped_form_of(&pending.key))
             })?;
         self.0.remove(position).map(|pending| pending.origin)
     }
@@ -1696,12 +1740,14 @@ impl UpstreamEchoes {
     /// target it names.
     pub(super) fn sent(&mut self, line: &str, origin: u64, names: &NetworkNames) {
         let shared: std::sync::Arc<str> = line.into();
+        let sent_at = std::time::Instant::now();
         for (key, target) in EchoKey::of_client_line(line, names) {
             self.0.push(PendingEcho {
                 key,
                 origin,
                 line: shared.clone(),
                 target: target.to_string(),
+                sent_at,
             });
         }
     }
@@ -1709,8 +1755,10 @@ impl UpstreamEchoes {
     /// The upstream will not echo what is still waiting — it withdrew
     /// `echo-message`, or refused the request for it — so each waiting
     /// delivery is echoed here, as `identity`, once, with the attachment that
-    /// sent it.
+    /// sent it. What waited past [`PENDING_ECHO_WINDOW`] was refused, and is
+    /// not echoed.
     pub(super) fn synthesize_waiting(&mut self, identity: &SelfIdentity) -> Vec<(String, u64)> {
+        self.0.forget_expired(std::time::Instant::now());
         self.0
             .0
             .drain(..)
@@ -2122,6 +2170,60 @@ pub(super) mod tests {
         let (key, head) =
             EchoKey::of_upstream_echo(&owned(&cut), "alice", &names).expect("our echo");
         assert_eq!(pending.take(&key, head), Some(7));
+    }
+
+    /// A channel that strips colours echoes the text without them: that echo
+    /// is still the echo of the line sent, and a different text is not.
+    #[test]
+    fn an_echo_the_channel_stripped_of_colour_is_still_the_lines_echo() {
+        let names = NetworkNames::default();
+        let mut echoes = UpstreamEchoes::default();
+        echoes.sent(
+            "PRIVMSG #room :\u{3}4red\u{3} and \u{2}bold\u{2}",
+            7,
+            &names,
+        );
+        echoes.sent("PRIVMSG #room :\u{3}4other", 8, &names);
+        let pending = &mut echoes.0;
+        let unrelated = ":alice!~alice@host PRIVMSG #room :red and bold!";
+        let (key, head) =
+            EchoKey::of_upstream_echo(&owned(unrelated), "alice", &names).expect("our echo");
+        assert_eq!(pending.take(&key, head), None);
+        for (stripped, origin) in [
+            (
+                ":alice!~alice@host PRIVMSG #room :red and \u{2}bold\u{2}",
+                7,
+            ),
+            (":alice!~alice@host PRIVMSG #room :other", 8),
+        ] {
+            let (key, head) =
+                EchoKey::of_upstream_echo(&owned(stripped), "alice", &names).expect("our echo");
+            assert_eq!(pending.take(&key, head), Some(origin), "{stripped}");
+        }
+    }
+
+    /// A line whose echo has not come within the window was refused: when
+    /// the upstream stops echoing, it is not echoed as if delivered, while a
+    /// line still within the window is.
+    #[test]
+    fn a_line_refused_long_ago_is_not_echoed_when_echoes_stop() {
+        let names = NetworkNames::default();
+        let mut echoes = UpstreamEchoes::default();
+        echoes.sent("PRIVMSG #banned :refused", 7, &names);
+        let long_ago = std::time::Instant::now()
+            .checked_sub(PENDING_ECHO_WINDOW + Duration::from_secs(1))
+            .expect("the clock reaches back a minute");
+        for pending in &mut echoes.0.0 {
+            pending.sent_at = long_ago;
+        }
+        echoes.sent("PRIVMSG #room :recent", 8, &names);
+        let echoed = echoes.synthesize_waiting(&alice());
+        assert_eq!(echoed.len(), 1, "{echoed:?}");
+        assert!(
+            echoed[0].0.ends_with(" PRIVMSG #room :recent"),
+            "{echoed:?}"
+        );
+        assert_eq!(echoed[0].1, 8);
     }
 
     /// A keyed channel is rejoined with its key, from the client's JOIN and

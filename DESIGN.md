@@ -3129,10 +3129,14 @@ above the trait, provides for every network kind:
   alone, so a client that waits for its echo (as `e6irc send` does) learns the
   truth; the echo is routed to the attachment that sent the line by its label,
   or by matching command, one target and text against the lines awaiting one
-  (at most 256; a refused line's entry ages out). A message to several targets
+  (at most 256; a refused line's entry ages out after the 60 s a command waits
+  for its replies, so a later `CAP DEL echo-message` never echoes a line the
+  upstream refused as if it had been delivered). A message to several targets
   waits for, and is echoed as, one line per target — it is never filed as a
   conversation named `#a,#b` — and an echo whose text the upstream cut to fit
-  its line with our prefix still matches the line it came from. An upstream
+  its line with our prefix, or stripped of formatting (a channel's `+c`/`+S`),
+  still matches the line it came from; unmatched, it reached every client as a
+  new message and the sender saw its own line twice. An upstream
   without `echo-message` gets the echo synthesized, per target, when the line
   is written; the driver follows the upstream's `CAP DEL echo-message` (and
   asks for what a `CAP NEW` offers) mid-session, and a change of it never
