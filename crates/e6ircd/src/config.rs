@@ -664,8 +664,9 @@ impl SaslRequirement {
 /// Solanum's defaults: a 40-command burst refilling at 20 per second.
 pub const DEFAULT_COMMAND_BURST: usize = 40;
 pub const DEFAULT_COMMAND_RATE: usize = 20;
-/// Upper bound on both flood knobs; the console offers the same range.
-pub const MAX_COMMAND_FLOOD_TOKENS: usize = 10_000;
+/// Upper bound on both flood knobs; the console offers the same range. The
+/// edge's meter holds it (`e6irc_edge::meter`), where a bucket is built.
+pub use e6irc_edge::meter::MAX_COMMAND_FLOOD_TOKENS;
 
 /// Solanum's reference configuration and Libera run
 /// `anti_spam_exit_message_time` at five minutes.

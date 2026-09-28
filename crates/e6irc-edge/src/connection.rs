@@ -3,10 +3,11 @@
 //! through a [`CorePort`].
 //!
 //! Data flow per connection:
-//!   socket reads → LineBuffer → `CorePort::push_framed` into the core
-//!     (await = backpressure: a full core stops socket reads)
-//!   core → per-connection SendQ → writer half → socket
-//!     (SendQ overflow = core dooms the connection)
+//!   socket reads → LineBuffer → the session's meter → `CorePort::push` into
+//!     the core (await = the credit: a full core stops socket reads)
+//!   core → the session's link (`crate::link`) → send-queue buffer → writer
+//!     half → socket → `Drained` back to the core's account of the bound
+//!     (a line past the bound = the core dooms the connection)
 
 use std::future::Future;
 use std::io;
@@ -17,12 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use e6irc_proto::framing::{LineBuffer, LineEvent};
-use e6irc_queue::Receiver;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::address::{ClientIp, ConnLimiter, PeerRefusal, PeerRefusalLog};
+use crate::link::EdgeSession;
+use crate::meter::{CommandFlood, LineMeter};
 
 /// Traditional 512-byte line minus CRLF, plus the 4096-byte client tag
 /// allowance (message-tags spec); the body-only limit is enforced in
@@ -215,7 +217,7 @@ impl ConnectionTransport {
 }
 
 /// One wire line out to a connection I/O task, CRLF included. Socket
-/// close is signaled by dropping the session's queue Sender, never by
+/// close is signaled by the session's link ending ([`crate::link`]), never by
 /// an in-band event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output(pub Bytes);
@@ -239,43 +241,60 @@ pub trait TransportTelemetry: Send + Sync + 'static {
     fn record_connection_rejected(&self);
 }
 
-/// The core as a connection's tasks reach it: where a session is opened, where
-/// its framed lines go, and where its end is reported. This crate names no
-/// core type; in the single process e6ircd implements it over the core's own
-/// ingress, and edge tier phase 2 puts the in-process link's frames behind it
-/// (DESIGN §19.1).
+/// The core as a session's edge tasks reach it: the edge-to-core frames of
+/// the core link (DESIGN §19.2) — `Open`, `Line` and `OverlongLine`,
+/// `Closed` — and the terms the edge follows. The core-to-edge frames and
+/// `Drained` travel on each session's own link ([`crate::link`]). This crate
+/// names no core type; in the single process e6ircd implements it over the
+/// core's own ingress.
 pub trait CorePort: Clone + Send + Sync + 'static {
-    /// One session's command allowance, spent as each of its lines is handed
-    /// over (DESIGN §7.2).
-    type Meter: Send + 'static;
-
-    /// Open `conn`'s session, with a send queue of `sendq_bytes`: the
-    /// receiver its writer drains, or `None` when the core is gone. The core
-    /// ends the session by dropping the queue's sending end.
+    /// Open `conn`'s session (the `Open` frame), with a send-queue bound of
+    /// `sendq_bytes`: the edge's end of its link, or `None` when the core is
+    /// gone.
     fn open(
         &self,
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
         sendq_bytes: usize,
-    ) -> impl Future<Output = Option<Receiver<Output>>> + Send;
+    ) -> impl Future<Output = Option<EdgeSession>> + Send;
 
-    /// `conn`'s allowance, full.
-    fn line_meter(&self, conn: ConnId) -> Self::Meter;
+    /// The shape every session's command allowance has (DESIGN §7.2), or
+    /// `None` for a core that meters nothing.
+    fn command_flood(&self) -> Option<CommandFlood>;
 
-    /// Hand every framed event in `events` to the core, spending `meter` for
-    /// each; `false` when the core is gone, so the connection stops rather
-    /// than queueing into a void.
-    fn push_framed(
-        &self,
-        meter: &mut Self::Meter,
-        conn: ConnId,
-        events: &mut Vec<LineEvent>,
-    ) -> impl Future<Output = bool> + Send;
+    /// Hand one framed event of `conn`'s to the core (a `Line`, or an
+    /// `OverlongLine`), once the core has room for it: that room is the
+    /// credit a line waits for (DESIGN §19.2), granted first come first
+    /// served, so a session out of room waits in line behind the sessions
+    /// that asked before it, and a noisy one cannot starve the rest. `false`
+    /// when the core is gone, so the connection stops rather than queueing
+    /// into a void.
+    fn push(&self, conn: ConnId, event: LineEvent) -> impl Future<Output = bool> + Send;
 
-    /// Tell the core `conn` ended, and why. For a session the core already
-    /// ended this is a no-op, and a core that is gone needs no telling.
+    /// Tell the core `conn` ended, and why (the `Closed` frame). For a session
+    /// the core already ended this is a no-op, and a core that is gone needs
+    /// no telling.
     fn closed(&self, conn: ConnId, reason: String) -> impl Future<Output = ()> + Send;
+}
+
+/// Hand every framed event in `events` to the core through `core`, spending
+/// `meter` for each first: a session past its allowance waits here, in its
+/// own socket buffers, before its line reaches the core. `false` when the
+/// core is gone.
+pub async fn hand_over<C: CorePort>(
+    core: &C,
+    meter: &mut LineMeter,
+    conn: ConnId,
+    events: &mut Vec<LineEvent>,
+) -> bool {
+    for event in events.drain(..) {
+        meter.spend().await;
+        if !core.push(conn, event).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// Bind a listening socket as `tokio::net::TcpListener::bind` does (address
@@ -470,7 +489,7 @@ pub async fn serve_conn<S, C: CorePort>(
         task: _task,
     } = accepted;
     let (mut read_half, write_half) = tokio::io::split(stream);
-    let Some(out_rx) = core_tx
+    let Some(edge) = core_tx
         .open(
             conn,
             // The canonical IPv4 spelling of a mapped peer (`ClientIp`): the
@@ -483,17 +502,18 @@ pub async fn serve_conn<S, C: CorePort>(
     else {
         return; // core gone: shutting down
     };
-    // The core ends the session by dropping its end of the send queue.
-    let session_over = out_rx.senders_gone();
+    // The core ends the session by ending its link (`End` or `Kill`).
+    let session_over = edge.session_over();
+    let meter = edge.line_meter(core_tx.command_flood());
     let write_half = crate::peer_write::DeadlineWriter::new(write_half, outbound.write_deadline);
-    let mut writer = tokio::spawn(write_loop(write_half, out_rx, telemetry.clone()));
+    let mut writer = tokio::spawn(write_loop(write_half, edge, telemetry.clone()));
     let written_first = tokio::select! {
         // The client closed its sending side (or errored), or the core queue is
         // gone. `read_loop` has told the core, which answers what the client
         // sent before closing — a pipelined `NICK`/`USER`/`QUIT` from a
         // half-closing client is owed its welcome and its `ERROR` — and then
         // ends the session.
-        () = read_loop(&mut read_half, conn, &core_tx, &*telemetry) => None,
+        () = read_loop(&mut read_half, conn, &core_tx, meter, &*telemetry) => None,
         // The core ended the session (QUIT, KILL, SendQ, shutdown). Nothing the
         // client sends is wanted any more, so reading stops here, and no line
         // is pushed for a connection the core has forgotten.
@@ -532,12 +552,14 @@ pub async fn serve_conn<S, C: CorePort>(
     core_tx.closed(conn, reason.to_string()).await;
 }
 
-/// Frame `read_half` into lines and hand them to the core, metered, until the
-/// client closes or fails; then tell the core the session ended.
+/// Frame `read_half` into lines and hand them to the core, metered by
+/// `meter`, until the client closes or fails; then tell the core the session
+/// ended.
 pub async fn read_loop<R, C: CorePort>(
     mut read_half: R,
     conn: ConnId,
     core_tx: &C,
+    mut meter: LineMeter,
     telemetry: &dyn TransportTelemetry,
 ) where
     R: AsyncRead + Unpin,
@@ -545,7 +567,6 @@ pub async fn read_loop<R, C: CorePort>(
     let mut framing = LineBuffer::new(LINE_LIMIT);
     let mut buf = [0u8; READ_BUF];
     let mut events = Vec::new();
-    let mut meter = core_tx.line_meter(conn);
     let reason = loop {
         match read_half.read(&mut buf).await {
             Ok(0) => break "Connection closed".to_string(),
@@ -553,7 +574,7 @@ pub async fn read_loop<R, C: CorePort>(
                 framing.feed(&buf[..n], &mut events);
                 // Nothing more is read until these lines are through the
                 // meter: a client past its allowance waits in its own socket.
-                if !core_tx.push_framed(&mut meter, conn, &mut events).await {
+                if !hand_over(core_tx, &mut meter, conn, &mut events).await {
                     return; // core gone
                 }
             }
@@ -577,12 +598,14 @@ enum WriterEnd<W> {
     Failed(&'static str),
 }
 
-/// Drain the sendq to the socket until the core ends the session (its sender
-/// dropped) or a write fails, distinguishing the two so neither is conflated
-/// nor silently skipped.
+/// Drain the session's send-queue buffer to the socket until the core ends
+/// the session (its link ended) or a write fails, distinguishing the two so
+/// neither is conflated nor silently skipped. Each batch, once written and
+/// flushed, is reported to the core (`Drained`), which counts it against the
+/// bound until then.
 async fn write_loop<W>(
     mut write_half: W,
-    mut rx: Receiver<Output>,
+    mut edge: EdgeSession,
     telemetry: Arc<dyn TransportTelemetry>,
 ) -> WriterEnd<W>
 where
@@ -590,7 +613,7 @@ where
 {
     let mut batch = Vec::new();
     loop {
-        let Some(envelope) = rx.pop().await else {
+        let Some(envelope) = edge.take().await else {
             return WriterEnd::Drained(write_half);
         };
         // Drain everything currently queued and present the shared Bytes as
@@ -598,13 +621,16 @@ where
         // once; concatenating here copied every recipient's wire bytes again.
         batch.clear();
         batch.push(envelope.payload.0);
-        while let Some(e) = rx.try_pop() {
+        while let Some(e) = edge.try_take() {
             batch.push(e.payload.0);
         }
         let written = match write_all_vectored(&mut write_half, &batch).await {
             Ok(()) => write_half.flush().await,
             Err(error) => Err(error),
         };
+        if written.is_ok() {
+            edge.written(batch.iter().map(Bytes::len).sum());
+        }
         if let Err(error) = written {
             telemetry.record_error(TransportError::Write);
             // A broken pipe / RST, or a peer that stopped reading while output
@@ -673,7 +699,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use e6irc_queue::{Policy, queue};
     use std::pin::Pin;
 
     /// Counts nothing: what these tests check is how a writer ends.
@@ -781,19 +806,45 @@ mod tests {
 
     #[tokio::test]
     async fn flush_failure_is_a_connection_write_error() {
-        let (tx, rx) = queue(e6irc_queue::Config {
-            name: "t-sendq",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        tx.push(Output(bytes::Bytes::from_static(b"NOTICE * :hello\r\n")))
-            .await
+        let (mut core, edge) = crate::link::session("t-sendq", 1);
+        core.output(Output(bytes::Bytes::from_static(b"NOTICE * :hello\r\n")))
             .expect("test output");
 
         assert!(matches!(
-            write_loop(FlushFails, rx, Arc::new(Uncounted)).await,
+            write_loop(FlushFails, edge, Arc::new(Uncounted)).await,
             WriterEnd::Failed("Write error")
         ));
+        assert_eq!(
+            core.in_flight(),
+            17,
+            "a line that was not written still counts"
+        );
+    }
+
+    /// What a writer writes counts against the bound until it is flushed,
+    /// and not after: the writer reports each batch written once it is.
+    #[tokio::test]
+    async fn a_written_batch_is_reported_drained_once_flushed() {
+        let (mut core, edge) = crate::link::session("t-sendq", 1024);
+        let line = bytes::Bytes::from_static(b"NOTICE * :hello\r\n");
+        for _ in 0..3 {
+            core.output(Output(line.clone())).expect("room");
+        }
+        assert_eq!(core.in_flight(), 3 * line.len());
+        let sink = PartialVectoredSink {
+            maximum_per_write: 5,
+            ..PartialVectoredSink::default()
+        };
+        let writer = tokio::spawn(write_loop(sink, edge, Arc::new(Uncounted)));
+        while core.in_flight() > 0 {
+            tokio::task::yield_now().await;
+        }
+        // Everything was written and reported; ending the link ends the writer.
+        drop(core);
+        match writer.await.expect("writer task") {
+            WriterEnd::Drained(sink) => assert_eq!(sink.bytes.len(), 3 * line.len()),
+            WriterEnd::Failed(reason) => panic!("{reason}"),
+        }
     }
 
     /// Counts the TLS handshakes it is told failed.

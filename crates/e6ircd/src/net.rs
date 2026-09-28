@@ -2136,13 +2136,13 @@ mod tests {
             },
             Arc::new(Telemetry::new()),
         ));
-        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+        let Input::Open { mut tx, .. } = core_rx.pop().await.expect("Open event").payload else {
             panic!("expected Open");
         };
         // Far more than both kernel buffers hold: the writer parks mid-write.
         let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
         for _ in 0..4096 {
-            if tx.0.try_push(Output(line.clone())).is_err() {
+            if tx.0.output(Output(line.clone())).is_err() {
                 break;
             }
         }
@@ -2548,7 +2548,7 @@ mod tests {
             Outbound::with_sendq(64 * 512),
             Arc::new(Telemetry::new()),
         ));
-        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+        let Input::Open { mut tx, .. } = core_rx.pop().await.expect("Open event").payload else {
             panic!("expected Open");
         };
         let (mut client_read, mut client_write) = client.into_split();
@@ -2562,7 +2562,7 @@ mod tests {
             drop(client_write.shutdown().await);
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        tx.0.try_push(Output(bytes::Bytes::from_static(
+        tx.0.output(Output(bytes::Bytes::from_static(
             b"ERROR :Closing Link: 127.0.0.1 (Killed)\r\n",
         )))
         .expect("room");
@@ -2615,7 +2615,7 @@ mod tests {
             },
             Arc::new(Telemetry::new()),
         ));
-        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+        let Input::Open { mut tx, .. } = core_rx.pop().await.expect("Open event").payload else {
             panic!("expected Open");
         };
         tokio::spawn(trickle(client_read));
@@ -2627,7 +2627,7 @@ mod tests {
         });
         let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
         for _ in 0..100 {
-            tx.0.try_push(Output(line.clone())).expect("room");
+            tx.0.output(Output(line.clone())).expect("room");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(tx);
@@ -2728,6 +2728,82 @@ mod tests {
         );
     }
 
+    /// The credit a line waits for is room in the core's queue, granted first
+    /// come first served (DESIGN §19.2): a session streaming lines into a
+    /// full core waits in line like any other, so a quiet session's one line
+    /// is taken after at most the noisy session's line that was already
+    /// waiting — one session cannot starve the rest.
+    #[tokio::test]
+    async fn a_noisy_session_cannot_starve_a_quiet_one_of_credit() {
+        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-credit",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::single(core_tx);
+        let telemetry = Arc::new(Telemetry::new());
+        let unmetered = || {
+            e6irc_edge::meter::LineMeter::new(
+                None,
+                e6irc_edge::meter::FloodExemption::default(),
+                tokio::time::Instant::now(),
+            )
+        };
+        let (mut noisy_client, noisy_server) = tokio::io::duplex(1024 * 1024);
+        noisy_client
+            .write_all("PING :noise\r\n".repeat(1000).as_bytes())
+            .await
+            .expect("write");
+        let noisy = {
+            let (ingress, telemetry) = (ingress.clone(), telemetry.clone());
+            let meter = unmetered();
+            tokio::spawn(async move {
+                read_loop(noisy_server, ConnId(1), &ingress, meter, &*telemetry).await;
+            })
+        };
+        // The noisy session has filled the queue and waits for room.
+        while core_rx.depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (mut quiet_client, quiet_server) = tokio::io::duplex(1024);
+        quiet_client
+            .write_all(b"PING :quiet\r\n")
+            .await
+            .expect("write");
+        let quiet = {
+            let (ingress, telemetry) = (ingress.clone(), telemetry.clone());
+            let meter = unmetered();
+            tokio::spawn(async move {
+                read_loop(quiet_server, ConnId(2), &ingress, meter, &*telemetry).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut before_quiet = 0;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), core_rx.pop())
+                .await
+                .expect("an event")
+                .expect("ingress open");
+            match event.payload {
+                Input::Line {
+                    conn: ConnId(2), ..
+                } => break,
+                Input::Line {
+                    conn: ConnId(1), ..
+                } => before_quiet += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            before_quiet <= 2,
+            "{before_quiet} noisy lines were admitted ahead of the quiet one"
+        );
+        noisy.abort();
+        quiet.abort();
+        drop((noisy_client, quiet_client));
+    }
+
     /// A client streaming lines — PONGs, before it has even registered — gets
     /// no more of them into the core's queue than its command allowance: past
     /// its bucket its reader stops reading the socket until a token is back,
@@ -2747,7 +2823,12 @@ mod tests {
             .await
             .expect("write");
         let telemetry = Telemetry::new();
-        let reader = read_loop(server, ConnId(1), &ingress, &telemetry);
+        let meter = e6irc_edge::meter::LineMeter::new(
+            e6irc_edge::connection::CorePort::command_flood(&ingress),
+            e6irc_edge::meter::FloodExemption::default(),
+            tokio::time::Instant::now(),
+        );
+        let reader = read_loop(server, ConnId(1), &ingress, meter, &telemetry);
         tokio::pin!(reader);
         let queued = |rx: &mut Receiver<Input>| {
             std::iter::from_fn(|| rx.try_pop())
