@@ -6044,11 +6044,14 @@ phase rewrites.
   - *HTTP serving moved to the edge crate* (`e6irc_edge::http`): the
     connection-capped accept, the header timeout and the write deadline,
     which the core's own `[http]` and WebSocket IRC listeners, a standby's
-    health listener and the edge's web port all serve through. The core
-    still resolves X-Forwarded-For (`http::oidc::client_ip`) for requests
-    the edge forwards, from the client address the link conveys, and keeps
-    its per-address request admission, because both judge requests it
-    serves.
+    health listener and the edge's web port all serve through. The
+    X-Forwarded-For resolver moved with it, to `e6irc_edge::address`
+    (`client_ip`, `forwarded_https`), beside the rest of client-address
+    resolution. The core calls it for every request it serves — for one an
+    edge forwards, from the client address the link conveys — and keeps its
+    per-address request admission and the refusal of an unusable
+    forwarded entry (`http::oidc::resolve_client_ip`), because both answer
+    requests it serves.
   - *The PROXY protocol, version 2* (`e6irc_edge::proxy_protocol`) is read on
     any edge listener with `proxy_protocol = true` — IRC, WebSocket IRC,
     the web port, attach — exactly (never a byte of the client's own stream

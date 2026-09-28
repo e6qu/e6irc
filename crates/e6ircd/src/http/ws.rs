@@ -74,11 +74,12 @@ pub(super) async fn ws_irc(
     };
     // Umode +Z: this listener never terminates TLS, so a connection is secure
     // only when a trusted proxy says its client reached it over HTTPS.
-    let transport = if super::oidc::forwarded_https(peer.ip(), &headers, &state.trusted_proxies) {
-        crate::core::ConnectionTransport::SecureWebSocket
-    } else {
-        crate::core::ConnectionTransport::WebSocket
-    };
+    let transport =
+        if e6irc_edge::address::forwarded_https(peer.ip(), &headers, &state.trusted_proxies) {
+            crate::core::ConnectionTransport::SecureWebSocket
+        } else {
+            crate::core::ConnectionTransport::WebSocket
+        };
     let Some(guard) = state.conn_limiter.try_acquire(ip) else {
         state.telemetry.record_connection_rejected();
         // A slot frees only when a connection closes, which nothing here can
