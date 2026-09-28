@@ -4652,6 +4652,11 @@ pub(crate) fn without_tag(line: &str, key: &str) -> String {
     }
 }
 
+/// Numerics that say whether a watched nick is online (`MONITOR`'s 730 and
+/// 731, `WATCH`'s 600, 601, 604 and 605): presence as it is when they are
+/// said.
+const PRESENCE_NUMERICS: &[u16] = &[600, 601, 604, 605, 730, 731];
+
 /// Whether a line published to a network is told live only: to whoever is
 /// attached now, at the ring's position, and never retained in the ring, the
 /// stored backlog or CHATHISTORY. The one rule every way into and out of the
@@ -4670,6 +4675,8 @@ pub(crate) fn without_tag(line: &str, key: &str) -> String {
 ///   the member lists that follow every rejoin after a reconnect — hundreds of
 ///   lines on a heavy user's channels — evicted the conversation the backlog
 ///   exists to keep, and a replay showed a member list long out of date.
+/// - A watched nick's presence ([`PRESENCE_NUMERICS`]): replayed, a client
+///   was told a nick that left hours ago is online.
 pub(crate) fn told_live_only(line: &str) -> bool {
     let Ok(message) = e6irc_proto::message::Message::parse(line) else {
         return false;
@@ -4682,9 +4689,9 @@ pub(crate) fn told_live_only(line: &str) -> bool {
             .is_some_and(|text| crate::sanitize::is_ctcp_request(text)),
         command => {
             command.len() == 3
-                && command
-                    .parse::<u16>()
-                    .is_ok_and(|code| replies::JOIN_BURST.contains(&code))
+                && command.parse::<u16>().is_ok_and(|code| {
+                    replies::JOIN_BURST.contains(&code) || PRESENCE_NUMERICS.contains(&code)
+                })
         }
     }
 }
@@ -8638,6 +8645,20 @@ mod tests {
             .names_from_session("NAMES #room")
             .expect("the session follows the member list");
         assert!(answer[0].ends_with("353 me = #room :me @op"), "{answer:?}");
+    }
+
+    /// A watched nick's presence is told live, never retained: replayed, it
+    /// would say a nick that left long ago is online.
+    #[test]
+    fn a_watched_nicks_presence_is_told_live_and_never_retained() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.emit_line(":up 730 me :bob!b@h".to_string());
+        ends.emit_line(":up 600 me bob b h 1700000000 :logged online".to_string());
+        ends.emit_line(":bob!b@h PRIVMSG me :still here".to_string());
+        assert_eq!(
+            untimed(handle.buffer_snapshot()),
+            [":bob!b@h PRIVMSG me :still here"]
+        );
     }
 
     /// Rows an older build stored of what is now told live only are left in

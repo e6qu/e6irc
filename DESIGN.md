@@ -3095,7 +3095,7 @@ above the trait, provides for every network kind:
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
   are mirrored to all attached clients. What answers one client's command is
   that client's alone (`bouncer/replies.rs`): the replies to its `WHO`,
-  `WHOIS`, `LIST`, `NAMES`, `MODE` and `TOPIC` queries, its `INVITE` and
+  `WHOIS`, `LIST`, `NAMES`, `MODE`, `TOPIC` and `MONITOR L` queries, its `INVITE` and
   `AWAY` confirmations, and the error numerics and `FAIL`/`WARN`/`NOTE`
   standard replies to anything it sent reach that attachment only, live, and
   never enter the ring, the stored backlog or CHATHISTORY. With
@@ -3284,9 +3284,11 @@ above the trait, provides for every network kind:
   is state the session follows and an attaching client is told from the
   session — retained, the member lists that follow
   every rejoin after a reconnect (hundreds of lines on a heavy user's
-  channels) evicted the conversation the backlog exists to keep. Each is told
-  live, at the ring's position; rows an older build stored of them stay in
-  storage.
+  channels) evicted the conversation the backlog exists to keep; and a
+  watched nick's presence (`MONITOR`'s 730/731, `WATCH`'s 600/601/604/605),
+  which replayed told a client that a nick gone for hours was online. Each is
+  told live, at the ring's position; rows an older build stored of them stay
+  in storage.
 - **Authoritative attach state, and a replay read as it was said**: the ring
   keeps, beside its lines, the session's state as of its oldest entry — nick
   and channels — advanced by every entry it evicts (to the state a session
