@@ -168,7 +168,7 @@ fn trusted_proxies_from_the_environment_are_judged_like_the_file_setting() {
     let mut environment = minimal();
     environment.push((
         "E6IRC_TRUSTED_PROXIES",
-        "10.89.0.254/32, 192.168.7.0/24".to_owned(),
+        "192.0.2.10/32, 192.168.7.0/24".to_owned(),
     ));
     let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
     assert!(output.status.success(), "{}", report(&output));

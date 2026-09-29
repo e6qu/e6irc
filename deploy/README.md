@@ -1,9 +1,8 @@
 # Deploying e6irc
 
-The dev environment in `github.com/e6qu/infra` runs e6irc as an ARM64 Amazon
-ECS Fargate service on the shared VPC/cluster, behind API Gateway at
-`https://e6irc.dev.e6qu.dev`, with a per-tenant database on the shared
-PostgreSQL (`fck-rds`) and Shauth as its OpenID Connect SSO source.
+A typical deployment runs e6irc as a container behind a TLS-terminating
+reverse proxy or HTTP gateway, with its own database on a shared PostgreSQL
+and an OpenID Connect provider such as Shauth as its SSO source.
 
 The image is host-neutral: nothing in it knows about AWS.
 [Running on any container host](#running-on-any-container-host) states what a
@@ -217,9 +216,9 @@ configured, the next start seals and imports them atomically.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `E6IRC_SERVER_NAME` | on the first start | IRC server name, e.g. `e6irc.dev.e6qu.dev`; unset afterwards, the name the console stores applies |
+| `E6IRC_SERVER_NAME` | on the first start | IRC server name, e.g. `irc.example.com`; unset afterwards, the name the console stores applies |
 | `E6IRC_PUBLIC_URL` | on the first start | External base URL; OIDC redirect + post-logout base; unset afterwards, the URL the console stores applies |
-| `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant). Its query keys are a closed set — `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey` (or their hyphenated spellings), `application_name`, `options` (`-c name=value` settings), `statement-cache-capacity` — and any other key, a misspelt `sslmode` value or a field stated twice is refused at start; the container must not set libpq variables (`PGHOST`, `PGSSLMODE`, `PGPASSWORD`, ...), which are refused by name: the URL alone describes the connection |
+| `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL. Its query keys are a closed set — `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey` (or their hyphenated spellings), `application_name`, `options` (`-c name=value` settings), `statement-cache-capacity` — and any other key, a misspelt `sslmode` value or a field stated twice is refused at start; the container must not set libpq variables (`PGHOST`, `PGSSLMODE`, `PGPASSWORD`, ...), which are refused by name: the URL alone describes the connection |
 | `APPLICATION_RELEASE_REVISION` | yes | The deployed revision, shown on the console's configuration page and on the authenticated identity page Shauth's browser validator reads. With the `shauth` provider configured it must be 12–64 lowercase hexadecimal digits or `sha256:` plus 64 of them; the image tag's short SHA qualifies |
 | `E6IRC_SECRET_KEY` | for credential storage (secret) | Base64 32-byte primary key; new managed and account-network credentials are sealed with it |
 | `E6IRC_PREVIOUS_SECRET_KEYS` | only during rotation (secret) | Comma-separated old keys accepted for reads until `e6ircd rotate-secrets` commits |
@@ -230,14 +229,14 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_HSTS_INCLUDE_SUBDOMAINS` | no (`false`) | Add `includeSubDomains` to the HSTS header, forcing every sibling host of the domain onto HTTPS for a year; exactly `true` or `false`, and `true` needs an `https://` `E6IRC_PUBLIC_URL` |
 | `E6IRC_MONITORING_TOKEN` | no (secret; at least 32 non-whitespace characters) | Bearer for the read-only `/api/v1/monitoring/observation` endpoint; unset, the endpoint is closed |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated administrator account names, imported on the first start and console-owned afterwards (see above); empty fields name no account |
-| `E6IRC_TRUSTED_PROXIES` | no | Comma-separated CIDR ranges (`10.89.0.254/32` for one address) of the reverse proxies whose `X-Forwarded-For` names the client (`limits.trusted_proxies`); imported on the first start and console-owned afterwards, so a stated value must match the stored one (see above). A container behind a proxy states it: its listener binds `0.0.0.0`, so start cannot tell that every request comes from the proxy, and every user would share one authentication budget |
+| `E6IRC_TRUSTED_PROXIES` | no | Comma-separated CIDR ranges (`192.0.2.10/32` for one address) of the reverse proxies whose `X-Forwarded-For` names the client (`limits.trusted_proxies`); imported on the first start and console-owned afterwards, so a stated value must match the stored one (see above). A container behind a proxy states it: its listener binds `0.0.0.0`, so start cannot tell that every request comes from the proxy, and every user would share one authentication budget |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
 | `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for the serving process's pool, a few connections per standby (see High availability), and your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
-| `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
+| `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.example.com` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
 | `E6IRC_OIDC_NAME` | no (`shauth`) | Provider name (URL segment) |
-| `E6IRC_OIDC_END_SESSION` | with issuer | Relying-party-initiated logout endpoint, e.g. `https://auth.dev.e6qu.dev/oauth2/sessions/logout` |
+| `E6IRC_OIDC_END_SESSION` | with issuer | Relying-party-initiated logout endpoint, e.g. `https://auth.example.com/oauth2/sessions/logout` |
 | `E6IRC_OIDC_ACCOUNT_CLAIM` | no (`preferred_username`) | ID-token claim that names the e6irc account: `preferred_username` or `email` |
 | `E6IRC_OIDC_TOKEN_AUTH` | no (`client_secret_post`) | How the client authenticates at the token endpoint: `client_secret_post` (how Shauth registers managed applications) or `client_secret_basic`. It belongs to the client registration, so discovery cannot report it |
 
@@ -511,7 +510,7 @@ Any host that runs an OCI image can run e6irc. It has to provide:
 
 Public IRC networks judge a connection by the address it comes from, so whether
 an always-on network connects depends on the host's egress, not on e6irc. The
-recorded case: on 2026-08-23 the production container, on Scaleway, registered
+recorded case: on 2026-08-23 a production container on a cloud host registered
 and joined its configured channels on OFTC and Ergo Testnet, while Libera
 refused the same container's IPv4 address unless the connection authenticated
 with an existing, email-verified NickServ account over SASL — and that
