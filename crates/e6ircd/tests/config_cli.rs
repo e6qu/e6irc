@@ -160,6 +160,27 @@ fn an_admin_accounts_entry_that_is_not_an_account_name_is_refused_by_name() {
     assert!(text.contains("\" bob\""), "names the entry: {text}");
 }
 
+/// `E6IRC_TRUSTED_PROXIES` goes through the parser a file's
+/// `limits.trusted_proxies` does, so a proxy named by host name is refused by
+/// the setting's name.
+#[test]
+fn trusted_proxies_from_the_environment_are_judged_like_the_file_setting() {
+    let mut environment = minimal();
+    environment.push((
+        "E6IRC_TRUSTED_PROXIES",
+        "10.89.0.254/32, 192.168.7.0/24".to_owned(),
+    ));
+    let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
+    assert!(output.status.success(), "{}", report(&output));
+
+    let mut environment = minimal();
+    environment.push(("E6IRC_TRUSTED_PROXIES", "caddy".to_owned()));
+    let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
+    let text = report(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("trusted_proxies"), "{text}");
+}
+
 #[test]
 fn a_missing_or_malformed_variable_is_refused_by_name_without_printing_any_value() {
     let cases: [(&str, Option<&str>, &str); 4] = [
