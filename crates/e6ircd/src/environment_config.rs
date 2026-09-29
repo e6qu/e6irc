@@ -702,7 +702,7 @@ mod tests {
     fn trusted_proxies_state_only_that_limit() {
         let stated = table(&with(
             minimal(),
-            &[("E6IRC_TRUSTED_PROXIES", "10.89.0.254/32, 192.168.7.0/24,")],
+            &[("E6IRC_TRUSTED_PROXIES", "192.0.2.10/32, 192.168.7.0/24,")],
         ))
         .unwrap();
         let limits = stated["limits"].as_table().unwrap();
@@ -713,7 +713,7 @@ mod tests {
             .iter()
             .map(|proxy| proxy.as_str().unwrap())
             .collect();
-        assert_eq!(proxies, ["10.89.0.254/32", "192.168.7.0/24"]);
+        assert_eq!(proxies, ["192.0.2.10/32", "192.168.7.0/24"]);
         assert!(!table(&minimal()).unwrap().contains_key("limits"));
     }
 

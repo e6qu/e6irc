@@ -33,14 +33,14 @@
   },
   "oidc_providers": [],
   "opers": [],
-  "public_url": "https://e6irc.dev.e6qu.dev",
+  "public_url": "https://irc.example.com",
   "registration": {
     "before_connect": false,
     "require_email": false
   },
   "secure_cookies": true,
   "sendq": 1024,
-  "server_name": "e6irc.dev.e6qu.dev",
+  "server_name": "irc.example.com",
   "storage": {
     "audit_retention_days": 365,
     "history_retention_days": 30
