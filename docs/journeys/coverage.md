@@ -163,7 +163,8 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 
 | CI job | Product risk addressed |
 |---|---|
-| `lint` | `tools/gate.sh` — formatting, shell syntax of every script, every structural guard (locked builds, one Rust toolchain, image pins, migration integrity, no-op, dead-public, duplication, no-deferral, fuzz lock, journeys, client capabilities, template accessibility, API-first) and every guard's contract test, the backup/restore, load-sweep, qualification, and native-packaging self-tests; then warnings in all-feature, default, and per-feature compilation, the dead-code build, and frontend unit tests/build |
+| `guards` | `tools/gate.sh` — formatting, shell syntax of every script, every structural guard (locked builds, one Rust toolchain, image pins, migration integrity, no-op, dead-public, duplication, no-deferral, fuzz lock, journeys, client capabilities, template accessibility, API-first) and every guard's contract test, the backup/restore, load-sweep, qualification, and native-packaging self-tests |
+| `lint` | warnings in all-feature, default, and per-feature compilation, the dead-code build, and frontend unit tests/build |
 | `deny` | licenses, advisories, bans (including one version of each network stack), and dependency-source policy, for the workspace and for the separate `fuzz/` package |
 | `test` | all-feature workspace behavior, plus the daemon's unit tests and HTTP suite in the default-feature build, on six OS/architecture cells; this includes the zero-drop suite's process-level edge scenarios (real `e6ircd` and `e6ircd edge` processes) |
 | `coverage` | all-feature workspace line-coverage regression floor |
@@ -173,7 +174,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `postgres-recovery` | isolated empty PostgreSQL first boot plus live stop/start degradation and recovery under HTTP and IRC traffic |
 | `production-container` | deployable image and embedded web-client shape; the built distroless image booted with its real command against PostgreSQL to a served `/healthz`, a ready `/readyz`, the login page, its own `healthcheck` probe, user 10001, no shell, a missing variable refused by name, and a clean exit on SIGTERM within the stop budget |
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
-| `native-client-journeys` | real pseudo-terminal render/message/terminal-restore journey (the deterministic archive contract runs in `lint`) |
+| `native-client-journeys` | real pseudo-terminal render/message/terminal-restore journey (the deterministic archive contract runs in `guards`) |
 | `shauth-sso` | exact external single-sign-on/logout integration |
 | `irctest`, `irctest-edge`, `irctest-services` | IRC and services conformance; the green list runs in one process (`irctest`) and, in parallel, through an edge (`irctest-edge`) |
 | `matrix-bridge` | bidirectional live bridge behavior |

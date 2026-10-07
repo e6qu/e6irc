@@ -42,6 +42,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Every structural guard and every guard's contract test: the one list
+  # AGENTS.md's checklist points at (tools/gate.sh names each step). A job of
+  # its own, beside lint's clippy builds, because together they outgrew the
+  # 15-minute job bound.
+  guards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The checkout is shallow, so fetch main for the guards that read what
+      # this change added; a failed fetch fails the step, because without the
+      # base those additions would go unexamined. cargo deny runs in the deny
+      # job.
+      - name: Guards and their contract tests
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          tools/gate.sh --base FETCH_HEAD --skip-cargo-deny
+
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -52,15 +75,6 @@ jobs:
           toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # Every structural guard and every guard's contract test: the one list
-      # AGENTS.md's checklist points at (tools/gate.sh names each step). The
-      # checkout is shallow, so fetch main for the guards that read what this
-      # change added; a failed fetch fails the step, because without the base
-      # those additions would go unexamined. cargo deny runs in the deny job.
-      - name: Guards and their contract tests
-        run: |
-          git fetch --no-tags --depth=1 origin main
-          tools/gate.sh --base FETCH_HEAD --skip-cargo-deny
       # embed-web (pulled in by --all-features) embeds web/dist, so build
       # the frontend first. Node is preinstalled on the runners.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
@@ -86,8 +100,8 @@ jobs:
       # with -D warnings, so code kept alive solely by tests is caught as dead.
       - run: tools/check-dead-code.sh
 
-  # tools/gate.sh's cargo deny step, run with the cargo-deny action (the lint
-  # job passes --skip-cargo-deny).
+  # tools/gate.sh's cargo deny step, run with the cargo-deny action (the
+  # guards job passes --skip-cargo-deny).
   deny:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -746,6 +760,7 @@ jobs:
     needs:
       [
         lint,
+        guards,
         deny,
         test,
         coverage,
