@@ -20,6 +20,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # GitHub occasionally delivers no push event for a commit, which leaves it
+  # without CI and so without a published image; a dispatch on main runs it.
+  workflow_dispatch:
 
 # Service and tool images are pinned by digest like the Dockerfile's bases
 # (tools/check-image-pins.py requires a digest on every image any tracked file
