@@ -4274,11 +4274,15 @@ pub struct BufferedLine {
     pub line: String,
 }
 
-/// The ring as a reader paging back from a cursor sees it: every retained
-/// line, oldest first, of which the first `held_after` are at or before the
-/// cursor. When `successors_retained`, every line after the cursor is still
-/// in the ring, so what the reader holds after it the ring holds too, and
-/// older history can be joined to the ring's own oldest line.
+/// The ring as a reader paging back through one conversation from a cursor
+/// sees it: every retained line, oldest first, of which the first
+/// `held_after` are at or before the cursor. When `successors_retained`,
+/// every line of the conversation after the cursor is still in the ring, so
+/// what the reader holds of it after the cursor the ring holds too, and older
+/// history can be joined to the conversation's own oldest line in the ring.
+/// A conversation's lines leave the ring oldest first, whether from the front
+/// or from its share ([`Buffer::evict_one`]), so what the ring holds of it is
+/// always its newest lines, none missing between.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingHistory {
     epoch: u64,
@@ -4506,6 +4510,14 @@ pub struct Buffer {
     /// The newest position the ring has let go of: a cursor at or past it has
     /// every successor still held.
     evicted_through: u64,
+    /// The newest position each share has let go of, from the front or from
+    /// its middle: its lines go oldest first, so every line of the share
+    /// after it is still held.
+    let_go: std::collections::HashMap<Share, u64>,
+    /// The newest position a share may have let go of that the ring cannot
+    /// name the share of: what storage let go of before a continued ring
+    /// restored the rest (migration 0103).
+    let_go_floor: u64,
     /// Identifies this ring's lifetime; part of every cursor it hands out.
     /// A ring continuing a stored one takes its epoch
     /// ([`NetworkHandle::continue_ring`]).
@@ -4550,6 +4562,8 @@ impl Buffer {
             bytes: 0,
             shares: std::collections::HashMap::new(),
             evicted_through: 0,
+            let_go: std::collections::HashMap::new(),
+            let_go_floor: 0,
             epoch,
             next_seq: cap as u64 + 1,
             first_seq: cap as u64 + 1,
@@ -4597,6 +4611,8 @@ impl Buffer {
     fn forget(&mut self, line: &BufferedLine, share: &Share) {
         self.bytes -= line.line.len();
         self.evicted_through = self.evicted_through.max(line.seq);
+        let let_go = self.let_go.entry(share.clone()).or_default();
+        *let_go = (*let_go).max(line.seq);
         if let Some(held) = self.shares.get_mut(share) {
             *held -= 1;
             if *held == 0 {
@@ -4747,15 +4763,37 @@ impl Buffer {
     /// Every retained line with its position, as of one instant, and how many
     /// of them are at or before `through`; `None` for another ring's cursor,
     /// or a position the ring has not reached. See [`RingHistory`].
-    fn history_through(&self, through: ReplayCursor) -> Option<RingHistory> {
+    fn history_through(&self, through: ReplayCursor, conversation: &str) -> Option<RingHistory> {
         if through.epoch != self.epoch || through.seq >= self.next_seq {
             return None;
         }
         let lines: Vec<BufferedLine> = self.lines().cloned().collect();
         let held_after = lines.partition_point(|line| line.seq <= through.seq);
-        let successors_retained = lines
-            .first()
-            .is_none_or(|oldest| oldest.seq <= through.seq + 1);
+        // Nothing of the conversation after the cursor was let go of: not
+        // from its share, nor before what a restore could name the share of,
+        // nor by history retention, which lets go of the oldest lines and
+        // so of everything at or before the newest it expired.
+        let share = Share::Conversation(conversation.to_string());
+        let cutoff = self.cutoff();
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                RingEntry::Line(line, held) if *held == share && !Self::keeps(line, cutoff) => {
+                    Some(line.seq)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let let_go = self
+            .let_go
+            .get(&share)
+            .copied()
+            .unwrap_or(0)
+            .max(self.let_go_floor)
+            .max(expired);
+        let successors_retained = through.seq >= let_go;
         Some(RingHistory {
             epoch: self.epoch,
             lines,
@@ -5602,11 +5640,16 @@ impl NetworkHandle {
 
     /// [`Self::buffer_through`], and whether every line after `through` is
     /// still retained (see [`Buffer::history_through`]).
-    pub fn history_through(&self, through: ReplayCursor) -> Option<RingHistory> {
+    /// `conversation` is the folded name of the conversation paged.
+    pub fn history_through(
+        &self,
+        through: ReplayCursor,
+        conversation: &str,
+    ) -> Option<RingHistory> {
         self.buffer
             .lock()
             .expect("buffer poisoned")
-            .history_through(through)
+            .history_through(through, conversation)
     }
 
     /// Establish one exact boundary between detached-buffer/session replay and
@@ -5783,6 +5826,7 @@ impl NetworkHandle {
         let not_restored = Self::restore_front(&mut buf, older, |_, stored| {
             stored.seq.expect("every position checked above")
         });
+        buf.let_go_floor = let_go.unwrap_or(0).max(not_restored.unwrap_or(0));
         buf.evicted_through = buf
             .evicted_through
             .max(let_go.unwrap_or(0))
@@ -12306,26 +12350,94 @@ mod tests {
         untimed(replay.lines.iter().map(|entry| entry.line.as_str()))
     }
 
+    /// `text` said in `channel`, as the ring holds it.
+    fn said(channel: &str, text: &str) -> String {
+        format!(":peer!p@h PRIVMSG {channel} :{text}")
+    }
+
     #[test]
     fn history_through_says_whether_the_lines_after_the_cursor_are_kept() {
         let mut ring = Buffer::new(2);
-        let first = ring.push("one".into());
-        let second = ring.push("two".into());
+        let first = ring.push(said("#c", "one"));
+        let second = ring.push(said("#c", "two"));
         let at_first = ring.replay_after(None).cursor_at(first);
-        let kept = ring.history_through(at_first).expect("this ring's cursor");
+        let kept = ring
+            .history_through(at_first, "#c")
+            .expect("this ring's cursor");
         assert_eq!(kept.lines.len(), 2);
         assert_eq!((kept.held_after, kept.successors_retained), (1, true));
         assert_eq!(kept.cursor_before(second), at_first);
         // "one" is gone, but everything after it is kept.
-        ring.push("three".into());
-        let kept = ring.history_through(at_first).expect("this ring's cursor");
+        ring.push(said("#c", "three"));
+        let kept = ring
+            .history_through(at_first, "#c")
+            .expect("this ring's cursor");
         assert_eq!((kept.held_after, kept.successors_retained), (0, true));
         // "two" is gone too: a reader holding it holds what the ring does not.
-        ring.push("four".into());
-        let evicted = ring.history_through(at_first).expect("this ring's cursor");
+        ring.push(said("#c", "four"));
+        let evicted = ring
+            .history_through(at_first, "#c")
+            .expect("this ring's cursor");
         assert_eq!(
             (evicted.held_after, evicted.successors_retained),
             (0, false)
+        );
+    }
+
+    /// A busy channel's flood lets lines go from the middle of the ring: a
+    /// quiet conversation paged from any cursor still finds every line of it
+    /// after the cursor held, and a busy one is joinable exactly from the
+    /// cursors whose successors it still holds — its lines go oldest first.
+    #[test]
+    fn history_through_is_exact_when_lines_go_from_the_middle() {
+        let mut ring = Buffer::new(6);
+        let lobby: Vec<u64> = (1..=4)
+            .map(|n| ring.push(said("#lobby", &format!("lobby-{n}"))))
+            .collect();
+        let busy: Vec<u64> = (1..=20)
+            .map(|n| ring.push(said("#busy", &format!("busy-{n}"))))
+            .collect();
+        let cursor = |seq| ring.replay_after(None).cursor_at(seq);
+        let held = |ring: &Buffer, conversation: &str| {
+            untimed(ring.snapshot())
+                .into_iter()
+                .filter(|line| line.contains(&format!("PRIVMSG {conversation} ")))
+                .count()
+        };
+        assert_eq!(held(&ring, "#lobby"), 2, "{:?}", ring.snapshot());
+        assert_eq!(held(&ring, "#busy"), 4, "{:?}", ring.snapshot());
+        // #lobby lost its two oldest lines: from its second on, the rest is
+        // held, so a cursor at it joins; one before it does not.
+        let at_lobby_1 = cursor(lobby[1]);
+        let paged = ring
+            .history_through(at_lobby_1, "#lobby")
+            .expect("this ring's cursor");
+        assert!(paged.successors_retained);
+        let before_lobby_1 = cursor(lobby[0]);
+        assert!(
+            !ring
+                .history_through(before_lobby_1, "#lobby")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+        // #busy lost every line but its last four, from the middle of the
+        // ring: a cursor before them does not join, one at the last lost does.
+        assert!(
+            !ring
+                .history_through(cursor(busy[14]), "#busy")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+        assert!(
+            ring.history_through(cursor(busy[15]), "#busy")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+        // A conversation the flood never touched is joinable from anywhere.
+        assert!(
+            ring.history_through(cursor(busy[0]), "#quiet")
+                .expect("this ring's cursor")
+                .successors_retained
         );
     }
 
