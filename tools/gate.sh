@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The repository's guard gate: every structural guard and every guard's own
-# contract test, in one list. CI's `lint` job runs exactly this script, and
+# contract test, in one list. CI's `guards` job runs exactly this script, and
 # AGENTS.md's checklist points here instead of keeping a second copy of the
 # list, so the two cannot drift. What it does not cover (builds, clippy in each
 # feature configuration, the test suites, the dead-code build, the fuzz

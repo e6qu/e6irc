@@ -4,7 +4,7 @@
 #
 # Nothing is published from unverified code. The image jobs are triggered by
 # the completion of the CI workflow (not by the push) and run only when that
-# run was a push to main that concluded `success`; they build
+# run was a push to main, or a dispatch on main, that concluded `success`; they build
 # `github.event.workflow_run.head_sha`, because in a `workflow_run` event
 # `github.sha` is whatever main points at when CI finishes, not the commit CI
 # verified. CI does not run on tag pushes, so the tag path instead requires a
@@ -48,10 +48,10 @@ jobs:
   metadata:
     # The `branches` filter above matches the head branch NAME, which a fork's
     # pull request can also call `main`; a push event can only be this
-    # repository's own branch.
+    # repository's own branch, and so can a dispatch, which needs write access.
     if: >-
       github.event_name == 'workflow_run'
-      && github.event.workflow_run.event == 'push'
+      && contains(fromJSON('["push", "workflow_dispatch"]'), github.event.workflow_run.event)
       && github.event.workflow_run.head_branch == 'main'
       && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04

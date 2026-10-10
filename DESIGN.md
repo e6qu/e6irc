@@ -1211,7 +1211,9 @@ strip = "symbols"
   and the HTTP listener bound only to loopback, so every client is on this
   host (`Config::shared_authentication_budget`). A listener bound wider may or
   may not sit behind a proxy, which start cannot see; the deployment guide's
-  upgrade notes say what to set.
+  upgrade notes say what to set. A container states it as
+  `E6IRC_TRUSTED_PROXIES`, which is imported and held to the stored value like
+  every other console-owned setting a variable states.
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with

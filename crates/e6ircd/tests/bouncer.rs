@@ -4352,22 +4352,41 @@ async fn a_list_reaches_only_the_client_that_asked_for_it() {
     let mut bystander = handle.route_replies(8);
     wait_connected(&handle, &mut events).await;
     assert_eq!(handle.send_from(7, "LIST"), SendOutcome::Sent);
-    let mut listed = 0;
+    // The asker may read more slowly than the network sends: what did not fit
+    // its route is dropped for it alone and counted in a notice, so every line
+    // of the reply is either read or reported, whatever the reader's pace.
+    let reply_lines = CHANNELS + 2;
+    let mut accounted = 0;
     tokio::time::timeout(deadline::HANG, async {
-        loop {
+        while accounted < reply_lines {
             let line = untimed(&asker.recv().await);
-            assert!(!line.contains("dropped"), "{line}");
-            if line.contains(" 322 ") {
-                listed += 1;
-            }
-            if line.contains(" 323 ") {
-                return;
+            if let Some(notice) = line.strip_prefix(":*bnc* NOTICE * :") {
+                let lost: usize = notice
+                    .split_once(' ')
+                    .and_then(|(count, rest)| {
+                        rest.starts_with("line(s) of a reply to your command were dropped")
+                            .then(|| count.parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| panic!("an unexpected notice: {line}"));
+                accounted += lost;
+            } else {
+                assert!(
+                    [" 321 ", " 322 ", " 323 "]
+                        .iter()
+                        .any(|numeric| line.contains(numeric)),
+                    "the asker read a line that is not the LIST reply: {line}"
+                );
+                accounted += 1;
             }
         }
     })
     .await
     .expect("the LIST reached the client that asked");
-    assert_eq!(listed, CHANNELS);
+    assert_eq!(
+        accounted, reply_lines,
+        "a LIST line was neither read nor reported"
+    );
     assert_eq!(handle.send_from(8, "WHO #room"), SendOutcome::Sent);
     let who = tokio::time::timeout(deadline::HANG, bystander.recv())
         .await
