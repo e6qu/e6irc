@@ -212,16 +212,19 @@ created from a different accepted connection.
 
 **Flow.**
 
-1. Open the network detail page. Its **NickServ account** section leads with the
-   account and password pair for an account already held; open **Register a new
-   NickServ account** beneath it. The IRC transcript remains visible beside it.
+1. Open the network detail page. Its **NickServ account** section links to the
+   network's settings in the chat client, the one place an account and password
+   already held are saved; open **Register a new NickServ account** beneath it.
+   The IRC transcript remains visible beside it.
 2. Enter an email address and new password. The closed owner-scoped endpoint
    sends the ordinary IRC command `PRIVMSG NickServ :REGISTER password email`.
 3. Read NickServ's response in the transcript, check the email, and return with
    its code. Submitting the code sends
    `PRIVMSG NickServ :VERIFY REGISTER nick code`.
 4. Confirm NickServ's success in the transcript, then save the account and
-   password. The normal network replacement path seals the password and
+   password in the network's settings, which step 3 links to (the register
+   form is emptied once NickServ has the command, so the password is typed
+   there again). The normal network replacement path seals the password and
    reconnects with SASL, using the strongest mechanism the network offers
    (SCRAM-SHA-512 on Libera) and saying which one logged in.
 5. An attached IRC client may perform the same exchange with normal

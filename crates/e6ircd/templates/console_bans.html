@@ -69,7 +69,7 @@
       </label>
       <label class="field">
         <span>Mask</span>
-        <input name="mask" value="{{ mask }}" maxlength="512" autocomplete="off"
+        <input name="mask" value="{{ mask }}" maxlength="512" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off"
                placeholder="*@bad.example" />
       </label>
       <label class="field">
