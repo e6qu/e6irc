@@ -354,90 +354,64 @@ impl Session {
     }
 }
 
+/// Calls `$then!` with [`Caps`]' fields in the order a record holds them as
+/// bits: the one list [`caps_bits`] and [`caps_from_bits`] both follow.
+macro_rules! with_caps_fields {
+    ($then:ident) => {
+        $then!(
+            server_time,
+            echo_message,
+            message_tags,
+            cap_notify,
+            multi_prefix,
+            userhost_in_names,
+            extended_join,
+            away_notify,
+            account_notify,
+            account_tag,
+            setname,
+            invite_notify,
+            batch,
+            chathistory,
+            read_marker,
+            labeled_response,
+            chghost,
+            extended_monitor,
+            standard_replies,
+            sasl,
+            account_registration,
+            multiline
+        )
+    };
+}
+
 /// A session's negotiated capabilities as the bits a record holds, in the
-/// order of [`Caps`]' fields: every field named, so a capability added to
-/// `Caps` does not compile until it is placed here.
+/// order [`with_caps_fields`] lists: every field named, so a capability added
+/// to `Caps` does not compile until it is placed there.
 pub(crate) fn caps_bits(caps: Caps) -> u32 {
-    let Caps {
-        server_time,
-        echo_message,
-        message_tags,
-        cap_notify,
-        multi_prefix,
-        userhost_in_names,
-        extended_join,
-        away_notify,
-        account_notify,
-        account_tag,
-        setname,
-        invite_notify,
-        batch,
-        chathistory,
-        read_marker,
-        labeled_response,
-        chghost,
-        extended_monitor,
-        standard_replies,
-        sasl,
-        account_registration,
-        multiline,
-    } = caps;
-    [
-        server_time,
-        echo_message,
-        message_tags,
-        cap_notify,
-        multi_prefix,
-        userhost_in_names,
-        extended_join,
-        away_notify,
-        account_notify,
-        account_tag,
-        setname,
-        invite_notify,
-        batch,
-        chathistory,
-        read_marker,
-        labeled_response,
-        chghost,
-        extended_monitor,
-        standard_replies,
-        sasl,
-        account_registration,
-        multiline,
-    ]
-    .into_iter()
-    .enumerate()
-    .fold(0, |bits, (index, set)| bits | (u32::from(set) << index))
+    macro_rules! bits {
+        ($($field:ident),*) => {{
+            let Caps { $($field),* } = caps;
+            [$($field),*]
+        }};
+    }
+    with_caps_fields!(bits)
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (index, set)| bits | (u32::from(set) << index))
 }
 
 /// The capabilities [`caps_bits`] wrote.
 pub(crate) fn caps_from_bits(bits: u32) -> Caps {
-    let set = |index: u32| bits & (1 << index) != 0;
-    Caps {
-        server_time: set(0),
-        echo_message: set(1),
-        message_tags: set(2),
-        cap_notify: set(3),
-        multi_prefix: set(4),
-        userhost_in_names: set(5),
-        extended_join: set(6),
-        away_notify: set(7),
-        account_notify: set(8),
-        account_tag: set(9),
-        setname: set(10),
-        invite_notify: set(11),
-        batch: set(12),
-        chathistory: set(13),
-        read_marker: set(14),
-        labeled_response: set(15),
-        chghost: set(16),
-        extended_monitor: set(17),
-        standard_replies: set(18),
-        sasl: set(19),
-        account_registration: set(20),
-        multiline: set(21),
+    macro_rules! caps {
+        ($($field:ident),*) => {{
+            let mut set = (0u32..).map(|index| bits & (1 << index) != 0);
+            Caps {
+                $($field: set.next().expect("the count is endless")),*
+            }
+        }};
     }
+    with_caps_fields!(caps)
 }
 
 /// A session a rebuild resumes: its record, and what the rebuild gives it

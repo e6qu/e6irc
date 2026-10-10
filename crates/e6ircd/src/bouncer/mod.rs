@@ -5369,13 +5369,15 @@ impl NetworkHandle {
     /// and this one does not is left in storage: a network's registration
     /// burst, whose ISUPPORT would undo the bouncer's own when replayed
     /// (§10.4), and whatever is told live only ([`told_live_only`]).
-    pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) {
+    ///
+    /// Each restored row, with the position it took in this ring.
+    pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) -> Vec<(i64, u64)> {
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         // Each restored line takes the position just below the current
         // oldest: older than everything pushed, in storage order.
         Self::restore_front(&mut buf, older, |buf, _| {
             buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1
-        });
+        })
     }
 
     /// Continue the stored ring `epoch`, whose every line through position
@@ -5387,9 +5389,11 @@ impl NetworkHandle {
     /// answer says which events' positions moved, and by how much, so their
     /// persistence stores the positions they have now.
     ///
-    /// The lines back, changing nothing, when they do not fit the claim: a
-    /// line without a position, or positions not rising or past `through`.
-    /// The caller then restores them as a new epoch.
+    /// A line without a position was in no ring of this epoch — its start
+    /// gave every line it restored the position it took
+    /// ([`crate::db::claim_bnc_ring`]) — and is not restored. The lines back,
+    /// changing nothing, when the positions do not fit the claim: not rising,
+    /// or past `through`. The caller then restores them as a new epoch.
     pub(crate) fn continue_ring(
         &self,
         epoch: u64,
@@ -5397,14 +5401,18 @@ impl NetworkHandle {
         older: Vec<crate::db::StoredBacklogLine>,
     ) -> Result<Renumbered, Vec<crate::db::StoredBacklogLine>> {
         let mut last = 0u64;
-        let fits = older.iter().all(|stored| {
-            let fits = stored.seq.is_some_and(|seq| seq > last && seq <= through);
-            last = stored.seq.unwrap_or(last);
+        let fits = older.iter().filter_map(|stored| stored.seq).all(|seq| {
+            let fits = seq > last && seq <= through;
+            last = seq;
             fits
         });
         if !fits {
             return Err(older);
         }
+        let older: Vec<crate::db::StoredBacklogLine> = older
+            .into_iter()
+            .filter(|stored| stored.seq.is_some())
+            .collect();
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         let renumbered = Renumbered {
             below: buf.next_seq,
@@ -5418,9 +5426,10 @@ impl NetworkHandle {
         }
         buf.next_seq += renumbered.shift;
         buf.epoch = epoch;
-        Self::restore_front(&mut buf, older, |_, stored| {
-            stored.seq.expect("every position checked above")
-        });
+        // Its rows keep the positions they have.
+        drop(Self::restore_front(&mut buf, older, |_, stored| {
+            stored.seq.expect("only lines with a position are restored")
+        }));
         Ok(renumbered)
     }
 
@@ -5431,12 +5440,12 @@ impl NetworkHandle {
     }
 
     /// [`Self::preload_front`]'s restore, each line at the position
-    /// `position` gives it.
+    /// `position` gives it: each row restored, with that position.
     fn restore_front(
         buf: &mut Buffer,
         older: Vec<crate::db::StoredBacklogLine>,
         position: impl Fn(&Buffer, &crate::db::StoredBacklogLine) -> u64,
-    ) {
+    ) -> Vec<(i64, u64)> {
         let older: Vec<crate::db::StoredBacklogLine> = older
             .into_iter()
             .filter(|stored| {
@@ -5446,9 +5455,11 @@ impl NetworkHandle {
         let room = buf.cap.saturating_sub(buf.entries.len());
         // The own nicks of the lines restored, newest first.
         let mut restored = Vec::new();
+        let mut positions = Vec::new();
         for stored in older.iter().rev().take(room) {
             let seq = position(buf, stored);
             let crate::db::StoredBacklogLine {
+                id,
                 line,
                 stored_at,
                 own_nick,
@@ -5468,11 +5479,13 @@ impl NetworkHandle {
             buf.entries
                 .push_front(RingEntry::Line(BufferedLine { seq, line }));
             restored.push(own_nick);
+            positions.push((*id, seq));
         }
         if !restored.is_empty() {
             let (names, features) = (buf.names.clone(), buf.features.clone());
             buf.head = restored_head(restored.into_iter().rev(), names, features);
         }
+        positions
     }
 
     /// The most lines the replay buffer holds: the network's `buffer_cap`.
@@ -8415,6 +8428,7 @@ mod tests {
         own_nick: crate::db::StoredOwnNick,
     ) -> crate::db::StoredBacklogLine {
         crate::db::StoredBacklogLine {
+            id: 0,
             line: line.into(),
             stored_at: stored_at.into(),
             own_nick,
@@ -11160,22 +11174,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::bridge_channels(4);
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let attach = spawn_attach_as_alice(server, handle);
         let (read, mut write) = tokio::io::split(client);
         write
             .write_all(b"NICK alice\r\nNICK bob\r\nJOIN #general\r\nJOIN\r\n")
@@ -11209,18 +11208,13 @@ mod tests {
         attach.await.expect("attach task").expect("attach result");
     }
 
-    /// A bridge's own JOIN answer echoes each requested channel as one middle
-    /// parameter: `JOIN :#a b` used to answer `437 alice #a b :…` and
-    /// `JOIN ::x` `437 alice :x :…`, both of which shift the reply's
-    /// parameters. Each is the `*` placeholder.
-    #[tokio::test]
-    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-    async fn a_bridge_join_echoes_an_unframeable_channel_as_a_placeholder() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-        let (client, server) = tokio::io::duplex(4096);
-        let (handle, _ends) = NetworkHandle::bridge_channels(4);
-        let attach = tokio::spawn(async move {
+    /// `alice`'s attach to `handle` over `server`, with no capabilities, as a
+    /// task.
+    fn spawn_attach_as_alice(
+        server: tokio::io::DuplexStream,
+        handle: NetworkHandle,
+    ) -> tokio::task::JoinHandle<std::io::Result<AttachEnd>> {
+        tokio::spawn(async move {
             attach(
                 attach_link::over_stream(server).await,
                 ClientInput::default(),
@@ -11235,7 +11229,21 @@ mod tests {
                 ATTACH_LIVENESS_INTERVAL,
             )
             .await
-        });
+        })
+    }
+
+    /// A bridge's own JOIN answer echoes each requested channel as one middle
+    /// parameter: `JOIN :#a b` used to answer `437 alice #a b :…` and
+    /// `JOIN ::x` `437 alice :x :…`, both of which shift the reply's
+    /// parameters. Each is the `*` placeholder.
+    #[tokio::test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    async fn a_bridge_join_echoes_an_unframeable_channel_as_a_placeholder() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (handle, _ends) = NetworkHandle::bridge_channels(4);
+        let attach = spawn_attach_as_alice(server, handle);
         let (read, mut write) = tokio::io::split(client);
         write
             .write_all(b"JOIN :#a b\r\nJOIN ::x\r\n")
@@ -11279,22 +11287,7 @@ mod tests {
         for index in 0..4 {
             ends.emit_line(format!(":srv NOTICE upstreamNick :filler {index}"));
         }
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let attach = spawn_attach_as_alice(server, handle);
 
         let mut bytes = vec![0; 4096];
         let mut output = String::new();
@@ -11381,22 +11374,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::channels(4);
         ends.begin_irc_session("alice".to_string());
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let attach = spawn_attach_as_alice(server, handle);
 
         let mut bytes = vec![0; 4096];
         tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
@@ -11683,6 +11661,7 @@ mod tests {
         ends.emit_line(":a!a@h PRIVMSG #c :said before the restore".into());
         let (fresh_epoch, said_at) = handle.ring_position();
         let stored = |text: &str, seq| crate::db::StoredBacklogLine {
+            id: 0,
             line: format!(":a!a@h PRIVMSG #c :{text}"),
             stored_at: "2026-01-01T00:00:00.000Z".into(),
             own_nick: crate::db::StoredOwnNick::NoNick,
@@ -11721,6 +11700,79 @@ mod tests {
         assert_eq!(
             replay.lines.iter().map(|line| line.seq).collect::<Vec<_>>(),
             [100, 101]
+        );
+    }
+
+    /// After a crash a start restores the stored lines into a new epoch at
+    /// new positions, which it stores (`claim_bnc_ring`); a clean restart
+    /// after it continues that epoch with every line where its clients saw
+    /// it, so a cursor between two restored lines resumes exactly. A line
+    /// the new epoch did not restore has no position, and is no line of it.
+    #[test]
+    fn a_ring_restored_after_a_crash_continues_with_its_new_positions() {
+        let stored = |id, text: &str, seq| crate::db::StoredBacklogLine {
+            id,
+            line: format!(":a!a@h PRIVMSG #c :{text}"),
+            stored_at: "2026-01-01T00:00:00.000Z".into(),
+            own_nick: crate::db::StoredOwnNick::NoNick,
+            seq,
+        };
+        // The crashed run's positions, stale in any other epoch.
+        let (first, _) = NetworkHandle::channels(8);
+        let positions = first.preload_front(vec![
+            stored(1, "one", Some(1)),
+            stored(2, "two", Some(2)),
+            stored(3, "three", Some(3)),
+        ]);
+        let (epoch, through) = first.ring_position();
+        assert_eq!(positions.len(), 3);
+        assert!(
+            positions
+                .iter()
+                .all(|(_, seq)| *seq != 1 && *seq <= through),
+            "{positions:?}"
+        );
+        let at = |id| {
+            positions
+                .iter()
+                .find(|(row, _)| *row == id)
+                .map(|(_, seq)| *seq)
+        };
+        assert!(at(1) < at(2) && at(2) < at(3), "{positions:?}");
+        let between = ReplayCursor {
+            epoch,
+            seq: at(2).expect("restored"),
+        };
+
+        // The clean restart reads the rows as the claim stored them.
+        let (second, _) = NetworkHandle::channels(8);
+        second
+            .continue_ring(
+                epoch,
+                through,
+                vec![
+                    stored(0, "never restored", None),
+                    stored(1, "one", at(1)),
+                    stored(2, "two", at(2)),
+                    stored(3, "three", at(3)),
+                ],
+            )
+            .expect("the new positions fit the new epoch");
+        let replay = second
+            .buffer
+            .lock()
+            .expect("buffer")
+            .replay_after(Some(between));
+        assert!(replay.resumed);
+        assert_eq!(replayed(&replay), [":a!a@h PRIVMSG #c :three"]);
+        let whole = second.buffer.lock().expect("buffer").replay_after(None);
+        assert_eq!(
+            replayed(&whole),
+            [
+                ":a!a@h PRIVMSG #c :one",
+                ":a!a@h PRIVMSG #c :two",
+                ":a!a@h PRIVMSG #c :three"
+            ]
         );
     }
 

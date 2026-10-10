@@ -6350,7 +6350,13 @@ phase rewrites.
     restore moved past them (no client has been handed a cursor by then), so
     a `ReplayCursor` from before the restart names the same line. A start
     withdraws the claim at once, so a process that dies without storing
-    everything leaves none, and the start after it begins a new epoch.
+    everything leaves none, and the start after it begins a new epoch. A new
+    epoch restores the stored lines below everything pushed, at new
+    positions, and stores each restored row's position with its claim — every
+    other row's it clears — in one transaction, so a stored position is
+    always the line's in the claimed ring: the clean restart after a crash
+    puts every line where that epoch's clients saw it, and a line with no
+    position is no line of it.
   - *The `local` driver's session* (D13, `core::local_home`) lives in the
     core, with no socket and so no edge of its own. In edge mode its link is
     a holding one: its shard publishes its record like any session's, and the

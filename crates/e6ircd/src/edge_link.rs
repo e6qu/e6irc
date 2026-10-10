@@ -946,6 +946,32 @@ impl SessionStream {
     }
 
     /// Refuse a session the edge opened, telling its client why.
+    /// The per-address slot of the session `open` opens from `client`; `None`,
+    /// the client told and the refusal counted, past the limit.
+    async fn admit_address(
+        &self,
+        session: SessionId,
+        open: &Open,
+        client: ClientIp,
+    ) -> Option<e6irc_edge::address::ConnGuard> {
+        let guard = self.server.limiter.try_acquire(client);
+        if guard.is_none() {
+            self.server
+                .limiter
+                .refusals()
+                .note(client, PeerRefusal::PerIpLimit, None);
+            self.server.telemetry.record_connection_rejected();
+            self.refuse(
+                session,
+                open.address,
+                open.kind,
+                "Too many connections from your address",
+            )
+            .await;
+        }
+        guard
+    }
+
     async fn refuse(
         &self,
         session: SessionId,
@@ -1025,19 +1051,7 @@ impl SessionStream {
                 self.open_irc(session, ClientIp::new(address), transport, None, guard);
             }
             SessionKind::Irc => {
-                let Some(guard) = self.server.limiter.try_acquire(client) else {
-                    self.server
-                        .limiter
-                        .refusals()
-                        .note(client, PeerRefusal::PerIpLimit, None);
-                    self.server.telemetry.record_connection_rejected();
-                    self.refuse(
-                        session,
-                        open.address,
-                        open.kind,
-                        "Too many connections from your address",
-                    )
-                    .await;
+                let Some(guard) = self.admit_address(session, &open, client).await else {
                     return;
                 };
                 self.open_irc(session, client, transport, open.tls, guard);
@@ -1053,19 +1067,7 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                let Some(guard) = self.server.limiter.try_acquire(client) else {
-                    self.server
-                        .limiter
-                        .refusals()
-                        .note(client, PeerRefusal::PerIpLimit, None);
-                    self.server.telemetry.record_connection_rejected();
-                    self.refuse(
-                        session,
-                        open.address,
-                        open.kind,
-                        "Too many connections from your address",
-                    )
-                    .await;
+                let Some(guard) = self.admit_address(session, &open, client).await else {
                     return;
                 };
                 let edge = if self.version >= 2 {

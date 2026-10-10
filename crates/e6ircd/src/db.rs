@@ -9299,14 +9299,48 @@ pub async fn bnc_ring(
 }
 
 /// Claim `(owner, network)`'s ring for a running ring of `epoch`: the epoch is
-/// stored, and no stop is claimed clean until this one says so.
+/// stored, and no stop is claimed clean until this one says so. A ring of a
+/// new epoch — claimed before its run stores a line — gives each of its
+/// `restored` rows (the row, and the position it took) its position in it,
+/// and every other stored row none, in the same transaction: a stored
+/// position is always the line's in the claimed ring, so the epoch a clean
+/// stop records continues with every line where its clients saw it.
 pub async fn claim_bnc_ring(
     pool: &PgPool,
     owner: &str,
     network: &str,
     epoch: u64,
+    restored: Option<&[(i64, u64)]>,
 ) -> Result<(), DbError> {
     let key = BncBufferKey::new(owner, network);
+    let mut tx = pool.begin().await.map_err(query_error)?;
+    if let Some(restored) = restored {
+        sqlx::query("UPDATE bnc_buffer SET seq = NULL WHERE owner = $1 AND network = $2")
+            .bind(&key.owner)
+            .bind(&key.network)
+            .execute(&mut *tx)
+            .await
+            .map_err(query_error)?;
+        let (ids, seqs): (Vec<i64>, Vec<i64>) = restored
+            .iter()
+            .map(|(id, seq)| Ok((*id, ring_position(*seq)?)))
+            .collect::<Result<Vec<_>, DbError>>()?
+            .into_iter()
+            .unzip();
+        sqlx::query(
+            "UPDATE bnc_buffer SET seq = restored.seq
+             FROM unnest($3::BIGINT[], $4::BIGINT[]) AS restored(id, seq)
+             WHERE bnc_buffer.id = restored.id
+               AND bnc_buffer.owner = $1 AND bnc_buffer.network = $2",
+        )
+        .bind(&key.owner)
+        .bind(&key.network)
+        .bind(&ids)
+        .bind(&seqs)
+        .execute(&mut *tx)
+        .await
+        .map_err(query_error)?;
+    }
     sqlx::query(
         "INSERT INTO bnc_ring_positions (owner, network, epoch, clean_through)
          VALUES ($1, $2, $3, NULL)
@@ -9315,9 +9349,10 @@ pub async fn claim_bnc_ring(
     .bind(&key.owner)
     .bind(&key.network)
     .bind(epoch.cast_signed())
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(())
 }
 
@@ -9568,6 +9603,8 @@ pub enum StoredOwnNick {
 /// One stored backlog line, for a ring restored from storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBacklogLine {
+    /// The row: what a restore that gives the line a new position rewrites.
+    pub id: i64,
     pub line: String,
     /// The time it was stored under: its `time` tag, or its arrival.
     pub stored_at: String,
@@ -9579,6 +9616,7 @@ pub struct StoredBacklogLine {
 
 #[derive(sqlx::FromRow)]
 struct StoredBacklogRow {
+    id: i64,
     line: String,
     stored_at: String,
     own_nick: Option<String>,
@@ -9595,6 +9633,7 @@ impl From<StoredBacklogRow> for StoredBacklogLine {
             (true, Some(nick)) => StoredOwnNick::Nick(nick),
         };
         Self {
+            id: row.id,
             line: row.line,
             stored_at: row.stored_at,
             own_nick,
@@ -9618,7 +9657,7 @@ pub async fn recent_bnc_backlog(
     // buffer's replay cost grew with everyone else's traffic. A row from
     // before `sent_at` existed has its arrival.
     let rows: Vec<StoredBacklogRow> = sqlx::query_as(
-        "SELECT line,
+        "SELECT id, line,
                 coalesce(sent_at,
                          to_char(created_at AT TIME ZONE 'UTC',
                                  'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) AS stored_at,
