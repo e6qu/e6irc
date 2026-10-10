@@ -115,7 +115,8 @@ pub(crate) fn ctcp_action(text: &str) -> Option<&str> {
 }
 
 /// Whether `text` is a CTCP other than [`ctcp_action`] (`\x01VERSION\x01`,
-/// `\x01PING 1\x01`, a DCC offer): a request its recipient's client answers.
+/// `\x01PING 1\x01`, a direct file-transfer offer): a request its
+/// recipient's client answers.
 /// One predicate, read by the core's `+C` check, the bridges' outbound
 /// translation and the bouncer's backlog, which keeps none of them.
 pub(crate) fn is_ctcp_request(text: &str) -> bool {

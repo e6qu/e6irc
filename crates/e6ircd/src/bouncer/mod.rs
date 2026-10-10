@@ -4664,8 +4664,9 @@ const PRESENCE_NUMERICS: &[u16] = &[600, 601, 604, 605, 730, 731];
 ///
 /// - A `TAGMSG` history keeps nothing of (a typing indicator): a moment, not
 ///   conversation.
-/// - A CTCP request (`\x01VERSION\x01`, `\x01PING …\x01`, a DCC offer): a
-///   question to the clients attached when it was asked. Replayed, every
+/// - A CTCP request (`\x01VERSION\x01`, `\x01PING …\x01`, a direct
+///   file-transfer offer): a question to the clients attached when it was
+///   asked. Replayed, every
 ///   client that attached later answered it again — hours after it was asked,
 ///   once per attach — as neither ZNC nor soju ever does.
 /// - A channel's state as the numerics that follow our own `JOIN` state it

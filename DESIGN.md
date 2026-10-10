@@ -3278,8 +3278,8 @@ above the trait, provides for every network kind:
 - **What the backlog never keeps** (`told_live_only`, the one rule that
   publishing a line or an echo, persisting it and restoring it all read): a
   `TAGMSG` history keeps nothing of (a typing indicator); a CTCP request
-  other than `ACTION` (`VERSION`, `PING`, a DCC offer), which is a question to
-  the clients attached when it is asked — replayed, every client that
+  other than `ACTION` (`VERSION`, `PING`, a direct file-transfer offer),
+  which is a question to the clients attached when it is asked — replayed, every client that
   attached later answered it again, hours afterwards and once per attach,
   which neither ZNC nor soju does; and a channel's modes, topic and member
   list (324, 328, 329, 331–333, 353, 366: what follows our own `JOIN`), which
