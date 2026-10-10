@@ -4,7 +4,7 @@ set -euo pipefail
 
 : "${SHAUTH_SOURCE_DIR:?SHAUTH_SOURCE_DIR must point to the exact Shauth checkout}"
 
-readonly expected_shauth_commit="0fda680cba964e5768ed75a9c3e5b7230c418ca6"
+readonly expected_shauth_commit="226ffffb9a046378334098c9bf34cc31776c34d4"
 actual_shauth_commit="$(git -C "$SHAUTH_SOURCE_DIR" rev-parse HEAD)"
 if [[ "$actual_shauth_commit" != "$expected_shauth_commit" ]]; then
   echo "Shauth checkout is $actual_shauth_commit; expected $expected_shauth_commit" >&2
@@ -93,8 +93,8 @@ export POSTGRES_PASSWORD
 HYDRA_SYSTEM_SECRET="$(random_secret)"
 export HYDRA_SYSTEM_SECRET
 export HYDRA_DSN="postgres://shauth:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable"
-# Shauth proxies Hydra on this public origin; the issuer must match discovery.
-export HYDRA_PUBLIC_URL="http://localhost:8080"
+# Shauth proxies Hydra on this public origin, which Shauth's compose file makes
+# Hydra's issuer; the issuer must match discovery.
 export SHAUTH_PUBLIC_URL="http://localhost:8080"
 export SHAUTH_DATABASE_URL="postgres://shauth:${POSTGRES_PASSWORD}@postgres:5432/shauth?sslmode=disable"
 export GITHUB_CLIENT_ID="local-password-integration"
@@ -103,11 +103,15 @@ SHAUTH_BOOTSTRAP_ADMIN_PASSWORD="$(random_secret)"
 export SHAUTH_BOOTSTRAP_ADMIN_PASSWORD
 SHAUTH_VALIDATOR_TOKEN="$(random_secret)"
 SHAUTH_VALIDATION_STATUS_TOKEN="$(random_secret)"
-if [[ "$SHAUTH_VALIDATOR_TOKEN" == "$SHAUTH_VALIDATION_STATUS_TOKEN" ]]; then
-  echo "Shauth validator and validation-status tokens must differ" >&2
+# Hydra presents this to Shauth's token hook before it issues any token.
+SHAUTH_TOKEN_HOOK_TOKEN="$(random_secret)"
+if [[ "$SHAUTH_VALIDATOR_TOKEN" == "$SHAUTH_VALIDATION_STATUS_TOKEN" ||
+      "$SHAUTH_TOKEN_HOOK_TOKEN" == "$SHAUTH_VALIDATOR_TOKEN" ||
+      "$SHAUTH_TOKEN_HOOK_TOKEN" == "$SHAUTH_VALIDATION_STATUS_TOKEN" ]]; then
+  echo "Shauth validator, validation-status and token-hook tokens must differ" >&2
   exit 1
 fi
-export SHAUTH_VALIDATOR_TOKEN SHAUTH_VALIDATION_STATUS_TOKEN
+export SHAUTH_VALIDATOR_TOKEN SHAUTH_VALIDATION_STATUS_TOKEN SHAUTH_TOKEN_HOOK_TOKEN
 E6IRC_NON_AUTHENTIC_CREDENTIAL_SENTINEL="$(random_secret)"
 if [[ "$E6IRC_NON_AUTHENTIC_CREDENTIAL_SENTINEL" == "$SHAUTH_BOOTSTRAP_ADMIN_PASSWORD" ]]; then
   echo "e6irc negative-probe sentinel must differ from the Shauth password" >&2
