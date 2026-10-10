@@ -2753,7 +2753,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     // A network deleted from its own page has no page left to refresh: reading
     // it again is a 404 shown as a failure, and its live panel would keep
     // polling for it. Go to the directory it was removed from.
-    if (method === "DELETE" && form.closest("[data-api-owner-network-detail]")) {
+    if (method === "DELETE" && form.matches("[data-api-owner-network-delete]") && form.closest("[data-api-owner-network-detail]")) {
       stopBackgroundRefreshes();
       window.location.assign("/console/networks");
       return;
@@ -2918,6 +2918,24 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       event.preventDefault();
       const name = decodeURIComponent(new URL(form.action).pathname.split("/").pop() || "");
       void mutateOwnerNetwork(form, form.action, "DELETE", undefined, `${name} removed.`);
+    } else if (form.matches("[data-api-network-certificate-generate]")) {
+      event.preventDefault();
+      const algorithm = fieldValue(new FormData(form), "algorithm");
+      void mutateOwnerNetwork(form, form.action, "POST", { action: "generate", algorithm }, "Client certificate generated; the network reconnects with it. Register its fingerprint with NickServ CERT ADD.");
+    } else if (form.matches("[data-api-network-certificate-upload]")) {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const certificate = String(fields.get("certificate") || "");
+      const key = String(fields.get("key") || "");
+      if (!certificate.trim() || !key.trim()) { setOwnerNetworkResult("Paste both the certificate and its private key.", false); return; }
+      void mutateOwnerNetwork(form, form.action, "POST", { action: "upload", certificate, key }, "Client certificate stored; the network reconnects with it.");
+    } else if (form.matches("[data-api-network-certificate-delete]")) {
+      event.preventDefault();
+      void mutateOwnerNetwork(form, form.action, "DELETE", undefined, "Client certificate removed; the network reconnects without it.");
+    } else if (form.matches("[data-api-network-remembered-forget]")) {
+      event.preventDefault();
+      const channel = form.dataset.channel || "";
+      void mutateOwnerNetwork(form, form.action, "DELETE", undefined, `${channel} is no longer rejoined.`);
     }
   });
 
@@ -2947,6 +2965,65 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) { toggleForm.hidden = operatorOwned; toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; }
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.hidden = operatorOwned; deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
       const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (operatorOwned) edit.hidden = true; else if (network.kind === "irc") { edit.href = `/?network=${encodeURIComponent(network.name)}&settings=1`; edit.textContent = "Edit settings"; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
+      // An IRC network the owner stores signs in with a client certificate
+      // and remembers the channels its session joins; a bridge and an
+      // operator's network do neither.
+      const ownIrc = network.kind === "irc" && !operatorOwned;
+      const base = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
+      const certificate = ownerNetworkDetail.querySelector("[data-network-certificate]");
+      if (certificate instanceof HTMLElement) {
+        certificate.hidden = !ownIrc;
+        const stored = network.client_certificate ?? null;
+        const show = (selector, visible) => { const node = certificate.querySelector(selector); if (node instanceof HTMLElement) node.hidden = !visible; };
+        show("[data-certificate-none]", !stored);
+        show("[data-certificate-fingerprints]", Boolean(stored));
+        show("[data-certificate-next]", Boolean(stored));
+        const sha256 = certificate.querySelector("[data-certificate-sha256]"); if (sha256) sha256.textContent = stored?.fingerprint_sha256 ?? "—";
+        const sha512 = certificate.querySelector("[data-certificate-sha512]"); if (sha512) sha512.textContent = stored?.fingerprint_sha512 ?? "—";
+        const generateButton = certificate.querySelector("[data-certificate-generate]"); if (generateButton) generateButton.textContent = stored ? "Generate a new certificate" : "Generate certificate";
+        for (const form of certificate.querySelectorAll("form")) {
+          form.action = `${base}/client-certificate`;
+          if (stored && !form.matches("[data-api-network-certificate-delete]")) form.dataset.confirm = "Replace the stored client certificate? The network's services know the old one's fingerprint until you register the new one with NickServ CERT ADD.";
+          else delete form.dataset.confirm;
+        }
+        const remove = certificate.querySelector("[data-api-network-certificate-delete]");
+        if (remove instanceof HTMLFormElement) { remove.hidden = !stored; remove.dataset.confirm = "Remove the client certificate? The network reconnects without it."; }
+        if (!network.tls) {
+          const note = certificate.querySelector("[data-certificate-none]");
+          if (note) note.textContent = "A client certificate is presented only over TLS; enable TLS in this network's settings first.";
+          for (const button of certificate.querySelectorAll('button[type="submit"]')) button.disabled = !stored;
+        }
+      }
+      const remembered = ownerNetworkDetail.querySelector("[data-network-remembered]");
+      if (remembered instanceof HTMLElement) {
+        remembered.hidden = !ownIrc;
+        const channels = network.remembered_channels ?? [];
+        const empty = remembered.querySelector("[data-remembered-empty]"); if (empty instanceof HTMLElement) empty.hidden = channels.length > 0;
+        const list = remembered.querySelector("[data-remembered-list]");
+        const csrf = ownerNetworkDetail.querySelector('input[name="csrf"]');
+        if (list instanceof HTMLElement) {
+          list.replaceChildren(...channels.map((entry) => {
+            const item = document.createElement("li");
+            const name = document.createElement("code");
+            name.textContent = entry.keyed ? `${entry.channel} (key stored encrypted)` : entry.channel;
+            const form = document.createElement("form");
+            form.method = "post";
+            form.action = `${base}/remembered-channels/${encodeURIComponent(entry.channel)}`;
+            form.dataset.apiNetworkRememberedForget = "";
+            form.dataset.channel = entry.channel;
+            form.dataset.confirm = `Stop rejoining ${entry.channel}? A session in it leaves it.`;
+            if (csrf instanceof HTMLInputElement) { const token = csrf.cloneNode(); form.append(token); }
+            const button = document.createElement("button");
+            button.type = "submit";
+            button.className = "danger";
+            button.textContent = "Remove";
+            ariaName(button, `Remove ${entry.channel}`);
+            form.append(button);
+            item.append(name, form);
+            return item;
+          }));
+        }
+      }
       const accountSetup = ownerNetworkDetail.querySelector("[data-network-account-setup]");
       if (accountSetup instanceof HTMLElement) {
         accountSetup.hidden = network.kind !== "irc" || operatorOwned;

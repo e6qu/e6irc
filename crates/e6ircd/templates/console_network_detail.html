@@ -34,6 +34,53 @@
       <div><span>Configured state</span><strong data-network-field="enabled">—</strong></div>
     </div>
 
+    <section class="panel" data-network-certificate hidden>
+      <div class="panel-head">
+        <div>
+          <h2>Client certificate</h2>
+          <p>A TLS client certificate signs this network in without a password: with SASL EXTERNAL where the network offers it, and otherwise by its fingerprint, which NickServ's CertFP recognises (OFTC). Saving reconnects the network.</p>
+        </div>
+      </div>
+      <p class="section-note" data-certificate-none>No client certificate is stored.</p>
+      <div class="network-summary" role="group" aria-label="Client certificate fingerprints" data-certificate-fingerprints hidden>
+        <div><span>SHA-256 fingerprint</span><code data-certificate-sha256>—</code></div>
+        <div><span>SHA-512 fingerprint</span><code data-certificate-sha512>—</code></div>
+      </div>
+      <p class="section-note" data-certificate-next hidden>Register it with the network's services from an identified session: <code>/msg NickServ CERT ADD</code> adds the certificate the session connected with, or name a fingerprint above after <code>CERT ADD</code>. The private key is stored encrypted and is never shown.</p>
+      <div class="account-setup-steps">
+        <form method="post" data-api-network-certificate-generate>
+          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+          <h3>Generate a certificate</h3>
+          <label class="field"><span>Key type</span><select name="algorithm"><option value="ecdsa_p256" selected>ECDSA P-256</option><option value="ed25519">Ed25519</option></select></label>
+          <button type="submit" data-certificate-generate>Generate certificate</button>
+        </form>
+        <details class="advanced">
+          <summary>Upload a certificate and key</summary>
+          <form method="post" data-api-network-certificate-upload>
+            <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+            <label class="field"><span>Certificate (PEM)</span><textarea name="certificate" rows="6" spellcheck="false" required></textarea></label>
+            <label class="field"><span>Private key (PEM)</span><textarea name="key" rows="6" spellcheck="false" autocomplete="off" required></textarea></label>
+            <button type="submit">Upload certificate</button>
+          </form>
+        </details>
+      </div>
+      <form method="post" data-api-network-certificate-delete hidden>
+        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <button class="danger" type="submit">Remove certificate</button>
+      </form>
+    </section>
+
+    <section class="panel" data-network-remembered hidden>
+      <div class="panel-head">
+        <div>
+          <h2>Remembered channels</h2>
+          <p>Channels the session was confirmed in, rejoined after a restart or an edit besides the configured ones. Removing one leaves it and stops rejoining it.</p>
+        </div>
+      </div>
+      <p class="section-note" data-remembered-empty>No channels are remembered.</p>
+      <ul class="remembered-channels" data-remembered-list></ul>
+    </section>
+
     <section class="panel account-setup" data-network-account-setup hidden>
       <div class="panel-head">
         <div>

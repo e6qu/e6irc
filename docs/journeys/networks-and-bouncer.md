@@ -69,7 +69,11 @@ constant) rather than keeping a copy of its own.
    and **Another network…**. **Nickname** defaults to the account name.
 3. Optionally enter the **NickServ account** and **NickServ password** of an
    account already held on that network, and **Channels to join**. Signing in to
-   Libera with existing credentials needs nothing else.
+   Libera with existing credentials needs nothing else. OFTC has no SASL
+   password login: its catalog entry says so (`authentication:
+   client_certificate`, with `guidance`), and it signs in with a client
+   certificate made on the network's page once saved
+   ([Sign in to a network with a client certificate](#sign-in-to-a-network-with-a-client-certificate)).
 4. What a known network already determines — **Name**, **Server**, **Use TLS**,
    **Real name** — sits under **Advanced**. Choosing **Another network…** opens
    it, because the name and server are then the person's to supply; so does any
@@ -199,6 +203,129 @@ qualifies only the egress where it ran. A 2026-08-23 production-container run
 proved OFTC and Ergo Testnet registration plus configured-channel joins from
 a cloud host, while Libera returned its verified-account requirement on that
 container's IPv4 path.
+
+## Sign in to a network with a client certificate
+
+**Actor and goal.** An account holder on a network without SASL PLAIN (OFTC),
+or one who would rather not store a password, wants the always-on session
+identified by a TLS client certificate: SASL EXTERNAL where the network offers
+it, NickServ's CertFP where it does not.
+
+**Preconditions.** A stored IRC network that uses TLS, a master key, and an
+account on the network's services from which the fingerprint can be
+registered. The OFTC preset says this is how OFTC signs in
+(`authentication: client_certificate`, with its guidance in the add dialog's
+catalog).
+
+**Flow.**
+
+1. On the network's console page, **Client certificate** offers **Generate
+   certificate** (ECDSA P-256 by default, or Ed25519) and, under **Upload a
+   certificate and key**, a PEM certificate and its private key
+   (`POST /api/v1/me/networks/{name}/client-certificate`, `generate` or
+   `upload`). The server seals the key, stores the certificate, and reconnects
+   the network with it.
+2. The page shows the certificate's SHA-256 and SHA-512 fingerprints, and says
+   how to register one: from an identified session, `/msg NickServ CERT ADD`
+   adds the certificate the session connected with (or name a fingerprint).
+3. From then on the driver presents the certificate on every connection. A
+   network that offers SASL `EXTERNAL` logs it in, and a `*bnc*` notice says
+   "upstream logged in with the client certificate (SASL EXTERNAL)"; on one
+   without `EXTERNAL` the session registers with the certificate alone and a
+   notice says so, and services identify it by its fingerprint.
+4. **Generate a new certificate** (or another upload) replaces it — a rotation,
+   after which the new fingerprint is registered the same way — and **Remove
+   certificate** (`DELETE …/client-certificate`) reconnects without one.
+
+**Visible failures and recovery.**
+
+- A certificate is presented only over TLS: on a network without TLS the
+  controls are disabled and the API answers `409` at the `tls` field, and an
+  edit that turns TLS off while a certificate is stored is refused the same
+  way.
+- An upload whose key does not belong to its certificate, or that is not PEM,
+  is refused with `400` naming the field (`certificate` or `key`).
+- A network that refuses the certificate over SASL EXTERNAL (its fingerprint
+  is not on the account yet) is offered the stored password next, with a
+  `*bnc*` notice, so it keeps connecting while the fingerprint is registered;
+  with no password the network parks as rejected credentials whose reason says
+  to run `NickServ CERT ADD`.
+- A network whose `sasl` capability names none of the mechanisms the stored
+  password can use parks at once (`sasl_mechanism_unavailable`), quoting what
+  it offers and, when that includes `EXTERNAL`, that it signs in with a client
+  certificate; one that offers no `sasl` at all is outlasted for about an hour
+  (a services outage) and then parks (`sasl_unavailable`), saying to remove
+  the SASL account or use a certificate.
+
+**Security and observability.** The private key is sealed with the master key
+under the owner's context, resealed by `rotate-secrets`, write-only in the API
+and never returned or logged (its `Debug` is redacted). The certificate is
+public. Setting and removing it is audited (`NETWORK_CERTIFICATE_SET`,
+`NETWORK_CERTIFICATE_REMOVE`) without key material. Generation uses rcgen on
+aws-lc-rs, the process's one crypto provider.
+
+**Evidence.** Proven. `a_client_certificate_logs_in_with_sasl_external` and
+`without_sasl_the_client_certificate_alone_registers` run the real driver over
+TLS against a scripted upstream that checks the certificate's fingerprint in
+the handshake; `sasl_external_logs_in_with_the_certificate`,
+`a_refused_certificate_falls_back_to_the_stored_password`,
+`a_refused_certificate_alone_is_a_credential_rejection_that_says_what_to_do`
+and `the_tls_handshake_presents_the_client_certificate` cover the client
+library; `a_network_client_certificate_is_generated_rotated_and_removed` proves
+the API against PostgreSQL (generate, rotate, upload, a mismatched key, the TLS
+rule, removal, audit); `a_sasl_mechanism_the_network_does_not_offer_parks_at_once`,
+`a_missing_sasl_capability_is_outlasted_then_parked` and
+`an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection` prove the
+refusal schedule. No public network's NickServ `CERT ADD` is exercised in CI.
+
+## Stay in channels across a restart or an edit
+
+**Actor and goal.** A user who joined channels from their IRC client wants the
+always-on session back in them after a redeploy or after editing the network,
+as ZNC and soju keep them, without listing them in autojoin.
+
+**Preconditions.** PostgreSQL, a stored IRC network, and, for a keyed channel's
+key to be kept, a master key.
+
+**Flow.**
+
+1. A client attached to the network joins a channel. Once the upstream echoes
+   the `JOIN` for the session's own nick, the channel is remembered: the
+   network's writer stores the session's whole set of channels, with the key a
+   channel was joined with, sealed.
+2. The console's network page lists **Remembered channels** (a keyed one says
+   its key is stored encrypted), as does `GET /api/v1/me/networks/{name}`
+   (`remembered_channels`, each with `keyed`).
+3. After a process restart the new driver rejoins the remembered channels with
+   the configured autojoin; after an edit the replacement driver goes on from
+   its predecessor's set.
+4. A `PART`, a `KICK` of the session (told with the kicker's reason), or a
+   rejoin the upstream refuses (told with its reason) forgets the channel.
+   **Remove** beside a remembered channel
+   (`DELETE /api/v1/me/networks/{name}/remembered-channels/{channel}`) forgets
+   it and leaves it when the session is in it.
+
+**Visible failures and recovery.** A write that fails leaves the previous set
+stored, is retried every five seconds, and is told live as
+`remembered_channels_storage_failed`; the session itself never waits on the
+database. A channel the network does not remember answers `404`. Without a
+master key a channel is remembered without its key, and its rejoin may then be
+refused (and forgotten, with a notice).
+
+**Security and observability.** Learned keys are sealed like configured ones
+and only ever listed as `keyed`; removal is owner-authenticated, serialized
+with every other network mutation, and audited (`NETWORK_CHANNEL_FORGET`). The
+rows die with their network.
+
+**Evidence.** Proven. `joined_channels_are_remembered_across_restarts_and_edits`
+runs the daemon against PostgreSQL and a live upstream: a client joins (one
+channel with a key, stored sealed) and parts, the daemon restarts and rejoins,
+an edit rejoins under a new nickname, and the API removal parts and forgets.
+`remembered_channels_are_rejoined_by_a_new_driver`,
+`a_kick_stops_the_rejoin_and_says_why` and
+`runtime_joined_channels_are_rejoined_after_reconnect` prove the driver;
+`remembered_channels_and_client_certificates_belong_to_their_network` and
+`secret_rotation_reseals_every_database_secret_atomically` prove the storage.
 
 ## Register and verify an upstream IRC account
 

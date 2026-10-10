@@ -1731,6 +1731,9 @@ async fn bnc_networks_are_capped_per_account() {
         sasl_password_sealed: None,
         enabled: true,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     // Mint the maximum (32); each succeeds.
     for i in 0..32 {
@@ -2942,6 +2945,9 @@ async fn bnc_networks_crud() {
         sasl_password_sealed: Some("enc:v1:abc".into()),
         enabled: true,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     db::create_bnc_network(
         &pool,
@@ -3068,6 +3074,9 @@ async fn bnc_networks_crud() {
         sasl_password_sealed: Some("enc:v2:sealed".into()),
         enabled: true,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     db::create_bnc_network(
         &pool,
@@ -3255,6 +3264,9 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         sasl_password_sealed: None,
         enabled: true,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     db::create_bnc_network(
         &pool,
@@ -3410,6 +3422,9 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         sasl_password_sealed: None,
         enabled: true,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     db::create_bnc_network(
         &pool,
@@ -5212,6 +5227,8 @@ async fn a_sealed_server_password_round_trips_through_every_network_query() {
         sasl_account: None,
         sasl_password_sealed: None,
         server_password_sealed: Some(sealed.clone()),
+        client_certificate: None,
+        remembered_channels: Vec::new(),
         enabled: true,
     };
     db::create_bnc_network(
@@ -6750,6 +6767,9 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         sasl_password_sealed: Some(old.seal("xapp-account", &owner_context)),
         enabled: false,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     db::create_bnc_network(
         &pool,
@@ -6780,6 +6800,8 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         sasl_account: None,
         sasl_password_sealed: None,
         server_password_sealed: Some(old.seal("account-pass", &owner_context)),
+        client_certificate: None,
+        remembered_channels: Vec::new(),
         enabled: false,
     };
     db::create_bnc_network(
@@ -6793,6 +6815,39 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
     )
     .await
     .expect("private account network");
+    // The client certificate's key, and a key a session learned for a channel
+    // it remembers, are account-network secrets too.
+    assert!(
+        db::set_bnc_network_client_certificate(
+            &pool,
+            "alice",
+            "private",
+            Some(&db::BncClientCertificate {
+                certificate_pem: "-----BEGIN CERTIFICATE-----".into(),
+                key_sealed: old.seal("client-key", &owner_context),
+            }),
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: "",
+            },
+        )
+        .await
+        .expect("certificate")
+    );
+    db::replace_bnc_remembered_channels(
+        &pool,
+        "alice",
+        "private",
+        &[
+            db::BncAutojoin {
+                channel: "#learned".into(),
+                key_sealed: Some(old.seal("learned-key", &owner_context)),
+            },
+            "#plain".into(),
+        ],
+    )
+    .await
+    .expect("remembered channels");
 
     let new = SecretKey::generate();
     let new_base64 = new.to_base64();
@@ -6804,7 +6859,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         report,
         db::SecretRotationReport {
             managed_config_secrets: 5,
-            account_network_secrets: 4,
+            account_network_secrets: 6,
         }
     );
 
@@ -6848,6 +6903,42 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         "an account network's channel key is resealed"
     );
     assert_eq!(rotated_private.autojoin[1], db::BncAutojoin::from("#open"));
+    assert_eq!(
+        new_verifier
+            .open(
+                &rotated_private
+                    .client_certificate
+                    .as_ref()
+                    .expect("certificate")
+                    .key_sealed,
+                &owner_context,
+            )
+            .unwrap(),
+        "client-key",
+        "a client certificate's key is resealed"
+    );
+    assert_eq!(
+        rotated_private.remembered_channels[0].channel, "#learned",
+        "{:?}",
+        rotated_private.remembered_channels
+    );
+    assert_eq!(
+        new_verifier
+            .open(
+                rotated_private.remembered_channels[0]
+                    .key_sealed
+                    .as_deref()
+                    .unwrap(),
+                &owner_context,
+            )
+            .unwrap(),
+        "learned-key",
+        "a remembered channel's key is resealed"
+    );
+    assert_eq!(
+        rotated_private.remembered_channels[1],
+        db::BncAutojoin::from("#plain")
+    );
     let managed_pass = rotated.settings.networks[1]
         .server_password
         .as_deref()
@@ -6925,6 +7016,9 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
             sasl_password_sealed: Some("enc:v2:not-base64".into()),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "alice",
@@ -11257,6 +11351,8 @@ fn audit_test_network(name: &str) -> db::BncNetworkRow {
         sasl_password_sealed: None,
         enabled: true,
         server_password_sealed: None,
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     }
 }
 
@@ -14158,4 +14254,130 @@ async fn an_oidc_flow_is_spent_once_atomically() {
             .iter()
             .all(|digest| digest.len() == 32 && digest != b"state-1")
     );
+}
+
+/// A network's remembered channels are its session's: written as a whole set
+/// (so a failed write leaves the previous one), forgotten one at a time by a
+/// case-insensitive name with an audit row, never kept for a network that is
+/// gone, and a client certificate fits only an IRC network over TLS.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn remembered_channels_and_client_certificates_belong_to_their_network() {
+    let url = support::test_db("remembered_channels_belong_to_their_network").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "alice", "pw", None)
+        .await
+        .expect("account");
+    let audit = e6ircd::db::NetworkAudit {
+        actor: "alice",
+        detail: "",
+    };
+    let mut network = audit_test_network("work");
+    db::create_bnc_network(&pool, "alice", &network, audit)
+        .await
+        .expect("network");
+    let stored = |channels: &[&str]| -> Vec<db::BncAutojoin> {
+        channels.iter().map(|channel| (*channel).into()).collect()
+    };
+    db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#a", "#B", "#c"]))
+        .await
+        .expect("first set");
+    db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#B", "#c", "#d"]))
+        .await
+        .expect("second set");
+    let read = db::get_bnc_network(&pool, "alice", "work")
+        .await
+        .expect("read")
+        .expect("network");
+    assert_eq!(read.remembered_channels, stored(&["#B", "#c", "#d"]));
+
+    // Forgotten by name, whatever its case, and audited; an unknown name is
+    // not a change.
+    assert!(
+        db::forget_bnc_remembered_channel(&pool, "alice", "work", "#b", audit)
+            .await
+            .expect("forget")
+    );
+    assert!(
+        !db::forget_bnc_remembered_channel(&pool, "alice", "work", "#nowhere", audit)
+            .await
+            .expect("forget unknown")
+    );
+    let forgotten: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'NETWORK_CHANNEL_FORGET' \
+         AND target = 'alice/work' AND detail LIKE '%channel=#b%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(forgotten, 1);
+    let read = db::get_bnc_network(&pool, "alice", "work")
+        .await
+        .expect("read")
+        .expect("network");
+    assert_eq!(read.remembered_channels, stored(&["#c", "#d"]));
+
+    // A name that is not one JOIN parameter is refused by the table.
+    assert!(
+        db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#two words"]))
+            .await
+            .is_err()
+    );
+
+    // A client certificate: only with TLS, removed again on request.
+    let certificate = db::BncClientCertificate {
+        certificate_pem: "-----BEGIN CERTIFICATE-----".into(),
+        key_sealed: "enc:v2:sealed".into(),
+    };
+    assert!(
+        db::set_bnc_network_client_certificate(&pool, "alice", "work", Some(&certificate), audit)
+            .await
+            .expect("set")
+    );
+    assert_eq!(
+        db::get_bnc_network(&pool, "alice", "work")
+            .await
+            .expect("read")
+            .expect("network")
+            .client_certificate,
+        Some(certificate.clone())
+    );
+    network.tls = false;
+    assert!(
+        db::update_bnc_network(&pool, "alice", "work", &network, audit)
+            .await
+            .is_err(),
+        "a stored certificate keeps the network on TLS"
+    );
+    assert!(
+        db::set_bnc_network_client_certificate(&pool, "alice", "work", None, audit)
+            .await
+            .expect("remove")
+    );
+    assert!(
+        db::update_bnc_network(&pool, "alice", "work", &network, audit)
+            .await
+            .expect("update"),
+    );
+
+    // The rows die with their network; a write for a network that is gone
+    // writes nothing.
+    assert!(
+        db::delete_bnc_network(&pool, "alice", "work", audit)
+            .await
+            .expect("delete")
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_remembered_channels")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 0);
+    db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#late"]))
+        .await
+        .expect("a late write of a deleted network is not an error");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_remembered_channels")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 0);
 }

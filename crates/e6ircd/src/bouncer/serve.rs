@@ -62,6 +62,10 @@ pub struct Registry {
     /// an older edit adding its driver back as an untracked live network.
     mutations: Arc<tokio::sync::Mutex<()>>,
     pool: Option<PgPool>,
+    /// The master keyring, which seals the keys of the channels a stored
+    /// network remembers; `None` when the server has none, and then no key
+    /// is stored.
+    secret_keys: Option<Arc<crate::secret::SecretKeyring>>,
     telemetry: Option<Arc<crate::observability::Telemetry>>,
     /// The server's policy on upstreams inside its own network, applied to
     /// every driver this registry builds.
@@ -251,11 +255,23 @@ impl NetworkDefinition {
     }
 }
 
+/// What a registry stores its networks' state in: the database, and the
+/// master keyring that seals the secrets it writes there. Without a pool
+/// nothing is stored.
+#[derive(Default)]
+pub(crate) struct Storage {
+    pub(crate) pool: Option<PgPool>,
+    pub(crate) secret_keys: Option<Arc<crate::secret::SecretKeyring>>,
+}
+
 /// A registered network: its driver handle, the persistence task that
 /// mirrors upstream lines to the database, and where it is defined.
 struct Slot {
     handle: Arc<NetworkHandle>,
     persistence: Option<Persistence>,
+    /// For a stored IRC network with a database, the writer of the channels it
+    /// rejoins after a restart.
+    memory: Option<super::channel_memory::ChannelMemory>,
     /// The driver's stable kind (`irc`, `matrix`, `discord`, `slack`, …),
     /// captured before `start()` consumes the driver — for status views.
     kind: &'static str,
@@ -289,6 +305,7 @@ impl Slot {
         Self {
             handle: Arc::new(handle),
             persistence: None,
+            memory: None,
             kind: entry.kind.as_db_str(),
             definition,
             restart: Some(Arc::new(entry.clone())),
@@ -326,6 +343,9 @@ fn configured_driver(
             autojoin: identity.autojoin,
             buffer_cap: e.buffer_cap,
             sasl: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
+            tls_roots: None,
             server_password: None,
             keepalive_idle: super::KEEPALIVE_IDLE,
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
@@ -359,6 +379,10 @@ fn configured_driver(
         sasl_account: e.sasl_account.clone(),
         sasl_password: e.sasl_password.clone(),
         server_password: e.server_password.clone(),
+        // A configured network is the operator's declaration: its channels
+        // are its autojoin, and it has no row to remember others in.
+        client_certificate: None,
+        remembered_channels: Vec::new(),
         internal_upstreams,
         first_dial: super::FirstDial::Immediate,
     })
@@ -466,6 +490,9 @@ impl Slot {
         if let Some(persistence) = self.persistence {
             persistence.stop(unwritten).await;
         }
+        if let Some(memory) = self.memory {
+            memory.stop(unwritten).await;
+        }
     }
 }
 
@@ -484,7 +511,7 @@ impl Registry {
     pub(crate) fn start_observed(
         entries: &[NetworkEntry],
         holds: &HashMap<String, OwnerHold>,
-        pool: Option<PgPool>,
+        storage: Storage,
         core: super::CoreHandles,
         telemetry: Arc<crate::observability::Telemetry>,
         internal_upstreams: crate::egress::InternalUpstreams,
@@ -492,7 +519,7 @@ impl Registry {
         Self::start_inner(
             entries,
             holds,
-            pool,
+            storage,
             core,
             Some(telemetry),
             internal_upstreams,
@@ -502,7 +529,7 @@ impl Registry {
     fn start_inner(
         entries: &[NetworkEntry],
         holds: &HashMap<String, OwnerHold>,
-        pool: Option<PgPool>,
+        storage: Storage,
         core: super::CoreHandles,
         telemetry: Option<Arc<crate::observability::Telemetry>>,
         internal_upstreams: crate::egress::InternalUpstreams,
@@ -510,7 +537,8 @@ impl Registry {
         let registry = Self {
             networks: Mutex::new(Networks::default()),
             mutations: Arc::new(tokio::sync::Mutex::new(())),
-            pool,
+            pool: storage.pool,
+            secret_keys: storage.secret_keys,
             telemetry,
             internal_upstreams,
             history_retention: core.core_tx.history_retention(),
@@ -549,6 +577,7 @@ impl Registry {
                     definition,
                     driver,
                     Some(Arc::new(e.clone())),
+                    None,
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -615,7 +644,7 @@ impl Registry {
         definition: NetworkDefinition,
         driver: Box<dyn super::NetworkDriver>,
     ) -> Result<(), AddRefused> {
-        self.insert(owner, name, definition, driver, None)
+        self.insert(owner, name, definition, driver, None, None)
     }
 
     /// [`Registry::add`], remembering the configuration entry a configured
@@ -627,6 +656,7 @@ impl Registry {
         definition: NetworkDefinition,
         driver: Box<dyn super::NetworkDriver>,
         restart: Option<Arc<NetworkEntry>>,
+        predecessor: Option<Arc<NetworkHandle>>,
     ) -> Result<(), AddRefused> {
         let key = NetworkKey::new(owner, name);
         // Held across the start, so the occupancy check cannot race a second
@@ -663,6 +693,30 @@ impl Registry {
                 handle.clone(),
             )
         });
+        // A stored IRC network remembers the channels its session is in
+        // across restarts; a configured one has no row to remember them in.
+        let memory = match (&self.pool, &key.owner, &definition, kind) {
+            (Some(pool), Some(owner), NetworkDefinition::Stored, "irc") => {
+                Some(super::channel_memory::spawn(
+                    super::channel_memory::ChannelStore {
+                        pool: pool.clone(),
+                        owner: owner.clone(),
+                        network: key.name.clone(),
+                        keys: self.secret_keys.clone(),
+                    },
+                    handle.clone(),
+                ))
+            }
+            _ => None,
+        };
+        // A reconfigured network goes on from where its predecessor was, keys
+        // it learned included; written by the writer above, which is already
+        // listening.
+        if let Some(predecessor) = predecessor.filter(|_| kind == "irc") {
+            handle
+                .joined_channels()
+                .carry_over(predecessor.joined_channels());
+        }
         run.spawn();
         networks.unstartable.remove(&key);
         networks.slots.insert(
@@ -670,6 +724,7 @@ impl Registry {
             Slot {
                 handle,
                 persistence,
+                memory,
                 kind,
                 definition,
                 restart,
@@ -751,6 +806,9 @@ impl Registry {
                     Some(persistence) => persistence.stop_by(UnwrittenLines::Store, deadline).await,
                     None => true,
                 };
+                if let Some(memory) = slot.memory {
+                    memory.stop_by(UnwrittenLines::Store, deadline).await;
+                }
                 (released, written)
             });
         }
@@ -950,12 +1008,22 @@ impl MutationLane {
         {
             return Err(RegistryClosed.into());
         }
-        if let Some(old) = self.take_stored(owner, name, true)? {
-            old.stop(UnwrittenLines::Store).await;
-        }
-        let added = self
-            .registry
-            .add(owner, name, NetworkDefinition::Stored, driver);
+        let predecessor = match self.take_stored(owner, name, true)? {
+            Some(old) => {
+                let handle = old.handle.clone();
+                old.stop(UnwrittenLines::Store).await;
+                Some(handle)
+            }
+            None => None,
+        };
+        let added = self.registry.insert(
+            owner,
+            name,
+            NetworkDefinition::Stored,
+            driver,
+            None,
+            predecessor,
+        );
         self.registry
             .networks
             .lock()
@@ -1135,7 +1203,7 @@ impl MutationLane {
                     // lane first, so the key is free and the registry open.
                     drop(networks);
                     self.registry
-                        .insert(key.owner.as_deref(), &name, definition, driver, entry)
+                        .insert(key.owner.as_deref(), &name, definition, driver, entry, None)
                         .expect("the mutation lane serializes registry writers");
                     networks = self.registry.networks.lock().expect("registry poisoned");
                     started.push(name);
@@ -2942,6 +3010,7 @@ mod key_tests {
             networks: Mutex::new(Networks::default()),
             mutations: Arc::new(tokio::sync::Mutex::new(())),
             pool: None,
+            secret_keys: None,
             telemetry: None,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             history_retention: crate::core::HistoryRetention::default(),
@@ -3039,7 +3108,7 @@ mod key_tests {
             let started = Registry::start_inner(
                 std::slice::from_ref(&network),
                 &HashMap::new(),
-                None,
+                Storage::default(),
                 super::super::CoreHandles {
                     core_tx: crate::core::CoreIngress::single(core_tx),
                     next_conn: Arc::new(crate::core::ConnectionIdAllocator::new(
@@ -3138,7 +3207,7 @@ mod key_tests {
             Registry::start_inner(
                 &[owned_configured_entry()],
                 &HashMap::new(),
-                None,
+                Storage::default(),
                 test_core(),
                 None,
                 crate::egress::InternalUpstreams::Allow,
@@ -3213,7 +3282,7 @@ mod key_tests {
             let registry = Registry::start_inner(
                 &[owned_configured_entry()],
                 &HashMap::from([("alice".to_string(), hold)]),
-                None,
+                Storage::default(),
                 test_core(),
                 None,
                 crate::egress::InternalUpstreams::Allow,
@@ -3673,6 +3742,7 @@ mod key_tests {
         Slot {
             handle: Arc::new(handle),
             persistence: Some(Persistence { stop, task }),
+            memory: None,
             kind: "loopback",
             definition: NetworkDefinition::Stored,
             restart: None,

@@ -210,6 +210,24 @@ It uses **SASLprep** (RFC 4013), the normalization applied to the account name
 and password first, and **PBKDF2**, the iterated key derivation that salts the
 password.
 
+**Client certificate / CertFP** — a TLS certificate the client presents in
+the handshake, here the bouncer towards an upstream network. Services
+recognise it by its **fingerprint** (the SHA-256 or SHA-512 digest of the
+certificate) once the account owner has registered it with NickServ
+`CERT ADD`: **CertFP** ("certificate fingerprint") identifies the account on
+every connection with no password, which is how OFTC authenticates. A network
+that offers **SASL EXTERNAL** logs the certificate in during the handshake
+instead ("external" because the credential is the one the transport already
+carried). A generated one is self-signed: services compare fingerprints, not a
+chain.
+
+**ECDSA / Ed25519** — the signature algorithms a generated client certificate
+uses: **ECDSA** is the Elliptic Curve Digital Signature Algorithm (here on the
+P-256 curve), **Ed25519** the Edwards-curve signature scheme on Curve25519. An
+uploaded key may also be RSA. It is read in PEM form as **PKCS** #8 or #1
+(Public-Key Cryptography Standards) or **SEC** 1 (Standards for Efficient
+Cryptography).
+
 **GS2** — the Generic Security Service Application Program Interface
 bridge for SASL (RFC 5801): the header (`n,a=<authzid>,`) that opens an
 `OAUTHBEARER` response (RFC 7628) and a SCRAM one, naming channel binding and
@@ -357,7 +375,14 @@ reports its client reached over HTTPS; `websocket` is any other.
 (`IRC_NETWORK_PRESETS`: Libera Chat, OFTC, Snoonet), served at
 `GET /api/v1/network-presets`. Every preset is a TLS endpoint on port 6697. A
 preset only fills the add-network form; the request carries the resulting
-fields, never a preset identifier.
+fields, never a preset identifier. Each says how the network authenticates an
+account (`sasl`, or `client_certificate` for OFTC) and how to set it up.
+
+**Remembered channel** — a channel a stored IRC network's session was
+confirmed in (the upstream echoed our own `JOIN`), kept in PostgreSQL with its
+key sealed, and rejoined beside the configured autojoin after a process
+restart or an edit of the network. A `PART`, a `KICK` of the session, a rejoin
+the upstream refuses, or its removal from the console forgets it.
 
 **Preflight** — the optional **Test connection** diagnostic
 (`POST /api/v1/me/network-preflight`, `preflight_irc`). It resolves, connects,

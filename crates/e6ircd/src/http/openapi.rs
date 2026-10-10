@@ -421,9 +421,17 @@ fn operations() -> serde_json::Value {
         "type": ["string", "null"], "minLength": 1, "maxLength": super::networks::MAX_UPSTREAM_PASSWORD_LEN, "writeOnly": true
     });
     let bridge_secret_schema = |max_length: usize| serde_json::json!({ "type": "string", "minLength": 1, "maxLength": max_length, "writeOnly": true });
+    let certificate_fingerprints_schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["fingerprint_sha256", "fingerprint_sha512"],
+        "properties": {
+            "fingerprint_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "fingerprint_sha512": { "type": "string", "pattern": "^[0-9a-f]{128}$" }
+        }
+    });
     let network_response_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "autojoin_keyed", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime", "configured"],
+        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "autojoin_keyed", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "client_certificate", "remembered_channels", "enabled", "connected", "runtime", "configured"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
             "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
@@ -434,6 +442,15 @@ fn operations() -> serde_json::Value {
             "autojoin_keyed": { "type": "array", "items": { "type": "string" }, "description": "The channels among autojoin that have a key stored. The key is stored sealed and never returned." },
             "sasl_account": { "type": ["string", "null"] },
             "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" }, "has_server_password": { "type": "boolean" },
+            "client_certificate": { "oneOf": [{ "type": "null" }, certificate_fingerprints_schema.clone()],
+                "description": "The TLS client certificate an IRC network presents (SASL EXTERNAL, or NickServ CertFP), by its fingerprints; null when none is stored. Its key is never returned." },
+            "remembered_channels": { "type": "array", "maxItems": 512, "items": {
+                "type": "object", "additionalProperties": false, "required": ["channel", "keyed"],
+                "properties": {
+                    "channel": { "type": "string", "minLength": 2, "maxLength": 200 },
+                    "keyed": { "type": "boolean", "description": "Whether the key it is joined with is stored, sealed; never returned." }
+                } },
+                "description": "Channels the session was confirmed in, rejoined after a restart or an edit besides autojoin. Remove one with DELETE /api/v1/me/networks/{name}/remembered-channels/{channel}." },
             "enabled": { "type": "boolean" }, "connected": { "type": ["boolean", "null"] },
             "configured": { "type": "boolean", "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409)." },
             "runtime": { "oneOf": [
@@ -452,7 +469,7 @@ fn operations() -> serde_json::Value {
                         "last_error": { "oneOf": [
                             { "type": "null" },
                             { "type": "object", "additionalProperties": false, "required": ["code", "summary"],
-                                "properties": { "code": { "type": "string" }, "summary": { "type": "string" }, "diagnostic": { "type": "string", "maxLength": 160 } } }
+                                "properties": { "code": { "type": "string" }, "summary": { "type": "string" }, "diagnostic": { "type": "string", "maxLength": e6irc_client::MAX_DIAGNOSTIC_CHARS, "description": "The upstream's own words, bounded and free of control characters." } } }
                         ] },
                         "connect_latency_ms": { "type": ["integer", "null"], "minimum": 0 },
                         "connection_attempts": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 },
@@ -1199,13 +1216,16 @@ fn operations() -> serde_json::Value {
                         "type": "object", "additionalProperties": false, "required": ["presets"],
                         "properties": { "presets": { "type": "array", "maxItems": 32, "items": {
                             "type": "object", "additionalProperties": false,
-                            "required": ["id", "label", "name", "addr", "tls"],
+                            "required": ["id", "label", "name", "addr", "tls", "authentication", "guidance"],
                             "properties": {
                                 "id": { "type": "string", "minLength": 1, "maxLength": 64 },
                                 "label": { "type": "string", "minLength": 1, "maxLength": 64 },
                                 "name": { "type": "string", "minLength": 1, "maxLength": 64 },
                                 "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
-                                "tls": { "type": "boolean" }
+                                "tls": { "type": "boolean" },
+                                "authentication": { "type": "string", "enum": ["sasl", "client_certificate"],
+                                    "description": "sasl: the NickServ account's password over SASL. client_certificate: the network has no SASL password login; a TLS client certificate whose fingerprint NickServ knows (CertFP) identifies the account." },
+                                "guidance": { "type": "string", "minLength": 1, "maxLength": 400 }
                             } } } }
                     }))
                 }
@@ -1901,6 +1921,79 @@ fn operations() -> serde_json::Value {
                         "409": { "description": "the account's network with this upstream and nickname is running and holds the nickname; disable it to test its settings" },
                         "429": { "description": "this account already has a connection test running, has started six in the last minute, or the server is running as many as it allows at once; Retry-After gives the seconds to wait" },
                         "502": { "description": "typed upstream DNS, transport, TLS, authentication, or registration failure" }
+                    }
+                }
+            },
+            "/api/v1/me/networks/{name}/client-certificate": {
+                "post": {
+                    "summary": "Generate or upload the network's TLS client certificate",
+                    "description": "An IRC network over TLS presents it to the upstream: SASL EXTERNAL where the network offers it, and otherwise the certificate alone, which NickServ's CertFP recognises by its fingerprint (OFTC). Register a fingerprint with `/msg NickServ CERT ADD`. The private key is sealed at rest and never returned; posting again replaces the certificate (key rotation). The network reconnects with it.",
+                    "security": authenticated,
+                    "parameters": network_name_parameter,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "oneOf": [
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["action", "algorithm"],
+                                "properties": {
+                                    "action": { "const": "generate" },
+                                    "algorithm": { "type": "string", "enum": ["ed25519", "ecdsa_p256"] }
+                                } },
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["action", "certificate", "key"],
+                                "properties": {
+                                    "action": { "const": "upload" },
+                                    "certificate": { "type": "string", "minLength": 1, "maxLength": e6irc_client::client_certificate::MAX_PEM_BYTES,
+                                        "description": "PEM: the certificate, then any intermediates." },
+                                    "key": { "type": "string", "minLength": 1, "maxLength": e6irc_client::client_certificate::MAX_PEM_BYTES, "writeOnly": true,
+                                        "description": "PEM: the certificate's private key (PKCS #8, SEC 1 or PKCS #1)." }
+                                } }
+                        ] } } } },
+                    "responses": {
+                        "200": {
+                            "description": "stored, and the network reconnects with it",
+                            "content": { "application/json": { "schema": {
+                                "type": "object", "additionalProperties": false,
+                                "required": ["algorithm", "fingerprint_sha256", "fingerprint_sha512", "certificate"],
+                                "properties": {
+                                    "algorithm": { "type": "string", "enum": ["ed25519", "ecdsa", "rsa"] },
+                                    "fingerprint_sha256": certificate_fingerprints_schema["properties"]["fingerprint_sha256"].clone(),
+                                    "fingerprint_sha512": certificate_fingerprints_schema["properties"]["fingerprint_sha512"].clone(),
+                                    "certificate": { "type": "string", "description": "The certificate, PEM (public)." }
+                                }
+                            } } }
+                        },
+                        "400": { "description": "not an IRC network, or a certificate and key that are not a usable pair (the problem names the field)" },
+                        "404": { "description": "no owner-scoped network with this name" },
+                        "409": { "description": "the network does not use TLS, no master key is configured, the server configuration defines the network, or the owner is suspended" },
+                        "503": { "description": "database unavailable" }
+                    }
+                },
+                "delete": {
+                    "summary": "Remove the network's TLS client certificate",
+                    "security": authenticated,
+                    "parameters": network_name_parameter,
+                    "responses": {
+                        "204": { "description": "removed, and the network reconnects without it" },
+                        "404": { "description": "no owner-scoped network with this name, or it has no certificate" },
+                        "409": { "description": "the server configuration defines the network, or the owner is suspended" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/networks/{name}/remembered-channels/{channel}": {
+                "delete": {
+                    "summary": "Stop rejoining one remembered channel",
+                    "description": "The channel is no longer rejoined after a restart or an edit; a session that is in it leaves it. The channel name is matched without regard to ASCII case and must be percent-encoded (`%23` for `#`).",
+                    "security": authenticated,
+                    "parameters": [
+                        { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "channel", "in": "path", "required": true, "schema": { "type": "string", "minLength": 2, "maxLength": 200 } }
+                    ],
+                    "responses": {
+                        "204": { "description": "forgotten" },
+                        "404": { "description": "no owner-scoped network with this name, or it does not remember that channel" },
+                        "409": { "description": "the server configuration defines the network" },
+                        "503": { "description": "database unavailable" }
                     }
                 }
             },

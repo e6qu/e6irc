@@ -127,7 +127,7 @@ pub async fn rotate_database_secrets(
     let network_rows = sqlx::query(
         "SELECT n.id, a.name AS owner, n.name, n.kind, n.sasl_account,
                 n.sasl_password_sealed, n.server_password_sealed, n.autojoin,
-                n.autojoin_keys_sealed
+                n.autojoin_keys_sealed, n.client_key_sealed
          FROM bnc_networks n
          JOIN accounts a ON a.id = n.account_id
          ORDER BY n.id
@@ -148,6 +148,15 @@ pub async fn rotate_database_secrets(
         let mut server_password: Option<String> = row.get("server_password_sealed");
         let channels: Vec<String> = row.get("autojoin");
         let mut channel_keys: Vec<Option<String>> = row.get("autojoin_keys_sealed");
+        let mut client_key: Option<String> = row.get("client_key_sealed");
+        if let Some(value) = &mut client_key {
+            account_network_secrets += reseal(
+                value,
+                &context,
+                keys,
+                &format!("account {owner:?} network {name:?} client certificate key"),
+            )? as usize;
+        }
         if kind.account_is_secret()
             && let Some(value) = &mut account
         {
@@ -187,7 +196,7 @@ pub async fn rotate_database_secrets(
         sqlx::query(
             "UPDATE bnc_networks
              SET sasl_account = $2, sasl_password_sealed = $3, server_password_sealed = $4,
-                 autojoin_keys_sealed = $5
+                 autojoin_keys_sealed = $5, client_key_sealed = $6
              WHERE id = $1",
         )
         .bind(id)
@@ -195,9 +204,41 @@ pub async fn rotate_database_secrets(
         .bind(password)
         .bind(server_password)
         .bind(channel_keys)
+        .bind(client_key)
         .execute(&mut *transaction)
         .await
         .map_err(super::query_error)?;
+        // The keys a session learned for the channels it remembers.
+        let remembered = sqlx::query(
+            "SELECT channel, key_sealed FROM bnc_remembered_channels
+             WHERE network_id = $1 AND key_sealed IS NOT NULL
+             ORDER BY channel
+             FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(super::query_error)?;
+        for entry in remembered {
+            let channel: String = entry.get("channel");
+            let mut key: String = entry.get("key_sealed");
+            account_network_secrets += reseal(
+                &mut key,
+                &context,
+                keys,
+                &format!("account {owner:?} network {name:?} remembered key of {channel:?}"),
+            )? as usize;
+            sqlx::query(
+                "UPDATE bnc_remembered_channels SET key_sealed = $3
+                 WHERE network_id = $1 AND channel = $2",
+            )
+            .bind(id)
+            .bind(&channel)
+            .bind(key)
+            .execute(&mut *transaction)
+            .await
+            .map_err(super::query_error)?;
+        }
     }
 
     insert_audit_log_with(

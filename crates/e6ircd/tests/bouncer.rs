@@ -1575,8 +1575,8 @@ async fn buffered_upstream_lines_keep_their_wire_form() {
 // to the test's script.
 
 struct FakeSession {
-    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: tokio::net::tcp::OwnedWriteHalf,
+    reader: tokio::io::BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
 }
 
 impl FakeSession {
@@ -1660,9 +1660,278 @@ async fn fake_accept(listener: &tokio::net::TcpListener) -> FakeSession {
     let (socket, _) = listener.accept().await.expect("accept");
     let (read, writer) = socket.into_split();
     FakeSession {
-        reader: tokio::io::BufReader::new(read),
-        writer,
+        reader: tokio::io::BufReader::new(Box::new(read)),
+        writer: Box::new(writer),
     }
+}
+
+/// A TLS upstream for the client-certificate tests: its server certificate
+/// (for `localhost`), which the driver is told to trust, and a handshake that
+/// asks for a client certificate and accepts any.
+struct TlsUpstream {
+    acceptor: tokio_rustls::TlsAcceptor,
+    roots: std::sync::Arc<rustls::RootCertStore>,
+}
+
+impl TlsUpstream {
+    fn new() -> Self {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(certificate.cert.der().clone())
+            .expect("trust the upstream certificate");
+        // A provider of its own: installing the process default here would
+        // make the next `net::start` in this test binary refuse to pin it.
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_client_cert_verifier(std::sync::Arc::new(AnyClientCertificate))
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(certificate.signing_key.serialize_der())
+                .expect("key"),
+        )
+        .expect("server config");
+        Self {
+            acceptor: tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)),
+            roots: std::sync::Arc::new(roots),
+        }
+    }
+
+    /// Accept one connection: the session, and the SHA-256 fingerprint of the
+    /// client certificate it presented, if it presented one.
+    async fn accept(&self, listener: &tokio::net::TcpListener) -> (FakeSession, Option<String>) {
+        let (socket, _) = listener.accept().await.expect("accept");
+        let tls = self.acceptor.accept(socket).await.expect("TLS handshake");
+        let presented = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .map(|chain| e6irc_client::Fingerprints::of_der(&chain[0]).sha256);
+        let (read, writer) = tokio::io::split(tls);
+        (
+            FakeSession {
+                reader: tokio::io::BufReader::new(Box::new(read)),
+                writer: Box::new(writer),
+            },
+            presented,
+        )
+    }
+}
+
+/// Asks for a client certificate, accepts any — what an IRC network does:
+/// services match the fingerprint, not a chain.
+#[derive(Debug)]
+struct AnyClientCertificate;
+
+impl rustls::server::danger::ClientCertVerifier for AnyClientCertificate {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A client certificate generated as the console generates one.
+fn generated_certificate() -> e6irc_client::ClientCertificate {
+    let pem = e6ircd::bouncer::client_certificates::generate(
+        e6ircd::bouncer::client_certificates::GeneratedKey::EcdsaP256,
+        "alice/oftc",
+    )
+    .expect("generated");
+    e6irc_client::ClientCertificate::from_pem(&pem.certificate, &pem.key).expect("usable")
+}
+
+/// A network that offers SASL EXTERNAL logs the session in with the client
+/// certificate: the TLS handshake presents it, and the exchange names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_certificate_logs_in_with_sasl_external() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let tls = TlsUpstream::new();
+    let roots = tls.roots.clone();
+    let certificate = generated_certificate();
+    let expected = certificate.fingerprint_sha256();
+    let upstream = ScriptedTask::spawn(async move {
+        let (mut session, presented) = tls.accept(&listener).await;
+        assert_eq!(session.read_line().await, "CAP LS 302");
+        session
+            .send(":up CAP * LS :sasl=EXTERNAL,PLAIN server-time message-tags account-tag")
+            .await;
+        assert_eq!(session.read_line().await, "CAP REQ :sasl");
+        session.send(":up CAP * ACK :sasl").await;
+        session.acknowledge_metadata().await;
+        assert_eq!(session.read_line().await, "AUTHENTICATE EXTERNAL");
+        session.send("AUTHENTICATE +").await;
+        assert!(session.read_line().await.starts_with("NICK "));
+        assert!(session.read_line().await.starts_with("USER "));
+        assert_eq!(session.read_line().await, "AUTHENTICATE +");
+        session
+            .send(":up 903 bncbot :SASL authentication successful")
+            .await;
+        assert_eq!(session.read_line().await, "CAP END");
+        session.send(":up 001 bncbot :welcome").await;
+        // Held open until the test has read the driver's state.
+        let held = session.read_line().await;
+        (presented, held)
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: format!("localhost:{port}"),
+        tls: true,
+        tls_roots: Some(roots),
+        nick: "bncbot".parse().expect("test nickname"),
+        client_certificate: Some(certificate),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let backlog = handle.buffer_snapshot();
+    assert!(
+        backlog
+            .iter()
+            .any(|line| line
+                .contains("upstream logged in with the client certificate (SASL EXTERNAL)")),
+        "{backlog:?}"
+    );
+    handle.shutdown_and_wait().await;
+    let (presented, _) = upstream.finish().await;
+    assert_eq!(presented, Some(expected));
+}
+
+/// OFTC offers no SASL: the certificate alone registers the session, which
+/// NickServ's CertFP recognises by its fingerprint, and the owner is told
+/// that is how it logged in. A network set up this way connects, where one
+/// configured with a SASL password retried `sasl_unavailable` forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_sasl_the_client_certificate_alone_registers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let tls = TlsUpstream::new();
+    let roots = tls.roots.clone();
+    let certificate = generated_certificate();
+    let expected = certificate.fingerprint_sha256();
+    let upstream = ScriptedTask::spawn(async move {
+        let (mut session, presented) = tls.accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        let held = session.read_line().await;
+        (presented, held)
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: format!("localhost:{port}"),
+        tls: true,
+        tls_roots: Some(roots),
+        nick: "bncbot".parse().expect("test nickname"),
+        client_certificate: Some(certificate),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let backlog = handle.buffer_snapshot();
+    assert!(
+        backlog.iter().any(|line| line.contains(
+            "upstream SASL: the server offers no SASL EXTERNAL; registering with the client \
+             certificate alone"
+        )),
+        "{backlog:?}"
+    );
+    handle.shutdown_and_wait().await;
+    let (presented, _) = upstream.finish().await;
+    assert_eq!(presented, Some(expected));
+}
+
+/// The channels a stored network remembers are rejoined on the first
+/// connection of a new driver — after a restart or an edit — beside the
+/// configured autojoin, a remembered key with its channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn remembered_channels_are_rejoined_by_a_new_driver() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        let mut joined = Vec::new();
+        while joined.len() < 3 {
+            let line = session.read_line().await;
+            let Some(join) = line.strip_prefix("JOIN ") else {
+                continue;
+            };
+            let (channels, keys) = join.split_once(' ').unwrap_or((join, ""));
+            let mut keys = keys.split(',');
+            for channel in channels.split(',') {
+                joined.push(match keys.next().filter(|key| !key.is_empty()) {
+                    Some(key) => format!("{channel} {key}"),
+                    None => channel.to_string(),
+                });
+            }
+        }
+        joined.sort();
+        // Held open until the driver is stopped.
+        let held = session.read_line().await;
+        (joined, held)
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#static".parse().expect("test channel")],
+        remembered_channels: vec![
+            e6ircd::bouncer::RememberedChannel::parse("#runtime", None).expect("a channel"),
+            e6ircd::bouncer::RememberedChannel::parse("#keyed", Some("sesame"))
+                .expect("a keyed channel"),
+        ],
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    handle.shutdown_and_wait().await;
+    let (joined, _) = upstream.finish().await;
+    assert_eq!(joined, ["#keyed sesame", "#runtime", "#static"]);
 }
 
 /// The connection test's budget belongs to the whole test: the stage that is
@@ -2757,9 +3026,9 @@ async fn a_stopped_driver_says_quit_to_its_upstream() {
 }
 
 /// Solanum withdraws the `sasl` capability while services are down. That
-/// clears by itself, so it must never park: parked networks stay down until
-/// their owner re-saves them, and a few minutes of services downtime would
-/// take every SASL network with it. The reason stays readable for the whole
+/// clears by itself, so it must not park within an outage's length: parked
+/// networks stay down until their owner re-saves them, and a few minutes of
+/// services downtime would take every SASL network with it. The reason stays readable for the whole
 /// wait, and the driver connects by itself once services are back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_services_outage_is_outlasted_not_parked() {
@@ -2871,8 +3140,9 @@ async fn rejected_credentials_park_without_a_second_dial() {
 
 /// An upstream that offers SASL but not PLAIN says nothing about the password.
 /// Parking it as rejected credentials sent the owner to retype a correct
-/// password forever; it is a worded registration refusal, and no credential is
-/// ever put on the wire.
+/// password forever; retrying it forever hid that nothing would ever change.
+/// It is a worded registration refusal that parks at once, naming what the
+/// network offers, and no credential is ever put on the wire.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2909,19 +3179,8 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
-    // Wait on exactly what is asserted: the recorded refusal. (It is retried,
-    // never parked — see `a_services_outage_is_outlasted_not_parked`.)
-    let snapshot = tokio::time::timeout(deadline::HANG, async {
-        loop {
-            let snapshot = handle.runtime_snapshot();
-            if snapshot.last_error.is_some() {
-                return snapshot;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the refusal was never recorded");
+    wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
+    let snapshot = handle.runtime_snapshot();
     let (opening, after) = tokio::time::timeout(deadline::HANG, dial_rx.recv())
         .await
         .expect("the upstream never saw a whole dial")
@@ -2931,20 +3190,21 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
         after.iter().all(|line| !line.starts_with("AUTHENTICATE")),
         "the driver must hang up without starting a credential exchange: {after:?}"
     );
-    assert_ne!(
-        snapshot.lifecycle,
-        NetworkLifecycle::AuthenticationFailed,
-        "a missing mechanism says nothing about the password: {snapshot:?}"
+    assert_eq!(
+        snapshot.connection_attempts, 1,
+        "parked on the first answer: {snapshot:?}"
     );
     assert_eq!(
         snapshot.last_error,
-        Some(e6ircd::bouncer::NetworkFailure::SaslUnavailable),
-        "{snapshot:?}"
+        Some(e6ircd::bouncer::NetworkFailure::SaslMechanismUnavailable),
+        "a missing mechanism says nothing about the password: {snapshot:?}"
     );
     assert_eq!(
         snapshot.last_error_diagnostic.as_deref(),
         Some(
-            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE"
+            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers \
+             EXTERNAL,ECDSA-NIST256P-CHALLENGE; it logs in with a client certificate (SASL \
+             EXTERNAL) instead"
         ),
         "{snapshot:?}"
     );
@@ -6017,4 +6277,70 @@ async fn a_session_a_token_signed_in_ends_when_the_token_expires() {
         .expect("count");
     assert_eq!(still_stored, 1, "maintenance has not pruned it: expiry did");
     assert!(still_open(&mut with_password).await);
+}
+
+/// A kick removes the channel from what is rejoined, and the attached clients
+/// are told so with the kicker's reason; the next session rejoins only the
+/// rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kick_stops_the_rejoin_and_says_why() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let upstream = ScriptedTask::spawn(async move {
+        let mut first = fake_accept(&listener).await;
+        first.complete_registration("bncbot").await;
+        loop {
+            let line = first.read_line().await;
+            if line == "JOIN #static" {
+                first.send(":bncbot!~bncbot@up JOIN #static").await;
+            } else if line == "JOIN #runtime" {
+                first.send(":bncbot!~bncbot@up JOIN #runtime").await;
+                first
+                    .send(":op!o@up KICK #runtime bncbot :no bots here")
+                    .await;
+                break;
+            }
+        }
+        drop_rx.recv().await;
+        drop(first);
+        let mut second = fake_accept(&listener).await;
+        second.complete_registration("bncbot").await;
+        loop {
+            let line = second.read_line().await;
+            if let Some(channels) = line.strip_prefix("JOIN ") {
+                return channels.to_string();
+            }
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#static".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(handle.send("JOIN #runtime"), SendOutcome::Sent);
+    let notice = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
+                events.recv().await
+                && line.contains("will not be rejoined")
+            {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("the kick was never told");
+    assert!(
+        notice.contains(
+            "#runtime will not be rejoined after a reconnect: kicked by op (no bots here)"
+        ),
+        "{notice}"
+    );
+    drop_tx.send(()).await.unwrap();
+    assert_eq!(upstream.finish().await, "#static");
 }

@@ -13,7 +13,8 @@ use e6irc_client::{Connection, NetworkNames, OwnedMessage, RelayEvent};
 use super::nick_regain::{NickRegain, NickRegainTiming, alternative_nick};
 use super::replies::{Correlation, ReplyRouter, Upstream};
 use super::upstream_identity::{
-    AutojoinChannel, ChannelKey, ConfirmedChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
+    AutojoinChannel, ChannelKey, ConfirmedChannel, RememberedChannel, UpstreamNick,
+    UpstreamRealname, UpstreamUsername,
 };
 use super::{ClientTags, ConnectionEvent, DriverEnds, NetworkHandle};
 
@@ -34,6 +35,17 @@ pub struct NetworkConfig {
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
     pub sasl: Option<(String, String)>,
+    /// The TLS client certificate presented to the upstream, which logs in
+    /// with SASL EXTERNAL where the network offers it and is otherwise
+    /// recognised by its fingerprint (NickServ CertFP). Only with `tls`.
+    pub client_certificate: Option<e6irc_client::ClientCertificate>,
+    /// The channels the session was in before this driver started (a stored
+    /// network's remembered channels), rejoined with the autojoin.
+    pub remembered_channels: Vec<RememberedChannel>,
+    /// The roots the upstream's certificate is verified against: `None` is the
+    /// compiled-in webpki set, which every production network uses; only a
+    /// test that stands up its own TLS upstream names others.
+    pub tls_roots: Option<std::sync::Arc<e6irc_client::RootCertStore>>,
     /// The network's connection password, sent as `PASS` before registration
     /// when the upstream is a private server that requires one.
     pub server_password: Option<e6irc_client::ServerPassword>,
@@ -80,6 +92,9 @@ impl Default for NetworkConfig {
             autojoin: Vec::new(),
             buffer_cap: 1000,
             sasl: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
+            tls_roots: None,
             server_password: None,
             keepalive_idle: KEEPALIVE_IDLE,
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
@@ -99,12 +114,28 @@ pub struct IrcNetwork;
 /// keyed by the network's own fold of the name with the server's canonical
 /// casing kept. `connect_once` joins the configured autojoin plus everything
 /// here, so channels joined at runtime (not just the static config) are
-/// restored after a drop — the behaviour ZNC/soju users rely on. In-memory
-/// only, learned keys included: a process restart legitimately falls back to
-/// the configured autojoin, with its configured keys, which is the owner's
-/// declared floor.
-#[derive(Debug, Default)]
-pub struct JoinedChannels(std::sync::Mutex<Intent>);
+/// restored after a drop — the behaviour ZNC/soju users rely on.
+///
+/// It outlives the driver too: a stored network's registry slot writes it to
+/// PostgreSQL after every change ([`JoinedChannels::changes`]), and a restart
+/// seeds the next driver from those rows; a replacement driver is seeded with
+/// its predecessor's ([`JoinedChannels::carry_over`]).
+#[derive(Debug)]
+pub struct JoinedChannels {
+    intent: std::sync::Mutex<Intent>,
+    /// Bumped whenever what is remembered changes: a channel confirmed or
+    /// left, or a key learned or cleared.
+    revision: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for JoinedChannels {
+    fn default() -> Self {
+        Self {
+            intent: std::sync::Mutex::new(Intent::default()),
+            revision: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct Intent {
@@ -145,6 +176,69 @@ impl Intent {
 }
 
 impl JoinedChannels {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Intent> {
+        self.intent.lock().expect("joined set poisoned")
+    }
+
+    fn changed(&self) {
+        self.revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    /// Wakes whenever what is remembered changes.
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    /// Start from the channels a previous session was in, before the first
+    /// dial: what a stored network's rows remember after a restart. At most
+    /// [`super::MAX_TRACKED_CHANNELS`]; the rest are not rejoined, and the
+    /// count says how many.
+    pub(crate) fn remember(&self, channels: Vec<super::RememberedChannel>) -> usize {
+        let mut intent = self.lock();
+        let mut dropped = 0;
+        for remembered in channels {
+            let folded = intent.names.fold(remembered.channel.as_str());
+            if !intent.channels.contains_key(&folded)
+                && intent.channels.len() >= super::MAX_TRACKED_CHANNELS
+            {
+                dropped += 1;
+                continue;
+            }
+            intent.channels.insert(
+                folded,
+                Intended {
+                    channel: remembered.channel,
+                    key: remembered.key,
+                },
+            );
+        }
+        dropped
+    }
+
+    /// What is remembered now: every confirmed channel with the key it is
+    /// joined with, in no particular order.
+    pub(crate) fn remembered(&self) -> Vec<super::RememberedChannel> {
+        self.lock()
+            .channels
+            .values()
+            .map(|intended| super::RememberedChannel {
+                channel: intended.channel.clone(),
+                key: intended.key.clone(),
+            })
+            .collect()
+    }
+
+    /// Replace what is remembered with `predecessor`'s: a reconfigured
+    /// network's new driver goes on from where the old one was, keys it
+    /// learned included.
+    pub(crate) fn carry_over(&self, predecessor: &JoinedChannels) {
+        let carried = predecessor.remembered();
+        self.lock().channels.clear();
+        self.remember(carried);
+        self.changed();
+    }
+
     /// Fold one line's membership change into the reconnect intent. The intent
     /// outlives sessions, so it carries the tracker's bound itself: successive
     /// sessions could otherwise each confirm a different full set. A channel
@@ -154,18 +248,21 @@ impl JoinedChannels {
         change: super::SessionChange,
         names: &NetworkNames,
     ) -> Result<(), super::ChannelLimitExceeded> {
-        let mut intent = self.0.lock().expect("joined set poisoned");
+        let mut intent = self.lock();
         intent.adopt(names);
+        let mut changed = false;
         for left in &change.left {
             let key = intent.names.fold(left);
-            intent.channels.remove(&key);
+            changed |= intent.channels.remove(&key).is_some();
         }
+        let mut outcome = Ok(());
         for channel in change.joined {
             let folded = intent.names.fold(channel.as_str());
             if !intent.channels.contains_key(&folded)
                 && intent.channels.len() >= super::MAX_TRACKED_CHANNELS
             {
-                return Err(super::ChannelLimitExceeded);
+                outcome = Err(super::ChannelLimitExceeded);
+                break;
             }
             let key = intent.offered_keys.remove(&folded).or_else(|| {
                 intent
@@ -173,9 +270,18 @@ impl JoinedChannels {
                     .get(&folded)
                     .and_then(|intended| intended.key.clone())
             });
-            intent.channels.insert(folded, Intended { channel, key });
+            let intended = Intended { channel, key };
+            let known = intent.channels.get(&folded).is_some_and(|known| {
+                known.channel == intended.channel && known.key == intended.key
+            });
+            changed |= !known;
+            intent.channels.insert(folded, intended);
         }
-        Ok(())
+        drop(intent);
+        if changed {
+            self.changed();
+        }
+        outcome
     }
 
     /// Remember the keys an attached client's `JOIN` line offers, until the
@@ -184,7 +290,7 @@ impl JoinedChannels {
         let [channels, keys, ..] = message.params.as_slice() else {
             return;
         };
-        let mut intent = self.0.lock().expect("joined set poisoned");
+        let mut intent = self.lock();
         for (channel, key) in channels.split(',').zip(keys.split(',')) {
             let Some(key) = ChannelKey::parse(key) else {
                 continue;
@@ -199,18 +305,36 @@ impl JoinedChannels {
 
     /// Follow a `+k`/`-k` on a channel in the intent.
     fn set_key(&self, channel: &str, key: Option<ChannelKey>) {
-        let mut intent = self.0.lock().expect("joined set poisoned");
+        let mut intent = self.lock();
         let folded = intent.names.fold(channel);
-        if let Some(intended) = intent.channels.get_mut(&folded) {
-            intended.key = key;
+        let changed = intent
+            .channels
+            .get_mut(&folded)
+            .filter(|intended| intended.key != key)
+            .map(|intended| intended.key = key)
+            .is_some();
+        drop(intent);
+        if changed {
+            self.changed();
         }
     }
 
+    /// Whether `channel` is rejoined after a reconnect.
+    fn remembers(&self, channel: &str) -> bool {
+        let intent = self.lock();
+        intent.channels.contains_key(&intent.names.fold(channel))
+    }
+
     /// Stop rejoining `channel`. `true` when it was in the intent.
-    fn forget(&self, channel: &str) -> bool {
-        let mut intent = self.0.lock().expect("joined set poisoned");
+    pub(crate) fn forget(&self, channel: &str) -> bool {
+        let mut intent = self.lock();
         let folded = intent.names.fold(channel);
-        intent.channels.remove(&folded).is_some()
+        let forgotten = intent.channels.remove(&folded).is_some();
+        drop(intent);
+        if forgotten {
+            self.changed();
+        }
+        forgotten
     }
 
     /// The configured autojoin plus every channel the upstream confirmed
@@ -219,7 +343,7 @@ impl JoinedChannels {
     /// joined with the key it was last seen with (a `+k` since, or the key a
     /// client joined it with), and otherwise with its configured key.
     pub(super) fn rejoin(&self, autojoin: &[AutojoinChannel]) -> Vec<(String, Option<ChannelKey>)> {
-        let intent = self.0.lock().expect("joined set poisoned");
+        let intent = self.lock();
         let names = &intent.names;
         let mut list: Vec<(String, Option<ChannelKey>)> = autojoin
             .iter()
@@ -257,6 +381,15 @@ impl IrcNetwork {
     /// The driver's handle and its task, not yet running.
     pub(super) fn prepare(config: NetworkConfig) -> super::PreparedDriver {
         let (handle, ends) = NetworkHandle::channels(config.buffer_cap);
+        let unremembered = handle
+            .joined_channels()
+            .remember(config.remembered_channels.clone());
+        if unremembered > 0 {
+            eprintln!(
+                "bnc: {unremembered} remembered channel(s) past the {} tracked are not rejoined",
+                super::MAX_TRACKED_CHANNELS
+            );
+        }
         super::PreparedDriver::new(handle, run(config, ends))
     }
 }
@@ -302,6 +435,7 @@ pub enum IrcPreflightFailure {
     ServerPasswordRequired(Option<e6irc_client::RegistrationRejection>),
     NetworkBanned(Option<e6irc_client::RegistrationRejection>),
     SaslUnavailable(e6irc_client::RegistrationRejection),
+    SaslMechanismUnavailable(e6irc_client::RegistrationRejection),
     SaslFailed(e6irc_client::RegistrationRejection),
     RegistrationFailed,
     RegistrationTimedOut,
@@ -325,6 +459,7 @@ impl IrcPreflightFailure {
             Self::ServerPasswordRequired(_) => "server_password_required",
             Self::NetworkBanned(_) => "network_banned",
             Self::SaslUnavailable(_) => "sasl_unavailable",
+            Self::SaslMechanismUnavailable(_) => "sasl_mechanism_unavailable",
             Self::SaslFailed(_) => "sasl_failed",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationTimedOut => "registration_timed_out",
@@ -356,6 +491,9 @@ impl IrcPreflightFailure {
             }
             Self::NetworkBanned(_) => "The upstream network banned this connection.",
             Self::SaslUnavailable(_) => super::NetworkFailure::SaslUnavailable.summary(),
+            Self::SaslMechanismUnavailable(_) => {
+                super::NetworkFailure::SaslMechanismUnavailable.summary()
+            }
             Self::SaslFailed(_) => super::NetworkFailure::SaslFailed.summary(),
             Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
             Self::RegistrationTimedOut => "IRC registration timed out.",
@@ -371,9 +509,9 @@ impl IrcPreflightFailure {
             | Self::ServerPasswordRejected(rejection)
             | Self::ServerPasswordRequired(rejection)
             | Self::NetworkBanned(rejection) => rejection.as_ref().map(|value| value.diagnostic()),
-            Self::SaslUnavailable(rejection) | Self::SaslFailed(rejection) => {
-                Some(rejection.diagnostic())
-            }
+            Self::SaslUnavailable(rejection)
+            | Self::SaslMechanismUnavailable(rejection)
+            | Self::SaslFailed(rejection) => Some(rejection.diagnostic()),
             Self::AuthenticationRejected(rejection) => {
                 rejection.as_ref().map(|value| value.diagnostic())
             }
@@ -530,8 +668,8 @@ async fn run(config: NetworkConfig, mut ends: DriverEnds) {
     }
     // Clean stop: the command channel closed (handle dropped).
     let shared = SharedDriver {
+        joined: ends.joined_channels().clone(),
         config,
-        joined: std::sync::Arc::new(JoinedChannels::default()),
     };
     super::run_with_backoff(shared, &mut ends, |shared, ends| {
         Box::pin(connect_once(shared, ends))
@@ -594,9 +732,19 @@ async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::i
         realname: config.realname.as_str(),
         server_password: config.server_password.as_ref(),
     };
-    match &config.sasl {
-        Some((account, password)) => connection.register_sasl(&identity, account, password).await,
-        None => connection.register(&identity).await,
+    match (&config.client_certificate, &config.sasl) {
+        (Some(_), sasl) => {
+            let password = sasl
+                .as_ref()
+                .map(|(account, password)| (account.as_str(), password.as_str()));
+            connection
+                .register_with_client_certificate(&identity, password)
+                .await
+        }
+        (None, Some((account, password))) => {
+            connection.register_sasl(&identity, account, password).await
+        }
+        (None, None) => connection.register(&identity).await,
     }
 }
 
@@ -680,6 +828,9 @@ fn preflight_refusal(
         e6irc_client::RegistrationRefusal::SaslUnavailable => {
             IrcPreflightFailure::SaslUnavailable(rejection)
         }
+        e6irc_client::RegistrationRefusal::SaslMechanismUnavailable => {
+            IrcPreflightFailure::SaslMechanismUnavailable(rejection)
+        }
         e6irc_client::RegistrationRefusal::SaslAborted
         | e6irc_client::RegistrationRefusal::SaslFailed => {
             IrcPreflightFailure::SaslFailed(rejection)
@@ -759,6 +910,24 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     let mut upstream = UpstreamCapabilities::of(&conn);
     ends.set_client_tags(upstream.client_tags());
     ends.begin_irc_session(identity.nick.clone());
+    // The mechanism is the client's choice among what the network offered, so
+    // the owner is told which one carried the password — and which ones the
+    // network refused before any credential was sent, so a weaker one that is
+    // used instead is never a silent choice.
+    for note in conn.sasl_notes() {
+        ends.emit_line(super::bnc_notice("*", &format!("upstream SASL: {note}")));
+    }
+    match (conn.sasl_mechanism(), &config.sasl) {
+        (Some("EXTERNAL"), _) => ends.emit_line(super::bnc_notice(
+            "*",
+            "upstream logged in with the client certificate (SASL EXTERNAL)",
+        )),
+        (Some(mechanism), Some((account, _))) => ends.emit_line(super::bnc_notice(
+            "*",
+            &format!("upstream logged in as {account} with SASL {mechanism}"),
+        )),
+        _ => {}
+    }
     let mut requested_nicks = RequestedNicks::default();
     let mut regain = match registered_as {
         Some(alternative) => {
@@ -783,19 +952,6 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             None
         }
     };
-    // The mechanism is the client's choice among what the network offered, so
-    // the owner is told which one carried the password — and which ones the
-    // network refused before any credential was sent, so a weaker one that is
-    // used instead is never a silent choice.
-    for note in conn.sasl_notes() {
-        ends.emit_line(super::bnc_notice("*", &format!("upstream SASL: {note}")));
-    }
-    if let (Some(mechanism), Some((account, _))) = (conn.sasl_mechanism(), &config.sasl) {
-        ends.emit_line(super::bnc_notice(
-            "*",
-            &format!("upstream logged in as {account} with SASL {mechanism}"),
-        ));
-    }
     let mut echoes = UpstreamEchoes::default();
     let mut router = ReplyRouter::default();
     // While the nickname is being regained no command is read, so the stop
@@ -1210,8 +1366,41 @@ pub(super) fn follow_membership(
             "*",
             &format!(
                 "{channel} will not be rejoined after a reconnect: \
-                 the upstream refused to join it ({})",
-                message.command
+                 the upstream refused to join it ({}: {})",
+                message.command,
+                e6irc_client::bounded_diagnostic(
+                    message
+                        .params
+                        .last()
+                        .map(String::as_str)
+                        .unwrap_or("no reason")
+                )
+            ),
+        ));
+    }
+    // A kick is somebody else's decision: the session stops rejoining the
+    // channel (the tracker drops it once the line is relayed), and says so
+    // and why, so nobody is left waiting for a rejoin that will not come.
+    if message.command.eq_ignore_ascii_case("KICK")
+        && let [channel, target, ..] = message.params.as_slice()
+        && !channel.contains(',')
+        && ends
+            .irc_session_snapshot()
+            .is_some_and(|session| names.eq(&session.nick, target))
+        && joined.remembers(channel)
+    {
+        let by = message.source.as_deref().unwrap_or("the upstream");
+        let by = by.split('!').next().unwrap_or(by);
+        let reason = message
+            .params
+            .get(2)
+            .map(|reason| e6irc_client::bounded_diagnostic(reason))
+            .unwrap_or_else(|| "no reason".to_owned());
+        ends.emit_line(super::bnc_notice(
+            "*",
+            &format!(
+                "{channel} will not be rejoined after a reconnect: kicked by {by} ({reason}); \
+                 join it again to have it rejoined"
             ),
         ));
     }
@@ -1947,12 +2136,26 @@ async fn connect_resolved(
             }
         };
         let connected = if config.tls {
-            match tokio::time::timeout(
-                super::ADDRESS_DIAL_DEADLINE,
-                Connection::from_tcp_tls(stream, server_name, e6irc_client::webpki_root_store()),
-            )
-            .await
-            {
+            let roots = config
+                .tls_roots
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(e6irc_client::webpki_root_store);
+            let handshake = async {
+                match &config.client_certificate {
+                    Some(certificate) => {
+                        Connection::from_tcp_tls_with_certificate(
+                            stream,
+                            server_name,
+                            roots,
+                            certificate,
+                        )
+                        .await
+                    }
+                    None => Connection::from_tcp_tls(stream, server_name, roots).await,
+                }
+            };
+            match tokio::time::timeout(super::ADDRESS_DIAL_DEADLINE, handshake).await {
                 Ok(result) => result,
                 Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -2387,7 +2590,7 @@ pub(super) mod tests {
             Err(super::super::ChannelLimitExceeded)
         );
         assert_eq!(
-            joined.0.lock().expect("joined set").channels.len(),
+            joined.lock().channels.len(),
             super::super::MAX_TRACKED_CHANNELS
         );
 
@@ -2471,11 +2674,13 @@ pub(super) mod tests {
         };
         assert_eq!(
             rejection.refusal(),
-            e6irc_client::RegistrationRefusal::SaslUnavailable
+            e6irc_client::RegistrationRefusal::SaslMechanismUnavailable
         );
         assert_eq!(
             rejection.diagnostic(),
-            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE"
+            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers \
+             EXTERNAL,ECDSA-NIST256P-CHALLENGE; it logs in with a client certificate (SASL \
+             EXTERNAL) instead"
         );
     }
 

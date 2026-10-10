@@ -6773,6 +6773,12 @@ pub async fn begin_account_export(
                     'sasl_account', n.sasl_account,
                     'has_sasl_password', n.sasl_password_sealed IS NOT NULL,
                     'has_server_password', n.server_password_sealed IS NOT NULL,
+                    'client_certificate', n.client_certificate,
+                    'has_client_key', n.client_key_sealed IS NOT NULL,
+                    'remembered_channels', COALESCE((
+                        SELECT jsonb_agg(c.channel ORDER BY c.channel)
+                        FROM bnc_remembered_channels c WHERE c.network_id = n.id
+                    ), '[]'::jsonb),
                     'enabled', n.enabled,
                     'created_at', to_char(n.created_at AT TIME ZONE 'UTC',
                         'YYYY-MM-DD"T"HH24:MI:SS"Z"')
@@ -8351,6 +8357,24 @@ fn autojoin_columns(autojoin: &[BncAutojoin]) -> (Vec<String>, Vec<Option<String
         .unzip()
 }
 
+/// A stored IRC network's TLS client certificate: the certificate chain in
+/// PEM, which is public, and its private key sealed like every stored
+/// upstream secret. Its `Debug` says only that a key is stored.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BncClientCertificate {
+    pub certificate_pem: String,
+    pub key_sealed: String,
+}
+
+impl std::fmt::Debug for BncClientCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BncClientCertificate")
+            .field("certificate_pem", &self.certificate_pem)
+            .field("key_sealed", &"<sealed>")
+            .finish()
+    }
+}
+
 /// A stored per-account BNC network. `sasl_password_sealed`,
 /// `server_password_sealed` and each autojoin key are sealed blobs (or
 /// `None`); the caller opens them with the master key before starting the
@@ -8373,6 +8397,16 @@ pub struct BncNetworkRow {
     /// The sealed IRC server password (`PASS`). Only `kind = irc` carries one
     /// (a table CHECK).
     pub server_password_sealed: Option<String>,
+    /// The TLS client certificate, only on an IRC network over TLS (a table
+    /// CHECK). Set and removed on its own ([`set_bnc_network_client_certificate`]);
+    /// creating and editing a network keep what is stored.
+    pub client_certificate: Option<BncClientCertificate>,
+    /// The channels the network's session was in, each with its sealed key
+    /// when one is known, by name. Written by the network's registry slot
+    /// ([`replace_bnc_remembered_channels`]) and by an owner's removal
+    /// ([`forget_bnc_remembered_channel`]); creating and editing a network
+    /// keep what is stored.
+    pub remembered_channels: Vec<BncAutojoin>,
     /// Whether an always-on driver runs for this network. A disabled
     /// network keeps its config/buffers but is skipped at boot.
     pub enabled: bool,
@@ -8401,6 +8435,30 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
             key_sealed,
         })
         .collect();
+    let remembered: Vec<String> = row.get("remembered_channels");
+    let remembered_keys: Vec<Option<String>> = row.get("remembered_keys");
+    if remembered.len() != remembered_keys.len() {
+        return Err(DbError::InvalidNetworkAutojoin(row.get("name")));
+    }
+    let remembered_channels = remembered
+        .into_iter()
+        .zip(remembered_keys)
+        .map(|(channel, key_sealed)| BncAutojoin {
+            channel,
+            key_sealed,
+        })
+        .collect();
+    let client_certificate = match (
+        row.get::<Option<String>, _>("client_certificate"),
+        row.get::<Option<String>, _>("client_key_sealed"),
+    ) {
+        (Some(certificate_pem), Some(key_sealed)) => Some(BncClientCertificate {
+            certificate_pem,
+            key_sealed,
+        }),
+        // A table CHECK holds the two together.
+        _ => None,
+    };
     Ok(BncNetworkRow {
         kind: stored_network_kind(&kind)?,
         name: row.get("name"),
@@ -8414,6 +8472,8 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
         sasl_account: row.get("sasl_account"),
         sasl_password_sealed: row.get("sasl_password_sealed"),
         server_password_sealed: row.get("server_password_sealed"),
+        client_certificate,
+        remembered_channels,
     })
 }
 
@@ -8424,7 +8484,12 @@ macro_rules! bnc_network_columns {
     () => {
         "n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin, \
          n.autojoin_keys_sealed, n.sasl_account, n.sasl_password_sealed, \
-         n.server_password_sealed, n.enabled, n.kind"
+         n.server_password_sealed, n.enabled, n.kind, n.client_certificate, \
+         n.client_key_sealed, \
+         ARRAY(SELECT c.channel FROM bnc_remembered_channels c \
+               WHERE c.network_id = n.id ORDER BY c.channel) AS remembered_channels, \
+         ARRAY(SELECT c.key_sealed FROM bnc_remembered_channels c \
+               WHERE c.network_id = n.id ORDER BY c.channel) AS remembered_keys"
     };
 }
 
@@ -8751,6 +8816,149 @@ pub async fn update_bnc_network(
         return Ok(false);
     };
     audit_network_mutation(&mut transaction, audit, "NETWORK_UPDATE", &folded, &stored).await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
+}
+
+/// Set or remove `account`'s IRC network `name`'s TLS client certificate,
+/// audited in the same transaction. The key in `certificate` is already
+/// sealed. Returns whether a row matched (false ⇒ no such network for that
+/// owner, and nothing is recorded); a bridge's row, or one without TLS, is
+/// refused by the table's CHECK and is the caller's to have ruled out.
+pub async fn set_bnc_network_client_certificate(
+    pool: &PgPool,
+    account: &str,
+    name: &str,
+    certificate: Option<&BncClientCertificate>,
+    audit: NetworkAudit<'_>,
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let stored: Option<String> = sqlx::query_scalar(
+        "UPDATE bnc_networks n SET client_certificate = $3, client_key_sealed = $4
+         FROM accounts a
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)
+         RETURNING n.name",
+    )
+    .bind(&folded)
+    .bind(name)
+    .bind(certificate.map(|certificate| certificate.certificate_pem.as_str()))
+    .bind(certificate.map(|certificate| certificate.key_sealed.as_str()))
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    let action = if certificate.is_some() {
+        "NETWORK_CERTIFICATE_SET"
+    } else {
+        "NETWORK_CERTIFICATE_REMOVE"
+    };
+    audit_network_mutation(&mut transaction, audit, action, &folded, &stored).await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
+}
+
+/// Most channels one network remembers: what a session tracks
+/// ([`crate::bouncer::MAX_TRACKED_CHANNELS`]).
+const MAX_REMEMBERED_CHANNELS: usize = 512;
+
+/// Replace the channels `owner`'s stored network `name` remembers with
+/// `channels`, each key already sealed: the whole set, in one transaction, so
+/// a write that fails leaves the previous set whole. A network that no longer
+/// exists has nothing to remember, and nothing is written.
+pub async fn replace_bnc_remembered_channels(
+    pool: &PgPool,
+    owner: &str,
+    name: &str,
+    channels: &[BncAutojoin],
+) -> Result<(), DbError> {
+    if channels.len() > MAX_REMEMBERED_CHANNELS {
+        return Err(DbError::InvalidNetworkAutojoin(name.to_string()));
+    }
+    let folded = CaseMapping::Rfc1459.casefold(owner);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    // Locked, so a concurrent delete of the network either happens before
+    // (no row, nothing written) or waits for this write to commit.
+    let network: Option<i64> = sqlx::query_scalar(
+        "SELECT n.id FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         WHERE a.name_folded = $1 AND lower(n.name) = lower($2)
+         FOR NO KEY UPDATE OF n",
+    )
+    .bind(&folded)
+    .bind(name)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    let Some(network) = network else {
+        return Ok(());
+    };
+    sqlx::query("DELETE FROM bnc_remembered_channels WHERE network_id = $1")
+        .bind(network)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+    let (names, keys) = autojoin_columns(channels);
+    sqlx::query(
+        "INSERT INTO bnc_remembered_channels (network_id, channel, key_sealed)
+         SELECT $1, entry.channel, entry.key_sealed
+         FROM unnest($2::text[], $3::text[]) AS entry(channel, key_sealed)
+         ON CONFLICT (network_id, channel) DO NOTHING",
+    )
+    .bind(network)
+    .bind(&names)
+    .bind(&keys)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(())
+}
+
+/// Forget the remembered channel `channel` of `account`'s network `name`,
+/// matched without regard to ASCII case, audited in the same transaction.
+/// Returns whether a remembered channel was removed (false ⇒ none by that
+/// name, and nothing is recorded).
+pub async fn forget_bnc_remembered_channel(
+    pool: &PgPool,
+    account: &str,
+    name: &str,
+    channel: &str,
+    audit: NetworkAudit<'_>,
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let stored: Option<String> = sqlx::query_scalar(
+        "DELETE FROM bnc_remembered_channels c
+         USING bnc_networks n, accounts a
+         WHERE c.network_id = n.id AND n.account_id = a.id
+           AND a.name_folded = $1 AND lower(n.name) = lower($2)
+           AND lower(c.channel) = lower($3)
+         RETURNING n.name",
+    )
+    .bind(&folded)
+    .bind(name)
+    .bind(channel)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(query_error)?
+    .into_iter()
+    .next();
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    audit_network_mutation(
+        &mut transaction,
+        NetworkAudit {
+            detail: &format!("{}; channel={channel}", audit.detail),
+            ..audit
+        },
+        "NETWORK_CHANNEL_FORGET",
+        &folded,
+        &stored,
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }

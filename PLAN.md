@@ -1522,6 +1522,29 @@ Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
   failover can roll the lease row back; the first upgrade to this release
   stops every process.
 
+Two bouncer decisions of the maintainer's (DESIGN §10.3), each with tests that
+drive the real driver, the daemon and PostgreSQL:
+
+- **Channels joined at runtime survive a restart and an edit.** A stored IRC
+  network remembers every channel the upstream confirmed (migration 0103),
+  its learned key sealed; a restart or an edit rejoins them beside the
+  autojoin; a `PART`, a `KICK` (told with its reason), a refused rejoin (told
+  with its reason) or the owner's removal on the console or the API forgets
+  one. A restart used to fall back to the configured autojoin, and an edit
+  dropped the in-memory set.
+- **A network signs in with a TLS client certificate** (SASL EXTERNAL, or the
+  certificate alone for NickServ CertFP, as OFTC needs), generated (Ed25519 or
+  ECDSA P-256) or uploaded on the console and the API, shown by its SHA-256
+  and SHA-512 fingerprints, its key sealed and write-only, rotated or removed.
+  OFTC's preset says to use one. The class behind it is fixed too: a `sasl`
+  capability without a usable mechanism parks at once
+  (`sasl_mechanism_unavailable`), and a missing one is outlasted for about an
+  hour and then parks, where both used to be retried forever.
+- The OpenAPI contract's upstream diagnostic said at most 160 characters while
+  the server sends up to 300; it now states the server's bound. The client
+  library no longer installs the process-wide TLS provider as a side effect of
+  connecting, which made a later `e6ircd` start in the same process refuse to.
+
 ## Edge tier
 
 Goal: e6irc deploys and redeploys without dropping a client connection

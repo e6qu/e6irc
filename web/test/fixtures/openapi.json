@@ -4180,6 +4180,32 @@
                                 },
                                 "type": "array"
                               },
+                              "client_certificate": {
+                                "description": "The TLS client certificate an IRC network presents (SASL EXTERNAL, or NickServ CertFP), by its fingerprints; null when none is stored. Its key is never returned.",
+                                "oneOf": [
+                                  {
+                                    "type": "null"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "fingerprint_sha256": {
+                                        "pattern": "^[0-9a-f]{64}$",
+                                        "type": "string"
+                                      },
+                                      "fingerprint_sha512": {
+                                        "pattern": "^[0-9a-f]{128}$",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "fingerprint_sha256",
+                                      "fingerprint_sha512"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
                               "configured": {
                                 "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409).",
                                 "type": "boolean"
@@ -4228,6 +4254,30 @@
                                   "string",
                                   "null"
                                 ]
+                              },
+                              "remembered_channels": {
+                                "description": "Channels the session was confirmed in, rejoined after a restart or an edit besides autojoin. Remove one with DELETE /api/v1/me/networks/{name}/remembered-channels/{channel}.",
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "channel": {
+                                      "maxLength": 200,
+                                      "minLength": 2,
+                                      "type": "string"
+                                    },
+                                    "keyed": {
+                                      "description": "Whether the key it is joined with is stored, sealed; never returned.",
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": [
+                                    "channel",
+                                    "keyed"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 512,
+                                "type": "array"
                               },
                               "runtime": {
                                 "oneOf": [
@@ -4292,7 +4342,8 @@
                                                 "type": "string"
                                               },
                                               "diagnostic": {
-                                                "maxLength": 160,
+                                                "description": "The upstream's own words, bounded and free of control characters.",
+                                                "maxLength": 300,
                                                 "type": "string"
                                               },
                                               "summary": {
@@ -4453,6 +4504,8 @@
                               "has_sasl_account",
                               "has_sasl_password",
                               "has_server_password",
+                              "client_certificate",
+                              "remembered_channels",
                               "enabled",
                               "connected",
                               "runtime",
@@ -4550,7 +4603,8 @@
                                                 "type": "string"
                                               },
                                               "diagnostic": {
-                                                "maxLength": 160,
+                                                "description": "The upstream's own words, bounded and free of control characters.",
+                                                "maxLength": 300,
                                                 "type": "string"
                                               },
                                               "summary": {
@@ -8335,6 +8389,32 @@
                             },
                             "type": "array"
                           },
+                          "client_certificate": {
+                            "description": "The TLS client certificate an IRC network presents (SASL EXTERNAL, or NickServ CertFP), by its fingerprints; null when none is stored. Its key is never returned.",
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "fingerprint_sha256": {
+                                    "pattern": "^[0-9a-f]{64}$",
+                                    "type": "string"
+                                  },
+                                  "fingerprint_sha512": {
+                                    "pattern": "^[0-9a-f]{128}$",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "fingerprint_sha256",
+                                  "fingerprint_sha512"
+                                ],
+                                "type": "object"
+                              }
+                            ]
+                          },
                           "configured": {
                             "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409).",
                             "type": "boolean"
@@ -8379,6 +8459,30 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "remembered_channels": {
+                            "description": "Channels the session was confirmed in, rejoined after a restart or an edit besides autojoin. Remove one with DELETE /api/v1/me/networks/{name}/remembered-channels/{channel}.",
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "channel": {
+                                  "maxLength": 200,
+                                  "minLength": 2,
+                                  "type": "string"
+                                },
+                                "keyed": {
+                                  "description": "Whether the key it is joined with is stored, sealed; never returned.",
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "channel",
+                                "keyed"
+                              ],
+                              "type": "object"
+                            },
+                            "maxItems": 512,
+                            "type": "array"
                           },
                           "runtime": {
                             "oneOf": [
@@ -8443,7 +8547,8 @@
                                             "type": "string"
                                           },
                                           "diagnostic": {
-                                            "maxLength": 160,
+                                            "description": "The upstream's own words, bounded and free of control characters.",
+                                            "maxLength": 300,
                                             "type": "string"
                                           },
                                           "summary": {
@@ -8604,6 +8709,8 @@
                           "has_sasl_account",
                           "has_sasl_password",
                           "has_server_password",
+                          "client_certificate",
+                          "remembered_channels",
                           "enabled",
                           "connected",
                           "runtime",
@@ -9070,6 +9177,32 @@
                       },
                       "type": "array"
                     },
+                    "client_certificate": {
+                      "description": "The TLS client certificate an IRC network presents (SASL EXTERNAL, or NickServ CertFP), by its fingerprints; null when none is stored. Its key is never returned.",
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fingerprint_sha256": {
+                              "pattern": "^[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            "fingerprint_sha512": {
+                              "pattern": "^[0-9a-f]{128}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "fingerprint_sha256",
+                            "fingerprint_sha512"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
                     "configured": {
                       "description": "Whether the server configuration defines this network: the operator's, read-only through the account API (edit, enable/disable, and delete are refused with 409).",
                       "type": "boolean"
@@ -9114,6 +9247,30 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "remembered_channels": {
+                      "description": "Channels the session was confirmed in, rejoined after a restart or an edit besides autojoin. Remove one with DELETE /api/v1/me/networks/{name}/remembered-channels/{channel}.",
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "channel": {
+                            "maxLength": 200,
+                            "minLength": 2,
+                            "type": "string"
+                          },
+                          "keyed": {
+                            "description": "Whether the key it is joined with is stored, sealed; never returned.",
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "channel",
+                          "keyed"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 512,
+                      "type": "array"
                     },
                     "runtime": {
                       "oneOf": [
@@ -9178,7 +9335,8 @@
                                       "type": "string"
                                     },
                                     "diagnostic": {
-                                      "maxLength": 160,
+                                      "description": "The upstream's own words, bounded and free of control characters.",
+                                      "maxLength": 300,
                                       "type": "string"
                                     },
                                     "summary": {
@@ -9339,6 +9497,8 @@
                     "has_sasl_account",
                     "has_sasl_password",
                     "has_server_password",
+                    "client_certificate",
+                    "remembered_channels",
                     "enabled",
                     "connected",
                     "runtime",
@@ -9961,6 +10121,215 @@
         "summary": "Read the bounded owner-scoped component log (oldest-first)"
       }
     },
+    "/api/v1/me/networks/{name}/client-certificate": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed, and the network reconnects without it"
+          },
+          "400": {
+            "description": "a path parameter does not parse as its schema (a problem document)"
+          },
+          "401": {
+            "description": "not signed in, or the token or session is invalid or expired"
+          },
+          "403": {
+            "description": "the account is suspended, the token lacks the scope this method needs, or a cookie-authenticated unsafe method carried no valid X-E6IRC-CSRF value"
+          },
+          "404": {
+            "description": "no owner-scoped network with this name, or it has no certificate"
+          },
+          "408": {
+            "description": "the request passed the 30-second deadline (a problem document)"
+          },
+          "409": {
+            "description": "the server configuration defines the network, or the owner is suspended"
+          },
+          "413": {
+            "description": "the request body is larger than 1 MiB (a problem document)"
+          },
+          "429": {
+            "description": "the account's request budget is spent; Retry-After gives the seconds to wait"
+          },
+          "503": {
+            "description": "database unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          },
+          {
+            "secureBrowserSession": []
+          }
+        ],
+        "summary": "Remove the network's TLS client certificate"
+      },
+      "post": {
+        "description": "An IRC network over TLS presents it to the upstream: SASL EXTERNAL where the network offers it, and otherwise the certificate alone, which NickServ's CertFP recognises by its fingerprint (OFTC). Register a fingerprint with `/msg NickServ CERT ADD`. The private key is sealed at rest and never returned; posting again replaces the certificate (key rotation). The network reconnects with it.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "action": {
+                        "const": "generate"
+                      },
+                      "algorithm": {
+                        "enum": [
+                          "ed25519",
+                          "ecdsa_p256"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "action",
+                      "algorithm"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "action": {
+                        "const": "upload"
+                      },
+                      "certificate": {
+                        "description": "PEM: the certificate, then any intermediates.",
+                        "maxLength": 32768,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "key": {
+                        "description": "PEM: the certificate's private key (PKCS #8, SEC 1 or PKCS #1).",
+                        "maxLength": 32768,
+                        "minLength": 1,
+                        "type": "string",
+                        "writeOnly": true
+                      }
+                    },
+                    "required": [
+                      "action",
+                      "certificate",
+                      "key"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "algorithm": {
+                      "enum": [
+                        "ed25519",
+                        "ecdsa",
+                        "rsa"
+                      ],
+                      "type": "string"
+                    },
+                    "certificate": {
+                      "description": "The certificate, PEM (public).",
+                      "type": "string"
+                    },
+                    "fingerprint_sha256": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "fingerprint_sha512": {
+                      "pattern": "^[0-9a-f]{128}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "algorithm",
+                    "fingerprint_sha256",
+                    "fingerprint_sha512",
+                    "certificate"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "stored, and the network reconnects with it"
+          },
+          "400": {
+            "description": "not an IRC network, or a certificate and key that are not a usable pair (the problem names the field)"
+          },
+          "401": {
+            "description": "not signed in, or the token or session is invalid or expired"
+          },
+          "403": {
+            "description": "the account is suspended, the token lacks the scope this method needs, or a cookie-authenticated unsafe method carried no valid X-E6IRC-CSRF value"
+          },
+          "404": {
+            "description": "no owner-scoped network with this name"
+          },
+          "408": {
+            "description": "the request passed the 30-second deadline (a problem document)"
+          },
+          "409": {
+            "description": "the network does not use TLS, no master key is configured, the server configuration defines the network, or the owner is suspended"
+          },
+          "413": {
+            "description": "the request body is larger than 1 MiB (a problem document)"
+          },
+          "429": {
+            "description": "the account's request budget is spent; Retry-After gives the seconds to wait"
+          },
+          "503": {
+            "description": "database unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          },
+          {
+            "secureBrowserSession": []
+          }
+        ],
+        "summary": "Generate or upload the network's TLS client certificate"
+      }
+    },
     "/api/v1/me/networks/{name}/operations": {
       "get": {
         "description": "Returns owner-scoped typed runtime state, persisted backlog metadata, and the newest 100 detached upstream lines. Secret material is never returned.",
@@ -10055,7 +10424,8 @@
                                       "type": "string"
                                     },
                                     "diagnostic": {
-                                      "maxLength": 160,
+                                      "description": "The upstream's own words, bounded and free of control characters.",
+                                      "maxLength": 300,
                                       "type": "string"
                                     },
                                     "summary": {
@@ -10262,6 +10632,75 @@
           }
         ],
         "summary": "Read bounded network Operations data"
+      }
+    },
+    "/api/v1/me/networks/{name}/remembered-channels/{channel}": {
+      "delete": {
+        "description": "The channel is no longer rejoined after a restart or an edit; a session that is in it leaves it. The channel name is matched without regard to ASCII case and must be percent-encoded (`%23` for `#`).",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "channel",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 2,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "forgotten"
+          },
+          "400": {
+            "description": "a path parameter does not parse as its schema (a problem document)"
+          },
+          "401": {
+            "description": "not signed in, or the token or session is invalid or expired"
+          },
+          "403": {
+            "description": "the account is suspended, the token lacks the scope this method needs, or a cookie-authenticated unsafe method carried no valid X-E6IRC-CSRF value"
+          },
+          "404": {
+            "description": "no owner-scoped network with this name, or it does not remember that channel"
+          },
+          "408": {
+            "description": "the request passed the 30-second deadline (a problem document)"
+          },
+          "409": {
+            "description": "the server configuration defines the network"
+          },
+          "413": {
+            "description": "the request body is larger than 1 MiB (a problem document)"
+          },
+          "429": {
+            "description": "the account's request budget is spent; Retry-After gives the seconds to wait"
+          },
+          "503": {
+            "description": "database unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          },
+          {
+            "secureBrowserSession": []
+          }
+        ],
+        "summary": "Stop rejoining one remembered channel"
       }
     },
     "/api/v1/me/password": {
@@ -11448,6 +11887,19 @@
                             "minLength": 1,
                             "type": "string"
                           },
+                          "authentication": {
+                            "description": "sasl: the NickServ account's password over SASL. client_certificate: the network has no SASL password login; a TLS client certificate whose fingerprint NickServ knows (CertFP) identifies the account.",
+                            "enum": [
+                              "sasl",
+                              "client_certificate"
+                            ],
+                            "type": "string"
+                          },
+                          "guidance": {
+                            "maxLength": 400,
+                            "minLength": 1,
+                            "type": "string"
+                          },
                           "id": {
                             "maxLength": 64,
                             "minLength": 1,
@@ -11472,7 +11924,9 @@
                           "label",
                           "name",
                           "addr",
-                          "tls"
+                          "tls",
+                          "authentication",
+                          "guidance"
                         ],
                         "type": "object"
                       },

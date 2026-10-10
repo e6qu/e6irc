@@ -17,6 +17,8 @@ async fn plain_pool(url: &e6ircd::db::DatabaseUrl) -> Result<sqlx::PgPool, sqlx:
 
 #[path = "support/deadline.rs"]
 mod deadline;
+#[path = "support/membership.rs"]
+mod membership;
 
 /// A full-access personal access token with the default lifetime, minted the
 /// way the REST endpoint mints one.
@@ -1944,6 +1946,9 @@ async fn bnc_network_upstream_secret_requires_master_key() {
             sasl_password_sealed: Some("enc:v2:unavailable-without-key".into()),
             enabled: true,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "alice",
@@ -3560,6 +3565,9 @@ async fn console_networks_page_lists_the_callers_networks() {
             sasl_password_sealed: None,
             enabled: true,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "alice",
@@ -7516,6 +7524,9 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
             sasl_password_sealed: Some("enc:v1:test".into()),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "alice",
@@ -7641,6 +7652,9 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
             sasl_password_sealed: Some("enc:v1:test".into()),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "alice",
@@ -7806,6 +7820,9 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
             sasl_password_sealed: Some(matrix_password),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::BncNetworkRow {
             kind: e6ircd::config::NetworkKind::Discord,
@@ -7820,6 +7837,9 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
             sasl_password_sealed: Some(discord_token),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::BncNetworkRow {
             kind: e6ircd::config::NetworkKind::Slack,
@@ -7834,6 +7854,9 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
             sasl_password_sealed: Some(slack_app_token),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
     ] {
         e6ircd::db::create_bnc_network(
@@ -8097,6 +8120,9 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         sasl_password_sealed: None,
         enabled: false,
         server_password_sealed: None,
+
+        client_certificate: None,
+        remembered_channels: Vec::new(),
     };
     e6ircd::db::create_bnc_network(
         &verification,
@@ -9253,6 +9279,9 @@ async fn network_buffer_read() {
             sasl_password_sealed: None,
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "alice",
@@ -9953,6 +9982,9 @@ async fn admin_networks_fleet_view_and_toggle() {
             sasl_password_sealed: None,
             enabled: true,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: "bob",
@@ -11168,6 +11200,9 @@ async fn account_with_enabled_network(pool: &sqlx::PgPool, owner: &str) -> i64 {
             sasl_password_sealed: None,
             enabled: true,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         },
         e6ircd::db::NetworkAudit {
             actor: owner,
@@ -12657,4 +12692,402 @@ async fn configured_networks_are_the_operators_and_the_inventory_pages_them() {
     .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("sasl_account"), "{body}");
+}
+
+/// The configuration the remembered-channel and client-certificate tests run
+/// under: HTTP, the database, the BNC listener, and a master key.
+fn remembering_config(url: &e6ircd::db::DatabaseUrl, key_path: &std::path::Path) -> Config {
+    Config {
+        server_name: "irc.memory.example".into(),
+        network_name: "Memory".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path.to_path_buf(),
+            previous_key_files: Vec::new(),
+        }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    }
+}
+
+/// The remembered channels of `network` as the API lists them.
+async fn remembered_channels(
+    http: std::net::SocketAddr,
+    token: &str,
+    network: &str,
+) -> Vec<(String, bool)> {
+    let (status, value, body) =
+        get_json(http, &format!("/api/v1/me/networks/{network}"), token).await;
+    assert_eq!(status, 200, "{body}");
+    value["remembered_channels"]
+        .as_array()
+        .expect("remembered_channels")
+        .iter()
+        .map(|entry| {
+            (
+                entry["channel"].as_str().expect("channel").to_owned(),
+                entry["keyed"].as_bool().expect("keyed"),
+            )
+        })
+        .collect()
+}
+
+async fn wait_remembered(
+    http: std::net::SocketAddr,
+    token: &str,
+    network: &str,
+    expected: &[(&str, bool)],
+) {
+    let expected: Vec<(String, bool)> = expected
+        .iter()
+        .map(|(channel, keyed)| ((*channel).to_owned(), *keyed))
+        .collect();
+    let mut last = Vec::new();
+    let settled = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            last = remembered_channels(http, token, network).await;
+            if last == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "remembered {last:?}, never {expected:?}");
+}
+
+/// Channels a client joins through the bouncer are remembered once the
+/// upstream confirms them, rejoined after a process restart and after an
+/// edit, forgotten when the session parts, and removable through the API —
+/// which leaves the channel too. A learned key is stored sealed and listed
+/// only as `keyed`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn joined_channels_are_remembered_across_restarts_and_edits() {
+    let url = support::test_db("joined_channels_are_remembered").await;
+    let key_path = temporary_path("remembered-key");
+    std::fs::write(&key_path, e6ircd::secret::SecretKey::generate().to_base64())
+        .expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("token");
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
+
+    let running = net::start(remembering_config(&url, &key_path))
+        .await
+        .expect("start");
+    let http = running.http_addr.expect("http bound");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    wait_http_ready(http).await;
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(
+            r##"{{"kind":"irc","name":"work","addr":"{up}","tls":false,"nick":"memo","username":"memo","realname":"Memo","autojoin":["#lobby"]}}"##
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    membership::wait_joined(up, "memo", "#lobby").await;
+
+    // A client joins two channels, one with a key, and parts a third.
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .unwrap();
+    client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/work",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("attach");
+    client.send_line("JOIN #runtime").await.unwrap();
+    client.send_line("JOIN #keyed sesame").await.unwrap();
+    client.send_line("JOIN #brief").await.unwrap();
+    membership::wait_joined(up, "memo", "#brief").await;
+    wait_remembered(
+        http,
+        &token,
+        "work",
+        &[
+            ("#brief", false),
+            ("#keyed", true),
+            ("#lobby", false),
+            ("#runtime", false),
+        ],
+    )
+    .await;
+    client.send_line("PART #brief").await.unwrap();
+    wait_remembered(
+        http,
+        &token,
+        "work",
+        &[("#keyed", true), ("#lobby", false), ("#runtime", false)],
+    )
+    .await;
+    drop(client);
+    let sealed: String = sqlx::query_scalar(
+        "SELECT key_sealed FROM bnc_remembered_channels WHERE channel = '#keyed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("stored key");
+    assert!(
+        e6ircd::secret::is_sealed(&sealed) && !sealed.contains("sesame"),
+        "a learned key is stored sealed"
+    );
+
+    // A restart rejoins them.
+    running.shutdown.run().await;
+    membership::whois_until(up, "memo", "left", Option::is_none).await;
+    let running = net::start(remembering_config(&url, &key_path))
+        .await
+        .expect("restart");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    membership::wait_joined(up, "memo", "#runtime").await;
+    membership::wait_joined(up, "memo", "#keyed").await;
+
+    // So does an edit: the edited network registers under its new nickname
+    // and rejoins what its predecessor was in.
+    let (status, body) = send_json(
+        http,
+        "PUT",
+        "/api/v1/me/networks/work",
+        &token,
+        &format!(
+            r##"{{"addr":"{up}","tls":false,"nick":"memo2","username":"memo","realname":"Memo","autojoin":["#lobby"],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"##
+        ),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    membership::wait_joined(up, "memo2", "#runtime").await;
+    membership::wait_joined(up, "memo2", "#keyed").await;
+
+    // Removing one through the API forgets it and leaves it.
+    let (status, body) = send_json(
+        http,
+        "DELETE",
+        "/api/v1/me/networks/work/remembered-channels/%23RUNTIME",
+        &token,
+        "",
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    membership::whois_until(up, "memo2", "left #runtime", |whois| {
+        whois
+            .as_ref()
+            .is_some_and(|channels| !channels.iter().any(|channel| channel == "#runtime"))
+    })
+    .await;
+    wait_remembered(http, &token, "work", &[("#keyed", true), ("#lobby", false)]).await;
+    let (status, _) = send_json(
+        http,
+        "DELETE",
+        "/api/v1/me/networks/work/remembered-channels/%23runtime",
+        &token,
+        "",
+    )
+    .await;
+    assert_eq!(status, 404, "a channel forgotten is not forgotten twice");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'NETWORK_CHANNEL_FORGET' \
+         AND target = 'alice/work'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1);
+    running.shutdown.run().await;
+    upstream.shutdown.run().await;
+}
+
+/// A network's client certificate over the API: generated (Ed25519 or ECDSA
+/// P-256) or uploaded, shown only as its fingerprints, its key sealed and never
+/// returned, replaced to rotate it, removed, and refused without TLS.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_network_client_certificate_is_generated_rotated_and_removed() {
+    let url = support::test_db("network_client_certificate").await;
+    let key_path = temporary_path("certificate-key");
+    std::fs::write(&key_path, e6ircd::secret::SecretKey::generate().to_base64())
+        .expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("token");
+    let running = net::start(remembering_config(&url, &key_path))
+        .await
+        .expect("start");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    // Nothing answers there: the network only retries, which is all these
+    // checks need of it.
+    for (name, tls) in [("oftc", true), ("plain", false)] {
+        let (status, body) = post_json(
+            http,
+            "/api/v1/me/networks",
+            &token,
+            &format!(
+                r#"{{"kind":"irc","name":"{name}","addr":"127.0.0.1:1","tls":{tls},"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let certificate_path = "/api/v1/me/networks/oftc/client-certificate";
+    let generate =
+        |algorithm: &str| format!(r#"{{"action":"generate","algorithm":"{algorithm}"}}"#);
+
+    let (status, body) = post_json(http, certificate_path, &token, &generate("ed25519")).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("PRIVATE KEY"),
+        "the key is never returned: {body}"
+    );
+    let first: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(first["algorithm"], "ed25519");
+    let fingerprint = first["fingerprint_sha512"]
+        .as_str()
+        .expect("sha512")
+        .to_owned();
+    assert_eq!(fingerprint.len(), 128);
+    let (status, network, body) = get_json(http, "/api/v1/me/networks/oftc", &token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        network["client_certificate"]["fingerprint_sha512"],
+        fingerprint
+    );
+    assert_eq!(
+        network["client_certificate"]["fingerprint_sha256"],
+        first["fingerprint_sha256"]
+    );
+    assert!(!body.contains("PRIVATE KEY"), "{body}");
+    let sealed: String =
+        sqlx::query_scalar("SELECT client_key_sealed FROM bnc_networks WHERE name = 'oftc'")
+            .fetch_one(&pool)
+            .await
+            .expect("stored key");
+    assert!(
+        e6ircd::secret::is_sealed(&sealed),
+        "the key is stored sealed"
+    );
+
+    // Rotation is a new certificate, with a new key and fingerprint.
+    let (status, body) = post_json(http, certificate_path, &token, &generate("ecdsa_p256")).await;
+    assert_eq!(status, 200, "{body}");
+    let rotated: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(rotated["algorithm"], "ecdsa");
+    assert_ne!(rotated["fingerprint_sha512"], fingerprint.as_str());
+
+    // An uploaded pair, and one whose key belongs to another certificate.
+    let mine = rcgen::generate_simple_self_signed(vec!["alice".into()]).expect("certificate");
+    let other = rcgen::generate_simple_self_signed(vec!["mallory".into()]).expect("certificate");
+    let upload = |certificate: &str, key: &str| {
+        serde_json::json!({ "action": "upload", "certificate": certificate, "key": key })
+            .to_string()
+    };
+    let (status, body) = post_json(
+        http,
+        certificate_path,
+        &token,
+        &upload(&mine.cert.pem(), &mine.signing_key.serialize_pem()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let uploaded: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        uploaded["fingerprint_sha256"],
+        e6irc_client::Fingerprints::of_der(mine.cert.der()).sha256
+    );
+    let (status, body) = post_json(
+        http,
+        certificate_path,
+        &token,
+        &upload(&mine.cert.pem(), &other.signing_key.serialize_pem()),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).expect("problem");
+    assert_eq!(problem["field"], "key", "{body}");
+
+    // Without TLS no certificate is presented, so none is accepted, and a
+    // network that has one keeps TLS on.
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks/plain/client-certificate",
+        &token,
+        &generate("ed25519"),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let (status, body) = send_json(
+        http,
+        "PUT",
+        "/api/v1/me/networks/oftc",
+        &token,
+        r#"{"addr":"127.0.0.1:1","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"autojoin_keys":{"keep":[]},"credentials":{"action":"keep"},"server_password":{"action":"keep"}}"#,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).expect("problem");
+    assert_eq!(problem["field"], "tls", "{body}");
+
+    // Removal.
+    let (status, body) = send_json(http, "DELETE", certificate_path, &token, "").await;
+    assert_eq!(status, 204, "{body}");
+    let (_, network, _) = get_json(http, "/api/v1/me/networks/oftc", &token).await;
+    assert!(network["client_certificate"].is_null(), "{network}");
+    let (status, _) = send_json(http, "DELETE", certificate_path, &token, "").await;
+    assert_eq!(status, 404);
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action IN \
+         ('NETWORK_CERTIFICATE_SET', 'NETWORK_CERTIFICATE_REMOVE') AND target = 'alice/oftc'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 4, "three set, one removed");
+    running.shutdown.run().await;
 }

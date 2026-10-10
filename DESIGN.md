@@ -3436,9 +3436,22 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   a taken nickname that follows a services outage is owed the whole schedule. **Until
   it clears, never park**: a capacity or policy answer from the network — a
   pre-welcome `ERROR` (a connection throttle, "too many host connections", a
-  K-line, "SASL access only"), a 465 ban, `sasl_unavailable`, a 906 abort —
-  takes the same first steps and then stays at 4m for as long as it lasts,
-  with the upstream's sanitized reason in the runtime snapshot the whole time.
+  K-line, "SASL access only"), a 465 ban, a 906 abort — takes the same first
+  steps and then stays at 4m for as long as it lasts, with the upstream's
+  sanitized reason in the runtime snapshot the whole time. **Outlast, then
+  park**: an upstream that offers no `sasl` capability at all
+  (`sasl_unavailable`) is either Solanum while services are down, which clears
+  by itself, or a network that has no SASL (OFTC), which never will; nothing on
+  the wire tells them apart. It takes the same steps for 18 refusals in a row
+  (`MAX_CONSECUTIVE_OUTLASTED_REFUSALS`, about an hour), longer than services
+  stay down for, and then parks, its summary saying to remove the SASL account
+  or use a client certificate. It used to be retried forever, so an OFTC
+  network configured with a password never connected and never said why in a
+  way anyone acted on. A `sasl` capability that names its mechanisms and none
+  the credentials can use (`sasl_mechanism_unavailable`) is the network's
+  settled answer, not an outage: it parks at once, the diagnostic naming what
+  the network offers — and, when that includes `EXTERNAL`, that it logs in
+  with a client certificate instead.
   Parking waits for the owner to change something; a throttle, a services
   outage and even a ban give them nothing to change, and a ban that is
   retried every four minutes costs the network one refused dial while keeping
@@ -3463,7 +3476,38 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   requests, SASL, and the welcome — so its reason (`Trying to reconnect too
   fast`, `SASL access only`) is typed and kept wherever it arrives.
   Authentication and registration rejection have distinct terminal lifecycle
-  states. **A ghost of the network's own session is regained.** A session
+  states. **A client certificate authenticates without a password** (modelled
+  on soju's certfp). A stored IRC network over TLS may carry one TLS client
+  certificate with its key, generated in the console or the API (Ed25519 or
+  ECDSA P-256, self-signed: services compare fingerprints, never a chain) or
+  uploaded as PEM; `e6irc_client::ClientCertificate` admits only a pair whose
+  key is one aws-lc-rs signs with and belongs to the certificate, so a
+  mismatched upload is refused at its field instead of failing every
+  handshake. The driver presents it in the TLS handshake. A network that
+  offers SASL `EXTERNAL` logs it in; one that refuses it there (its fingerprint
+  is not on the account yet) is offered the stored password next on the same
+  connection, said in a `*bnc*` notice — nothing of the password crossed yet,
+  and a network keeps connecting while its owner registers the fingerprint —
+  and without a password that refusal is a credential rejection that parks,
+  naming `NickServ CERT ADD`. A network that offers no `EXTERNAL` (OFTC offers
+  no SASL at all) is offered the stored password when it offers a mechanism for
+  it, and otherwise registers with the certificate alone, which NickServ's
+  CertFP recognises by its fingerprint; a `*bnc*` notice says which happened.
+  The certificate is public and shown as its SHA-256 and SHA-512 fingerprints
+  (what `CERT ADD` takes; networks differ in which digest they compare); the
+  key is sealed with the master key under the owner's context like every other
+  upstream secret, resealed by `rotate-secrets`, write-only in the API and
+  never echoed. Generating or uploading another replaces it (rotation); removal
+  is its own action; both reconnect the network. A table CHECK and the edit
+  path keep a network with a certificate on TLS. Client and server stay on the
+  one TLS stack, rustls on aws-lc-rs, and rcgen on aws-lc-rs mints the
+  certificates, as it does the core link's (§19.2). The client library builds
+  each connection's TLS configuration on an explicit aws-lc-rs provider rather
+  than installing the process default, so a library connection made before
+  `e6ircd` pins its provider can no longer make the start refuse to. A network
+  the configuration defines has no certificate: one is created and rotated by
+  its owner, and the operator's networks have no owner-side page.
+  **A ghost of the network's own session is regained.** A session
   the upstream never saw end — the process crashed and a standby took over
   (§18), or the link died without a `QUIT` — keeps the configured nickname
   until the upstream's ping timeout reaps it, and the next dial meets it as a
@@ -3557,20 +3601,45 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   client's `JOIN` offered once the upstream confirms that channel, then any
   `+k`/`-k` the channel sees (read with the network's `CHANMODES` and
   `PREFIX`), and failing both the key the owner configured for an autojoin
-  channel. A key is a secret of the channel's members: a learned one is held
-  in memory beside the reconnect intent only, a configured one is stored
-  sealed (§10, the network manager), and its `Debug` is redacted. A channel
+  channel. A key is a secret of the channel's members: a configured one is
+  stored sealed (§10, the network manager), a learned one is stored sealed
+  beside its remembered channel (below), and its `Debug` is redacted. A channel
   whose rejoin the upstream refuses (403, 471, 473, 474, 475) is dropped from
-  the intent, with a `*bnc*` notice, rather than retried and refused after
-  every reconnect; and a client's `PART` of a channel the intent holds but the
-  session is not in drops it too, answered by a `*bnc*` notice before the
-  upstream's own 442. Tracked membership is bounded at 512 channels, per session and in
+  the intent, with a `*bnc*` notice carrying the upstream's reason, rather than
+  retried and refused after every reconnect; a `KICK` of the session drops it
+  with a `*bnc*` notice naming the kicker and reason, since nobody chose to
+  leave; and a client's `PART` of a channel the intent holds but the session
+  is not in drops it too, answered by a `*bnc*` notice before the upstream's
+  own 442. Tracked membership is bounded at 512 channels, per session and in
   the reconnect intent: the names come from the upstream, which a tenant may
   point at a server of their own, so an unbounded set was a memory and
   reconnect-flood lever on the shared daemon. Past the bound the session ends
   as `channel_limit_exceeded`; a confirmed name e6irc cannot track is announced
-  live and not rejoined. A process restart falls back to the configured
-  autojoin, which is the operator-declared floor. Upstream SASL uses
+  live and not rejoined. **The intent outlives the driver** for a network an
+  account stores (ZNC and soju keep their channels too): its registry slot runs
+  a writer (`bouncer::channel_memory`) that stores the whole set in
+  `bnc_remembered_channels` (migration 0103) after every change, off the
+  driver's path — a database that is away holds no upstream line, the last set
+  written stays whole, and the write is retried every 5 s with
+  `remembered_channels_storage_failed` told live until it lands. A channel is
+  remembered once the upstream's `JOIN` echo for our own nick confirms it, and
+  forgotten on a `PART`, a `KICK` of us, a refused rejoin, or its removal by
+  the owner (the console's network page and
+  `DELETE /api/v1/me/networks/{name}/remembered-channels/{channel}`, which also
+  parts it when the session is in it, so what is remembered stays what the
+  session is in). The next driver is seeded with the rows after a process
+  restart, and with its predecessor's set after an edit (`replace`, which
+  waits for the old driver to stop), and rejoins them with the configured
+  autojoin. A key it learned is stored sealed with the master key under the
+  owner's context, resealed by `rotate-secrets`, and never returned (the API
+  says `keyed`). The choice is principled rather than convenient: a learned
+  key is the same secret as a configured one, which is already stored sealed
+  the same way, and not storing it would make every keyed channel joined from a
+  client fail with 475 after a restart and then be forgotten, a silent loss.
+  Without a master key nothing can be sealed, so the channel is remembered
+  without its key. A configured network is the operator's declaration: its
+  channels are its autojoin, and it has no row to remember others in.
+  Upstream SASL uses
   credentials stored encrypted (§15) with the strongest password mechanism the
   network offers — SCRAM-SHA-512, then SCRAM-SHA-256 (RFC 5802/7677, the
   server's signature verified in constant time, and the iteration count held to
@@ -3612,7 +3681,9 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   `sasl_failed` code but, being the client's `SaslAborted` refusal, is retried
   until it clears), is a registration refusal carrying the server's own
   words. Treating those as "rejected credentials" parked a network instantly
-  and left its owner retyping a correct password. A server with no capability
+  and left its owner retyping a correct password. A mechanism the network does
+  not name is `sasl_mechanism_unavailable` and parks at once; a missing
+  capability is outlasted and then parked (the refusal schedules above). A server with no capability
   negotiation at all — a 421 or 451 to `CAP LS`, or twenty seconds of silence —
   registers plainly (NICK/USER and then `CAP END`, harmless to a server that
   merely answered slowly) — unless SASL is configured, where registering
@@ -5139,7 +5210,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   the environment is wiped; the process is non-dumpable on Linux
   (`PR_SET_DUMPABLE`) and the systemd unit sets `LimitCORE=0`, so an abort
   cannot write keys or passwords to a core file.
-- Not provided, stated rather than implied: TLS client certificates, application-layer
+- Not provided, stated rather than implied: TLS client certificates presented
+  to e6ircd's own listeners (the bouncer presents one to an upstream, §10.3), application-layer
   protocol negotiation, and multiple certificates chosen by the requested
   server name on IRC listeners (one certificate per listener); online
   certificate-status or revocation-list checks on outbound TLS, whose roots are the

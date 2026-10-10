@@ -32,8 +32,10 @@ mod bridge_oracle;
 mod bridged_senders;
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) use bridged_senders::{BridgedSenders, ProviderAccount};
+mod channel_memory;
 mod channel_views;
 mod chathistory;
+pub mod client_certificates;
 #[cfg(feature = "discord")]
 mod discord;
 mod irc_driver;
@@ -60,13 +62,15 @@ pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
 pub use nick_regain::NickRegainTiming;
 pub use serve::{ConfiguredNetwork, DriverStops, NetworkStatus, Registry};
 pub(crate) use serve::{
-    ConfiguredNetworkHeld, MutationLane, RegistryRefusal, UnwrittenLines, bnc_serve,
+    ConfiguredNetworkHeld, MutationLane, RegistryRefusal, Storage as RegistryStorage,
+    UnwrittenLines, bnc_serve,
 };
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 pub use upstream_identity::{
-    AutojoinChannel, AutojoinEntry, ConfirmedChannel, UpstreamChannel, UpstreamIdentity,
-    UpstreamIdentityError, UpstreamNick, UpstreamRealname, UpstreamSaslAccount, UpstreamUsername,
+    AutojoinChannel, AutojoinEntry, ConfirmedChannel, RememberedChannel, UpstreamChannel,
+    UpstreamIdentity, UpstreamIdentityError, UpstreamNick, UpstreamRealname, UpstreamSaslAccount,
+    UpstreamUsername,
 };
 
 /// The ISUPPORT a network is described with when it has reported nothing of
@@ -278,6 +282,12 @@ pub struct DriverSpec {
     /// The IRC connection password (`PASS`), plaintext. Accepted for
     /// `kind=irc` only; refused for a bridge.
     pub server_password: Option<String>,
+    /// The TLS client certificate an IRC network presents. Accepted for
+    /// `kind=irc` over TLS only.
+    pub client_certificate: Option<e6irc_client::ClientCertificate>,
+    /// The channels a stored IRC network's session was in when its previous
+    /// driver stopped. Empty for a bridge.
+    pub remembered_channels: Vec<RememberedChannel>,
     /// The server's policy on upstreams inside its own network.
     pub internal_upstreams: crate::egress::InternalUpstreams,
     /// Whether the driver dials at once or holds its first dial back as one of
@@ -308,6 +318,8 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
         sasl_account,
         sasl_password,
         server_password,
+        client_certificate,
+        remembered_channels,
         internal_upstreams,
         first_dial,
     } = spec;
@@ -332,6 +344,18 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
     if kind.is_bridge() && server_password.is_some() {
         return Err(format!(
             "kind={} does not accept a server password; it applies only to IRC networks",
+            kind.as_db_str()
+        ));
+    }
+    if kind.is_bridge() && client_certificate.is_some() {
+        return Err(format!(
+            "kind={} does not accept a client certificate; it applies only to IRC networks",
+            kind.as_db_str()
+        ));
+    }
+    if kind.is_bridge() && !remembered_channels.is_empty() {
+        return Err(format!(
+            "kind={} remembers no joined channels; its rooms are its configuration",
             kind.as_db_str()
         ));
     }
@@ -366,6 +390,13 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 server_password.is_some(),
             ) {
                 return Err(credential.reason().to_string());
+            }
+            if client_certificate.is_some() && !tls {
+                return Err(
+                    "kind=irc presents a client certificate only over TLS; set tls=true or \
+                     remove the certificate"
+                        .into(),
+                );
             }
             let sasl = match (sasl_account, sasl_password) {
                 (Some(account), Some(password)) => Some((
@@ -402,6 +433,9 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 autojoin,
                 buffer_cap,
                 sasl,
+                client_certificate,
+                remembered_channels,
+                tls_roots: None,
                 server_password,
                 keepalive_idle: KEEPALIVE_IDLE,
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
@@ -552,6 +586,28 @@ pub fn driver_from_row(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let client_certificate = row
+        .client_certificate
+        .as_ref()
+        .map(|stored| {
+            let key = unseal(&stored.key_sealed)?;
+            e6irc_client::ClientCertificate::from_pem(&stored.certificate_pem, &key)
+                .map_err(|error| format!("the stored client certificate is unusable: {error}"))
+        })
+        .transpose()?;
+    let remembered_channels = row
+        .remembered_channels
+        .iter()
+        .map(|entry| {
+            let key = entry.key_sealed.as_deref().map(unseal).transpose()?;
+            RememberedChannel::parse(&entry.channel, key.as_deref()).ok_or_else(|| {
+                format!(
+                    "the remembered channel {:?} is not one channel and key",
+                    entry.channel
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let realname = match row.kind {
         crate::config::NetworkKind::Irc => row.realname.clone().ok_or_else(|| {
             "kind=irc stored network has no realname; update the network configuration".to_string()
@@ -577,6 +633,8 @@ pub fn driver_from_row(
         sasl_account: account,
         sasl_password: password,
         server_password,
+        client_certificate,
+        remembered_channels,
         internal_upstreams,
         first_dial,
     })
@@ -914,6 +972,12 @@ impl Refusal {
 /// than an instant park. Rejected *credentials* and a welcome under another
 /// nickname never reach this count: they park on the first rejection.
 pub(crate) const MAX_CONSECUTIVE_REGISTRATION_REJECTIONS: u32 = 5;
+
+/// Consecutive refusals *of one kind* before a driver on the
+/// outlast-then-park policy parks: 30s, 1m, 2m, then 4m steps, about an hour
+/// in all — longer than services stay down for, and short of retrying a
+/// network that will never offer SASL for the rest of the process's life.
+pub(crate) const MAX_CONSECUTIVE_OUTLASTED_REFUSALS: u32 = 18;
 
 /// First delay after an upstream refuses registration, doubled per consecutive
 /// refusal (30s, 1m, 2m, 4m, then park or stay at 4m). Long enough to outlast a
@@ -1265,6 +1329,9 @@ async fn retry_refusal<C>(
         RefusalRetry::ParkNow => true,
         RefusalRetry::ScheduleThenPark => {
             *consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS
+        }
+        RefusalRetry::OutlastThenPark => {
+            *consecutive_rejections >= MAX_CONSECUTIVE_OUTLASTED_REFUSALS
         }
         RefusalRetry::UntilItClears => false,
     };
@@ -3417,6 +3484,9 @@ pub struct NetworkHandle {
     history_ready: tokio::sync::watch::Sender<bool>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
+    /// The channels the session is to be in after a reconnect, shared with the
+    /// driver: what a stored network remembers across restarts and edits.
+    joined: std::sync::Arc<irc_driver::JoinedChannels>,
 }
 
 /// The database context a BNC attach needs to serve CHATHISTORY and MARKREAD:
@@ -3503,7 +3573,12 @@ pub enum NetworkFailure {
     ServerPasswordRequired,
     NetworkBanned,
     AuthenticationRejected,
+    /// The upstream offers no SASL at all: services may be down, or the
+    /// network may have none (OFTC).
     SaslUnavailable,
+    /// The upstream offers SASL, but none of the mechanisms the configured
+    /// credentials can use.
+    SaslMechanismUnavailable,
     SaslFailed,
     AutojoinFailed,
     ConnectionLost,
@@ -3529,6 +3604,9 @@ pub enum NetworkFailure {
     GatewayConfigurationRefused,
     BacklogStorageFailed,
     BacklogStorageLagged,
+    /// The channels a stored network rejoins after a restart could not be
+    /// written; the previous set stays stored, and the write is retried.
+    RememberedChannelsStorageFailed,
     CommandQueueFull,
     DriverStopped,
 }
@@ -3553,6 +3631,7 @@ impl NetworkFailure {
             Self::NetworkBanned => "network_banned",
             Self::AuthenticationRejected => "authentication_rejected",
             Self::SaslUnavailable => "sasl_unavailable",
+            Self::SaslMechanismUnavailable => "sasl_mechanism_unavailable",
             Self::SaslFailed => "sasl_failed",
             Self::AutojoinFailed => "autojoin_failed",
             Self::ConnectionLost => "connection_lost",
@@ -3568,6 +3647,7 @@ impl NetworkFailure {
             Self::GatewayConfigurationRefused => "gateway_configuration_refused",
             Self::BacklogStorageFailed => "backlog_storage_failed",
             Self::BacklogStorageLagged => "backlog_storage_lagged",
+            Self::RememberedChannelsStorageFailed => "remembered_channels_storage_failed",
             Self::CommandQueueFull => "command_queue_full",
             Self::DriverStopped => "driver_stopped",
         }
@@ -3598,7 +3678,12 @@ impl NetworkFailure {
             Self::NetworkBanned => "The upstream network banned this connection.",
             Self::AuthenticationRejected => "The upstream rejected the configured credentials.",
             Self::SaslUnavailable => {
-                "The upstream does not offer the SASL authentication this network is configured for."
+                "The upstream offers no SASL; services may be down, or the network has none \
+                 (then remove the SASL account, or use a client certificate)."
+            }
+            Self::SaslMechanismUnavailable => {
+                "The upstream offers SASL, but none of the mechanisms the configured credentials \
+                 can use; the diagnostic names what it offers."
             }
             Self::SaslFailed => "SASL authentication ended without a verdict on the credentials.",
             Self::AutojoinFailed => "A configured JOIN could not be sent during startup.",
@@ -3630,6 +3715,9 @@ impl NetworkFailure {
             Self::BacklogStorageFailed => "The detached backlog could not be stored.",
             Self::BacklogStorageLagged => {
                 "The detached backlog writer fell behind and missed messages."
+            }
+            Self::RememberedChannelsStorageFailed => {
+                "The channels to rejoin after a restart could not be stored; retrying."
             }
             Self::CommandQueueFull => "The upstream command queue is full.",
             Self::DriverStopped => "The network driver is no longer accepting commands.",
@@ -3663,6 +3751,7 @@ fn emit_failure_notice(
         failure,
         NetworkFailure::BacklogStorageFailed
             | NetworkFailure::BacklogStorageLagged
+            | NetworkFailure::RememberedChannelsStorageFailed
             | NetworkFailure::CommandQueueFull
     );
     let mut buffer = buffer;
@@ -5407,7 +5496,9 @@ impl NetworkHandle {
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
         let history = std::sync::Arc::new(std::sync::Mutex::new(None));
         let (history_ready, _) = tokio::sync::watch::channel(true);
+        let joined = std::sync::Arc::new(irc_driver::JoinedChannels::default());
         let handle = NetworkHandle {
+            joined: joined.clone(),
             events: events.clone(),
             commands: command_tx,
             attach_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -5437,6 +5528,7 @@ impl NetworkHandle {
             reply_routes,
             telemetry,
             reconnect_seed,
+            joined,
             rejection_retry_floor: REJECTION_RETRY_FLOOR,
             first_dial_delay: std::time::Duration::ZERO,
             buffered_status: std::sync::Mutex::new(BufferedStatus::default()),
@@ -5444,6 +5536,11 @@ impl NetworkHandle {
             bridge: BridgeRelayState::default(),
         };
         (handle, ends)
+    }
+
+    /// The channels the session is to be in after a reconnect.
+    pub(crate) fn joined_channels(&self) -> &std::sync::Arc<irc_driver::JoinedChannels> {
+        &self.joined
     }
 
     /// Stop the network's driver authoritatively. Called by the registry when a
@@ -5591,6 +5688,8 @@ pub struct DriverEnds {
     /// concurrent drivers de-correlate (see [`Backoff`]). Assigned once at
     /// construction from a process-wide counter.
     reconnect_seed: u64,
+    /// See [`NetworkHandle`]'s field of the same name.
+    joined: std::sync::Arc<irc_driver::JoinedChannels>,
     /// First delay after the upstream refuses registration; see
     /// [`REJECTION_RETRY_FLOOR`].
     rejection_retry_floor: std::time::Duration,
@@ -5690,6 +5789,12 @@ impl Drop for DriverEnds {
 }
 
 impl DriverEnds {
+    /// The channels the session is to be in after a reconnect, which the
+    /// network's handle shares.
+    pub(crate) fn joined_channels(&self) -> &std::sync::Arc<irc_driver::JoinedChannels> {
+        &self.joined
+    }
+
     /// Start a newly registered IRC session and publish its authoritative
     /// identity. This clears memberships from the previous transport; JOIN
     /// confirmations repopulate them through [`DriverEnds::emit_session_line`].
@@ -6400,6 +6505,9 @@ const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> Net
         e6irc_client::RegistrationRefusal::NetworkBanned => NetworkFailure::NetworkBanned,
         e6irc_client::RegistrationRefusal::NotRegistered => NetworkFailure::RegistrationRejected,
         e6irc_client::RegistrationRefusal::SaslUnavailable => NetworkFailure::SaslUnavailable,
+        e6irc_client::RegistrationRefusal::SaslMechanismUnavailable => {
+            NetworkFailure::SaslMechanismUnavailable
+        }
         e6irc_client::RegistrationRefusal::SaslAborted
         | e6irc_client::RegistrationRefusal::SaslFailed => NetworkFailure::SaslFailed,
     }
@@ -7847,6 +7955,8 @@ mod tests {
             sasl_account: account.map(str::to_string),
             sasl_password: password.map(str::to_string),
             server_password: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: FirstDial::Immediate,
         })
@@ -7928,6 +8038,8 @@ mod tests {
             sasl_account: None,
             sasl_password: (kind != NetworkKind::Irc).then(|| "token".into()),
             server_password: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: FirstDial::Immediate,
         };
@@ -7972,6 +8084,8 @@ mod tests {
             sasl_account: None,
             sasl_password: password.map(str::to_string),
             server_password: Some(server_password.into()),
+            client_certificate: None,
+            remembered_channels: Vec::new(),
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: FirstDial::Immediate,
         };
@@ -8094,6 +8208,9 @@ mod tests {
             sasl_password_sealed: Some("sealed-but-no-key".into()),
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         };
         let error = driver_from_row(
             &row,
@@ -8122,6 +8239,9 @@ mod tests {
             sasl_password_sealed: None,
             enabled: false,
             server_password_sealed: None,
+
+            client_certificate: None,
+            remembered_channels: Vec::new(),
         };
         let error = driver_from_row(
             &row,
@@ -9362,13 +9482,8 @@ mod tests {
     async fn refusals_that_never_park_do_not_count_toward_parking_a_later_one() {
         use e6irc_client::RegistrationRefusal;
         // The outage's refusal, from a real exchange: services gone, the
-        // upstream no longer offers the mechanism the driver speaks.
-        let Err(SessionOutcome::RegistrationRejected(unavailable)) =
-            irc_driver::tests::sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL")])
-                .await
-        else {
-            panic!("an upstream without the mechanism refuses registration");
-        };
+        // upstream no longer offers SASL at all.
+        let unavailable = services_outage_refusal().await;
         assert_eq!(unavailable.refusal(), RegistrationRefusal::SaslUnavailable);
         // The schedule itself runs on the paused clock.
         tokio::time::pause();
@@ -9390,6 +9505,120 @@ mod tests {
             snapshot.connection_attempts,
             u64::from(MAX_CONSECUTIVE_REGISTRATION_REJECTIONS) + 2,
             "{snapshot:?}"
+        );
+    }
+
+    /// Run the script under [`run_with_backoff`] until the driver parks;
+    /// the handle it parked on. A script that runs out first is a failure.
+    async fn run_until_parked(steps: Vec<ScriptedStep>) -> NetworkHandle {
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        ends.set_rejection_retry_floor(std::time::Duration::from_millis(1));
+        let script = Script {
+            steps: std::sync::Mutex::new(steps.into_iter().collect()),
+            starts: std::sync::Mutex::new(Vec::new()),
+        };
+        let parked = async {
+            while handle.runtime_snapshot().lifecycle != NetworkLifecycle::RegistrationFailed {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            () = run_with_backoff(&script, &mut ends, |script, ends| {
+                scripted_session(script, ends)
+            }) => panic!("the script ran out before the driver parked"),
+            () = parked => {}
+        }
+        handle
+    }
+
+    /// Solanum's answer while services are down, from a real exchange: no
+    /// `sasl` capability at all.
+    async fn services_outage_refusal() -> e6irc_client::RegistrationRejection {
+        let Err(SessionOutcome::RegistrationRejected(unavailable)) =
+            irc_driver::tests::sasl_outcome_against(&[("CAP LS", ":up CAP * LS :server-time")])
+                .await
+        else {
+            panic!("an upstream without SASL refuses a SASL registration");
+        };
+        unavailable
+    }
+
+    /// A network that never offers SASL (OFTC) looks like a services outage
+    /// that never ends. It is outlasted for about an hour, never parked inside
+    /// an outage's length, and then parked: retried for the rest of the
+    /// process's life, it only hid its reason behind "retrying".
+    #[tokio::test]
+    async fn a_missing_sasl_capability_is_outlasted_then_parked() {
+        let unavailable = services_outage_refusal().await;
+        tokio::time::pause();
+        let mut steps: Vec<ScriptedStep> = (0..MAX_CONSECUTIVE_OUTLASTED_REFUSALS)
+            .map(|_| ScriptedStep::Refuse(unavailable.clone()))
+            .collect();
+        steps.push(ScriptedStep::Stop);
+        let handle = run_until_parked(steps).await;
+        let snapshot = handle.runtime_snapshot();
+        assert_eq!(
+            snapshot.lifecycle,
+            NetworkLifecycle::RegistrationFailed,
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.last_error, Some(NetworkFailure::SaslUnavailable));
+        assert_eq!(
+            snapshot.connection_attempts,
+            u64::from(MAX_CONSECUTIVE_OUTLASTED_REFUSALS),
+            "{snapshot:?}"
+        );
+        // The scripted floor is 1 ms: the count is the bound, and with the
+        // production floor it comes to about an hour.
+        let production: std::time::Duration = (1..MAX_CONSECUTIVE_OUTLASTED_REFUSALS)
+            .map(|count| {
+                REJECTION_RETRY_FLOOR
+                    * (1 << (count - 1).min(MAX_CONSECUTIVE_REGISTRATION_REJECTIONS - 2))
+            })
+            .sum();
+        assert!(
+            production >= std::time::Duration::from_secs(55 * 60)
+                && production <= std::time::Duration::from_secs(65 * 60),
+            "{production:?}"
+        );
+    }
+
+    /// A SASL capability that names its mechanisms, none of them one the
+    /// credentials can use, is the network's settled answer: parked at once,
+    /// with what it offers, and never dialled again.
+    #[tokio::test]
+    async fn a_sasl_mechanism_the_network_does_not_offer_parks_at_once() {
+        use e6irc_client::RegistrationRefusal;
+        let Err(SessionOutcome::RegistrationRejected(unavailable)) =
+            irc_driver::tests::sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL")])
+                .await
+        else {
+            panic!("an upstream without the mechanism refuses registration");
+        };
+        assert_eq!(
+            unavailable.refusal(),
+            RegistrationRefusal::SaslMechanismUnavailable
+        );
+        tokio::time::pause();
+        let handle =
+            run_until_parked(vec![ScriptedStep::Refuse(unavailable), ScriptedStep::Stop]).await;
+        let snapshot = handle.runtime_snapshot();
+        assert_eq!(
+            snapshot.lifecycle,
+            NetworkLifecycle::RegistrationFailed,
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.connection_attempts, 1, "{snapshot:?}");
+        assert_eq!(
+            snapshot.last_error,
+            Some(NetworkFailure::SaslMechanismUnavailable)
+        );
+        assert_eq!(
+            snapshot.last_error_diagnostic.as_deref(),
+            Some(
+                "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers \
+                 EXTERNAL; it logs in with a client certificate (SASL EXTERNAL) instead"
+            )
         );
     }
 

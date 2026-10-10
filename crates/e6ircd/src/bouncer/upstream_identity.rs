@@ -276,8 +276,58 @@ impl ConfirmedChannel {
         .then(|| Self(value.to_string()))
     }
 
+    /// A channel remembered from an earlier session (stored, or carried over
+    /// from a replaced driver) before this one knows the network's
+    /// `CHANTYPES`: the shape of one `JOIN` parameter is all that can be
+    /// checked, and all that the rejoin needs. `None` for what is not one.
+    pub(crate) fn remembered(value: &str) -> Option<Self> {
+        (value.len() <= Self::MAX_BYTES && one_channel_word(value).is_ok())
+            .then(|| Self(value.to_string()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// A channel the session was in before this driver started — stored after a
+/// confirmation, so a restart or an edit rejoins it — with the key it was
+/// last joined with, when one is known. Its `Debug` never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RememberedChannel {
+    pub(crate) channel: ConfirmedChannel,
+    pub(crate) key: Option<ChannelKey>,
+}
+
+impl RememberedChannel {
+    /// Parse a stored entry: `None` for a name that is not one channel or a
+    /// key that is not one key.
+    pub fn parse(channel: &str, key: Option<&str>) -> Option<Self> {
+        Some(Self {
+            channel: ConfirmedChannel::remembered(channel)?,
+            key: match key {
+                Some(key) => Some(ChannelKey::parse(key)?),
+                None => None,
+            },
+        })
+    }
+
+    pub fn channel(&self) -> &str {
+        self.channel.as_str()
+    }
+
+    /// The key, for the one place that seals it into storage.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_ref().map(ChannelKey::as_str)
+    }
+}
+
+impl fmt::Debug for RememberedChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RememberedChannel")
+            .field("channel", &self.channel.as_str())
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 
@@ -285,8 +335,8 @@ impl ConfirmedChannel {
 /// autojoin channel, or as a client joined it with or the channel was since
 /// set to, so the driver can join it and rejoin it after a reconnect. A secret
 /// of the channel's members: a configured one is stored sealed (DESIGN §10),
-/// a learned one is kept in memory only, beside the reconnect intent, and
-/// neither is ever shown — its `Debug` is redacted, so no log or panic message
+/// a learned one is stored sealed beside the remembered channel (and not at
+/// all without a master key), and neither is ever shown — its `Debug` is redacted, so no log or panic message
 /// can carry it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChannelKey(String);

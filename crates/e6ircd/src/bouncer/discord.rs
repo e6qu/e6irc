@@ -1713,6 +1713,8 @@ mod tests {
             sasl_account: None,
             sasl_password: Some("token".into()),
             server_password: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: crate::bouncer::FirstDial::Immediate,
         })

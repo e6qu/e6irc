@@ -162,6 +162,22 @@ pub(super) struct IrcNetworkPreset {
     pub(super) name: &'static str,
     pub(super) addr: &'static str,
     pub(super) tls: bool,
+    /// How an account logs in on this network, so the add dialog can say
+    /// what to set up before it saves.
+    pub(super) authentication: PresetAuthentication,
+    /// One sentence on setting that up, for the add dialog.
+    pub(super) guidance: &'static str,
+}
+
+/// How a preset network authenticates an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PresetAuthentication {
+    /// SASL with the NickServ account's password (SCRAM or PLAIN).
+    Sasl,
+    /// A TLS client certificate whose fingerprint NickServ knows (CertFP):
+    /// the network has no SASL password mechanism.
+    ClientCertificate,
 }
 
 /// Public connection endpoints from the networks' own documentation, each
@@ -187,6 +203,9 @@ pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
         name: "libera",
         addr: "irc.libera.chat:6697",
         tls: true,
+        authentication: PresetAuthentication::Sasl,
+        guidance: "Sign in with your NickServ account and password (SASL); a client \
+                   certificate added with /msg NickServ CERT ADD works too.",
     },
     IrcNetworkPreset {
         id: "oftc",
@@ -194,6 +213,10 @@ pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
         name: "oftc",
         addr: "irc.oftc.net:6697",
         tls: true,
+        authentication: PresetAuthentication::ClientCertificate,
+        guidance: "OFTC has no SASL password login. Save the network without a NickServ \
+                   password, generate a client certificate on its page, identify once and \
+                   send /msg NickServ CERT ADD; from then on the certificate identifies you.",
     },
     IrcNetworkPreset {
         id: "snoonet",
@@ -201,6 +224,8 @@ pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
         name: "snoonet",
         addr: "irc.snoonet.org:6697",
         tls: true,
+        authentication: PresetAuthentication::Sasl,
+        guidance: "Sign in with your NickServ account and password (SASL).",
     },
 ];
 
@@ -536,12 +561,42 @@ pub(super) struct NetworkResponse {
     has_sasl_password: bool,
     /// Whether a sealed server password is stored. The value is never shown.
     has_server_password: bool,
+    /// The TLS client certificate presented to the upstream, by its
+    /// fingerprints; `null` when none is stored. Its key is never shown.
+    client_certificate: Option<CertificateFingerprintsResponse>,
+    /// The channels the session rejoins after a restart or an edit besides
+    /// its autojoin, by name, with whether a key is stored for each.
+    remembered_channels: Vec<RememberedChannelResponse>,
     enabled: bool,
     connected: Option<bool>,
     runtime: Option<NetworkRuntimeResponse>,
     /// Whether the server configuration defines this network: the operator's,
     /// read-only through the account API.
     configured: bool,
+}
+
+/// A stored client certificate as the API shows it: the fingerprints its
+/// owner registers with the network's services.
+#[derive(serde::Serialize)]
+pub(super) struct CertificateFingerprintsResponse {
+    pub(super) fingerprint_sha256: String,
+    pub(super) fingerprint_sha512: String,
+}
+
+impl CertificateFingerprintsResponse {
+    pub(super) fn of_pem(certificate: &str) -> Option<Self> {
+        e6irc_client::Fingerprints::of_pem(certificate).map(|fingerprints| Self {
+            fingerprint_sha256: fingerprints.sha256,
+            fingerprint_sha512: fingerprints.sha512,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RememberedChannelResponse {
+    channel: String,
+    /// Whether the key it is joined with is stored (sealed, never shown).
+    keyed: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -646,6 +701,18 @@ pub(super) fn network_response(
     } else {
         network.sasl_account.clone()
     };
+    let client_certificate = network
+        .client_certificate
+        .as_ref()
+        .and_then(|stored| CertificateFingerprintsResponse::of_pem(&stored.certificate_pem));
+    let remembered_channels = network
+        .remembered_channels
+        .into_iter()
+        .map(|entry| RememberedChannelResponse {
+            keyed: entry.key_sealed.is_some(),
+            channel: entry.channel,
+        })
+        .collect();
     NetworkResponse {
         name: network.name,
         kind: network.kind.as_db_str(),
@@ -660,6 +727,8 @@ pub(super) fn network_response(
         has_sasl_account,
         has_sasl_password,
         has_server_password,
+        client_certificate,
+        remembered_channels,
         enabled: network.enabled,
         connected: runtime.map(|r| r.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
         runtime: runtime.map(runtime_response),
@@ -688,6 +757,10 @@ pub(super) fn configured_network_response(
         has_sasl_account: network.has_sasl_account,
         has_sasl_password: network.has_sasl_password,
         has_server_password: network.has_server_password,
+        // An operator-configured network presents no certificate and
+        // remembers nothing beyond its autojoin.
+        client_certificate: None,
+        remembered_channels: Vec::new(),
         enabled: true,
         connected: Some(runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
         runtime: Some(runtime_response(runtime)),
@@ -915,6 +988,12 @@ pub(super) async fn preflight_network_core(
         sasl: sasl_account
             .map(crate::bouncer::UpstreamSaslAccount::into_string)
             .zip(req.sasl_password),
+        // A connection test presents no certificate: one is generated or
+        // uploaded for a saved network, which is then refused a test while
+        // it runs.
+        client_certificate: None,
+        remembered_channels: Vec::new(),
+        tls_roots: None,
         server_password,
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
@@ -2016,6 +2095,17 @@ async fn update_network_in_lane(
             state.internal_upstreams,
         )?;
     }
+    if row.client_certificate.is_some() && !tls {
+        return Err(network_error(
+            StatusCode::CONFLICT,
+            "A client certificate needs TLS",
+            Some(
+                "the stored client certificate is presented only over TLS; keep TLS on, or \
+                 remove the certificate first",
+            ),
+        )
+        .with_field("tls"));
+    }
     row.addr = addr.to_string();
     row.tls = tls;
     row.nick = nick.to_string();
@@ -2176,6 +2266,8 @@ mod secret_destination_tests {
             sasl_account: None,
             sasl_password_sealed: None,
             server_password_sealed: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
             enabled: true,
         })
     }
@@ -2243,6 +2335,8 @@ mod audit_detail_tests {
             sasl_account: None,
             sasl_password_sealed: None,
             server_password_sealed: None,
+            client_certificate: None,
+            remembered_channels: Vec::new(),
             enabled: true,
         }
     }
@@ -2475,6 +2569,8 @@ async fn create_network_in_lane(
         sasl_account: req.sasl_account.clone(),
         sasl_password: req.sasl_password.clone(),
         server_password: server_password.map(|password| password.as_str().to_owned()),
+        client_certificate: None,
+        remembered_channels: Vec::new(),
         internal_upstreams: state.internal_upstreams,
         first_dial: crate::bouncer::FirstDial::Immediate,
     })
@@ -2492,6 +2588,8 @@ async fn create_network_in_lane(
         sasl_account: stored_account,
         sasl_password_sealed: sealed_password,
         server_password_sealed: sealed_server_password,
+        client_certificate: None,
+        remembered_channels: Vec::new(),
         enabled: true,
     };
     let pool = state.pool().expect("caller checked the pool");
@@ -2969,6 +3067,290 @@ pub(super) async fn delete_network(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+// ---- an IRC network's client certificate and remembered channels ---------
+
+/// Set an IRC network's TLS client certificate: generated here, or uploaded
+/// with its key. The key is write-only: sealed at rest, never returned.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum SetClientCertificate {
+    Generate {
+        algorithm: crate::bouncer::client_certificates::GeneratedKey,
+    },
+    Upload {
+        certificate: String,
+        key: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct ClientCertificateResponse {
+    algorithm: &'static str,
+    #[serde(flatten)]
+    fingerprints: CertificateFingerprintsResponse,
+    /// The certificate itself (public), PEM.
+    certificate: String,
+}
+
+/// Generate or upload the certificate, store its key sealed, and reconnect
+/// the network with it. Its fingerprints are what the owner registers with
+/// the network's services (`/msg NickServ CERT ADD`); replacing a stored
+/// certificate is how its key is rotated.
+pub(super) async fn set_network_client_certificate(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account, _): Authenticated,
+    PathParams(name): PathParams<String>,
+    JsonBody(request): JsonBody<SetClientCertificate>,
+) -> Response {
+    let registry = registry_of(&state).clone();
+    let state = state.clone();
+    let result = registry
+        .mutate(move |lane| async move {
+            set_client_certificate_in_lane(&state, &lane, &account, &name, Some(request)).await
+        })
+        .await;
+    match result {
+        Ok(Some(response)) => json_no_store(response),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Remove the network's client certificate and reconnect without it.
+pub(super) async fn delete_network_client_certificate(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account, _): Authenticated,
+    PathParams(name): PathParams<String>,
+) -> Response {
+    let registry = registry_of(&state).clone();
+    let state = state.clone();
+    let result = registry
+        .mutate(move |lane| async move {
+            set_client_certificate_in_lane(&state, &lane, &account, &name, None).await
+        })
+        .await;
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The certificate a request states, as PEM, refused at its field when it is
+/// not a usable pair.
+fn requested_certificate(
+    request: SetClientCertificate,
+    subject: &str,
+) -> Result<
+    (
+        crate::bouncer::client_certificates::CertificatePem,
+        e6irc_client::ClientCertificate,
+        &'static str,
+    ),
+    NetworkMutationError,
+> {
+    let (pem, source) = match request {
+        SetClientCertificate::Generate { algorithm } => (
+            crate::bouncer::client_certificates::generate(algorithm, subject).map_err(|error| {
+                eprintln!("http: client certificate generation failed: {error}");
+                network_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Certificate generation failed",
+                    None,
+                )
+            })?,
+            "generated",
+        ),
+        SetClientCertificate::Upload { certificate, key } => (
+            crate::bouncer::client_certificates::CertificatePem { certificate, key },
+            "uploaded",
+        ),
+    };
+    let parsed =
+        e6irc_client::ClientCertificate::from_pem(&pem.certificate, &pem.key).map_err(|error| {
+            use e6irc_client::ClientCertificateError as Refused;
+            let field = match error {
+                Refused::NoCertificate | Refused::ChainTooLong => "certificate",
+                Refused::TooLong
+                | Refused::NoPrivateKey
+                | Refused::UnsupportedKey
+                | Refused::KeyMismatch => "key",
+            };
+            network_error(
+                StatusCode::BAD_REQUEST,
+                "Unusable client certificate",
+                Some(&error.to_string()),
+            )
+            .with_field(field)
+        })?;
+    Ok((pem, parsed, source))
+}
+
+async fn set_client_certificate_in_lane(
+    state: &AppState,
+    lane: &crate::bouncer::MutationLane,
+    account: &str,
+    name: &str,
+    request: Option<SetClientCertificate>,
+) -> Result<Option<ClientCertificateResponse>, NetworkMutationError> {
+    let lane = ActiveOwnerLane::enter(state, lane, account).await?;
+    let mut row = editable_network(state, lane.lane, account, name, "certificate").await?;
+    if row.kind != crate::config::NetworkKind::Irc {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Client certificates are for IRC networks",
+            Some("a bridge signs in with its provider's token"),
+        ));
+    }
+    let (response, detail) = match request {
+        Some(request) => {
+            if !row.tls {
+                return Err(network_error(
+                    StatusCode::CONFLICT,
+                    "A client certificate needs TLS",
+                    Some("a client certificate is presented only over TLS; enable TLS first"),
+                )
+                .with_field("tls"));
+            }
+            let (pem, parsed, source) =
+                requested_certificate(request, &format!("{account}/{}", row.name))?;
+            row.client_certificate = Some(crate::db::BncClientCertificate {
+                key_sealed: seal_network_secret(state, account, &pem.key)
+                    .map_err(|error| error.with_field("key"))?,
+                certificate_pem: pem.certificate.clone(),
+            });
+            let algorithm = parsed.algorithm().name();
+            (
+                Some(ClientCertificateResponse {
+                    algorithm,
+                    fingerprints: CertificateFingerprintsResponse {
+                        fingerprint_sha256: parsed.fingerprint_sha256(),
+                        fingerprint_sha512: parsed.fingerprint_sha512(),
+                    },
+                    certificate: pem.certificate,
+                }),
+                format!("source={source}; algorithm={algorithm}"),
+            )
+        }
+        None => {
+            if row.client_certificate.take().is_none() {
+                return Err(network_error(
+                    StatusCode::NOT_FOUND,
+                    "No client certificate",
+                    Some("this network has no client certificate to remove"),
+                ));
+            }
+            (None, String::new())
+        }
+    };
+    let driver = prospective_network_driver(state, account, &row, row.enabled, false)?;
+    require_network_updated(
+        crate::db::set_bnc_network_client_certificate(
+            pool_of(state),
+            account,
+            name,
+            row.client_certificate.as_ref(),
+            crate::db::NetworkAudit {
+                actor: account,
+                detail: &detail,
+            },
+        )
+        .await,
+        "certificate update failed",
+    )?;
+    if let Some(driver) = driver {
+        lane.supersede(name, driver).await?;
+    }
+    Ok(response)
+}
+
+/// Stop rejoining one remembered channel of an IRC network. The session, when
+/// it is in the channel, leaves it, so what is remembered stays what the
+/// session is in.
+pub(super) async fn forget_network_channel(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account, _): Authenticated,
+    PathParams((name, channel)): PathParams<(String, String)>,
+) -> Response {
+    let registry = registry_of(&state).clone();
+    let state = state.clone();
+    let result = registry
+        .mutate(move |lane| async move {
+            forget_network_channel_in_lane(&state, &lane, &account, &name, &channel).await
+        })
+        .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// What a channel is left with when its owner removes it from the bouncer's
+/// list.
+const FORGET_PART_REASON: &str = "removed from the bouncer's channel list";
+
+async fn forget_network_channel_in_lane(
+    state: &AppState,
+    lane: &crate::bouncer::MutationLane,
+    account: &str,
+    name: &str,
+    channel: &str,
+) -> Result<(), NetworkMutationError> {
+    let row = editable_network(state, lane, account, name, "channel removal").await?;
+    let forgotten = crate::db::forget_bnc_remembered_channel(
+        pool_of(state),
+        account,
+        &row.name,
+        channel,
+        crate::db::NetworkAudit {
+            actor: account,
+            detail: "",
+        },
+    )
+    .await;
+    match forgotten {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(network_error(
+                StatusCode::NOT_FOUND,
+                "No such remembered channel",
+                Some("this network does not remember that channel"),
+            ));
+        }
+        Err(error) => {
+            eprintln!("http: remembered channel removal: {error}");
+            return Err(network_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    }
+    let Some(handle) = lane.get_stored(account, &row.name) else {
+        return Ok(());
+    };
+    handle.joined_channels().forget(channel);
+    let names = handle.names();
+    let joined = handle.irc_session_snapshot().is_some_and(|session| {
+        session
+            .channels
+            .iter()
+            .any(|member| names.eq(member, channel))
+    });
+    if joined {
+        match handle.send(&format!("PART {channel} :{FORGET_PART_REASON}")) {
+            crate::bouncer::SendOutcome::Sent => {}
+            // Forgotten either way: the session is not rejoined to it; a
+            // part that could not be queued only leaves it there until the
+            // next reconnect.
+            refused => eprintln!(
+                "http: {account}/{}: {channel} forgotten, but its PART was not sent: {refused:?}",
+                row.name
+            ),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

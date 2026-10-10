@@ -1840,6 +1840,13 @@ documented_routes! {
     "/api/v1/me/networks/{name}/operations" => { get: pages::owner_network_operations },
     "/api/v1/me/networks/{name}/account-registration" => { post: network_account_command },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
+    "/api/v1/me/networks/{name}/client-certificate" => {
+        post: set_network_client_certificate,
+        delete: delete_network_client_certificate,
+    },
+    "/api/v1/me/networks/{name}/remembered-channels/{channel}" => {
+        delete: forget_network_channel,
+    },
     "/api/v1/history" => { get: history },
     "/ws/ui" => { get: ws_ui },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },

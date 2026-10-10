@@ -1138,7 +1138,10 @@ async fn serve(
             crate::bouncer::Registry::start_observed(
                 &config.networks,
                 &holds,
-                pool.clone(),
+                crate::bouncer::RegistryStorage {
+                    pool: pool.clone(),
+                    secret_keys: secret_key.clone(),
+                },
                 crate::bouncer::CoreHandles {
                     core_tx: core_tx.clone(),
                     next_conn: next_conn.clone(),
@@ -2207,7 +2210,7 @@ mod tests {
                     server_password: None,
                 }],
                 &std::collections::HashMap::new(),
-                None,
+                crate::bouncer::RegistryStorage::default(),
                 crate::bouncer::CoreHandles {
                     core_tx: CoreIngress::single(core_tx),
                     next_conn: Arc::new(ConnectionIdAllocator::new(
@@ -2355,7 +2358,7 @@ mod tests {
             crate::bouncer::Registry::start_observed(
                 &[],
                 &std::collections::HashMap::new(),
-                None,
+                crate::bouncer::RegistryStorage::default(),
                 crate::bouncer::CoreHandles {
                     core_tx: CoreIngress::single(core_tx),
                     next_conn: Arc::new(ConnectionIdAllocator::new(
