@@ -2348,15 +2348,18 @@ impl Connection {
     /// playback are returned in wire order so a UI can build state before its
     /// first draw, with whether unread lines remain beyond what was loaded. A
     /// history request the server refuses leaves the join standing and is
-    /// returned as [`JoinedHistory::refusal`].
+    /// returned as [`JoinedHistory::refusal`]. `key` is the channel key a
+    /// keyed (`+k`) channel admits with, sent after the name.
     pub async fn join_with_history(
         &mut self,
         target: &str,
+        key: Option<&str>,
         page_lines: usize,
         max_lines: usize,
     ) -> io::Result<JoinedHistory> {
         self.join_history(
             target,
+            key,
             HistoryRequest::Unread {
                 page_lines,
                 max_lines,
@@ -2377,7 +2380,7 @@ impl Connection {
         history_count: usize,
     ) -> io::Result<Vec<ClientEvent>> {
         let joined = self
-            .join_history(target, HistoryRequest::Latest(history_count))
+            .join_history(target, None, HistoryRequest::Latest(history_count))
             .await?;
         match joined.refusal {
             None => Ok(joined.events),
@@ -2410,12 +2413,13 @@ impl Connection {
     async fn join_history(
         &mut self,
         target: &str,
+        key: Option<&str>,
         request: HistoryRequest,
     ) -> io::Result<JoinedHistory> {
         within(
             self.response_deadline,
             "confirming a JOIN and its history",
-            self.join_and_replay(target, request),
+            self.join_and_replay(target, key, request),
         )
         .await
     }
@@ -2452,9 +2456,13 @@ impl Connection {
     async fn join_and_replay(
         &mut self,
         target: &str,
+        key: Option<&str>,
         request: HistoryRequest,
     ) -> io::Result<JoinedHistory> {
-        self.send_line(&format!("JOIN {target}")).await?;
+        match key {
+            Some(key) => self.send_line(&format!("JOIN {target} {key}")).await?,
+            None => self.send_line(&format!("JOIN {target}")).await?,
+        }
         let mut events = Vec::new();
         let mut read_marker = None;
         loop {
@@ -5201,7 +5209,7 @@ mod tests {
             let (_reader, writer) = tokio::io::split(server_io);
             let peer = tokio::spawn(chatter(writer));
             let error = if join {
-                must_give_up(connection.join_with_history("#room", 0, 0)).await
+                must_give_up(connection.join_with_history("#room", None, 0, 0)).await
             } else {
                 must_give_up(connection.require_capabilities(&["batch"], |_: RelayEvent| Ok(())))
                     .await
@@ -5452,7 +5460,10 @@ mod tests {
         .await
         .unwrap();
         let messages = if resume_after_marker {
-            let joined = conn.join_with_history("#Room", 50, 500).await.unwrap();
+            let joined = conn
+                .join_with_history("#Room", None, 50, 500)
+                .await
+                .unwrap();
             assert_eq!(
                 joined.coverage,
                 HistoryCoverage::AllUnread,
@@ -5515,7 +5526,7 @@ mod tests {
         );
         let (mut connection, server) = scripted(steps);
         let history = connection
-            .join_with_history("#r", 2, 100)
+            .join_with_history("#r", None, 2, 100)
             .await
             .expect("history");
         assert_eq!(history.coverage, HistoryCoverage::AllUnread);
@@ -5547,7 +5558,7 @@ mod tests {
         );
         let (mut connection, server) = scripted(steps);
         let history = connection
-            .join_with_history("#r", 2, 3)
+            .join_with_history("#r", None, 2, 3)
             .await
             .expect("history");
         assert_eq!(history.coverage, HistoryCoverage::UnreadBeyondLoaded);
@@ -5836,7 +5847,7 @@ mod tests {
         ];
         let (mut connection, server) = scripted(std::mem::take(&mut steps));
         let joined = connection
-            .join_with_history("#r", 50, 500)
+            .join_with_history("#r", None, 50, 500)
             .await
             .expect("a refused history request does not fail the join");
         assert_eq!(joined.coverage, HistoryCoverage::UnreadBeyondLoaded);
@@ -5870,7 +5881,7 @@ mod tests {
                 assert!(error.to_string().contains("limit too large"), "{error}");
             } else {
                 let joined = connection
-                    .join_with_history("#r", 1000, 5000)
+                    .join_with_history("#r", None, 1000, 5000)
                     .await
                     .expect("the join stands");
                 assert_eq!(joined.coverage, HistoryCoverage::NoHistory);

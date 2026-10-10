@@ -30,6 +30,7 @@
         </div>
         <a class="secondary-link" data-api-session-clear href="/console/sessions">Clear</a>
       </div>
+      {% include "console_query_refusal.html" %}
       {% if own %}
         <form class="field-grid" method="get" action="/console/my-sessions" data-api-connection-filter>
       {% else %}
@@ -37,36 +38,36 @@
       {% endif %}
         <label class="field">
           <span>Nickname</span>
-          <input name="nick" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off" placeholder="alice" />
+          <input name="nick" value="{{ filters.value("nick") }}" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off" placeholder="alice" />
         </label>
         {% if !own %}
           <label class="field">
             <span>Account</span>
-            <input name="account" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off" placeholder="alice" />
+            <input name="account" value="{{ filters.value("account") }}" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off" placeholder="alice" />
           </label>
         {% endif %}
         <label class="field">
           <span>Connection type</span>
           <select name="transport">
             <option value="">All connection types</option>
-            <option value="tcp">TCP</option>
-            <option value="tls">TLS</option>
-            <option value="websocket">WebSocket</option>
-            <option value="wss">WebSocket over HTTPS</option>
-            <option value="local">Local network</option>
+            <option value="tcp"{% if filters.value("transport") == "tcp" %} selected{% endif %}>TCP</option>
+            <option value="tls"{% if filters.value("transport") == "tls" %} selected{% endif %}>TLS</option>
+            <option value="websocket"{% if filters.value("transport") == "websocket" %} selected{% endif %}>WebSocket</option>
+            <option value="wss"{% if filters.value("transport") == "wss" %} selected{% endif %}>WebSocket over HTTPS</option>
+            <option value="local"{% if filters.value("transport") == "local" %} selected{% endif %}>Local network</option>
           </select>
         </label>
         <label class="field">
           <span>IRC operator</span>
           <select name="oper">
             <option value="">All clients</option>
-            <option value="true">Operators only</option>
-            <option value="false">Non-operators only</option>
+            <option value="true"{% if filters.value("oper") == "true" %} selected{% endif %}>Operators only</option>
+            <option value="false"{% if filters.value("oper") == "false" %} selected{% endif %}>Non-operators only</option>
           </select>
         </label>
         <label class="field">
           <span>Rows per page</span>
-          <input type="number" name="limit" value="50" min="1" max="1000" inputmode="numeric" required />
+          <input type="number" name="limit" value="{{ filters.value_or("limit", "50") }}" min="1" max="1000" inputmode="numeric" required />
         </label>
         <div class="form-actions field-wide"><button class="primary" type="submit">Apply</button></div>
       </form>

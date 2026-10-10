@@ -15,11 +15,12 @@ use e6irc_client::credentials::{
 use e6irc_client::liveness::{Heard, LIVENESS_WINDOW, Liveness};
 use e6irc_client::{
     CleartextCredentials, ClientEvent, Connection, ConnectionOptions, HistoryCoverage,
-    HistoryRefusal, JoinRefusal, NetworkNames, OwnedMessage, Registered, RelayEvent, TerminalSafe,
+    HistoryRefusal, JoinRefusal, NetworkNames, Registered, RelayEvent, TerminalSafe,
 };
 use e6irc_tui::app::{App, LogLine, SCROLLBACK_LINES, SessionStart};
 use e6irc_tui::keys::{self, KeyOutcome};
 use e6irc_tui::reconnect::{AfterFailure, ReconnectPolicy};
+use e6irc_tui::rejoin::Rejoin;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
@@ -284,7 +285,7 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     };
     let history = HistoryWindow::new(cli.history_lines as usize);
     let read_markers = !cli.no_read_markers;
-    let mut joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
+    let mut joined_channels = Rejoin::initial(cli.channel.clone());
     // The UI state exists before the connection does: what the server says
     // while the client connects goes straight into it, never into a list.
     let mut app = App::new(
@@ -544,7 +545,7 @@ async fn network_task(
     mut conn: Connection,
     mut out_rx: mpsc::Receiver<Queued>,
     net_tx: mpsc::Sender<Ev>,
-    mut joined_channels: std::collections::BTreeSet<String>,
+    mut joined_channels: Rejoin,
     mut own_nick: String,
     reconnect: Reconnect,
 ) {
@@ -663,7 +664,7 @@ async fn relay_session(
     conn: &mut Connection,
     out_rx: &mut mpsc::Receiver<Queued>,
     net_tx: &mpsc::Sender<Ev>,
-    joined_channels: &mut std::collections::BTreeSet<String>,
+    joined_channels: &mut Rejoin,
     own_nick: &mut String,
     liveness_window: Duration,
 ) -> SessionEnd {
@@ -685,16 +686,21 @@ async fn relay_session(
                     Err(error) => return SessionEnd::Failed(error.to_string()),
                 };
                 if let ClientEvent::Message(message) = &event {
-                    track_own_state(joined_channels, own_nick, conn.names(), message);
+                    joined_channels.track(own_nick, conn.names(), message);
                 }
                 if net_tx.send(Ev::Net(event)).await.is_err() {
                     return finish(conn, out_rx).await;
                 }
             }
             queued = out_rx.recv() => match queued {
-                Some(queued) => if let Err(error) = conn.send_line(queued.line()).await {
-                    return SessionEnd::Failed(format!("message write failed: {error}"));
-                },
+                Some(queued) => {
+                    // A channel key is in the JOIN that carries it and in no
+                    // reply: it is remembered as the line goes out.
+                    joined_channels.note_sent(conn.names(), queued.line());
+                    if let Err(error) = conn.send_line(queued.line()).await {
+                        return SessionEnd::Failed(format!("message write failed: {error}"));
+                    }
+                }
                 None => return finish(conn, out_rx).await,
             },
         }
@@ -790,7 +796,7 @@ fn coverage_event(channel: String, coverage: HistoryCoverage) -> Option<Ev> {
 /// channel whose history the server refuses is joined without it, and said.
 async fn connect_and_join(
     options: &ConnectionOptions,
-    channels: &mut std::collections::BTreeSet<String>,
+    channels: &mut Rejoin,
     history: HistoryWindow,
     read_markers: bool,
     ui: &mut Ui<'_>,
@@ -828,9 +834,14 @@ async fn connect_and_join(
         echo_message: connection.enabled("echo-message"),
     }))
     .await?;
-    for channel in channels.clone() {
+    for (channel, key) in channels.to_join(connection.names()) {
         match connection
-            .join_with_history(&channel, history.page_lines, history.max_lines)
+            .join_with_history(
+                &channel,
+                key.as_deref(),
+                history.page_lines,
+                history.max_lines,
+            )
             .await
         {
             Ok(joined) => {
@@ -849,65 +860,12 @@ async fn connect_and_join(
                 let Some(refusal) = JoinRefusal::from_error(&error) else {
                     return Err(error);
                 };
-                channels.remove(&channel);
+                channels.refused(connection.names(), &channel);
                 ui.deliver(Ev::JoinRefused(refusal)).await?;
             }
         }
     }
     Ok(Registered { connection, nick })
-}
-
-/// Keep what a reconnect needs in step with the server: the channels this
-/// client is in, and the nickname it is known by — own JOIN, PART and KICK are
-/// only recognisable under the current one.
-fn track_own_state(
-    channels: &mut std::collections::BTreeSet<String>,
-    own_nick: &mut String,
-    names: &NetworkNames,
-    message: &OwnedMessage,
-) {
-    if message.command == "KICK"
-        && message
-            .params
-            .get(1)
-            .is_some_and(|nick| names.eq(nick, own_nick))
-    {
-        if let Some(channel) = message.params.first() {
-            remove_channel(channels, names, channel);
-        }
-        return;
-    }
-    let source_nick = message
-        .source
-        .as_deref()
-        .and_then(|source| source.split('!').next());
-    if !source_nick.is_some_and(|nick| names.eq(nick, own_nick)) {
-        return;
-    }
-    match (message.command.as_str(), message.params.first()) {
-        // A JOIN of a channel already held under another spelling is the
-        // same channel: one entry, or a reconnect joins it twice.
-        ("JOIN", Some(channel)) if !channels.iter().any(|held| names.eq(held, channel)) => {
-            channels.insert(channel.clone());
-        }
-        ("PART", Some(channel)) => remove_channel(channels, names, channel),
-        ("NICK", Some(nick)) => own_nick.clone_from(nick),
-        _ => {}
-    }
-}
-
-fn remove_channel(
-    channels: &mut std::collections::BTreeSet<String>,
-    names: &NetworkNames,
-    channel: &str,
-) {
-    let existing = channels
-        .iter()
-        .find(|candidate| names.eq(candidate, channel))
-        .cloned();
-    if let Some(existing) = existing {
-        channels.remove(&existing);
-    }
 }
 
 async fn run_ui<B: Backend>(
@@ -1309,6 +1267,7 @@ fn composer_view(input: &str, cursor: usize, width: u16) -> (u16, u16) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use e6irc_client::OwnedMessage;
     use ratatui::backend::TestBackend;
 
     /// An app on a connection with the default naming rules that keeps read
@@ -1593,7 +1552,7 @@ mod tests {
             .await
             .unwrap();
         drop(out_tx);
-        let mut channels = std::collections::BTreeSet::new();
+        let mut channels = Rejoin::default();
         let mut nick = "me".to_owned();
         let end = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1622,66 +1581,28 @@ mod tests {
 
     #[test]
     fn reconnect_channels_track_self_join_part_and_kick_case_insensitively() {
-        let mut channels = std::collections::BTreeSet::from(["#Home".to_owned()]);
+        let mut channels = Rejoin::from(["#Home"]);
         let mut nick = "Me".to_owned();
         let names = NetworkNames::default();
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":me!u@h JOIN #HOME"),
-        );
+        channels.track(&mut nick, &names, &message(":me!u@h JOIN #HOME"));
         assert_eq!(channels.len(), 1, "one channel under two spellings");
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":me!u@h JOIN #Other"),
-        );
+        channels.track(&mut nick, &names, &message(":me!u@h JOIN #Other"));
         assert!(channels.contains("#Other"));
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":ME!u@h PART #other :bye"),
-        );
-        assert!(
-            !channels
-                .iter()
-                .any(|channel| channel.eq_ignore_ascii_case("#other"))
-        );
+        channels.track(&mut nick, &names, &message(":ME!u@h PART #other :bye"));
+        assert!(channels.to_join(&names).len() == 1 && !channels.contains("#Other"));
         // Own joins are only recognisable under the current nickname.
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":me!u@h NICK Renamed"),
-        );
+        channels.track(&mut nick, &names, &message(":me!u@h NICK Renamed"));
         assert_eq!(nick, "Renamed");
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":renamed!u@h JOIN #later"),
-        );
+        channels.track(&mut nick, &names, &message(":renamed!u@h JOIN #later"));
         assert!(channels.contains("#later"));
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":me!u@h JOIN #not-ours"),
-        );
+        channels.track(&mut nick, &names, &message(":me!u@h JOIN #not-ours"));
         assert!(!channels.contains("#not-ours"));
-        track_own_state(
-            &mut channels,
+        channels.track(
             &mut nick,
             &names,
             &message(":op!u@h KICK #home RENAMED :gone"),
         );
-        assert_eq!(
-            channels,
-            std::collections::BTreeSet::from(["#later".to_owned()])
-        );
+        assert_eq!(channels, Rejoin::from(["#later"]));
     }
 
     /// On an `ascii` network `#a[` and `#a{` are two channels: parting one
@@ -1692,25 +1613,12 @@ mod tests {
         names.adopt_isupport(&message(
             ":srv 005 me CASEMAPPING=ascii :are supported by this server",
         ));
-        let mut channels = std::collections::BTreeSet::from(["#a[".to_owned()]);
+        let mut channels = Rejoin::from(["#a["]);
         let mut nick = "me".to_owned();
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":me!u@h JOIN #a{"),
-        );
+        channels.track(&mut nick, &names, &message(":me!u@h JOIN #a{"));
         assert_eq!(channels.len(), 2);
-        track_own_state(
-            &mut channels,
-            &mut nick,
-            &names,
-            &message(":me!u@h PART #a{"),
-        );
-        assert_eq!(
-            channels,
-            std::collections::BTreeSet::from(["#a[".to_owned()])
-        );
+        channels.track(&mut nick, &names, &message(":me!u@h PART #a{"));
+        assert_eq!(channels, Rejoin::from(["#a["]));
     }
 
     /// One closed channel used to fail the whole connect, so every reconnect
@@ -1752,8 +1660,7 @@ mod tests {
             cleartext_credentials: CleartextCredentials::Refuse,
             server_password: None,
         };
-        let mut channels =
-            std::collections::BTreeSet::from(["#closed".to_owned(), "#open".to_owned()]);
+        let mut channels = Rejoin::from(["#closed", "#open"]);
         let mut app = test_app("#open", "requested");
         let registered = connect_and_join(
             &options,
@@ -1766,10 +1673,7 @@ mod tests {
         .expect("a refused channel does not fail the session");
         assert_eq!(registered.nick, "upstream");
         assert_eq!(app.nick, "upstream");
-        assert_eq!(
-            channels,
-            std::collections::BTreeSet::from(["#open".to_owned()])
-        );
+        assert_eq!(channels, Rejoin::from(["#open"]));
         assert!(
             app.current().log.iter().any(|line| line.text
                 == "cannot join #closed: Cannot join channel (+i); it will not be rejoined"),
@@ -1840,7 +1744,7 @@ mod tests {
             cleartext_credentials: CleartextCredentials::Refuse,
             server_password: None,
         };
-        let mut channels = std::collections::BTreeSet::from(["#open".to_owned()]);
+        let mut channels = Rejoin::from(["#open"]);
         let mut app = App::new(
             "#open".into(),
             SessionStart {
@@ -1984,7 +1888,7 @@ mod tests {
             }
             (playback, connected)
         });
-        let mut channels = std::collections::BTreeSet::from(["#open".to_owned()]);
+        let mut channels = Rejoin::from(["#open"]);
         let mut stale = Stale::default();
         let registered = tokio::time::timeout(
             Duration::from_secs(20),
@@ -2033,7 +1937,7 @@ mod tests {
         let mut conn = Connection::connect(&address).await.unwrap();
         let (net_tx, _net_rx) = mpsc::channel(8);
         let (_out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
-        let mut channels = std::collections::BTreeSet::new();
+        let mut channels = Rejoin::default();
         let mut nick = "me".to_owned();
         let window = Duration::from_millis(150);
         let started = std::time::Instant::now();
@@ -2098,7 +2002,7 @@ mod tests {
         let (_out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
         let window = Duration::from_millis(100);
         let session = tokio::spawn(async move {
-            let mut channels = std::collections::BTreeSet::new();
+            let mut channels = Rejoin::default();
             let mut nick = "me".to_owned();
             relay_session(
                 &mut conn,
@@ -2173,7 +2077,7 @@ mod tests {
             cleartext_credentials: CleartextCredentials::Refuse,
             server_password: None,
         };
-        let mut channels = std::collections::BTreeSet::from(["#open".to_owned()]);
+        let mut channels = Rejoin::from(["#open"]);
         let mut app = test_app("#open", "me");
         let registered = connect_and_join(
             &options,
@@ -2239,5 +2143,69 @@ mod tests {
                 assert!(after.modifier.contains(Modifier::REVERSED));
             }
         }
+    }
+
+    /// A channel joined with a key is rejoined with it: the reconnect sends
+    /// the key the user's JOIN carried, held only in this process's memory.
+    #[tokio::test]
+    async fn a_reconnect_rejoins_a_keyed_channel_with_its_key() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let mut seen = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply: &[u8] = match line.as_str() {
+                    "CAP LS 302" => b":srv CAP * LS :\r\n",
+                    "CAP END" => b":srv 001 me :Welcome\r\n",
+                    "JOIN #locked sesame" => {
+                        b":me!u@h JOIN #locked\r\n:srv 366 me #locked :End of NAMES\r\n"
+                    }
+                    "JOIN #locked" => b":srv 475 me #locked :Cannot join channel (+k)\r\n",
+                    "PING :e6irc-round-trip" => b":srv PONG srv :e6irc-round-trip\r\n",
+                    _ => b"",
+                };
+                seen.push(line);
+                writer.write_all(reply).await.unwrap();
+            }
+            seen
+        });
+        let options = ConnectionOptions {
+            address,
+            tls: false,
+            tls_server_name: None,
+            nick: "me".into(),
+            username: "ident".into(),
+            realname: "real".into(),
+            authentication: e6irc_client::Authentication::None,
+            response_deadline: Duration::from_secs(5),
+            cleartext_credentials: CleartextCredentials::Refuse,
+            server_password: None,
+        };
+        // The previous session: the user's keyed JOIN went out and the server
+        // confirmed it.
+        let names = NetworkNames::default();
+        let mut channels = Rejoin::default();
+        let mut nick = "me".to_owned();
+        channels.note_sent(&names, "JOIN #locked sesame");
+        channels.track(&mut nick, &names, &message(":me!u@h JOIN #locked"));
+        let mut app = test_app("#locked", "me");
+        let registered = connect_and_join(
+            &options,
+            &mut channels,
+            HistoryWindow::new(0),
+            false,
+            &mut Ui::Starting(&mut app),
+        )
+        .await
+        .expect("the keyed channel is rejoined");
+        drop(registered);
+        let seen = server.await.unwrap();
+        assert!(seen.contains(&"JOIN #locked sesame".to_owned()), "{seen:?}");
+        assert!(channels.contains("#locked"));
     }
 }

@@ -94,6 +94,9 @@ async function consoleTemplate(name, values = {}) {
   while (conditional.test(html)) html = html.replace(conditional, "");
   return html
     .replace(/\{%[^%]*%\}/g, "")
+    // A filter page's form values: `filters.value("x")`, or
+    // `filters.value_or("x", "default")`, read from `values.x`.
+    .replace(/\{\{\s*filters\.value(?:_or)?\("(\w+)"(?:,\s*"([^"]*)")?\)\s*\}\}/g, (_, key, fallback) => values[key] || fallback || "")
     .replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, key) => values[key] ?? "");
 }
 
@@ -152,7 +155,7 @@ async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}, a
     contentType: "text/javascript",
     body: "export const loadSettings = () => ({ settings: { theme: 'auto' }, warning: null }); export const saveSetting = () => null;",
   }));
-  await page.route("**/console-runtime-test", (route) => route.fulfill({
+  await page.route(/\/console-runtime-test(\?.*)?$/, (route) => route.fulfill({
     contentType: "text/html",
     body: `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>${styles}</style></head><body><div id="app">${body}</div><script type="module" src="/console.js"></script></body></html>`,
   }));
@@ -715,6 +718,58 @@ test("a session that ended says so once, with the way to sign in, instead of off
   await page.getByRole("button", { name: "Retry" }).click();
   await expect.poll(() => page.evaluate(() => window.consoleApiFailures.length)).toBe(0);
   await expect(page.getByRole("alert")).toHaveCount(1);
+});
+
+test("each integration platform reads exactly its own bridges, and says when there are more", async ({ page }) => {
+  // The template's platform loop, as the server renders it for three built
+  // platforms.
+  const platform = (kind, name) => `<section class="panel"><h2>${name}</h2><span class="count" data-integration-count="${kind}">—</span><div data-integration-list="${kind}"><p class="empty">Loading ${name} bridges…</p></div></section>`;
+  const bridge = (kind, name) => ({
+    name, kind, owner: "root", addr: "", tls: true, nick: "", username: null, realname: null, autojoin: [], sasl_account: null,
+    autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, configured: false,
+    enabled: true, connected: false, shared: false, runtime: null,
+  });
+  await mountConsoleRuntime(page, `<main><div data-api-integrations data-account="root" data-csrf="test-csrf">${platform("matrix", "Matrix")}${platform("discord", "Discord")}${platform("slack", "Slack")}</div></main>`, await consoleStyles(), {
+    "/api/v1/admin/networks?kind=matrix": { networks: [bridge("matrix", "hq"), bridge("matrix", "lab")], next_after: null },
+    "/api/v1/admin/networks?kind=discord": { networks: [], next_after: null },
+    "/api/v1/admin/networks?kind=slack": { networks: [bridge("slack", "team")], next_after: "root/team" },
+  });
+  await expect(page.locator('[data-integration-count="matrix"]')).toHaveText("2");
+  await expect(page.locator('[data-integration-count="discord"]')).toHaveText("0");
+  // One read per platform, each filtered to that platform: filtering one page
+  // of every network here left out every bridge past the first hundred.
+  expect((await page.evaluate(() => window.consoleApiRequests)).sort()).toEqual([
+    "/api/v1/admin/networks?kind=discord&limit=1000",
+    "/api/v1/admin/networks?kind=matrix&limit=1000",
+    "/api/v1/admin/networks?kind=slack&limit=1000",
+  ]);
+  // A platform with more bridges than one page says so and links to the rest.
+  await expect(page.locator('[data-integration-count="slack"]')).toHaveText("1+");
+  await expect(page.getByRole("link", { name: "More slack bridges" }))
+    .toHaveAttribute("href", "/console/admin/networks?kind=slack&limit=1000&after=root%2Fteam");
+  await expectAccessible(page);
+});
+
+test("a page whose query the server refused does not read its directory", async ({ page }) => {
+  const body = await consoleTemplate("console_bans.html", { "shell.csrf": "test-csrf", limit: "50" });
+  await mountConsoleRuntime(page, `<main><p class="banner-error" role="alert" id="query-refusal">Invalid server-ban filter. The kind filter must be kline, dline, or xline.</p>${body}</main>`, await consoleStyles(), {
+    "/api/v1/admin/bans": { bans: [], next_before_id: null },
+  });
+  await expect(page.getByRole("alert")).toBeVisible();
+  // Long enough for the directory read the page would otherwise start.
+  await page.waitForTimeout(500);
+  expect(await page.evaluate(() => window.consoleApiRequests ?? [])).toEqual([]);
+});
+
+test("the fleet view forwards its type filter to the inventory", async ({ page }) => {
+  const body = await consoleTemplate("console_admin_networks.html", { "shell.csrf": "test-csrf" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {
+    "/api/v1/admin/networks": { networks: [], next_after: null },
+  });
+  await page.goto("/console-runtime-test?kind=slack&limit=5");
+  await expect.poll(() => page.evaluate(() => window.consoleApiRequests ?? [])).toEqual([
+    "/api/v1/admin/networks?kind=slack&limit=5",
+  ]);
 });
 
 test("a directory filter refuses surrounding spaces before the page is asked", async ({ page }) => {

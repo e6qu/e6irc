@@ -232,6 +232,20 @@ pub(super) struct OwnLiveConnectionQueryParams {
     pub(super) oper: Option<String>,
 }
 
+impl LiveConnectionQueryParams {
+    /// The console's filter form submits every field it did not fill empty.
+    pub(super) fn with_unfilled_fields_absent(self) -> Self {
+        use super::device::filled_form_field;
+        Self {
+            nick: filled_form_field(self.nick),
+            account: filled_form_field(self.account),
+            transport: filled_form_field(self.transport),
+            oper: filled_form_field(self.oper),
+            ..self
+        }
+    }
+}
+
 impl From<OwnLiveConnectionQueryParams> for LiveConnectionQueryParams {
     fn from(params: OwnLiveConnectionQueryParams) -> Self {
         Self {
@@ -279,7 +293,7 @@ pub(super) const LIVE_NICK_FILTER_CHARS: usize = 64;
 pub(super) fn validate_live_connection_query(
     params: LiveConnectionQueryParams,
     default_limit: usize,
-) -> ResponseResult<ValidatedLiveConnectionQuery> {
+) -> Result<ValidatedLiveConnectionQuery, super::QueryRefusal> {
     let page_size = super::device::bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -313,12 +327,11 @@ pub(super) fn validate_live_connection_query(
         Some("wss") => Some(crate::core::ConnectionTransport::SecureWebSocket),
         Some("local") => Some(crate::core::ConnectionTransport::Local),
         Some(_) => {
-            return Err(problem(
-                StatusCode::BAD_REQUEST,
+            return Err(super::QueryRefusal::new(
                 "Invalid live-connection filter",
-                Some("The transport filter must be tcp, tls, websocket, wss, or local."),
-            )
-            .into());
+                "The transport filter must be tcp, tls, websocket, wss, or local.",
+                Some("transport"),
+            ));
         }
     };
     let oper = match params.oper.as_deref() {
@@ -326,12 +339,11 @@ pub(super) fn validate_live_connection_query(
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(_) => {
-            return Err(problem(
-                StatusCode::BAD_REQUEST,
+            return Err(super::QueryRefusal::new(
                 "Invalid live-connection filter",
-                Some("The oper filter must be true or false."),
-            )
-            .into());
+                "The oper filter must be true or false.",
+                Some("oper"),
+            ));
         }
     };
     Ok(ValidatedLiveConnectionQuery {
@@ -564,7 +576,7 @@ mod tests {
     fn assert_bad_query(params: LiveConnectionQueryParams) {
         match validate_live_connection_query(params, 100) {
             Ok(_) => panic!("invalid live-connection query was accepted"),
-            Err(response) => assert_eq!(response.status(), StatusCode::BAD_REQUEST),
+            Err(refusal) => assert_eq!(Response::from(refusal).status(), StatusCode::BAD_REQUEST),
         }
     }
 

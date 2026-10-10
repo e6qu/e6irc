@@ -2421,10 +2421,13 @@ fn operations() -> serde_json::Value {
                             "schema": { "type": "integer", "minimum": 1, "maximum": crate::db::BncNetworkInventoryPageSize::MAX, "default": 100 } },
                         { "name": "after", "in": "query", "required": false,
                             "description": "A `next_after` value from the previous page.",
-                            "schema": { "type": "string", "minLength": 1 } }
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "kind", "in": "query", "required": false,
+                            "description": "Exact driver filter: only networks of this kind, shared, configured and stored alike, are paged. An unknown or blank value is refused (400) rather than read as no filter.",
+                            "schema": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] } }
                     ],
                     "responses": { "200": admin_networks_response["200"],
-                        "400": { "description": "invalid limit or cursor" },
+                        "400": { "description": "invalid limit, cursor, or kind filter" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/networks/{owner}/{name}": {

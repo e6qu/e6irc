@@ -4148,6 +4148,22 @@
               "minLength": 1,
               "type": "string"
             }
+          },
+          {
+            "description": "Exact driver filter: only networks of this kind, shared, configured and stored alike, are paged. An unknown or blank value is refused (400) rather than read as no filter.",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "enum": [
+                "irc",
+                "local",
+                "matrix",
+                "discord",
+                "slack"
+              ],
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4720,7 +4736,7 @@
             "description": "networks with runtime snapshots"
           },
           "400": {
-            "description": "invalid limit or cursor"
+            "description": "invalid limit, cursor, or kind filter"
           },
           "401": {
             "description": "not signed in, or the token or session is invalid or expired"

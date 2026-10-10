@@ -1,0 +1,6 @@
+{#- A filter page's refused query, shown beside the form whose fields keep the
+    refused values. The page's directory is not read until the query is
+    corrected: it would be refused again. -#}
+{%- if let Some(refusal) = filters.refusal() %}
+      <p class="banner-error" role="alert" id="query-refusal">{{ refusal }} Correct it below to continue; a refused filter keeps the value that was sent.</p>
+{%- endif %}

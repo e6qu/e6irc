@@ -174,6 +174,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   }
 
   const configurationResult = document.getElementById("configuration-api-result");
+  // The server refused this page's query and says so beside its filter form;
+  // the directory would be refused again, so it is not read until the query
+  // is corrected.
+  const queryRefused = document.getElementById("query-refusal") !== null;
 
   const apiOperation = (method, url) => {
     const parsed = new URL(url, window.location.origin);
@@ -1809,7 +1813,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       return true;
     };
-    void refreshBanDirectory();
+    if (!queryRefused) void refreshBanDirectory();
   }
   const setBanResult = (message, success) => showResult(banResult, message, success);
 
@@ -1880,7 +1884,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const csrf = sessionPage.dataset.csrf;
     const browserSessions = sessionPage.querySelector("[data-api-browser-sessions]");
     const connections = sessionPage.querySelector("[data-api-live-connections]");
-    const filters = sessionPage.querySelector("[data-api-connection-filter]");
     const clear = sessionPage.querySelector("[data-api-session-clear]");
     const pagePath = own ? "/console/my-sessions" : "/console/sessions";
     const apiPath = own ? "/api/v1/me/connections" : "/api/v1/admin/connections";
@@ -1991,17 +1994,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       connections.append(fillPager(element("div", "pager"), directoryPage(query, "before_id", data.next_before_id), "Showing the newest matching connections.", "Showing an older page.", "Older connections", pagePath));
     };
-    if (filters instanceof HTMLFormElement) {
-      const query = connectionQuery();
-      for (const input of filters.elements) {
-        if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = query.get(input.name) || (input.name === "limit" ? "50" : "");
-      }
-    }
     if (clear instanceof HTMLAnchorElement) clear.href = pagePath;
     const load = () => refresh()
       .then(() => clearLoadFailure(sessionResult))
       .catch((error) => showLoadFailure(sessionResult, error, "Session data could not be loaded.", () => void load()));
-    void load();
+    if (!queryRefused) void load();
   }
 
   const accountResult = document.getElementById("account-api-result");
@@ -2477,7 +2474,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const csrf = adminAccountsPage.dataset.csrf || "";
     const invitationHost = adminAccountsPage.querySelector("[data-api-admin-invitations]");
     const accountHost = adminAccountsPage.querySelector("[data-api-admin-accounts]");
-    const filters = adminAccountsPage.querySelector("[data-api-admin-accounts-filter]");
     const capability = () => hiddenInput("csrf", csrf);
     const button = (text, className) => { const node = element("button", className, text); node.type = "submit"; return node; };
     // The page carries both directories' cursors; each API query takes only its own.
@@ -2493,11 +2489,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = captionedTable("Account directory"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td", "account-actions"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; form.append(capability(), hiddenInput(key === "suspension" ? "suspended" : "administrator", value), button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const { label: deletionLabel, control: confirmation } = labelledControl("input", "confirmation", `Type ${account.name} to delete`); confirmation.autocomplete = "off"; confirmation.required = true; deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = timeElement(account.created_at); const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "account-posture", loginMethods), element("td", "account-posture", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
     refreshAdminAccounts = async () => { const params = pageQuery(); const accounts = directoryQuery(params, ["name", "limit", "before_id"]); const invitations = directoryQuery(params, ["limit"]); if (params.has("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accountData, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${accounts}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accountData); renderInvitations(invitationData); };
-    if (filters instanceof HTMLFormElement) { const params = pageQuery(); for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = params.get(input.name) || ""; }
     const load = () => refreshAdminAccounts()
       .then(() => clearLoadFailure(adminAccountResult))
       .catch((error) => showLoadFailure(adminAccountResult, error, "Account directory failed to load.", () => void load()));
-    void load();
+    if (!queryRefused) void load();
   }
 
   const adminNetworkResult = document.getElementById("admin-network-api-result");
@@ -2545,7 +2540,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (adminNetworkRows instanceof HTMLElement) {
     refreshAdminNetworks = async () => {
       try {
-        const query = directoryQuery(window.location.search, ["limit", "after"], { limit: "100" });
+        const query = directoryQuery(window.location.search, ["kind", "limit", "after"], { limit: "100" });
         const result = await apiRead(`/api/v1/admin/networks?${query}`);
         renderAdminNetworks(apiCollection(result, "networks", "network directory"));
         const pager = document.getElementById("admin-network-pager");
@@ -2556,7 +2551,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       return true;
     };
-    void refreshAdminNetworks();
+    if (!queryRefused) void refreshAdminNetworks();
   }
   document.addEventListener("submit", (event) => {
     const form = event.target;
@@ -2821,48 +2816,56 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (integrations instanceof HTMLElement) {
     const account = integrations.dataset.account || "";
     const csrf = integrations.dataset.csrf || "";
-    const render = (networks) => {
-      for (const kind of ["matrix", "discord", "slack"]) {
-        const target = integrations.querySelector(`[data-integration-list="${kind}"]`);
-        const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
-        if (!(target instanceof HTMLElement)) continue;
-        const entries = networks.filter((network) => network.kind === kind);
-        if (count) count.textContent = String(entries.length);
-        target.replaceChildren();
-        if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
-        const table = captionedTable(`${kind[0].toUpperCase()}${kind.slice(1)} bridges`);
-        table.append(append(document.createElement("thead"), append(element("tr"), ...["Status", "Network", "Owner", "Actions"].map((heading) => element("th", "", heading)))));
-        const body = document.createElement("tbody");
-        for (const network of entries) {
-          const row = document.createElement("tr"); const runtime = network.runtime;
-          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state));
-          const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
-          const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
-          const actions = document.createElement("td"); actions.className = "row-actions";
-          if (network.owner === account && network.shared !== true && network.configured !== true) {
-            for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
-            const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = hiddenInput("csrf", csrf); const enabled = hiddenInput("enabled", !network.enabled); const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
-            const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = hiddenInput("csrf", csrf); const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
-          } else actions.textContent = network.shared === true || network.configured === true ? "Managed configuration" : `Managed by ${network.owner}`;
-          row.append(status, name, owner, actions); body.append(row);
-        }
-        table.append(body); target.append(scrollRegion(`${kind} bridges`, table));
+    // One platform's list, from a read of exactly its kind. Filtering one
+    // page of every network by kind here showed a platform's count and list
+    // for that page only: a bridge past the first hundred networks of any kind
+    // was missing, and its platform said it had none.
+    const render = (kind, target, count, entries, nextAfter) => {
+      if (count) count.textContent = nextAfter === null ? String(entries.length) : `${entries.length}+`;
+      target.replaceChildren();
+      if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); return; }
+      const table = captionedTable(`${kind[0].toUpperCase()}${kind.slice(1)} bridges`);
+      table.append(append(document.createElement("thead"), append(element("tr"), ...["Status", "Network", "Owner", "Actions"].map((heading) => element("th", "", heading)))));
+      const body = document.createElement("tbody");
+      for (const network of entries) {
+        const row = document.createElement("tr"); const runtime = network.runtime;
+        const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state));
+        const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
+        const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
+        const actions = document.createElement("td"); actions.className = "row-actions";
+        if (network.owner === account && network.shared !== true && network.configured !== true) {
+          for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
+          const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = hiddenInput("csrf", csrf); const enabled = hiddenInput("enabled", !network.enabled); const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
+          const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = hiddenInput("csrf", csrf); const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
+        } else actions.textContent = network.shared === true || network.configured === true ? "Managed configuration" : `Managed by ${network.owner}`;
+        row.append(status, name, owner, actions); body.append(row);
+      }
+      table.append(body); target.append(scrollRegion(`${kind} bridges`, table));
+      // The inventory's largest page; the rest of a platform's bridges are
+      // one link away, in the fleet view filtered to that platform.
+      if (nextAfter !== null) {
+        const more = element("a", "secondary-link", `More ${kind} bridges`);
+        more.href = `/console/admin/networks?${new URLSearchParams({ kind, limit: "1000", after: nextAfter })}`;
+        target.append(more);
+      }
+    };
+    const refreshPlatform = async (target) => {
+      const kind = target.dataset.integrationList || "";
+      const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
+      try {
+        const result = await apiRead(`/api/v1/admin/networks?${new URLSearchParams({ kind, limit: "1000" })}`);
+        render(kind, target, count, apiCollection(result, "networks", "integration directory"), result.next_after);
+        return true;
+      } catch (error) {
+        if (count) count.textContent = "—";
+        listLoadFailure(target, error, () => void refreshPlatform(target));
+        return false;
       }
     };
     refreshIntegrations = async () => {
-      try {
-        const query = directoryQuery(window.location.search, ["limit", "after"], { limit: "100" });
-        const result = await apiRead(`/api/v1/admin/networks?${query}`);
-        render(apiCollection(result, "networks", "integration directory"));
-        const pager = integrations.querySelector("[data-integration-pager]");
-        if (pager instanceof HTMLElement) fillPager(pager, directoryPage(query, "after", result.next_after), "Showing the first networks.", "Showing a later page.", "More networks", "/console/integrations");
-      } catch (error) {
-        integrations.querySelectorAll("[data-integration-list]").forEach((target) => {
-          if (target instanceof HTMLElement) listLoadFailure(target, error, () => void refreshIntegrations());
-        });
-        return false;
-      }
-      return true;
+      const platforms = Array.from(integrations.querySelectorAll("[data-integration-list]"));
+      const loaded = await Promise.all(platforms.map(refreshPlatform));
+      return loaded.every(Boolean);
     };
     void refreshIntegrations();
   }
@@ -3024,7 +3027,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       return true;
     };
-    void refreshAdminChannelDirectory();
+    if (!queryRefused) void refreshAdminChannelDirectory();
   }
 
   const adminAuditRows = document.querySelector("[data-api-admin-audit-list]");
@@ -3066,7 +3069,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         tableLoadFailure(adminAuditRows, 6, error, () => void refreshAuditDirectory());
       }
     };
-    void refreshAuditDirectory();
+    if (!queryRefused) void refreshAuditDirectory();
   }
 
   const setChannelResult = (message, success) => showResult(channelResult, message, success);

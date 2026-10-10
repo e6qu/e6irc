@@ -1432,6 +1432,23 @@ try {
   );
   await page.locator("#network-operations").getByText("Email address verified", { exact: false }).waitFor();
   assert.doesNotMatch(await page.locator("#network-operations").innerText(), /mail-code-123/);
+  // The chat's console is where the raw exchange is read back: NickServ's
+  // replies to the registration, exactly as the network sent them, replayed
+  // to a client that was not open when they arrived -- and never the
+  // password or the emailed code the commands carried.
+  await page.goto(`${applicationOrigin}/?network=journey`);
+  await page.locator("#buffers").getByRole("button", { name: /^Open console/ }).click();
+  for (const reply of ["Verification email requested", "Email address verified"]) {
+    const nickServLine = page.locator("#messages .line-wire").filter({ hasText: reply }).first();
+    await nickServLine.waitFor();
+    assert.match(
+      await nickServLine.innerText(),
+      new RegExp(`« (?:@\\S+ )?:NickServ!service@journey NOTICE \\S+ :${reply}`),
+    );
+  }
+  assert.doesNotMatch(await page.locator("#messages").innerText(), /journey-secret|mail-code-123/);
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
+  await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
   await page.locator("[data-api-owner-network-toggle]").getByRole("button", { name: "Disable", exact: true }).click();
   await page.locator('[data-network-field="enabled"]', { hasText: "Disabled" }).waitFor();
   upstream.resetJoin("#journey");

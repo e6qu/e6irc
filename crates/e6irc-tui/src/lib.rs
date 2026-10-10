@@ -5,3 +5,4 @@
 pub mod app;
 pub mod keys;
 pub mod reconnect;
+pub mod rejoin;

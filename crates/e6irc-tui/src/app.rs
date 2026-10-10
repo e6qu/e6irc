@@ -93,6 +93,12 @@ pub struct Buffer {
     unread: usize,
     /// Scrollback offset in lines from the bottom (0 = following live).
     scroll: usize,
+    /// The texts of messages this client showed as sent by a local copy (a
+    /// server without echo-message), oldest first, that no server copy has
+    /// matched yet. History loaded after a reconnect holds those messages
+    /// with their message IDs; each is recognised as the line already shown
+    /// rather than shown again. Bounded by [`MAX_UNCONFIRMED`].
+    unconfirmed: std::collections::VecDeque<String>,
     /// Who is known to be in this conversation, for nick completion: keyed by
     /// the name folded under the network's case mapping, holding the name as
     /// the server spells it. Filled from NAMES, JOIN and whoever speaks;
@@ -115,7 +121,26 @@ impl Buffer {
             unread: 0,
             scroll: 0,
             members: std::collections::HashMap::new(),
+            unconfirmed: std::collections::VecDeque::new(),
         }
+    }
+
+    /// A local copy of `text` was shown as sent.
+    fn shown_unconfirmed(&mut self, text: &str) {
+        if self.unconfirmed.len() == MAX_UNCONFIRMED {
+            self.unconfirmed.pop_front();
+        }
+        self.unconfirmed.push_back(text.to_owned());
+    }
+
+    /// Whether `text`, from history, is a message already shown by its local
+    /// copy: the oldest such copy, which it now confirms.
+    fn confirms_local_copy(&mut self, text: &str) -> bool {
+        let Some(position) = self.unconfirmed.iter().position(|shown| shown == text) else {
+            return false;
+        };
+        self.unconfirmed.remove(position);
+        true
     }
 
     /// Note that `nick` is in this conversation. `false` when the member
@@ -232,6 +257,11 @@ pub const SCROLLBACK_LINES: usize = 5_000;
 /// Buffers a client will open. Names arrive from the server, so this bounds
 /// what a remote party can make the client allocate.
 const MAX_BUFFERS: usize = 256;
+
+/// Local copies per conversation awaiting their server copy. The writer
+/// queue holds at most 256 lines, and a copy unmatched past this many later
+/// sends is one the server never kept (a refused message).
+const MAX_UNCONFIRMED: usize = 256;
 
 /// Members remembered per conversation for nick completion. Names arrive from
 /// the server, so this bounds what a remote party can make the client keep.
@@ -629,7 +659,16 @@ impl App {
                 if from_a_user {
                     self.note_member(idx, &sender);
                 }
-                self.buffers[idx].push(LogLine::message(&sender, &text));
+                // History holds what this client sent; a line it showed by a
+                // local copy is that copy, not a second message. Its time
+                // still moves the read position past it.
+                let already_shown = from_self
+                    && msg.command == "PRIVMSG"
+                    && msg.tag("batch").is_some()
+                    && self.buffers[idx].confirms_local_copy(&text);
+                if !already_shown {
+                    self.buffers[idx].push(LogLine::message(&sender, &text));
+                }
                 if let Some(raw_time) = msg.tag("time") {
                     if let Some(millis) = e6irc_proto::time::parse_server_time_millis(raw_time) {
                         self.buffers[idx].latest_time =
@@ -987,6 +1026,7 @@ impl App {
         };
         let from = self.nick.clone();
         self.buffers[index].push(LogLine::message(&from, &echo.text));
+        self.buffers[index].shown_unconfirmed(&echo.text);
     }
 
     /// Restore editor text when the bounded writer refuses admission. The
@@ -1219,7 +1259,7 @@ impl App {
             return match command.as_str() {
                 "help" if arguments.is_empty() => {
                     self.status(
-                        "commands: /join #channel · /msg nick text · /me action · /win name|number · /raw LINE · /quit · //text sends /text · Tab completes a nick",
+                        "commands: /join #channel [key] · /msg nick text · /me action · /win name|number · /raw LINE · /quit · //text sends /text · Tab completes a nick",
                     );
                     Action::None
                 }
@@ -1247,20 +1287,35 @@ impl App {
         self.message_outbound(line.clone(), line)
     }
 
-    fn join_command(&mut self, input: String, channel: &str) -> Action {
+    fn join_command(&mut self, input: String, arguments: &str) -> Action {
         // One channel per command: `#a,#b` would open a buffer of that name,
         // and a name that is not a channel on this network (`chat` without
-        // its `#`) a buffer whose lines go to a nickname.
-        if channel.is_empty() || channel.contains([' ', ',']) || !self.names.is_channel(channel) {
+        // its `#`) a buffer whose lines go to a nickname. A keyed (`+k`)
+        // channel takes its key after the name, one word.
+        let (channel, key) = match arguments.split_once(' ') {
+            Some((channel, key)) => (channel, Some(key.trim_start())),
+            None => (arguments, None),
+        };
+        let key_usable = key.is_none_or(|key| {
+            !key.is_empty() && !key.starts_with(':') && !key.contains([' ', ','])
+        });
+        if channel.is_empty()
+            || channel.contains(',')
+            || !self.names.is_channel(channel)
+            || !key_usable
+        {
             return self.refuse_command(
                 input,
-                "usage: /join #channel — one channel; a keyed one: /raw JOIN #channel key",
+                "usage: /join #channel [key] — one channel, and its key if it has one",
             );
         }
         if !self.connected {
             return self.refuse_command(input, "not connected — JOIN not sent");
         }
-        let wire = format!("JOIN {channel}");
+        let wire = match key {
+            Some(key) => format!("JOIN {channel} {key}"),
+            None => format!("JOIN {channel}"),
+        };
         if !e6irc_proto::message::client_frame_fits(wire.as_bytes()) {
             return self.refuse_command(
                 input,
@@ -2340,14 +2395,53 @@ mod tests {
             app.take_read_marker_command().as_deref(),
             Some("MARKREAD #c timestamp=2026-09-28T10:00:00.000Z")
         );
+    }
 
-        // Without echo-message the local copy is all there is.
+    /// On a server without echo-message the local copy is what the buffer
+    /// shows, and history loaded after a reconnect holds the same message
+    /// with its ID: it is recognised as that copy, shown once, and its time
+    /// moves the read marker. Another line of this client's in history, or
+    /// the same text sent live from another device, is still shown.
+    #[test]
+    fn a_local_copy_is_recognised_in_history_without_echo_message() {
         let mut app = test_app("#c", "me");
         let Action::Send(outbound) = type_line(&mut app, "hello") else {
             panic!("message should be queued");
         };
         app.outbound_accepted(&outbound);
         assert_eq!(app.current().log.back().unwrap().text, "hello");
+        let replayed =
+            "@batch=h1;msgid=own1;time=2026-10-10T10:00:00.000Z :me!u@h PRIVMSG #c :hello";
+        app.on_message(&msg(replayed));
+        app.on_message(&msg(replayed));
+        app.on_message(&msg(
+            "@batch=h1;msgid=own2;time=2026-10-10T10:00:01.000Z :me!u@h PRIVMSG #c :from my phone",
+        ));
+        app.on_message(&msg(":me!u@h PRIVMSG #c :hello"));
+        let shown: Vec<_> = app
+            .current()
+            .log
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(shown, ["hello", "from my phone", "hello"]);
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #c timestamp=2026-10-10T10:00:01.000Z")
+        );
+    }
+
+    #[test]
+    fn unconfirmed_local_copies_are_bounded() {
+        let mut app = test_app("#c", "me");
+        for i in 0..MAX_UNCONFIRMED + 3 {
+            let Action::Send(outbound) = type_line(&mut app, &format!("line {i}")) else {
+                panic!("message should be queued");
+            };
+            app.outbound_accepted(&outbound);
+        }
+        assert_eq!(app.current().unconfirmed.len(), MAX_UNCONFIRMED);
+        assert_eq!(app.current().unconfirmed[0], "line 3");
     }
 
     /// What this person said from another client attached to the same
@@ -2380,7 +2474,13 @@ mod tests {
     /// that name, and `chat` a buffer whose messages went to a nickname.
     #[test]
     fn slash_join_takes_exactly_one_channel() {
-        for refused in ["/join chat", "/join #a,#b", "/join #a key"] {
+        for refused in [
+            "/join chat",
+            "/join #a,#b",
+            "/join #a key word",
+            "/join #a :key",
+            "/join #a k,ey",
+        ] {
             let mut app = test_app("#c", "me");
             assert_eq!(type_line(&mut app, refused), Action::None, "{refused}");
             assert_eq!(app.input(), refused, "retained for correction");
@@ -2401,6 +2501,19 @@ mod tests {
             panic!("a local channel is a channel");
         };
         assert_eq!(outbound.line(), "JOIN &local");
+        // A keyed channel takes its key after the name; the key is never
+        // shown in the buffer.
+        let Action::Send(outbound) = type_line(&mut app, "/join #locked sesame") else {
+            panic!("a keyed join should be queued");
+        };
+        assert_eq!(outbound.line(), "JOIN #locked sesame");
+        assert_eq!(app.current().name, "#locked");
+        assert!(
+            !app.buffers
+                .iter()
+                .flat_map(|buffer| buffer.log.iter())
+                .any(|line| line.text.as_str().contains("sesame"))
+        );
     }
 
     /// Type `word` into an empty composer and press Tab.

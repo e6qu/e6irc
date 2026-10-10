@@ -4481,7 +4481,19 @@ own query string: its API query and its pager links are built by the shared
 `directoryQuery` from the keys that directory's operation declares, keeping
 only non-empty values, so a filter form's "All kinds" (`kind=`) or a
 page-only parameter (a second pager cursor, a one-shot notice flag) cannot
-fail the contract before the request is made.
+fail the contract before the request is made. A filter page (sessions,
+accounts, channel registry, all networks, bans, audit, monitoring) validates
+its own query with the same validator as its API, which returns a typed
+`QueryRefusal`: the API answers it as the `400` problem document naming the
+field, and the page answers it as itself, a `400` with the refusal beside the
+filter form, whose fields keep what was sent, and without reading the
+directory the query would fail again. A hand-edited or bookmarked query
+therefore never replaces the page with a problem document. The administrator
+network inventory takes an exact `kind` filter (`irc`, `local`, `matrix`,
+`discord`, `slack`; blank or unknown is refused), applied before the page is
+cut to configured and stored networks alike, and **Integrations** reads each
+platform's bridges with it, so each platform's count and list are its own
+rather than one page of every network filtered in the browser.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle
@@ -4951,7 +4963,7 @@ moderated channel is said in the buffer it was sent from instead of standing
 there as a delivered-looking local echo. The slash-command grammar is
 closed (`/join` takes exactly one name that is a channel on this network, so
 neither `#a,#b` nor a bare `chat` opens a buffer whose lines would go
-elsewhere): malformed
+elsewhere, and a `+k` channel's key as one word after it): malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
@@ -5005,7 +5017,14 @@ offers `echo-message` the client asks for it, and its own messages are shown
 as the server echoes them, with their message ID and time: a local copy has
 neither, so history loaded after a reconnect showed each sent line a second
 time and the read marker could not pass it. On a server without it a message
-is locally echoed only after bounded-queue admission. What this person said
+is locally echoed only after bounded-queue admission, and each conversation
+keeps the texts of its local copies no server copy has matched yet (at most
+256): a line of this client's in a history batch with such a text is that
+copy, not shown again, though its time still moves the read position. A
+channel key — one the TUI's `/join #c key` or a raw `JOIN` sent — is kept in
+the process's memory only, never written anywhere, and a reconnect rejoins
+the channel with it; leaving the channel, or joining it again without a key,
+forgets it (at most 256 are kept). What this person said
 from another client attached to the same network is not counted unread. A
 full queue, disconnected socket,
 or over-limit complete IRC line leaves the input available and reports the

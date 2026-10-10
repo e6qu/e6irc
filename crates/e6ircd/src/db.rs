@@ -8619,6 +8619,7 @@ impl BncInventoryKey {
 pub async fn bnc_network_inventory_page(
     pool: &PgPool,
     after: Option<&BncInventoryKey>,
+    kind: Option<crate::config::NetworkKind>,
     page_size: BncNetworkInventoryPageSize,
 ) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
     use sqlx::Row;
@@ -8626,10 +8627,11 @@ pub async fn bnc_network_inventory_page(
         "SELECT a.name AS owner, a.name_folded AS owner_key, ",
         bnc_network_columns!(),
         " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         WHERE $1::text IS NULL
+         WHERE ($1::text IS NULL
             OR (a.name_folded COLLATE \"C\", lower(n.name) COLLATE \"C\")
                  > ($1 COLLATE \"C\", $2 COLLATE \"C\")
-            OR (a.name_folded = $1 AND lower(n.name) = $2 AND NOT $3)
+            OR (a.name_folded = $1 AND lower(n.name) = $2 AND NOT $3))
+           AND ($5::text IS NULL OR n.kind = $5)
          ORDER BY a.name_folded COLLATE \"C\", lower(n.name) COLLATE \"C\"
          LIMIT $4"
     ))
@@ -8637,6 +8639,7 @@ pub async fn bnc_network_inventory_page(
     .bind(after.map(|key| key.name.as_str()))
     .bind(after.is_some_and(|key| key.stored))
     .bind((page_size.value() + 1) as i64)
+    .bind(kind.map(crate::config::NetworkKind::as_db_str))
     .fetch_all(pool)
     .await
     .map_err(query_error)?;

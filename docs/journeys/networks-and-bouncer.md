@@ -282,10 +282,13 @@ accumulate.
 **Evidence.** `tools/test-oidc-browser.mjs`, run in Chromium, Firefox, and
 WebKit against a local live upstream, opens the console, reads a replayed
 `PRIVMSG` off it as the wire line, types an IRC line there that the upstream
-receives verbatim, and finds that line shown beside the replies. The parked
+receives verbatim, and finds that line shown beside the replies. After the
+same journey registers and verifies an upstream account through the real
+driver, it opens the chat afresh, opens the console, reads both of the
+upstream NickServ's replies back off it as the wire lines the network sent,
+and finds neither the password nor the emailed code there. The parked
 lifecycle/error-code pairings, generic parked-state recovery, and the
-redaction classifier have unit tests. No test reads a NickServ exchange back
-off the console.
+redaction classifier have unit tests.
 
 ## Diagnose an upstream connection
 

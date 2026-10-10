@@ -33,6 +33,10 @@ shown and rejected explicitly. Invalid/rejected credentials are fatal until
 configuration changes rather than retried forever. Network/transient failures
 use bounded backoff and visible error categories. A failed bridge-inventory
 read is announced in each affected platform list and offers an in-place retry.
+Each platform's list is read with the inventory's exact `kind` filter, so its
+count and rows are that platform's own; past the inventory's largest page the
+count says so (`1000+`) and links to the rest in **All networks**, filtered to
+that platform.
 Inbound identities/channel names are sanitized and validated before entering
 IRC state.
 Reverse delivery supports `PRIVMSG`; malformed messages, unsupported commands,
@@ -166,7 +170,8 @@ private to the current user.
    current destination, connection state, and unread work. Receive into bounded
    buffers, switch with Alt-Left/Right, scroll with Page Up/Down, return live
    with Ctrl-End, edit the composer with character-safe cursor movement, and
-   use `/help`, `/join` (one channel of this network), `/msg`, `/me`, one-based
+   use `/help`, `/join` (one channel of this network, and its key if it has
+   one), `/msg`, `/me`, one-based
    or named `/win` (the rail shows each buffer's number), `/raw`, `//` for a
    literal leading slash, and `/quit`; Tab completes the word before the caret
    to a member of the conversation in view, and again cycles the matches.
@@ -178,7 +183,8 @@ private to the current user.
    is represented by terminal-safe types.
 6. A live disconnect starts bounded-delay reconnect attempts with the same
    explicit transport/authentication request, rejoins every channel whose
-   self-JOIN was confirmed, and reloads marker-relative history. The composer
+   self-JOIN was confirmed (a keyed channel with the key it was joined with,
+   kept in memory only), and reloads marker-relative history. The composer
    visibly marks itself offline and retains editable input, while submission is
    refused. Anything racing the disconnect is counted and reported rather than
    replayed late or shown as a false successful send.
@@ -186,7 +192,8 @@ private to the current user.
    line or full queue retains/refuses input without local echo. On a server
    offering `echo-message` a sent message is shown as the server echoes it,
    with its message ID, so a reconnect's history cannot show it twice; without
-   it, accepted input is echoed only after queue admission. A read-marker write
+   it, accepted input is echoed only after queue admission, and the same line
+   met again in a reconnect's history is recognised as that copy. A read-marker write
    remains pending when admission is temporarily unavailable.
 
 **Visible failures and recovery.** Transport, TLS, SASL, capability, history,
@@ -208,12 +215,15 @@ marker-relative CHATHISTORY, and batch completion. A pseudo-terminal test
 e6ircd, proves the relay-desk route/status/conversation framing, command help,
 inbound rendering, and outbound delivery; stops the daemon and proves the
 reconnecting state, that a line typed while offline is not sent but kept, and
-that after the daemon restarts the client rejoins its channel and sends the
-kept line; proves Tab completion and `/me` reach the channel; enters `/quit`,
+that after the daemon restarts the client rejoins its channels — a keyed one
+with its key — and sends the kept line; proves Tab completion and `/me` reach the channel; enters `/quit`,
 and requires clean alternate-screen restoration. Model tests
 (`an_own_message_is_shown_once_across_a_history_replay`,
 `tab_completes_and_cycles_channel_members`,
-`slash_join_takes_exactly_one_channel`) and
+`slash_join_takes_exactly_one_channel`,
+`a_local_copy_is_recognised_in_history_without_echo_message`,
+`a_keyed_channel_is_rejoined_with_its_key_until_it_is_left`,
+`a_reconnect_rejoins_a_keyed_channel_with_its_key`) and
 `echo_message_is_asked_for_when_offered` and
 `no_color_draws_the_screen_without_colour` hold the rest.
 Shared-client tests also prove that anonymous, PLAIN, and OAUTHBEARER
