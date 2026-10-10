@@ -414,7 +414,9 @@ PLAIN.
    is then told its topic and members as the session knows them (asked of
    the upstream, for at most two channels, when the session does not know
    them). If the client negotiated read markers, its stored channel position
-   arrives before 366.
+   arrives before 366. The `MODE`, `NAMES` and `TOPIC` a client then asks of
+   each channel are answered by the bouncer from the session, so a client in
+   a hundred channels does not hold the network's paced queue for minutes.
 7. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 

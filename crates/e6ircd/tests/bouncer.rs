@@ -6018,3 +6018,68 @@ async fn a_session_a_token_signed_in_ends_when_the_token_expires() {
     assert_eq!(still_stored, 1, "maintenance has not pruned it: expiry did");
     assert!(still_open(&mut with_password).await);
 }
+
+/// The driver asks each channel it joins for its settings once, when no
+/// client's command waits; from then on a client's `MODE #chan` — which
+/// irssi and WeeChat send for every channel they are shown joined — is
+/// answered by the session, and never takes a line of the upstream's flood
+/// allowance or a place in the queue every attached client shares.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joined_channels_settings_are_asked_once_and_answer_mode_queries() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (asked, mut upstream_asked) = tokio::sync::mpsc::unbounded_channel();
+    let _upstream = ScriptedTask::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        session.send(":up 376 bncbot :End of MOTD").await;
+        session.send(":bncbot!u@h JOIN #room").await;
+        session.send(":up 353 bncbot = #room :bncbot @op").await;
+        session
+            .send(":up 366 bncbot #room :End of /NAMES list.")
+            .await;
+        loop {
+            let line = next_command(&mut session).await;
+            if line == "MODE #room" {
+                session.send(":up 324 bncbot #room +nt").await;
+                session.send(":up 329 bncbot #room 1700000000").await;
+            }
+            drop(asked.send(line));
+        }
+    });
+    let handle = driver_at(addr, "bncbot");
+    let mut events = handle.subscribe();
+    let mut asker = handle.route_replies(7);
+    wait_connected(&handle, &mut events).await;
+    let first = tokio::time::timeout(deadline::HANG, upstream_asked.recv())
+        .await
+        .expect("the driver asks")
+        .expect("the upstream reads");
+    assert_eq!(first, "MODE #room");
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            if let Ok(DriverEvent::Notice(line)) = events.recv().await
+                && line.line.contains(" 329 ")
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the settings reach the session");
+    assert_eq!(handle.send_from(7, "MODE #room"), SendOutcome::Sent);
+    assert_eq!(untimed(&asker.recv().await), ":*bnc* 324 bncbot #room +nt");
+    assert_eq!(
+        untimed(&asker.recv().await),
+        ":*bnc* 329 bncbot #room 1700000000"
+    );
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG #room :marker"),
+        SendOutcome::Sent
+    );
+    let next = tokio::time::timeout(deadline::HANG, upstream_asked.recv())
+        .await
+        .expect("the marker arrives")
+        .expect("the upstream reads");
+    assert_eq!(next, "PRIVMSG #room :marker", "the MODE was answered here");
+}

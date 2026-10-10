@@ -3117,11 +3117,19 @@ above the trait, provides for every network kind:
   channel's state for every client — and which the session follows from then
   on through every `JOIN`, `PART`, `KICK`, `QUIT`, `NICK`, membership `MODE`
   and `TOPIC` (at most 20,000 memberships per session; a channel past that
-  has its list unknown). A client's `NAMES` of one channel whose list the
-  session follows is answered from it, to that client, as soju answers one:
-  the browser asks for every joined channel's list on each connect, and each
-  question would otherwise be a line of the upstream's flood allowance
-  (§10.3). Each attachment's route holds 1,024
+  has its list unknown). The session follows each channel's settings too:
+  the `irc` driver asks each channel it joins for them once (`MODE #chan`,
+  answered with `324` and `329`), only while no attached client's command
+  waits, and every `MODE` since keeps them; a channel whose member list
+  ended with no `332` before it has no topic. A client's `NAMES`, `MODE` or
+  `TOPIC` of one channel the session follows is answered from it, to that
+  client, as soju and ZNC answer them: clients ask them of every channel
+  they are shown joined — irssi and WeeChat `MODE` and `NAMES`, the browser
+  `NAMES` — and asked of the upstream, an attach of a client in a hundred
+  channels held the queue every attached client shares for minutes at the
+  upstream's flood allowance (§10.3), and past the queue's bound dropped the
+  questions. A list mode (`MODE #chan b`), `WHO` and anything the session
+  does not know yet are the upstream's, paced as before. Each attachment's route holds 1,024
   lines; a reply read more slowly than the network sends it loses the rest,
   for that client alone, and it is told how many. The `/ws/ui` socket has a
   route like a raw attach. A sender's own messages reach the

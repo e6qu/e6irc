@@ -4521,16 +4521,17 @@ impl Drop for ReplyRoute {
 /// which is nothing but tags, is answered here, to its sender alone, rather
 /// than refused by the network in front of every attached client. The echo of
 /// what is sent is made from the returned line, so it never shows a tag the
-/// network did not carry. A `NAMES` of a channel whose member list the
-/// session follows is answered from it, as soju answers one: the browser asks
-/// for every joined channel's list on each connect, and each question would
-/// otherwise be a line of the upstream's flood allowance.
+/// network did not carry. A `NAMES`, `MODE` or `TOPIC` of a channel the
+/// session follows is answered from what it follows, as soju and ZNC answer
+/// them ([`DriverEnds::answered_by_session`]): clients ask them of every
+/// channel on each connect, and each question would otherwise be a line of
+/// the upstream's flood allowance.
 pub(super) fn carriable(
     cmd: &ClientCommand,
     client_tags: ClientTags,
     ends: &DriverEnds,
 ) -> Option<String> {
-    if let Some(answer) = ends.names_from_session(&cmd.line) {
+    if let Some(answer) = ends.answered_by_session(&cmd.line) {
         for line in answer {
             ends.answer(cmd.origin, line);
         }
@@ -5797,22 +5798,30 @@ impl DriverEnds {
         self.reply_routes.deliver(origin, line);
     }
 
-    /// The session's own answer to `line` when it is a `NAMES` of one channel
-    /// the session is in and follows the complete member list of.
-    fn names_from_session(&self, line: &str) -> Option<Vec<String>> {
+    /// The session's own answer to `line` when it asks about one channel the
+    /// session is in what the session follows of it: its member list
+    /// (`NAMES #chan`), its settings (`MODE #chan`) or its topic (`TOPIC
+    /// #chan`), each once it is known. These are what a client asks of every
+    /// channel it is shown joined — irssi and WeeChat ask `MODE` and `NAMES`
+    /// for each — so asked of the upstream, an attach of a client in a
+    /// hundred channels held the queue every attached client shares for
+    /// minutes at the upstream's flood allowance, and past the queue's bound
+    /// the questions were dropped. soju and ZNC answer them the same way.
+    fn answered_by_session(&self, line: &str) -> Option<Vec<String>> {
         let message = e6irc_proto::message::Message::parse(line).ok()?;
-        if !message.command.eq_ignore_ascii_case("NAMES") {
-            return None;
-        }
         let [channel] = message.params.as_slice() else {
             return None;
         };
         let session = self.irc_session.lock().expect("IRC session state poisoned");
         let nick = MiddleParam::echo(session.nick.as_deref()?).to_string();
         let shown = session.channels.get(&session.names.fold(channel))?;
-        session
-            .view(channel)?
-            .names_reply("*bnc*", &nick, shown.as_str(), &session.features)
+        let view = session.view(channel)?;
+        match message.command.to_ascii_uppercase().as_str() {
+            "NAMES" => view.names_reply("*bnc*", &nick, shown.as_str(), &session.features),
+            "MODE" => view.modes_reply("*bnc*", &nick, shown.as_str()),
+            "TOPIC" => view.topic_reply("*bnc*", &nick, shown.as_str()),
+            _ => None,
+        }
     }
 
     /// The bouncer's own answer to attachment `origin`'s command.
@@ -6336,6 +6345,12 @@ impl DriverEnds {
             }
             cmd = self.commands.recv() => cmd,
         }
+    }
+
+    /// Whether an attached client's command waits in the queue: what the
+    /// driver asks on its own behalf waits for none.
+    pub(crate) fn has_queued_commands(&self) -> bool {
+        !self.commands.is_empty()
     }
 
     /// Tell each sender of a line still queued that it was not sent: the
@@ -8750,7 +8765,7 @@ mod tests {
             .collect();
         assert_eq!(kept, [":me!u@h JOIN #room", ":op!o@h PRIVMSG #room :hello"]);
         let answer = ends
-            .names_from_session("NAMES #room")
+            .answered_by_session("NAMES #room")
             .expect("the session follows the member list");
         assert!(answer[0].ends_with("353 me = #room :me @op"), "{answer:?}");
     }
@@ -11794,6 +11809,78 @@ mod tests {
                 Some(asked.to_string())
             );
         }
+    }
+
+    /// A channel's settings, once a `324` said them, are followed through
+    /// every `MODE` and answer a client's `MODE #chan` with its creation
+    /// time; its topic answers `TOPIC #chan`, and a channel that said no
+    /// topic before its member list has none. A list mode, a member's status
+    /// and a query the session cannot answer are the upstream's.
+    #[tokio::test]
+    async fn a_mode_or_topic_the_session_can_answer_does_not_reach_the_upstream() {
+        let (handle, ends) = a_session_in_room(16, &[]);
+        let mut replies = handle.route_replies(7);
+        let command = |line: &str| ClientCommand {
+            origin: 7,
+            line: line.to_string(),
+        };
+        assert_eq!(
+            carriable(&command("MODE #room"), ClientTags::Relayed, &ends),
+            Some("MODE #room".to_string()),
+            "not known before the upstream said them"
+        );
+        for line in [
+            ":up 324 alice #room +nst",
+            ":up 329 alice #room 1700000000",
+            ":op!o@h MODE #room +kl-t+bo hunter2 10 *!*@spam peer",
+        ] {
+            ends.emit_session_line(line.to_string()).expect("tracked");
+        }
+        assert_eq!(
+            carriable(&command("MODE #Room"), ClientTags::Relayed, &ends),
+            None
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 324 alice #room +klns hunter2 10"
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 329 alice #room 1700000000"
+        );
+        assert_eq!(
+            carriable(&command("TOPIC #room"), ClientTags::Relayed, &ends),
+            None
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 332 alice #room :the topic"
+        );
+        for asked in [
+            "MODE #room b",
+            "MODE #room +i",
+            "MODE alice",
+            "TOPIC #room :new",
+            "MODE #other",
+        ] {
+            assert_eq!(
+                carriable(&command(asked), ClientTags::Relayed, &ends),
+                Some(asked.to_string()),
+                "{asked}"
+            );
+        }
+        ends.emit_session_line(":alice!u@h JOIN #quiet".to_string())
+            .expect("tracked");
+        ends.emit_session_line(":up 366 alice #quiet :End of /NAMES list".to_string())
+            .expect("tracked");
+        assert_eq!(
+            carriable(&command("TOPIC #quiet"), ClientTags::Relayed, &ends),
+            None
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 331 alice #quiet :No topic is set"
+        );
     }
 
     /// The bouncer's own numerics to an attached client are addressed to the
