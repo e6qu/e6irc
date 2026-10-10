@@ -2233,21 +2233,7 @@ impl Connection {
              which services that recognise its fingerprint (CertFP) log in"
                 .to_owned(),
         );
-        match negotiation {
-            CapabilityNegotiation::Open => {
-                self.request_metadata_capabilities().await?;
-                self.send_registration_identity(identity).await?;
-                self.send_line("CAP END").await?;
-            }
-            CapabilityNegotiation::Unsupported => {
-                self.send_registration_identity(identity).await?;
-            }
-            CapabilityNegotiation::Unanswered => {
-                self.send_registration_identity(identity).await?;
-                self.send_line("CAP END").await?;
-            }
-        }
-        self.await_welcome(identity.nick).await
+        self.register_without_sasl(negotiation, identity).await
     }
 
     /// Register with a nick and realname, answering PINGs, until the
@@ -2293,7 +2279,18 @@ impl Connection {
 
     async fn register_steps(&mut self, identity: &Identity<'_>) -> io::Result<String> {
         self.send_server_password(identity).await?;
-        match self.begin_cap().await? {
+        let negotiation = self.begin_cap().await?;
+        self.register_without_sasl(negotiation, identity).await
+    }
+
+    /// Finish a registration that authenticates with no SASL exchange (none,
+    /// or a client certificate alone), however capability negotiation went.
+    async fn register_without_sasl(
+        &mut self,
+        negotiation: CapabilityNegotiation,
+        identity: &Identity<'_>,
+    ) -> io::Result<String> {
+        match negotiation {
             CapabilityNegotiation::Open => {
                 self.request_metadata_capabilities().await?;
                 self.send_registration_identity(identity).await?;
@@ -6161,32 +6158,48 @@ mod tests {
         (outcome, mechanism, notes)
     }
 
+    /// A successful SASL verdict, then the welcome.
+    const VERDICT_THEN_WELCOME: [Step; 3] = [
+        Send(":srv 903 nick :SASL authentication successful"),
+        Expect("CAP END"),
+        Send(":srv 001 nick :Welcome"),
+    ];
+
+    /// The server's side of SASL EXTERNAL up to its verdict: the capability,
+    /// the mechanism, the registration identity and the empty response.
+    fn external_until_verdict(advertised: &'static str, metadata: bool) -> Vec<Step> {
+        let mut steps = vec![
+            Expect("CAP LS 302"),
+            Send(advertised),
+            Expect("CAP REQ :sasl"),
+            Send(":srv CAP * ACK :sasl"),
+        ];
+        if metadata {
+            steps.extend([
+                Expect("CAP REQ :server-time"),
+                Send(":srv CAP * ACK :server-time"),
+            ]);
+        }
+        steps.extend([
+            Expect("AUTHENTICATE EXTERNAL"),
+            Send("AUTHENTICATE +"),
+            Expect("NICK nick"),
+            Expect("USER ident 0 * :real"),
+            Expect("AUTHENTICATE +"),
+        ]);
+        steps
+    }
+
     /// A network that offers SASL EXTERNAL logs the certificate in: the
     /// mechanism is offered, its empty response sent, and the verdict waited
     /// for before `CAP END`.
     #[tokio::test]
     async fn sasl_external_logs_in_with_the_certificate() {
-        let (outcome, mechanism, notes) = register_with_certificate(
-            after_discovery(
-                ":srv CAP * LS :sasl=EXTERNAL,PLAIN server-time",
-                vec![
-                    Expect("CAP REQ :sasl"),
-                    Send(":srv CAP * ACK :sasl"),
-                    Expect("CAP REQ :server-time"),
-                    Send(":srv CAP * ACK :server-time"),
-                    Expect("AUTHENTICATE EXTERNAL"),
-                    Send("AUTHENTICATE +"),
-                    Expect("NICK nick"),
-                    Expect("USER ident 0 * :real"),
-                    Expect("AUTHENTICATE +"),
-                    Send(":srv 903 nick :SASL authentication successful"),
-                    Expect("CAP END"),
-                    Send(":srv 001 nick :Welcome"),
-                ],
-            ),
-            Some(("acct", "pw")),
-        )
-        .await;
+        let mut steps =
+            external_until_verdict(":srv CAP * LS :sasl=EXTERNAL,PLAIN server-time", true);
+        steps.extend(VERDICT_THEN_WELCOME);
+        let (outcome, mechanism, notes) =
+            register_with_certificate(steps, Some(("acct", "pw"))).await;
         assert_eq!(outcome.expect("registered"), "nick");
         assert_eq!(mechanism.as_deref(), Some("EXTERNAL"));
         assert!(notes.is_empty(), "{notes:?}");
@@ -6222,30 +6235,17 @@ mod tests {
     /// owner adds the fingerprint.
     #[tokio::test]
     async fn a_refused_certificate_falls_back_to_the_stored_password() {
-        let (outcome, mechanism, notes) = register_with_certificate(
-            after_discovery(
-                ":srv CAP * LS :sasl=EXTERNAL,PLAIN",
-                vec![
-                    Expect("CAP REQ :sasl"),
-                    Send(":srv CAP * ACK :sasl"),
-                    Expect("AUTHENTICATE EXTERNAL"),
-                    Send("AUTHENTICATE +"),
-                    Expect("NICK nick"),
-                    Expect("USER ident 0 * :real"),
-                    Expect("AUTHENTICATE +"),
-                    Send(":srv 904 nick :SASL authentication failed"),
-                    Expect("AUTHENTICATE PLAIN"),
-                    Send("AUTHENTICATE +"),
-                    // base64("\0acct\0pw")
-                    Expect("AUTHENTICATE AGFjY3QAcHc="),
-                    Send(":srv 903 nick :SASL authentication successful"),
-                    Expect("CAP END"),
-                    Send(":srv 001 nick :Welcome"),
-                ],
-            ),
-            Some(("acct", "pw")),
-        )
-        .await;
+        let mut steps = external_until_verdict(":srv CAP * LS :sasl=EXTERNAL,PLAIN", false);
+        steps.extend([
+            Send(":srv 904 nick :SASL authentication failed"),
+            Expect("AUTHENTICATE PLAIN"),
+            Send("AUTHENTICATE +"),
+            // base64("\0acct\0pw")
+            Expect("AUTHENTICATE AGFjY3QAcHc="),
+        ]);
+        steps.extend(VERDICT_THEN_WELCOME);
+        let (outcome, mechanism, notes) =
+            register_with_certificate(steps, Some(("acct", "pw"))).await;
         assert_eq!(outcome.expect("registered"), "nick");
         assert_eq!(mechanism.as_deref(), Some("PLAIN"));
         assert_eq!(
@@ -6261,23 +6261,9 @@ mod tests {
     /// the credential, which says what to do about it.
     #[tokio::test]
     async fn a_refused_certificate_alone_is_a_credential_rejection_that_says_what_to_do() {
-        let (outcome, _, _) = register_with_certificate(
-            after_discovery(
-                ":srv CAP * LS :sasl=EXTERNAL,PLAIN",
-                vec![
-                    Expect("CAP REQ :sasl"),
-                    Send(":srv CAP * ACK :sasl"),
-                    Expect("AUTHENTICATE EXTERNAL"),
-                    Send("AUTHENTICATE +"),
-                    Expect("NICK nick"),
-                    Expect("USER ident 0 * :real"),
-                    Expect("AUTHENTICATE +"),
-                    Send(":srv 904 nick :SASL authentication failed"),
-                ],
-            ),
-            None,
-        )
-        .await;
+        let mut steps = external_until_verdict(":srv CAP * LS :sasl=EXTERNAL,PLAIN", false);
+        steps.push(Send(":srv 904 nick :SASL authentication failed"));
+        let (outcome, _, _) = register_with_certificate(steps, None).await;
         let error = outcome.expect_err("refused");
         let rejection = SaslRejection::from_error(&error).expect("a typed SASL rejection");
         assert_eq!(rejection.failure(), SaslFailure::Failed);

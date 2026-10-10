@@ -2258,22 +2258,11 @@ mod secret_destination_tests {
     use crate::config::NetworkKind;
 
     fn destination(kind: NetworkKind, addr: &str, tls: bool) -> SecretDestination {
-        SecretDestination::of(&crate::db::BncNetworkRow {
-            kind,
-            name: "work".into(),
-            addr: addr.into(),
-            tls,
-            nick: String::new(),
-            username: None,
-            realname: None,
-            autojoin: Vec::new(),
-            sasl_account: None,
-            sasl_password_sealed: None,
-            server_password_sealed: None,
-            client_certificate: None,
-            remembered_channels: Vec::new(),
-            enabled: true,
-        })
+        let mut row = super::audit_detail_tests::row();
+        row.kind = kind;
+        row.addr = addr.into();
+        row.tls = tls;
+        SecretDestination::of(&row)
     }
 
     #[test]
@@ -2326,7 +2315,7 @@ mod secret_destination_tests {
 mod audit_detail_tests {
     use super::{changed_network_fields, network_audit_detail, present_network_fields};
 
-    fn row() -> crate::db::BncNetworkRow {
+    pub(super) fn row() -> crate::db::BncNetworkRow {
         crate::db::BncNetworkRow {
             kind: crate::config::NetworkKind::Irc,
             name: "work".into(),
@@ -3108,18 +3097,7 @@ pub(super) async fn set_network_client_certificate(
     PathParams(name): PathParams<String>,
     JsonBody(request): JsonBody<SetClientCertificate>,
 ) -> Response {
-    let registry = registry_of(&state).clone();
-    let state = state.clone();
-    let result = registry
-        .mutate(move |lane| async move {
-            set_client_certificate_in_lane(&state, &lane, &account, &name, Some(request)).await
-        })
-        .await;
-    match result {
-        Ok(Some(response)) => json_no_store(response),
-        Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error.into_response(),
-    }
+    client_certificate_response(state, account, name, Some(request)).await
 }
 
 /// Remove the network's client certificate and reconnect without it.
@@ -3128,15 +3106,26 @@ pub(super) async fn delete_network_client_certificate(
     Authenticated(account, _): Authenticated,
     PathParams(name): PathParams<String>,
 ) -> Response {
+    client_certificate_response(state, account, name, None).await
+}
+
+/// Set (`Some`) or remove the certificate on the mutation lane: the stored
+/// certificate's fingerprints, or no content for a removal.
+async fn client_certificate_response(
+    state: Arc<AppState>,
+    account: String,
+    name: String,
+    request: Option<SetClientCertificate>,
+) -> Response {
     let registry = registry_of(&state).clone();
-    let state = state.clone();
     let result = registry
         .mutate(move |lane| async move {
-            set_client_certificate_in_lane(&state, &lane, &account, &name, None).await
+            set_client_certificate_in_lane(&state, &lane, &account, &name, request).await
         })
         .await;
     match result {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(response)) => json_no_store(response),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
 }

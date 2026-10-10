@@ -8721,26 +8721,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stored_bridge_factory_rejects_noncanonical_realname_before_secrets() {
+    /// Why a stored row of `kind` with this real name and sealed password
+    /// builds no driver, with no master key at hand.
+    fn stored_row_refusal(
+        kind: crate::config::NetworkKind,
+        realname: Option<&str>,
+        password_sealed: Option<&str>,
+    ) -> String {
+        let irc = kind == crate::config::NetworkKind::Irc;
         let row = crate::db::BncNetworkRow {
-            kind: crate::config::NetworkKind::Discord,
-            name: "discord".into(),
-            addr: String::new(),
+            kind,
+            name: kind.as_db_str().into(),
+            addr: if irc { "irc.libera.chat:6697" } else { "" }.into(),
             tls: true,
-            nick: String::new(),
-            username: None,
-            realname: Some("silently ignored before this invariant".into()),
+            nick: if irc { "alice" } else { "" }.into(),
+            username: irc.then(|| "alice".into()),
+            realname: realname.map(str::to_owned),
             autojoin: vec![],
             sasl_account: None,
-            sasl_password_sealed: Some("sealed-but-no-key".into()),
+            sasl_password_sealed: password_sealed.map(str::to_owned),
             enabled: false,
             server_password_sealed: None,
-
             client_certificate: None,
             remembered_channels: Vec::new(),
         };
-        let error = driver_from_row(
+        driver_from_row(
             &row,
             None,
             "owner",
@@ -8748,38 +8753,22 @@ mod tests {
             FirstDial::Immediate,
         )
         .err()
-        .expect("noncanonical stored bridge should be rejected");
+        .expect("the stored row is refused")
+    }
+
+    #[test]
+    fn stored_bridge_factory_rejects_noncanonical_realname_before_secrets() {
+        let error = stored_row_refusal(
+            crate::config::NetworkKind::Discord,
+            Some("silently ignored before this invariant"),
+            Some("sealed-but-no-key"),
+        );
         assert!(error.contains("real name field"), "{error}");
     }
 
     #[test]
     fn stored_irc_factory_requires_realname() {
-        let row = crate::db::BncNetworkRow {
-            kind: crate::config::NetworkKind::Irc,
-            name: "libera".into(),
-            addr: "irc.libera.chat:6697".into(),
-            tls: true,
-            nick: "alice".into(),
-            username: Some("alice".into()),
-            realname: None,
-            autojoin: vec![],
-            sasl_account: None,
-            sasl_password_sealed: None,
-            enabled: false,
-            server_password_sealed: None,
-
-            client_certificate: None,
-            remembered_channels: Vec::new(),
-        };
-        let error = driver_from_row(
-            &row,
-            None,
-            "owner",
-            crate::egress::InternalUpstreams::Refuse,
-            FirstDial::Immediate,
-        )
-        .err()
-        .expect("stored IRC network without realname should fail");
+        let error = stored_row_refusal(crate::config::NetworkKind::Irc, None, None);
         assert!(error.contains("no realname"), "{error}");
     }
 
@@ -9985,12 +9974,7 @@ mod tests {
     /// Run the script to its end under [`run_with_backoff`]; when each session
     /// began, and the handle whose runtime the run left behind.
     async fn run_script(steps: Vec<ScriptedStep>) -> (Vec<tokio::time::Instant>, NetworkHandle) {
-        let (handle, mut ends) = NetworkHandle::channels(8);
-        ends.set_rejection_retry_floor(std::time::Duration::from_millis(1));
-        let script = Script {
-            steps: std::sync::Mutex::new(steps.into_iter().collect()),
-            starts: std::sync::Mutex::new(Vec::new()),
-        };
+        let (handle, mut ends, script) = scripted_driver(steps);
         tokio::time::timeout(
             std::time::Duration::from_secs(600),
             run_with_backoff(&script, &mut ends, |script, ends| {
@@ -10039,12 +10023,7 @@ mod tests {
     /// Run the script under [`run_with_backoff`] until the driver parks;
     /// the handle it parked on. A script that runs out first is a failure.
     async fn run_until_parked(steps: Vec<ScriptedStep>) -> NetworkHandle {
-        let (handle, mut ends) = NetworkHandle::channels(8);
-        ends.set_rejection_retry_floor(std::time::Duration::from_millis(1));
-        let script = Script {
-            steps: std::sync::Mutex::new(steps.into_iter().collect()),
-            starts: std::sync::Mutex::new(Vec::new()),
-        };
+        let (handle, mut ends, script) = scripted_driver(steps);
         let parked = async {
             while handle.runtime_snapshot().lifecycle != NetworkLifecycle::RegistrationFailed {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -10057,6 +10036,18 @@ mod tests {
             () = parked => {}
         }
         handle
+    }
+
+    /// A network's two ends and the script its sessions play, on a 1 ms
+    /// refusal floor.
+    fn scripted_driver(steps: Vec<ScriptedStep>) -> (NetworkHandle, DriverEnds, Script) {
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        ends.set_rejection_retry_floor(std::time::Duration::from_millis(1));
+        let script = Script {
+            steps: std::sync::Mutex::new(steps.into_iter().collect()),
+            starts: std::sync::Mutex::new(Vec::new()),
+        };
+        (handle, ends, script)
     }
 
     /// Solanum's answer while services are down, from a real exchange: no
