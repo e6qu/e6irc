@@ -6312,8 +6312,11 @@ phase rewrites.
     directory order with new directory keys; re-authorizes every login
     against the account's standing and the credential's liveness, and every
     address against the server bans; ends each session whose client left in
-    the gap as that client would have; and sends `Resume` to every edge then
-    linked, an edge linking later resuming itself. The edge takes a stream's
+    the gap as that client would have; and, once every shard has handled
+    what the rebuild pushed it and nothing passes between shards
+    (`caught_up`) — so a client's first line meets every session rebuilt on
+    any shard — sends `Resume` to every edge then linked, an edge linking
+    later resuming itself. The edge takes a stream's
     gate from a `Resume` until it has replayed each session's retained
     lines, numbered afresh, and lets input flow, so a `Pause` after it is
     answered after the replay. An edge gives its replicas up as it uploads
@@ -6402,7 +6405,7 @@ phase rewrites.
     stop with `--final`; refuse a handover without edges; and hand over on
     SIGTERM. `edge_tier.rs` restarts a core after every step of a scripted
     two-client conversation twice in a row, onto a core of another shard
-    count and back, and compares the transcripts line for line with an
+    count and then a third, and compares the transcripts line for line with an
     unrestarted run; with PostgreSQL
     (in `db-tests`, and on macOS and Windows in `zero-drop-database` with
     PostgreSQL 18 installed natively, D15) it keeps a live chat socket, a
@@ -6935,7 +6938,7 @@ Each rewrite lands in the phase that makes it true (`PLAN.md`, "Edge tier"):
   changes, away, private messages, the monitor list, replies — runs through
   a real edge process's link, and after each of its steps in turn the core
   is gracefully restarted twice in a row, onto a core of another shard
-  count and back. Every run's transcripts equal the unrestarted run's line
+  count and then onto a third. Every run's transcripts equal the unrestarted run's line
   for line (tags and the welcome's server facts aside). The link, the
   pumps, the pause, settle and cut, and the upload are the ones a deployment
   runs, which an in-process scheduler handing records from core to core

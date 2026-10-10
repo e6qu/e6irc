@@ -450,6 +450,25 @@ impl CoreIngress {
         Ok(gathered)
     }
 
+    /// Resolves once every shard has handled everything pushed to it before
+    /// the call — each answers a question queued behind it — and nothing is
+    /// passing between shards: what those inputs published, every shard
+    /// sees. A rebuild waits on this before any edge's input flows, so a
+    /// client's first line after it finds every rebuilt session in the
+    /// directories (a `MONITOR` asked on one shard of a nick rebuilt on
+    /// another used to find it offline).
+    pub(crate) async fn caught_up(&self) -> Result<(), String> {
+        self.unsettled().await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !self.cross_shard_idle() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("events between shards did not settle in time".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        Ok(())
+    }
+
     /// What keeps each shard from being cut exactly now.
     pub(crate) async fn unsettled(&self) -> Result<Vec<state::Unsettled>, String> {
         self.ask_each(std::time::Duration::from_secs(5), |reply| Input::Settled {
@@ -4188,6 +4207,53 @@ mod ingress_tests {
         second_tx: Sender<Input>,
         second_rx: Receiver<Input>,
         ingress: CoreIngress,
+    }
+
+    /// A rebuild resumes its edges only once every shard has handled what it
+    /// was pushed: `caught_up` answers after each shard answers a question
+    /// queued behind those inputs, never before. (A `MONITOR` from a client
+    /// on one shard was answered before another shard had rebuilt the nick
+    /// it asked about, and found it offline.)
+    #[tokio::test]
+    async fn caught_up_waits_for_every_shard_to_handle_what_was_pushed_before() {
+        let TwoWorkerHarness {
+            mut first_rx,
+            second_tx,
+            mut second_rx,
+            ingress,
+            ..
+        } = two_worker_harness();
+        assert!(
+            second_tx
+                .push(Input::Closed {
+                    conn: ConnId(7),
+                    reason: "pushed by the rebuild".into(),
+                })
+                .await
+                .is_ok()
+        );
+        let caught_up = tokio::spawn(async move { ingress.caught_up().await });
+        let Input::Settled { reply: first } = first_rx.pop().await.expect("asked").payload else {
+            panic!("the first shard is asked");
+        };
+        assert!(matches!(
+            second_rx.pop().await.expect("pushed").payload,
+            Input::Closed { .. }
+        ));
+        let Input::Settled { reply: second } = second_rx.pop().await.expect("asked").payload else {
+            panic!("the second shard is asked behind what it was pushed");
+        };
+        first.send(Default::default()).expect("asker waits");
+        tokio::task::yield_now().await;
+        assert!(
+            !caught_up.is_finished(),
+            "caught up before the second shard answered"
+        );
+        second.send(Default::default()).expect("asker waits");
+        caught_up
+            .await
+            .expect("task")
+            .expect("every shard answered");
     }
 
     fn two_worker_harness() -> TwoWorkerHarness {

@@ -836,7 +836,7 @@ fn comparable(line: &str) -> Option<String> {
 
 /// Run [`SCRIPT`] through an edge, gracefully restarting the core twice in a
 /// row after step `restart_after` (none, when `None`) — onto a core with
-/// another shard count, then back: each client's transcript.
+/// another shard count, then onto a third: each client's transcript.
 async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let credentials = Credentials::new(&format!("steps-{restart_after:?}"), &["edge-a"]);
@@ -917,7 +917,7 @@ async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
         if restart_after == Some(step) {
             // Twice in a row, nothing said between: what the first next core
             // rebuilt, it hands on whole.
-            for core_workers in [2, 1] {
+            for core_workers in [2, 3] {
                 let stopping = core.take().expect("the core before");
                 stopping.shutdown.run(net::StopMode::Handover).await;
                 let mut next = core_config(&credentials, &link.to_string());
@@ -936,7 +936,7 @@ async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
 /// Restart at every step (DESIGN §19.11): a scripted two-client conversation
 /// gives the same transcripts, line for line, whether the core runs it alone
 /// or is gracefully restarted twice in a row after any one of its steps —
-/// onto a core with another shard count, then back — registration, channel
+/// onto a core with another shard count, then a third — registration, channel
 /// state, ranks, nick changes, away, private messages, the monitor list and
 /// replies alike.
 #[tokio::test(flavor = "multi_thread")]

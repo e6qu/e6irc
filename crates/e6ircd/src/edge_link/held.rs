@@ -591,6 +591,13 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let rebuilt = rebuild(&server, &uploaded).await;
+        // Every shard has handled what the rebuild pushed it before any input
+        // flows: a session's first line meets the others rebuilt.
+        if let Err(error) = server.core_tx.caught_up().await {
+            eprintln!(
+                "e6ircd: the shards did not finish the rebuild in time ({error}); edges resume"
+            );
+        }
         if let Some(cut) = cut {
             server.roster.clear_cut(cut).await;
         }

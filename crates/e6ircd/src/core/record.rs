@@ -570,54 +570,18 @@ fn read_credential(r: &mut BodyReader) -> Result<crate::identity::CredentialId, 
 }
 
 impl SessionRecord {
-    /// The record's body, in `format`, at the writer's `clock`.
+    /// The record's body, in `format`, at the writer's `clock`: every field,
+    /// in the order [`Self::decode`] reads them — whose struct expression
+    /// names each, and whose round trip the tests hold this to.
     pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
-        let Self {
-            directory_key,
-            host,
-            transport,
-            tls,
-            registration,
-            cap_negotiating,
-            cap_302,
-            caps,
-            login,
-            sasl,
-            sasl_verify,
-            credential_attempts,
-            pending_identify,
-            pending_register,
-            nick_held,
-            nick_deadlines,
-            drop_confirmation,
-            away,
-            oper,
-            invisible,
-            wallops,
-            bot,
-            registered_only,
-            last_knock,
-            nick_changes,
-            monitoring,
-            channel_list,
-            channel_names,
-            paced_who,
-            anon_read_markers,
-            idle_since,
-            signon,
-            opened_at,
-            awaiting_pong,
-            last_ping_sent,
-            conversations,
-        } = self;
         body(format, clock, |w| {
-            w.u64(*directory_key);
-            w.text("host", host)?;
-            write_transport(w, *transport);
+            w.u64(self.directory_key);
+            w.text("host", &self.host)?;
+            write_transport(w, self.transport);
             if format >= RecordFormat::V2 {
-                w.w.option(tls.as_ref(), |w, tls| tls.write(w))?;
+                w.w.option(self.tls.as_ref(), |w, tls| tls.write(w))?;
             }
-            match registration {
+            match &self.registration {
                 RecordedRegistration::Registering {
                     nick,
                     user,
@@ -641,10 +605,10 @@ impl SessionRecord {
                     w.text("realname", realname)?;
                 }
             }
-            w.bool(*cap_negotiating);
-            w.bool(*cap_302);
-            w.w.u32(*caps);
-            match login {
+            w.bool(self.cap_negotiating);
+            w.bool(self.cap_302);
+            w.w.u32(self.caps);
+            match &self.login {
                 None => w.w.u8(0),
                 Some(login) => {
                     w.w.u8(1);
@@ -653,23 +617,23 @@ impl SessionRecord {
                     w.opt_mono(login.expires_at);
                 }
             }
-            w.w.u8(match sasl {
+            w.w.u8(match &self.sasl {
                 RecordedSasl::Idle => 0,
                 RecordedSasl::PlainPending => 1,
                 RecordedSasl::BearerPending => 2,
                 RecordedSasl::Verifying => 3,
             });
-            write_label(w, sasl_verify.as_ref())?;
-            w.w.u8(*credential_attempts);
-            write_label(w, pending_identify.as_ref())?;
-            write_label(w, pending_register.as_ref())?;
-            w.opt_text("held nick", nick_held.as_deref())?;
-            w.count("nick deadlines", nick_deadlines.len())?;
-            for (nick, deadline) in nick_deadlines {
+            write_label(w, self.sasl_verify.as_ref())?;
+            w.w.u8(self.credential_attempts);
+            write_label(w, self.pending_identify.as_ref())?;
+            write_label(w, self.pending_register.as_ref())?;
+            w.opt_text("held nick", self.nick_held.as_deref())?;
+            w.count("nick deadlines", self.nick_deadlines.len())?;
+            for (nick, deadline) in &self.nick_deadlines {
                 w.text("clocked nick", nick)?;
                 w.mono(*deadline);
             }
-            match drop_confirmation {
+            match &self.drop_confirmation {
                 None => w.w.u8(0),
                 Some((account, key)) => {
                     w.w.u8(1);
@@ -677,21 +641,21 @@ impl SessionRecord {
                     w.text("drop key", key)?;
                 }
             }
-            w.opt_text("away", away.as_deref())?;
-            w.opt_text("oper", oper.as_deref())?;
-            w.bool(*invisible);
-            w.bool(*wallops);
-            w.bool(*bot);
-            w.bool(*registered_only);
-            w.opt_mono(*last_knock);
-            w.w.u32(nick_changes.0);
-            w.opt_mono(nick_changes.1);
-            w.count("monitoring", monitoring.len())?;
-            for (key, display) in monitoring {
+            w.opt_text("away", self.away.as_deref())?;
+            w.opt_text("oper", self.oper.as_deref())?;
+            w.bool(self.invisible);
+            w.bool(self.wallops);
+            w.bool(self.bot);
+            w.bool(self.registered_only);
+            w.opt_mono(self.last_knock);
+            w.w.u32(self.nick_changes.0);
+            w.opt_mono(self.nick_changes.1);
+            w.count("monitoring", self.monitoring.len())?;
+            for (key, display) in &self.monitoring {
                 w.text("monitored key", key)?;
                 w.text("monitored nick", display)?;
             }
-            for sweep in [channel_list, channel_names] {
+            for sweep in [&self.channel_list, &self.channel_names] {
                 match sweep {
                     None => w.w.u8(0),
                     Some(sweep) => {
@@ -700,8 +664,8 @@ impl SessionRecord {
                     }
                 }
             }
-            w.count("paced WHO replies", paced_who.len())?;
-            for reply in paced_who {
+            w.count("paced WHO replies", self.paced_who.len())?;
+            for reply in &self.paced_who {
                 match &reply.batch {
                     None => w.w.u8(0),
                     Some((label, reference, opened)) => {
@@ -716,18 +680,18 @@ impl SessionRecord {
                     w.w.bytes("paced line", line, MAX_TEXT)?;
                 }
             }
-            w.count("read markers", anon_read_markers.len())?;
-            for (target, at) in anon_read_markers {
+            w.count("read markers", self.anon_read_markers.len())?;
+            for (target, at) in &self.anon_read_markers {
                 w.text("marker target", target)?;
                 w.millis(*at);
             }
-            w.mono(*idle_since);
-            w.millis(*signon);
-            w.mono(*opened_at);
-            w.bool(*awaiting_pong);
-            w.mono(*last_ping_sent);
-            w.count("conversations", conversations.len())?;
-            for ring in conversations {
+            w.mono(self.idle_since);
+            w.millis(self.signon);
+            w.mono(self.opened_at);
+            w.bool(self.awaiting_pong);
+            w.mono(self.last_ping_sent);
+            w.count("conversations", self.conversations.len())?;
+            for ring in &self.conversations {
                 w.text("conversation", &ring.key)?;
                 w.bool(ring.complete);
                 match &ring.shed_through {
@@ -943,24 +907,10 @@ fn read_list(r: &mut BodyReader) -> Result<Vec<RecordedListEntry>, DecodeError> 
 
 impl ChannelState {
     pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
-        let Self {
-            name,
-            created_at,
-            topic,
-            flags,
-            key,
-            limit,
-            bans,
-            quiets,
-            ban_exceptions,
-            invite_exceptions,
-            invited,
-            last_knock,
-        } = self;
         body(format, clock, |w| {
-            w.text("channel name", name)?;
-            w.millis(*created_at);
-            match topic {
+            w.text("channel name", &self.name)?;
+            w.millis(self.created_at);
+            match &self.topic {
                 None => w.w.u8(0),
                 Some((text, set_by, set_at)) => {
                     w.w.u8(1);
@@ -969,20 +919,25 @@ impl ChannelState {
                     w.u64(*set_at);
                 }
             }
-            w.text("flags", flags)?;
-            w.opt_text("key", key.as_deref())?;
-            w.w.option(limit.as_ref(), |w, limit| {
+            w.text("flags", &self.flags)?;
+            w.opt_text("key", self.key.as_deref())?;
+            w.w.option(self.limit.as_ref(), |w, limit| {
                 w.u32(*limit);
                 Ok(())
             })?;
-            for list in [bans, quiets, ban_exceptions, invite_exceptions] {
+            for list in [
+                &self.bans,
+                &self.quiets,
+                &self.ban_exceptions,
+                &self.invite_exceptions,
+            ] {
                 write_list(w, list)?;
             }
-            w.count("invited", invited.len())?;
-            for conn in invited {
+            w.count("invited", self.invited.len())?;
+            for conn in &self.invited {
                 w.u64(*conn);
             }
-            w.opt_mono(*last_knock);
+            w.opt_mono(self.last_knock);
             Ok(())
         })
     }
