@@ -187,7 +187,7 @@ mistake, before a single line changes.
       note in any file — see the No-Deferral Rule above), the glossary guard
       (every abbreviation defined in `docs/terminology.md` or spelled out),
       migration integrity, image pins, the one Rust toolchain, and the rest. The list lives in that
-      script only, and CI's `lint` job runs the same script, so the two cannot
+      script only, and CI's `guards` job runs the same script, so the two cannot
       drift. It measures additions against `origin/main`; pass `--base REV`
       for another base. Each guard's own comment says what it holds; the
       duplication ratchet is fixed by extracting shared logic, never by
