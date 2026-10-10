@@ -990,12 +990,28 @@ async fn network_presets_endpoint_serves_the_curated_catalog() {
             "name": "libera",
             "addr": "irc.libera.chat:6697",
             "tls": true,
+            "authentication": "sasl",
+            "guidance": "Sign in with your NickServ account and password (SASL); a client \
+                         certificate added with /msg NickServ CERT ADD works too.",
         }),
         "{body}"
     );
     assert!(
         presets.iter().all(|preset| preset["tls"] == true),
         "every curated public network is TLS-only: {body}"
+    );
+    // OFTC has no SASL password login: its entry says to use a certificate.
+    let oftc = presets
+        .iter()
+        .find(|preset| preset["id"] == "oftc")
+        .expect("OFTC");
+    assert_eq!(oftc["authentication"], "client_certificate", "{body}");
+    assert!(
+        oftc["guidance"]
+            .as_str()
+            .expect("guidance")
+            .contains("CERT ADD"),
+        "{body}"
     );
 }
 
@@ -2814,6 +2830,8 @@ async fn openapi_spec_is_served() {
             "has_sasl_account",
             "has_sasl_password",
             "has_server_password",
+            "client_certificate",
+            "remembered_channels",
             "enabled",
             "connected",
             "runtime",

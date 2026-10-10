@@ -639,8 +639,9 @@ pub(super) struct AdminNetworkResponse {
 enum AdminNetworkKind {
     Owned {
         owner: String,
+        /// Both variants box their large part, so neither sizes the other.
         #[serde(flatten)]
-        network: NetworkResponse,
+        network: Box<NetworkResponse>,
     },
     Shared {
         owner: &'static str,
@@ -648,7 +649,7 @@ enum AdminNetworkKind {
         kind: &'static str,
         enabled: bool,
         connected: bool,
-        runtime: NetworkRuntimeResponse,
+        runtime: Box<NetworkRuntimeResponse>,
         shared: bool,
     },
 }
@@ -658,7 +659,10 @@ pub(super) fn owned_admin_network_response(
     network: NetworkResponse,
 ) -> AdminNetworkResponse {
     AdminNetworkResponse {
-        kind: AdminNetworkKind::Owned { owner, network },
+        kind: AdminNetworkKind::Owned {
+            owner,
+            network: Box::new(network),
+        },
     }
 }
 
@@ -672,7 +676,7 @@ pub(super) fn shared_admin_network_response(
             kind: status.kind,
             enabled: true,
             connected: status.connected,
-            runtime: runtime_response(&status.runtime),
+            runtime: Box::new(runtime_response(&status.runtime)),
             shared: true,
         },
     }
