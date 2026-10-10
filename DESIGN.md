@@ -4943,7 +4943,7 @@ moderated channel is said in the buffer it was sent from instead of standing
 there as a delivered-looking local echo. The slash-command grammar is
 closed (`/join` takes exactly one name that is a channel on this network, so
 neither `#a,#b` nor a bare `chat` opens a buffer whose lines would go
-elsewhere): malformed
+elsewhere, and a `+k` channel's key as one word after it): malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
@@ -4997,7 +4997,14 @@ offers `echo-message` the client asks for it, and its own messages are shown
 as the server echoes them, with their message ID and time: a local copy has
 neither, so history loaded after a reconnect showed each sent line a second
 time and the read marker could not pass it. On a server without it a message
-is locally echoed only after bounded-queue admission. What this person said
+is locally echoed only after bounded-queue admission, and each conversation
+keeps the texts of its local copies no server copy has matched yet (at most
+256): a line of this client's in a history batch with such a text is that
+copy, not shown again, though its time still moves the read position. A
+channel key — one the TUI's `/join #c key` or a raw `JOIN` sent — is kept in
+the process's memory only, never written anywhere, and a reconnect rejoins
+the channel with it; leaving the channel, or joining it again without a key,
+forgets it (at most 256 are kept). What this person said
 from another client attached to the same network is not counted unread. A
 full queue, disconnected socket,
 or over-limit complete IRC line leaves the input available and reports the
