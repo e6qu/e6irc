@@ -4481,25 +4481,38 @@ mod composer_tests {
     #[test]
     fn slash_commands_map_to_irc() {
         use super::slash_to_irc;
-        assert_eq!(slash_to_irc("hello", "#c").unwrap(), "PRIVMSG #c :hello");
+        let names = e6irc_client::NetworkNames::default();
         assert_eq!(
-            slash_to_irc("/me waves", "#c").unwrap(),
+            slash_to_irc("hello", "#c", &names).unwrap(),
+            "PRIVMSG #c :hello"
+        );
+        assert_eq!(
+            slash_to_irc("/me waves", "#c", &names).unwrap(),
             "PRIVMSG #c :\u{1}ACTION waves\u{1}"
         );
-        assert_eq!(slash_to_irc("/join #other", "#c").unwrap(), "JOIN #other");
-        assert_eq!(slash_to_irc("/part", "#c").unwrap(), "PART #c");
-        assert_eq!(slash_to_irc("/nick bob", "#c").unwrap(), "NICK bob");
         assert_eq!(
-            slash_to_irc("/topic new topic", "#c").unwrap(),
+            slash_to_irc("/join #other", "#c", &names).unwrap(),
+            "JOIN #other"
+        );
+        assert_eq!(slash_to_irc("/part", "#c", &names).unwrap(), "PART #c");
+        assert_eq!(slash_to_irc("/nick bob", "#c", &names).unwrap(), "NICK bob");
+        assert_eq!(
+            slash_to_irc("/topic new topic", "#c", &names).unwrap(),
             "TOPIC #c :new topic"
         );
         assert_eq!(
-            slash_to_irc("/msg bob hi bob", "#c").unwrap(),
+            slash_to_irc("/msg bob hi bob", "#c", &names).unwrap(),
             "PRIVMSG bob :hi bob"
         );
-        assert_eq!(slash_to_irc("/raw WHOIS bob", "#c").unwrap(), "WHOIS bob");
+        assert_eq!(
+            slash_to_irc("/raw WHOIS bob", "#c", &names).unwrap(),
+            "WHOIS bob"
+        );
         // unknown slash-command passes through (server answers 421)
-        assert_eq!(slash_to_irc("/frobnicate x", "#c").unwrap(), "FROBNICATE x");
+        assert_eq!(
+            slash_to_irc("/frobnicate x", "#c", &names).unwrap(),
+            "FROBNICATE x"
+        );
         for invalid in [
             ("hello", ""),
             ("/", "#c"),
@@ -4511,8 +4524,50 @@ mod composer_tests {
             ("/topic hello", ""),
             ("/msg bob", "#c"),
         ] {
-            assert!(slash_to_irc(invalid.0, invalid.1).is_err(), "{invalid:?}");
+            assert!(
+                slash_to_irc(invalid.0, invalid.1, &names).is_err(),
+                "{invalid:?}"
+            );
         }
+    }
+
+    /// `/topic` without text reads the topic (the help says so); sending
+    /// `TOPIC #c :` instead cleared it. Free text is always the trailing
+    /// parameter, so a reason or an away message is never cut to one word, and
+    /// a leading channel is recognised by the network's own CHANTYPES.
+    #[test]
+    fn free_text_commands_keep_their_whole_text_and_never_clear_by_asking() {
+        use super::slash_to_irc;
+        let names = e6irc_client::NetworkNames::default();
+        for (message, target, line) in [
+            ("/topic", "#c", "TOPIC #c"),
+            ("/topic   ", "#c", "TOPIC #c"),
+            ("/topic #other", "#c", "TOPIC #other"),
+            ("/topic #other new words", "#c", "TOPIC #other :new words"),
+            ("/topic &local set here", "", "TOPIC &local :set here"),
+            ("/part #c see you all", "#c", "PART #c :see you all"),
+            ("/part see you all", "#c", "PART #c :see you all"),
+            ("/part #a,#b bye", "#c", "PART #a,#b :bye"),
+            ("/part #other", "", "PART #other"),
+            ("/away", "#c", "AWAY"),
+            ("/away gone to lunch", "#c", "AWAY :gone to lunch"),
+        ] {
+            assert_eq!(
+                slash_to_irc(message, target, &names).as_deref(),
+                Ok(line),
+                "{message} in {target:?}"
+            );
+        }
+        for (message, target) in [("/topic", ""), ("/part bye", "")] {
+            assert!(slash_to_irc(message, target, &names).is_err(), "{message}");
+        }
+        // Only the network's own channel types name a channel.
+        let mut hash_only = e6irc_client::NetworkNames::default();
+        hash_only.adopt_tokens(["CHANTYPES=#"]);
+        assert_eq!(
+            slash_to_irc("/part &x marks the spot", "#c", &hash_only).as_deref(),
+            Ok("PART #c :&x marks the spot")
+        );
     }
 }
 
