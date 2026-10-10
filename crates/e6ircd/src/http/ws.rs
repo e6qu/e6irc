@@ -800,6 +800,15 @@ pub(super) async fn ws_ui_conn(
                             send_unavailable(&mut socket).await;
                             break;
                         }
+                        crate::bouncer::SendOutcome::Disconnected => {
+                            let event = composer_result_event(cursor, ComposerResult::Rejected {
+                                request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
+                                message: "the network is not connected (it is connecting or reconnecting); nothing was sent",
+                            });
+                            if socket.send(event).await.is_err() {
+                                break;
+                            }
+                        }
                         crate::bouncer::SendOutcome::Unavailable => {
                             let event = composer_result_event(cursor, ComposerResult::Rejected {
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),

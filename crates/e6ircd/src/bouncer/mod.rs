@@ -1024,7 +1024,7 @@ pub(crate) type DriverSession<C> =
 /// does not carry one (a registered session it closed with a stated reason).
 /// Returns `false` when the network was stopped while waiting.
 async fn wait_for_reconnect<C>(
-    ends: &DriverEnds,
+    ends: &mut DriverEnds,
     carried: Carried<'_, C>,
     event: ConnectionEvent,
     upstream_reason: Option<&str>,
@@ -1032,6 +1032,7 @@ async fn wait_for_reconnect<C>(
     sleep: impl Future<Output = ()>,
 ) -> bool {
     ends.publish(event, Some(delay), upstream_reason);
+    ends.refuse_queued();
     idle_until(ends, carried, sleep).await
 }
 
@@ -1040,8 +1041,9 @@ async fn wait_for_reconnect<C>(
 /// (which drops the handle). Work the driver carries keeps finishing while it
 /// is parked: a message already accepted for delivery is delivered or said to
 /// be undelivered, never held without a word for as long as the park lasts.
-async fn park<C>(ends: &DriverEnds, carried: Carried<'_, C>, event: ConnectionEvent) {
+async fn park<C>(ends: &mut DriverEnds, carried: Carried<'_, C>, event: ConnectionEvent) {
     ends.emit(event);
+    ends.refuse_queued();
     ends.emit_line(
         ":*bnc* NOTICE * :upstream rejected this network's credentials or registration; \
          not reconnecting until this network is reconfigured"
@@ -1249,7 +1251,7 @@ enum RefusalHandled {
 
 /// Count `refusal` against the run of its kind and act on its retry policy.
 async fn retry_refusal<C>(
-    ends: &DriverEnds,
+    ends: &mut DriverEnds,
     carried: Carried<'_, C>,
     backoff: &Backoff,
     refusal: Refusal,
@@ -4577,6 +4579,30 @@ fn own_rename(line: &str, own: &str, names: &e6irc_client::NetworkNames) -> Opti
         .flatten()
 }
 
+/// Why a line sent to a network that has no session was not sent.
+pub(crate) const NOT_CONNECTED: &str =
+    "the network is not connected (it is connecting or reconnecting)";
+
+/// What the sender of `line` is told when it was never sent, and `why`: by
+/// its command and target, as ZNC's "Your message to #chan got lost" names
+/// them.
+pub(crate) fn unsent_notice(line: &str, why: &str) -> String {
+    let what = match e6irc_proto::message::Message::parse(line) {
+        Ok(message) => {
+            let command = message.command.to_ascii_uppercase();
+            match (command.as_str(), message.params.first()) {
+                ("PRIVMSG" | "NOTICE" | "TAGMSG", Some(target)) => {
+                    format!("your message to {target}")
+                }
+                (_, Some(target)) => format!("your {command} {target}"),
+                (_, None) => format!("your {command}"),
+            }
+        }
+        Err(_) => "a line you sent".to_string(),
+    };
+    bnc_notice("*", &format!("{what} was not sent: {why}"))
+}
+
 /// A `*bnc*` NOTICE to `target` (`*`, or a channel), its text fitted to the
 /// line. The bouncer's own notices carry upstream text — a closing reason, a
 /// SASL refusal, a channel name, a bridge's room id — bounded in characters,
@@ -5005,9 +5031,17 @@ const BRIDGE_PACING_POLL: std::time::Duration = std::time::Duration::from_millis
 pub enum SendOutcome {
     /// The line was queued for the upstream.
     Sent,
-    /// The bounded queue is full (upstream reconnecting / congested). The line
-    /// was not queued; the caller must tell the client loudly.
+    /// The bounded queue is full: the upstream is connected and the lines
+    /// before this one wait on its flood allowance. The line was not queued;
+    /// the caller must tell the client loudly.
     Full,
+    /// The network has no session to send it on: it is connecting, or
+    /// reconnecting after a drop or a refusal. The line was not queued, as ZNC
+    /// ("Your message got lost, you are not connected to IRC") and soju
+    /// ("Disconnected from upstream network") refuse it: queued, it waited for
+    /// the next session — minutes later, or hours, while a ban or a throttle
+    /// was retried — and was then sent out of every context it was written in.
+    Disconnected,
     /// The driver is gone; the caller should detach.
     Closed,
     /// Registration or authentication is terminally parked. No driver loop
@@ -5026,24 +5060,13 @@ impl NetworkHandle {
     ///
     /// The command queue is bounded and *shared by every client attached to the
     /// network*. A blocking send would make one client's backlog (e.g. a burst
-    /// during an upstream reconnect) stall every *other* attached client's
+    /// paste on a slow flood allowance) stall every *other* attached client's
     /// delivery loop — a cross-tenant head-of-line stall on operator-shared
     /// networks. So this never waits: a full queue returns [`SendOutcome::Full`]
     /// and the caller surfaces it to the client loudly (the same discipline the
     /// core's SendQ uses — bound, then act, never silently block or drop).
     pub fn send(&self, line: &str) -> SendOutcome {
         self.send_from(0, line)
-    }
-
-    /// How long after a [`SendOutcome::Full`] the same send can be expected to
-    /// find room: a connected driver drains the queue or declares the upstream
-    /// dead within [`UPSTREAM_WRITE_DEADLINE`]; a reconnecting one drains
-    /// nothing before its next attempt, so that wait comes first.
-    pub fn full_queue_retry_after(&self) -> std::time::Duration {
-        let until_next_attempt = self.runtime_snapshot().next_retry_at.map_or(0, |at| {
-            at.as_millis().saturating_sub(epoch_millis().as_millis())
-        });
-        std::time::Duration::from_millis(until_next_attempt) + UPSTREAM_WRITE_DEADLINE
     }
 
     /// As [`NetworkHandle::send`], but the command carries the sending
@@ -5054,11 +5077,21 @@ impl NetworkHandle {
         if let Err(error) = parse_client_line(line) {
             return SendOutcome::Rejected(error);
         }
-        if matches!(
-            self.runtime_snapshot().lifecycle,
-            NetworkLifecycle::AuthenticationFailed | NetworkLifecycle::RegistrationFailed
-        ) {
-            return SendOutcome::Unavailable;
+        match self.runtime_snapshot().lifecycle {
+            NetworkLifecycle::AuthenticationFailed | NetworkLifecycle::RegistrationFailed => {
+                return SendOutcome::Unavailable;
+            }
+            NetworkLifecycle::Connecting | NetworkLifecycle::Reconnecting => {
+                return SendOutcome::Disconnected;
+            }
+            // A session registered under an alternative nickname is one: what
+            // is sent waits, bounded by the regain window, for the configured
+            // nickname (§10.3), and is told it was not sent if that never
+            // comes.
+            NetworkLifecycle::Connected
+            | NetworkLifecycle::RegainingNickname
+            | NetworkLifecycle::OwnerSuspended
+            | NetworkLifecycle::OwnerDeleted => {}
         }
         match self.commands.try_send(ClientCommand {
             origin,
@@ -6305,6 +6338,21 @@ impl DriverEnds {
         }
     }
 
+    /// Tell each sender of a line still queued that it was not sent: the
+    /// session it was queued for has ended, and the lifecycle published just
+    /// before this refuses every later send ([`SendOutcome::Disconnected`],
+    /// [`SendOutcome::Unavailable`]), so what is drained here is everything
+    /// that will never be. Each is named by its command and target, never its
+    /// text, which may be a password for services.
+    fn refuse_queued(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            self.answer(
+                command.origin,
+                unsent_notice(&command.line, "the network disconnected before it went out"),
+            );
+        }
+    }
+
     /// Whether the network has been shut down (observed without consuming a
     /// command). Lets `run_with_backoff` abandon its reconnect wait promptly.
     pub fn is_shutdown(&self) -> bool {
@@ -7163,7 +7211,7 @@ where
                 if !handled {
                     match attachment.handle.send_from(attachment.id, &text) {
                         SendOutcome::Sent => {}
-                        // Full: the upstream is congested/reconnecting.
+                        // Full: the connected upstream is congested.
                         // Drop this line loudly rather than block —
                         // blocking here would stall every other client
                         // sharing this network's queue. Never silent.
@@ -7177,6 +7225,11 @@ where
                         }
                         SendOutcome::Closed => {
                             return Ok(Some(AttachEnd::DriverStopped));
+                        }
+                        SendOutcome::Disconnected => {
+                            let notice = unsent_notice(&text, NOT_CONNECTED);
+                            write.write_all(format!("{notice}\r\n").as_bytes()).await?;
+                            write.flush().await?;
                         }
                         SendOutcome::Unavailable => {
                             write
@@ -8136,24 +8189,77 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_retry_waits_for_the_next_attempt_and_the_write_deadline() {
+    fn a_send_without_a_session_is_refused_not_queued() {
         let (handle, ends) = NetworkHandle::channels(16);
+        assert_eq!(
+            handle.send("PRIVMSG #room :early"),
+            SendOutcome::Disconnected
+        );
         ends.begin_attempt();
         ends.emit(ConnectionEvent::Connected);
-        assert_eq!(handle.full_queue_retry_after(), UPSTREAM_WRITE_DEADLINE);
-
-        handle.runtime.failed(
-            FailureDisposition::Retry {
-                next_attempt_in: Some(std::time::Duration::from_secs(20)),
-            },
+        assert_eq!(handle.send("PRIVMSG #room :now"), SendOutcome::Sent);
+        ends.emit(ConnectionEvent::Reconnecting(
             NetworkFailure::ConnectionLost,
-            None,
+        ));
+        assert_eq!(
+            handle.send("PRIVMSG #room :late"),
+            SendOutcome::Disconnected
         );
-        let wait = handle.full_queue_retry_after();
+        ends.emit(ConnectionEvent::RegainingNickname(NicknameRegain::new(
+            "alice_", "alice",
+        )));
+        assert_eq!(
+            handle.send("PRIVMSG #room :waits for the nickname"),
+            SendOutcome::Sent,
+            "a session under the alternative nickname holds what is sent"
+        );
+    }
+
+    /// A line still queued when its session ends is never sent: its sender
+    /// is told, by command and target and never by its text, as soon as the
+    /// driver says it is reconnecting; another attachment hears nothing.
+    #[tokio::test]
+    async fn a_line_queued_when_the_session_ends_is_told_unsent() {
+        let (handle, mut ends) = NetworkHandle::channels(16);
+        let mut sender = handle.route_replies(5);
+        let mut other = handle.route_replies(6);
+        ends.begin_attempt();
+        ends.emit(ConnectionEvent::Connected);
+        for line in ["PRIVMSG NickServ :IDENTIFY hunter2", "JOIN #later"] {
+            assert_eq!(handle.send_from(5, line), SendOutcome::Sent);
+        }
+        let waited = wait_for_reconnect(
+            &mut ends,
+            Carried::<()> {
+                config: &(),
+                next: None,
+            },
+            ConnectionEvent::Reconnecting(NetworkFailure::ConnectionLost),
+            None,
+            std::time::Duration::from_secs(1),
+            std::future::ready(()),
+        )
+        .await;
+        assert!(waited);
+        let first = sender.recv().await;
         assert!(
-            wait > UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(19)
-                && wait <= UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(20),
-            "{wait:?}"
+            first.ends_with(
+                "your message to NickServ was not sent: the network disconnected before it went out"
+            ),
+            "{first}"
+        );
+        assert!(!first.contains("hunter2"), "{first}");
+        assert!(sender.recv().await.ends_with(
+            ":your JOIN #later was not sent: the network disconnected before it went out"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), other.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            ends.commands.try_recv().is_err(),
+            "nothing is left for the next session"
         );
     }
 
@@ -8164,6 +8270,7 @@ mod tests {
     #[test]
     fn a_full_command_queue_is_told_live_and_never_retained() {
         let (handle, ends) = NetworkHandle::channels(16);
+        handle.runtime.connected();
         ends.emit_line(":peer PRIVMSG #room :kept".to_string());
         let mut events = handle.subscribe();
         for n in 0..BNC_COMMAND_QUEUE {
@@ -10351,7 +10458,7 @@ mod tests {
     /// network was "reconnecting" after a failure with no next attempt at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_retry_is_published_with_its_next_attempt_time_in_one_step() {
-        let (handle, ends) = NetworkHandle::channels(4);
+        let (handle, mut ends) = NetworkHandle::channels(4);
         let handle = std::sync::Arc::new(handle);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = std::thread::spawn({
@@ -10372,7 +10479,7 @@ mod tests {
         });
         for _ in 0..20_000 {
             let waited = wait_for_reconnect(
-                &ends,
+                &mut ends,
                 Carried::<()> {
                     config: &(),
                     next: None,
@@ -10638,6 +10745,7 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::channels(4);
+        handle.runtime.connected();
         ends.begin_irc_session("upstreamNick".to_string());
         ends.emit_session_line(":upstreamNick!u@h JOIN #current".to_string())
             .expect("within the channel limit");
@@ -11632,6 +11740,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_member_lists_are_asked_for_a_bounded_few() {
         let (handle, mut ends) = NetworkHandle::channels(2);
+        handle.runtime.connected();
         ends.begin_irc_session("alice".to_string());
         for n in 0..10 {
             ends.emit_session_line(format!(":alice!u@h JOIN #c{n}"))

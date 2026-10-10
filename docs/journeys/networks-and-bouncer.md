@@ -418,7 +418,12 @@ PLAIN.
 7. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 
-**Visible failures and recovery.** Missing SASL, malformed/chunked payload
+**Visible failures and recovery.** A line sent while the network is
+connecting or reconnecting is refused at once with a `*bnc*` notice naming
+it (`your message to #chan was not sent: the network is not connected`), and
+a line still queued when the session drops is told unsent the same way; the
+user resends once the network is back, instead of the line going out
+whenever the next session happens to start. Missing SASL, malformed/chunked payload
 errors, bad credentials, credential-store unavailability, absent/disabled network, registry failure, and
 cross-account selection are refused before attachment. An unavailable
 upstream may still allow stored backlog replay, but it is not described as a

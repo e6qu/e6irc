@@ -1393,6 +1393,7 @@ mod tests {
     fn bouncer_handle_records_both_traffic_directions() {
         let telemetry = std::sync::Arc::new(Telemetry::new());
         let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
+        ends.emit(crate::bouncer::ConnectionEvent::Connected);
         handle.set_telemetry(telemetry.clone());
         ends.emit_line(":upstream NOTICE * :hello".into());
         assert_eq!(

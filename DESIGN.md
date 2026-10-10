@@ -3191,6 +3191,26 @@ above the trait, provides for every network kind:
   backlog and to every attached client. The bouncer's own numerics to an
   attached client (`409`, `907`, `421`, a `CAP` reply) are addressed to the
   nick that client has now, not the one it was welcomed under.
+- **Nothing waits for a session that is not there**: a line any client (an
+  attachment, the browser, the API) sends while the network is connecting
+  or reconnecting is refused at once (`SendOutcome::Disconnected`), its
+  sender told which line by its command and target — `your message to #chan
+  was not sent: the network is not connected` — as ZNC ("Your message got
+  lost") and soju ("Disconnected from upstream network") refuse it. It used
+  to wait in the queue for the next session and was sent then: minutes
+  later, or hours while a ban or a throttle was retried, out of every
+  context it was written in. A line already queued when a session ends is
+  told unsent the same way, to its sender alone, as soon as the driver
+  publishes that it is reconnecting or parked (`DriverEnds::refuse_queued`),
+  never by its text, which may be a password for services. A session
+  registered under the alternative nickname is a session: what is sent waits
+  for the configured nickname (§10.3), bounded by the regain window, and is
+  told unsent if it never comes back. A full queue is therefore only ever a
+  connected upstream's flood allowance, which drains within the upstream
+  write deadline: the API's `429` says that in `Retry-After`, and a send to
+  a network that is not connected is the API's `409`. The bridges share the
+  queue and the rule; a message a bridge already accepted for delivery is
+  carried across its sessions as before.
 - **Attach status**: an attaching client is told the network's state up
   front, after its welcome: connected, or the lifecycle it is in with the
   failure and the upstream's own words (the lifecycle notice of that
@@ -4296,8 +4316,9 @@ any other): the per-address
 authentication budget gives the seconds until its bucket holds a token again,
 the `/ws/irc` per-address connection cap the registration timeout (the soonest
 a slot held by an unregistered connection is reclaimed), and a full upstream
-command queue the upstream write deadline (by which the queue has drained or
-the upstream has been declared dead).
+command queue the upstream write deadline (the queue fills only while the
+upstream is connected, and has drained by then or the upstream has been
+declared dead).
 Every URL query and form is closed: unknown fields are rejected before a
 handler runs. The one exception is the OIDC callback, whose query is the
 provider's authorization response rather than this server's API: RFC 6749

@@ -105,6 +105,15 @@ async fn loopback_reference_driver_meets_the_spi_contract() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_relays_over_the_loopback_driver() {
     let handle = Box::new(LoopbackDriver::new(100)).start();
+    // A network with no session refuses what is sent (`Disconnected`), so
+    // the driver is given its moment to say it is connected.
+    tokio::time::timeout(deadline::HANG, async {
+        while handle.runtime_snapshot().lifecycle != e6ircd::bouncer::NetworkLifecycle::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the loopback driver connects at once");
 
     // Pre-attach line lands in the buffer and must replay on attach.
     // Poll for it rather than sleeping a fixed interval (a fixed sleep is
