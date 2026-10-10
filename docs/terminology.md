@@ -909,15 +909,14 @@ them.
 **Content delivery network (CDN)** — edge caches that serve static files
 close to the browser.
 
-**RDS** — Relational Database Service (managed databases). **fck-rds** is the
-shared PostgreSQL the environment provisions a per-tenant database on.
+**RDS** — Relational Database Service (managed databases).
 
 **VPC** — Virtual Private Cloud, the isolated network. **ALB** / **NLB** are
 the Application / Network Load Balancers; **API Gateway** is the HTTP entry
 point used by scale-to-zero services.
 
 **ACM** — AWS Certificate Manager (TLS certificates). **Route 53** is DNS;
-the environment owns the `dev.e6qu.dev` zone.
+a deployment owns the zone that names its hosts.
 
 **Secrets Manager** — AWS's store for secrets (database URLs, OIDC client
 secrets), injected into a task at runtime by its Amazon Resource Name rather
