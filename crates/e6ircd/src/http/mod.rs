@@ -1901,6 +1901,7 @@ documented_routes! {
     "/api/v1/me/networks/{name}/remembered-channels/{channel}" => {
         delete: forget_network_channel,
     },
+    "/api/v1/me/networks/{name}/history" => { get: network_history },
     "/api/v1/history" => { get: history },
     "/ws/ui" => { get: ws_ui },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },

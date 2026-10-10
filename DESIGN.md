@@ -4737,25 +4737,36 @@ code point boundaries into several requests; `send-error`, queue refusal, replac
 and socket closure retain retryable text and cannot produce a false successful
 echo. This keeps the web client on the exact same multiplexer attach path as an
 IRC client — the web client *is* an attached client of the user's networks.
-Fetching persisted history prepends it without replacing live lines or local
-echoes that arrived while the request was in flight. Each row records the
-replay cursor before its line (a local echo, the cursor when its send was
-accepted), so every later ring line for that buffer is already a row, and
-history is read with `GET /api/v1/me/networks/{name}/buffer?through=<cursor>`
-— only the running ring's lines at or before the oldest row's position — so no
-line arrives twice and none is matched by content. A cursor the server cannot
-bound (another ring lifetime, or a stopped network whose lines are persisted
-history without positions) is refused with 409; only then is the page read
-whole, and matching non-empty `msgid` values and the exact ordered overlap at
-the seam are deduplicated, over wire lines and the client's own lines against
-their local echoes, skipping join/part notices history has no counterpart
-for; content equality elsewhere is not identity because distinct IRC messages
-can have identical bodies. Explicit history expands the buffer's
-bounded capacity by one API page, so loading older context remains effective
-even when the normal live window is full. Live and persisted PRIVMSG/NOTICE
+"Load earlier" pages back through one conversation with
+`GET /api/v1/me/networks/{name}/history?target=<conversation>`: the running
+network's ring first, then the persisted backlog, so it reaches past the ring
+and works while the network is stopped; each page names where the next older
+one begins (`before`), and `null` when storage holds nothing older. Nothing is
+matched by content. Each row records the replay cursor before its line (a local
+echo, the cursor when its send was accepted), so every later ring line for that
+conversation is already a row, and the first page is read `before` the oldest
+row's cursor: the conversation's ring lines at or before it. Cursors are ring
+positions, which a clean restart keeps (§19.3, migration 0102), so a reader's
+cursor stays good across one. Storage is joined at the stored row of the
+conversation's oldest ring line: the row stored at that line's ring position
+(`bnc_buffer.seq`), or — for a line a new epoch restored at another position —
+the row with its exact millisecond-stamped text, past as many byte-identical
+copies as the ring holds (a line storage failed to keep moves the join to the
+next one it did keep). That is sound only while the ring still holds every line
+after the reader's cursor; otherwise, after a crash, or on a stopped network,
+the server answers 409 and the client joins at the exact text of the oldest
+line the server sent it (`seam`, with how many identical copies it holds).
+Storage pages by row id, the order the ring held its lines in: positions repeat
+across epochs, ids do not. Rows that arrived on the socket while a page
+was read, and, for a page joined at a `seam`, the local echoes held before that
+line (storage holds each as our own line), are the only rows a page can share
+with the buffer, and each is removed once. Each page widens the conversation's
+bounded window by the rows it brought, up to 5,000; a live line that pushes the
+oldest row out makes the next page join that buffer's new oldest row rather
+than leave a gap. Live and persisted PRIVMSG/NOTICE
 rows use the same routing function, so a status-target or server notice cannot
-change buffer class when older history is loaded. Self PART/KICK closes the
-channel buffer, direct-message buffers have an explicit local Close action,
+change buffer class when older history is loaded. A self PART closes the
+channel buffer; a self KICK keeps it, marked past, with the kick at its end; direct-message buffers have an explicit local Close action,
 and channel buffers have a Leave action whose confirmed self PART closes them.
 Comma-separated JOIN/PART targets and the supported multi-target KICK forms
 update every affected buffer using the same pairing rules as the BNC session

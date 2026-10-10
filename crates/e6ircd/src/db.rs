@@ -9847,6 +9847,93 @@ pub async fn recent_bnc_backlog(
     Ok(rows.into_iter().map(StoredBacklogLine::from).collect())
 }
 
+// ---- One conversation's stored history, for the web client ---------------
+
+/// One stored row of a conversation, oldest first in a page.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ConversationHistoryRow {
+    pub id: i64,
+    pub line: String,
+}
+
+/// Which stored copy of a ring line [`bnc_conversation_line`] finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredCopy {
+    /// The one stored at this ring position (migration 0102). A position
+    /// repeats only across epochs, whose rows are older, so the newest such
+    /// row is this epoch's.
+    AtPosition(u64),
+    /// Of this many byte-identical copies a reader holds — the newest of
+    /// them — the oldest.
+    OldestOfHeld(i64),
+}
+
+/// The stored row of conversation `target` (as the network folds it) whose
+/// text is exactly `line`, the copy `which` names. `None` when storage holds
+/// no such copy (the line failed to store, a new epoch restored it at another
+/// position, or fewer copies are stored than are held), so no page can be
+/// joined to that line exactly.
+pub async fn bnc_conversation_line(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    line: &str,
+    which: StoredCopy,
+) -> Result<Option<i64>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let (position, skip) = match which {
+        StoredCopy::AtPosition(seq) => (Some(ring_position(seq)?), 0),
+        StoredCopy::OldestOfHeld(held) => (None, (held - 1).max(0)),
+    };
+    sqlx::query_scalar(
+        "SELECT id FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND target = $3 AND line = $4
+           AND ($5::BIGINT IS NULL OR seq = $5)
+         ORDER BY id DESC OFFSET $6 LIMIT 1",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(target)
+    .bind(line)
+    .bind(position)
+    .bind(skip)
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)
+}
+
+/// Up to `limit` stored rows of conversation `target` of `(owner, network)`
+/// stored before row `before` (all of them without one), oldest first, in
+/// storage order — the order the ring held them in.
+pub async fn bnc_conversation_history(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    before: Option<i64>,
+    limit: i64,
+) -> Result<Vec<ConversationHistoryRow>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    // `bnc_buffer_sent_at_idx (owner, network, target, sent_at, id)` bounds
+    // the scan to this conversation's capped slice.
+    let mut rows: Vec<ConversationHistoryRow> = sqlx::query_as(
+        "SELECT id, line FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND target = $3 AND id < $4
+         ORDER BY id DESC LIMIT $5",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(target)
+    .bind(before.unwrap_or(i64::MAX))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    rows.reverse();
+    Ok(rows)
+}
+
 // ---- BNC CHATHISTORY queries ---------------------------------------------
 
 /// One stored backlog line and its ordering metadata, for CHATHISTORY paging.

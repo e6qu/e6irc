@@ -16,15 +16,18 @@ import {
   clearTranscript,
   composerRequests,
   countsAsUnread,
+  echoesBeforeSeam,
   existingChannelBuffer,
   fold,
+  historyQuery,
+  historySeam,
   isChannel,
   isPrefixMode,
   isSaid,
+  joinHistory,
   kickPairs,
   memberRank,
   membershipTargets,
-  mergeTimeline,
   messageIdentity,
   modeChanges,
   modeTakesParameter,
@@ -35,7 +38,6 @@ import {
   oldestRingFloor,
   outgoingChat,
   parseIrc,
-  prependHistory,
   reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
@@ -306,68 +308,6 @@ test("channel and nick names are drawn without bidi controls, in isolation", asy
   }
 });
 
-test("history merge never replaces live or unidentified lines", () => {
-  const history = [
-    { identity: "old", text: "old" },
-    { identity: "shared", text: "persisted shared" },
-    { identity: null, text: "first identical body" },
-    { identity: null, text: "first identical body" },
-  ];
-  const live = [
-    { identity: "shared", text: "live shared" },
-    { identity: null, text: "arrived while loading" },
-    { identity: null, text: "local echo not persisted" },
-  ];
-  assert.deepEqual(mergeTimeline(history, live, 20), [
-    { identity: "old", text: "old" },
-    { identity: null, text: "first identical body" },
-    { identity: null, text: "first identical body" },
-    { identity: "shared", text: "live shared" },
-    { identity: null, text: "arrived while loading" },
-    { identity: null, text: "local echo not persisted" },
-  ]);
-});
-
-test("history merge deduplicates duplicate stable ids and applies the cap last", () => {
-  const history = [
-    { identity: "one", text: "oldest" },
-    { identity: "two", text: "first copy" },
-    { identity: "two", text: "newest copy" },
-  ];
-  const live = [{ identity: "three", text: "live" }];
-  assert.deepEqual(mergeTimeline(history, live, 2), [
-    { identity: "two", text: "newest copy" },
-    { identity: "three", text: "live" },
-  ]);
-});
-
-test("history merge removes only an ordered unidentified wire overlap", () => {
-  const first = { identity: null, text: "same body", wire: ":n PRIVMSG #c :same body" };
-  const second = { identity: null, text: "same body", wire: ":n PRIVMSG #c :same body" };
-  const boundary = { identity: null, text: "boundary", wire: ":n PRIVMSG #c :boundary" };
-  const liveOnly = { identity: null, text: "live", wire: ":n PRIVMSG #c :live" };
-
-  assert.deepEqual(
-    mergeTimeline([first, second, boundary], [second, boundary, liveOnly], 20),
-    [first, second, boundary, liveOnly],
-    "the largest suffix/prefix overlap is removed while an earlier identical message remains",
-  );
-});
-
-test("history merge retains requested context in front of a full live window", () => {
-  const older = { identity: "old", text: "older" };
-  const live = [
-    { identity: "live-1", text: "live one" },
-    { identity: "live-2", text: "live two" },
-  ];
-
-  assert.deepEqual(
-    mergeTimeline([older], live, 3),
-    [older, ...live],
-    "the expanded explicit-history bound must not discard the row just loaded",
-  );
-});
-
 test("authoritative session channels replace stale replay membership by casefold", () => {
   assert.deepEqual(
     reconcileChannelSnapshot(["#Keep", "#stale"], ["#keep", "#New", "#new"]),
@@ -496,13 +436,15 @@ test("a topic or NAMES reply finds an open channel buffer and never makes one", 
   assert.equal(buffers.size, 2);
 });
 
-test("a replay clears a transcript and offers its earlier history again", () => {
+test("a replay clears a transcript and starts its paging over", () => {
   const buffer = {
     lines: [{ text: "old" }],
     unread: 3,
     mentions: 1,
     pendingVisibleMessages: 2,
-    historyLoaded: true,
+    historyBefore: "row:7",
+    historyExhausted: true,
+    historyRows: 40,
     transcriptEpoch: 4,
   };
   clearTranscript(buffer);
@@ -511,7 +453,9 @@ test("a replay clears a transcript and offers its earlier history again", () => 
     unread: 0,
     mentions: 0,
     pendingVisibleMessages: 0,
-    historyLoaded: false,
+    historyBefore: undefined,
+    historyExhausted: false,
+    historyRows: 0,
     // A history read still out is told the transcript it was read for ended.
     transcriptEpoch: 5,
   });
@@ -543,49 +487,6 @@ test("a bridge's session snapshot joins its channels under the provider account'
   assert.deepEqual(reconciliation.removed, []);
   assert.deepEqual(reconciliation.added, ["#random"]);
   assert.deepEqual(reconciliation.joined, ["#General", "#random"]);
-});
-
-// ---- history merge around rows the history has no counterpart for ---------
-
-test("history merge on a network without msgids matches past join notices and local echoes", () => {
-  // No msgid anywhere. The live buffer opens with a join notice, which history
-  // has no counterpart for, and holds a local echo of our own message, which
-  // history holds as the ring's copy of the line.
-  const wire = (text, nick = "bob") => ({
-    identity: null, kind: "msg", sender: nick, text, wire: `:${nick}!u@h PRIVMSG #c :${text}`,
-  });
-  const older = wire("older");
-  const first = wire("first");
-  const second = wire("second");
-  const joined = { identity: null, kind: "event", sender: null, text: "carol joined", wire: null };
-  const echo = { identity: null, kind: "msg", sender: "me", text: "mine", wire: null };
-  const live = [joined, first, echo, second];
-  const isMine = (nick) => nick === "me";
-
-  assert.deepEqual(
-    mergeTimeline([older, first, wire("mine", "me"), second], live, 20, isMine),
-    [older, joined, first, echo, second],
-    "the overlap is matched past rows history cannot hold, so it is not prepended again",
-  );
-  // Our own older line is still prepended when it precedes the overlap.
-  assert.deepEqual(
-    mergeTimeline([wire("earlier", "me"), first, wire("mine", "me"), second], live, 20, isMine),
-    [wire("earlier", "me"), joined, first, echo, second],
-  );
-});
-
-test("history bounded by ring position is prepended whole, with msgids still unique", () => {
-  const history = [
-    { identity: null, text: "same", wire: ":b!u@h PRIVMSG #c :same" },
-    { identity: "m1", text: "identified", wire: ":b!u@h PRIVMSG #c :identified" },
-  ];
-  const live = [
-    { identity: null, text: "same", wire: ":b!u@h PRIVMSG #c :same" },
-    { identity: "m1", text: "identified", wire: ":b!u@h PRIVMSG #c :identified" },
-  ];
-  // Equal wire text is not identity: bounded history is older by position, so
-  // its unidentified row stays; the shared msgid appears once.
-  assert.deepEqual(prependHistory(history, live, 20), [history[0], ...live]);
 });
 
 test("a buffer's ring floor is its oldest row's cursor-before", () => {
@@ -750,4 +651,55 @@ test("a refusal or the answer to the person's own question is reported in words"
   ]) {
     assert.equal(report(line), null, line);
   }
+});
+
+// ---- paging back through one conversation ---------------------------------
+
+const said = (text, nick = "bob", extra = {}) => ({
+  kind: "msg", sender: nick, text, wire: `@time=2026-01-01T00:00:00.000Z :${nick}!u@h PRIVMSG #c :${text}`, ...extra,
+});
+const echo = (text) => ({ kind: "msg", sender: "me", text, wire: null });
+const isMine = (nick) => nick === "me";
+
+test("the next page is asked for where the server can join it exactly", () => {
+  // A previous page's cursor, while the buffer begins where that page ended.
+  assert.deepEqual(historyQuery({ historyBefore: "row:9", lines: [said("a")] }, "9:50"), { before: "row:9" });
+  // The socket position before the oldest row, when it came from the socket.
+  assert.deepEqual(historyQuery({ lines: [said("a", "bob", { ringFloor: "9:4" })] }, "9:50"), { before: "9:4" });
+  // Nothing held: everything up to the socket's cursor is older.
+  assert.deepEqual(historyQuery({ lines: [] }, "9:50"), { before: "9:50" });
+  // No position says where the buffer begins (a full replay's first row, or
+  // a history row): the oldest line the server sent, and its copies held.
+  const copy = said("same");
+  assert.deepEqual(
+    historyQuery({ lines: [echo("mine"), { ...copy, ringFloor: null }, copy, said("other")] }, "9:50"),
+    { seam: copy.wire, held: "2" },
+  );
+  assert.deepEqual(historyQuery({ lines: [echo("mine")] }, "9:50"), {});
+  assert.deepEqual(historyQuery({ lines: [] }, null), {});
+  assert.equal(historySeam([echo("x")]), null);
+});
+
+test("a page joins in front, dropping only lines that arrived during the read and echoes before the seam", () => {
+  const older = said("older");
+  const mine = said("hello", "me");
+  const arrivedLine = said("arrived");
+  const held = [echo("hello"), said("pivot"), arrivedLine];
+  assert.deepEqual(echoesBeforeSeam(held, isMine), [held[0]]);
+  // Storage holds our echo as a line of ours older than the pivot, and the
+  // line that arrived while the page was read.
+  const joined = joinHistory([older, mine, arrivedLine], held, {
+    arrived: [arrivedLine.wire],
+    echoes: echoesBeforeSeam(held, isMine),
+    isMine,
+  });
+  assert.deepEqual(joined, [older, ...held]);
+  // Without those, identical text is not identity: two equal older lines stay.
+  const twin = said("twin");
+  assert.deepEqual(joinHistory([twin, { ...twin }], held), [twin, { ...twin }, ...held]);
+  // An echo is removed once, newest first, even when an older equal line exists.
+  assert.deepEqual(
+    joinHistory([said("hello", "me"), mine], [echo("hello")], { echoes: [echo("hello")], isMine }),
+    [said("hello", "me"), echo("hello")],
+  );
 });
