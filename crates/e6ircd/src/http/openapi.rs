@@ -2049,6 +2049,40 @@ fn operations() -> serde_json::Value {
                         "404": { "description": "no such network" },
                         "409": { "description": "`through` names no position of the running network's buffer (another buffer lifetime), or the network is stopped and its lines are persisted history without positions; read without `through`" } } }
             },
+            "/api/v1/me/networks/{name}/history": {
+                "get": { "summary": "Page back through one conversation's history (oldest-first)",
+                    "description": "One conversation's lines older than what the reader holds, a page at a time: the running network's buffer first, then the persisted backlog, so it reaches past the buffer and works while the network is stopped. Give `before` (a `/ws/ui` replay cursor when the reader holds every line after it, or a previous page's `before`) or `seam` and `held` (the exact text of the oldest line the reader holds, and how many byte-identical copies of it it holds), or neither for the newest page. Lines come in the order the buffer held them; nothing is matched by content.",
+                    "security": authenticated,
+                    "parameters": [
+                        { "name": "name", "in": "path", "required": true,
+                            "schema": { "type": "string" } },
+                        { "name": "target", "in": "query", "required": true,
+                            "description": "The conversation: a channel, or the other party of a direct conversation.",
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "limit", "in": "query", "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": super::networks::MAX_HISTORY_READ_LIMIT, "default": super::networks::DEFAULT_HISTORY_READ_LIMIT } },
+                        { "name": "before", "in": "query", "required": false,
+                            "description": "A `/ws/ui` replay cursor, or a previous page's `before`.",
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "seam", "in": "query", "required": false,
+                            "description": "The exact text of the oldest line the reader holds, when no cursor can say where its transcript begins.",
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "held", "in": "query", "required": false,
+                            "description": "How many byte-identical copies of `seam` the reader holds (default 1).",
+                            "schema": { "type": "integer", "minimum": 1 } }],
+                    "responses": {
+                        "200": { "description": "a page of the conversation", "content": { "application/json": {
+                            "schema": { "type": "object", "required": ["lines", "before"], "additionalProperties": false,
+                                "properties": {
+                                    "lines": { "type": "array", "maxItems": super::networks::MAX_HISTORY_READ_LIMIT,
+                                        "items": { "type": "string", "maxLength": e6irc_proto::message::MAX_SERVER_FRAME_LEN } },
+                                    "before": { "type": ["string", "null"], "minLength": 1,
+                                        "description": "Where the next older page begins; null when nothing older is held." } } }
+                        } } },
+                        "400": { "description": "an empty `target`, a limit outside its range, a `before` that is not a cursor, `held` without `seam`, or both `before` and `seam` (`field` names it)" },
+                        "404": { "description": "no such network" },
+                        "409": { "description": "the page cannot be joined exactly to what the reader holds: `before` names no position of the running buffer, or the buffer no longer holds every line after it, or storage holds no such `seam`; read with `seam` (`field` names which)" } } }
+            },
             "/ws/ui": {
                 "get": { "summary": "The web client's live chat socket for one of your networks",
                     "description": "A WebSocket upgrade (RFC 6455): send `Connection: Upgrade`, `Upgrade: websocket`, and the handshake headers. A browser's `Origin` must be this application's (the configured public URL, else the `Host` it addressed). The socket first sends the network's status, its session snapshot, the replayed lines (after `after`, when that cursor is still in the ring), and a snapshot boundary, then live events; every server frame is one JSON event. A client frame is a composer request `{\"id\", \"target\", \"message\"}` answered by a `sent` or `send-error` event; sending needs the `write` scope or a browser session. The socket closes with code 1008 and a reason when policy refuses it — the account already holds 32 live sockets, or the session or token that opened it was revoked or expired (the client should not retry by itself) — and with 1013 when that credential could not be re-checked (reconnecting authenticates again).",
@@ -2788,7 +2822,7 @@ mod tests {
         ("/api/v1/me", "get"),
         ("/api/v1/me/networks", "get"),
         ("/api/v1/me/networks/{name}", "get"),
-        ("/api/v1/me/networks/{name}/buffer", "get"),
+        ("/api/v1/me/networks/{name}/history", "get"),
         ("/api/v1/network-presets", "get"),
     ];
 

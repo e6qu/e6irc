@@ -2596,25 +2596,9 @@ pub(super) async fn network_buffer(
     QueryParams(params): QueryParams<BufferQuery>,
 ) -> Response {
     let pool = pool_of(&state);
-    let registry = registry_of(&state);
-    // The network must belong to the caller — no cross-account reads: its
-    // stored row, or a network the server configuration defines for it. The
-    // running driver read is that network's own, never the other kind's under
-    // the same name.
-    let handle = match crate::db::get_bnc_network(pool, &account, &name).await {
-        Ok(Some(_)) => registry.get_stored(&account, &name),
-        Ok(None) => match registry.get_configured_owned(&account, &name) {
-            Some((_, handle)) => Some(handle),
-            None => return problem(StatusCode::NOT_FOUND, "No such network", None),
-        },
-        Err(e) => {
-            eprintln!("http: network buffer lookup failed: {e}");
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            );
-        }
+    let handle = match owned_network_handle(&state, &account, &name).await {
+        Ok(handle) => handle,
+        Err(response) => return response.into(),
     };
     let limit = match bounded_query_limit(params.limit, DEFAULT_BUFFER_READ_LIMIT, 1000, "buffer") {
         Ok(limit) => limit,
@@ -2666,6 +2650,323 @@ pub(super) async fn network_buffer(
             )
         }
     }
+}
+
+/// The caller's own network `name`, and its running driver when it runs: its
+/// stored row, or a network the server configuration defines for it — no
+/// cross-account reads. The running driver is that network's own, never the
+/// other kind's under the same name.
+async fn owned_network_handle(
+    state: &AppState,
+    account: &str,
+    name: &str,
+) -> ResponseResult<Option<Arc<crate::bouncer::NetworkHandle>>> {
+    let registry = registry_of(state);
+    match crate::db::get_bnc_network(pool_of(state), account, name).await {
+        Ok(Some(_)) => Ok(registry.get_stored(account, name)),
+        Ok(None) => match registry.get_configured_owned(account, name) {
+            Some((_, handle)) => Ok(Some(handle)),
+            None => Err(problem(StatusCode::NOT_FOUND, "No such network", None).into()),
+        },
+        Err(e) => {
+            eprintln!("http: network lookup failed: {e}");
+            Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+            .into())
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConversationHistoryQuery {
+    pub(super) target: String,
+    pub(super) limit: Option<usize>,
+    /// The page to read: older than a `/ws/ui` replay cursor (the reader holds
+    /// every line after it), or than a previous page's `before`.
+    pub(super) before: Option<String>,
+    /// Older than this exact stored line, which the reader holds — when no
+    /// cursor can say where its transcript begins (the network restarted or
+    /// stopped since it was read). `held` says how many byte-identical copies
+    /// of it the reader holds.
+    pub(super) seam: Option<String>,
+    pub(super) held: Option<i64>,
+}
+
+/// Lines `GET /me/networks/{name}/history` returns when the request names no
+/// `limit`; the OpenAPI document advertises the same value.
+pub(super) const DEFAULT_HISTORY_READ_LIMIT: usize = 100;
+/// The most it returns at once.
+pub(super) const MAX_HISTORY_READ_LIMIT: usize = 500;
+
+/// A page cursor naming a stored row: the next page is older than it.
+const STORED_PAGE_PREFIX: &str = "row:";
+
+#[derive(serde::Serialize)]
+struct ConversationHistoryResponse {
+    /// Oldest first.
+    lines: Vec<String>,
+    /// Where the next older page begins, or `null` when nothing older is held.
+    before: Option<String>,
+}
+
+/// The `before` or `seam` a page cannot be joined to exactly.
+fn unjoinable_history(detail: &'static str, field: &'static str) -> Response {
+    problem_at_field(
+        StatusCode::CONFLICT,
+        "History cannot be joined here",
+        Some(detail),
+        Some(field),
+    )
+}
+
+/// One conversation's history, older than what the reader holds, a page at a
+/// time: the running network's ring first, then the persisted backlog, so it
+/// reaches past the ring and works while the network is stopped.
+///
+/// Nothing is matched by content. The ring part is the conversation's ring
+/// lines at or before the reader's cursor. The ring and storage share no
+/// position, so storage is joined at the stored copy of the conversation's
+/// oldest ring line — its exact text, stamped with its millisecond time, past
+/// as many identical copies as the ring holds — which is sound only when the
+/// reader holds every ring line after its cursor (409 otherwise). Storage then
+/// pages by row id, which is the order the ring held its lines in.
+pub(super) async fn network_history(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account, _): Authenticated,
+    PathParams(name): PathParams<String>,
+    QueryParams(params): QueryParams<ConversationHistoryQuery>,
+) -> Response {
+    let handle = match owned_network_handle(&state, &account, &name).await {
+        Ok(handle) => handle,
+        Err(response) => return response.into(),
+    };
+    if params.target.is_empty() {
+        return problem_at_field(
+            StatusCode::BAD_REQUEST,
+            "Invalid history request",
+            Some("`target` must name a conversation."),
+            Some("target"),
+        );
+    }
+    let limit = match bounded_query_limit(
+        params.limit,
+        DEFAULT_HISTORY_READ_LIMIT,
+        MAX_HISTORY_READ_LIMIT,
+        "history",
+    ) {
+        Ok(limit) => limit,
+        Err(response) => return response.into(),
+    };
+    let pool = pool_of(&state);
+    // How the network names things: the running driver's rules, else the case
+    // mapping its stored conversations were keyed under.
+    let names = match &handle {
+        Some(handle) => handle.names(),
+        None => {
+            let mut names = e6irc_client::NetworkNames::default();
+            match crate::db::bnc_buffer_casemapping(pool, &account, &name).await {
+                Ok(Some(casemapping)) => {
+                    names.adopt_tokens([
+                        format!("CASEMAPPING={}", casemapping.isupport_token()).as_str()
+                    ]);
+                }
+                Ok(None) => {}
+                Err(e) => return history_unavailable(e),
+            }
+            names
+        }
+    };
+    let target = names.fold(&params.target);
+    // Rows stored before row `before` (all, without one).
+    let read = |before: Option<i64>, limit: i64| {
+        let (account, name, target) = (account.clone(), name.clone(), target.clone());
+        async move {
+            crate::db::bnc_conversation_history(pool, &account, &name, &target, before, limit).await
+        }
+    };
+    // The stored row holding the oldest of `held` copies of `line`.
+    let locate = |line: String, held: i64| {
+        let (account, name, target) = (account.clone(), name.clone(), target.clone());
+        async move {
+            crate::db::bnc_conversation_line_id(pool, &account, &name, &target, &line, held).await
+        }
+    };
+    let stored_page = |rows: Vec<crate::db::ConversationHistoryRow>, asked: i64| {
+        let before = (rows.len() as i64 == asked)
+            .then(|| {
+                rows.first()
+                    .map(|row| format!("{STORED_PAGE_PREFIX}{}", row.id))
+            })
+            .flatten();
+        (
+            rows.into_iter().map(|row| row.line).collect::<Vec<_>>(),
+            before,
+        )
+    };
+    match (params.before.as_deref(), params.seam, params.held) {
+        (Some(before), None, None) => {
+            if let Some(id) = before.strip_prefix(STORED_PAGE_PREFIX) {
+                let Ok(id) = id.parse::<i64>() else {
+                    return problem_at_field(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid history cursor",
+                        Some(
+                            "`before` must be a cursor this API or the live chat socket handed out.",
+                        ),
+                        Some("before"),
+                    );
+                };
+                return match read(Some(id), limit).await {
+                    Ok(rows) => {
+                        let (lines, before) = stored_page(rows, limit);
+                        json_no_store(ConversationHistoryResponse { lines, before })
+                    }
+                    Err(e) => history_unavailable(e),
+                };
+            }
+            let Some(cursor) = crate::bouncer::ReplayCursor::parse(before) else {
+                return problem_at_field(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid history cursor",
+                    Some("`before` must be a cursor this API or the live chat socket handed out."),
+                    Some("before"),
+                );
+            };
+            let Some(ring) = handle
+                .as_ref()
+                .and_then(|handle| handle.history_through(cursor))
+            else {
+                return unjoinable_history(
+                    "The cursor names no position of this network's running buffer; read with `seam`.",
+                    "before",
+                );
+            };
+            if !ring.successors_retained {
+                return unjoinable_history(
+                    "The buffer no longer holds every line after the cursor; read with `seam`.",
+                    "before",
+                );
+            }
+            let own_nick = handle
+                .as_ref()
+                .and_then(|handle| handle.irc_session_snapshot())
+                .map(|session| session.nick);
+            let in_conversation = |line: &str| {
+                crate::db::bnc_line_target(line, own_nick.as_deref(), &names)
+                    .is_some_and(|display| names.fold(&display) == target)
+            };
+            let conversation: Vec<&crate::bouncer::BufferedLine> = ring
+                .lines
+                .iter()
+                .filter(|line| in_conversation(&line.line))
+                .collect();
+            let older: Vec<&crate::bouncer::BufferedLine> = ring.lines[..ring.held_after]
+                .iter()
+                .filter(|line| in_conversation(&line.line))
+                .collect();
+            let skip = older.len().saturating_sub(limit as usize);
+            let mut lines: Vec<String> =
+                older[skip..].iter().map(|line| line.line.clone()).collect();
+            if skip > 0 {
+                let before = ring.cursor_before(older[skip].seq).to_string();
+                return json_no_store(ConversationHistoryResponse {
+                    lines,
+                    before: Some(before),
+                });
+            }
+            // The ring holds nothing older: storage continues before the stored
+            // copy of the conversation's oldest ring line that storage holds
+            // (one it failed to store has no copy, and nothing between that
+            // and the next is stored either), or from the newest stored row
+            // when it holds none of them.
+            let remaining = limit - lines.len() as i64;
+            let mut seam = None;
+            for line in &conversation {
+                let held = conversation
+                    .iter()
+                    .filter(|other| other.line == line.line)
+                    .count() as i64;
+                match locate(line.line.clone(), held).await {
+                    Ok(Some(id)) => {
+                        seam = Some(id);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return history_unavailable(e),
+                }
+            }
+            let rows = match read(seam, remaining).await {
+                Ok(rows) => rows,
+                Err(e) => return history_unavailable(e),
+            };
+            let (mut older_stored, before) = stored_page(rows, remaining);
+            older_stored.append(&mut lines);
+            json_no_store(ConversationHistoryResponse {
+                lines: older_stored,
+                before,
+            })
+        }
+        (None, Some(seam), held) => {
+            let held = held.unwrap_or(1);
+            if held < 1 {
+                return problem_at_field(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid history request",
+                    Some("`held` counts the copies of `seam` held: at least 1."),
+                    Some("held"),
+                );
+            }
+            let id = match locate(seam, held).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return unjoinable_history(
+                        "The stored history holds no such line in this conversation.",
+                        "seam",
+                    );
+                }
+                Err(e) => return history_unavailable(e),
+            };
+            match read(Some(id), limit).await {
+                Ok(rows) => {
+                    let (lines, before) = stored_page(rows, limit);
+                    json_no_store(ConversationHistoryResponse { lines, before })
+                }
+                Err(e) => history_unavailable(e),
+            }
+        }
+        (None, None, None) => match read(None, limit).await {
+            Ok(rows) => {
+                let (lines, before) = stored_page(rows, limit);
+                json_no_store(ConversationHistoryResponse { lines, before })
+            }
+            Err(e) => history_unavailable(e),
+        },
+        (_, None, Some(_)) => problem_at_field(
+            StatusCode::BAD_REQUEST,
+            "Invalid history request",
+            Some("`held` goes with `seam`."),
+            Some("held"),
+        ),
+        _ => problem_at_field(
+            StatusCode::BAD_REQUEST,
+            "Invalid history request",
+            Some("Give `before` or `seam`, not both."),
+            Some("seam"),
+        ),
+    }
+}
+
+fn history_unavailable(e: crate::db::DbError) -> Response {
+    eprintln!("http: conversation history read failed: {e}");
+    problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database unavailable",
+        None,
+    )
 }
 
 #[derive(serde::Deserialize)]

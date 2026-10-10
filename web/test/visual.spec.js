@@ -1889,14 +1889,19 @@ test("on a phone the member list opens from the buffer header", async ({ page })
 
 // ---- chat defects: history seam, focus, unread, echo, session, a11y ---------
 
-// The buffer read "Load earlier" makes, as the served contract declares it.
-async function mockBuffer(page, respond) {
+// The conversation history read "Load earlier" makes, as the served contract
+// declares it.
+async function mockHistory(page, respond) {
   await mockApiContract(page);
-  await page.route(/\/api\/v1\/me\/networks\/[^/]+\/buffer/, respond);
+  await page.route(/\/api\/v1\/me\/networks\/[^/]+\/history/, respond);
 }
+const historyPage = (route, lines, before) => route.fulfill({
+  contentType: "application/json", body: JSON.stringify({ lines, before }),
+});
 
 // A chat attached to #only on a network that sends no msgid: a join notice
 // opens the buffer, a message follows, and the reader sends one of their own.
+// Each history read's query is recorded.
 async function historySeam(page, respond) {
   await page.routeWebSocket(/\/ws\/ui/, (socket) => {
     attachReplay(socket, [
@@ -1911,10 +1916,10 @@ async function historySeam(page, respond) {
   });
   await mockSession(page, [ircNetwork("Libera")]);
   const reads = [];
-  await mockBuffer(page, (route) => {
+  await mockHistory(page, (route) => {
     const url = new URL(route.request().url());
-    reads.push(url.searchParams.get("through"));
-    return respond(route, url);
+    reads.push(Object.fromEntries(url.searchParams));
+    return respond(route, url, reads.length);
   });
   await page.goto("/?network=Libera");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
@@ -1928,42 +1933,67 @@ async function historySeam(page, respond) {
   return { messages, reads };
 }
 
-test("earlier history is read through the oldest row's ring position and shown once", async ({ page }) => {
-  const { messages, reads } = await historySeam(page, (route, url) => {
-    // The ring through position 1: the lines before carol's join.
-    expect(url.searchParams.get("through")).toBe(cursorAt(1));
-    return route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify({ lines: [":bob!u@h PRIVMSG #only :older", ":viewer!u@h JOIN #only"] }),
-    });
-  });
-  expect(reads).toEqual([cursorAt(1)]);
+test("earlier history pages back through the conversation from the oldest row's ring position", async ({ page }) => {
+  const { messages, reads } = await historySeam(page, (route, url, read) => read === 1
+    ? historyPage(route, [":bob!u@h PRIVMSG #only :older"], "row:41")
+    : historyPage(route, [":bob!u@h PRIVMSG #only :oldest"], null));
+  // The socket position before carol's join, the buffer's oldest row.
+  expect(reads).toEqual([{ target: "#only", limit: "200", before: cursorAt(1) }]);
   await expect(messages.locator(".line-msg")).toHaveText([/older/, /live one/, /mine/]);
   await expect(messages.locator(".line-event", { hasText: "carol joined" })).toHaveCount(1);
+  // The next page continues from where the server said the first ended.
+  await page.getByRole("button", { name: "Load earlier messages" }).click();
+  await expect(messages.locator(".line-msg")).toHaveText([/oldest/, /older/, /live one/, /mine/]);
+  expect(reads[1]).toEqual({ target: "#only", limit: "200", before: "row:41" });
+  // Nothing older is held: the control goes.
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toBeHidden();
 });
 
-test("history the server cannot bound is matched at the seam past join notices and local echoes", async ({ page }) => {
-  const { messages, reads } = await historySeam(page, (route, url) => {
-    if (url.searchParams.has("through")) {
-      return route.fulfill({
+test("a ring position the server cannot join falls back to the oldest line it sent", async ({ page }) => {
+  const { messages, reads } = await historySeam(page, (route, url, read) => read === 1
+    ? route.fulfill({
         status: 409,
         contentType: "application/problem+json",
-        body: JSON.stringify({ title: "Buffer cursor not honoured", field: "through" }),
-      });
-    }
-    return route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify({ lines: [
-        ":bob!u@h PRIVMSG #only :older",
-        ":viewer!u@h JOIN #only",
-        ":carol!u@h JOIN #only",
-        ":bob!u@h PRIVMSG #only :live one",
-        ":viewer!u@h PRIVMSG #only :mine",
-      ] }),
+        body: JSON.stringify({ title: "History cannot be joined here", field: "before" }),
+      })
+    : historyPage(route, [":bob!u@h PRIVMSG #only :older"], "row:3"));
+  expect(reads).toEqual([
+    { target: "#only", limit: "200", before: cursorAt(1) },
+    { target: "#only", limit: "200", seam: ":bob!u@h PRIVMSG #only :live one", held: "1" },
+  ]);
+  await expect(messages.locator(".line-msg")).toHaveText([/older/, /live one/, /mine/]);
+});
+
+test("joined at a held line, a page drops the stored copies of this page's own earlier sends", async ({ page }) => {
+  let upstream;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    attachReplay(socket, [":viewer!u@h JOIN #only"], ["#only"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (request.id) socket.send(JSON.stringify({ t: "sent", v: request.id }));
     });
   });
-  expect(reads).toEqual([cursorAt(1), null]);
-  await expect(messages.locator(".line-msg")).toHaveText([/older/, /live one/, /mine/]);
+  await mockSession(page, [ircNetwork("Libera")]);
+  await mockHistory(page, (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.has("before")) {
+      return route.fulfill({ status: 409, contentType: "application/problem+json", body: JSON.stringify({ title: "no", field: "before" }) });
+    }
+    // Storage holds our send as a line of ours, older than bob's.
+    return historyPage(route, [":bob!u@h PRIVMSG #only :older", ":viewer!u@h PRIVMSG #only :mine"], null);
+  });
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await composer.fill("mine");
+  await composer.press("Enter");
+  const messages = page.getByLabel("Messages");
+  await expect(messages.locator(".line-msg", { hasText: "mine" })).toHaveCount(1);
+  upstream.send(lineEvent(":bob!u@h PRIVMSG #only :live", 3));
+  await expect(messages.locator(".line-msg", { hasText: "live" })).toHaveCount(1);
+  await page.getByRole("button", { name: "Load earlier messages" }).click();
+  await expect(messages.locator(".line-msg")).toHaveText([/older/, /mine/, /live/]);
 });
 
 test("new lines and member changes keep keyboard focus where it is", async ({ page }) => {
@@ -2395,9 +2425,9 @@ test("history that arrives after the transcript was reloaded is not merged into 
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   const chat = await chatWith(page, ["#only", "#other"]);
-  await mockBuffer(page, async (route) => {
+  await mockHistory(page, async (route) => {
     await gate;
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ lines: [":bob!u@h PRIVMSG #only :older"] }) });
+    await historyPage(route, [":bob!u@h PRIVMSG #only :older"], null);
   });
   await page.getByRole("button", { name: /^Open #only/ }).click();
   await page.getByRole("button", { name: "Load earlier messages" }).click();
@@ -2420,7 +2450,7 @@ test("history that arrives after the transcript was reloaded is not merged into 
 
 test("a history read that finds nothing says so", async ({ page }) => {
   await chatWith(page, ["#only"]);
-  await mockBuffer(page, (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ lines: [] }) }));
+  await mockHistory(page, (route) => historyPage(route, [], null));
   await page.getByRole("button", { name: "Load earlier messages" }).click();
   await expect(page.locator('[data-alert="history"]')).toContainText("No earlier messages in #only");
   await expect(page.getByRole("button", { name: "Load earlier messages" })).toBeHidden();

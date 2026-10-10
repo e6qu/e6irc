@@ -46,25 +46,26 @@ import {
   clearTranscript,
   composerRequests,
   countsAsUnread,
+  echoesBeforeSeam,
   existingChannelBuffer,
   fold as foldUnder,
+  historyQuery,
+  historySeam,
   isChannel as isChannelUnder,
   isPrefixMode,
   isSaid,
+  joinHistory,
   kickPairs,
   memberRank,
   membershipTargets,
-  mergeTimeline,
   messageIdentity,
   modeChanges,
   namesDiffer,
   namesFrom,
   namesFromIsupport,
   nickPrefix,
-  oldestRingFloor,
   outgoingChat,
   parseIrc,
-  prependHistory,
   reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
@@ -141,10 +142,12 @@ const joinInput = el("join-input");
 const joinButton = el("join-form")?.querySelector("button[type=submit]");
 
 const MAX_LINES = 500;
-// Explicit history loading may add one full API page in front of the live
-// window. Keep both sides bounded without immediately throwing the requested
-// older context away just because the live window already reached MAX_LINES.
-const MAX_LOADED_LINES = 1500;
+// Each page of earlier history the reader asks for widens that conversation's
+// window by the rows it brought, up to this many rows in all (what storage
+// keeps for a whole network), so the older context asked for is not thrown
+// away by the live window's own bound.
+const MAX_HISTORY_LINES = 5000;
+const HISTORY_PAGE = 200;
 // Bounds against a hostile upstream that streams distinct channels/senders or a
 // giant NAMES list: buffers and per-channel members can't grow without limit.
 const MAX_BUFFERS = 200;
@@ -592,7 +595,7 @@ function adoptNames(next, { quiet = false } = {}) {
   if (!namesDiffer(previous, next)) return;
   const newKey = new Map([...buffers.values()].map((buffer) => [buffer.key, buffer.key === SERVER ? SERVER : fold(buffer.display)]));
   const moved = (key) => newKey.get(key) ?? fold(key);
-  const { buffers: rekeyed, merged } = rekeyBuffers(buffers, ircNames, MAX_LOADED_LINES);
+  const { buffers: rekeyed, merged } = rekeyBuffers(buffers, ircNames, MAX_HISTORY_LINES);
   buffers.clear();
   for (const [key, buffer] of rekeyed) buffers.set(key, buffer);
   for (const set of [namesSnapshots, namesRequested, requestedJoins]) {
@@ -635,7 +638,11 @@ function ensureBuffer(name, kind) {
     unread: 0,
     mentions: 0,
     pendingVisibleMessages: 0,
-    historyLoaded: false,
+    // Paging back (historyQuery): the cursor the last page handed back, and
+    // whether storage holds nothing older; how many rows paging brought in.
+    historyBefore: undefined,
+    historyExhausted: false,
+    historyRows: 0,
     historyLoading: false,
     transcriptEpoch: 0,
     joined: kind === "channel" ? false : null,
@@ -1131,7 +1138,7 @@ function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null,
     mention: false,
     identity: messageIdentity(tags),
     wire,
-    // The ring position before this row's line (see oldestRingFloor): the line
+    // The ring position before this row's line (see historyQuery): the line
     // being handled has not yet moved the cursor past it, and a local echo's
     // own ring line comes after every line already received.
     ringFloor: replayCursor,
@@ -1150,8 +1157,14 @@ function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null,
   const counts = countsAsUnread(line) && !(replaying && replayIsHistory) && !mine;
   if (!replaying && isSaid(line) && !mine) maybeNotify(b, line);
   b.lines.push(line);
-  const lineLimit = b.historyLoaded ? MAX_LOADED_LINES : MAX_LINES;
-  if (b.lines.length > lineLimit) b.lines.shift();
+  const lineLimit = Math.min(MAX_HISTORY_LINES, MAX_LINES + b.historyRows);
+  if (b.lines.length > lineLimit) {
+    b.lines.shift();
+    // The buffer no longer begins where the last page ended: the next page is
+    // joined to its new oldest row instead (historyQuery), never past a gap.
+    b.historyBefore = undefined;
+    b.historyExhausted = false;
+  }
   if (b.key === active) {
     const atLatest = isAtLatest();
     messagesEl.appendChild(messageRow(line));
@@ -2881,60 +2894,68 @@ function keepNetworkListCurrent() {
 
 // ---- load earlier history ----------------------------------------------
 
-// "Load earlier" is offered for a conversation (channel or direct message)
-// whose earlier history has not been read yet, and says so while it is being
-// read. It is one control shared by every conversation, so it is drawn from
-// the open one each time: drawn from the request, it stayed disabled and
-// reading "Loading…" in whatever conversation the person moved to meanwhile.
+// "Load earlier" pages back through one conversation (a channel or a direct
+// message) until storage holds nothing older or the window is full, and says
+// so while a page is being read. It is one control shared by every
+// conversation, so it is drawn from the open one each time: drawn from the
+// request, it stayed disabled and reading "Loading…" in whatever
+// conversation the person moved to meanwhile.
 function renderLoadEarlier() {
   const button = el("load-earlier");
   const b = buffers.get(active);
-  button.hidden = !(network && b && b.kind !== "server" && !b.historyLoaded);
+  button.hidden = !(network && b && b.kind !== "server" && !b.historyExhausted && b.lines.length < MAX_HISTORY_LINES);
   button.disabled = Boolean(b?.historyLoading);
   button.textContent = b?.historyLoading ? "Loading…" : "Load earlier messages";
 }
 
-// Pull the network's persisted backlog and prepend the active buffer's older
-// messages. Persisted and live raw lines retain any upstream identity tags;
-// exact ordered wire overlap handles servers that do not send msgids. One-shot
-// per buffer.
+// Read one page of a conversation's history (the server's ring, then its
+// stored backlog), older than everything the buffer holds.
+async function readHistoryPage(b, query, limit) {
+  const parameters = new URLSearchParams({ target: b.display, limit: String(limit), ...query });
+  return apiGet(`/api/v1/me/networks/${encodeURIComponent(network)}/history?${parameters}`);
+}
+
+// Pull the next older page of the open conversation and join it in front of
+// what it holds. The server decides what is older -- by the socket position
+// before the buffer's oldest row, by a cursor its last page handed back, or by
+// the exact text of the oldest row it sent -- so nothing is matched by
+// content here beyond what `joinHistory` names.
 async function loadEarlier() {
   const b = buffers.get(active);
-  if (!network || !b || b.kind === "server" || b.historyLoaded || b.historyLoading) return;
+  if (!network || !b || b.kind === "server" || b.historyExhausted || b.historyLoading) return;
+  const room = MAX_HISTORY_LINES - b.lines.length;
+  if (room <= 0) return;
   b.historyLoading = true;
   renderLoadEarlier();
-  // What the answer is merged into must still be what it was read against:
+  // What the answer is joined to must still be what it was read against:
   // a replay that starts the transcript over (clearTranscript), the
   // conversation being closed, or another network being opened while the
   // request is out each make it an answer to a question nobody is asking now,
-  // and merged anyway it put lines in the transcript twice.
+  // and joined anyway it put lines in the transcript twice.
   const epoch = b.transcriptEpoch;
   const current = () => buffers.get(b.key) === b && b.transcriptEpoch === epoch;
   const settle = () => {
     b.historyLoading = false;
     if (b.key === active) renderLoadEarlier();
   };
-  // Every ring line after the buffer's oldest row's floor is already a row
-  // here (oldestRingFloor), so history is read through that position and holds
-  // nothing twice. An empty buffer holds nothing yet: everything up to the
-  // socket's cursor is earlier. The server refuses a position it cannot bound
-  // (the network restarted, or is stopped and its lines are persisted
-  // history); only then is history read whole and matched at the seam.
-  const floor = oldestRingFloor(b.lines);
-  const through = floor === undefined ? replayCursor : floor;
-  const page = `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`;
-  let lines = [];
-  let bounded = false;
+  // Rows that arrive while the page is read are newer than all of it; storage
+  // may already hold them.
+  const readFrom = receivedRows;
+  let query = historyQuery(b, replayCursor);
+  const limit = Math.min(HISTORY_PAGE, room);
+  let page;
   try {
-    if (through) {
-      try {
-        lines = backlogFrom(await apiGet(`${page}&through=${encodeURIComponent(through)}`));
-        bounded = true;
-      } catch (error) {
-        if (!(error instanceof ApiError && error.status === 409)) throw error;
-      }
+    try {
+      page = await readHistoryPage(b, query, limit);
+    } catch (error) {
+      // The socket position no longer joins the ring to what is held (the
+      // network restarted or stopped, or the ring moved past it): join at the
+      // oldest line the server sent instead.
+      if (!(error instanceof ApiError && error.status === 409 && "before" in query)) throw error;
+      const seam = historySeam(b.lines);
+      query = seam ? { seam: seam.seam, held: String(seam.held) } : {};
+      page = await readHistoryPage(b, query, limit);
     }
-    if (!bounded) lines = backlogFrom(await apiGet(page));
   } catch (error) {
     settle();
     if (current()) showAlert("history", errorMessage("load earlier messages", error), "error");
@@ -2951,17 +2972,11 @@ async function loadEarlier() {
   }
   clearAlert("history");
   const rebuilt = [];
-  for (const raw of lines) {
+  for (const raw of page.lines) {
     const m = parseIrc(raw);
-    const route = chatMessageRoute(
-      m,
-      myNick,
-      (candidate) => b.kind === "channel" && fold(candidate) === b.key,
-      ircNames,
-    );
-    if (!route || route.kind !== b.kind || fold(route.target || "") !== b.key) continue;
-    const kind = m.command === "NOTICE" ? "notice" : "msg";
-    const rendered = asMessage(kind, m.nick, m.params[1] ?? "");
+    // A tag-only message has nothing to show.
+    if (m.command !== "PRIVMSG" && m.command !== "NOTICE") continue;
+    const rendered = asMessage(m.command === "NOTICE" ? "notice" : "msg", m.nick, m.params[1] ?? "");
     rebuilt.push({
       ...lineTime(m.tags, false),
       from: rendered.from,
@@ -2973,18 +2988,17 @@ async function loadEarlier() {
       wire: raw,
     });
   }
-  // History is older context, never authority over the live buffer. Messages
-  // can arrive while this request is in flight, and local echoes may not exist
-  // in persisted input at all, so replacing `b.lines` loses user-visible data.
+  const arrived = b.lines.filter((line) => line.order > readFrom && line.wire).map((line) => line.wire);
+  const echoes = "seam" in query ? echoesBeforeSeam(b.lines, isMe) : [];
   const held = b.lines.length;
-  b.lines = bounded
-    ? prependHistory(rebuilt, b.lines, MAX_LOADED_LINES)
-    : mergeTimeline(rebuilt, b.lines, MAX_LOADED_LINES, isMe);
-  b.historyLoaded = true;
-  // The control goes away either way; without a word, a read that found
-  // nothing looked like a button that did nothing.
+  b.lines = joinHistory(rebuilt, b.lines, { arrived, echoes, isMine: isMe });
+  b.historyRows += b.lines.length - held;
+  b.historyBefore = page.before ?? undefined;
+  b.historyExhausted = page.before === null;
   if (b.lines.length <= held) {
     showAlert("history", `No earlier messages in ${bufferLabel(b)} are held by the server.`);
+  } else if (b.lines.length >= MAX_HISTORY_LINES) {
+    showAlert("history", `${bufferLabel(b)} now holds the most rows it can, ${MAX_HISTORY_LINES}.`);
   }
   // Loading older context is an explicit reader action. Keep that context in
   // view instead of snapping back to the live edge where it cannot be seen.

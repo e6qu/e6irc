@@ -764,3 +764,255 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
         other => panic!("no close frame after the terminal status: {other:?}"),
     }
 }
+
+/// "Load earlier" pages back through one conversation: the running ring
+/// first, then the stored backlog the ring has evicted, joined without a
+/// line twice or missing — identical lines included — and from storage alone
+/// at a held line when no ring position can say where the reader begins.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
+    let url =
+        support::test_db("conversation_history_pages_from_the_ring_into_storage_exactly").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "web").await.expect("token");
+    // What an earlier run of the network stored.
+    let buffer = e6ircd::db::open_bnc_buffer(
+        &pool,
+        Some("alice"),
+        "up",
+        e6ircd::db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    for (millis, body) in [(1, "stored-1"), (2, "stored-2")] {
+        e6ircd::db::persist_bnc_line(
+            &pool,
+            &buffer,
+            Some("alicebnc"),
+            &format!("@time=2026-01-01T00:00:00.00{millis}Z :peer!u@h PRIVMSG #lobby :{body}"),
+            &e6irc_client::NetworkNames::default(),
+        )
+        .await
+        .expect("seed");
+    }
+    drop(pool);
+
+    let up = upstream().await;
+    let config = Config {
+        server_name: "irc.web.example".into(),
+        network_name: "Web".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        networks: vec![NetworkEntry {
+            kind: e6ircd::config::NetworkKind::Irc,
+            name: "up".into(),
+            owner: Some("alice".into()),
+            addr: up.to_string(),
+            tls: false,
+            nick: "alicebnc".into(),
+            username: Some("tester".into()),
+            realname: Some("alicebnc".into()),
+            autojoin: vec!["#lobby".into()],
+            // A ring this small has evicted most of the conversation by the
+            // time it is paged, so the pages have to continue into storage.
+            buffer_cap: 4,
+            sasl_account: None,
+            sasl_password: None,
+            server_password: None,
+        }],
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+        server_password: None,
+    })
+    .await
+    .unwrap();
+    peer.send_line("JOIN #lobby").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    // Two identical lines back to back: identical text is not identity, and
+    // both must come back once each.
+    let said = [
+        "live-1", "live-2", "live-3", "live-4", "live-5", "same", "same", "live-6",
+    ];
+    for body in said {
+        peer.send_line(&format!("PRIVMSG #lobby :{body}"))
+            .await
+            .unwrap();
+    }
+    peer.send_line("PRIVMSG #elsewhere :not this conversation")
+        .await
+        .unwrap();
+    let expected: Vec<&str> = ["stored-1", "stored-2"].into_iter().chain(said).collect();
+
+    let get = |query: String| {
+        let token = token.clone();
+        async move {
+            let (status, body) = http_req(
+                http,
+                &format!(
+                    "GET /api/v1/me/networks/up/history?target=%23lobby&{query} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+            (status, value)
+        }
+    };
+    let bodies = |lines: &serde_json::Value| -> Vec<String> {
+        lines
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|line| {
+                let line = line.as_str().expect("line");
+                line.rsplit_once(" :").expect("a message").1.to_string()
+            })
+            .collect()
+    };
+
+    // The newest page of storage, once everything said is stored.
+    let newest = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let (status, page) = get("limit=500".into()).await;
+            assert_eq!(status, 200, "{page}");
+            if bodies(&page["lines"]) == expected {
+                return page;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the conversation is never stored whole");
+    assert_eq!(newest["before"], serde_json::Value::Null, "nothing older");
+
+    // A reader holding nothing pages back from its socket's position.
+    let mut socket = {
+        let mut req = "ws://HOST/ws/ui?network=up"
+            .replace("HOST", &http.to_string())
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        tokio_tungstenite::connect_async(req)
+            .await
+            .expect("ws/ui connect")
+            .0
+    };
+    let events = events_until_snapshot(&mut socket).await;
+    let position = events
+        .last()
+        .and_then(|event| event["cursor"].as_str())
+        .expect("boundary cursor")
+        .to_string();
+    let mut pages = Vec::new();
+    let mut before = position.clone();
+    loop {
+        let (status, page) = get(format!("limit=3&before={}", before.replace(':', "%3A"))).await;
+        assert_eq!(status, 200, "{page}");
+        pages.push(bodies(&page["lines"]));
+        match page["before"].as_str() {
+            Some(next) => before = next.to_string(),
+            None => break,
+        }
+        assert!(pages.len() < 10, "paging never ends: {pages:?}");
+    }
+    let joined: Vec<String> = pages.iter().rev().flatten().cloned().collect();
+    assert_eq!(joined, expected, "pages: {pages:?}");
+    assert!(
+        pages.len() >= 3,
+        "the ring and storage both took part: {pages:?}"
+    );
+
+    // A position the ring has evicted past cannot be joined to what the
+    // reader holds; it is told to read with `seam` instead.
+    let epoch = position.split_once(':').expect("cursor").0;
+    let (status, refusal) = get(format!("before={epoch}%3A1")).await;
+    assert_eq!(status, 409, "{refusal}");
+    assert_eq!(refusal["field"], "before", "{refusal}");
+
+    // From storage alone, at a line the reader holds.
+    let held = newest["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .find(|line| line.ends_with(":live-3"))
+        .expect("live-3 stored");
+    let seam: String = url_encode(held);
+    let (status, page) = get(format!("seam={seam}&held=1&limit=500")).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(
+        bodies(&page["lines"]),
+        ["stored-1", "stored-2", "live-1", "live-2"]
+    );
+    assert_eq!(page["before"], serde_json::Value::Null);
+    let (status, refusal) =
+        get("seam=%3Anobody%20PRIVMSG%20%23lobby%20%3Anever&held=1".into()).await;
+    assert_eq!(status, 409, "{refusal}");
+    assert_eq!(refusal["field"], "seam", "{refusal}");
+
+    // Requests that say two things, or nothing usable.
+    for (query, field) in [
+        ("held=1".to_string(), "held"),
+        (format!("seam={seam}&before=row%3A1"), "seam"),
+        ("before=row%3Anot-a-row".to_string(), "before"),
+        ("before=nonsense".to_string(), "before"),
+    ] {
+        let (status, refusal) = get(query.clone()).await;
+        assert_eq!(status, 400, "{query}: {refusal}");
+        assert_eq!(refusal["field"], field, "{query}: {refusal}");
+    }
+}
+
+/// `value` as one URL query component.
+fn url_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
