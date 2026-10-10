@@ -104,7 +104,9 @@ survive process restart.
    keeps; storage is joined to the ring at the row the conversation's oldest
    ring line was stored at — by its ring position, or, for a line a new epoch
    restored elsewhere, by its exact millisecond-stamped text and the number of
-   identical copies the ring holds — and then pages by storage order. When no
+   identical copies the ring holds — and then pages by storage order. A busy
+   channel that makes room in the ring from the middle takes its own oldest
+   lines, so a quiet conversation still pages back exactly. When no
    ring position can say where the reader's transcript begins (after a crash,
    on a stopped network, or once the ring moved past it) the server answers
    409 and the client joins at the exact text of the oldest line it was sent. Nothing is matched by content beyond

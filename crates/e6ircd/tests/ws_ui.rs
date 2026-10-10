@@ -962,6 +962,64 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
     running.shutdown.run(net::StopMode::Final).await;
 }
 
+/// A busy channel makes room in the ring from the middle — its own oldest
+/// lines go, not the quiet conversation's — and "Load earlier" still pages
+/// the quiet conversation back exactly, through the ring and into storage.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn conversation_history_pages_exactly_after_a_busy_channel_floods_the_ring() {
+    let url =
+        support::test_db("conversation_history_pages_exactly_after_a_busy_channel_floods_the_ring")
+            .await;
+    let token = history_account(&url).await;
+    let up = upstream().await;
+    let mut config = history_config(&url, up, 8);
+    config.networks[0].autojoin.push("#busy".into());
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    membership::wait_joined(up, "alicebnc", "#busy").await;
+    let (mut peer, expected) = converse(up).await;
+    peer.send_line("JOIN #busy").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    for n in 0..40 {
+        peer.send_line(&format!("PRIVMSG #busy :flood {n}"))
+            .await
+            .unwrap();
+    }
+    let busy_stored = async || {
+        let (status, body) = http_req(
+            http,
+            &format!(
+                "GET /api/v1/me/networks/up/history?target=%23busy&limit=1 HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        status == 200 && body.contains("flood 39")
+    };
+    tokio::time::timeout(deadline::HANG, async {
+        while !busy_stored().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the flood is never stored");
+    stored_whole(http, &token, &expected).await;
+
+    let position = snapshot_cursor(http, &token).await;
+    let pages = page_back(http, &token, &position).await;
+    assert_eq!(
+        pages.iter().rev().flatten().cloned().collect::<Vec<_>>(),
+        expected,
+        "{pages:?}"
+    );
+    running.shutdown.run(net::StopMode::Final).await;
+}
+
 /// The cursors "Load earlier" pages from are ring positions, which a clean
 /// restart keeps (migration 0102): a reader's cursor from before it still
 /// names its place, and pages on exactly. Before it, lines a crashed run

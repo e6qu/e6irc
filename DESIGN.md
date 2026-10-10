@@ -4735,7 +4735,17 @@ conversation's oldest ring line: the row stored at that line's ring position
 the row with its exact millisecond-stamped text, past as many byte-identical
 copies as the ring holds (a line storage failed to keep moves the join to the
 next one it did keep). That is sound only while the ring still holds every line
-after the reader's cursor; otherwise, after a crash, or on a stopped network,
+of the conversation after the reader's cursor. A conversation's lines leave the
+ring oldest first, from the front or from its share (§8: a busy channel makes
+room from its own oldest lines, in the middle of the ring), so the ring holds
+its newest lines with none missing between, and the server knows the newest
+position each conversation let go of — and, for a ring a clean restart
+continued, the newest position storage let go of (migration 0103), which it
+takes as every conversation's. A page the ring fills to its limit names the
+cursor before its oldest line, so the next joins storage there. The page waits
+for the network's stored backlog to be restored into its ring, as an attach
+does: before, a restarted network's ring was not yet the one the cursor names.
+Otherwise, after a crash, or on a stopped network,
 the server answers 409 and the client joins at the exact text of the oldest
 line the server sent it (`seam`, with how many identical copies it holds).
 Storage pages by row id, the order the ring held its lines in: positions repeat
