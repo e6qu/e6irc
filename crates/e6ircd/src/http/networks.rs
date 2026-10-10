@@ -1059,9 +1059,11 @@ pub(super) async fn network_account_command(
         crate::bouncer::SendOutcome::Full => retry_later(
             "Upstream command queue is full",
             "nothing was sent; retry after the interval in the Retry-After header",
-            retry_after_seconds(handle.full_queue_retry_after()),
+            retry_after_seconds(crate::bouncer::UPSTREAM_WRITE_DEADLINE),
         ),
-        crate::bouncer::SendOutcome::Closed | crate::bouncer::SendOutcome::Unavailable => problem(
+        crate::bouncer::SendOutcome::Closed
+        | crate::bouncer::SendOutcome::Unavailable
+        | crate::bouncer::SendOutcome::Disconnected => problem(
             StatusCode::CONFLICT,
             "IRC network is not connected",
             Some("nothing was sent; repair or enable the network before registering an account"),

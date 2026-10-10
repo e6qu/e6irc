@@ -2059,17 +2059,30 @@ Principal tables (columns abridged):
   from a driver and restored backlog from this table — remove CR/LF/NUL and
   cap one entry to the IRC wire limit. A replay cannot inject a second line or
   make the bounded buffer retain an unbounded entry.
-  Retention is per (owner, network): the persistence task counts its own
-  appends and trims to the newest `BNC_BUFFER_CAP` (5,000) rows, and of those
-  to the newest `BNC_BUFFER_BYTES` (5,000 × 512 bytes), at every
+  Retention is per (owner, network), shared out by conversation: the
+  persistence task counts its own appends and trims to `BNC_BUFFER_CAP`
+  (5,000) rows, and of those to `BNC_BUFFER_BYTES` (5,000 × 512 bytes), in
+  the order the buffer keeps its rows (`bnc_kept_order!`): the newest row of
+  every conversation (its `target`; the lines of none share one) before the
+  second newest of any, so a busy channel gives up its own older lines
+  before a quiet channel or a private conversation gives up its newest, at every
   `BNC_TRIM_INTERVAL` — a thousand ordinary lines, each line weighing one per
   512 bytes it holds (`bnc_trim_weight`), so a trim is also due after half a
   megabyte of long ones. The upstream decides how long its lines are; counted
   only in rows, 5,000 lines of eight kilobytes of tags each stood. The
   in-memory backlog is held to the same rate: `buffer_cap` lines and
-  `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), oldest first,
-  its newest line always kept, on every push and when a stored backlog is
-  restored. A start restores a network's whole `buffer_cap` from this table:
+  `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), shared out the
+  same way (`Share`: room is made from the conversation holding the most,
+  its oldest line first, and the session's own `NICK`/`JOIN`/`PART` and
+  session boundaries go only from the front, where the replay's head state
+  takes them in), its newest line always kept, on every push and when a
+  stored backlog is restored; a resume cursor before a line let go of from
+  the middle is refused, and that client replays the whole ring — across a
+  restart that continues the ring too: a trim records the newest position it
+  let go of (`let_go_through`, migration 0103), and a continued ring refuses a
+  cursor before it, or before a stored line its restore left out. A start
+  restores a network's whole `buffer_cap` from this table, in the order it
+  keeps its rows:
   `buffer_cap` is bounded by what the table keeps (`MAX_NETWORK_BUFFER_CAP`,
   the constant `BNC_BUFFER_CAP` is), so the replay the setting promises
   survives a restart. It used to accept 100,000 while the table kept 5,000 and
@@ -3117,11 +3130,19 @@ above the trait, provides for every network kind:
   channel's state for every client — and which the session follows from then
   on through every `JOIN`, `PART`, `KICK`, `QUIT`, `NICK`, membership `MODE`
   and `TOPIC` (at most 20,000 memberships per session; a channel past that
-  has its list unknown). A client's `NAMES` of one channel whose list the
-  session follows is answered from it, to that client, as soju answers one:
-  the browser asks for every joined channel's list on each connect, and each
-  question would otherwise be a line of the upstream's flood allowance
-  (§10.3). Each attachment's route holds 1,024
+  has its list unknown). The session follows each channel's settings too:
+  the `irc` driver asks each channel it joins for them once (`MODE #chan`,
+  answered with `324` and `329`), only while no attached client's command
+  waits, and every `MODE` since keeps them; a channel whose member list
+  ended with no `332` before it has no topic. A client's `NAMES`, `MODE` or
+  `TOPIC` of one channel the session follows is answered from it, to that
+  client, as soju and ZNC answer them: clients ask them of every channel
+  they are shown joined — irssi and WeeChat `MODE` and `NAMES`, the browser
+  `NAMES` — and asked of the upstream, an attach of a client in a hundred
+  channels held the queue every attached client shares for minutes at the
+  upstream's flood allowance (§10.3), and past the queue's bound dropped the
+  questions. A list mode (`MODE #chan b`), `WHO` and anything the session
+  does not know yet are the upstream's, paced as before. Each attachment's route holds 1,024
   lines; a reply read more slowly than the network sends it loses the rest,
   for that client alone, and it is told how many. The `/ws/ui` socket has a
   route like a raw attach. A sender's own messages reach the
@@ -3191,6 +3212,26 @@ above the trait, provides for every network kind:
   backlog and to every attached client. The bouncer's own numerics to an
   attached client (`409`, `907`, `421`, a `CAP` reply) are addressed to the
   nick that client has now, not the one it was welcomed under.
+- **Nothing waits for a session that is not there**: a line any client (an
+  attachment, the browser, the API) sends while the network is connecting
+  or reconnecting is refused at once (`SendOutcome::Disconnected`), its
+  sender told which line by its command and target — `your message to #chan
+  was not sent: the network is not connected` — as ZNC ("Your message got
+  lost") and soju ("Disconnected from upstream network") refuse it. It used
+  to wait in the queue for the next session and was sent then: minutes
+  later, or hours while a ban or a throttle was retried, out of every
+  context it was written in. A line already queued when a session ends is
+  told unsent the same way, to its sender alone, as soon as the driver
+  publishes that it is reconnecting or parked (`DriverEnds::refuse_queued`),
+  never by its text, which may be a password for services. A session
+  registered under the alternative nickname is a session: what is sent waits
+  for the configured nickname (§10.3), bounded by the regain window, and is
+  told unsent if it never comes back. A full queue is therefore only ever a
+  connected upstream's flood allowance, which drains within the upstream
+  write deadline: the API's `429` says that in `Retry-After`, and a send to
+  a network that is not connected is the API's `409`. The bridges share the
+  queue and the rule; a message a bridge already accepted for delivery is
+  carried across its sessions as before.
 - **Attach status**: an attaching client is told the network's state up
   front, after its welcome: connected, or the lifecycle it is in with the
   failure and the upstream's own words (the lifecycle notice of that
@@ -3209,7 +3250,11 @@ above the trait, provides for every network kind:
   attachment ends as too slow, where a parked write used to hide the network's
   removal and the client's silence from the relay for good.
 - **Detached buffering**: events accumulate in a per-network ring persisted
-  to PostgreSQL. Every line is stamped at ingest with the time it arrived when
+  to PostgreSQL, each conversation holding a share of its own (§8: a busy
+  channel used to evict, oldest first, the private message the owner had not
+  read yet; now it gives up its own older lines first, and the network's cap
+  and bytes still bound the whole, as ZNC's per-buffer and soju's
+  per-target history do). Every line is stamped at ingest with the time it arrived when
   it carries no valid `time` of its own — the upstream's lines on a network
   without `server-time` (EFnet, IRCnet, QuakeNet), and the bouncer's own
   notices — so the ring's replay, the stored `sent_at` and CHATHISTORY read one
@@ -3232,7 +3277,14 @@ above the trait, provides for every network kind:
   separate from the ircd core's per-account markers (§11) because a BNC
   target lives on an external network the core knows nothing about.
 - **Playback**: attaching clients receive the detached ring,
-  tag-filtered by their negotiated caps. A raw IRC client presents no cursor,
+  tag-filtered by their negotiated caps. A client that did not negotiate
+  `server-time` would show every replayed message as said now, so each
+  replayed `PRIVMSG` and `NOTICE` carries its time at the head of its text,
+  as ZNC replays a buffer: `[HH:MM:SS]` in UTC, `[YYYY-MM-DD HH:MM:SS]` when
+  it was not said today, after `ACTION ` for a `/me`, the text cut to fit the
+  line; a CTCP reply, membership and numerics are replayed as they are, and
+  live lines are never changed. A client with `server-time` is sent the
+  `time` tag instead. A raw IRC client presents no cursor,
   so its account's read markers (`bnc_read_markers`, the `draft/read-marker`
   positions it set with `MARKREAD`) are its position, conversation by
   conversation: a message of a conversation the account has a marker for is
@@ -4296,8 +4348,9 @@ any other): the per-address
 authentication budget gives the seconds until its bucket holds a token again,
 the `/ws/irc` per-address connection cap the registration timeout (the soonest
 a slot held by an unregistered connection is reclaimed), and a full upstream
-command queue the upstream write deadline (by which the queue has drained or
-the upstream has been declared dead).
+command queue the upstream write deadline (the queue fills only while the
+upstream is connected, and has drained by then or the upstream has been
+declared dead).
 Every URL query and form is closed: unknown fields are rejected before a
 handler runs. The one exception is the OIDC callback, whose query is the
 provider's authorization response rather than this server's API: RFC 6749

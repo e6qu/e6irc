@@ -449,7 +449,7 @@ pub async fn verify_attached_client(
                     .expect("attach read")
                     .expect("attach closed");
                 let theirs =
-                    line.ends_with(" :hello from Discord") || line.ends_with(" :hello from Slack");
+                    line.ends_with("hello from Discord") || line.ends_with("hello from Slack");
                 if !theirs && !line.starts_with(":*bnc* NOTICE") {
                     return line;
                 }

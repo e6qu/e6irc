@@ -426,11 +426,18 @@ PLAIN.
    is then told its topic and members as the session knows them (asked of
    the upstream, for at most two channels, when the session does not know
    them). If the client negotiated read markers, its stored channel position
-   arrives before 366.
+   arrives before 366. The `MODE`, `NAMES` and `TOPIC` a client then asks of
+   each channel are answered by the bouncer from the session, so a client in
+   a hundred channels does not hold the network's paced queue for minutes.
 7. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 
-**Visible failures and recovery.** Missing SASL, malformed/chunked payload
+**Visible failures and recovery.** A line sent while the network is
+connecting or reconnecting is refused at once with a `*bnc*` notice naming
+it (`your message to #chan was not sent: the network is not connected`), and
+a line still queued when the session drops is told unsent the same way; the
+user resends once the network is back, instead of the line going out
+whenever the next session happens to start. Missing SASL, malformed/chunked payload
 errors, bad credentials, credential-store unavailability, absent/disabled network, registry failure, and
 cross-account selection are refused before attachment. An unavailable
 upstream may still allow stored backlog replay, but it is not described as a
@@ -467,10 +474,14 @@ driver receives upstream lines while no BNC or web client is attached.
    stale `VERSION` again), and each channel's topic and member list (the
    session's state, told to each attaching client from the session).
 2. With PostgreSQL, a persistence task stores wire-preserving lines under the
-   owner/network key and trims the network’s history to its cap.
+   owner/network key and trims the network’s history to its cap, sharing it
+   out by conversation: a busy channel gives up its own older lines before a
+   private message or a quiet channel loses its newest.
 3. On driver start, recent rows preload oldest-first into the bounded buffer.
 4. A later BNC or web attachment replays that stream before following live
-   output.
+   output. A client that did not negotiate `server-time` sees each replayed
+   message with its time at the head of its text (`[09:05:03]`, with the
+   date when it was not today, in UTC), as ZNC shows a buffer.
 5. Deleting a network purges its casefolded buffer; another network’s history
    is untouched.
 

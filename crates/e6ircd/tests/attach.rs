@@ -464,8 +464,8 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
 }
 
 /// With echo-message negotiated on attach, the originator receives exactly
-/// one copy of its own message (synthesized — the upstream is never asked
-/// for echo-message, so no second echo can arrive).
+/// one copy of its own message: the upstream's echo when it offers
+/// echo-message, else the one the driver synthesizes — never both.
 #[tokio::test(flavor = "multi_thread")]
 async fn self_echo_delivered_once_when_negotiated() {
     let addr = upstream().await;
@@ -525,9 +525,10 @@ async fn next_driver_command(ends: &mut e6ircd::bouncer::DriverEnds) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn attached_client_quit_ends_the_attachment_and_never_reaches_the_driver() {
     let (handle, mut ends) = NetworkHandle::channels(8);
+    ends.emit(e6ircd::bouncer::ConnectionEvent::Connected);
     let handle = std::sync::Arc::new(handle);
     let (mut reader, mut writer, task) = attach_client(&handle, Default::default());
-    read_until(&mut reader, "upstream connecting").await;
+    read_until(&mut reader, "connected").await;
 
     writer.write_all(b"QUIT :leaving\r\n").await.unwrap();
     tokio::time::timeout(deadline::HANG, task)
@@ -563,9 +564,10 @@ async fn attached_client_quit_ends_the_attachment_and_never_reaches_the_driver()
 #[tokio::test(flavor = "multi_thread")]
 async fn attached_client_ping_is_answered_locally_and_pong_is_consumed() {
     let (handle, mut ends) = NetworkHandle::channels(8);
+    ends.emit(e6ircd::bouncer::ConnectionEvent::Connected);
     let handle = std::sync::Arc::new(handle);
     let (mut reader, mut writer, _task) = attach_client(&handle, Default::default());
-    read_until(&mut reader, "upstream connecting").await;
+    read_until(&mut reader, "connected").await;
 
     writer
         .write_all(b"PING :lag 1234\r\nPONG :unsolicited\r\nPRIVMSG #room :marker\r\n")
@@ -576,6 +578,39 @@ async fn attached_client_ping_is_answered_locally_and_pong_is_consumed() {
     assert_eq!(
         next_driver_command(&mut ends).await,
         "PRIVMSG #room :marker"
+    );
+}
+
+/// A line sent while the network has no session is refused at once, as ZNC
+/// and soju refuse it, rather than queued for whenever the next session comes;
+/// the client is told which line, and the driver never sees it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_sent_while_the_network_is_not_connected_is_refused_not_queued() {
+    let (handle, mut ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let (mut reader, mut writer, _task) = attach_client(&handle, Default::default());
+    read_until(&mut reader, "upstream connecting").await;
+
+    writer
+        .write_all(b"PRIVMSG #room :typed during the outage\r\n")
+        .await
+        .unwrap();
+    let refused = read_until(&mut reader, "was not sent").await;
+    assert_eq!(
+        refused,
+        ":*bnc* NOTICE * :your message to #room was not sent: the network is not \
+         connected (it is connecting or reconnecting)\r\n"
+    );
+    ends.emit(e6ircd::bouncer::ConnectionEvent::Connected);
+    read_until(&mut reader, "connected").await;
+    writer
+        .write_all(b"PRIVMSG #room :marker\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        next_driver_command(&mut ends).await,
+        "PRIVMSG #room :marker",
+        "the refused line never reached the driver"
     );
 }
 
