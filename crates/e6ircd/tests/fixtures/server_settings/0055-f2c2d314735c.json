@@ -35,24 +35,24 @@
     {
       "account_claim": "preferred_username",
       "allowed_email_domains": [],
-      "client_id": "e6irc-dev",
+      "client_id": "e6irc",
       "client_secret": "",
-      "end_session_endpoint": "https://auth.dev.e6qu.dev/oauth2/sessions/logout",
-      "issuer_url": "https://auth.dev.e6qu.dev",
+      "end_session_endpoint": "https://auth.example.com/oauth2/sessions/logout",
+      "issuer_url": "https://auth.example.com",
       "name": "shauth",
       "scopes": [],
       "token_endpoint_auth_method": "client_secret_post"
     }
   ],
   "opers": [],
-  "public_url": "https://e6irc.dev.e6qu.dev",
+  "public_url": "https://irc.example.com",
   "registration": {
     "before_connect": false,
     "require_email": false
   },
   "secure_cookies": true,
   "sendq": 1024,
-  "server_name": "e6irc.dev.e6qu.dev",
+  "server_name": "irc.example.com",
   "storage": {
     "audit_retention_days": 365,
     "history_retention_days": 30

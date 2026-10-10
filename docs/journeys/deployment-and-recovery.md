@@ -124,8 +124,7 @@ when archives are requested.
 - The container's command is `e6ircd --config-from-environment`; the
   configuration is built in memory and never written to disk.
 - `deploy/` documents the environment-variable deployment contract and ships
-  a hardened systemd service for native Linux installation. The Terraform/ECS
-  example lives in the separate `e6qu/infra` repository, not in this one.
+  a hardened systemd service for native Linux installation.
 - A tag exactly equal to `v` plus the workspace version builds `e6ircd`,
   `e6irc`, and `e6irc-tui` natively for Linux, macOS, and Windows on x86-64
   and ARM64. The six deterministic archives include documentation/license and
