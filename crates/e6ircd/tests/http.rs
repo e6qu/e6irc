@@ -323,6 +323,66 @@ async fn device_authorization_requires_an_absolute_public_url() {
     assert!(body.contains("Device authorization unavailable"), "{body}");
 }
 
+/// The device endpoints are OAuth form endpoints (RFC 8628 over RFC 6749),
+/// whose §3.1 says a parameter the server does not recognise is ignored and
+/// none may be sent twice: an unknown parameter reaches the request's next
+/// check, and a repeated one is `invalid_request` before anything else.
+#[tokio::test]
+async fn device_endpoints_ignore_unknown_parameters_and_refuse_repeated_ones() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let form_post = |path: &str, body: &str| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let oauth_error = |body: &str| {
+        serde_json::from_str::<serde_json::Value>(body).expect("an OAuth error is JSON")["error"]
+            .as_str()
+            .expect("error code")
+            .to_string()
+    };
+    const GRANT: &str = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code";
+
+    // Accepted past the form: this server has no public URL to advertise.
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/start",
+            "client_id=e6irc-test&audience=ignored",
+        ),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("Device authorization unavailable"), "{body}");
+    // Accepted past the form: this server has no database to poll.
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/token",
+            &format!("{GRANT}&device_code=d&client_id=e6irc-test&resource=ignored"),
+        ),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+
+    for (path, form) in [
+        (
+            "/api/v1/auth/device/start",
+            "client_id=e6irc-test&client_id=another".to_owned(),
+        ),
+        (
+            "/api/v1/auth/device/token",
+            format!("{GRANT}&device_code=d&device_code=e&client_id=e6irc-test"),
+        ),
+    ] {
+        let (status, _, body) = request(http, &form_post(path, &form)).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        assert_eq!(oauth_error(&body), "invalid_request", "{path}");
+    }
+}
+
 #[tokio::test]
 async fn bootstrap_routes_are_closed_when_not_configured() {
     let running = net::start(test_config()).await.expect("start");
@@ -8640,10 +8700,17 @@ async fn device_authorization_grant_flow() {
         "a device code is its own client's"
     );
 
-    // poll before approval -> authorization_pending
+    // poll before approval -> authorization_pending. A parameter the token
+    // endpoint does not define is ignored (RFC 6749 §3.1), not refused.
     let tok_body = poll_body(&device_code);
-    let (status, headers, body) =
-        request(http, &form_post("/api/v1/auth/device/token", &tok_body)).await;
+    let (status, headers, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/token",
+            &format!("{tok_body}&resource=https%3A%2F%2Fignored.example"),
+        ),
+    )
+    .await;
     assert_eq!(status, 400);
     assert_eq!(oauth_error(&body), "authorization_pending");
     assert!(
