@@ -1,6 +1,8 @@
 import playwrightTest from "playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { RECORD_COMMAND, baselineDirectory, recordingBaselines } from "./visual-baselines.js";
 
 const { expect, test } = playwrightTest;
 
@@ -47,6 +49,23 @@ const ircNetwork = (name, extra = {}) => ({
 // the contract: a hand-written schema drifts and then passes while the product
 // is broken.
 const apiContract = await readFile(new URL("fixtures/openapi.json", import.meta.url), "utf8");
+
+const recording = recordingBaselines();
+
+// Compare `page` with its baseline. A missing baseline fails here, naming the
+// platform's directory and the record step, rather than as Playwright's
+// "writing actual": a normal run records nothing.
+async function expectScreenshot(page, name, options) {
+  const baseline = test.info().snapshotPath(name, { kind: "screenshot" });
+  if (!recording && !existsSync(baseline)) {
+    throw new Error(
+      `visual suite: no ${process.platform} baseline ${name} in web/${baselineDirectory()}. ` +
+        `Record this platform's baselines with \`${RECORD_COMMAND}\` (refused in CI), look ` +
+        "at them, and run the suite again to compare.",
+    );
+  }
+  await expect(page).toHaveScreenshot(name, options);
+}
 
 async function expectAccessible(page) {
   const results = await new AxeBuilder({ page }).include("#app").analyze();
@@ -176,7 +195,7 @@ test("identity entry uses the shared relay-desk system", async ({ page }) => {
   await setStyledFixture(page, "identity-entry.html", styles);
 
   await expectAccessible(page);
-  await expect(page).toHaveScreenshot("identity-entry-light.png", { animations: "disabled", fullPage: true });
+  await expectScreenshot(page, "identity-entry-light.png", { animations: "disabled", fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await expectAccessible(page);
@@ -192,7 +211,7 @@ test("console shell keeps operations dense and legible", async ({ page }) => {
   await setStyledFixture(page, "console-overview.html", styles);
 
   await expectAccessible(page);
-  await expect(page).toHaveScreenshot("console-overview-light.png", { animations: "disabled", fullPage: true });
+  await expectScreenshot(page, "console-overview-light.png", { animations: "disabled", fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await expectAccessible(page);
@@ -860,7 +879,7 @@ test("network picker renders the empty account state", async ({ page }) => {
   await expect(page.getByRole("list", { name: "Messages" })).toHaveAttribute("tabindex", "0");
   await expect(page.getByRole("button", { name: "Join channel" })).toBeDisabled();
   await expectAccessible(page);
-  await expect(page).toHaveScreenshot("network-picker-empty-light.png", {
+  await expectScreenshot(page, "network-picker-empty-light.png", {
     animations: "disabled",
     fullPage: true,
   });
@@ -959,7 +978,7 @@ test("the one network list shows typed states and opens a runnable network by it
   await expect(page.getByRole("combobox", { name: "Active network" })).toHaveCount(0);
   await expect(page.getByLabel("Messages").getByRole("link")).toHaveCount(0);
   await expectAccessible(page);
-  await expect(page).toHaveScreenshot("network-picker-tablet.png", {
+  await expectScreenshot(page, "network-picker-tablet.png", {
     animations: "disabled",
     fullPage: true,
     mask: [page.locator("#messages .ts")],
@@ -1431,7 +1450,7 @@ test("network picker distinguishes an unavailable API on narrow dark screens", a
   await expect(page.getByRole("alert")).toContainText("Network service unavailable");
   await expect(page.getByRole("link", { name: "Retry" })).toBeVisible();
   await expectAccessible(page);
-  await expect(page).toHaveScreenshot("network-picker-unavailable-dark-narrow.png", {
+  await expectScreenshot(page, "network-picker-unavailable-dark-narrow.png", {
     animations: "disabled",
     fullPage: true,
   });

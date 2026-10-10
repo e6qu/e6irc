@@ -1,35 +1,24 @@
-import { existsSync } from "node:fs";
 import playwrightTest from "playwright/test";
+import { baselineDirectory, recordingBaselines } from "./test/visual-baselines.js";
 
 const { defineConfig, devices } = playwrightTest;
 
-// The committed baselines are macOS renders (CI's visual-regression job runs
-// on macos-15), and font rasterization differs by platform. Elsewhere the
-// screenshots live under a platform directory of their own (ignored by git):
-// a Linux run compares against Linux renders, and `--update-snapshots` there
-// can never overwrite the baselines CI holds.
+// The committed baselines are macOS renders; elsewhere the screenshots live
+// in a platform directory of their own, ignored by git, so `--update-snapshots`
+// there can never overwrite the baselines CI holds (test/visual-baselines.js).
 const snapshots =
   process.platform === "darwin"
     ? "{testDir}/__snapshots__/{testFilePath}/{arg}{ext}"
     : "{testDir}/__snapshots__/{testFilePath}/{platform}/{arg}{ext}";
 
-// A platform's first run has no renders of its own to compare with, and
-// Playwright fails every screenshot test whose baseline is missing even while
-// it writes one ("A snapshot doesn't exist … writing actual") — so a fresh
-// checkout's first run failed each screenshot test once and the next passed,
-// which read as flaky tests. When this platform's directory does not exist
-// yet, the run records it and says so; from then on a missing or different
-// render fails as it should. macOS always compares with the committed
-// baselines.
-const platformBaselines = new URL(
-  `./test/__snapshots__/visual.spec.js/${process.platform}/`,
-  import.meta.url,
-);
-const recordPlatformBaselines = process.platform !== "darwin" && !existsSync(platformBaselines);
-if (recordPlatformBaselines) {
+// A normal run compares and never writes: Playwright's default would write a
+// missing baseline (and fail that once), so the next run passed against a
+// render nobody looked at. Only the explicit record step writes.
+const recording = recordingBaselines();
+if (recording) {
   console.log(
-    `visual suite: no ${process.platform} screenshots yet; this run records them in ` +
-      `${platformBaselines.pathname} and compares nothing. Run it again to compare.`,
+    `visual suite: RECORDING ${process.platform} baselines into web/${baselineDirectory()}: ` +
+      "this run compares nothing. Run `pnpm -C web test:visual` to compare against them.",
   );
 }
 
@@ -45,7 +34,7 @@ export default defineConfig({
   testMatch: "visual.spec.js",
   reporter: "list",
   snapshotPathTemplate: snapshots,
-  updateSnapshots: recordPlatformBaselines ? "all" : "missing",
+  updateSnapshots: recording ? "all" : "none",
   use: {
     ...devices["Desktop Chrome"],
     baseURL: `http://127.0.0.1:${port}`,
