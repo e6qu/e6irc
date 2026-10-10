@@ -45,8 +45,12 @@ grep -qx 'LimitCORE=0' "$unit" || {
 # SHUTDOWN_CORE_STOP_TIMEOUT, THEN the client connections deliver their closing
 # ERROR for up to SHUTDOWN_CONNECTION_DRAIN_TIMEOUT, THEN the database flushes
 # for up to SHUTDOWN_DB_FLUSH_TIMEOUT, THEN the serving lease is given back for
-# up to SHUTDOWN_LEASE_RELEASE_TIMEOUT. The unit's stop budget must exceed the
-# sum, or systemd can kill a shutdown that was still clean.
+# up to SHUTDOWN_LEASE_RELEASE_TIMEOUT. In edge mode SIGTERM is a handover
+# (DESIGN §19.3, D16), whose cut runs after the listeners close and before the
+# drivers stop: each of its steps waits at most a cap, the caps listed between
+# two markers in crates/e6ircd/src/edge_link/held.rs, and the cut is stopped at
+# their sum. The unit's stop budget must exceed the whole sum, or systemd can
+# kill a shutdown — or a cut — that was still clean.
 stop_seconds="$(sed -n 's/^TimeoutStopSec=\([0-9][0-9]*\)s$/\1/p' "$unit")"
 flush_seconds="$(sed -n 's/.*const SHUTDOWN_DB_FLUSH_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
 drain_seconds="$(sed -n 's/.*const SHUTDOWN_CORE_STOP_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
@@ -54,13 +58,27 @@ driver_seconds="$(sed -n 's/.*const SHUTDOWN_DRIVER_STOP_TIMEOUT.*from_secs(\([0
 connection_seconds="$(sed -n 's/.*const SHUTDOWN_CONNECTION_DRAIN_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
 release_seconds="$(sed -n 's/.*const SHUTDOWN_LEASE_RELEASE_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
 listener_seconds="$(sed -n 's/.*const SHUTDOWN_LISTENER_CLOSE_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
+handover_file="crates/e6ircd/src/edge_link/held.rs"
+handover_caps="$(sed -n "/^\/\/ ---- The handover's caps\./,/^\/\/ ---- End of the handover's caps\./s/.*const [A-Z_]*: Duration = Duration::from_secs(\([0-9][0-9]*\));.*/\1/p" "$handover_file")"
+if [ -z "$handover_caps" ]; then
+  echo "could not read the handover's caps between the markers in $handover_file" >&2
+  exit 1
+fi
+handover_seconds=0
+for cap in $handover_caps; do
+  handover_seconds=$((handover_seconds + cap))
+done
+if ! grep -q 'crate::edge_link::HANDOVER_BOUND' crates/e6ircd/src/net.rs; then
+  echo "crates/e6ircd/src/net.rs no longer stops the cut at HANDOVER_BOUND, the sum this check budgets" >&2
+  exit 1
+fi
 if [ -z "$stop_seconds" ] || [ -z "$flush_seconds" ] || [ -z "$drain_seconds" ] || [ -z "$driver_seconds" ] || [ -z "$connection_seconds" ] || [ -z "$release_seconds" ] || [ -z "$listener_seconds" ]; then
   echo "could not resolve the systemd stop budget or the daemon's listener-close/driver-stop/drain/connection/flush/lease-release budgets" >&2
   exit 1
 fi
-budget=$((listener_seconds + driver_seconds + drain_seconds + connection_seconds + flush_seconds + release_seconds))
+budget=$((listener_seconds + handover_seconds + driver_seconds + drain_seconds + connection_seconds + flush_seconds + release_seconds))
 if [ "$stop_seconds" -le "$budget" ]; then
-  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${listener_seconds}s listener close plus ${driver_seconds}s driver stop plus ${drain_seconds}s core drain plus ${connection_seconds}s connection drain plus ${flush_seconds}s database flush plus ${release_seconds}s lease release (${budget}s)" >&2
+  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${listener_seconds}s listener close plus ${handover_seconds}s handover plus ${driver_seconds}s driver stop plus ${drain_seconds}s core drain plus ${connection_seconds}s connection drain plus ${flush_seconds}s database flush plus ${release_seconds}s lease release (${budget}s)" >&2
   exit 1
 fi
 

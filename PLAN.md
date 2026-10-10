@@ -1714,7 +1714,14 @@ other phase is scheduled in the order below.
   `[edge] core_absence_limit_seconds` (D12's ten minutes unless stated); the
   `local` driver's session homed at the cut on an edge that holds it and
   taken up by its driver after the rebuild without registering again (D13,
-  `Home` and `HomeUpload`); and the restart-at-every-step test, twice in a
+  `Home` and `HomeUpload`), the commands queued for it sent past the command
+  allowance while the cut settles and, once the cut freezes it, refused to
+  their senders through the not-sent notice rather than lost or sent into a
+  cut shard; an attachment's last-told upstream status kept as its value, so
+  a restart neither repeats nor suppresses a status notice; every wait of the
+  cut capped, the caps summed into `HANDOVER_BOUND` (84 s) at which the cut
+  is stopped, and the stop-budget guard summing the same caps into the
+  unit's `TimeoutStopSec` (150 s); and the restart-at-every-step test, twice in a
   row after each step, run through an edge over real links rather than the
   `CoreScheduler`. irctest runs through an edge without a restart in the
   middle of a test: the restart-at-every-step test is the restart evidence
@@ -1757,8 +1764,9 @@ other phase is scheduled in the order below.
   refuses to start when the module is unavailable, and has its own Linux
   zero-drop scenario.
 - **Phase 9 — deployment and qualification.** systemd units, Compose,
-  Kubernetes manifests and `deploy/README.md`; DESIGN §18's edge mode; the
-  stop-budget guard gains the handover budget; the chaos soak; the 100k
+  Kubernetes manifests and `deploy/README.md`; DESIGN §18's edge mode (the
+  stop-budget guard already sums the handover's caps, phase 4); the chaos
+  soak; the 100k
   scale qualification with its gap measurement; the journey that proves the
   outcome (`docs/journeys/`). *Green because* documentation, guards and
   measurement.

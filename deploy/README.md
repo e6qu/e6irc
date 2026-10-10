@@ -87,12 +87,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now e6ircd
 ```
 
-The unit uses SIGTERM and a 65-second stop budget, exceeding the daemon’s
-bounded shutdown — up to 15 seconds telling every bouncer network's upstream
+The unit uses SIGTERM and a 150-second stop budget, exceeding the daemon’s
+bounded shutdown — in edge mode up to 84 seconds handing every client over to
+the next core, then up to 15 seconds telling every bouncer network's upstream
 goodbye, then up to 5 seconds draining the core shards, then up to 8 seconds
 letting client connections deliver their closing `ERROR`, then up to 30
 seconds flushing PostgreSQL ([Stop timeout](#stop-timeout)) — so systemd cannot
-kill a still-clean shutdown first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
+kill a still-clean shutdown, or a handover, first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
 daemon in milliseconds, and systemd's default limit of five starts in ten
 seconds would otherwise leave the unit permanently failed after a reboot where
 PostgreSQL comes up later than e6irc; restarts stay two seconds apart and each
@@ -352,7 +353,15 @@ Read these before deploying a release that includes the change named.
 
 ## Stop timeout
 
-On SIGTERM the daemon stops accepting work, tells every bouncer network's
+On SIGTERM the daemon stops accepting work. In edge mode it then hands its
+clients over to the next core (DESIGN §19.3): each step of that cut waits at
+most a fixed cap — up to 35 seconds for a rebuild still under way, 5 for
+every edge to pause, 10 for the work in flight to settle and 2 to close what
+did not, 5 to close the sessions no edge holds, 2 for the local bouncer
+sessions to stop sending, 5 to cut the core shards, 5 for the local sessions'
+records, 10 for every edge to take what is left and the cut, and 5 to record
+the cut — and the whole cut is stopped at their sum, 84 seconds, after which
+every session ends loudly instead. The daemon then tells every bouncer network's
 upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so the
 next process to serve does not meet its session there still logged in),
 drains its core shards for at most 5 seconds, lets every client connection
@@ -362,10 +371,12 @@ back for at most 5 seconds, so a standby takes over at once. A process that is
 killed instead says no goodbye: its upstream sessions end when the upstream
 notices the dropped connection, and until then the next process to serve
 finds its nick held there — it registers under the alternative nickname and
-takes the configured one back once the ghost is gone or NickServ regains it. Give the container at least 65 seconds
+takes the configured one back once the ghost is gone or NickServ regains it. Give the container at least 150 seconds
 before it is killed, as
-`e6ircd.service` does: `stopTimeout: 65` (or more) in the ECS container
-definition, `docker stop --time 65`, or `stop_grace_period: 65s` in Compose.
+`e6ircd.service` does: `stopTimeout: 150` (or more) in the ECS container
+definition, `docker stop --time 150`, or `stop_grace_period: 150s` in Compose.
+`tools/check-systemd-unit.sh` sums the cut's caps from the code with the other
+steps, so this budget and the code cannot drift apart.
 The Docker default of 10 seconds and the ECS default of 30 can both kill a
 shutdown that was still flushing cleanly.
 
@@ -494,7 +505,7 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   optional BNC listener an administrator can enable in the console is a TCP
   port of its own, needs a host that can publish one, and off loopback needs a
   certificate the container can read ([BNC attach listener](#bnc-attach-listener)).
-- **A stop timeout of at least 65 seconds** ([Stop timeout](#stop-timeout)).
+- **A stop timeout of at least 150 seconds** ([Stop timeout](#stop-timeout)).
 - **Outbound network access** to PostgreSQL, to the OpenID Connect issuer, and
   — for always-on networks and bridges — to the IRC networks (TCP 6697 for the
   curated ones), Matrix homeservers, Discord, and Slack. On an account's

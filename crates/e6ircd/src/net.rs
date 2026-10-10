@@ -310,18 +310,33 @@ impl ShutdownHandle {
                     .lease
                     .as_ref()
                     .map_or(0, |lease| u64::try_from(lease.epoch()).unwrap_or(0));
-                let handover = links.cut(cut, epoch).await;
-                eprintln!(
-                    "e6ircd: handed over to the next core: cut {:#x}, {} edges hold the \
-                     sessions, {} of the core's own homed on one ({} closed as unsettled, {} \
-                     that no edge holds closed)",
-                    cut.get(),
-                    handover.edges.len(),
-                    handover.homed,
-                    handover.unsettled,
-                    handover.unheld
-                );
-                true
+                // Each step of the cut waits at most its cap; the whole is
+                // stopped at their sum, the unit's stop budget's share for it.
+                match tokio::time::timeout(crate::edge_link::HANDOVER_BOUND, links.cut(cut, epoch))
+                    .await
+                {
+                    Ok(handover) => {
+                        eprintln!(
+                            "e6ircd: handed over to the next core: cut {:#x}, {} edges hold \
+                             the sessions, {} of the core's own homed on one ({} closed as \
+                             unsettled, {} that no edge holds closed)",
+                            cut.get(),
+                            handover.edges.len(),
+                            handover.homed,
+                            handover.unsettled,
+                            handover.unheld
+                        );
+                        true
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "e6ircd: the cut did not finish within {}s; every session ends \
+                             with this core",
+                            crate::edge_link::HANDOVER_BOUND.as_secs()
+                        );
+                        false
+                    }
+                }
             }
             _ => false,
         };

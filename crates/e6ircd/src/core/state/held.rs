@@ -739,6 +739,12 @@ impl ServerState {
                 Some("a registration")
             } else if session.history_requests_in_flight > 0 {
                 Some("a CHATHISTORY page")
+            } else if session.multiline.is_some()
+                && session.transport == crate::core::ConnectionTransport::Local
+            {
+                // An edge's session has the batch's lines retained and
+                // replayed; the core's own has no edge to replay them.
+                Some("a multiline batch")
             } else if [&session.channel_list, &session.channel_names]
                 .into_iter()
                 .flatten()

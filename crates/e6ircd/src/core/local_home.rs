@@ -93,6 +93,8 @@ pub(crate) struct LocalHomes {
     state: Mutex<Homes>,
     /// How many sessions a rebuild resumed are not yet taken up.
     restoring: Arc<tokio::sync::watch::Sender<usize>>,
+    /// Where a cut stands, as the drivers follow it.
+    phase: tokio::sync::watch::Sender<CutPhase>,
 }
 
 impl Default for LocalHomes {
@@ -101,8 +103,34 @@ impl Default for LocalHomes {
             homing: AtomicBool::default(),
             state: Mutex::default(),
             restoring: Arc::new(tokio::sync::watch::Sender::new(0)),
+            phase: tokio::sync::watch::Sender::new(CutPhase::Serving),
         }
     }
+}
+
+/// Where a cut stands for the core's own sessions: what each driver does
+/// with the commands its attachments queue (DESIGN §19.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutPhase {
+    /// No cut: commands go to the core at the session's command allowance.
+    Serving,
+    /// The cut is settling: every queued command goes to the core at once,
+    /// past the allowance, so the queue drains before the shards are cut.
+    Settling,
+    /// The shards are about to be cut: a command still queued, or queued
+    /// later, is refused to its sender, never sent into a cut shard.
+    Frozen,
+}
+
+/// Where one session's driver stands in a cut, as it last said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverStand {
+    /// Not relaying: no attachment's command reaches it.
+    Away,
+    /// Relaying, between commands, with commands queued or not.
+    Relaying { queued: bool },
+    /// Saw the freeze between commands: it sends the core nothing more.
+    Frozen,
 }
 
 #[derive(Default)]
@@ -113,6 +141,7 @@ struct Homes {
 
 struct Homed {
     key: LocalHomeKey,
+    stand: DriverStand,
     /// What says the shard published something not yet taken.
     signal: HeldSignal,
     record: Option<(u64, Bytes)>,
@@ -141,6 +170,7 @@ impl LocalHomes {
             conn,
             Homed {
                 key,
+                stand: DriverStand::Away,
                 signal: edge.held_signal(),
                 record: None,
             },
@@ -148,6 +178,57 @@ impl LocalHomes {
         FollowedHome {
             homes: self.clone(),
             conn,
+        }
+    }
+
+    /// Where a cut stands, for a driver to follow.
+    pub(crate) fn phase(&self) -> tokio::sync::watch::Receiver<CutPhase> {
+        self.phase.subscribe()
+    }
+
+    /// `conn`'s driver says where it stands.
+    pub(crate) fn stand(&self, conn: ConnId, stand: DriverStand) {
+        if let Some(homed) = self.state.lock().expect("local homes").live.get_mut(&conn) {
+            homed.stand = stand;
+        }
+    }
+
+    /// The cut begins settling: drivers send what is queued at once.
+    pub(crate) fn settle(&self) {
+        self.phase.send_replace(CutPhase::Settling);
+    }
+
+    /// Whether no driver has a command queued or in hand.
+    pub(crate) fn quiet(&self) -> bool {
+        self.state
+            .lock()
+            .expect("local homes")
+            .live
+            .values()
+            .all(|homed| homed.stand != DriverStand::Relaying { queued: true })
+    }
+
+    /// Freeze the core's own sessions before the shards are cut: each driver,
+    /// between commands, refuses what is still queued and everything after,
+    /// and says so. Waits at most `bound`; the sessions whose drivers did not
+    /// say so, which may still send a line the cut shard drops — named.
+    pub(crate) async fn freeze(&self, bound: std::time::Duration) -> Vec<ConnId> {
+        self.phase.send_replace(CutPhase::Frozen);
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let unfrozen: Vec<ConnId> = self
+                .state
+                .lock()
+                .expect("local homes")
+                .live
+                .iter()
+                .filter(|(_, homed)| matches!(homed.stand, DriverStand::Relaying { .. }))
+                .map(|(conn, _)| *conn)
+                .collect();
+            if unfrozen.is_empty() || tokio::time::Instant::now() >= deadline {
+                return unfrozen;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }
 

@@ -5986,9 +5986,13 @@ Layers, bottom to top:
   `E6IRC_PREVIOUS_SECRET_KEYS` included; a source test refuses a
   `std::env` read anywhere else in the daemon.
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
-  — the bouncer drivers' stop (their goodbye and their last backlog write),
+  — the listeners' close, then in edge mode the handover's cut (§19.3: each
+  of its waits capped, the caps written between two markers in
+  `edge_link/held.rs` and the cut stopped at their sum, `HANDOVER_BOUND`),
+  then the bouncer drivers' stop (their goodbye and their last backlog write),
   then the core drain, then the connection drain, then the PostgreSQL flush,
-  then the lease's release; the guard sums the five constants, and holds the budget `deploy/README.md`
+  then the lease's release; the guard sums those constants and every cap
+  between the markers, so systemd never kills a process mid-cut, and holds the budget `deploy/README.md`
   states and the one `tools/test-production-container.sh` stops the image with
   to the unit's `TimeoutStopSec`. The unit sets `StartLimitIntervalSec=0` (asserted by the same
   guard): a refused first database connection fails the daemon in
@@ -6426,19 +6430,36 @@ phase rewrites.
     answer them twice.
   - *The cut* (`LinkServer::cut`, on `e6ircd stop --handover` or, in edge
     mode, SIGTERM — D16): a core still rebuilding finishes first (at most
-    60 s), so what it cuts is whole; then it sends `Pause` on every stream
+    35 s), so what it cuts is whole; then it sends `Pause` on every stream
     its input flows on — `Resume` and `Pause` go under one lock per stream,
     so each goes at most once and in order, and a stream never resumed is
-    paused as it is — and waits up to 5 s for each `Paused`, which follows
-    every line the edge sent before it; waits up to 10 s until every line is handled, nothing passes between
-    shards and no database round trip is awaited, then closes each session
-    still waiting, loudly (`server restarting: a request did not complete`);
-    cuts every shard, which republishes every record and replica and handles
-    nothing more; homes the core's own sessions on the first edge holding
-    the cut (below); lets each stream's pumps send what their sessions were
-    last given (10 s); sends the cut state — WHOWAS, the LUSERS maximum, the
+    paused as it is — and waits up to 5 s, for every stream at once, for each
+    `Paused`, which follows every line the edge sent before it. It then
+    settles, for up to 10 s: every line is handled, nothing passes between
+    shards, no database round trip is awaited, and every command an
+    attachment queued for one of the core's own sessions (the `local`
+    driver's) is sent — at once, past the session's command allowance — and
+    no local session holds an open multiline batch. Each session still
+    waiting is then closed, loudly (`server restarting: a request did not
+    complete`), within 2 s. The sessions no edge holds are closed (5 s), and
+    the local drivers are frozen (2 s): each says, between two commands,
+    that it sends nothing more, and a command queued for it after that is
+    refused to its sender through the not-sent notice (`… was not sent: the
+    server is restarting; send it again once it is back`), never sent into a
+    cut shard and never lost silently. Carrying such a command to the next
+    core is not exact — its origin is an attachment of this process — so it
+    is refused instead. The cut then cuts every shard (5 s), which
+    republishes every record and replica and handles nothing more; homes the
+    core's own sessions on the first edge holding the cut (below; 5 s for
+    their records); lets each stream's pumps send what their sessions were
+    last given and sends the cut state — WHOWAS, the LUSERS maximum, the
     account-creation buckets and the edges cut — on the first stream and
-    `Cut { cut, epoch }` on every stream; and records the cut in the roster.
+    `Cut { cut, epoch }` on every stream, all within 10 s, an edge whose
+    link does not take it all in time ending as lost; and records the cut in
+    the roster (5 s). Each wait is a cap written between two markers in
+    `edge_link/held.rs`; the cut is stopped at their sum (`HANDOVER_BOUND`,
+    84 s) whatever it waits on, and `tools/check-systemd-unit.sh` adds that
+    sum to the stop budget (§18), so systemd never kills a process mid-cut.
     Drivers, the core, the database flush and the lease release then run as
     for any stop, and no client hears a word.
   - *The edge holds.* An edge whose every stream ended with the same `Cut`
@@ -6768,7 +6789,7 @@ phase rewrites.
   | Bouncer networks and owner holds | database, as today | same |
   | Driver rings | `bnc_buffer` restore, with the ring epoch and sequence number made durable (a per-network epoch on `bnc_networks`, the sequence number on each row), so a `ReplayCursor` from before the restart stays valid | lines not yet persisted are a gap: attachments behind it get the existing gap notice |
   | Upstream session state (`IrcSessionSnapshot`, reply router, echo table, nick regain) | edge-held upstream: the upstream record (§19.4); core-held: re-dialled | §19.4 |
-  | Attachment and `/ws/ui` state (network, capabilities, shown nick, delivered cursor, composer authority) | record; the `AccountLease` is re-taken, and one refused to a revoked account ends the attachment as revoked | same |
+  | Attachment and `/ws/ui` state (network, capabilities, shown nick, delivered cursor, composer authority, the upstream status it was last told) | record; the `AccountLease` is re-taken, and one refused to a revoked account ends the attachment as revoked; the status is kept as its value (lifecycle and failure code), so a resumed attachment is told the upstream status only when it differs — never twice, never skipped | same |
 
 - **Nothing new is written to PostgreSQL per event.** The only new tables and
   columns are the `core_edges` roster (edge identifier, slot, last epoch
@@ -6927,7 +6948,8 @@ preference:
   the gap), health-checked by `e6ircd healthcheck --edge`. A core service of
   two tasks, reached through internal service discovery health-checked on
   `/readyz`, so only the holder is a target. A core rolling update starts the
-  new task and then stops the old one (a stop timeout of at least 65 s); an
+  new task and then stops the old one (a stop timeout of at least 150 s, the
+  bounded handover included); an
   edge upgrade is the overlap drain, since a container restart keeps no
   descriptor.
 - **Kubernetes.** Edges as a Deployment or DaemonSet behind a `LoadBalancer`

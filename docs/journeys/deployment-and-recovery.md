@@ -149,8 +149,9 @@ members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
 incomplete archive set. `systemd-analyze verify` checks the service in CI,
 the same gate (`tools/check-systemd-unit.sh`) requires its stop budget to
-exceed the sum of the daemon's four shutdown budgets — bouncer-driver stop,
-core drain, connection drain, and database flush — and holds the budget
+exceed the sum of the daemon's shutdown budgets — listener close, the edge
+handover's capped cut, bouncer-driver stop, core drain, connection drain,
+database flush, and lease release — and holds the budget
 `deploy/README.md` states and the one the production-container test stops with
 to the unit's, and
 `crates/e6ircd/tests/config_cli.rs` drives the binary's environment-stated configuration:

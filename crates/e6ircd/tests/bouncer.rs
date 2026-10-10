@@ -1001,20 +1001,14 @@ async fn driver_authenticates_to_sasl_upstream() {
     wait_connected(&handle, &mut events).await;
     // The mechanism is chosen, not configured, so the owner is told which one
     // carried the password: e6ircd offers PLAIN and OAUTHBEARER, and PLAIN is
-    // the password mechanism among them.
-    let told = tokio::time::timeout(deadline::HANG, async {
-        loop {
-            if let Ok(e6ircd::bouncer::DriverEvent::Line(line)) = events.recv().await
-                && line.line.contains("logged in as bncacct with SASL PLAIN")
-            {
-                return;
-            }
-        }
-    })
-    .await;
+    // the password mechanism among them. The notice precedes `Connected`, so
+    // it is read from the backlog, never from the events the wait consumed.
+    let backlog = handle.buffer_snapshot();
     assert!(
-        told.is_ok(),
-        "the driver never said which mechanism logged in"
+        backlog
+            .iter()
+            .any(|line| line.contains("upstream logged in as bncacct with SASL PLAIN")),
+        "the driver never said which mechanism logged in: {backlog:?}"
     );
 
     // Connected implies SASL success (register_sasl errors on 904, so

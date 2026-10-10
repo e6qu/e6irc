@@ -63,20 +63,64 @@ pub(crate) const ROSTER_WAIT: Duration = Duration::from_secs(30);
 /// holds a cut links within it.
 const DISCOVERY_WAIT: Duration = Duration::from_secs(1);
 
-/// How long a cut waits for each stream's `Paused`.
-const PAUSE_WAIT: Duration = Duration::from_secs(5);
+// ---- The handover's caps. Each step of a cut waits at most its cap, and
+// `tools/check-systemd-unit.sh` sums every `from_secs` between this line and
+// the end marker into the unit's stop budget, so systemd never kills a
+// process mid-cut. A new wait in the cut is a new cap here.
 
 /// How long a cut asked of a core still rebuilding waits for the rebuild: the
 /// wait for the edges, then the rebuild itself.
-const REBUILD_FINISH_WAIT: Duration = Duration::from_secs(2 * ROSTER_WAIT.as_secs());
+const REBUILD_FINISH_WAIT: Duration = Duration::from_secs(35);
+
+/// How long a cut waits for every stream's `Paused`, all at once.
+const PAUSE_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a cut waits for the work in flight to settle before it closes
 /// the sessions still waiting.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
 
-/// How long a cut waits for each stream's pumps to send what is left, and
-/// for the core's own sessions to take their records.
+/// How long closing the sessions that did not settle may take.
+const SETTLE_CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the shards may take to close the sessions no edge holds.
+const UNHELD_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the core's own sessions' drivers may take to stop sending.
+const FREEZE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the shards may take to be cut.
+const SHARD_CUT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the core's own sessions may take to take the records the cut
+/// published.
+const GATHER_WAIT: Duration = Duration::from_secs(5);
+
+/// How long every stream's pumps may take to send what is left, and every
+/// edge's link to take the cut, all at once.
 const FLUSH_WAIT: Duration = Duration::from_secs(10);
+
+/// How long the roster may take to record the cut.
+const ROSTER_RECORD_WAIT: Duration = Duration::from_secs(5);
+
+// ---- End of the handover's caps.
+
+// A cut asked while the next core waits for its edges outlasts that wait.
+const _: () = assert!(REBUILD_FINISH_WAIT.as_secs() > ROSTER_WAIT.as_secs());
+
+/// The longest a cut takes: the sum of its caps. A cut is stopped at it
+/// whatever it is waiting on.
+pub(crate) const HANDOVER_BOUND: Duration = Duration::from_secs(
+    REBUILD_FINISH_WAIT.as_secs()
+        + PAUSE_WAIT.as_secs()
+        + SETTLE_WAIT.as_secs()
+        + SETTLE_CLOSE_WAIT.as_secs()
+        + UNHELD_WAIT.as_secs()
+        + FREEZE_WAIT.as_secs()
+        + SHARD_CUT_WAIT.as_secs()
+        + GATHER_WAIT.as_secs()
+        + FLUSH_WAIT.as_secs()
+        + ROSTER_RECORD_WAIT.as_secs(),
+);
 
 /// How long a session of the core's own that a rebuild resumed waits for its
 /// network's driver — which starts once the rebuild is over — before it is
@@ -1370,7 +1414,9 @@ pub(crate) struct Handover {
 
 impl LinkServer {
     /// Cut every link gracefully: pause, settle, cut the shards, flush and
-    /// send the cut. The core's shards handle nothing afterwards.
+    /// send the cut. The core's shards handle nothing afterwards. Each step
+    /// waits at most its cap (the caps above), so the whole takes at most
+    /// [`HANDOVER_BOUND`].
     pub(crate) async fn cut(&self, cut: CutId, epoch: u64) -> Handover {
         let registrations: Vec<Arc<Registration>> = self
             .edges
@@ -1391,6 +1437,7 @@ impl LinkServer {
             );
         }
         let mut handover = Handover::default();
+        let homes = self.core_tx.directories().held.homes;
         // 0. A core still rebuilding what its edges hold finishes first: what
         //    it cuts is then whole, and the streams it resumes are resumed
         //    before they are paused.
@@ -1405,7 +1452,7 @@ impl LinkServer {
                 REBUILD_FINISH_WAIT.as_secs()
             );
         }
-        // 1. Pause every stream, and hear it pause.
+        // 1. Pause every stream, and hear it pause, all within one wait.
         let mut paused = Vec::new();
         for registration in &holding {
             let streams: Vec<Arc<SessionStream>> = registration
@@ -1421,14 +1468,16 @@ impl LinkServer {
                 paused.push((registration.clone(), stream, answered));
             }
         }
+        let pause_deadline = tokio::time::Instant::now() + PAUSE_WAIT;
         let mut holding_paused = Vec::new();
         for (registration, stream, answered) in paused {
-            let heard = match stream.pause().await {
-                Pausing::Asked => {
-                    matches!(tokio::time::timeout(PAUSE_WAIT, answered).await, Ok(Ok(())))
-                }
-                Pausing::NeverResumed => true,
-                Pausing::Gone => false,
+            let heard = match tokio::time::timeout_at(pause_deadline, stream.pause()).await {
+                Ok(Pausing::Asked) => matches!(
+                    tokio::time::timeout_at(pause_deadline, answered).await,
+                    Ok(Ok(()))
+                ),
+                Ok(Pausing::NeverResumed) => true,
+                Ok(Pausing::Gone) | Err(_) => false,
             };
             if !heard {
                 eprintln!(
@@ -1450,36 +1499,51 @@ impl LinkServer {
             .filter(|registration| !matches!(*registration.over.borrow(), Some(LinkEnd::Lost)))
             .collect();
         // 2. Settle: every line handed to its shard, nothing between shards,
-        //    no database round trip awaited.
-        handover.unsettled = self.settle(&holding).await;
+        //    no database round trip awaited, and every command an attachment
+        //    queued for the core's own sessions sent — at once, past the
+        //    command allowance.
+        homes.settle();
+        let settle_deadline = tokio::time::Instant::now() + SETTLE_WAIT;
+        handover.unsettled = self.settle(&holding, settle_deadline).await;
         // 2b. The core's own sessions — the `local` driver's — are homed on
         //     the first edge that holds the cut, and their memberships (slot
         //     0's replicas) go there from now on (D13). A session no edge
         //     holds — one on a version 1 link, or the core's own with no edge
         //     to home it on — ends now, loudly, so its channels see it go
         //     before the cut rather than keep it with no session behind it;
-        //     then the quits settle.
+        //     then the quits settle, within the same wait.
         let home = holding.first().cloned();
         *self.edges.local_home.lock().expect("local home") = home
             .as_ref()
             .map(|registration| registration.view.slot.get());
         match self
             .core_tx
-            .close_unheld("server restarting", home.is_some())
+            .close_unheld("server restarting", home.is_some(), UNHELD_WAIT)
             .await
         {
             Ok(0) => {}
             Ok(closed) => {
                 handover.unheld = closed;
-                handover.unsettled += self.settle(&holding).await;
+                handover.unsettled += self.settle(&holding, settle_deadline).await;
             }
             Err(error) => {
                 eprintln!("e6ircd: the sessions no edge holds could not be closed: {error}")
             }
         }
+        // 2c. The core's own sessions send nothing more: a command still
+        //     queued for one is refused to its sender, never sent into a cut
+        //     shard.
+        for conn in homes.freeze(FREEZE_WAIT).await {
+            eprintln!(
+                "e6ircd: the local session {} was still sending after {}s; a line it sends now \
+                 meets a cut shard",
+                conn.0,
+                FREEZE_WAIT.as_secs()
+            );
+        }
         // 3. Cut every shard: the records and replicas are published whole,
         //    and nothing is handled afterwards.
-        let buckets = match self.core_tx.cut().await {
+        let buckets = match self.core_tx.cut(SHARD_CUT_WAIT).await {
             Ok(buckets) => buckets,
             Err(error) => {
                 eprintln!("e6ircd: the core could not be cut ({error}); every session ends");
@@ -1510,14 +1574,7 @@ impl LinkServer {
         //     home edge.
         let mut homed: HashMap<u16, Vec<CoreFrame>> = HashMap::new();
         if home.is_some() {
-            let records = self
-                .core_tx
-                .directories()
-                .held
-                .homes
-                .gathered(FLUSH_WAIT)
-                .await;
-            for record in records {
+            for record in homes.gathered(GATHER_WAIT).await {
                 let Some(frames) = home_frames(&record, format, origin) else {
                     continue;
                 };
@@ -1531,7 +1588,10 @@ impl LinkServer {
             }
         }
         // 4. Each stream: its pumps send what is left and stop; the first
-        //    stream carries the cut state; every stream ends with the cut.
+        //    stream carries the cut state; every stream ends with the cut —
+        //    every stream within one wait. An edge whose link does not take
+        //    it all in time is not cut: its sessions end with this core.
+        let flush_deadline = tokio::time::Instant::now() + FLUSH_WAIT;
         for registration in &holding {
             let streams: Vec<Arc<SessionStream>> = registration
                 .streams
@@ -1540,10 +1600,11 @@ impl LinkServer {
                 .values()
                 .cloned()
                 .collect();
+            let mut sent_all = true;
             for stream in streams {
                 stream.cutting.send_replace(true);
                 drop(stream.pumps.lock().expect("stream pumps").take());
-                let flushed = tokio::time::timeout(FLUSH_WAIT, async {
+                let flushed = tokio::time::timeout_at(flush_deadline, async {
                     stream.pumps_done.lock().await.recv().await;
                 })
                 .await
@@ -1555,7 +1616,7 @@ impl LinkServer {
                     .expect("replica forwarder")
                     .take();
                 if let Some(forwarder) = forwarder {
-                    drop(tokio::time::timeout(FLUSH_WAIT, forwarder).await);
+                    drop(tokio::time::timeout_at(flush_deadline, forwarder).await);
                 }
                 if !flushed {
                     eprintln!(
@@ -1565,40 +1626,69 @@ impl LinkServer {
                         FLUSH_WAIT.as_secs()
                     );
                 }
+                let mut frames = Vec::new();
                 if home
                     .as_ref()
                     .is_some_and(|home| Arc::ptr_eq(home, registration))
                 {
-                    for frame in homed.remove(&stream.index).unwrap_or_default() {
-                        drop(stream.out.send(frame).await);
-                    }
+                    frames.extend(homed.remove(&stream.index).unwrap_or_default());
                 }
                 if stream.index == 0 {
-                    for part in &parts {
-                        drop(
-                            stream
-                                .out
-                                .send(CoreFrame::CutState(CutPart {
-                                    cut,
-                                    part: part.clone(),
-                                }))
-                                .await,
-                        );
+                    frames.extend(parts.iter().map(|part| {
+                        CoreFrame::CutState(CutPart {
+                            cut,
+                            part: part.clone(),
+                        })
+                    }));
+                }
+                frames.push(CoreFrame::Cut(Cut { cut, epoch }));
+                for frame in frames {
+                    if !matches!(
+                        tokio::time::timeout_at(flush_deadline, stream.out.send(frame)).await,
+                        Ok(Ok(()))
+                    ) {
+                        sent_all = false;
+                        break;
                     }
                 }
-                drop(stream.out.send(CoreFrame::Cut(Cut { cut, epoch })).await);
+                if !sent_all {
+                    break;
+                }
+            }
+            if !sent_all {
+                eprintln!(
+                    "e6ircd: edge {}'s link did not take the cut within {}s; its sessions end \
+                     with this core",
+                    registration.view.name,
+                    FLUSH_WAIT.as_secs()
+                );
+                registration.end(LinkEnd::Lost);
+                continue;
             }
             registration.end(LinkEnd::Cut);
             handover.edges.push(registration.view.name.clone());
         }
-        self.roster.record_cut(&handover.edges, cut).await;
+        if tokio::time::timeout(
+            ROSTER_RECORD_WAIT,
+            self.roster.record_cut(&handover.edges, cut),
+        )
+        .await
+        .is_err()
+        {
+            eprintln!(
+                "e6ircd: the roster did not record the cut within {}s; the next core finds the \
+                 edges holding it as they link",
+                ROSTER_RECORD_WAIT.as_secs()
+            );
+        }
         handover
     }
 
-    /// Wait until the work in flight settles, within [`SETTLE_WAIT`]; then
-    /// close each session still waiting, loudly. How many were closed.
-    async fn settle(&self, holding: &[Arc<Registration>]) -> usize {
-        let deadline = tokio::time::Instant::now() + SETTLE_WAIT;
+    /// Wait until the work in flight settles, until `deadline`; then close
+    /// each session still waiting, loudly, within [`SETTLE_CLOSE_WAIT`]. How
+    /// many were closed.
+    async fn settle(&self, holding: &[Arc<Registration>], deadline: tokio::time::Instant) -> usize {
+        let homes = self.core_tx.directories().held.homes;
         loop {
             let pushed = holding.iter().all(|registration| {
                 registration
@@ -1613,16 +1703,17 @@ impl LinkServer {
                             == 0
                     })
             });
-            let unsettled = if pushed && self.core_tx.cross_shard_idle() {
-                match self.core_tx.unsettled().await {
-                    Ok(unsettled) if unsettled.iter().all(crate::core::Unsettled::is_empty) => {
+            let unsettled = if pushed && self.core_tx.cross_shard_idle() && homes.quiet() {
+                match tokio::time::timeout_at(deadline, self.core_tx.unsettled()).await {
+                    Ok(Ok(unsettled)) if unsettled.iter().all(crate::core::Unsettled::is_empty) => {
                         return 0;
                     }
-                    Ok(unsettled) => Some(unsettled),
-                    Err(error) => {
+                    Ok(Ok(unsettled)) => Some(unsettled),
+                    Ok(Err(error)) => {
                         eprintln!("e6ircd: the core could not say what is in flight: {error}");
                         return 0;
                     }
+                    Err(_) => None,
                 }
             } else {
                 None
@@ -1637,24 +1728,65 @@ impl LinkServer {
                     return 0;
                 };
                 let mut closed = 0;
-                for shard in unsettled {
-                    for what in shard.shard {
-                        eprintln!("e6ircd: the cut goes ahead with {what} unsettled");
+                let closing = tokio::time::timeout(SETTLE_CLOSE_WAIT, async {
+                    for shard in unsettled {
+                        for what in shard.shard {
+                            eprintln!("e6ircd: the cut goes ahead with {what} unsettled");
+                        }
+                        for (conn, what) in shard.sessions {
+                            eprintln!(
+                                "e6ircd: session {} still waited on {what} at the cut; it is \
+                                 closed",
+                                conn.0
+                            );
+                            close(self, conn, "server restarting: a request did not complete")
+                                .await;
+                            closed += 1;
+                        }
                     }
-                    for (conn, what) in shard.sessions {
-                        eprintln!(
-                            "e6ircd: session {} still waited on {what} at the cut; it is closed",
-                            conn.0
-                        );
-                        close(self, conn, "server restarting: a request did not complete").await;
-                        closed += 1;
-                    }
+                    // Their QUITs reach their channels before the cut.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                })
+                .await;
+                if closing.is_err() {
+                    eprintln!(
+                        "e6ircd: closing the unsettled sessions took past {}s; the cut goes ahead",
+                        SETTLE_CLOSE_WAIT.as_secs()
+                    );
                 }
-                // Their QUITs reach their channels before the cut.
-                tokio::time::sleep(Duration::from_millis(50)).await;
                 return closed;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The cut is stopped at the sum of the caps written between the
+    /// markers, the very sum `tools/check-systemd-unit.sh` reads into the
+    /// unit's stop budget: a cap left out of either, or written in a form the
+    /// script does not read, is a wait systemd could kill mid-cut.
+    #[test]
+    fn the_handover_bound_is_the_sum_of_the_caps_between_the_markers() {
+        let source = include_str!("held.rs");
+        let start = source
+            .find("// ---- The handover's caps.")
+            .expect("the start marker");
+        let end = source
+            .find("// ---- End of the handover's caps.")
+            .expect("the end marker");
+        let caps: Vec<u64> = source[start..end]
+            .lines()
+            .filter(|line| line.starts_with("const "))
+            .map(|line| {
+                line.split_once(": Duration = Duration::from_secs(")
+                    .and_then(|(_, rest)| rest.strip_suffix(");"))
+                    .and_then(|seconds| seconds.parse().ok())
+                    .unwrap_or_else(|| panic!("a cap the check script cannot read: {line}"))
+            })
+            .collect();
+        assert!(!caps.is_empty());
+        assert_eq!(super::HANDOVER_BOUND.as_secs(), caps.iter().sum::<u64>());
     }
 }

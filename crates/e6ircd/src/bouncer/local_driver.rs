@@ -18,7 +18,7 @@ use e6irc_edge::connection::CorePort;
 use super::irc_driver::{JoinedChannels, UpstreamControl};
 use super::upstream_identity::AutojoinChannel;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
-use crate::core::local_home::{LocalHomeKey, LocalHomes, ResumedLocal};
+use crate::core::local_home::{CutPhase, DriverStand, LocalHomeKey, LocalHomes, ResumedLocal};
 use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, EdgeSession};
 
 /// The in-process network's name — the driver `kind`, the session host, and the
@@ -160,6 +160,8 @@ struct CoreLines<'a> {
     core: &'a CoreIngress,
     conn: ConnId,
     meter: e6irc_edge::meter::LineMeter,
+    /// A cut is settling: what is queued goes at once, past the allowance.
+    unmetered: bool,
 }
 
 impl<'a> CoreLines<'a> {
@@ -168,12 +170,17 @@ impl<'a> CoreLines<'a> {
             core,
             conn,
             meter: edge.line_meter(core.command_flood()),
+            unmetered: false,
         }
     }
 
     /// Queue one line for the core. `false` means the core is gone.
     async fn say(&mut self, line: String) -> bool {
-        let mut events = vec![e6irc_proto::framing::LineEvent::Line(line.into_bytes())];
+        let event = e6irc_proto::framing::LineEvent::Line(line.into_bytes());
+        if self.unmetered {
+            return CorePort::push(self.core, self.conn, event).await;
+        }
+        let mut events = vec![event];
         e6irc_edge::connection::hand_over(self.core, &mut self.meter, self.conn, &mut events).await
     }
 }
@@ -676,12 +683,33 @@ impl<'a> Relay<'a> {
             }
         }
         let published = end.edge.held_signal();
+        let mut cut = end.homes.phase();
         loop {
+            // A cut settling has every queued command go at once; a cut
+            // about to cut the shards has each refused to its sender, never
+            // sent into a cut shard. Said here, between commands.
+            let phase = *cut.borrow_and_update();
+            self.lines.unmetered = phase != CutPhase::Serving;
+            if phase == CutPhase::Frozen {
+                ends.refuse_queued_at_cut();
+                end.homes.stand(end.conn, DriverStand::Frozen);
+            } else {
+                let queued = ends.has_queued_commands();
+                end.homes.stand(end.conn, DriverStand::Relaying { queued });
+            }
             // Past the session's command allowance, the attachments' commands
             // wait until a token is back; the core's output keeps flowing.
-            let blocked = self.lines.meter.blocked_until(tokio::time::Instant::now());
+            let blocked = match phase {
+                CutPhase::Serving => self.lines.meter.blocked_until(tokio::time::Instant::now()),
+                CutPhase::Settling | CutPhase::Frozen => None,
+            };
             tokio::select! {
                 () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
+                // The cut moved on.
+                changed = cut.changed() => {
+                    // The homes outlive every driver.
+                    drop(changed);
+                }
                 // What the core publishes for the session to be held.
                 () = published.published() => end.take_held(),
                 // Core output -> buffer + broadcast (attach playback/live).
@@ -702,7 +730,11 @@ impl<'a> Relay<'a> {
                 },
                 // Downstream command -> core.
                 cmd = ends.next_command(), if blocked.is_none() => match cmd {
+                    Some(cmd) if phase == CutPhase::Frozen => ends.refuse_at_cut(&cmd),
                     Some(cmd) => {
+                        // In hand until it is with the core.
+                        end.homes
+                            .stand(end.conn, DriverStand::Relaying { queued: true });
                         if let Some(outcome) = self.command(ends, cmd).await {
                             return outcome;
                         }
@@ -1455,5 +1487,121 @@ mod tests {
             super::super::NetworkLifecycle::Connected
         );
         task.abort();
+    }
+
+    /// A homed session (edge mode, D13) registered under a command allowance
+    /// of 4 lines a second at most 1 a second: the registration spends it,
+    /// so an attachment's commands then wait on the meter.
+    async fn a_homed_session_past_its_allowance() -> (
+        Receiver<Input>,
+        NetworkHandle,
+        Arc<LocalHomes>,
+        tokio::task::JoinHandle<super::super::SessionOutcome>,
+        SendQueue,
+    ) {
+        let (core_tx, mut core_rx) = core_queue(64);
+        let mut session = local_session(core_tx, Vec::new());
+        session.core.core_tx = session
+            .core
+            .core_tx
+            .clone()
+            .with_command_flood(crate::core::CommandFlood::new(4, 1).expect("a valid bucket"));
+        let homes = session.core.core_tx.directories().held.homes;
+        homes.enable();
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        let task = tokio::spawn(async move { session_once(&session, &mut ends).await });
+        let mut out_tx = finish_registration(&mut core_rx).await;
+        core_says(&mut out_tx, ":e6.example 001 alice :Welcome").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await,
+                Ok(super::super::DriverEvent::Status {
+                    status: super::super::DriverConnectionStatus::Connected,
+                    ..
+                })
+            ) {}
+        })
+        .await
+        .expect("the session is connected");
+        (core_rx, handle, homes, task, out_tx)
+    }
+
+    /// The attachments' lines the core heard, barriers left out, until none
+    /// came for `quiet`.
+    async fn lines_heard(core_rx: &mut Receiver<Input>, quiet: std::time::Duration) -> Vec<String> {
+        let mut heard = Vec::new();
+        while let Ok(Some(input)) = tokio::time::timeout(quiet, core_rx.pop()).await {
+            if let Input::Line { line, .. } = input.payload {
+                let line = String::from_utf8(line).expect("UTF-8");
+                if !line.starts_with("PING :") {
+                    heard.push(line);
+                }
+            }
+        }
+        heard
+    }
+
+    /// A cut settling sends what the attachments queued at once, past the
+    /// command allowance, so the queue drains before the shards are cut
+    /// (DESIGN §19.3), and the driver says it is quiet once it has.
+    #[tokio::test]
+    async fn a_settling_cut_sends_the_queued_commands_past_the_allowance() {
+        let (mut core_rx, handle, homes, _task, _out_tx) =
+            a_homed_session_past_its_allowance().await;
+        let sent: Vec<String> = (0..4).map(|n| format!("PRIVMSG #room :{n}")).collect();
+        for line in &sent {
+            assert_eq!(handle.send_from(7, line), super::super::SendOutcome::Sent);
+        }
+        homes.settle();
+        // At one line a second, four commands and their barriers would take
+        // seconds; settling, they are all heard within a fraction of one.
+        let heard = lines_heard(&mut core_rx, std::time::Duration::from_millis(300)).await;
+        assert_eq!(heard, sent);
+        assert!(homes.quiet(), "the driver says it has nothing queued");
+    }
+
+    /// A command still queued for the core's own session when the cut
+    /// freezes it is never lost silently and never sent into a cut shard:
+    /// its sender is told it was not sent, as is the sender of one queued
+    /// after, and the core hears nothing more (DESIGN §19.3).
+    #[tokio::test]
+    async fn a_command_queued_at_the_cut_is_refused_to_its_sender() {
+        let (mut core_rx, handle, homes, _task, _out_tx) =
+            a_homed_session_past_its_allowance().await;
+        let mut replies = handle.route_replies(7);
+        let queued: Vec<String> = (0..5).map(|n| format!("PRIVMSG #room :{n}")).collect();
+        for line in &queued {
+            assert_eq!(handle.send_from(7, line), super::super::SendOutcome::Sent);
+        }
+        // The allowance is spent: at most one of them leaves before the
+        // freeze, the rest wait queued.
+        assert_eq!(
+            homes.freeze(std::time::Duration::from_secs(2)).await,
+            Vec::<ConnId>::new(),
+            "the driver says it is frozen"
+        );
+        assert_eq!(
+            handle.send_from(7, "PRIVMSG #room :after"),
+            super::super::SendOutcome::Sent
+        );
+        let heard = lines_heard(&mut core_rx, std::time::Duration::from_millis(300)).await;
+        assert!(heard.len() <= 1, "{heard:?}");
+        assert_eq!(heard[..], queued[..heard.len()]);
+        let mut refused = Vec::new();
+        for _ in heard.len()..=queued.len() {
+            let notice = tokio::time::timeout(std::time::Duration::from_secs(2), replies.recv())
+                .await
+                .expect("each command not sent is refused to its sender");
+            assert!(
+                notice.contains(
+                    "your message to #room was not sent: the server is restarting; send it \
+                     again once it is back"
+                ),
+                "{notice}"
+            );
+            refused.push(notice);
+        }
+        assert_eq!(heard.len() + refused.len(), queued.len() + 1);
     }
 }

@@ -61,7 +61,7 @@ use crate::core::{CoreIngress, Input};
 use crate::observability::{ErrorKind, Telemetry};
 
 mod held;
-pub(crate) use held::{PendingCut, ReplicaRoutes};
+pub(crate) use held::{HANDOVER_BOUND, PendingCut, ReplicaRoutes};
 
 /// Where edges link, and the core's link credentials (`[edge_link]`). Its
 /// presence is edge mode: the core binds no client listener of its own.

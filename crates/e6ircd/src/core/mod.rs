@@ -425,23 +425,26 @@ impl CoreIngress {
         self.traffic.in_flight.load(Ordering::SeqCst) == 0
     }
 
-    /// Ask each shard in turn and gather the answers, each within `bound`.
+    /// Ask each shard in turn and gather the answers, all within `bound`.
     async fn ask_each<T>(
         &self,
         bound: std::time::Duration,
         mut question: impl FnMut(tokio::sync::oneshot::Sender<T>) -> Input,
     ) -> Result<Vec<T>, String> {
+        let deadline = tokio::time::Instant::now() + bound;
         let mut answers = Vec::with_capacity(self.shards.len());
         for shard in self.shards.iter() {
             let (reply, answered) = tokio::sync::oneshot::channel();
-            if shard.push(question(reply)).await.is_err() {
-                return Err("a core worker is unavailable".into());
+            match tokio::time::timeout_at(deadline, shard.push(question(reply))).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => return Err("a core worker is unavailable".into()),
+                Err(_) => return Err("a core worker did not take the question in time".into()),
             }
             answers.push(answered);
         }
         let mut gathered = Vec::with_capacity(answers.len());
         for answered in answers {
-            match tokio::time::timeout(bound, answered).await {
+            match tokio::time::timeout_at(deadline, answered).await {
                 Ok(Ok(answer)) => gathered.push(answer),
                 Ok(Err(_closed)) => return Err("a core worker dropped the question".into()),
                 Err(_elapsed) => return Err("a core worker did not answer in time".into()),
@@ -485,14 +488,13 @@ impl CoreIngress {
         &self,
         reason: &'static str,
         local_homed: bool,
+        bound: std::time::Duration,
     ) -> Result<usize, String> {
         let closed = self
-            .ask_each(std::time::Duration::from_secs(5), |reply| {
-                Input::CloseUnheld {
-                    reason,
-                    local_homed,
-                    reply,
-                }
+            .ask_each(bound, |reply| Input::CloseUnheld {
+                reason,
+                local_homed,
+                reply,
             })
             .await?;
         Ok(closed.into_iter().sum())
@@ -501,12 +503,9 @@ impl CoreIngress {
     /// Cut every shard; the account-creation buckets they held.
     pub(crate) async fn cut(
         &self,
+        bound: std::time::Duration,
     ) -> Result<Vec<(String, f64, e6irc_proto::time::MonoMillis)>, String> {
-        let buckets = self
-            .ask_each(std::time::Duration::from_secs(5), |reply| Input::Cut {
-                reply,
-            })
-            .await?;
+        let buckets = self.ask_each(bound, |reply| Input::Cut { reply }).await?;
         Ok(buckets.into_iter().flatten().collect())
     }
 
@@ -5207,6 +5206,18 @@ mod ingress_tests {
 
         /// [`Self::client`] with a send queue of `sendq_bytes`.
         fn client_with_sendq(&mut self, conn: u64, nick: &str, caps: &str, sendq_bytes: usize) {
+            self.client_on(conn, nick, caps, sendq_bytes, ConnectionTransport::Tcp);
+        }
+
+        /// [`Self::client_with_sendq`] over `transport`.
+        fn client_on(
+            &mut self,
+            conn: u64,
+            nick: &str,
+            caps: &str,
+            sendq_bytes: usize,
+            transport: ConnectionTransport,
+        ) {
             let (tx, rx) = crate::core::send_queue("shards-client", sendq_bytes);
             self.outputs.insert(conn, rx);
             let shard = conn as usize % self.cores.len();
@@ -5214,7 +5225,7 @@ mod ingress_tests {
                 conn: ConnId(conn),
                 tx,
                 host: "host.test".into(),
-                transport: ConnectionTransport::Tcp,
+                transport,
                 tls: None,
             });
             if !caps.is_empty() {
@@ -5787,6 +5798,30 @@ mod ingress_tests {
         shards.line(1, &format!("CHATHISTORY LATEST {there} * 10"));
         let history = shards.drain(1);
         assert!(replayed(&history).is_empty(), "stored: {history:#?}");
+    }
+
+    /// An open multiline batch keeps the core's own session — the `local`
+    /// driver's — from being cut: an edge retains and replays the batch's
+    /// lines for its sessions, but nothing would replay them for the core's
+    /// own, so the cut settles it first (DESIGN §19.3).
+    #[test]
+    fn an_open_multiline_batch_unsettles_only_the_cores_own_session() {
+        let caps = "batch draft/multiline message-tags";
+        let mut shards = Shards::on_one_worker();
+        let here = shards.owned[0];
+        shards.client(1, "bob", caps);
+        shards.client_on(2, "alice", caps, 256 * 512, ConnectionTransport::Local);
+        for conn in [1, 2] {
+            shards.line(conn, &format!("JOIN {here}"));
+            shards.line(conn, &format!("BATCH +7 draft/multiline {here}"));
+            shards.line(conn, &format!("@batch=7 PRIVMSG {here} :half"));
+        }
+        assert_eq!(
+            shards.cores[0].state.unsettled().sessions,
+            vec![(ConnId(2), "a multiline batch")]
+        );
+        shards.line(2, "BATCH -7");
+        assert!(shards.cores[0].state.unsettled().is_empty());
     }
 
     /// A wall clock stepped back leaves a message stamped earlier arriving

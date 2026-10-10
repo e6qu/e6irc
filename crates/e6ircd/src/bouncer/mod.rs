@@ -7065,6 +7065,34 @@ impl DriverEnds {
         !self.commands.is_empty()
     }
 
+    /// Tell each sender of a command still queued that it was not sent: the
+    /// server is restarting, and the session it was queued for is about to
+    /// be cut (DESIGN §19.3). The log counts them.
+    pub(crate) fn refuse_queued_at_cut(&mut self) {
+        let mut refused = 0usize;
+        while let Ok(command) = self.commands.try_recv() {
+            self.refuse_at_cut(&command);
+            refused += 1;
+        }
+        if refused > 0 {
+            eprintln!(
+                "bnc: {}: {refused} queued command(s) refused at the cut",
+                self.runtime.label()
+            );
+        }
+    }
+
+    /// Tell `command`'s sender it was not sent: the server is restarting.
+    pub(crate) fn refuse_at_cut(&self, command: &ClientCommand) {
+        self.answer(
+            command.origin,
+            unsent_notice(
+                &command.line,
+                "the server is restarting; send it again once it is back",
+            ),
+        );
+    }
+
     /// Tell each sender of a line still queued that it was not sent: the
     /// session it was queued for has ended, and the lifecycle published just
     /// before this refuses every later send ([`SendOutcome::Disconnected`],
