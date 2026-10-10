@@ -1546,6 +1546,20 @@ It fixes, each with a test that failed before:
   pseudo-terminal journey now restarts the daemon and proves reconnect,
   rejoin, input kept while offline, completion and `/me`.
 
+Maintainer decisions implemented after the sweep:
+
+- **Own lines show once on any server.** Without `echo-message` each
+  conversation keeps the texts of its unmatched local copies (at most 256),
+  and a line of this client's in a reconnect's history batch is recognised as
+  that copy.
+- **`/join #c key`, rejoined with its key.** The key is kept in memory for
+  the life of the process, never persisted, and a reconnect sends it.
+- **The device endpoints follow RFC 6749 §3.1**: an unrecognised parameter is
+  ignored, a recognised one is validated strictly and refused when repeated;
+  the journey said every device-grant request object was closed.
+- **The raw-protocol console journey is proven**: the browser journey reads
+  NickServ's registration replies back off the console.
+
 ## Edge tier
 
 Goal: e6irc deploys and redeploys without dropping a client connection

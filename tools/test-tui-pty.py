@@ -389,6 +389,19 @@ def main() -> None:
             # to send while offline and keeps what was typed, then — the
             # server back — reconnects through the same request, rejoins the
             # channel it was in, and sends the kept line once it is entered.
+            # A keyed channel: joined with its key, and — below — rejoined
+            # with it after the reconnect, from memory.
+            peer.send("JOIN #vault")
+            peer.wait_line(lambda line: " 366 observer #vault " in line, "observer in #vault")
+            peer.send("MODE #vault +k sesame")
+            peer.wait_line(lambda line: " MODE #vault +k" in line, "#vault keyed")
+            type_line(master, output, b"/join #vault sesame")
+            peer.wait_line(
+                lambda line: line.startswith(":ptyclient!") and " JOIN #vault" in line,
+                "the TUI in the keyed channel",
+            )
+            type_line(master, output, b"/win #pty")
+            drain_pty(master, output, 0.3)
             peer.close()
             peer = None
             stop_server(server)
@@ -399,7 +412,10 @@ def main() -> None:
             server = start_server(config, server_log)
             wait_for_server(port, server)
             deadline = time.monotonic() + TIMEOUT
-            while sum(line == "JOIN #pty" for line in proxy.lines()) < 2:
+            while (
+                sum(line == "JOIN #pty" for line in proxy.lines()) < 2
+                or sum(line == "JOIN #vault sesame" for line in proxy.lines()) < 2
+            ):
                 if time.monotonic() > deadline:
                     raise AssertionError(f"the TUI never rejoined: {proxy.lines()!r}")
                 drain_pty(master, output, 0.1)
@@ -485,8 +501,8 @@ def main() -> None:
                 signal_ends_the_session_cleanly(port, peer, signum)
             print(
                 "TUI PTY journey passed: product state, help, inbound, outbound, "
-                "multi-line paste refused, reconnect and rejoin after a server "
-                "restart with offline input kept, Tab completion, /me, resize "
+                "multi-line paste refused, reconnect and rejoin (a keyed channel with "
+                "its key) after a server restart with offline input kept, Tab completion, /me, resize "
                 "redraw, read marker and QUIT on exit, clean restore, and the same "
                 "QUIT and restore on SIGTERM, SIGINT and SIGHUP"
             )

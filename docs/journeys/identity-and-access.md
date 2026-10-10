@@ -261,7 +261,9 @@ authenticated browser session.
    minted; replay cannot create a second token.
 
 **Visible failures and recovery.** Unknown, expired, malformed, already
-consumed, or unapproved codes receive their specified error. Polling and start
+consumed, or unapproved codes receive their specified error. A request
+parameter neither endpoint defines is ignored (RFC 6749 §3.1); a defined one
+that is missing, malformed, or repeated is `invalid_request`. Polling and start
 are rate-limited; live grants are bounded and stale grants are pruned.
 
 **Security and observability.** Device and user codes are random, bounded,
@@ -272,7 +274,9 @@ session-authenticated and CSRF-protected; polling metrics use fixed outcomes
 without codes, tokens, or account names. A bearer cannot approve a grant.
 
 **Evidence.** Proven at HTTP/PostgreSQL level by
-`device_authorization_grant_flow`,
+`device_authorization_grant_flow` (which also sends each endpoint a parameter
+it does not define),
+`device_endpoints_ignore_unknown_parameters_and_refuse_repeated_ones`,
 `approved_device_grant_polls_to_a_working_token_then_is_consumed`, and the
 device-page HTTP coverage. `e6irc login` drives the real start, polling,
 approval/consume, private-cache, and authenticated API path in
@@ -342,7 +346,11 @@ An app password cannot rotate the primary password. The primary credential
 cannot be deleted through generic revocation. Expired or under-scoped personal
 access tokens are rejected, and a bearer cannot mint broader credentials.
 Account and credential request objects reject unknown fields instead of ignoring them.
-Device-grant request objects use the same closed contract.
+The device-approval request object uses the same closed contract. The RFC 8628
+device authorization and token endpoints are OAuth form endpoints instead: as
+RFC 6749 §3.1 requires, a parameter they do not define is ignored, a
+parameter they do define is validated strictly, and one sent twice is
+refused.
 Exact-resource deletes are owner-scoped and idempotent only where the API
 contract says so. A failed Account & access API read remains an announced,
 in-place retryable state rather than appearing as empty profile, credential,
