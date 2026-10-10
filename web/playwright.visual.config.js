@@ -12,6 +12,13 @@ const snapshots =
     ? "{testDir}/__snapshots__/{testFilePath}/{arg}{ext}"
     : "{testDir}/__snapshots__/{testFilePath}/{platform}/{arg}{ext}";
 
+// The suite starts its own Vite server for this checkout, on a port nothing
+// else holds (`--strictPort` refuses a busy one rather than moving). Reusing
+// whatever already answered on the port tested another checkout's pages when
+// two worktrees ran the suite at once, and passed or failed on code that was
+// not the code under test. E6IRC_VISUAL_PORT picks another port.
+const port = Number(process.env.E6IRC_VISUAL_PORT ?? 4173);
+
 export default defineConfig({
   testDir: "./test",
   testMatch: "visual.spec.js",
@@ -19,13 +26,13 @@ export default defineConfig({
   snapshotPathTemplate: snapshots,
   use: {
     ...devices["Desktop Chrome"],
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: `http://127.0.0.1:${port}`,
     trace: "retain-on-failure",
     video: "retain-on-failure",
   },
   webServer: {
-    command: "pnpm exec vite --host 127.0.0.1 --port 4173",
-    port: 4173,
-    reuseExistingServer: !process.env.CI,
+    command: `pnpm exec vite --host 127.0.0.1 --port ${port} --strictPort`,
+    port,
+    reuseExistingServer: false,
   },
 });
