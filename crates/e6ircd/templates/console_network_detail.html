@@ -47,7 +47,8 @@
         <div><span>SHA-512 fingerprint</span><code data-certificate-sha512>—</code></div>
       </div>
       <p class="section-note" data-certificate-next hidden>Register it with the network's services from an identified session: <code>/msg NickServ CERT ADD</code> adds the certificate the session connected with, or name a fingerprint above after <code>CERT ADD</code>. The private key is stored encrypted and is never shown.</p>
-      <div class="account-setup-steps">
+      <p class="section-note" data-certificate-configured hidden>The server configuration names this certificate: the operator replaces its files and restarts the server to rotate it.</p>
+      <div class="account-setup-steps" data-certificate-controls>
         <form method="post" data-api-network-certificate-generate>
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <h3>Generate a certificate</h3>

@@ -448,6 +448,7 @@ async fn database_core(
         sasl_account: None,
         sasl_password: None,
         server_password: None,
+        client_certificate: None,
     }];
     config.internal_upstreams = e6ircd::egress::InternalUpstreams::Allow;
     net::start(config).await.expect("start the core")
@@ -991,6 +992,7 @@ async fn a_local_driver_session_quits_before_a_graceful_restart_and_rejoins() {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }];
         config
     };

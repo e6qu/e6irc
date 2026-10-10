@@ -1,9 +1,10 @@
-//! A stored IRC network's remembered channels, kept in PostgreSQL (DESIGN
-//! §10.3): every channel the upstream confirmed the session in, with the key
-//! it is joined with, so a process restart rejoins them as a reconnect does.
+//! An IRC network's remembered channels, kept in PostgreSQL (DESIGN §10.3):
+//! every channel the upstream confirmed the session in, with the key it is
+//! joined with, so a process restart rejoins them as a reconnect does — a
+//! stored network's by its row, a configured one's by its owner and name.
 //!
 //! The driver keeps the set in memory ([`super::irc_driver::JoinedChannels`]);
-//! this task, which the registry runs beside each stored IRC network's driver,
+//! this task, which the registry runs beside each IRC network's driver,
 //! writes the whole set after each change. Writing is never on the driver's
 //! path: a database that is away holds no upstream line, the last set written
 //! stays whole, and the write is retried until it lands.
@@ -29,9 +30,12 @@ pub(super) struct ChannelMemory {
 /// keys.
 pub(super) struct ChannelStore {
     pub(super) pool: PgPool,
-    /// The owning account, as the registry keys it.
-    pub(super) owner: String,
+    /// The owning account, as the registry keys it; `None` for a configured
+    /// network shared by every account.
+    pub(super) owner: Option<String>,
     pub(super) network: String,
+    /// Whether the network is a stored row or the configuration's.
+    pub(super) definition: crate::db::BncNetworkDefinition,
     /// Without a master key a learned key cannot be sealed, so it is not
     /// stored: the channel is remembered without it.
     pub(super) keys: Option<Arc<crate::secret::SecretKeyring>>,
@@ -40,7 +44,7 @@ pub(super) struct ChannelStore {
 impl ChannelStore {
     /// Write what `handle`'s session remembers now, the whole set.
     async fn write(&self, handle: &NetworkHandle) -> Result<(), crate::db::DbError> {
-        let context = super::bnc_secret_context(&self.owner);
+        let context = super::bnc_secret_context(self.owner.as_deref().unwrap_or("*"));
         let mut remembered = handle.joined_channels().remembered();
         remembered.sort_by(|a, b| a.channel().cmp(b.channel()));
         let rows: Vec<crate::db::BncAutojoin> = remembered
@@ -53,8 +57,16 @@ impl ChannelStore {
                     .map(|(key, keys)| keys.seal(key, &context)),
             })
             .collect();
-        crate::db::replace_bnc_remembered_channels(&self.pool, &self.owner, &self.network, &rows)
-            .await
+        crate::db::replace_bnc_remembered_channels(
+            &self.pool,
+            crate::db::RememberedChannelsOf {
+                definition: self.definition,
+                owner: self.owner.as_deref(),
+                network: &self.network,
+            },
+            &rows,
+        )
+        .await
     }
 }
 
@@ -66,7 +78,11 @@ pub(super) fn spawn(store: ChannelStore, handle: Arc<NetworkHandle>) -> ChannelM
     let mut changes = handle.joined_channels().changes();
     changes.mark_unchanged();
     let task = tokio::spawn(async move {
-        let label = format!("{}/{}", store.owner, store.network);
+        let label = format!(
+            "{}/{}",
+            store.owner.as_deref().unwrap_or("*"),
+            store.network
+        );
         // A change not yet written, and whether the last write failed (so an
         // outage logs once, and its end once).
         let mut dirty = false;

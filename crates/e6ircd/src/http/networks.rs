@@ -583,12 +583,18 @@ pub(super) struct CertificateFingerprintsResponse {
     pub(super) fingerprint_sha512: String,
 }
 
-impl CertificateFingerprintsResponse {
-    pub(super) fn of_pem(certificate: &str) -> Option<Self> {
-        e6irc_client::Fingerprints::of_pem(certificate).map(|fingerprints| Self {
+impl From<e6irc_client::Fingerprints> for CertificateFingerprintsResponse {
+    fn from(fingerprints: e6irc_client::Fingerprints) -> Self {
+        Self {
             fingerprint_sha256: fingerprints.sha256,
             fingerprint_sha512: fingerprints.sha512,
-        })
+        }
+    }
+}
+
+impl CertificateFingerprintsResponse {
+    pub(super) fn of_pem(certificate: &str) -> Option<Self> {
+        e6irc_client::Fingerprints::of_pem(certificate).map(Self::from)
     }
 }
 
@@ -651,6 +657,9 @@ enum AdminNetworkKind {
         connected: bool,
         runtime: Box<NetworkRuntimeResponse>,
         shared: bool,
+        /// The fingerprints of the client certificate the configuration
+        /// names; `null` when it names none.
+        client_certificate: Option<CertificateFingerprintsResponse>,
     },
 }
 
@@ -678,6 +687,11 @@ pub(super) fn shared_admin_network_response(
             connected: status.connected,
             runtime: Box::new(runtime_response(&status.runtime)),
             shared: true,
+            client_certificate: status
+                .configured
+                .as_ref()
+                .and_then(|configured| configured.client_certificate.clone())
+                .map(CertificateFingerprintsResponse::from),
         },
     }
 }
@@ -746,7 +760,16 @@ pub(super) fn network_response(
 pub(super) fn configured_network_response(
     network: &crate::bouncer::ConfiguredNetwork,
     runtime: &crate::bouncer::NetworkRuntimeSnapshot,
+    remembered: &[crate::bouncer::RememberedChannel],
 ) -> NetworkResponse {
+    let mut remembered_channels: Vec<RememberedChannelResponse> = remembered
+        .iter()
+        .map(|channel| RememberedChannelResponse {
+            channel: channel.channel().to_owned(),
+            keyed: channel.key().is_some(),
+        })
+        .collect();
+    remembered_channels.sort_by(|a, b| a.channel.cmp(&b.channel));
     NetworkResponse {
         name: network.name.clone(),
         kind: network.kind.as_db_str(),
@@ -761,10 +784,11 @@ pub(super) fn configured_network_response(
         has_sasl_account: network.has_sasl_account,
         has_sasl_password: network.has_sasl_password,
         has_server_password: network.has_server_password,
-        // An operator-configured network presents no certificate and
-        // remembers nothing beyond its autojoin.
-        client_certificate: None,
-        remembered_channels: Vec::new(),
+        client_certificate: network
+            .client_certificate
+            .clone()
+            .map(CertificateFingerprintsResponse::from),
+        remembered_channels,
         enabled: true,
         connected: Some(runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
         runtime: Some(runtime_response(runtime)),
@@ -792,7 +816,11 @@ pub(super) async fn list_networks(
                 .collect();
             networks.extend(registry.configured_owned(&account).into_iter().map(
                 |(configured, handle)| {
-                    configured_network_response(&configured, &handle.runtime_snapshot())
+                    configured_network_response(
+                        &configured,
+                        &handle.runtime_snapshot(),
+                        &handle.joined_channels().remembered(),
+                    )
                 },
             ));
             json_no_store(NetworkListResponse { networks })
@@ -824,6 +852,7 @@ pub(super) async fn get_network(
                 Some((configured, handle)) => json_no_store(configured_network_response(
                     &configured,
                     &handle.runtime_snapshot(),
+                    &handle.joined_channels().remembered(),
                 )),
                 None => problem(StatusCode::NOT_FOUND, "No such network", None),
             };
@@ -3605,6 +3634,46 @@ async fn forget_network_channel_in_lane(
     name: &str,
     channel: &str,
 ) -> Result<(), NetworkMutationError> {
+    let not_remembered = || {
+        network_error(
+            StatusCode::NOT_FOUND,
+            "No such remembered channel",
+            Some("this network does not remember that channel"),
+        )
+    };
+    let unavailable = |error: crate::db::DbError| {
+        eprintln!("http: remembered channel removal: {error}");
+        network_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database unavailable",
+            None,
+        )
+    };
+    // A network the configuration defines for the account is the operator's
+    // to configure, but its session is the account's: what it rejoins is
+    // forgotten in the session, whose writer stores the change.
+    if let Some((configured, handle)) = lane.get_configured_owned(account, name) {
+        if !handle.joined_channels().forget(channel) {
+            return Err(not_remembered());
+        }
+        crate::db::insert_audit_log(
+            pool_of(state),
+            &crate::db::AuditPrincipal::account(
+                &e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account),
+            ),
+            "NETWORK_CHANNEL_FORGET",
+            &crate::db::AuditPrincipal::network(&format!(
+                "{}/{}",
+                e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account),
+                configured.name
+            )),
+            &format!("configured; channel={channel}"),
+        )
+        .await
+        .map_err(unavailable)?;
+        part_forgotten_channel(&handle, account, &configured.name, channel);
+        return Ok(());
+    }
     let row = editable_network(state, lane, account, name, "channel removal").await?;
     let forgotten = crate::db::forget_bnc_remembered_channel(
         pool_of(state),
@@ -3616,29 +3685,26 @@ async fn forget_network_channel_in_lane(
             detail: "",
         },
     )
-    .await;
-    match forgotten {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(network_error(
-                StatusCode::NOT_FOUND,
-                "No such remembered channel",
-                Some("this network does not remember that channel"),
-            ));
-        }
-        Err(error) => {
-            eprintln!("http: remembered channel removal: {error}");
-            return Err(network_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
+    .await
+    .map_err(unavailable)?;
+    if !forgotten {
+        return Err(not_remembered());
     }
-    let Some(handle) = lane.get_stored(account, &row.name) else {
-        return Ok(());
-    };
-    handle.joined_channels().forget(channel);
+    if let Some(handle) = lane.get_stored(account, &row.name) {
+        handle.joined_channels().forget(channel);
+        part_forgotten_channel(&handle, account, &row.name, channel);
+    }
+    Ok(())
+}
+
+/// Leave a channel its owner removed from the list, when the session is in
+/// it, so what is remembered stays what the session is in.
+fn part_forgotten_channel(
+    handle: &crate::bouncer::NetworkHandle,
+    account: &str,
+    network: &str,
+    channel: &str,
+) {
     let names = handle.names();
     let joined = handle.irc_session_snapshot().is_some_and(|session| {
         session
@@ -3653,12 +3719,11 @@ async fn forget_network_channel_in_lane(
             // part that could not be queued only leaves it there until the
             // next reconnect.
             refused => eprintln!(
-                "http: {account}/{}: {channel} forgotten, but its PART was not sent: {refused:?}",
-                row.name
+                "http: {account}/{network}: {channel} forgotten, but its PART was not sent: \
+                 {refused:?}"
             ),
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

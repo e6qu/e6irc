@@ -211,11 +211,23 @@ pub struct ConfiguredNetwork {
     pub has_sasl_account: bool,
     pub has_sasl_password: bool,
     pub has_server_password: bool,
+    /// The fingerprints of the client certificate the configuration names,
+    /// as read when the network last started.
+    pub client_certificate: Option<e6irc_client::Fingerprints>,
 }
 
 impl ConfiguredNetwork {
-    pub(crate) fn from_entry(entry: &NetworkEntry) -> Self {
+    /// The view of `entry`, presenting `certificate` (read from the files
+    /// the entry names).
+    pub(crate) fn from_entry(
+        entry: &NetworkEntry,
+        certificate: Option<&e6irc_client::ClientCertificate>,
+    ) -> Self {
         Self {
+            client_certificate: certificate.map(|certificate| e6irc_client::Fingerprints {
+                sha256: certificate.fingerprint_sha256(),
+                sha512: certificate.fingerprint_sha512(),
+            }),
             name: entry.name.clone(),
             owner: entry.owner.clone(),
             kind: entry.kind,
@@ -262,6 +274,24 @@ impl NetworkDefinition {
 pub(crate) struct Storage {
     pub(crate) pool: Option<PgPool>,
     pub(crate) secret_keys: Option<Arc<crate::secret::SecretKeyring>>,
+    /// The channels each configured IRC network remembered when the process
+    /// last stopped, by its folded owner (`None` when shared) and name.
+    pub(crate) configured_channels: ConfiguredChannels,
+}
+
+/// [`Storage::configured_channels`].
+pub(crate) type ConfiguredChannels =
+    HashMap<(Option<String>, String), Vec<super::RememberedChannel>>;
+
+/// The client certificate a configured network names, read and checked.
+fn configured_certificate(
+    e: &NetworkEntry,
+) -> Result<Option<e6irc_client::ClientCertificate>, String> {
+    e.client_certificate
+        .as_ref()
+        .map(crate::config::ClientCertificateFiles::load)
+        .transpose()
+        .map_err(|error| format!("network '{}': {error}", e.name))
 }
 
 /// A registered network: its driver handle, the persistence task that
@@ -297,9 +327,13 @@ impl Slot {
         entry: &NetworkEntry,
         definition: NetworkDefinition,
         hold: OwnerHold,
+        remembered: Vec<super::RememberedChannel>,
     ) -> Self {
         let (handle, ends) = NetworkHandle::channels(entry.buffer_cap);
         drop(ends);
+        // Kept while held: the release carries them over to the driver it
+        // starts.
+        handle.joined_channels().remember(remembered);
         handle.set_label(label);
         handle.runtime.hold(hold);
         Self {
@@ -322,6 +356,8 @@ fn configured_driver(
     e: &NetworkEntry,
     core: Option<&super::CoreHandles>,
     internal_upstreams: crate::egress::InternalUpstreams,
+    certificate: Option<e6irc_client::ClientCertificate>,
+    remembered_channels: Vec<super::RememberedChannel>,
 ) -> Result<Box<dyn super::NetworkDriver>, String> {
     use crate::config::NetworkKind;
     if e.kind == NetworkKind::Local {
@@ -379,10 +415,8 @@ fn configured_driver(
         sasl_account: e.sasl_account.clone(),
         sasl_password: e.sasl_password.clone(),
         server_password: e.server_password.clone(),
-        // A configured network is the operator's declaration: its channels
-        // are its autojoin, and it has no row to remember others in.
-        client_certificate: None,
-        remembered_channels: Vec::new(),
+        client_certificate: certificate,
+        remembered_channels,
         internal_upstreams,
         first_dial: super::FirstDial::Immediate,
     })
@@ -400,6 +434,8 @@ pub struct NetworkStatus {
     /// What the configuration states, for a configuration-defined network;
     /// `None` for an account's stored network.
     pub configured: Option<Arc<ConfiguredNetwork>>,
+    /// The channels the session rejoins besides its autojoin.
+    pub remembered: Vec<super::RememberedChannel>,
 }
 
 /// A network's persistence task and the signal that ends it.
@@ -546,9 +582,16 @@ impl Registry {
             revocations: AccountRevocations::new(),
             authority: crate::account_authority::AuthorityLedger::default(),
         };
+        let mut configured_channels = storage.configured_channels;
         for e in entries {
-            let definition =
-                NetworkDefinition::Configured(Arc::new(ConfiguredNetwork::from_entry(e)));
+            let certificate = configured_certificate(e)?;
+            let definition = NetworkDefinition::Configured(Arc::new(
+                ConfiguredNetwork::from_entry(e, certificate.as_ref()),
+            ));
+            let key = NetworkKey::new(e.owner.as_deref(), &e.name);
+            let remembered = configured_channels
+                .remove(&(key.owner.clone(), key.name.clone()))
+                .unwrap_or_default();
             let hold = e.owner.as_deref().and_then(|owner| {
                 holds
                     .get(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner))
@@ -557,8 +600,13 @@ impl Registry {
             if let Some(hold) = hold {
                 // Built anyway, so an entry that could never start still fails
                 // the boot as it would for an active owner.
-                configured_driver(e, registry.core.as_ref(), internal_upstreams)?;
-                let key = NetworkKey::new(e.owner.as_deref(), &e.name);
+                configured_driver(
+                    e,
+                    registry.core.as_ref(),
+                    internal_upstreams,
+                    certificate,
+                    Vec::new(),
+                )?;
                 let label = format!("{}/{}", key.display_owner(), e.name);
                 let mut networks = registry.networks.lock().expect("registry poisoned");
                 if networks.slots.contains_key(&key) {
@@ -566,10 +614,16 @@ impl Registry {
                 }
                 networks
                     .slots
-                    .insert(key, Slot::held(label, e, definition, hold));
+                    .insert(key, Slot::held(label, e, definition, hold, remembered));
                 continue;
             }
-            let driver = configured_driver(e, registry.core.as_ref(), internal_upstreams)?;
+            let driver = configured_driver(
+                e,
+                registry.core.as_ref(),
+                internal_upstreams,
+                certificate,
+                remembered,
+            )?;
             registry
                 .insert(
                     e.owner.as_deref(),
@@ -695,18 +749,17 @@ impl Registry {
         });
         // A stored IRC network remembers the channels its session is in
         // across restarts; a configured one has no row to remember them in.
-        let memory = match (&self.pool, &key.owner, &definition, kind) {
-            (Some(pool), Some(owner), NetworkDefinition::Stored, "irc") => {
-                Some(super::channel_memory::spawn(
-                    super::channel_memory::ChannelStore {
-                        pool: pool.clone(),
-                        owner: owner.clone(),
-                        network: key.name.clone(),
-                        keys: self.secret_keys.clone(),
-                    },
-                    handle.clone(),
-                ))
-            }
+        let memory = match (&self.pool, &definition, kind) {
+            (Some(pool), definition, "irc") => Some(super::channel_memory::spawn(
+                super::channel_memory::ChannelStore {
+                    pool: pool.clone(),
+                    owner: key.owner.clone(),
+                    network: key.name.clone(),
+                    definition: definition.storage(),
+                    keys: self.secret_keys.clone(),
+                },
+                handle.clone(),
+            )),
             _ => None,
         };
         // A reconfigured network goes on from where its predecessor was, keys
@@ -942,6 +995,7 @@ impl Registry {
                         NetworkDefinition::Configured(configured) => Some(configured.clone()),
                         NetworkDefinition::Stored => None,
                     },
+                    remembered: slot.handle.joined_channels().remembered(),
                 }
             })
             .collect()
@@ -1178,16 +1232,25 @@ impl MutationLane {
         for key in held {
             let slot = networks.slots.get(&key).expect("listed under the lock");
             let entry = slot.restart.clone();
-            let definition = slot.definition.clone();
+            let predecessor = slot.handle.clone();
             let built = entry
                 .as_deref()
                 .ok_or_else(|| format!("network '{}': no configuration entry to restart", key.name))
                 .and_then(|entry| {
+                    // Read again: the files may have been replaced (a
+                    // rotation) while the network was held.
+                    let certificate = configured_certificate(entry)?;
+                    let definition = NetworkDefinition::Configured(Arc::new(
+                        ConfiguredNetwork::from_entry(entry, certificate.as_ref()),
+                    ));
                     configured_driver(
                         entry,
                         self.registry.core.as_ref(),
                         self.registry.internal_upstreams,
+                        certificate,
+                        Vec::new(),
                     )
+                    .map(|driver| (driver, definition))
                 });
             match built {
                 // A shutdown closed the registry: the network stays held, as
@@ -1195,7 +1258,7 @@ impl MutationLane {
                 Ok(_) if networks.closed => {
                     failed.push(format!("network '{}': {RegistryClosed}", key.name))
                 }
-                Ok(driver) => {
+                Ok((driver, definition)) => {
                     let name = entry.as_ref().map_or(key.name.clone(), |e| e.name.clone());
                     networks.slots.remove(&key);
                     // The lock is released for the start: `insert` takes it.
@@ -1203,7 +1266,14 @@ impl MutationLane {
                     // lane first, so the key is free and the registry open.
                     drop(networks);
                     self.registry
-                        .insert(key.owner.as_deref(), &name, definition, driver, entry, None)
+                        .insert(
+                            key.owner.as_deref(),
+                            &name,
+                            definition,
+                            driver,
+                            entry,
+                            Some(predecessor),
+                        )
                         .expect("the mutation lane serializes registry writers");
                     networks = self.registry.networks.lock().expect("registry poisoned");
                     started.push(name);
@@ -3222,6 +3292,88 @@ mod key_tests {
     /// refused when it is saved. (A nick with a space, a keyed or unprefixed
     /// autojoin entry, and a control character in the real name were saved,
     /// then bricked the next start.)
+    /// A configured network's client certificate is files on the host: read
+    /// and checked when the network starts — a pair that does not match, or a
+    /// file that is not there, fails the start by name — and its fingerprints
+    /// are what the operator's and owner's views show. It needs TLS.
+    #[tokio::test]
+    async fn a_configured_client_certificate_is_read_and_checked_at_start() {
+        let dir = std::env::temp_dir().join(format!(
+            "e6irc-configured-certificate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = crate::bouncer::client_certificates::generate(
+            crate::bouncer::client_certificates::GeneratedKey::Ed25519,
+            "operator/oftc",
+        )
+        .unwrap();
+        let other = crate::bouncer::client_certificates::generate(
+            crate::bouncer::client_certificates::GeneratedKey::Ed25519,
+            "operator/other",
+        )
+        .unwrap();
+        let write = |file: &str, text: &str| {
+            let path = dir.join(file);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let certificate = write("cert.pem", &mine.certificate);
+        let key = write("key.pem", &mine.key);
+        let other_key = write("other-key.pem", &other.key);
+        let entry = |tls: bool, key: &std::path::Path| NetworkEntry {
+            client_certificate: Some(crate::config::ClientCertificateFiles {
+                certificate: certificate.clone(),
+                key: key.to_path_buf(),
+            }),
+            tls,
+            ..owned_configured_entry()
+        };
+        let start = |entry: NetworkEntry| {
+            Registry::start_inner(
+                &[entry],
+                &HashMap::new(),
+                Storage::default(),
+                test_core(),
+                None,
+                crate::egress::InternalUpstreams::Allow,
+            )
+        };
+
+        let registry = start(entry(true, &key)).expect("a matching pair starts");
+        let (configured, _) = registry
+            .get_configured_owned("alice", "libera")
+            .expect("the configured network");
+        let expected =
+            e6irc_client::ClientCertificate::from_pem(&mine.certificate, &mine.key).unwrap();
+        assert_eq!(
+            configured.client_certificate,
+            Some(e6irc_client::Fingerprints {
+                sha256: expected.fingerprint_sha256(),
+                sha512: expected.fingerprint_sha512(),
+            })
+        );
+        registry
+            .stop_all_within(std::time::Duration::from_secs(5))
+            .await;
+
+        let refused = start(entry(true, &other_key))
+            .err()
+            .expect("a mismatched key");
+        assert!(refused.contains("does not belong"), "{refused}");
+        let refused = start(entry(true, &dir.join("missing.pem")))
+            .err()
+            .expect("a missing key file");
+        assert!(refused.contains("missing.pem"), "{refused}");
+        assert!(
+            entry(false, &key)
+                .validate_connection_intent()
+                .unwrap_err()
+                .contains("over TLS")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_configured_network_validates_exactly_when_it_starts() {
         use crate::config::NetworkKind;
@@ -3239,6 +3391,7 @@ mod key_tests {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         };
         let cases = [
             (
@@ -3315,7 +3468,9 @@ mod key_tests {
                 sasl_account: None,
                 sasl_password: None,
                 server_password: None,
+                client_certificate: None,
             },
+            None,
         )))
     }
 
@@ -3334,6 +3489,7 @@ mod key_tests {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }
     }
 

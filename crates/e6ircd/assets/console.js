@@ -519,6 +519,25 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   //
   // A div or span has no role to carry a name, so naming one without giving
   // it a role is refused rather than published as a name nothing reads.
+  // A client certificate's fingerprints, read-only, as a disclosure: what the
+  // network's services are told to recognise (NickServ CERT ADD).
+  const certificateFingerprints = (certificate) => {
+    const details = document.createElement("details");
+    details.className = "certificate-fingerprints";
+    const summary = document.createElement("summary");
+    summary.textContent = "Client certificate";
+    details.append(summary);
+    for (const [label, value] of [["SHA-256", certificate.fingerprint_sha256], ["SHA-512", certificate.fingerprint_sha512]]) {
+      const line = document.createElement("div");
+      const name = document.createElement("span");
+      name.textContent = `${label} `;
+      const code = document.createElement("code");
+      code.textContent = value;
+      line.append(name, code);
+      details.append(line);
+    }
+    return details;
+  };
   const ariaName = (node, label) => {
     if ((node instanceof HTMLDivElement || node instanceof HTMLSpanElement) && !node.hasAttribute("role")) {
       throw new Error(`A ${node.localName} was named without a role.`);
@@ -2517,7 +2536,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const row = document.createElement("tr");
       const runtime = network.runtime;
       const cells = [runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state, network.owner, network.name, network.kind, network.shared === true ? "Managed configuration" : network.addr, runtime === null ? 0 : runtime.attached_clients, runtime === null ? 0 : runtime.errors, runtime?.last_error?.summary ?? "—"];
-      cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } row.append(cell); });
+      cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } if (index === 4 && network.client_certificate) cell.append(certificateFingerprints(network.client_certificate)); row.append(cell); });
       const actions = document.createElement("td");
       actions.className = "row-actions";
       // A shared network, or one the server configuration defines for an
@@ -2968,15 +2987,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) { toggleForm.hidden = operatorOwned; toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; }
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.hidden = operatorOwned; deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
       const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (operatorOwned) edit.hidden = true; else if (network.kind === "irc") { edit.href = `/?network=${encodeURIComponent(network.name)}&settings=1`; edit.textContent = "Edit settings"; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
-      // An IRC network the owner stores signs in with a client certificate
-      // and remembers the channels its session joins; a bridge and an
-      // operator's network do neither.
+      // An IRC network signs in with a client certificate and remembers the
+      // channels its session joins; a bridge does neither. On a network the
+      // server configuration defines, the certificate is the operator's
+      // files, shown here and changed there.
       const ownIrc = network.kind === "irc" && !operatorOwned;
       const base = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const certificate = ownerNetworkDetail.querySelector("[data-network-certificate]");
       if (certificate instanceof HTMLElement) {
-        certificate.hidden = !ownIrc;
         const stored = network.client_certificate ?? null;
+        certificate.hidden = !(ownIrc || (network.kind === "irc" && stored));
+        for (const control of certificate.querySelectorAll("[data-certificate-controls], [data-api-network-certificate-delete]")) control.hidden = !ownIrc;
         const show = (selector, visible) => { const node = certificate.querySelector(selector); if (node instanceof HTMLElement) node.hidden = !visible; };
         show("[data-certificate-none]", !stored);
         show("[data-certificate-fingerprints]", Boolean(stored));
@@ -2990,7 +3011,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           else delete form.dataset.confirm;
         }
         const remove = certificate.querySelector("[data-api-network-certificate-delete]");
-        if (remove instanceof HTMLFormElement) { remove.hidden = !stored; remove.dataset.confirm = "Remove the client certificate? The network reconnects without it."; }
+        if (remove instanceof HTMLFormElement) { remove.hidden = !stored || !ownIrc; remove.dataset.confirm = "Remove the client certificate? The network reconnects without it."; }
+        const configured = certificate.querySelector("[data-certificate-configured]"); if (configured instanceof HTMLElement) configured.hidden = ownIrc;
         if (!network.tls) {
           const note = certificate.querySelector("[data-certificate-none]");
           if (note) note.textContent = "A client certificate is presented only over TLS; enable TLS in this network's settings first.";
@@ -2999,7 +3021,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       const remembered = ownerNetworkDetail.querySelector("[data-network-remembered]");
       if (remembered instanceof HTMLElement) {
-        remembered.hidden = !ownIrc;
+        remembered.hidden = network.kind !== "irc";
         const channels = network.remembered_channels ?? [];
         const empty = remembered.querySelector("[data-remembered-empty]"); if (empty instanceof HTMLElement) empty.hidden = channels.length > 0;
         const list = remembered.querySelector("[data-remembered-list]");

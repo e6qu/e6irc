@@ -640,6 +640,69 @@ pub fn driver_from_row(
     })
 }
 
+/// The channels each configured IRC network in `entries` remembered when the
+/// process last stopped, their keys opened under the network owner's context
+/// (`*` for a shared one), keyed as the registry keys the network; the rows of
+/// a network the configuration no longer defines are deleted. A key that does
+/// not open (the master key was replaced without keeping the old one) is
+/// dropped, loudly, and its channel kept: the rejoin may then be refused, and
+/// says so.
+pub(crate) async fn configured_remembered_channels(
+    pool: &sqlx::PgPool,
+    entries: &[crate::config::NetworkEntry],
+    keys: Option<&crate::secret::SecretKeyring>,
+) -> Result<serve::ConfiguredChannels, crate::db::DbError> {
+    let fold = |value: &str| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(value);
+    let networks: Vec<(Option<String>, String)> = entries
+        .iter()
+        .filter(|entry| entry.kind == crate::config::NetworkKind::Irc)
+        .map(|entry| (entry.owner.clone(), entry.name.clone()))
+        .collect();
+    let stored = crate::db::take_configured_remembered_channels(pool, &networks).await?;
+    Ok(stored
+        .into_iter()
+        .map(|((owner, name), rows)| {
+            let context = bnc_secret_context(owner.as_deref().unwrap_or("*"));
+            let label = format!("{}/{name}", owner.as_deref().unwrap_or("*"));
+            let channels = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let key = row.key_sealed.as_deref().and_then(|sealed| {
+                        match keys.map(|keys| keys.open(sealed, &context)) {
+                            Some(Ok(key)) => Some(key),
+                            Some(Err(error)) => {
+                                eprintln!(
+                                    "bnc: the remembered key of {} on {label} does not open \
+                                     ({error}); rejoining it without one",
+                                    row.channel
+                                );
+                                None
+                            }
+                            None => {
+                                eprintln!(
+                                    "bnc: the remembered key of {} on {label} is sealed and no \
+                                     master key is configured; rejoining it without one",
+                                    row.channel
+                                );
+                                None
+                            }
+                        }
+                    });
+                    let remembered = RememberedChannel::parse(&row.channel, key.as_deref());
+                    if remembered.is_none() {
+                        eprintln!(
+                            "bnc: {:?} remembered on {label} is not one channel; not rejoined",
+                            row.channel
+                        );
+                    }
+                    remembered
+                })
+                .collect();
+            ((owner.as_deref().map(fold), fold(&name)), channels)
+        })
+        .collect())
+}
+
 use tokio::sync::mpsc;
 
 /// Jittered exponential reconnect backoff shared by every always-on driver, so

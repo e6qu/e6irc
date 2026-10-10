@@ -98,6 +98,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -430,6 +431,7 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -837,6 +839,7 @@ fn history_config(
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),

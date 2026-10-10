@@ -506,6 +506,7 @@ fn bnc_config(up: std::net::SocketAddr, url: e6ircd::db::DatabaseUrl) -> Config 
                 sasl_account: None,
                 sasl_password: None,
                 server_password: None,
+                client_certificate: None,
             },
             // A network owned by a different account: alice must not see it.
             NetworkEntry {
@@ -522,6 +523,7 @@ fn bnc_config(up: std::net::SocketAddr, url: e6ircd::db::DatabaseUrl) -> Config 
                 sasl_account: None,
                 sasl_password: None,
                 server_password: None,
+                client_certificate: None,
             },
         ],
         bnc: Some(BncConfig {
@@ -1369,6 +1371,7 @@ async fn local_driver_presents_the_in_process_network() {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -5476,6 +5479,7 @@ fn shared_network(up: std::net::SocketAddr) -> e6ircd::config::NetworkEntry {
         sasl_account: None,
         sasl_password: None,
         server_password: None,
+        client_certificate: None,
     }
 }
 

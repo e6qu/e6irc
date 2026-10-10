@@ -8873,19 +8873,72 @@ pub async fn set_bnc_network_client_certificate(
 /// ([`crate::bouncer::MAX_TRACKED_CHANNELS`]).
 const MAX_REMEMBERED_CHANNELS: usize = 512;
 
-/// Replace the channels `owner`'s stored network `name` remembers with
-/// `channels`, each key already sealed: the whole set, in one transaction, so
-/// a write that fails leaves the previous set whole. A network that no longer
-/// exists has nothing to remember, and nothing is written.
+/// Whose remembered channels a write replaces: a stored network's, by its
+/// owning account and name, or a configured network's, by its owner (`None`
+/// when shared) and name.
+#[derive(Debug, Clone, Copy)]
+pub struct RememberedChannelsOf<'a> {
+    pub definition: BncNetworkDefinition,
+    pub owner: Option<&'a str>,
+    pub network: &'a str,
+}
+
+/// The `bnc_configured_remembered_channels` key of a configured network:
+/// its folded owner (`*` when shared) and folded name, as `bnc_buffer` keys
+/// its backlog.
+fn configured_channels_key(owner: Option<&str>, network: &str) -> (String, String) {
+    let fold = |value: &str| CaseMapping::Rfc1459.casefold(value);
+    (owner.map_or_else(|| "*".to_owned(), fold), fold(network))
+}
+
+/// Replace the channels a network remembers with `channels`, each key
+/// already sealed: the whole set, in one transaction, so a write that fails
+/// leaves the previous set whole. A stored network that no longer exists has
+/// nothing to remember, and nothing is written.
 pub async fn replace_bnc_remembered_channels(
     pool: &PgPool,
-    owner: &str,
-    name: &str,
+    of: RememberedChannelsOf<'_>,
     channels: &[BncAutojoin],
 ) -> Result<(), DbError> {
+    let name = of.network;
     if channels.len() > MAX_REMEMBERED_CHANNELS {
         return Err(DbError::InvalidNetworkAutojoin(name.to_string()));
     }
+    let (names, keys) = autojoin_columns(channels);
+    let owner = match (of.definition, of.owner) {
+        (BncNetworkDefinition::Configured, owner) => {
+            let (owner, network) = configured_channels_key(owner, name);
+            let mut transaction = pool.begin().await.map_err(query_error)?;
+            sqlx::query(
+                "DELETE FROM bnc_configured_remembered_channels
+                 WHERE owner = $1 AND network = $2",
+            )
+            .bind(&owner)
+            .bind(&network)
+            .execute(&mut *transaction)
+            .await
+            .map_err(query_error)?;
+            sqlx::query(
+                "INSERT INTO bnc_configured_remembered_channels
+                   (owner, network, channel, key_sealed)
+                 SELECT $1, $2, entry.channel, entry.key_sealed
+                 FROM unnest($3::text[], $4::text[]) AS entry(channel, key_sealed)
+                 ON CONFLICT (owner, network, channel) DO NOTHING",
+            )
+            .bind(&owner)
+            .bind(&network)
+            .bind(&names)
+            .bind(&keys)
+            .execute(&mut *transaction)
+            .await
+            .map_err(query_error)?;
+            return transaction.commit().await.map_err(query_error);
+        }
+        (BncNetworkDefinition::Stored, Some(owner)) => owner,
+        (BncNetworkDefinition::Stored, None) => {
+            return Err(DbError::InvalidNetworkAutojoin(name.to_string()));
+        }
+    };
     let folded = CaseMapping::Rfc1459.casefold(owner);
     let mut transaction = pool.begin().await.map_err(query_error)?;
     // Locked, so a concurrent delete of the network either happens before
@@ -8908,7 +8961,6 @@ pub async fn replace_bnc_remembered_channels(
         .execute(&mut *transaction)
         .await
         .map_err(query_error)?;
-    let (names, keys) = autojoin_columns(channels);
     sqlx::query(
         "INSERT INTO bnc_remembered_channels (network_id, channel, key_sealed)
          SELECT $1, entry.channel, entry.key_sealed
@@ -8923,6 +8975,61 @@ pub async fn replace_bnc_remembered_channels(
     .map_err(query_error)?;
     transaction.commit().await.map_err(query_error)?;
     Ok(())
+}
+
+/// The channels the configured networks `networks` (each its owner, `None`
+/// when shared, and name) remember, keys still sealed, by the same pair as
+/// given; the rows of every configured network not among them are deleted in
+/// the same transaction, so a network removed from the configuration leaves
+/// nothing behind and one added again later starts with nothing.
+pub async fn take_configured_remembered_channels(
+    pool: &PgPool,
+    networks: &[(Option<String>, String)],
+) -> Result<Vec<((Option<String>, String), Vec<BncAutojoin>)>, DbError> {
+    use sqlx::Row;
+    let keys: Vec<(String, String)> = networks
+        .iter()
+        .map(|(owner, network)| configured_channels_key(owner.as_deref(), network))
+        .collect();
+    let (owners, names): (Vec<String>, Vec<String>) = keys.iter().cloned().unzip();
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    sqlx::query(
+        "DELETE FROM bnc_configured_remembered_channels c
+         WHERE NOT EXISTS (
+             SELECT 1 FROM unnest($1::text[], $2::text[]) AS kept(owner, network)
+             WHERE kept.owner = c.owner AND kept.network = c.network)",
+    )
+    .bind(&owners)
+    .bind(&names)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    let rows = sqlx::query(
+        "SELECT owner, network, channel, key_sealed FROM bnc_configured_remembered_channels
+         ORDER BY owner, network, channel",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(networks
+        .iter()
+        .zip(&keys)
+        .map(|(network, (owner, name))| {
+            let channels = rows
+                .iter()
+                .filter(|row| {
+                    row.get::<String, _>("owner") == *owner
+                        && row.get::<String, _>("network") == *name
+                })
+                .map(|row| BncAutojoin {
+                    channel: row.get("channel"),
+                    key_sealed: row.get("key_sealed"),
+                })
+                .collect();
+            (network.clone(), channels)
+        })
+        .collect())
 }
 
 /// Forget the remembered channel `channel` of `account`'s network `name`,

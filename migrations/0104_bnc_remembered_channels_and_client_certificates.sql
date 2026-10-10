@@ -1,4 +1,4 @@
--- Two things a stored IRC network keeps across a process restart and an edit
+-- What a bouncer network keeps across a process restart and an edit
 -- (DESIGN §10.3).
 --
 -- 1. The channels its session was in. A channel is remembered once the
@@ -37,3 +37,19 @@ ALTER TABLE bnc_networks
         CHECK ((client_certificate IS NULL) = (client_key_sealed IS NULL)),
     ADD CONSTRAINT bnc_networks_client_certificate_irc_tls
         CHECK (client_certificate IS NULL OR (kind = 'irc' AND tls));
+
+-- 3. The channels a network the server configuration defines remembers. Such
+--    a network has no `bnc_networks` row, so its channels are keyed as its
+--    backlog is (`bnc_buffer`): by the folded owning account, `*` for a
+--    network shared by every account, and the folded network name. A start
+--    deletes the rows of every network the configuration no longer defines.
+CREATE TABLE bnc_configured_remembered_channels (
+    owner TEXT NOT NULL CHECK (owner <> ''),
+    network TEXT NOT NULL CHECK (network <> ''),
+    channel TEXT NOT NULL CHECK (
+        octet_length(channel) BETWEEN 2 AND 200
+        AND channel !~ '[[:space:],[:cntrl:]]'
+    ),
+    key_sealed TEXT,
+    PRIMARY KEY (owner, network, channel)
+);

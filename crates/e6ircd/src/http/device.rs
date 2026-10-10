@@ -1390,7 +1390,11 @@ pub(super) async fn admin_networks(
                     None => super::networks::shared_admin_network_response(status),
                     Some(owner) => super::networks::owned_admin_network_response(
                         owner.clone(),
-                        super::networks::configured_network_response(&configured, &status.runtime),
+                        super::networks::configured_network_response(
+                            &configured,
+                            &status.runtime,
+                            &status.remembered,
+                        ),
                     ),
                 };
                 Some((key, response))
@@ -1710,6 +1714,7 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
                 sasl_account,
                 sasl_password: _,
                 server_password: _,
+                client_certificate,
             } = network;
             NetworkEntry {
                 name,
@@ -1726,6 +1731,8 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
                 sasl_account: sasl_account.filter(|_| !kind.account_is_secret()),
                 sasl_password: None,
                 server_password: None,
+                // Where the files are is configuration, not a secret.
+                client_certificate,
             }
         })
         .collect();
@@ -2104,6 +2111,7 @@ mod shown_configuration_tests {
             sasl_account: Some(format!("{name}-account-secret")),
             sasl_password: Some("password-secret".into()),
             server_password: Some("pass-secret".into()),
+            client_certificate: None,
         };
         settings.networks = vec![
             network(crate::config::NetworkKind::Irc, "irc"),
@@ -2241,6 +2249,7 @@ pub(super) async fn admin_create_network(
                     sasl_account: sealed_account,
                     sasl_password: sealed_password,
                     server_password: sealed_server_password,
+                    client_certificate: None,
                     ..network
                 });
                 Ok(format!("added server network {name}"))

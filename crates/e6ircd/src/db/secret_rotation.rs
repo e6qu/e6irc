@@ -241,6 +241,41 @@ pub async fn rotate_database_secrets(
         }
     }
 
+    // The keys configured networks' sessions learned, sealed under their
+    // owner's context (`*` for a shared network's).
+    let configured = sqlx::query(
+        "SELECT owner, network, channel, key_sealed FROM bnc_configured_remembered_channels
+         WHERE key_sealed IS NOT NULL
+         ORDER BY owner, network, channel
+         FOR UPDATE",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(super::query_error)?;
+    for entry in configured {
+        let owner: String = entry.get("owner");
+        let network: String = entry.get("network");
+        let channel: String = entry.get("channel");
+        let mut key: String = entry.get("key_sealed");
+        account_network_secrets += reseal(
+            &mut key,
+            &crate::bouncer::bnc_secret_context(&owner),
+            keys,
+            &format!("configured network {owner}/{network} remembered key of {channel:?}"),
+        )? as usize;
+        sqlx::query(
+            "UPDATE bnc_configured_remembered_channels SET key_sealed = $4
+             WHERE owner = $1 AND network = $2 AND channel = $3",
+        )
+        .bind(&owner)
+        .bind(&network)
+        .bind(&channel)
+        .bind(key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(super::query_error)?;
+    }
+
     insert_audit_log_with(
         &mut *transaction,
         &AuditPrincipal::host(actor),

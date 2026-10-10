@@ -1244,6 +1244,18 @@ async fn serve(
                 holds.insert(owner, hold);
             }
         }
+        // What the configured IRC networks remembered when the process last
+        // stopped; the rows of networks the configuration no longer defines go.
+        let configured_channels = match &pool {
+            Some(pool) => crate::bouncer::configured_remembered_channels(
+                pool,
+                &config.networks,
+                secret_key.as_deref(),
+            )
+            .await
+            .map_err(io::Error::other)?,
+            None => Default::default(),
+        };
         let reg = Arc::new(
             crate::bouncer::Registry::start_observed(
                 &config.networks,
@@ -1251,6 +1263,7 @@ async fn serve(
                 crate::bouncer::RegistryStorage {
                     pool: pool.clone(),
                     secret_keys: secret_key.clone(),
+                    configured_channels,
                 },
                 crate::bouncer::CoreHandles {
                     core_tx: core_tx.clone(),
@@ -2393,6 +2406,7 @@ mod tests {
                     sasl_account: None,
                     sasl_password: None,
                     server_password: None,
+                    client_certificate: None,
                 }],
                 &std::collections::HashMap::new(),
                 crate::bouncer::RegistryStorage::default(),

@@ -12642,6 +12642,7 @@ async fn configured_networks_are_the_operators_and_the_inventory_pages_them() {
         sasl_account: None,
         sasl_password: None,
         server_password: None,
+        client_certificate: None,
     };
     let config = Config {
         server_name: "irc.configured.example".into(),
@@ -13331,4 +13332,170 @@ async fn a_network_client_certificate_is_generated_rotated_and_removed() {
     .expect("audit");
     assert_eq!(audited, 4, "three set, one removed");
     running.shutdown.run(net::StopMode::Final).await;
+}
+
+/// A network the configuration defines remembers what its session joins too,
+/// keyed by owner and name: a client's channel is rejoined after a restart,
+/// its owner can forget it, and the owner's and the operator's views show the
+/// fingerprints of the client certificate the configuration names.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_configured_network_remembers_its_channels_and_shows_its_certificate() {
+    let url = support::test_db("configured_network_remembers").await;
+    let key_path = temporary_path("configured-remembered-key");
+    std::fs::write(&key_path, e6ircd::secret::SecretKey::generate().to_base64())
+        .expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pem = e6ircd::bouncer::client_certificates::generate(
+        e6ircd::bouncer::client_certificates::GeneratedKey::EcdsaP256,
+        "operator/certified",
+    )
+    .expect("certificate");
+    let certificate_path = temporary_path("configured-certificate");
+    let certificate_key_path = temporary_path("configured-certificate-key");
+    std::fs::write(&certificate_path, &pem.certificate).expect("write certificate");
+    std::fs::write(&certificate_key_path, &pem.key).expect("write key");
+    let _certificate_files = (
+        TemporaryFile(certificate_path.clone()),
+        TemporaryFile(certificate_key_path.clone()),
+    );
+    let fingerprint = e6irc_client::ClientCertificate::from_pem(&pem.certificate, &pem.key)
+        .expect("usable")
+        .fingerprint_sha512();
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("token");
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
+    let config = || {
+        let mut config = remembering_config(&url, &key_path);
+        let network = |name: &str, addr: String, tls: bool| e6ircd::config::NetworkEntry {
+            kind: e6ircd::config::NetworkKind::Irc,
+            name: name.into(),
+            owner: Some("alice".into()),
+            addr,
+            tls,
+            nick: "confnick".into(),
+            username: Some("conf".into()),
+            realname: Some("Conf".into()),
+            autojoin: vec!["#lobby".into()],
+            buffer_cap: 100,
+            sasl_account: None,
+            sasl_password: None,
+            server_password: None,
+            client_certificate: None,
+        };
+        config.networks = vec![
+            network("conf", up.to_string(), false),
+            // Nothing answers there; it only shows its certificate.
+            e6ircd::config::NetworkEntry {
+                client_certificate: Some(e6ircd::config::ClientCertificateFiles {
+                    certificate: certificate_path.clone(),
+                    key: certificate_key_path.clone(),
+                }),
+                nick: "certnick".into(),
+                ..network("certified", "127.0.0.1:1".into(), true)
+            },
+        ];
+        config
+    };
+
+    let running = net::start(config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    wait_http_ready(http).await;
+    membership::wait_joined(up, "confnick", "#lobby").await;
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .unwrap();
+    client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/conf",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("attach");
+    client.send_line("JOIN #runtime").await.unwrap();
+    client.send_line("JOIN #spare").await.unwrap();
+    membership::wait_joined(up, "confnick", "#spare").await;
+    wait_remembered(
+        http,
+        &token,
+        "conf",
+        &[("#lobby", false), ("#runtime", false), ("#spare", false)],
+    )
+    .await;
+    drop(client);
+    // The writer stores the set beside the session, not before the API
+    // answers: wait for it.
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let stored: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM bnc_configured_remembered_channels \
+                 WHERE owner = 'alice' AND network = 'conf'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+            if stored == 3 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the configured network's channels are stored");
+
+    // The owner forgets one; the session leaves it.
+    let (status, body) = send_json(
+        http,
+        "DELETE",
+        "/api/v1/me/networks/conf/remembered-channels/%23spare",
+        &token,
+        "",
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    membership::whois_until(up, "confnick", "left #spare", |whois| {
+        whois
+            .as_ref()
+            .is_some_and(|channels| !channels.iter().any(|channel| channel == "#spare"))
+    })
+    .await;
+    wait_remembered(
+        http,
+        &token,
+        "conf",
+        &[("#lobby", false), ("#runtime", false)],
+    )
+    .await;
+
+    // Both views show the configured certificate by its fingerprints.
+    let (status, network, body) = get_json(http, "/api/v1/me/networks/certified", &token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(network["configured"], true);
+    assert_eq!(
+        network["client_certificate"]["fingerprint_sha512"],
+        fingerprint
+    );
+
+    // A restart rejoins what it remembered.
+    running.shutdown.run(net::StopMode::Final).await;
+    membership::whois_until(up, "confnick", "left", Option::is_none).await;
+    let running = net::start(config()).await.expect("restart");
+    membership::wait_joined(up, "confnick", "#runtime").await;
+    running.shutdown.run(net::StopMode::Final).await;
+    upstream.shutdown.run(net::StopMode::Final).await;
 }

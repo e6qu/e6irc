@@ -96,6 +96,7 @@ async fn bouncer(
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),

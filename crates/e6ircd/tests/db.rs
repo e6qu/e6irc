@@ -6781,6 +6781,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         sasl_account: Some(old.seal("xoxb-old", CONFIG_CONTEXT)),
         sasl_password: Some(old.seal("xapp-old", CONFIG_CONTEXT)),
         server_password: None,
+        client_certificate: None,
     });
     managed.networks.push(NetworkEntry {
         name: "private-shared".into(),
@@ -6796,6 +6797,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         sasl_account: None,
         sasl_password: None,
         server_password: Some(old.seal("managed-pass", CONFIG_CONTEXT)),
+        client_certificate: None,
     });
     db::load_or_initialize_managed_config(&pool, &managed)
         .await
@@ -6884,8 +6886,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
     );
     db::replace_bnc_remembered_channels(
         &pool,
-        "alice",
-        "private",
+        stored_network("alice", "private"),
         &[
             db::BncAutojoin {
                 channel: "#learned".into(),
@@ -10740,6 +10741,7 @@ async fn a_stored_buffer_cap_above_storage_is_brought_within_it_by_0091() {
         sasl_account: None,
         sasl_password: None,
         server_password: None,
+        client_certificate: None,
     };
     let config = Config {
         networks: vec![network("large"), network("small")],
@@ -14407,12 +14409,20 @@ async fn remembered_channels_and_client_certificates_belong_to_their_network() {
     let stored = |channels: &[&str]| -> Vec<db::BncAutojoin> {
         channels.iter().map(|channel| (*channel).into()).collect()
     };
-    db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#a", "#B", "#c"]))
-        .await
-        .expect("first set");
-    db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#B", "#c", "#d"]))
-        .await
-        .expect("second set");
+    db::replace_bnc_remembered_channels(
+        &pool,
+        stored_network("alice", "work"),
+        &stored(&["#a", "#B", "#c"]),
+    )
+    .await
+    .expect("first set");
+    db::replace_bnc_remembered_channels(
+        &pool,
+        stored_network("alice", "work"),
+        &stored(&["#B", "#c", "#d"]),
+    )
+    .await
+    .expect("second set");
     let read = db::get_bnc_network(&pool, "alice", "work")
         .await
         .expect("read")
@@ -14447,9 +14457,13 @@ async fn remembered_channels_and_client_certificates_belong_to_their_network() {
 
     // A name that is not one JOIN parameter is refused by the table.
     assert!(
-        db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#two words"]))
-            .await
-            .is_err()
+        db::replace_bnc_remembered_channels(
+            &pool,
+            stored_network("alice", "work"),
+            &stored(&["#two words"])
+        )
+        .await
+        .is_err()
     );
 
     // A client certificate: only with TLS, removed again on request.
@@ -14500,12 +14514,124 @@ async fn remembered_channels_and_client_certificates_belong_to_their_network() {
         .await
         .expect("count");
     assert_eq!(left, 0);
-    db::replace_bnc_remembered_channels(&pool, "alice", "work", &stored(&["#late"]))
-        .await
-        .expect("a late write of a deleted network is not an error");
+    db::replace_bnc_remembered_channels(
+        &pool,
+        stored_network("alice", "work"),
+        &stored(&["#late"]),
+    )
+    .await
+    .expect("a late write of a deleted network is not an error");
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_remembered_channels")
         .fetch_one(&pool)
         .await
         .expect("count");
     assert_eq!(left, 0);
+}
+
+/// Whose remembered channels a write replaces: the stored network `network`
+/// of `owner`.
+fn stored_network<'a>(owner: &'a str, network: &'a str) -> db::RememberedChannelsOf<'a> {
+    db::RememberedChannelsOf {
+        definition: db::BncNetworkDefinition::Stored,
+        owner: Some(owner),
+        network,
+    }
+}
+
+/// A configured network's remembered channels are keyed by its owner (`*`
+/// when shared) and name, without regard to case; a start takes those of the
+/// networks still configured and deletes the rest; and their keys are
+/// resealed by a rotation.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_configured_networks_remembered_channels_are_kept_by_owner_and_name() {
+    let url = support::test_db("configured_remembered_channels").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let configured =
+        |owner: Option<&'static str>, network: &'static str| db::RememberedChannelsOf {
+            definition: db::BncNetworkDefinition::Configured,
+            owner,
+            network,
+        };
+    let old = e6ircd::secret::SecretKey::generate();
+    let keyed = db::BncAutojoin {
+        channel: "#keyed".into(),
+        key_sealed: Some(old.seal("sesame", &e6ircd::bouncer::bnc_secret_context("*"))),
+    };
+    db::replace_bnc_remembered_channels(&pool, configured(None, "Shared"), &[keyed.clone()])
+        .await
+        .expect("shared");
+    db::replace_bnc_remembered_channels(
+        &pool,
+        configured(Some("Alice"), "Up"),
+        &["#a".into(), "#b".into()],
+    )
+    .await
+    .expect("owned");
+    db::replace_bnc_remembered_channels(&pool, configured(Some("bob"), "gone"), &["#x".into()])
+        .await
+        .expect("a network the configuration drops");
+    db::replace_bnc_remembered_channels(&pool, configured(Some("ALICE"), "UP"), &["#b".into()])
+        .await
+        .expect("the same network, spelled otherwise");
+
+    let taken = db::take_configured_remembered_channels(
+        &pool,
+        &[
+            (Some("alice".to_owned()), "up".to_owned()),
+            (None, "shared".to_owned()),
+            (None, "new".to_owned()),
+        ],
+    )
+    .await
+    .expect("take");
+    assert_eq!(
+        taken,
+        vec![
+            (
+                (Some("alice".to_owned()), "up".to_owned()),
+                vec!["#b".into()]
+            ),
+            ((None, "shared".to_owned()), vec![keyed]),
+            ((None, "new".to_owned()), vec![]),
+        ]
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM bnc_configured_remembered_channels WHERE owner = 'bob'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(left, 0, "a network no longer configured leaves nothing");
+
+    // A rotation reseals the learned key under the shared context.
+    db::create_account_with_contact(&pool, "operator", "pw", None)
+        .await
+        .expect("account");
+    db::load_or_initialize_managed_config(
+        &pool,
+        &e6ircd::config::ManagedConfig::from_config(&Config::default(), None).unwrap(),
+    )
+    .await
+    .expect("managed settings");
+    let new = e6ircd::secret::SecretKey::generate();
+    let new_base64 = new.to_base64();
+    let keys = e6ircd::secret::SecretKeyring::new(new, vec![old]).unwrap();
+    let report = db::rotate_database_secrets(&pool, &keys, "operator")
+        .await
+        .expect("rotate");
+    assert_eq!(report.account_network_secrets, 1);
+    let sealed: String = sqlx::query_scalar(
+        "SELECT key_sealed FROM bnc_configured_remembered_channels WHERE channel = '#keyed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("key");
+    assert_eq!(
+        e6ircd::secret::SecretKey::from_base64(&new_base64)
+            .unwrap()
+            .open(&sealed, &e6ircd::bouncer::bnc_secret_context("*"))
+            .unwrap(),
+        "sesame"
+    );
 }

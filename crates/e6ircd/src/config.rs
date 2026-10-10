@@ -1327,6 +1327,41 @@ pub struct NetworkEntry {
     /// only; sealed at rest like `sasl_password`.
     #[serde(default)]
     pub server_password: Option<String>,
+    /// The TLS client certificate an `irc` network over TLS presents to its
+    /// upstream (SASL EXTERNAL, or NickServ CertFP), as files on this host:
+    /// read and checked when the network starts, so replacing them and
+    /// restarting is how it is rotated.
+    #[serde(default)]
+    pub client_certificate: Option<ClientCertificateFiles>,
+}
+
+/// Where a configured network's client certificate and its private key are,
+/// both PEM. One value holds both, so neither can be configured alone.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCertificateFiles {
+    pub certificate: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+}
+
+impl ClientCertificateFiles {
+    /// Read both files and check that they are a usable pair.
+    pub fn load(&self) -> Result<e6irc_client::ClientCertificate, String> {
+        let read = |path: &std::path::Path| {
+            std::fs::read_to_string(path)
+                .map_err(|error| format!("client certificate file {}: {error}", path.display()))
+        };
+        let key = zeroize::Zeroizing::new(read(&self.key)?);
+        e6irc_client::ClientCertificate::from_pem(&read(&self.certificate)?, &key).map_err(
+            |error| {
+                format!(
+                    "client certificate {} with key {}: {error}",
+                    self.certificate.display(),
+                    self.key.display()
+                )
+            },
+        )
+    }
 }
 
 fn default_bnc_buffer() -> usize {
@@ -1345,6 +1380,7 @@ pub(crate) enum NetworkEntryWire {
         sasl_account: Option<String>,
         sasl_password: Option<String>,
         server_password: Option<String>,
+        client_certificate: Option<ClientCertificateFiles>,
     },
     Local {
         #[serde(flatten)]
@@ -1396,9 +1432,11 @@ impl From<NetworkEntryWire> for NetworkEntry {
                 sasl_account,
                 sasl_password,
                 server_password,
+                client_certificate,
             } => NetworkEntry {
                 username: Some(username),
                 server_password,
+                client_certificate,
                 ..common.into_entry(
                     NetworkKind::Irc,
                     nick,
@@ -1469,6 +1507,7 @@ impl NetworkEntryCommon {
             sasl_account,
             sasl_password,
             server_password: None,
+            client_certificate: None,
         }
     }
 }
@@ -1540,6 +1579,9 @@ impl NetworkEntry {
             .any(|channel| channel.trim().is_empty())
         {
             return Err("autojoin entries must be non-blank".into());
+        }
+        if self.client_certificate.is_some() && !(self.kind == NetworkKind::Irc && self.tls) {
+            return Err("client_certificate applies only to kind=irc over TLS (tls = true)".into());
         }
         if self.server_password.is_some() && self.kind != NetworkKind::Irc {
             return Err(format!(
@@ -1962,6 +2004,7 @@ impl std::fmt::Debug for NetworkEntry {
             sasl_account,
             sasl_password,
             server_password,
+            client_certificate,
         } = self;
         f.debug_struct("NetworkEntry")
             .field("name", name)
@@ -1978,6 +2021,8 @@ impl std::fmt::Debug for NetworkEntry {
             .field("sasl_account", &redacted_option(sasl_account))
             .field("sasl_password", &redacted_option(sasl_password))
             .field("server_password", &redacted_option(server_password))
+            // Paths, not the key: they are configuration, as public as `addr`.
+            .field("client_certificate", client_certificate)
             .finish()
     }
 }
@@ -4055,6 +4100,7 @@ mod tests {
                 sasl_account: Some(sealed_account),
                 sasl_password: Some(sealed),
                 server_password: None,
+                client_certificate: None,
             }],
             secrets: secrets_at(&path),
             ..Config::default()
@@ -4129,6 +4175,7 @@ mod tests {
             sasl_account: None,
             sasl_password: None,
             server_password: None,
+            client_certificate: None,
         }
     }
 
