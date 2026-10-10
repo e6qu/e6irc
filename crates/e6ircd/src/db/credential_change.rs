@@ -63,6 +63,29 @@ impl RevocableCredential {
         }
     }
 
+    /// The credential as a session record holds it (DESIGN §19.3): its kind
+    /// and its digest, never the secret.
+    pub(crate) fn recorded(&self) -> (u8, bytes::Bytes) {
+        let kind = match self.kind {
+            RevocableCredentialKind::BrowserSession => 0,
+            RevocableCredentialKind::ApiToken => 1,
+        };
+        (kind, bytes::Bytes::copy_from_slice(&self.digest))
+    }
+
+    /// The credential a record held, or `None` for a kind no release writes.
+    pub(crate) fn from_recorded(kind: u8, digest: &[u8]) -> Option<Self> {
+        let kind = match kind {
+            0 => RevocableCredentialKind::BrowserSession,
+            1 => RevocableCredentialKind::ApiToken,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            digest: digest.to_vec(),
+        })
+    }
+
     /// The credential a trigger notification names, or `None` for a payload
     /// no shipped trigger writes.
     fn from_notification(payload: &str) -> Option<Self> {

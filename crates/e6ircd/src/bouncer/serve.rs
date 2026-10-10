@@ -1205,13 +1205,7 @@ fn spawn_persistence(
         // `buffer_cap` is bounded by what storage keeps
         // (`config::MAX_NETWORK_BUFFER_CAP`), so a restart restores it all.
         let restore = i64::try_from(handle.buffer_capacity()).unwrap_or(i64::MAX);
-        match crate::db::recent_bnc_backlog(&pool, &owner_key, &network, restore).await {
-            Ok(lines) => handle.preload_front(lines),
-            Err(e) => {
-                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
-                eprintln!("bnc: buffer restore failed for {owner_key}/{network}: {e}");
-            }
-        }
+        let renumbered = restore_ring(&pool, &owner_key, &network, restore, &handle).await;
         // Until the network says how it compares names, they are compared as
         // its stored conversations were keyed, so CHATHISTORY finds them.
         match crate::db::bnc_buffer_casemapping(&pool, &owner_key, &network).await {
@@ -1254,6 +1248,9 @@ fn spawn_persistence(
         // Whether the last write failed, so an outage logs once, and its end
         // logs once.
         let mut storage_failing = false;
+        // Whether a line this ring took was never stored: then no stop is
+        // clean, and the next start begins a new epoch.
+        let mut lost_a_line = false;
         let mut feed = PersistenceFeed {
             events,
             stopped,
@@ -1263,7 +1260,7 @@ fn spawn_persistence(
         // always completes (or fails) before the task ends.
         let mut own = OwnNick(handle.irc_session_snapshot().map(|session| session.nick));
         while let Some(event) = feed.next().await {
-            let (line, own_nick) = match event {
+            let (line, own_nick, seq) = match event {
                 Ok(DriverEvent::Session(snapshot)) => {
                     own = OwnNick(Some(snapshot.nick));
                     continue;
@@ -1271,12 +1268,12 @@ fn spawn_persistence(
                 // A synthesized self-echo is part of the conversation record:
                 // persist it like an upstream line so a reattached client sees
                 // both sides after a restart.
-                Ok(DriverEvent::Line(BufferedLine { line, .. })) => {
+                Ok(DriverEvent::Line(BufferedLine { line, seq })) => {
                     let own_nick = own.for_line(&line, &handle.names());
-                    (line, own_nick)
+                    (line, own_nick, seq)
                 }
                 Ok(DriverEvent::Echo {
-                    line: BufferedLine { line, .. },
+                    line: BufferedLine { line, seq },
                     ..
                 }) => {
                     // The echo carries the exact identity used when it was
@@ -1287,7 +1284,7 @@ fn spawn_persistence(
                     let own_nick = e6irc_proto::message::Message::parse(&line)
                         .ok()
                         .and_then(|message| message.source.map(|source| source.name.to_string()));
-                    (line, own_nick)
+                    (line, own_nick, seq)
                 }
                 Ok(_) => continue,
                 // A persistence lag means upstream lines were never written:
@@ -1296,6 +1293,7 @@ fn spawn_persistence(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     // What was missed may have renamed the session.
                     own = OwnNick(handle.irc_session_snapshot().map(|session| session.nick));
+                    lost_a_line = true;
                     handle.record_error(super::NetworkFailure::BacklogStorageLagged);
                     eprintln!(
                         "bnc: persistence lagged for {owner_key}/{network}; {n} upstream \
@@ -1327,12 +1325,14 @@ fn spawn_persistence(
                     own_nick.as_deref(),
                     &line,
                     &names,
+                    renumbered.map_or(seq, |renumbered| renumbered.now(seq)),
                     &mut since_trim,
                 )
                 .await
             };
             match stored.await {
                 Err(e) => {
+                    lost_a_line = true;
                     handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                     // One line per outage, not one per upstream message: a
                     // database away for an hour under a busy channel wrote
@@ -1353,8 +1353,90 @@ fn spawn_persistence(
                 }
             }
         }
+        // A stop that kept its lines wrote every one the ring took (the driver
+        // had stopped, and the drain took what it said last): the next start
+        // continues this epoch, and a cursor handed out now stays valid.
+        if feed.draining.is_some() && !lost_a_line {
+            let (epoch, through) = handle.ring_position();
+            if through > 0
+                && let Err(e) =
+                    crate::db::bnc_ring_stopped_cleanly(&pool, &owner_key, &network, epoch, through)
+                        .await
+            {
+                eprintln!(
+                    "bnc: could not record that {owner_key}/{network} stored every line; its \
+                     next start begins a new ring, and clients replay it whole: {e}"
+                );
+            }
+        }
     });
     Persistence { stop, task }
+}
+
+/// Restore `(owner, network)`'s ring from storage and claim it for this run.
+/// A ring whose last stop stored every line continues its epoch, each line at
+/// the position it had, so a `ReplayCursor` from before the restart still
+/// names it; the answer then says how the positions the driver's first lines
+/// took have moved. Any other ring begins a new epoch, its stored lines below
+/// everything pushed, and every older cursor is refused (the client replays
+/// the ring whole).
+async fn restore_ring(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    restore: i64,
+    handle: &NetworkHandle,
+) -> Option<super::Renumbered> {
+    let stored = match crate::db::bnc_ring(pool, owner, network).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+            eprintln!(
+                "bnc: the stored ring of {owner}/{network} is unreadable, so it begins anew: {e}"
+            );
+            None
+        }
+    };
+    let renumbered = match crate::db::recent_bnc_backlog(pool, owner, network, restore).await {
+        Ok(lines) => match stored {
+            Some(crate::db::StoredRing {
+                epoch,
+                clean_through: Some(through),
+            }) => match handle.continue_ring(epoch, through, lines) {
+                Ok(renumbered) => Some(renumbered),
+                Err(lines) => {
+                    eprintln!(
+                        "bnc: the stored positions of {owner}/{network} do not fit its ring; it \
+                         begins anew, and clients replay it whole"
+                    );
+                    handle.preload_front(lines);
+                    None
+                }
+            },
+            Some(crate::db::StoredRing {
+                clean_through: None,
+                ..
+            })
+            | None => {
+                handle.preload_front(lines);
+                None
+            }
+        },
+        Err(e) => {
+            handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+            eprintln!("bnc: buffer restore failed for {owner}/{network}: {e}");
+            None
+        }
+    };
+    let (epoch, _) = handle.ring_position();
+    if let Err(e) = crate::db::claim_bnc_ring(pool, owner, network, epoch).await {
+        handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+        eprintln!(
+            "bnc: could not claim the ring of {owner}/{network}: {e}; its next start begins a \
+             new ring"
+        );
+    }
+    renumbered
 }
 
 /// The session's own nick as of each line the persistence task writes, which
@@ -1426,9 +1508,10 @@ async fn persist_and_trim(
     own_nick: Option<&str>,
     line: &str,
     names: &e6irc_client::NetworkNames,
+    seq: u64,
     since_trim: &mut u64,
 ) -> Result<(), crate::db::DbError> {
-    crate::db::persist_bnc_line(pool, buffer, own_nick, line, names).await?;
+    crate::db::persist_bnc_line(pool, buffer, own_nick, line, names, seq).await?;
     *since_trim += crate::db::bnc_trim_weight(line);
     if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
         *since_trim = 0;
@@ -1472,6 +1555,7 @@ pub(crate) async fn bnc_serve(
     let super::AttachLink {
         mut lines,
         mut write,
+        holding,
     } = link;
 
     // Taken before any credential is checked, so a suspension, deletion or
@@ -1512,8 +1596,8 @@ pub(crate) async fn bnc_serve(
     // that is *not* active, say why rather than falling through to a shared
     // network of the same name; only a name the account does not own at all
     // falls through to a shared (ownerless) network.
-    let handle = if let Some(handle) = registry.get_owned(&account, &network) {
-        handle
+    let (handle, shared) = if let Some(handle) = registry.get_owned(&account, &network) {
+        (handle, false)
     } else {
         match crate::db::get_bnc_network(pool, &account, &network).await {
             // Owned but not live. Say why rather than falling through to a
@@ -1548,7 +1632,7 @@ pub(crate) async fn bnc_serve(
             // legitimate fallback.
             Ok(None) => {
                 if let Some(handle) = registry.get_shared(&network) {
-                    handle
+                    (handle, true)
                 } else {
                     write
                         .write_all(
@@ -1580,8 +1664,14 @@ pub(crate) async fn bnc_serve(
 
     // Attach: the welcome (registration burst, ISUPPORT, end-of-MOTD) is
     // written there, from the same instant as the replay.
+    let mut link = super::AttachLink {
+        lines,
+        write,
+        holding,
+    };
+    link.name_holding(credential, shared);
     let end = attach(
-        super::AttachLink { lines, write },
+        link,
         input,
         &handle,
         caps,
@@ -1597,6 +1687,68 @@ pub(crate) async fn bnc_serve(
     // Why it ended, not just that it did: "client quit" and "client stopped
     // answering" are different stories to whoever reads this log.
     eprintln!("bnc: {account} detached from '{network}': {end}");
+    Ok(())
+}
+
+/// Resume an attachment a rebuild takes from its edge's record (DESIGN
+/// §19.3): its network as the record names it — the account's own, or the
+/// shared one — and its authority leased again, then the relay from where the
+/// record says the client was. A network gone, or an authority revoked
+/// meanwhile, ends it saying so. The record's login was checked against the
+/// database before this (the rebuild's re-authorization).
+pub(crate) async fn bnc_resume(
+    link: super::AttachLink,
+    registry: Arc<Registry>,
+    server_name: &str,
+    peer: e6irc_edge::address::ClientIp,
+    record: crate::core::record::AttachRecord,
+) -> std::io::Result<()> {
+    let mut link = link;
+    let handle = if record.shared {
+        registry.get_shared(&record.network)
+    } else {
+        registry.get_owned(&record.account, &record.network)
+    };
+    let Some(handle) = handle else {
+        let goodbye = crate::sanitize::closing_link(
+            &peer.to_string(),
+            &format!("network '{}' is gone", record.network),
+        );
+        link.write
+            .write_all(format!("{goodbye}\r\n").as_bytes())
+            .await?;
+        link.write.flush().await?;
+        return Ok(());
+    };
+    let ticket = registry.account_revocations().ticket();
+    let authority =
+        match registry
+            .account_revocations()
+            .lease(ticket, &record.account, record.credential)
+        {
+            Ok(authority) => authority,
+            Err(revoked) => {
+                link.write
+                    .write_all(
+                        format!(":{server_name} ERROR :Closing Link: {revoked}\r\n").as_bytes(),
+                    )
+                    .await?;
+                link.write.flush().await?;
+                return Ok(());
+            }
+        };
+    link.name_holding(record.credential, record.shared);
+    let (account, network) = (record.account.clone(), record.network.clone());
+    let end = super::resume_attached(
+        link,
+        &handle,
+        authority,
+        record,
+        server_name,
+        super::ATTACH_LIVENESS_INTERVAL,
+    )
+    .await?;
+    eprintln!("bnc: {account} detached from '{network}' after a restart: {end}");
     Ok(())
 }
 
@@ -2688,6 +2840,7 @@ mod handshake_tests {
         let super::super::AttachLink {
             mut lines,
             mut write,
+            holding: _,
         } = super::super::attach_link::over_stream(server).await;
         let task = tokio::spawn(async move {
             handshake(

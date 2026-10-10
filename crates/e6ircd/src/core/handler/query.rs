@@ -462,6 +462,20 @@ pub(super) fn pace_who_replies_to(state: &mut ServerState, conn: ConnId) {
     }
 }
 
+/// A TLS connection's protocol version and cipher suite as WHOIS names them:
+/// `TLSv1.3, TLS13_AES_256_GCM_SHA384`.
+fn tls_description(tls: &e6irc_link::TlsFacts) -> String {
+    let version = match tls.version {
+        0x0304 => "TLSv1.3".to_string(),
+        0x0303 => "TLSv1.2".to_string(),
+        other => format!("TLS version {other:#06x}"),
+    };
+    format!(
+        "{version}, {:?}",
+        tokio_rustls::rustls::CipherSuite::from(tls.cipher_suite)
+    )
+}
+
 pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // WHOIS [<server>] <nick>[,<nick>…], as Solanum's `m_whois` reads it: with
     // two parameters the first names the server to ask (a server mask, or a
@@ -521,12 +535,15 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 );
             }
             if user.secure {
-                state.numeric(
-                    conn,
-                    RPL_WHOISSECURE,
-                    &[Middle::own(nick)],
-                    Some("is using a secure connection"),
-                );
+                // Solanum names the TLS version and cipher to the user itself
+                // and to operators (`hide_tls_ciphers`), from what the edge
+                // that terminated the TLS saw.
+                let shown = user.conn() == conn || state.sessions[&conn].oper.is_some();
+                let text = match user.tls.as_ref().filter(|_| shown) {
+                    Some(tls) => format!("is using a secure connection [{}]", tls_description(tls)),
+                    None => "is using a secure connection".to_string(),
+                };
+                state.numeric(conn, RPL_WHOISSECURE, &[Middle::own(nick)], Some(&text));
             }
             // Solanum's 312 carries the server's description (`servptr->info`),
             // the same text LINKS shows for it.

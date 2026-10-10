@@ -148,6 +148,9 @@ pub(crate) const CREDENTIAL_CHANGED_CHANNEL: &str = "e6irc_credential_changed";
 /// The channel migration 0098's trigger announces each change of the serving
 /// lease's holder on, a release included.
 pub(crate) const SERVING_LEASE_CHANNEL: &str = "e6irc_serving_lease";
+/// The channel migration 0101's trigger announces each change of the body
+/// format the cores write for their edges on.
+pub(crate) const RECORD_FORMAT_CHANNEL: &str = "e6irc_record_format";
 
 #[cfg(test)]
 mod tests {

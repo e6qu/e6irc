@@ -258,6 +258,7 @@ impl TestServer {
             tx,
             host: host.to_string(),
             transport,
+            tls: None,
         });
         self.conns.push((conn, rx));
         conn
@@ -7514,6 +7515,7 @@ fn account_creation_is_rate_limited_per_ip() {
         tx,
         host: "shared-ip".into(),
         transport: e6ircd::core::ConnectionTransport::Tcp,
+        tls: None,
     });
     for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * password"] {
         core.handle(Input::Line {
@@ -7589,6 +7591,7 @@ fn hot_history_ring_is_lru_evicted() {
         tx,
         host: "h".into(),
         transport: e6ircd::core::ConnectionTransport::Tcp,
+        tls: None,
     });
     for line in [
         "CAP LS 302",
@@ -9820,6 +9823,7 @@ fn history_logmessage_gated_on_database() {
             tx,
             host: "h".into(),
             transport: e6ircd::core::ConnectionTransport::Tcp,
+            tls: None,
         });
         for line in ["NICK a", "USER a 0 * :A", "JOIN #c", "PRIVMSG #c :hello"] {
             core.handle(Input::Line {

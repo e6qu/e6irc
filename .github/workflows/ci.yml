@@ -500,6 +500,36 @@ jobs:
           pip install -r ../irctest/requirements.txt "pytest-timeout==2.4.0"
           vendor/tests/irctest/run.sh ../irctest "$(command -v python)"
 
+  # The graceful rebuild's PostgreSQL scenarios (DESIGN §19.3, §19.11) on the
+  # operating systems whose runners have no service containers, with
+  # PostgreSQL 18 installed natively (D15): a live chat socket, a bouncer
+  # attachment, a SASL exchange and the record-format window across graceful
+  # restarts, the `local` driver's session, and the durable ring positions.
+  # Linux runs them in `db-tests`; the scenarios without a database run in
+  # `test` on all six cells.
+  zero-drop-database:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: tools/ci-postgres-native.sh
+      - run: cargo test --locked -p e6ircd --test edge_tier --target ${{ matrix.target }} -- --include-ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --test bouncer --target ${{ matrix.target }} -- --ignored --test-threads=1 a_ring_keeps_its_epoch
+
   # The same green list with every client reaching the core through an
   # `e6ircd edge` over the mutual-TLS core link (DESIGN §19): the process
   # boundary changes nothing a client can see. Its own job, in parallel with
@@ -774,6 +804,7 @@ jobs:
         shauth-sso,
         irctest,
         irctest-edge,
+        zero-drop-database,
         irctest-services,
         matrix-bridge,
         loom,

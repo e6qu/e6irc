@@ -147,7 +147,7 @@ pub async fn serve_irc_socket<C: CorePort>(
         mode,
         sendq_bytes,
     } = session;
-    let Some(mut edge) = core.open(conn, host, transport, sendq_bytes).await else {
+    let Some(mut edge) = core.open(conn, host, transport, None, sendq_bytes).await else {
         return IrcSocketEnd::Abandoned;
     };
     // The core ends the session by ending its link (`End` or `Kill`).

@@ -16,6 +16,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use e6irc_link::TlsFacts;
 use e6irc_proto::framing::{LineBuffer, LineEvent};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -273,6 +274,7 @@ pub trait CorePort: Clone + Send + Sync + 'static {
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
+        tls: Option<TlsFacts>,
         sendq_bytes: usize,
     ) -> impl Future<Output = Option<EdgeSession>> + Send;
 
@@ -495,12 +497,14 @@ fn spawn_accepted<C: CorePort>(
                 else {
                     return;
                 };
+                let tls = tls_facts(tls_stream.get_ref().1);
                 serve_conn(
                     tls_stream,
                     AcceptedConnection {
                         conn,
                         peer,
                         transport: ConnectionTransport::Tls,
+                        tls: Some(tls),
                         task,
                     },
                     core_tx,
@@ -516,6 +520,7 @@ fn spawn_accepted<C: CorePort>(
                         conn,
                         peer,
                         transport: ConnectionTransport::Tcp,
+                        tls: None,
                         task,
                     },
                     core_tx,
@@ -577,7 +582,32 @@ pub struct AcceptedConnection {
     pub conn: ConnId,
     pub peer: SocketAddr,
     pub transport: ConnectionTransport,
+    /// What the TLS this edge terminated for it negotiated, when it did.
+    pub tls: Option<TlsFacts>,
     pub task: ConnectionTask,
+}
+
+/// What a TLS connection the edge terminated negotiated, as the core is told
+/// at `Open`: the version and cipher suite, the server name the client asked
+/// for, and the fingerprint of the certificate the client presented.
+pub fn tls_facts(connection: &rustls::ServerConnection) -> TlsFacts {
+    TlsFacts {
+        version: connection.protocol_version().map_or(0, u16::from),
+        cipher_suite: connection
+            .negotiated_cipher_suite()
+            .map_or(0, |suite| u16::from(suite.suite())),
+        server_name: connection
+            .server_name()
+            .filter(|name| name.len() <= e6irc_link::held::MAX_SERVER_NAME_LEN)
+            .map(str::to_owned),
+        client_certificate: connection
+            .peer_certificates()
+            .and_then(<[_]>::first)
+            .map(|leaf| {
+                let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, leaf);
+                <[u8; 32]>::try_from(digest.as_ref()).expect("a SHA-256 digest is 32 bytes")
+            }),
+    }
 }
 
 /// Serve one accepted connection until it ends: open its session, read its
@@ -595,6 +625,7 @@ pub async fn serve_conn<S, C: CorePort>(
         conn,
         peer,
         transport,
+        tls,
         task: _task,
     } = accepted;
     let (mut read_half, write_half) = tokio::io::split(stream);
@@ -605,6 +636,7 @@ pub async fn serve_conn<S, C: CorePort>(
             // subject `ban_match` tests and WHOIS shows.
             ClientIp::new(peer.ip()).to_string(),
             transport,
+            tls,
             outbound.sendq_bytes,
         )
         .await

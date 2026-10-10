@@ -33,6 +33,7 @@ use e6irc_proto::mask::FoldedMask;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use super::record::{RecordedQuestion, RecordedSweep};
 use super::state::{ChanKey, ChannelListRequestId, ChannelListRow};
 
 /// The `ELIST` letters [`ListFilter::parse`] implements.
@@ -65,9 +66,13 @@ impl Window {
 
 /// Which channels a LIST asks for, decided once where the command is parsed —
 /// its time bounds already absolute — and carried unchanged to every shard
-/// that holds channels.
+/// that holds channels. It keeps the parameter it was read from and the
+/// second it was read at, which read it again exactly: what a session's
+/// record holds of a LIST in progress.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ListFilter {
+    parameter: Option<String>,
+    parsed_at_secs: u64,
     /// A channel is listed only if it matches one of these (none: any name).
     masks: Vec<FoldedMask>,
     /// A channel matching any of these is not listed.
@@ -128,7 +133,11 @@ impl ListFilter {
         now_secs: u64,
         casemap: CaseMapping,
     ) -> Result<Self, InvalidListParameters> {
-        let mut filter = Self::default();
+        let mut filter = Self {
+            parameter: parameter.map(str::to_owned),
+            parsed_at_secs: now_secs,
+            ..Self::default()
+        };
         let Some(parameter) = parameter.filter(|parameter| !parameter.is_empty()) else {
             return Ok(filter);
         };
@@ -218,6 +227,9 @@ pub(crate) struct ChannelListCursor {
     pub(crate) sweep: ChannelSweep,
     pub(crate) batch: Option<String>,
     shards: Vec<ShardCursor>,
+    /// The last channel sent: where a sweep resumes exactly, whatever the
+    /// shard count, rows going out in global key order.
+    sent_through: Option<ChanKey>,
 }
 
 /// One channel shard's part of a LIST in progress.
@@ -263,7 +275,54 @@ impl ChannelListCursor {
                     page: ShardPage::Idle { after: None },
                 })
                 .collect(),
+            sent_through: None,
         }
+    }
+
+    /// The sweep as a record holds it: its question, its batch and the last
+    /// channel sent.
+    pub(crate) fn recorded(&self) -> RecordedSweep {
+        let question = match &self.sweep {
+            ChannelSweep::List(filter) => RecordedQuestion::List {
+                parameter: filter.parameter.clone(),
+                parsed_at_secs: filter.parsed_at_secs,
+            },
+            ChannelSweep::Names {
+                multi_prefix,
+                userhost_in_names,
+            } => RecordedQuestion::Names {
+                multi_prefix: *multi_prefix,
+                userhost_in_names: *userhost_in_names,
+            },
+        };
+        RecordedSweep {
+            question,
+            batch: self.batch.clone(),
+            sent_through: self
+                .sent_through
+                .as_ref()
+                .map(|key| key.as_str().to_owned()),
+        }
+    }
+
+    /// A sweep resumed after `sent_through` over `shards` shards, each read
+    /// from the channel after it: nothing sent is sent again, nothing unsent
+    /// is missed.
+    pub(crate) fn resumed(
+        id: ChannelListRequestId,
+        sweep: ChannelSweep,
+        batch: Option<String>,
+        sent_through: Option<ChanKey>,
+        shards: usize,
+    ) -> Self {
+        let mut cursor = Self::new(id, sweep, batch, shards);
+        for shard in &mut cursor.shards {
+            shard.page = ShardPage::Idle {
+                after: sent_through.clone(),
+            };
+        }
+        cursor.sent_through = sent_through;
+        cursor
     }
 
     /// The row that sorts first among every shard's, once no shard still to
@@ -282,12 +341,14 @@ impl ChannelListCursor {
             }
         }
         match first.map(|(index, _)| index) {
-            Some(index) => NextRow::Row(
-                self.shards[index]
+            Some(index) => {
+                let row = self.shards[index]
                     .rows
                     .pop_front()
-                    .expect("the chosen shard has a row"),
-            ),
+                    .expect("the chosen shard has a row");
+                self.sent_through = Some(row.key.clone());
+                NextRow::Row(row)
+            }
             None => NextRow::Finished,
         }
     }
@@ -326,6 +387,13 @@ impl ChannelListCursor {
             Some(after) => ShardPage::Idle { after: Some(after) },
             None => ShardPage::Exhausted,
         };
+    }
+
+    /// Whether a page was asked of a shard and has not arrived.
+    pub(crate) fn page_in_flight(&self) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| matches!(shard.page, ShardPage::Requested))
     }
 
     /// Rows the cursor holds, waiting to be sent.

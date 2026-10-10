@@ -15,6 +15,7 @@ mod hot_history;
 mod list;
 mod middle;
 mod paced;
+pub mod record;
 mod state;
 mod timer;
 
@@ -50,6 +51,10 @@ use state::{
     ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult, ChannelQuit,
     ChannelTagmsg, ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
+};
+pub(crate) use state::{
+    ChanKey as FoldedChannel, ChannelRebuild, IdleSince, RebuiltMember, RecordFormatCell,
+    ReplicaSink, SessionRebuild, Unsettled, adopt_shared, export_shared,
 };
 use state::{CoreDirectories, ServerState};
 
@@ -103,6 +108,10 @@ pub(crate) struct CoreShardId(usize);
 impl CoreShardId {
     pub(crate) const fn new(index: usize) -> Self {
         Self(index)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0
     }
 }
 
@@ -409,6 +418,80 @@ impl CoreIngress {
     pub(crate) fn directories(&self) -> CoreDirectories {
         self.directories.clone()
     }
+
+    /// Whether no event is on its way from one shard to another.
+    pub(crate) fn cross_shard_idle(&self) -> bool {
+        self.traffic.in_flight.load(Ordering::SeqCst) == 0
+    }
+
+    /// Ask each shard in turn and gather the answers, each within `bound`.
+    async fn ask_each<T>(
+        &self,
+        bound: std::time::Duration,
+        mut question: impl FnMut(tokio::sync::oneshot::Sender<T>) -> Input,
+    ) -> Result<Vec<T>, String> {
+        let mut answers = Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            let (reply, answered) = tokio::sync::oneshot::channel();
+            if shard.push(question(reply)).await.is_err() {
+                return Err("a core worker is unavailable".into());
+            }
+            answers.push(answered);
+        }
+        let mut gathered = Vec::with_capacity(answers.len());
+        for answered in answers {
+            match tokio::time::timeout(bound, answered).await {
+                Ok(Ok(answer)) => gathered.push(answer),
+                Ok(Err(_closed)) => return Err("a core worker dropped the question".into()),
+                Err(_elapsed) => return Err("a core worker did not answer in time".into()),
+            }
+        }
+        Ok(gathered)
+    }
+
+    /// What keeps each shard from being cut exactly now.
+    pub(crate) async fn unsettled(&self) -> Result<Vec<state::Unsettled>, String> {
+        self.ask_each(std::time::Duration::from_secs(5), |reply| Input::Settled {
+            reply,
+        })
+        .await
+    }
+
+    /// Close, with `reason`, every session whose edge holds nothing for the
+    /// next core (DESIGN §19.3): its client and its channels are told it
+    /// ended before the cut, rather than nothing. How many were closed.
+    pub(crate) async fn close_unheld(&self, reason: &'static str) -> Result<usize, String> {
+        let closed = self
+            .ask_each(std::time::Duration::from_secs(5), |reply| {
+                Input::CloseUnheld { reason, reply }
+            })
+            .await?;
+        Ok(closed.into_iter().sum())
+    }
+
+    /// Cut every shard; the account-creation buckets they held.
+    pub(crate) async fn cut(
+        &self,
+    ) -> Result<Vec<(String, f64, e6irc_proto::time::MonoMillis)>, String> {
+        let buckets = self
+            .ask_each(std::time::Duration::from_secs(5), |reply| Input::Cut {
+                reply,
+            })
+            .await?;
+        Ok(buckets.into_iter().flatten().collect())
+    }
+
+    /// Give every shard the account-creation buckets a cut carried.
+    pub(crate) async fn adopt_buckets(
+        &self,
+        buckets: Vec<(String, f64, e6irc_proto::time::MonoMillis)>,
+    ) -> Result<(), ()> {
+        let buckets = Arc::new(buckets);
+        self.broadcast(|| Input::AdoptBuckets {
+            buckets: buckets.clone(),
+        })
+        .await
+    }
 }
 
 impl Input {
@@ -467,9 +550,16 @@ impl Input {
             | Input::Shutdown
             | Input::ReadMarkersExpired { .. }
             | Input::AccountDeleted { .. }
-            | Input::RefuseVerdictsInFlight { .. } => {
+            | Input::RefuseVerdictsInFlight { .. }
+            | Input::Settled { .. }
+            | Input::CloseUnheld { .. }
+            | Input::Cut { .. }
+            | Input::AdoptBuckets { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
             }
+            Input::RebuildSession(rebuild) => shards.session_owner(rebuild.conn).shard(),
+            Input::RebuildChannel(rebuild) => shards.shard_for_channel(&rebuild.key),
+            Input::CloseSession { conn, .. } => shards.session_owner(*conn).shard(),
             Input::ServerBanResult { requester, .. } => match requester {
                 ServerBanRequester::Oper { session, .. } => session.shard(),
                 ServerBanRequester::Admin { .. } => CoreShardId(0),
@@ -663,6 +753,8 @@ pub enum Input {
         tx: SendQueue,
         host: String,
         transport: ConnectionTransport,
+        /// What the TLS its edge terminated negotiated, when it did.
+        tls: Option<e6irc_link::TlsFacts>,
     },
     /// One complete line from the connection (terminator stripped).
     Line {
@@ -887,6 +979,35 @@ pub enum Input {
     /// The revocation listener was re-connected: refuse the verdict of every
     /// credential check queued before now, then say so on `done`
     /// ([`state::ServerState::refuse_verdicts_in_flight`]).
+    /// Say what keeps this shard from being cut exactly now (DESIGN §19.3).
+    Settled {
+        reply: tokio::sync::oneshot::Sender<state::Unsettled>,
+    },
+    /// Close, with `reason`, each of this shard's sessions whose edge holds
+    /// nothing for the next core; the answer is how many.
+    CloseUnheld {
+        reason: &'static str,
+        reply: tokio::sync::oneshot::Sender<usize>,
+    },
+    /// Cut this shard: republish everything its edges hold, and handle nothing
+    /// more. The answer is the account-creation buckets the cut carries.
+    Cut {
+        reply: tokio::sync::oneshot::Sender<Vec<(String, f64, e6irc_proto::time::MonoMillis)>>,
+    },
+    /// Take the account-creation buckets a cut carried.
+    AdoptBuckets {
+        buckets: Arc<Vec<(String, f64, e6irc_proto::time::MonoMillis)>>,
+    },
+    /// Resume a session a rebuild hands this shard.
+    RebuildSession(Box<state::SessionRebuild>),
+    /// Resume a channel a rebuild hands this shard, its owner.
+    RebuildChannel(Box<state::ChannelRebuild>),
+    /// Close a session with its `ERROR`, for `reason`: one a cut could not
+    /// settle, or one a rebuild could not resume consistently.
+    CloseSession {
+        conn: ConnId,
+        reason: String,
+    },
     RefuseVerdictsInFlight {
         done: tokio::sync::oneshot::Sender<()>,
     },
@@ -1042,15 +1163,22 @@ impl CoreIngress {
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         sendq_bytes: usize,
+        edge_holds: bool,
     ) -> (Input, EdgeSession) {
-        let (tx, edge) = send_queue("sendq", sendq_bytes);
+        let (tx, edge) = if edge_holds {
+            holding_send_queue("sendq", sendq_bytes, 0)
+        } else {
+            send_queue("sendq", sendq_bytes)
+        };
         (
             Input::Open {
                 conn,
                 tx,
                 host,
                 transport,
+                tls,
             },
             edge,
         )
@@ -1063,9 +1191,10 @@ impl e6irc_edge::connection::CorePort for CoreIngress {
         conn: ConnId,
         host: String,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         sendq_bytes: usize,
     ) -> Option<EdgeSession> {
-        let (open, edge) = self.open_input(conn, host, transport, sendq_bytes);
+        let (open, edge) = self.open_input(conn, host, transport, tls, sendq_bytes, false);
         let opened = self.push(open).await;
         opened.ok().map(|_sequence| edge)
     }
@@ -2539,6 +2668,19 @@ pub fn send_queue(name: &'static str, bytes: usize) -> (SendQueue, EdgeSession) 
     (SendQueue(link), edge)
 }
 
+/// A connection's link whose edge holds the session's record for the core
+/// (link version 2), with `in_flight` bytes the core before this one sent and
+/// the edge has not yet written: a remote session opens with none, a rebuilt
+/// one with what its edge reports.
+pub(crate) fn holding_send_queue(
+    name: &'static str,
+    bytes: usize,
+    in_flight: u64,
+) -> (SendQueue, EdgeSession) {
+    let (link, edge) = e6irc_edge::link::holding_session(name, bytes, in_flight);
+    (SendQueue(link), edge)
+}
+
 /// Output withheld behind a deferred reply (see `Session::deferred_replies`),
 /// with the bytes it holds counted where lines enter it, so the bound on it is
 /// the send queue's own, in the send queue's unit.
@@ -2558,6 +2700,10 @@ impl HeldOutput {
         self.bytes += line.len();
         self.lines.push(line);
         true
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lines.is_empty()
     }
 }
 
@@ -3124,6 +3270,11 @@ impl Core {
     }
 
     fn handle_one(&mut self, input: Input) {
+        // A cut shard handles nothing more: whatever follows the cut is the
+        // next core's to handle, from what the edges hold.
+        if self.state.is_cut() {
+            return;
+        }
         let started = Instant::now();
         let sessions_before = self.state.sessions.len();
         let opened = matches!(input, Input::Open { .. });
@@ -3140,16 +3291,29 @@ impl Core {
                 tx,
                 host,
                 transport,
-            } => self.state.open(conn, tx, host, transport),
+                tls,
+            } => self.state.open(conn, tx, host, transport, tls),
             Input::Line { conn, line } => {
+                self.state.note_input_line(conn);
                 handler::dispatch(&mut self.state, conn, &line);
                 // A line is what makes (or unmakes) an IRC operator, whose
                 // lines are not metered.
                 self.state.sync_flood_exemption(conn);
             }
             Input::OverlongLine { conn, label } => {
+                self.state.note_input_line(conn);
                 handler::overlong(&mut self.state, conn, label.as_deref());
             }
+            Input::Settled { reply } => drop(reply.send(self.state.unsettled())),
+            Input::CloseUnheld { reason, reply } => {
+                // An asker that is gone needs no count.
+                reply.send(self.state.close_unheld(reason)).ok();
+            }
+            Input::Cut { reply } => drop(reply.send(self.state.cut())),
+            Input::AdoptBuckets { buckets } => self.state.adopt_registration_buckets(&buckets),
+            Input::RebuildSession(rebuild) => self.state.rebuild_session(*rebuild),
+            Input::RebuildChannel(rebuild) => self.state.rebuild_channel(*rebuild),
+            Input::CloseSession { conn, reason } => self.state.close_with_error(conn, &reason),
             Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
             Input::ChannelJoin {
                 owner,
@@ -3761,6 +3925,21 @@ impl SessionOutput {
     pub(crate) fn set_flood_exempt(&self, exempt: bool) {
         self.tx.0.set_flood_exempt(exempt);
     }
+
+    /// Whether the connection's edge holds its record for the core.
+    pub(crate) fn holds(&self) -> bool {
+        self.tx.0.holds()
+    }
+
+    /// Have the edge hold `body` as the session's record at `revision`.
+    pub(crate) fn hold_record(&self, revision: u64, body: Bytes) {
+        self.tx.0.hold_record(revision, body);
+    }
+
+    /// Tell the edge which of the session's input lines the core is done with.
+    pub(crate) fn hold_ack(&self, ack: e6irc_link::Ack) {
+        self.tx.0.hold_ack(ack);
+    }
 }
 
 pub(crate) struct SendqExceeded;
@@ -4059,6 +4238,7 @@ mod ingress_tests {
             output_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         (session, output_rx)
     }
@@ -4169,6 +4349,7 @@ mod ingress_tests {
             second_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         let check = |first: &Core, second: &Core| {
             for core in [first, second] {
@@ -4557,7 +4738,7 @@ mod ingress_tests {
         let conn = ConnId(2);
         first
             .state
-            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp, None);
         for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
             first.handle(Input::Line {
                 conn,
@@ -4713,6 +4894,7 @@ mod ingress_tests {
                     tx,
                     host: "host.test".into(),
                     transport: ConnectionTransport::Tcp,
+                    tls: None,
                 })
                 .await
                 .expect("open");
@@ -4949,6 +5131,7 @@ mod ingress_tests {
                 tx,
                 host: "host.test".into(),
                 transport: ConnectionTransport::Tcp,
+                tls: None,
             });
             if !caps.is_empty() {
                 self.line(conn, &format!("CAP REQ :{caps}"));
@@ -7052,7 +7235,7 @@ mod ingress_tests {
         let (tx, mut edge) = crate::core::send_queue("edge-link-test", sendq_bytes);
         let conn = ConnId(conn);
         core.state
-            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp, None);
         for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
             core.handle(Input::Line {
                 conn,
@@ -7501,12 +7684,14 @@ mod ingress_tests {
             alice_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         second.state.open(
             ConnId(1),
             bob_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         for (core, conn, nick, rx) in [
             (&mut first, ConnId(2), "alice", &mut alice_rx),
@@ -7617,6 +7802,7 @@ mod ingress_tests {
             alice_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         for line in [
             "CAP LS 302",
@@ -7637,7 +7823,7 @@ mod ingress_tests {
             let (tx, mut rx) = crate::core::send_queue("who-member-output", 128 * 512);
             second
                 .state
-                .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+                .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp, None);
             for line in [
                 format!("NICK member{index}"),
                 format!("USER member{index} 0 * :member{index}"),
@@ -7725,12 +7911,14 @@ mod ingress_tests {
             alice_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         second.state.open(
             ConnId(1),
             bob_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         for (core, conn, nick) in [
             (&mut first, ConnId(2), "alice"),
@@ -8095,6 +8283,7 @@ mod ingress_tests {
             out_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         let (sender_tx, _sender_rx) = crate::core::send_queue("local-member-sendq", 64 * 512);
         first.state.open(
@@ -8102,6 +8291,7 @@ mod ingress_tests {
             sender_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         first.handle(Input::Line {
             conn: ConnId(2),
@@ -8171,6 +8361,7 @@ mod ingress_tests {
             peer_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         let key = first.state.chan_key("#chat");
         let mut channel = Channel::for_test("#chat", ChanModes::default());
@@ -8194,6 +8385,7 @@ mod ingress_tests {
             joiner_tx,
             "host.test".into(),
             ConnectionTransport::Tcp,
+            None,
         );
         second.handle(Input::Line {
             conn: ConnId(1),

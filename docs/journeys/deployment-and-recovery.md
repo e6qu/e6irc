@@ -251,15 +251,24 @@ configuration and each edge's configuration.
    configuration page, which in edge mode has no listener field and shows
    each linked edge's listeners and certificates as it reports them.
 
-**Visible failures and recovery.** A core that stops or crashes closes every
-client loudly: `ERROR :Closing Link: <host> (server restarting)` from the
-edge on a lost link, the core's own `ERROR` on a graceful stop, close 1012 on
-`/ws/ui`; HTTP requests meanwhile wait up to 10 s and are answered `503` with
-`Retry-After`. The edge relinks to the next core by itself. An edge with the
-wrong certificate, an unsupported link version or the observer role is
-refused with the reason named; a lower serving-lease epoch than the edge has
-seen is refused by the edge. A client past the per-address limit, counted by
-the core across every edge, is told so in its `ERROR`.
+**Visible failures and recovery.** A core stopped with a handover — `e6ircd
+stop --handover`, or SIGTERM in edge mode — leaves every client to its edge
+(IRC, `/ws/ui` and bouncer attach alike): nothing is closed or said, lines
+typed meanwhile are delivered after, and the next core on the link's address
+rebuilds each session from what the edge uploads, within the edge's
+ten-minute hold. The bouncer's `local` network quits as the server
+restarting and joins again once the next core has rebuilt; `e6ircd records
+advance` moves every core to the newest record format once no older release
+will run again. `e6ircd stop --final` closes
+every client with the core's own `ERROR`. A core that crashes, or a link that
+is reset, closes every client loudly: `ERROR :Closing Link: <host> (server
+restarting)` from the edge, close 1012 on `/ws/ui`; HTTP requests meanwhile
+wait up to 10 s and are answered `503` with `Retry-After`. The edge relinks
+to the next core by itself. An edge with the wrong certificate, an
+unsupported link version or the observer role is refused with the reason
+named; a lower serving-lease epoch than the edge has seen is refused by the
+edge. A client past the per-address limit, counted by the core across every
+edge, is told so in its `ERROR`.
 
 **Security and observability.** Every link is mutual TLS 1.3, loopback
 included, and a core and an edge certificate cannot stand in for each other.
@@ -273,11 +282,14 @@ whether one needs an upgrade; `e6irc_core_link_version`,
 `e6irc_edge_link_version` and `e6irc_edge_upgrade_needed` are served, and a
 failed link counts as the `link` error kind.
 
-**Evidence.** Partially proven: a core restart still closes clients (the
-graceful rebuild is `PLAN.md` phase 4).
+**Evidence.** Partially proven: a crash still closes clients (crash takeover
+is `PLAN.md` phase 5).
 `clients_of_every_transport_are_served_through_an_edge_process`,
+`a_graceful_restart_keeps_every_client_of_every_transport`,
+`a_terminated_core_hands_its_clients_over`,
+`a_final_stop_closes_every_client_with_the_core_s_error`,
+`a_handover_is_refused_by_a_process_without_edges`,
 `a_killed_core_closes_every_session_loudly_and_the_next_core_serves`,
-`a_stopped_core_closes_every_session_with_its_own_error`,
 `a_link_reset_closes_its_sessions_loudly_on_both_sides`,
 `the_per_address_limit_holds_across_edges`,
 `a_proxy_protocol_listener_shows_the_relayed_client`,
@@ -293,7 +305,15 @@ console page.
 link's refusals; with PostgreSQL,
 `a_live_chat_socket_and_an_attach_reach_the_bouncer_through_an_edge` and
 `the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners` prove
-`/ws/ui`, attach, the roster and the console. `fuzz/fuzz_targets/link_frames.rs`
+`/ws/ui`, attach, the roster and the console;
+`a_graceful_restart_after_any_step_changes_no_transcript` restarts after
+every step of a scripted conversation, and
+`a_live_chat_socket_survives_a_graceful_restart`,
+`a_bouncer_attachment_survives_a_graceful_restart`,
+`a_sasl_exchange_and_a_format_advance_span_graceful_restarts`,
+`a_local_driver_session_quits_before_a_graceful_restart_and_rejoins` and
+`a_ring_keeps_its_epoch_and_positions_across_a_clean_restart` prove the
+rebuild of what PostgreSQL backs. `fuzz/fuzz_targets/link_frames.rs`
 covers the codec, and irctest's green list runs through an edge in CI.
 
 ## Recover from PostgreSQL interruption

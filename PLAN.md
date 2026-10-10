@@ -1572,8 +1572,8 @@ configuration, tests, clippy, `tools/gate.sh`, the dead-code guard and the
 fuzz type-check all pass, and DESIGN §19.9's rewrites for that phase land
 with it.
 
-Status: phases 0, 1, 2 and 3 done; phase 4 is the next to build; every other
-phase is scheduled in the order below.
+Status: phases 0, 1, 2, 3 and 4 done; phase 5 is the next to build; every
+other phase is scheduled in the order below.
 
 - **Phase 0 — design (done).** DESIGN §1 (goal and non-goals), §2 (the edge
   tier's invariants), §19 (the design and its settled decisions), a §18
@@ -1661,7 +1661,7 @@ phase is scheduled in the order below.
   listeners and certificates as reported; the link's headers are one
   namespace a client can neither send nor read; request admission stays the
   core's.
-- **Phase 4 — graceful rebuild.** PostgreSQL 18 installed natively on the
+- **Phase 4 — graceful rebuild (done).** PostgreSQL 18 installed natively on the
   macOS and Windows runners (D15), since this is the first phase whose
   zero-drop scenarios need it; `Open` gains the connection's TLS facts and
   `Hello` the cut identifier, with the roster's last cut, under link
@@ -1674,6 +1674,22 @@ phase is scheduled in the order below.
   restart-at-every-step test; the zero-drop suite's graceful scenarios. DESIGN
   §7.3, §8, §10, §11.2. *Green because* a graceful core restart becomes
   drop-free and exact, and a crash still closes sessions loudly.
+  As built (DESIGN §19.1, "Phase 4 as built"): link version 2 with the
+  held-state frames, `Hello`'s cut, `Welcome`'s admission and `Open`'s TLS
+  facts (shown in WHOIS); record formats 1 and 2 with `e6ircd records
+  advance` and a stored `record_format` every core follows; records of IRC
+  sessions, live chat sockets and bouncer attachments, channel replicas on
+  the owner shard's stream, and the cut state; acknowledgement after effect
+  with SASL chunks and multiline lines retained; the cut (pause, settle,
+  close what did not settle or no edge holds, cut, flush) and the rebuild
+  gate (roster wait, a one-second wait without a database, late edges
+  closing what they hold); re-authorization of every login and address;
+  durable ring epochs (migration 0102); `e6ircd stop --handover|--final`
+  through a per-process stop control; and the restart-at-every-step test,
+  run through an edge over real links rather than the `CoreScheduler`. The
+  `local` driver's session is not homed on an edge (D13): it quits before
+  the cut and rejoins after the rebuild. A late edge's sessions are closed,
+  as phase 5's re-admission is not built.
 - **Phase 5 — crash takeover.** The rebuild without a cut, catch-up lines,
   `NOTE INPUT_UNCONFIRMED`, the roster wait and late edges, the core-absence
   limit, resending after a link reset, and the interplay with the

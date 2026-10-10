@@ -20,11 +20,12 @@ use e6irc_queue::Receiver;
 mod announcements;
 mod credential_change;
 pub(crate) mod roster;
+pub use roster::advance_record_format;
 mod secret_rotation;
 mod url;
 pub(crate) use announcements::{
-    Announcement, Announcements, CREDENTIAL_CHANGED_CHANNEL, Follower, SERVING_LEASE_CHANNEL,
-    SETTINGS_CHANGED_CHANNEL, follow_announcements,
+    Announcement, Announcements, CREDENTIAL_CHANGED_CHANNEL, Follower, RECORD_FORMAT_CHANNEL,
+    SERVING_LEASE_CHANNEL, SETTINGS_CHANGED_CHANNEL, follow_announcements,
 };
 pub(crate) use credential_change::CredentialChange;
 pub use credential_change::{
@@ -78,6 +79,9 @@ pub enum DbError {
     /// The roster of edges holds, or would be given, a value outside its
     /// schema.
     InvalidRoster(String),
+    /// A bouncer ring position outside what storage holds (positive, within
+    /// `BIGINT`).
+    InvalidRingPosition(u64),
     /// A database-wide secret re-seal could not prove every value readable.
     SecretRotation(String),
     /// Persisted token scopes are outside the closed authorization model.
@@ -187,6 +191,9 @@ impl std::fmt::Display for DbError {
                 write!(f, "invalid persisted server settings: {error}")
             }
             Self::InvalidRoster(error) => write!(f, "invalid roster of edges: {error}"),
+            Self::InvalidRingPosition(seq) => {
+                write!(f, "ring position {seq} is outside what storage holds")
+            }
             Self::SecretRotation(error) => write!(f, "secret rotation failed: {error}"),
             Self::InvalidApiTokenScopes(error) => {
                 write!(f, "invalid persisted personal access token scopes: {error}")
@@ -2665,6 +2672,11 @@ pub async fn delete_account_permanently(
         }
     }
     sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1")
+        .bind(&folded)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+    sqlx::query("DELETE FROM bnc_ring_positions WHERE owner = $1")
         .bind(&folded)
         .execute(&mut *transaction)
         .await
@@ -9073,6 +9085,12 @@ pub async fn delete_bnc_network(
         .execute(&mut *tx)
         .await
         .map_err(query_error)?;
+    sqlx::query("DELETE FROM bnc_ring_positions WHERE owner = $1 AND network = $2")
+        .bind(&key.owner)
+        .bind(&key.network)
+        .execute(&mut *tx)
+        .await
+        .map_err(query_error)?;
     sqlx::query(
         "DELETE FROM bnc_read_markers
          WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
@@ -9205,13 +9223,15 @@ pub async fn open_bnc_buffer(
 /// network's own naming rules (`names`), with its name kept as the network
 /// spelled it. `own_nick` is the session's own nick when the line was said
 /// (`None` before the session had one), recorded with the line so a restore
-/// can start its replay under it (migration 0096).
+/// can start its replay under it (migration 0096). `seq` is the ring position
+/// the line took, which a restore gives it again (migration 0102).
 pub async fn persist_bnc_line(
     pool: &PgPool,
     buffer: &BncBuffer,
     own_nick: Option<&str>,
     line: &str,
     names: &e6irc_client::NetworkNames,
+    seq: u64,
 ) -> Result<(), DbError> {
     let display = bnc_line_target(line, own_nick, names);
     let target = display.as_deref().map(|display| names.fold(display));
@@ -9220,8 +9240,8 @@ pub async fn persist_bnc_line(
     sqlx::query(
         "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at,
                                  target_display, target_casemapping, own_nick,
-                                 own_nick_recorded)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)",
+                                 own_nick_recorded, seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, $11)",
     )
     .bind(&buffer.key.owner)
     .bind(&buffer.key.network)
@@ -9233,6 +9253,92 @@ pub async fn persist_bnc_line(
     .bind(display)
     .bind(names.casemapping().isupport_token())
     .bind(own_nick)
+    .bind(ring_position(seq)?)
+    .execute(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(())
+}
+
+/// A ring position as the database holds it: positive, and within `BIGINT`.
+fn ring_position(seq: u64) -> Result<i64, DbError> {
+    i64::try_from(seq)
+        .ok()
+        .filter(|seq| *seq > 0)
+        .ok_or(DbError::InvalidRingPosition(seq))
+}
+
+/// Where one backlog's ring stands in storage (migration 0102): its epoch,
+/// and — after a stop that stored every line — the last position it handed
+/// out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredRing {
+    pub epoch: u64,
+    pub clean_through: Option<u64>,
+}
+
+/// The stored ring of `(owner, network)`, when one was ever claimed.
+pub async fn bnc_ring(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+) -> Result<Option<StoredRing>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT epoch, clean_through FROM bnc_ring_positions WHERE owner = $1 AND network = $2",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(row.map(|(epoch, clean_through)| StoredRing {
+        epoch: epoch.cast_unsigned(),
+        clean_through: clean_through.map(i64::cast_unsigned),
+    }))
+}
+
+/// Claim `(owner, network)`'s ring for a running ring of `epoch`: the epoch is
+/// stored, and no stop is claimed clean until this one says so.
+pub async fn claim_bnc_ring(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    epoch: u64,
+) -> Result<(), DbError> {
+    let key = BncBufferKey::new(owner, network);
+    sqlx::query(
+        "INSERT INTO bnc_ring_positions (owner, network, epoch, clean_through)
+         VALUES ($1, $2, $3, NULL)
+         ON CONFLICT (owner, network) DO UPDATE SET epoch = $3, clean_through = NULL",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(epoch.cast_signed())
+    .execute(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(())
+}
+
+/// Every line the ring of `epoch` took through position `through` is stored:
+/// the next start continues the epoch after it.
+pub async fn bnc_ring_stopped_cleanly(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    epoch: u64,
+    through: u64,
+) -> Result<(), DbError> {
+    let key = BncBufferKey::new(owner, network);
+    sqlx::query(
+        "UPDATE bnc_ring_positions SET clean_through = $4
+         WHERE owner = $1 AND network = $2 AND epoch = $3",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(epoch.cast_signed())
+    .bind(ring_position(through)?)
     .execute(pool)
     .await
     .map_err(query_error)?;
@@ -9466,6 +9572,9 @@ pub struct StoredBacklogLine {
     /// The time it was stored under: its `time` tag, or its arrival.
     pub stored_at: String,
     pub own_nick: StoredOwnNick,
+    /// The ring position it took; `None` for a line stored before migration
+    /// 0102, which recorded none.
+    pub seq: Option<u64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -9474,6 +9583,7 @@ struct StoredBacklogRow {
     stored_at: String,
     own_nick: Option<String>,
     own_nick_recorded: bool,
+    seq: Option<i64>,
 }
 
 impl From<StoredBacklogRow> for StoredBacklogLine {
@@ -9488,6 +9598,7 @@ impl From<StoredBacklogRow> for StoredBacklogLine {
             line: row.line,
             stored_at: row.stored_at,
             own_nick,
+            seq: row.seq.map(i64::cast_unsigned),
         }
     }
 }
@@ -9511,7 +9622,7 @@ pub async fn recent_bnc_backlog(
                 coalesce(sent_at,
                          to_char(created_at AT TIME ZONE 'UTC',
                                  'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) AS stored_at,
-                own_nick, own_nick_recorded
+                own_nick, own_nick_recorded, seq
          FROM bnc_buffer
          WHERE id = ANY(ARRAY(
              SELECT id FROM bnc_buffer
