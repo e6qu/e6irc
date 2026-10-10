@@ -3101,7 +3101,7 @@ async fn bnc_networks_crud() {
     // The administrator inventory pages by a stable (owner, name) cursor: a
     // page of two plus the row that says another follows, then the rest.
     let page_size = db::BncNetworkInventoryPageSize::new(2).expect("page size");
-    let inventory = db::bnc_network_inventory_page(&pool, None, page_size)
+    let inventory = db::bnc_network_inventory_page(&pool, None, None, page_size)
         .await
         .expect("admin inventory");
     assert_eq!(
@@ -3118,7 +3118,7 @@ async fn bnc_networks_crud() {
     );
     let after = db::BncInventoryKey::parse_cursor(&inventory[1].key.cursor())
         .expect("a cursor round-trips");
-    let rest = db::bnc_network_inventory_page(&pool, Some(&after), page_size)
+    let rest = db::bnc_network_inventory_page(&pool, Some(&after), None, page_size)
         .await
         .expect("next page");
     assert_eq!(
@@ -3131,16 +3131,49 @@ async fn bnc_networks_crud() {
     // key, so a page that ended on it still yields the stored row after it;
     // one that ended on the stored row does not repeat it.
     let configured = db::BncInventoryKey::new(Some("BOB"), "Libera", false);
-    let after_configured = db::bnc_network_inventory_page(&pool, Some(&configured), page_size)
-        .await
-        .expect("after a configured key");
+    let after_configured =
+        db::bnc_network_inventory_page(&pool, Some(&configured), None, page_size)
+            .await
+            .expect("after a configured key");
     assert_eq!(after_configured.len(), 1);
     let stored = db::BncInventoryKey::new(Some("bob"), "libera", true);
     assert!(
-        db::bnc_network_inventory_page(&pool, Some(&stored), page_size)
+        db::bnc_network_inventory_page(&pool, Some(&stored), None, page_size)
             .await
             .expect("after the last row")
             .is_empty()
+    );
+    // A kind filter selects exactly that driver's networks, before the page
+    // is cut: one Matrix network of the three, and no page of IRC networks
+    // that a Matrix one could have pushed off.
+    let matrix = db::bnc_network_inventory_page(
+        &pool,
+        None,
+        Some(e6ircd::config::NetworkKind::Matrix),
+        page_size,
+    )
+    .await
+    .expect("matrix inventory");
+    assert_eq!(
+        matrix
+            .iter()
+            .map(|row| (row.owner.as_str(), row.network.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("alice", "hq")]
+    );
+    let irc = db::bnc_network_inventory_page(
+        &pool,
+        None,
+        Some(e6ircd::config::NetworkKind::Irc),
+        page_size,
+    )
+    .await
+    .expect("irc inventory");
+    assert_eq!(
+        irc.iter()
+            .map(|row| (row.owner.as_str(), row.network.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("alice", "libera"), ("bob", "libera")]
     );
     db::delete_bnc_network(
         &pool,
@@ -5232,6 +5265,7 @@ async fn a_sealed_server_password_round_trips_through_every_network_query() {
         .expect("network");
     let inventory = db::bnc_network_inventory_page(
         &pool,
+        None,
         None,
         db::BncNetworkInventoryPageSize::new(db::BncNetworkInventoryPageSize::MAX)
             .expect("page size"),

@@ -4481,7 +4481,19 @@ own query string: its API query and its pager links are built by the shared
 `directoryQuery` from the keys that directory's operation declares, keeping
 only non-empty values, so a filter form's "All kinds" (`kind=`) or a
 page-only parameter (a second pager cursor, a one-shot notice flag) cannot
-fail the contract before the request is made.
+fail the contract before the request is made. A filter page (sessions,
+accounts, channel registry, all networks, bans, audit, monitoring) validates
+its own query with the same validator as its API, which returns a typed
+`QueryRefusal`: the API answers it as the `400` problem document naming the
+field, and the page answers it as itself, a `400` with the refusal beside the
+filter form, whose fields keep what was sent, and without reading the
+directory the query would fail again. A hand-edited or bookmarked query
+therefore never replaces the page with a problem document. The administrator
+network inventory takes an exact `kind` filter (`irc`, `local`, `matrix`,
+`discord`, `slack`; blank or unknown is refused), applied before the page is
+cut to configured and stored networks alike, and **Integrations** reads each
+platform's bridges with it, so each platform's count and list are its own
+rather than one page of every network filtered in the browser.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle

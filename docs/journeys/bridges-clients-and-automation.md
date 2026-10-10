@@ -33,6 +33,10 @@ shown and rejected explicitly. Invalid/rejected credentials are fatal until
 configuration changes rather than retried forever. Network/transient failures
 use bounded backoff and visible error categories. A failed bridge-inventory
 read is announced in each affected platform list and offers an in-place retry.
+Each platform's list is read with the inventory's exact `kind` filter, so its
+count and rows are that platform's own; past the inventory's largest page the
+count says so (`1000+`) and links to the rest in **All networks**, filtered to
+that platform.
 Inbound identities/channel names are sanitized and validated before entering
 IRC state.
 Reverse delivery supports `PRIVMSG`; malformed messages, unsupported commands,
