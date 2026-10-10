@@ -1,4 +1,5 @@
 //! Run credential-gated external qualifications and write safe evidence.
+#![forbid(unsafe_code)]
 
 mod native;
 

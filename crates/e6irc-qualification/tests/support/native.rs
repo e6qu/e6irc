@@ -1,8 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, Path, Query, State};
@@ -42,34 +41,13 @@ struct SlackDeleteRequest {
     ts: String,
 }
 
-static ENVIRONMENT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-struct EnvironmentGuard(Vec<(&'static str, Option<OsString>)>);
-
-impl EnvironmentGuard {
-    fn set(values: &[(&'static str, &str)]) -> Self {
-        let mut previous = Vec::with_capacity(values.len());
-        unsafe {
-            for (name, value) in values {
-                previous.push((*name, std::env::var_os(name)));
-                std::env::set_var(name, value);
-            }
-        }
-        Self(previous)
-    }
-}
-
-impl Drop for EnvironmentGuard {
-    fn drop(&mut self) {
-        unsafe {
-            for (name, value) in self.0.drain(..).rev() {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
+fn settings(values: &[(Setting, &str)]) -> Settings {
+    Settings::capture(|name| {
+        values
+            .iter()
+            .find(|(setting, _)| setting.name() == name)
+            .map(|(_, value)| (*value).to_owned())
+    })
 }
 
 #[derive(Clone)]
@@ -824,10 +802,6 @@ fn provider_contracts_reject_missing_or_mistyped_required_fields() {
 
 #[tokio::test]
 async fn discord_oracle_proves_all_required_phases_and_cleanup() {
-    let _environment = ENVIRONMENT
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
     let oracle = start_discord_oracle().await;
     let base = format!(
         "http://{}/",
@@ -836,22 +810,23 @@ async fn discord_oracle_proves_all_required_phases_and_cleanup() {
             .trim_start_matches("ws://")
             .trim_end_matches("/socket")
     );
-    let _settings = EnvironmentGuard::set(&[
-        ("E6IRC_DISCORD_BOT_TOKEN", "token"),
-        ("E6IRC_DISCORD_CHANNEL_ID", "42"),
-        ("E6IRC_DISCORD_API_BASE", &base),
+    let settings = settings(&[
+        (Setting::DiscordBotToken, "token"),
+        (Setting::DiscordChannelId, "42"),
+        (Setting::DiscordApiBase, &base),
     ]);
     assert_eq!(
-        Secret::setting("E6IRC_DISCORD_BOT_TOKEN")
+        settings
+            .secret(Setting::DiscordBotToken)
             .map(|value| value.as_str().to_string())
             .as_deref(),
         Some("token")
     );
     assert_eq!(
-        environment_value("E6IRC_DISCORD_CHANNEL_ID").as_deref(),
+        settings.value(Setting::DiscordChannelId).as_deref(),
         Some("42")
     );
-    let base = safe_url(&environment_value("E6IRC_DISCORD_API_BASE").expect("base"))
+    let base = safe_url(&settings.value(Setting::DiscordApiBase).expect("base"))
         .await
         .expect("safe base");
     let status = endpoint(&base, "channels/42")
@@ -863,7 +838,7 @@ async fn discord_oracle_proves_all_required_phases_and_cleanup() {
         .expect("oracle request")
         .status();
     assert_eq!(status, StatusCode::OK);
-    let result = discord("oracle").await;
+    let result = discord(&settings, "oracle").await;
     assert_eq!(
         result.closed_outcome(TargetKind::Discord),
         super::super::ClosedOutcome::Passed,
@@ -874,10 +849,6 @@ async fn discord_oracle_proves_all_required_phases_and_cleanup() {
 
 #[tokio::test]
 async fn slack_oracle_proves_all_required_phases_and_cleanup() {
-    let _environment = ENVIRONMENT
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
     let oracle = start_slack_oracle().await;
     let base = format!(
         "http://{}/",
@@ -886,13 +857,13 @@ async fn slack_oracle_proves_all_required_phases_and_cleanup() {
             .trim_start_matches("ws://")
             .trim_end_matches("/socket")
     );
-    let _settings = EnvironmentGuard::set(&[
-        ("E6IRC_SLACK_BOT_TOKEN", "bot"),
-        ("E6IRC_SLACK_APP_TOKEN", "app"),
-        ("E6IRC_SLACK_CHANNEL_ID", "C42"),
-        ("E6IRC_SLACK_API_BASE", &base),
+    let settings = settings(&[
+        (Setting::SlackBotToken, "bot"),
+        (Setting::SlackAppToken, "app"),
+        (Setting::SlackChannelId, "C42"),
+        (Setting::SlackApiBase, &base),
     ]);
-    let result = slack("oracle").await;
+    let result = slack(&settings, "oracle").await;
     assert_eq!(
         result.closed_outcome(TargetKind::Slack),
         super::super::ClosedOutcome::Passed,
@@ -983,16 +954,12 @@ fn slack_hello_has_a_closed_shape() {
 
 #[tokio::test]
 async fn oidc_oracle_proves_all_required_phases_and_cleanup() {
-    let _environment = ENVIRONMENT
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
     let oracle = start_oidc_oracle().await;
-    let _settings = EnvironmentGuard::set(&[
-        ("E6IRC_OIDC_CLIENT_ID", "client"),
-        ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
+    let settings = settings(&[
+        (Setting::OidcClientId, "client"),
+        (Setting::OidcClientSecret, "secret"),
     ]);
-    let result = oidc(&oracle.issuer).await;
+    let result = oidc(&settings, &oracle.issuer).await;
     assert_eq!(
         result.closed_outcome(TargetKind::Oidc),
         super::super::ClosedOutcome::Passed,
@@ -1005,28 +972,24 @@ async fn oidc_oracle_proves_all_required_phases_and_cleanup() {
 
 #[tokio::test]
 async fn native_campaigns_reject_secret_bearing_configuration() {
-    let _environment = ENVIRONMENT
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    let _settings = EnvironmentGuard::set(&[
-        ("E6IRC_DISCORD_BOT_TOKEN", "token"),
-        ("E6IRC_DISCORD_CHANNEL_ID", "42"),
+    let settings = settings(&[
+        (Setting::DiscordBotToken, "token"),
+        (Setting::DiscordChannelId, "42"),
         (
-            "E6IRC_DISCORD_API_BASE",
+            Setting::DiscordApiBase,
             "https://oracle.example/?token=secret",
         ),
-        ("E6IRC_SLACK_BOT_TOKEN", "bot"),
-        ("E6IRC_SLACK_APP_TOKEN", "app"),
-        ("E6IRC_SLACK_CHANNEL_ID", "C42"),
+        (Setting::SlackBotToken, "bot"),
+        (Setting::SlackAppToken, "app"),
+        (Setting::SlackChannelId, "C42"),
         (
-            "E6IRC_SLACK_API_BASE",
+            Setting::SlackApiBase,
             "https://oracle.example/?token=secret",
         ),
-        ("E6IRC_OIDC_CLIENT_ID", "client"),
-        ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
+        (Setting::OidcClientId, "client"),
+        (Setting::OidcClientSecret, "secret"),
     ]);
-    let discord = discord("oracle").await;
+    let discord = discord(&settings, "oracle").await;
     assert_eq!(
         discord.closed_outcome(TargetKind::Discord),
         super::super::ClosedOutcome::Rejected
@@ -1038,11 +1001,13 @@ async fn native_campaigns_reject_secret_bearing_configuration() {
             .all(|(_, outcome)| *outcome == PhaseOutcome::NotRun)
     );
     assert_eq!(
-        slack("oracle").await.closed_outcome(TargetKind::Slack),
+        slack(&settings, "oracle")
+            .await
+            .closed_outcome(TargetKind::Slack),
         super::super::ClosedOutcome::Rejected
     );
     assert_eq!(
-        oidc("https://client:secret@oracle.example")
+        oidc(&settings, "https://client:secret@oracle.example")
             .await
             .closed_outcome(TargetKind::Oidc),
         super::super::ClosedOutcome::Rejected
@@ -1051,38 +1016,52 @@ async fn native_campaigns_reject_secret_bearing_configuration() {
 
 #[tokio::test]
 async fn native_campaigns_fail_closed_on_unreachable_transport() {
-    let _environment = ENVIRONMENT
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("reserve port");
     let base = format!("http://{}", listener.local_addr().expect("address"));
     drop(listener);
-    let _settings = EnvironmentGuard::set(&[
-        ("E6IRC_DISCORD_BOT_TOKEN", "token"),
-        ("E6IRC_DISCORD_CHANNEL_ID", "42"),
-        ("E6IRC_DISCORD_API_BASE", &base),
-        ("E6IRC_SLACK_BOT_TOKEN", "bot"),
-        ("E6IRC_SLACK_APP_TOKEN", "app"),
-        ("E6IRC_SLACK_CHANNEL_ID", "C42"),
-        ("E6IRC_SLACK_API_BASE", &base),
-        ("E6IRC_OIDC_CLIENT_ID", "client"),
-        ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
+    let settings = settings(&[
+        (Setting::DiscordBotToken, "token"),
+        (Setting::DiscordChannelId, "42"),
+        (Setting::DiscordApiBase, &base),
+        (Setting::SlackBotToken, "bot"),
+        (Setting::SlackAppToken, "app"),
+        (Setting::SlackChannelId, "C42"),
+        (Setting::SlackApiBase, &base),
+        (Setting::OidcClientId, "client"),
+        (Setting::OidcClientSecret, "secret"),
     ]);
     assert_eq!(
-        discord("oracle").await.closed_outcome(TargetKind::Discord),
+        discord(&settings, "oracle")
+            .await
+            .closed_outcome(TargetKind::Discord),
         super::super::ClosedOutcome::Failed
     );
     assert_eq!(
-        slack("oracle").await.closed_outcome(TargetKind::Slack),
+        slack(&settings, "oracle")
+            .await
+            .closed_outcome(TargetKind::Slack),
         super::super::ClosedOutcome::Failed
     );
     assert_eq!(
-        oidc(&format!("{base}/issuer"))
+        oidc(&settings, &format!("{base}/issuer"))
             .await
             .closed_outcome(TargetKind::Oidc),
         super::super::ClosedOutcome::Failed
+    );
+}
+
+#[test]
+fn empty_settings_are_absent() {
+    let settings = settings(&[
+        (Setting::SlackBotToken, ""),
+        (Setting::SlackChannelId, "C42"),
+    ]);
+    assert_eq!(settings.value(Setting::SlackBotToken), None);
+    assert!(settings.secret(Setting::SlackBotToken).is_none());
+    assert_eq!(
+        settings.value(Setting::SlackChannelId).as_deref(),
+        Some("C42")
     );
 }
