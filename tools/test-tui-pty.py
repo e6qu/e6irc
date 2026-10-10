@@ -63,8 +63,8 @@ class IrcPeer:
     def send(self, line: str) -> None:
         self.socket.sendall(line.encode() + b"\r\n")
 
-    def wait_line(self, predicate, description: str) -> str:
-        deadline = time.monotonic() + TIMEOUT
+    def wait_line(self, predicate, description: str, timeout: float = TIMEOUT) -> str:
+        deadline = time.monotonic() + timeout
         seen: list[str] = []
         while time.monotonic() < deadline:
             while b"\n" in self.buffer:
@@ -406,12 +406,24 @@ def main() -> None:
             if any("typed while offline" in line for line in proxy.lines()):
                 raise AssertionError("a line typed while offline was sent")
             peer = observer_in_pty(port)
-            os.write(master, b"\r")
-            peer.wait_line(
-                lambda line: line.startswith(":ptyclient!")
-                and " PRIVMSG #pty :typed while offline" in line,
-                "the line kept while offline, sent after the reconnect",
+            # The network task sends its JOIN before the UI has taken the new
+            # session, and an Enter before then is refused again with the line
+            # kept: Enter until it is sent. Once it is, Enter on the empty
+            # composer sends nothing.
+            sent_kept_line = lambda line: (
+                line.startswith(":ptyclient!")
+                and " PRIVMSG #pty :typed while offline" in line
             )
+            deadline = time.monotonic() + TIMEOUT
+            while True:
+                os.write(master, b"\r")
+                try:
+                    peer.wait_line(sent_kept_line, "the kept line", timeout=1.0)
+                    break
+                except TimeoutError:
+                    if time.monotonic() > deadline:
+                        raise
+                    drain_pty(master, output, 0.1)
 
             # Tab completes a member of the channel, here the observer who
             # joined after the TUI did; /me sends an action.
