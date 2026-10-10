@@ -494,7 +494,7 @@ fn an_attachment_record_round_trips_in_both_formats() {
         shown_nick: Some("alice_".into()),
         shown_channels: vec!["#rust".into(), "#e6irc".into()],
         shown_isupport: vec!["CHANTYPES=#".into(), "NETWORK=Libera".into()],
-        status_revision: 9,
+        shown_status: Some("reconnecting:connection_lost".into()),
     };
     for format in [RecordFormat::PREVIOUS, RecordFormat::NEWEST] {
         let body = record.encode(format, WRITER).expect("encode");

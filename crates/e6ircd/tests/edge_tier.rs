@@ -756,6 +756,7 @@ async fn a_bouncer_attachment_survives_a_graceful_restart() {
     peer.send_line("PRIVMSG #lobby :after the restart")
         .await
         .expect("send");
+    let mut connected_told = 0;
     let welcomed_again = tokio::time::timeout(deadline::HANG, async {
         loop {
             let message = attached
@@ -766,6 +767,11 @@ async fn a_bouncer_attachment_survives_a_graceful_restart() {
             assert_ne!(message.command, "ERROR", "{message:?}");
             if message.command == "001" {
                 return true;
+            }
+            if message.command == "NOTICE"
+                && message.params.last().map(String::as_str) == Some("upstream connected")
+            {
+                connected_told += 1;
             }
             if message
                 .params
@@ -779,6 +785,11 @@ async fn a_bouncer_attachment_survives_a_graceful_restart() {
     .await
     .expect("the line after the restart");
     assert!(!welcomed_again, "the attachment was welcomed a second time");
+    // The next core dialled the upstream again: the attachment is told
+    // "connected" at most once — when it was told something else between —
+    // its status compared by value, not by a revision the next process
+    // numbers afresh.
+    assert!(connected_told <= 1, "connected told {connected_told} times");
     attached
         .send_line("PRIVMSG #lobby :from the attachment")
         .await
@@ -1090,6 +1101,15 @@ async fn a_local_driver_session_survives_a_graceful_restart_unseen() {
         assert!(
             !["ERROR", "001", "JOIN", "PART", "QUIT"].contains(&message.command.as_str()),
             "the attachment saw the restart: {message:?}"
+        );
+        // The local session never left: no status changed to be told.
+        assert!(
+            !(message.command == "NOTICE"
+                && message
+                    .params
+                    .last()
+                    .is_some_and(|text| text.starts_with("upstream "))),
+            "the attachment was told a status: {message:?}"
         );
     }
     attached

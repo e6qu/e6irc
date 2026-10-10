@@ -3455,6 +3455,18 @@ impl DriverConnectionStatus {
     }
 }
 
+/// A connection status as a value an attachment compares what it was told
+/// by: its lifecycle and, when not connected, the failure behind it. The
+/// revision a process numbers statuses by starts over with the process; the
+/// value does not, so a status is never told twice, nor withheld, across a
+/// restart.
+pub(crate) fn status_shown(lifecycle: NetworkLifecycle, failure: Option<NetworkFailure>) -> String {
+    match failure.filter(|_| lifecycle != NetworkLifecycle::Connected) {
+        Some(failure) => format!("{}:{}", lifecycle.as_str(), failure.code()),
+        None => lifecycle.as_str().to_owned(),
+    }
+}
+
 fn status_notice(status: DriverConnectionStatus) -> String {
     match status {
         DriverConnectionStatus::Connected => ":*bnc* NOTICE * :upstream connected".to_string(),
@@ -7469,6 +7481,7 @@ async fn relay_attached(
     // the upstream's own words when it is not connected.
     let runtime = handle.runtime_snapshot();
     let status_revision = runtime.status_revision;
+    let shown_status = Some(status_shown(runtime.lifecycle, runtime.last_error));
     write
         .write_all(attach_status_notice(&runtime).as_bytes())
         .await?;
@@ -7551,6 +7564,7 @@ async fn relay_attached(
         replies,
         downstream_session,
         status_revision,
+        shown_status,
         attach_id,
         cursor,
         pending,
@@ -7587,7 +7601,7 @@ pub(crate) async fn resume_attached(
         shown_nick,
         shown_channels,
         shown_isupport,
-        status_revision,
+        shown_status,
     } = record;
     let caps = AttachCaps::from_bits(caps);
     let greeting = Greeting {
@@ -7680,13 +7694,17 @@ pub(crate) async fn resume_attached(
         write.write_all(b"\r\n").await?;
     }
     downstream_session.features.isupport = now;
+    // The status as it is now, told when it is not what the client was told:
+    // compared by value, as this process numbers statuses afresh.
     let runtime = handle.runtime_snapshot();
-    let mut told_revision = status_revision;
-    if accept_status_revision(&mut told_revision, runtime.status_revision) {
+    let now_shown = status_shown(runtime.lifecycle, runtime.last_error);
+    let mut shown_status = shown_status;
+    if shown_status.as_deref() != Some(now_shown.as_str()) {
         write
             .write_all(attach_status_notice(&runtime).as_bytes())
             .await?;
         write.write_all(b"\r\n").await?;
+        shown_status = Some(now_shown);
     }
     write.flush().await?;
     relay_live(LiveAttachment {
@@ -7701,7 +7719,8 @@ pub(crate) async fn resume_attached(
         events,
         replies,
         downstream_session,
-        status_revision: told_revision,
+        status_revision: runtime.status_revision,
+        shown_status,
         attach_id,
         cursor: position,
         pending: Vec::new(),
@@ -7891,7 +7910,11 @@ struct LiveAttachment<'a> {
     events: tokio::sync::broadcast::Receiver<DriverEvent>,
     replies: ReplyRoute,
     downstream_session: IrcSessionState,
+    /// The newest status revision of this process seen: an older one is a
+    /// stale event.
     status_revision: u64,
+    /// The status the client was last told, as a value ([`status_shown`]).
+    shown_status: Option<String>,
     attach_id: u64,
     /// The ring position the client has been sent everything through.
     cursor: ReplayCursor,
@@ -7930,7 +7953,7 @@ impl AttachHeld {
                 shown_nick: None,
                 shown_channels: Vec::new(),
                 shown_isupport: Vec::new(),
-                status_revision: 0,
+                shown_status: None,
             },
             format,
             origin: crate::core::record::ClockOrigin::of(
@@ -7953,7 +7976,7 @@ impl AttachHeld {
         self.record
             .shown_isupport
             .clone_from(&live.downstream_session.features.isupport);
-        self.record.status_revision = live.status_revision;
+        self.record.shown_status.clone_from(&live.shown_status);
         let body = self
             .record
             .encode(self.format.get(), self.origin)
@@ -8053,6 +8076,7 @@ async fn relay_live(mut live: LiveAttachment<'_>) -> std::io::Result<AttachEnd> 
             replies,
             downstream_session,
             status_revision,
+            shown_status,
             cursor,
             ..
         } = &mut live;
@@ -8108,6 +8132,11 @@ async fn relay_live(mut live: LiveAttachment<'_>) -> std::io::Result<AttachEnd> 
                     if !accept_status_revision(status_revision, revision) {
                         continue;
                     }
+                    let shown = status_shown(status.lifecycle(), status.failure());
+                    if shown_status.as_deref() == Some(shown.as_str()) {
+                        continue;
+                    }
+                    *shown_status = Some(shown);
                     write.write_all(status_notice(status).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
@@ -11921,6 +11950,71 @@ mod tests {
         drop(write);
         drop(lines);
         attach.await.expect("attach task").expect("attach result");
+    }
+
+    /// An attachment resumed after a restart is told its network's status
+    /// exactly when it differs from what its record says it was told: the
+    /// value is compared, never the revision, which the next process numbers
+    /// from the start (a record's high revision withheld every status until
+    /// the new count passed it).
+    #[tokio::test]
+    async fn a_resumed_attachment_is_told_its_status_only_when_its_value_changed() {
+        use tokio::io::AsyncReadExt;
+
+        for (shown, told) in [
+            (Some("connected"), false),
+            (Some("reconnecting:connection_lost"), true),
+            (None, true),
+        ] {
+            let (handle, ends) = NetworkHandle::channels(8);
+            ends.begin_irc_session("alice".to_string());
+            ends.emit(ConnectionEvent::Connected);
+            let record = crate::core::record::AttachRecord {
+                account: "alice".into(),
+                credential: crate::identity::CredentialId::AccountPassword,
+                shared: false,
+                network: "net".into(),
+                requested_nick: "alice".into(),
+                caps: 0,
+                cursor: None,
+                shown_nick: Some("alice".into()),
+                shown_channels: Vec::new(),
+                shown_isupport: Vec::new(),
+                shown_status: shown.map(str::to_owned),
+            };
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let resumed = tokio::spawn(async move {
+                resume_attached(
+                    attach_link::over_stream(server).await,
+                    &handle,
+                    account_lease::lease_for_test("alice"),
+                    record,
+                    "bnc.test",
+                    ATTACH_LIVENESS_INTERVAL,
+                )
+                .await
+            });
+            let mut output = String::new();
+            let mut bytes = vec![0; 4096];
+            while let Ok(Ok(count)) = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client.read(&mut bytes),
+            )
+            .await
+            {
+                if count == 0 {
+                    break;
+                }
+                output.push_str(&String::from_utf8_lossy(&bytes[..count]));
+            }
+            assert_eq!(
+                output.contains(":*bnc* NOTICE * :upstream connected\r\n"),
+                told,
+                "shown {shown:?}: {output}"
+            );
+            drop(client);
+            resumed.abort();
+        }
     }
 
     /// A bridge's own JOIN answer echoes each requested channel as one middle

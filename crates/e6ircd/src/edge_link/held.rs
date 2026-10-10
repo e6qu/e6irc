@@ -590,7 +590,7 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
     };
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let rebuilt = rebuild(&server, &uploaded).await;
+        let mut rebuilt = rebuild(&server, &uploaded).await;
         // Every shard has handled what the rebuild pushed it before any input
         // flows: a session's first line meets the others rebuilt.
         if let Err(error) = server.core_tx.caught_up().await {
@@ -609,6 +609,11 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
         if rebuilt.local > 0 {
             homes.restored_within(LOCAL_CLAIM_WAIT).await;
             close_unclaimed(&server).await;
+        }
+        let attachments = std::mem::take(&mut rebuilt.attachments);
+        let resumed_attachments = attachments.len();
+        for (stream, id, upload, record) in attachments {
+            resume_attachment(&server, &stream, id, &upload, record).await;
         }
         server.rebuild.opened();
         // Every edge linked now — those that uploaded, those held, and any
@@ -640,7 +645,7 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
             rebuilt.sessions,
             rebuilt.local,
             rebuilt.sockets,
-            rebuilt.attachments,
+            resumed_attachments,
             rebuilt.channels,
             uploaded.len(),
             started.elapsed().as_millis()
@@ -672,8 +677,10 @@ struct Rebuilt {
     channels: usize,
     /// Live chat sockets resumed.
     sockets: usize,
-    /// Bouncer attachments resumed.
-    attachments: usize,
+    /// Bouncer attachments to resume once the core's own sessions are taken
+    /// up: one attached to a `local` network is then shown its session as it
+    /// stands, never a network still connecting.
+    attachments: Vec<(Arc<SessionStream>, SessionId, Upload, AttachRecord)>,
 }
 
 /// One session an edge uploaded, with the stream it came on.
@@ -1088,10 +1095,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
     for (stream, id, upload, record) in attachments {
         match revoked.get(&ConnId(id.get())) {
             Some(reason) => refuse_held(&stream, id, &upload, reason).await,
-            None => {
-                resume_attachment(server, &stream, id, &upload, record).await;
-                rebuilt.attachments += 1;
-            }
+            None => rebuilt.attachments.push((stream, id, upload, record)),
         }
     }
     rebuilt

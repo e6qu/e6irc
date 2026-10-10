@@ -1186,8 +1186,10 @@ pub struct AttachRecord {
     pub shown_nick: Option<String>,
     pub shown_channels: Vec<String>,
     pub shown_isupport: Vec<String>,
-    /// The newest connection status the client was told.
-    pub status_revision: u64,
+    /// The connection status the client was last told, as a value
+    /// (`bouncer::status_shown`), so a status is told once whichever process
+    /// told it; none before the first.
+    pub shown_status: Option<String>,
 }
 
 impl AttachRecord {
@@ -1203,7 +1205,7 @@ impl AttachRecord {
             shown_nick,
             shown_channels,
             shown_isupport,
-            status_revision,
+            shown_status,
         } = self;
         body(format, clock, |w| {
             w.text("account", account)?;
@@ -1227,7 +1229,7 @@ impl AttachRecord {
                     w.text(field, item)?;
                 }
             }
-            w.u64(*status_revision);
+            w.opt_text("shown status", shown_status.as_deref())?;
             Ok(())
         })
     }
@@ -1252,7 +1254,7 @@ impl AttachRecord {
             shown_nick: r.opt_text("shown nick")?,
             shown_channels: texts(&mut r, "shown channels")?,
             shown_isupport: texts(&mut r, "shown ISUPPORT")?,
-            status_revision: r.u64("status revision")?,
+            shown_status: r.opt_text("shown status")?,
         };
         r.finish()?;
         Ok(record)

@@ -169,7 +169,7 @@ pub struct AttachPort {
 /// registration, or to resume from its record.
 enum Handoff {
     Serve,
-    Resume(crate::core::record::AttachRecord),
+    Resume(Box<crate::core::record::AttachRecord>),
 }
 
 impl AttachPort {
@@ -212,7 +212,13 @@ impl AttachPort {
     ) -> EdgeSession {
         let (link, edge) =
             e6irc_edge::link::holding_waiting_session("attach-sendq", sendq_bytes, in_flight);
-        self.hand_over(conn, address, link, Some(format), Handoff::Resume(record));
+        self.hand_over(
+            conn,
+            address,
+            link,
+            Some(format),
+            Handoff::Resume(Box::new(record)),
+        );
         edge
     }
 
@@ -248,7 +254,7 @@ impl AttachPort {
         };
         match handoff {
             Handoff::Serve => (self.serve)(link, ClientIp::new(address)),
-            Handoff::Resume(record) => (self.resume)(link, ClientIp::new(address), record),
+            Handoff::Resume(record) => (self.resume)(link, ClientIp::new(address), *record),
         }
     }
 }
