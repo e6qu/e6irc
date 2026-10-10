@@ -1311,7 +1311,7 @@ impl BridgeText {
         if let Some(action) = crate::sanitize::ctcp_action(text) {
             return Some(Self::Action(strip_irc_formatting(action)));
         }
-        if text.starts_with('\u{1}') {
+        if crate::sanitize::is_ctcp_request(text) {
             return None;
         }
         Some(Self::Text(strip_irc_formatting(text)))
@@ -2928,9 +2928,9 @@ struct IrcSessionState {
     nick: Option<String>,
     channels: std::collections::HashMap<String, upstream_identity::ConfirmedChannel>,
     /// Each channel's topic and members, as the session's lines told them
-    /// (the session's live state, and the ring's head state); `None` for a
-    /// mirror of what one attached client has been shown, which needs only
-    /// the membership.
+    /// (the session's live state); `None` for the ring's head and for a
+    /// mirror of what one attached client has been shown, which need only the
+    /// membership: the backlog keeps no member list ([`told_live_only`]).
     views: Option<channel_views::ChannelViews>,
     features: UpstreamFeatures,
     /// How the network names things, from its 005 lines. Kept across sessions
@@ -2962,7 +2962,7 @@ impl IrcSessionState {
     }
 
     /// State that follows each channel's topic and members as well: a
-    /// session's own, or the ring's head.
+    /// session's own.
     fn following_channels() -> Self {
         Self {
             views: Some(channel_views::ChannelViews::default()),
@@ -2980,7 +2980,7 @@ impl IrcSessionState {
         let mut state = Self {
             names,
             features,
-            ..Self::following_channels()
+            ..Self::default()
         };
         state.replace(snapshot);
         state
@@ -4211,9 +4211,8 @@ pub struct Buffer {
     /// How long history is kept: storage maintenance deletes older lines from
     /// `bnc_buffer`, and this ring neither keeps nor replays them either.
     retention: crate::core::HistoryRetention,
-    /// The session's state as of the oldest entry held — its nick, channels,
-    /// and each channel's topic and members — advanced by every entry the
-    /// ring evicts, so an attaching client is brought to it before the
+    /// The session's state as of the oldest entry held — its nick and
+    /// channels — advanced by every entry the ring evicts, so an attaching client is brought to it before the
     /// replay begins and reads each replayed line in the state it was said
     /// in (§10.1). `None` while the oldest lines are ones restored from
     /// rows stored before migration 0096, whose nick was not stored with them
@@ -4241,7 +4240,7 @@ impl Buffer {
             epoch,
             next_seq: cap as u64 + 1,
             retention: crate::core::HistoryRetention::default(),
-            head: Some(IrcSessionState::following_channels()),
+            head: Some(IrcSessionState::default()),
             names: e6irc_client::NetworkNames::default(),
             features: UpstreamFeatures::default(),
         }
@@ -4426,7 +4425,7 @@ fn restored_head<'a>(
     let mut head = IrcSessionState {
         names,
         features,
-        ..IrcSessionState::following_channels()
+        ..IrcSessionState::default()
     };
     for own_nick in own_nicks {
         match own_nick {
@@ -4568,12 +4567,6 @@ fn without_tags(line: &str) -> String {
     }
 }
 
-/// A `*bnc*` NOTICE to `target` (`*`, or a channel), its text fitted to the
-/// line. The bouncer's own notices carry upstream text — a closing reason, a
-/// SASL refusal, a channel name, a bridge's room id — bounded in characters,
-/// not in bytes, so a `format!`ed notice could outgrow the line and then be
-/// replaced whole by [`ingest`]'s rejection: the notice that exists to say
-/// what happened would say nothing. Every such notice is built here.
 /// The nick `line` renames the session to, when it is the `NICK` of the
 /// session whose nick is `own`.
 fn own_rename(line: &str, own: &str, names: &e6irc_client::NetworkNames) -> Option<String> {
@@ -4584,6 +4577,12 @@ fn own_rename(line: &str, own: &str, names: &e6irc_client::NetworkNames) -> Opti
         .flatten()
 }
 
+/// A `*bnc*` NOTICE to `target` (`*`, or a channel), its text fitted to the
+/// line. The bouncer's own notices carry upstream text — a closing reason, a
+/// SASL refusal, a channel name, a bridge's room id — bounded in characters,
+/// not in bytes, so a `format!`ed notice could outgrow the line and then be
+/// replaced whole by [`ingest`]'s rejection: the notice that exists to say
+/// what happened would say nothing. Every such notice is built here.
 pub(crate) fn bnc_notice(target: &str, text: &str) -> String {
     crate::core::server_notice("*bnc*", MiddleParam::echo(target).as_str(), text)
 }
@@ -4650,6 +4649,51 @@ pub(crate) fn without_tag(line: &str, key: &str) -> String {
         body.to_string()
     } else {
         format!("@{} {body}", kept.join(";"))
+    }
+}
+
+/// Numerics that say whether a watched nick is online (`MONITOR`'s 730 and
+/// 731, `WATCH`'s 600, 601, 604 and 605): presence as it is when they are
+/// said.
+const PRESENCE_NUMERICS: &[u16] = &[600, 601, 604, 605, 730, 731];
+
+/// Whether a line published to a network is told live only: to whoever is
+/// attached now, at the ring's position, and never retained in the ring, the
+/// stored backlog or CHATHISTORY. The one rule every way into and out of the
+/// backlog reads (publishing a line or an echo, persisting it, restoring it).
+///
+/// - A `TAGMSG` history keeps nothing of (a typing indicator): a moment, not
+///   conversation.
+/// - A CTCP request (`\x01VERSION\x01`, `\x01PING …\x01`, a direct
+///   file-transfer offer): a question to the clients attached when it was
+///   asked. Replayed, every
+///   client that attached later answered it again — hours after it was asked,
+///   once per attach — as neither ZNC nor soju ever does.
+/// - A channel's state as the numerics that follow our own `JOIN` state it
+///   ([`replies::JOIN_BURST`]: its modes, topic and member list): what the
+///   session follows, which an attaching client is told from the session
+///   itself (§10.1). Retained,
+///   the member lists that follow every rejoin after a reconnect — hundreds of
+///   lines on a heavy user's channels — evicted the conversation the backlog
+///   exists to keep, and a replay showed a member list long out of date.
+/// - A watched nick's presence ([`PRESENCE_NUMERICS`]): replayed, a client
+///   was told a nick that left hours ago is online.
+pub(crate) fn told_live_only(line: &str) -> bool {
+    let Ok(message) = e6irc_proto::message::Message::parse(line) else {
+        return false;
+    };
+    match message.command.to_ascii_uppercase().as_str() {
+        "TAGMSG" => crate::sanitize::is_ephemeral_tagmsg(line),
+        "PRIVMSG" => message
+            .params
+            .get(1)
+            .is_some_and(|text| crate::sanitize::is_ctcp_request(text)),
+        command => {
+            command.len() == 3
+                && command.parse::<u16>().is_ok_and(|code| {
+                    replies::JOIN_BURST.contains(&code) || PRESENCE_NUMERICS.contains(&code)
+                })
+        }
     }
 }
 
@@ -5181,13 +5225,16 @@ impl NetworkHandle {
     /// Each stored line comes with the time it was stored under, which it is
     /// stamped with when it carries no `time` of its own, and the session's
     /// own nick when it was said, which the ring's head takes from the oldest
-    /// line restored ([`restored_head`]). A network's registration burst,
-    /// which builds before this one retained, is left in storage: replayed,
-    /// its ISUPPORT would undo the bouncer's own (§10.4).
+    /// line restored ([`restored_head`]). What builds before this one retained
+    /// and this one does not is left in storage: a network's registration
+    /// burst, whose ISUPPORT would undo the bouncer's own when replayed
+    /// (§10.4), and whatever is told live only ([`told_live_only`]).
     pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) {
         let older: Vec<crate::db::StoredBacklogLine> = older
             .into_iter()
-            .filter(|stored| !is_registration_burst_line(&stored.line))
+            .filter(|stored| {
+                !is_registration_burst_line(&stored.line) && !told_live_only(&stored.line)
+            })
             .collect();
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         let room = buf.cap.saturating_sub(buf.entries.len());
@@ -5223,12 +5270,12 @@ impl NetworkHandle {
         }
     }
 
-    /// Subscribe to the driver's event stream (one receiver per attach).
     /// The most lines the replay buffer holds: the network's `buffer_cap`.
     pub(crate) fn buffer_capacity(&self) -> usize {
         self.buffer.lock().expect("buffer poisoned").cap
     }
 
+    /// Subscribe to the driver's event stream (one receiver per attach).
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<DriverEvent> {
         self.events.subscribe()
     }
@@ -5717,7 +5764,6 @@ impl DriverEnds {
         self.reply_routes.deliver(origin, line);
     }
 
-    /// The bouncer's own answer to attachment `origin`'s command.
     /// The session's own answer to `line` when it is a `NAMES` of one channel
     /// the session is in and follows the complete member list of.
     fn names_from_session(&self, line: &str) -> Option<Vec<String>> {
@@ -5736,6 +5782,7 @@ impl DriverEnds {
             .names_reply("*bnc*", &nick, shown.as_str(), &session.features)
     }
 
+    /// The bouncer's own answer to attachment `origin`'s command.
     pub(crate) fn answer(&self, origin: u64, line: String) {
         self.reply_routes.deliver(origin, ingest(line));
     }
@@ -5978,10 +6025,10 @@ impl DriverEnds {
 
     fn publish_buffered(&self, line: String) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
-        // A typing indicator is a moment, not conversation: told live, at the
-        // ring's position, and never retained or stored (the persistence task
+        // What the backlog keeps nothing of is told live, at the ring's
+        // position, and never retained or stored (the persistence task
         // stores `Line`s, not `Notice`s).
-        if crate::sanitize::is_ephemeral_tagmsg(&line) {
+        if told_live_only(&line) {
             let seq = buffer.position();
             drop(
                 self.events
@@ -6001,11 +6048,12 @@ impl DriverEnds {
     }
 
     /// Publish the echo of a line attachment `origin` sent: retained like any
-    /// line of the conversation, unless it is a typing indicator, which is
-    /// told live at the ring's position (and the persistence task skips).
+    /// line of the conversation, unless the backlog keeps nothing of it
+    /// ([`told_live_only`]), when it is told live at the ring's position (and
+    /// the persistence task skips it).
     fn publish_echo(&self, line: String, origin: u64) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
-        let seq = if crate::sanitize::is_ephemeral_tagmsg(&line) {
+        let seq = if told_live_only(&line) {
             buffer.position()
         } else {
             buffer.push(line.clone())
@@ -6739,10 +6787,14 @@ async fn relay_attached(
             continue;
         }
         let (line, change) = downstream_session.mirror(&entry.line);
-        // A channel rejoined in the replay has its topic and members told by
-        // the lines that followed that JOIN.
+        // A channel joined in the replay is told its topic and members once
+        // the replay is over, as the session knows them then: the backlog
+        // keeps no member list ([`told_live_only`]).
         for channel in &change.joined {
-            untold.told(&downstream_session.names.fold(channel.as_str()));
+            untold.untold(
+                downstream_session.names.fold(channel.as_str()),
+                channel.as_str().to_string(),
+            );
         }
         if let Some(line) = filter_tags(line, caps) {
             write.write_all(line.as_bytes()).await?;
@@ -8489,7 +8541,6 @@ mod tests {
         assert_eq!(handle.buffer_snapshot(), Vec::<String>::new());
     }
 
-    /// The live notice still reaches an attached client, at the ring position
     /// A typing indicator is told live and kept out of the backlog, as the
     /// core keeps it out of history; a reaction is conversation and retained.
     /// The echo of a client's own typing indicator is not retained either.
@@ -8518,6 +8569,119 @@ mod tests {
         );
     }
 
+    /// A CTCP request is a question to the clients attached when it is asked:
+    /// told live, never retained, so no client that attaches later answers it
+    /// again. A `/me` and a CTCP reply are conversation, and retained.
+    #[tokio::test]
+    async fn a_ctcp_request_is_told_live_and_never_retained() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        let position = handle.buffer.lock().expect("buffer").position();
+        ends.emit_line(":bob!b@h PRIVMSG me :\u{1}VERSION\u{1}".to_string());
+        ends.emit_line(":bob!b@h PRIVMSG #room :\u{1}PING 1234\u{1}".to_string());
+        ends.emit_line(":bob!b@h PRIVMSG me :\u{1}DCC SEND f 1 2 3\u{1}".to_string());
+        ends.emit_echo("PRIVMSG bob :\u{1}TIME\u{1}".to_string(), 1);
+        ends.emit_line(":bob!b@h PRIVMSG #room :\u{1}ACTION waves\u{1}".to_string());
+        ends.emit_line(":bob!b@h NOTICE me :\u{1}VERSION irssi\u{1}".to_string());
+        for _ in 0..3 {
+            assert!(matches!(
+                events.recv().await.expect("request"),
+                DriverEvent::Notice(_)
+            ));
+        }
+        match events.recv().await.expect("echo") {
+            DriverEvent::Echo { line, .. } => assert_eq!(line.seq, position, "not retained"),
+            other => panic!("expected the echo, got {other:?}"),
+        }
+        assert_eq!(
+            untimed(handle.buffer_snapshot()),
+            vec![
+                ":bob!b@h PRIVMSG #room :\u{1}ACTION waves\u{1}".to_string(),
+                ":bob!b@h NOTICE me :\u{1}VERSION irssi\u{1}".to_string(),
+            ]
+        );
+    }
+
+    /// The topic and member list that follow our own `JOIN` are the channel's
+    /// state, which the session follows and an attaching client is told from
+    /// it: told live, never retained, so a rejoin after every reconnect does
+    /// not put each channel's member list into the backlog in place of the
+    /// conversation. The session still follows them, and answers `NAMES`.
+    #[tokio::test]
+    async fn a_channels_topic_and_members_are_told_live_and_never_retained() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.begin_irc_session("me".to_string());
+        ends.emit_session_line(":up 376 me :End of MOTD".to_string())
+            .expect("the burst ends");
+        let mut events = handle.subscribe();
+        for line in [
+            ":me!u@h JOIN #room",
+            ":up 332 me #room :the topic",
+            ":up 333 me #room setter 1700000000",
+            ":up 353 me = #room :me @op",
+            ":up 366 me #room :End of /NAMES list.",
+            ":op!o@h PRIVMSG #room :hello",
+        ] {
+            ends.emit_session_line(line.to_string())
+                .expect("within the channel bound");
+        }
+        let mut kinds = Vec::new();
+        for _ in 0..6 {
+            kinds.push(match events.recv().await.expect("event") {
+                DriverEvent::Line(_) => "line",
+                DriverEvent::Notice(_) => "notice",
+                other => panic!("unexpected {other:?}"),
+            });
+        }
+        assert_eq!(
+            kinds,
+            ["line", "notice", "notice", "notice", "notice", "line"]
+        );
+        let kept: Vec<String> = untimed(handle.buffer_snapshot())
+            .into_iter()
+            .filter(|line| !line.contains("*bnc*"))
+            .collect();
+        assert_eq!(kept, [":me!u@h JOIN #room", ":op!o@h PRIVMSG #room :hello"]);
+        let answer = ends
+            .names_from_session("NAMES #room")
+            .expect("the session follows the member list");
+        assert!(answer[0].ends_with("353 me = #room :me @op"), "{answer:?}");
+    }
+
+    /// A watched nick's presence is told live, never retained: replayed, it
+    /// would say a nick that left long ago is online.
+    #[test]
+    fn a_watched_nicks_presence_is_told_live_and_never_retained() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.emit_line(":up 730 me :bob!b@h".to_string());
+        ends.emit_line(":up 600 me bob b h 1700000000 :logged online".to_string());
+        ends.emit_line(":bob!b@h PRIVMSG me :still here".to_string());
+        assert_eq!(
+            untimed(handle.buffer_snapshot()),
+            [":bob!b@h PRIVMSG me :still here"]
+        );
+    }
+
+    /// Rows an older build stored of what is now told live only are left in
+    /// storage, like a registration burst.
+    #[test]
+    fn a_restore_leaves_what_is_told_live_only_in_storage() {
+        let (handle, _ends) = NetworkHandle::channels(8);
+        handle.preload_front(vec![
+            stored_line(":up 353 me = #room :me op", "2026-01-01T00:00:00.000Z"),
+            stored_line(
+                ":bob!b@h PRIVMSG me :\u{1}VERSION\u{1}",
+                "2026-01-01T00:00:01.000Z",
+            ),
+            stored_line(":bob!b@h PRIVMSG #room :kept", "2026-01-01T00:00:02.000Z"),
+        ]);
+        assert_eq!(
+            untimed(handle.buffer_snapshot()),
+            [":bob!b@h PRIVMSG #room :kept"]
+        );
+    }
+
+    /// The live notice still reaches an attached client, at the ring position
     /// it was told at, so a replay cursor taken from it resumes correctly.
     #[tokio::test]
     async fn a_backlog_storage_failure_is_told_live_and_not_retained() {
@@ -11313,12 +11477,14 @@ mod tests {
 
     /// A replay whose window holds a nick change is read in the state each
     /// line was said in: the client is first brought to the nick and channels
-    /// of the oldest replayed line — the channel's JOIN, topic and members
-    /// before any of its lines — then shown the lines, then brought to the
-    /// state now. It used to start at the current nick, so the old nick's
-    /// own lines read as a stranger's and its `NICK` as someone taking the
-    /// client's name, and a channel whose JOIN had aged out had its lines
-    /// replayed before it was joined.
+    /// of the oldest replayed line — the channel's JOIN before any of its
+    /// lines — then shown the lines, then brought to the state now, with the
+    /// channel's topic and members as the session knows them. It used to
+    /// start at the current nick, so the old nick's own lines read as a
+    /// stranger's and its `NICK` as someone taking the client's name, and a
+    /// channel whose JOIN had aged out had its lines replayed before it was
+    /// joined. The backlog keeps no member list ([`told_live_only`]), so the
+    /// one told is the session's now, not one from the ring.
     #[tokio::test]
     async fn a_replay_starts_from_the_state_of_its_oldest_line() {
         let (handle, ends) = a_session_in_room(
@@ -11336,12 +11502,12 @@ mod tests {
                 ":bnc.test 001 bob :",
                 ":bob NICK :alice",
                 ":alice!~bnc@e6irc JOIN #room",
-                ":*bnc* 332 alice #room :the topic",
-                ":*bnc* 353 alice = #room :alice @op peer",
-                ":*bnc* 366 alice #room :End of /NAMES list",
                 ":alice!u@h PRIVMSG #room :before",
                 ":alice!u@h NICK :bob",
                 ":bob!u@h PRIVMSG #room :after",
+                ":*bnc* 332 bob #room :the topic",
+                ":*bnc* 353 bob = #room :bob @op peer",
+                ":*bnc* 366 bob #room :End of /NAMES list",
             ],
         );
         assert_eq!(output.matches(" JOIN ").count(), 1, "{output}");

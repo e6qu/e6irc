@@ -401,15 +401,20 @@ PLAIN.
 4. The listener resolves the account first, then selects only that account’s
    case-insensitive network name (or an eligible shared network).
 5. The client receives buffered lines and live driver output; commands are
-   relayed back to the same driver. The driver synthesizes the sender's own
-   messages into the stream (the upstream is never asked for
-   `echo-message`): the account's other attached sessions and the detached
-   buffer always see them, and the sender itself sees its echo exactly when
-   it negotiated `echo-message` on attach. Adding the upstream identity prefix
-   never creates an over-limit echo; trailing text is fitted on a UTF-8 boundary.
-6. When the bounded replay no longer contains a current JOIN, the authoritative
-   session snapshot synthesizes it with a minimal NAMES reply. If the client
-   negotiated read markers, its stored channel position arrives before 366.
+   relayed back to the same driver. The sender's own messages reach the
+   stream exactly once: the upstream's echo when it offers `echo-message`
+   (which the driver asks for), otherwise one the driver synthesizes. The
+   account's other attached sessions and the detached buffer always see them,
+   and the sender itself sees its echo exactly when it negotiated
+   `echo-message` on attach. Adding the upstream identity prefix never creates
+   an over-limit echo; trailing text is fitted on a UTF-8 boundary.
+6. The client is brought to the session as it stood at the oldest replayed
+   line (its nick and the JOINs the replay no longer contains), shown the
+   replay, and brought to the session now; every channel it is shown joined
+   is then told its topic and members as the session knows them (asked of
+   the upstream, for at most two channels, when the session does not know
+   them). If the client negotiated read markers, its stored channel position
+   arrives before 366.
 7. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 
@@ -442,10 +447,13 @@ driver receives upstream lines while no BNC or web client is attached.
 
 **Flow.**
 
-1. Every driver emits upstream lines into a bounded in-memory buffer; the
-   `irc` driver additionally synthesizes the account's own sent messages
-   (prefixed with its current upstream identity) so the backlog holds both
-   sides of the conversation.
+1. Every driver emits upstream lines into a bounded in-memory buffer, and
+   the account's own sent messages as they are echoed (by the upstream, or
+   synthesized with its current upstream identity) so the backlog holds both
+   sides of the conversation. What is not conversation is told live and never
+   kept: typing indicators, CTCP requests (so a later attach does not answer a
+   stale `VERSION` again), and each channel's topic and member list (the
+   session's state, told to each attaching client from the session).
 2. With PostgreSQL, a persistence task stores wire-preserving lines under the
    owner/network key and trims the network’s history to its cap.
 3. On driver start, recent rows preload oldest-first into the bounded buffer.

@@ -3097,7 +3097,7 @@ above the trait, provides for every network kind:
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
   are mirrored to all attached clients. What answers one client's command is
   that client's alone (`bouncer/replies.rs`): the replies to its `WHO`,
-  `WHOIS`, `LIST`, `NAMES`, `MODE` and `TOPIC` queries, its `INVITE` and
+  `WHOIS`, `LIST`, `NAMES`, `MODE`, `TOPIC` and `MONITOR L` queries, its `INVITE` and
   `AWAY` confirmations, and the error numerics and `FAIL`/`WARN`/`NOTE`
   standard replies to anything it sent reach that attachment only, live, and
   never enter the ring, the stored backlog or CHATHISTORY. With
@@ -3131,10 +3131,14 @@ above the trait, provides for every network kind:
   alone, so a client that waits for its echo (as `e6irc send` does) learns the
   truth; the echo is routed to the attachment that sent the line by its label,
   or by matching command, one target and text against the lines awaiting one
-  (at most 256; a refused line's entry ages out). A message to several targets
+  (at most 256; a refused line's entry ages out after the 60 s a command waits
+  for its replies, so a later `CAP DEL echo-message` never echoes a line the
+  upstream refused as if it had been delivered). A message to several targets
   waits for, and is echoed as, one line per target — it is never filed as a
   conversation named `#a,#b` — and an echo whose text the upstream cut to fit
-  its line with our prefix still matches the line it came from. An upstream
+  its line with our prefix, or stripped of formatting (a channel's `+c`/`+S`),
+  still matches the line it came from; unmatched, it reached every client as a
+  new message and the sender saw its own line twice. An upstream
   without `echo-message` gets the echo synthesized, per target, when the line
   is written; the driver follows the upstream's `CAP DEL echo-message` (and
   asks for what a `CAP NEW` offers) mid-session, and a change of it never
@@ -3271,21 +3275,37 @@ above the trait, provides for every network kind:
   text, so a reworded diagnostic is not a new transition, while a new reason
   within one outage (a `433`, a K-line, a throttle, after a string of
   connection failures) is retained the first time it is given.
+- **What the backlog never keeps** (`told_live_only`, the one rule that
+  publishing a line or an echo, persisting it and restoring it all read): a
+  `TAGMSG` history keeps nothing of (a typing indicator); a CTCP request
+  other than `ACTION` (`VERSION`, `PING`, a direct file-transfer offer),
+  which is a question to the clients attached when it is asked — replayed, every client that
+  attached later answered it again, hours afterwards and once per attach,
+  which neither ZNC nor soju does; and a channel's modes, topic and member
+  list (324, 328, 329, 331–333, 353, 366: what follows our own `JOIN`), which
+  is state the session follows and an attaching client is told from the
+  session — retained, the member lists that follow
+  every rejoin after a reconnect (hundreds of lines on a heavy user's
+  channels) evicted the conversation the backlog exists to keep; and a
+  watched nick's presence (`MONITOR`'s 730/731, `WATCH`'s 600/601/604/605),
+  which replayed told a client that a nick gone for hours was online. Each is
+  told live, at the ring's position; rows an older build stored of them stay
+  in storage.
 - **Authoritative attach state, and a replay read as it was said**: the ring
-  keeps, beside its lines, the session's state as of its oldest entry — nick,
-  channels, and each channel's topic and members as the session followed them
-  — advanced by every entry it evicts (to the state a session boundary
-  records, when one goes). An attaching raw client is brought to that state
-  before the replay (the `NICK` and `JOIN`s, each channel's topic and member
-  list with its JOIN), shown the replay, and then brought to the session's
-  state now (`IrcSessionSnapshot`: the current nick and confirmed
-  memberships), as soju and ZNC do. So a line said under an old nick is read
-  as the client's own and the rename as its own rename, a channel's lines
-  follow its JOIN, and a conversation is matched to its read marker under the
-  nick it was said to; the replay used to start at the current nick, which
-  made each of them look like someone else's. A channel joined without its
-  member list (the session never had it, or it was past the bound) is told,
-  once the replay is over, what the session knows now; the upstream is asked
+  keeps, beside its lines, the session's state as of its oldest entry — nick
+  and channels — advanced by every entry it evicts (to the state a session
+  boundary records, when one goes). An attaching raw client is brought to that
+  state before the replay (the `NICK` and `JOIN`s), shown the replay, and then
+  brought to the session's state now (`IrcSessionSnapshot`: the current nick
+  and confirmed memberships), as soju and ZNC do. So a line said under an old
+  nick is read as the client's own and the rename as its own rename, a
+  channel's lines follow its JOIN, and a conversation is matched to its read
+  marker under the nick it was said to; the replay used to start at the
+  current nick, which made each of them look like someone else's. Each
+  channel the client is shown joined — before the replay or in it — is told,
+  once the replay is over, its topic and members as the session knows them
+  now, as soju tells them; a channel whose member list the session does not
+  know (past the bound) has it asked for: the upstream is asked
   for it (`TOPIC`, `NAMES`, on the attaching client's behalf, the answers
   reaching that client alone) for at most two channels an attach, since every
   question is a line of the flood allowance and waits in the queue every

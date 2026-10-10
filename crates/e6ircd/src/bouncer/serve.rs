@@ -1305,9 +1305,9 @@ fn spawn_persistence(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            // The echo of a typing indicator is told live and never stored,
-            // like the indicator itself (`publish_echo`).
-            if crate::sanitize::is_ephemeral_tagmsg(&line) {
+            // An echo the backlog keeps nothing of is told live and never
+            // stored, like the line it echoes (`publish_echo`).
+            if super::told_live_only(&line) {
                 continue;
             }
             let names = handle.names();

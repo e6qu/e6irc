@@ -139,6 +139,16 @@ const QUERIES: &[Query] = &[
         continuing_errors: &[],
         local_params: None,
     },
+    // `MONITOR L`: the list, and its end. What `MONITOR +` and `S` are
+    // answered with (730, 731) is the watched nicks' presence, which later
+    // changes arrive as too, unasked: the session's, told to every client.
+    Query {
+        verb: "MONITOR",
+        replies: &[732],
+        ends: &[733],
+        continuing_errors: &[],
+        local_params: None,
+    },
     Query {
         verb: "USERHOST",
         replies: &[],
@@ -226,8 +236,9 @@ const QUERIES: &[Query] = &[
 const RPL_AWAY: u16 = 301;
 
 /// Numerics that follow our own `JOIN` of a channel: its state, told to every
-/// attached client, not a reply to whoever asked to join.
-const JOIN_BURST: &[u16] = &[324, 328, 329, 332, 333, 353, 366];
+/// attached client, not a reply to whoever asked to join — and, being state,
+/// never kept in the backlog (`super::told_live_only`).
+pub(super) const JOIN_BURST: &[u16] = &[324, 328, 329, 331, 332, 333, 353, 366];
 
 /// The query a command line is, when it is one. `MODE` is a query only when it
 /// changes nothing: a bare `MODE <target>`, or a list mode named with no mask.
@@ -243,6 +254,10 @@ fn query_of(verb: &str, params: &[String]) -> Option<&'static Query> {
             _ => None,
         },
         "TOPIC" => (params.len() == 1).then_some(query),
+        "MONITOR" => params
+            .first()
+            .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("L"))
+            .then_some(query),
         // `INVITE <nick> <channel>` is answered with 341; bare `INVITE` lists.
         "INVITE" => (params.len() == 2 || params.is_empty()).then_some(query),
         _ => Some(query),
@@ -722,6 +737,24 @@ mod tests {
             &NetworkNames::default(),
             now,
         )
+    }
+
+    /// A client's `MONITOR L` is answered to that client alone; the presence
+    /// a `MONITOR +` is answered with, and every later change of it, is the
+    /// session's.
+    #[test]
+    fn a_monitor_list_reaches_the_client_that_asked() {
+        let now = Instant::now();
+        let mut router = ReplyRouter::default();
+        forward(&mut router, 1, "MONITOR + bob", now);
+        forward(&mut router, 2, "MONITOR L", now);
+        let online = ":up 730 me :bob!b@h";
+        assert_eq!(classify(&mut router, online, now), session(online));
+        for line in [":up 732 me :bob", ":up 733 me :End of MONITOR list"] {
+            assert_eq!(classify(&mut router, line, now), reply(line, 2), "{line}");
+        }
+        let offline = ":up 731 me :bob";
+        assert_eq!(classify(&mut router, offline, now), session(offline));
     }
 
     /// Two clients' queries are answered in order: each reply reaches the one
