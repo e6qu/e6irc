@@ -111,8 +111,26 @@ struct AdminNetworksResponse {
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AdminNetworkInventoryQuery {
-    limit: Option<usize>,
-    after: Option<String>,
+    pub(super) limit: Option<usize>,
+    pub(super) after: Option<String>,
+    pub(super) kind: Option<String>,
+}
+
+impl AdminNetworkInventoryQuery {
+    /// The console's type select submits "every type" as `kind=`.
+    pub(super) fn with_unfilled_fields_absent(self) -> Self {
+        Self {
+            kind: filled_form_field(self.kind),
+            ..self
+        }
+    }
+}
+
+/// One validated inventory page request.
+pub(super) struct ValidatedAdminNetworkInventoryQuery {
+    pub(super) page_size: crate::db::BncNetworkInventoryPageSize,
+    pub(super) after: Option<crate::db::BncInventoryKey>,
+    pub(super) kind: Option<crate::config::NetworkKind>,
 }
 
 #[derive(serde::Serialize)]
@@ -737,18 +755,18 @@ pub(super) fn bounded_admin_page_size<T>(
     make: impl FnOnce(usize) -> Option<T>,
     invalid_title: &'static str,
     detail: &'static str,
-) -> ResponseResult<T> {
+) -> Result<T, QueryRefusal> {
     make(requested.unwrap_or(default_limit))
-        .ok_or_else(|| problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)).into())
+        .ok_or_else(|| QueryRefusal::new(invalid_title, detail, Some("limit")))
 }
 
 pub(super) fn positive_admin_cursor(
     before_id: Option<i64>,
     invalid_title: &'static str,
     detail: &'static str,
-) -> ResponseResult<Option<i64>> {
+) -> Result<Option<i64>, QueryRefusal> {
     if before_id.is_some_and(|id| id <= 0) {
-        return Err(problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)).into());
+        return Err(QueryRefusal::new(invalid_title, detail, Some("before_id")));
     }
     Ok(before_id)
 }
@@ -758,7 +776,7 @@ pub(super) fn positive_admin_cursor(
 /// page an empty field is the filter not given. Only exactly empty: a value of
 /// spaces is still refused by [`exact_filter`]. The API has no such form and
 /// refuses a blank filter outright.
-fn filled_form_field(value: Option<String>) -> Option<String> {
+pub(super) fn filled_form_field(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
@@ -813,7 +831,7 @@ pub(super) fn exact_filter(
     parameter: &'static str,
     maximum_chars: usize,
     invalid_title: &'static str,
-) -> ResponseResult<Option<String>> {
+) -> Result<Option<String>, QueryRefusal> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -823,16 +841,14 @@ pub(super) fn exact_filter(
         || value.chars().any(char::is_control)
         || value.trim() != value
     {
-        return Err(problem_at_field(
-            StatusCode::BAD_REQUEST,
+        return Err(QueryRefusal::new(
             invalid_title,
-            Some(&format!(
+            format!(
                 "The exact {parameter} filter must be 1–{maximum_chars} printable characters \
                  without surrounding whitespace."
-            )),
+            ),
             Some(parameter),
-        )
-        .into());
+        ));
     }
     Ok(Some(value))
 }
@@ -864,7 +880,7 @@ impl ValidatedAccountDirectoryQuery {
 pub(super) fn validate_account_directory_query(
     params: AccountDirectoryQuery,
     default_limit: usize,
-) -> ResponseResult<ValidatedAccountDirectoryQuery> {
+) -> Result<ValidatedAccountDirectoryQuery, QueryRefusal> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -1038,6 +1054,39 @@ pub(super) struct AdminCreateAccountInvitationBody {
     administrator: bool,
 }
 
+/// The account directory page's query: the account directory's own
+/// parameters and the invitation directory's cursor, which the page carries
+/// under its own name.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountsPageQuery {
+    limit: Option<usize>,
+    before_id: Option<i64>,
+    name: Option<String>,
+    invitation_before_id: Option<i64>,
+}
+
+/// The account directory page's query, as each of its two directories would
+/// read its part; the form submits an unfilled name as `name=`.
+pub(super) fn validate_accounts_page_query(params: AccountsPageQuery) -> Result<(), QueryRefusal> {
+    validate_account_directory_query(
+        AccountDirectoryQuery {
+            limit: params.limit,
+            before_id: params.before_id,
+            name: filled_form_field(params.name),
+        },
+        50,
+    )?;
+    validate_account_invitation_directory_query(
+        AccountInvitationDirectoryQuery {
+            limit: params.limit,
+            before_id: params.invitation_before_id,
+        },
+        50,
+    )?;
+    Ok(())
+}
+
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AccountInvitationDirectoryQuery {
@@ -1048,7 +1097,7 @@ pub(super) struct AccountInvitationDirectoryQuery {
 fn validate_account_invitation_directory_query(
     params: AccountInvitationDirectoryQuery,
     default_limit: usize,
-) -> ResponseResult<(crate::db::AccountInvitationPageSize, Option<i64>)> {
+) -> Result<(crate::db::AccountInvitationPageSize, Option<i64>), QueryRefusal> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -1231,10 +1280,7 @@ pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response 
 /// The inventory page's size and cursor, for the API and its console page.
 pub(super) fn validate_admin_network_inventory_query(
     params: AdminNetworkInventoryQuery,
-) -> ResponseResult<(
-    crate::db::BncNetworkInventoryPageSize,
-    Option<crate::db::BncInventoryKey>,
-)> {
+) -> Result<ValidatedAdminNetworkInventoryQuery, QueryRefusal> {
     let page_size = bounded_admin_page_size(
         params.limit,
         100,
@@ -1247,16 +1293,34 @@ pub(super) fn validate_admin_network_inventory_query(
         .as_deref()
         .map(|cursor| {
             crate::db::BncInventoryKey::parse_cursor(cursor).ok_or_else(|| {
-                ResponseRejection::from(problem_at_field(
-                    StatusCode::BAD_REQUEST,
+                QueryRefusal::new(
                     "Invalid network-inventory cursor",
-                    Some("`after` must be a next_after value this endpoint returned."),
+                    "`after` must be a next_after value this endpoint returned.",
                     Some("after"),
-                ))
+                )
             })
         })
         .transpose()?;
-    Ok((page_size, after))
+    // Exact, like every directory filter: a kind no driver has is refused,
+    // never read as "every kind".
+    let kind = params
+        .kind
+        .as_deref()
+        .map(|kind| {
+            crate::config::NetworkKind::from_db_str(kind).ok_or_else(|| {
+                QueryRefusal::new(
+                    "Invalid network-inventory filter",
+                    "The kind filter must be irc, local, matrix, discord, or slack.",
+                    Some("kind"),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(ValidatedAdminNetworkInventoryQuery {
+        page_size,
+        after,
+        kind,
+    })
 }
 
 /// Every account's BNC networks with their live driver state (admin only):
@@ -1271,18 +1335,26 @@ pub(super) async fn admin_networks(
     _admin: AdminAccount,
     QueryParams(params): QueryParams<AdminNetworkInventoryQuery>,
 ) -> Response {
-    let (page_size, after) = match validate_admin_network_inventory_query(params) {
+    let ValidatedAdminNetworkInventoryQuery {
+        page_size,
+        after,
+        kind,
+    } = match validate_admin_network_inventory_query(params) {
         Ok(query) => query,
-        Err(response) => return response.into(),
+        Err(refusal) => return refusal.into(),
     };
     let registry = super::registry_of(&state);
-    let rows =
-        match crate::db::bnc_network_inventory_page(pool_of(&state), after.as_ref(), page_size)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => return admin_db_error("network inventory", e),
-        };
+    let rows = match crate::db::bnc_network_inventory_page(
+        pool_of(&state),
+        after.as_ref(),
+        kind,
+        page_size,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return admin_db_error("network inventory", e),
+    };
     let mut page: Vec<(
         crate::db::BncInventoryKey,
         super::networks::AdminNetworkResponse,
@@ -1309,6 +1381,9 @@ pub(super) async fn admin_networks(
             .into_iter()
             .filter_map(|status| {
                 let configured = status.configured.clone()?;
+                if kind.is_some_and(|kind| kind != configured.kind) {
+                    return None;
+                }
                 let key =
                     crate::db::BncInventoryKey::new(status.owner.as_deref(), &status.name, false);
                 let response = match &configured.owner {
@@ -2478,7 +2553,7 @@ impl ValidatedRegisteredChannelDirectoryQuery {
 pub(super) fn validate_registered_channel_directory_query(
     params: RegisteredChannelDirectoryQuery,
     default_limit: usize,
-) -> ResponseResult<ValidatedRegisteredChannelDirectoryQuery> {
+) -> Result<ValidatedRegisteredChannelDirectoryQuery, QueryRefusal> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -2577,7 +2652,7 @@ impl ValidatedServerBanDirectoryQuery {
 pub(super) fn validate_server_ban_directory_query(
     params: ServerBanDirectoryQuery,
     default_limit: usize,
-) -> ResponseResult<ValidatedServerBanDirectoryQuery> {
+) -> Result<ValidatedServerBanDirectoryQuery, QueryRefusal> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -2594,12 +2669,11 @@ pub(super) fn validate_server_ban_directory_query(
         None => None,
         Some(kind @ ("kline" | "dline" | "xline")) => Some(kind.to_owned()),
         Some(_) => {
-            return Err(problem(
-                StatusCode::BAD_REQUEST,
+            return Err(QueryRefusal::new(
                 "Invalid server-ban filter",
-                Some("The kind filter must be kline, dline, or xline."),
-            )
-            .into());
+                "The kind filter must be kline, dline, or xline.",
+                Some("kind"),
+            ));
         }
     };
     let mask = exact_filter(
@@ -2802,7 +2876,7 @@ impl ValidatedAuditQuery {
 pub(super) fn validate_audit_query(
     params: AuditQuery,
     default_limit: usize,
-) -> ResponseResult<ValidatedAuditQuery> {
+) -> Result<ValidatedAuditQuery, QueryRefusal> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -2941,7 +3015,11 @@ mod admin_query_tests {
         for blank in ["", " ", "\u{3000}", " alice", "alice "] {
             let refused =
                 exact_filter(Some(blank.into()), "name", 64, "Invalid filter").expect_err(blank);
-            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{blank:?}");
+            assert_eq!(
+                Response::from(refused).status(),
+                StatusCode::BAD_REQUEST,
+                "{blank:?}"
+            );
         }
         assert_eq!(
             exact_filter(None, "name", 64, "Invalid filter").ok(),

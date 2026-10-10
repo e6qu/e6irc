@@ -636,7 +636,10 @@ test("every console pager takes its status from the page's own position", async 
   assert.doesNotMatch(source, /\?\s*"Showing an older page\."/);
   assert.doesNotMatch(source, /"Showing an older page\."\s*:/);
   const pagers = [...source.matchAll(/fillPager\([^()]*(?:\([^()]*\))?[^()]*, directoryPage\(/g)].length;
-  assert.ok(pagers >= 7, `expected every directory pager to use fillPager, found ${pagers}`);
+  // Sessions, the account page's pager helper (accounts and invitations),
+  // bans, channels, audit, and all networks; Integrations reads each platform
+  // with its own kind filter and has no pager.
+  assert.ok(pagers >= 6, `expected every directory pager to use fillPager, found ${pagers}`);
 });
 
 test("the network create contract refuses the names the server refuses", () => {
