@@ -3838,26 +3838,8 @@ async fn handle_request(
             topic,
             label,
         } => {
-            let result = match persist_channel_registration(
-                pool,
-                &channel,
-                &founder_account,
-                &topic,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("db: channel registration failed: {error}");
-                    crate::core::ChannelRegistrationResult::Unavailable
-                }
-            };
-            // Counted here, once, for both ways of being unavailable: the
-            // error arm above used to count it too, so every failed
-            // registration was recorded as two database errors.
-            if matches!(result, crate::core::ChannelRegistrationResult::Unavailable) {
-                record_database_error(telemetry);
-            }
+            let result =
+                register_channel(pool, telemetry, &channel, &founder_account, &topic).await;
             core_tx
                 .push(Input::ChannelRegistrationPersisted {
                     owner,
@@ -3878,21 +3860,8 @@ async fn handle_request(
             founder_account,
             topic,
         } => {
-            let result = match persist_channel_registration(
-                pool,
-                &channel,
-                &founder_account,
-                &topic,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    record_database_error(telemetry);
-                    eprintln!("db: owner channel registration failed: {error}");
-                    crate::core::ChannelRegistrationResult::Unavailable
-                }
-            };
+            let result =
+                register_channel(pool, telemetry, &channel, &founder_account, &topic).await;
             core_tx
                 .push(Input::OwnedChannelRegistrationResult {
                     owner,
@@ -7046,6 +7015,31 @@ pub async fn drop_channel(
     audit_channel_service(&mut transaction, actor, action, channel_folded, "").await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Ok(()))
+}
+
+/// Register `channel` for `founder_account`, for a session's `REGISTER` and
+/// an owner's API request alike. A registration that is unavailable is one
+/// database error, counted here once for both ways of being unavailable (an
+/// error, or storage answering so). The owner's path, written apart from the
+/// session's, counted only the first.
+async fn register_channel(
+    pool: &PgPool,
+    telemetry: Option<&Telemetry>,
+    channel: &str,
+    founder_account: &str,
+    topic: &Option<(String, String, u64)>,
+) -> crate::core::ChannelRegistrationResult {
+    let result = match persist_channel_registration(pool, channel, founder_account, topic).await {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("db: channel registration failed: {error}");
+            crate::core::ChannelRegistrationResult::Unavailable
+        }
+    };
+    if matches!(result, crate::core::ChannelRegistrationResult::Unavailable) {
+        record_database_error(telemetry);
+    }
+    result
 }
 
 /// Insert one registered channel with its initial retained topic and audit

@@ -1159,7 +1159,7 @@ pub(crate) async fn run_with_backoff_carrying<C>(
         }
         ends.begin_attempt();
         let started = tokio::time::Instant::now();
-        let (failure, upstream_reason, at_least) = match session(&config, ends).await {
+        let ended = match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             SessionOutcome::AuthRejected(rejection) => {
                 park(
@@ -1171,38 +1171,10 @@ pub(crate) async fn run_with_backoff_carrying<C>(
                 return;
             }
             SessionOutcome::RegistrationRejected(rejection) => {
-                let refusal = Refusal::Registration(rejection);
-                match retry_refusal(
-                    ends,
-                    carried,
-                    &backoff,
-                    refusal,
-                    &mut consecutive_rejections,
-                    &mut last_refusal,
-                )
-                .await
-                {
-                    RefusalHandled::Retrying => continue,
-                    RefusalHandled::Ended => return,
-                }
+                Err(Refusal::Registration(rejection))
             }
             #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-            SessionOutcome::ConfigurationRejected(refusal) => {
-                let refusal = Refusal::Configuration(refusal);
-                match retry_refusal(
-                    ends,
-                    carried,
-                    &backoff,
-                    refusal,
-                    &mut consecutive_rejections,
-                    &mut last_refusal,
-                )
-                .await
-                {
-                    RefusalHandled::Retrying => continue,
-                    RefusalHandled::Ended => return,
-                }
-            }
+            SessionOutcome::ConfigurationRejected(refusal) => Err(Refusal::Configuration(refusal)),
             #[cfg(feature = "discord")]
             SessionOutcome::ReconnectRequested => {
                 if idle_until(ends, carried, tokio::time::sleep(RECONNECT_REQUEST_PAUSE)).await {
@@ -1210,14 +1182,33 @@ pub(crate) async fn run_with_backoff_carrying<C>(
                 }
                 return;
             }
-            SessionOutcome::Dropped(failure) => (failure, None, std::time::Duration::ZERO),
+            SessionOutcome::Dropped(failure) => Ok((failure, None, std::time::Duration::ZERO)),
             #[cfg(any(feature = "discord", feature = "slack"))]
-            SessionOutcome::DroppedFor { failure, at_least } => (failure, None, at_least),
-            SessionOutcome::ClosedByUpstream(closed) => (
+            SessionOutcome::DroppedFor { failure, at_least } => Ok((failure, None, at_least)),
+            SessionOutcome::ClosedByUpstream(closed) => Ok((
                 NetworkFailure::ConnectionLost,
                 Some(closed),
                 std::time::Duration::ZERO,
-            ),
+            )),
+        };
+        // A refusal takes its own schedule, and may park.
+        let (failure, upstream_reason, at_least) = match ended {
+            Ok(dropped) => dropped,
+            Err(refusal) => {
+                match retry_refusal(
+                    ends,
+                    carried,
+                    &backoff,
+                    refusal,
+                    &mut consecutive_rejections,
+                    &mut last_refusal,
+                )
+                .await
+                {
+                    RefusalHandled::Retrying => continue,
+                    RefusalHandled::Ended => return,
+                }
+            }
         };
         // Only a session that actually registered proves the upstream accepts
         // this configuration. A drop *before* that (a throttled dial between
@@ -7081,30 +7072,29 @@ async fn relay_attached(
         mut write,
         holding,
     } = link;
-    // Revoked between the lease and here: the attachment never begins.
-    if let Some(revocation) = authority.revocation() {
-        return detach_revoked(&mut write, revocation).await;
-    }
-    let Some(shutdown) = network_to_attach(handle, &mut write).await? else {
-        return Ok(AttachEnd::NetworkRemoved);
-    };
     // A raw IRC client has no cursor to present. Its account's read markers
     // are its position instead: each conversation is replayed from where the
     // account stopped reading it, the whole of one it has no marker for.
     let read_positions = ReadPositions::of(handle, account).await;
-    let attach_id = handle.next_attachment_id();
-    let AttachSnapshot {
-        attachment,
-        events,
-        replay,
-        session: session_snapshot,
-        features,
-        names,
-        head,
-        current,
-    } = handle.subscribe_with_replay_snapshot(None);
-    // The answers to this client's own commands reach it here, and only here.
-    let replies = handle.route_replies(attach_id);
+    let OpenedAttachment {
+        shutdown,
+        attach_id,
+        snapshot:
+            AttachSnapshot {
+                attachment,
+                events,
+                replay,
+                session: session_snapshot,
+                features,
+                names,
+                head,
+                current,
+            },
+        replies,
+    } = match open_attachment(handle, &authority, &mut write, None).await? {
+        Ok(opened) => opened,
+        Err(end) => return Ok(end),
+    };
 
     // The welcome is of the same instant as the replay: an ISUPPORT or
     // CLIENTTAGDENY change made after it reaches this client live, and none
@@ -7265,23 +7255,25 @@ pub(crate) async fn resume_attached(
         mut write,
         holding,
     } = link;
-    if let Some(revocation) = authority.revocation() {
-        return detach_revoked(&mut write, revocation).await;
-    }
-    let Some(shutdown) = network_to_attach(handle, &mut write).await? else {
-        return Ok(AttachEnd::NetworkRemoved);
+    let cursor = cursor.map(ReplayCursor::from_recorded);
+    let OpenedAttachment {
+        shutdown,
+        attach_id,
+        snapshot:
+            AttachSnapshot {
+                attachment,
+                events,
+                replay,
+                features,
+                names,
+                current,
+                ..
+            },
+        replies,
+    } = match open_attachment(handle, &authority, &mut write, cursor).await? {
+        Ok(opened) => opened,
+        Err(end) => return Ok(end),
     };
-    let attach_id = handle.next_attachment_id();
-    let AttachSnapshot {
-        attachment,
-        events,
-        replay,
-        features,
-        names,
-        current,
-        ..
-    } = handle.subscribe_with_replay_snapshot(cursor.map(ReplayCursor::from_recorded));
-    let replies = handle.route_replies(attach_id);
     // A relay publishes its record only once the client is welcomed, under a
     // nick.
     let Some(shown_nick) = shown_nick else {
@@ -7370,6 +7362,47 @@ pub(crate) async fn resume_attached(
         _attachment: attachment,
     })
     .await
+}
+
+/// What an attachment, new or resumed, begins with: its account still
+/// authorised (or the client told it is not, and how the attachment ended),
+/// the network still there with its history loaded, its id, the replay from
+/// `cursor` with the live events from the same instant, and the route its
+/// own replies reach it by.
+async fn open_attachment<W>(
+    handle: &NetworkHandle,
+    authority: &AccountLease,
+    write: &mut W,
+    cursor: Option<ReplayCursor>,
+) -> std::io::Result<Result<OpenedAttachment, AttachEnd>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Revoked between the lease and here: the attachment never begins.
+    if let Some(revocation) = authority.revocation() {
+        return detach_revoked(write, revocation).await.map(Err);
+    }
+    let Some(shutdown) = network_to_attach(handle, write).await? else {
+        return Ok(Err(AttachEnd::NetworkRemoved));
+    };
+    let attach_id = handle.next_attachment_id();
+    let snapshot = handle.subscribe_with_replay_snapshot(cursor);
+    // The answers to this client's own commands reach it here, and only here.
+    let replies = handle.route_replies(attach_id);
+    Ok(Ok(OpenedAttachment {
+        shutdown,
+        attach_id,
+        snapshot,
+        replies,
+    }))
+}
+
+/// See [`open_attachment`].
+struct OpenedAttachment {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    attach_id: u64,
+    snapshot: AttachSnapshot,
+    replies: ReplyRoute,
 }
 
 /// The network's stop signal, once its history is loaded; `None`, the client
@@ -11395,24 +11428,8 @@ mod tests {
     async fn a_bridge_answers_join_and_nick_itself_before_it_connects() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let (client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::bridge_channels(4);
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let (client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
         let (read, mut write) = tokio::io::split(client);
         write
             .write_all(b"NICK alice\r\nNICK bob\r\nJOIN #general\r\nJOIN\r\n")
@@ -11455,24 +11472,8 @@ mod tests {
     async fn a_bridge_join_echoes_an_unframeable_channel_as_a_placeholder() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let (client, server) = tokio::io::duplex(4096);
         let (handle, _ends) = NetworkHandle::bridge_channels(4);
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let (client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
         let (read, mut write) = tokio::io::split(client);
         write
             .write_all(b"JOIN :#a b\r\nJOIN ::x\r\n")
@@ -11507,7 +11508,6 @@ mod tests {
     async fn raw_attach_snapshot_renames_and_rejoins_the_downstream_client() {
         use tokio::io::AsyncReadExt;
 
-        let (mut client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::channels(4);
         handle.runtime.connected();
         ends.begin_irc_session("upstreamNick".to_string());
@@ -11517,22 +11517,7 @@ mod tests {
         for index in 0..4 {
             ends.emit_line(format!(":srv NOTICE upstreamNick :filler {index}"));
         }
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let (mut client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
 
         let mut bytes = vec![0; 4096];
         let mut output = String::new();
@@ -11616,25 +11601,9 @@ mod tests {
     async fn registered_attach_keeps_cap_and_sasl_off_the_shared_upstream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (mut client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::channels(4);
         ends.begin_irc_session("alice".to_string());
-        let attach = tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        });
+        let (mut client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
 
         let mut bytes = vec![0; 4096];
         tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
