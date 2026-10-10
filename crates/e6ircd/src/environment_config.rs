@@ -23,6 +23,8 @@
 //!            `E6IRC_HSTS_INCLUDE_SUBDOMAINS` (exactly `true` or `false`;
 //!              default `false`: HSTS covers this origin only)
 //!            `E6IRC_ADMIN_ACCOUNTS` (comma-separated)
+//!            `E6IRC_TRUSTED_PROXIES` (comma-separated CIDR ranges
+//!              of the reverse proxies whose X-Forwarded-For names the client)
 //!            `E6IRC_BOOTSTRAP_TOKEN` (one-time first-administrator secret)
 //!            `E6IRC_DATABASE_MAX_CONNECTIONS` (a whole number, 2 to 200;
 //!              default sized to the host — see `database.max_connections`)
@@ -343,6 +345,20 @@ pub fn configuration_table(
         database.insert("max_connections".into(), Value::Integer(connections));
     }
     root.insert("database".into(), Value::Table(database));
+
+    if let Some(proxies) = environment.optional("E6IRC_TRUSTED_PROXIES")? {
+        // The ranges are the configuration's to judge, by the same parser a
+        // file goes through; an empty field names no proxy.
+        let proxies = proxies
+            .split(',')
+            .map(str::trim)
+            .filter(|proxy| !proxy.is_empty())
+            .map(|proxy| Value::String(proxy.to_owned()))
+            .collect();
+        let mut limits = Table::new();
+        limits.insert("trusted_proxies".into(), Value::Array(proxies));
+        root.insert("limits".into(), Value::Table(limits));
+    }
 
     if let Some(token) = environment.optional("E6IRC_BOOTSTRAP_TOKEN")? {
         let mut bootstrap = Table::new();
@@ -680,6 +696,25 @@ mod tests {
                 .collect();
             assert_eq!(accounts, expected, "{stated}");
         }
+    }
+
+    #[test]
+    fn trusted_proxies_state_only_that_limit() {
+        let stated = table(&with(
+            minimal(),
+            &[("E6IRC_TRUSTED_PROXIES", "192.0.2.10/32, 192.168.7.0/24,")],
+        ))
+        .unwrap();
+        let limits = stated["limits"].as_table().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        let proxies: Vec<_> = limits["trusted_proxies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|proxy| proxy.as_str().unwrap())
+            .collect();
+        assert_eq!(proxies, ["192.0.2.10/32", "192.168.7.0/24"]);
+        assert!(!table(&minimal()).unwrap().contains_key("limits"));
     }
 
     #[test]

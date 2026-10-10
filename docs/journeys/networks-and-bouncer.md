@@ -197,7 +197,7 @@ update/toggle/delete, and secret handling. The opt-in BNC-driver probes cover
 Libera, OFTC, and Ergo; public-server qualification remains outside CI and
 qualifies only the egress where it ran. A 2026-08-23 production-container run
 proved OFTC and Ergo Testnet registration plus configured-channel joins from
-Scaleway, while Libera returned its verified-account requirement on that
+a cloud host, while Libera returned its verified-account requirement on that
 container's IPv4 path.
 
 ## Register and verify an upstream IRC account

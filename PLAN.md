@@ -70,8 +70,8 @@ the runner verifier. Its Discord, Slack, and OpenID Connect boundaries use
 closed request, response, and WebSocket-frame contracts.
 The qualification runner recorded live public IRC campaign evidence for
 Libera.Chat, OFTC, and Ergo on 2026-08-13; that evidence qualifies the runner's
-egress, not an arbitrary deployment. A 2026-08-23 qualification from the
-Scaleway production container proved registration and configured-channel joins
+egress, not an arbitrary deployment. A 2026-08-23 qualification from a
+production container on a cloud host proved registration and configured-channel joins
 against OFTC and Ergo Testnet. The same deployed IPv4 egress was explicitly
 rejected by Libera until it supplies an existing email-verified NickServ
 account through SASL, and the container has no routable IPv6 fallback. Libera
@@ -447,7 +447,7 @@ supply chain) found, and this change fixes:
   reference accounts by id (0065), and `cargo` now rebuilds when a migration is
   added.
 
-Deploying c51261725b5d to Scaleway (2026-09-21) found, and 0067 plus this
+Deploying c51261725b5d (2026-09-21) found, and 0067 plus this
 change fix:
 
 - **A stored `null` stopped the daemon.** The live settings row, written by an
@@ -460,7 +460,7 @@ change fix:
   refused peer; only a connection that never completed a request is now.
 
 - **Libera from a cloud host.** Libera answered `CAP LS` only after its ident
-  check timed out (6.9 s from Scaleway, whose firewall dropped ident), past the
+  check timed out (6.9 s from a cloud host whose firewall dropped ident), past the
   client's 5 s bound, so every SASL attempt failed as "SASL unavailable" — and
   Libera requires SASL from cloud addresses, so the network could not connect
   at all. The bound is 20 s, silence is a retried timeout rather than a missing
