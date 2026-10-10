@@ -9387,37 +9387,45 @@ pub async fn trim_bnc_buffer(pool: &PgPool, buffer: &BncBuffer) -> Result<(), Db
     Ok(())
 }
 
-/// Delete up to `limit` of the oldest lines beyond the caps of one canonical
-/// (owner, network) buffer; returns how many went. The row-cap boundary is one
-/// index probe (`OFFSET cap` into `bnc_buffer_lookup_idx`, newest first); the
-/// byte-cap boundary is the newest row at which the lines from the newest back
-/// pass [`BNC_BUFFER_BYTES`], a running sum over at most the row cap's rows
-/// (older ones are beyond the row cap anyway). Everything at or below the
-/// later boundary goes, and the batch is named by primary key.
+/// The rows of one (owner, network) buffer in the order it keeps them, each
+/// with its place in that order (`kept`) and the bytes of it and every row
+/// kept before it (`kept_bytes`): a row's `depth` is how many newer rows its
+/// own conversation (`target`; every line of no conversation shares one) has,
+/// and the newest of every conversation is kept before the second newest of
+/// any. A busy channel therefore gives up its older lines before a quiet
+/// conversation gives up its newest — the share the ring keeps
+/// (`bouncer::Share`) — and the network's caps still bound the whole.
+macro_rules! bnc_kept_order {
+    () => {
+        "SELECT id, line,
+                row_number() OVER (ORDER BY depth, id DESC) AS kept,
+                sum(octet_length(line)) OVER (ORDER BY depth, id DESC) AS kept_bytes
+         FROM (SELECT id, line,
+                      row_number() OVER (PARTITION BY target ORDER BY id DESC) AS depth
+               FROM bnc_buffer
+               WHERE owner = $1 AND network = $2) per_conversation"
+    };
+}
+
+/// Delete up to `limit` of the lines beyond the caps of one canonical
+/// (owner, network) buffer, in the order it keeps them ([`bnc_kept_order!`]);
+/// returns how many went. A row goes when it is past the row cap in that
+/// order, or when the rows up to it pass [`BNC_BUFFER_BYTES`]; the batch is
+/// named by primary key, oldest first.
 async fn trim_bnc_buffer_batch(
     pool: &PgPool,
     owner: &str,
     network: &str,
     limit: u64,
 ) -> Result<u64, DbError> {
-    sqlx::query(
+    sqlx::query(concat!(
         "DELETE FROM bnc_buffer WHERE id = ANY(ARRAY(
-             SELECT id FROM bnc_buffer
-             WHERE owner = $1 AND network = $2 AND id <= greatest(
-                 (SELECT id FROM bnc_buffer
-                  WHERE owner = $1 AND network = $2
-                  ORDER BY id DESC OFFSET $3 LIMIT 1),
-                 (SELECT id FROM (
-                      SELECT id, sum(octet_length(line)) OVER (ORDER BY id DESC) AS newer
-                      FROM (SELECT id, line FROM bnc_buffer
-                            WHERE owner = $1 AND network = $2
-                            ORDER BY id DESC LIMIT $3) newest
-                  ) running
-                  WHERE newer > $5
-                  ORDER BY id DESC LIMIT 1)
-             )
-             ORDER BY id LIMIT $4))",
-    )
+             SELECT id FROM (",
+        bnc_kept_order!(),
+        ") ordered
+             WHERE kept > $3 OR kept_bytes > $5
+             ORDER BY id LIMIT $4))"
+    ))
     .bind(owner)
     .bind(network)
     .bind(BNC_BUFFER_CAP)
@@ -9498,12 +9506,13 @@ pub async fn recent_bnc_backlog(
     limit: i64,
 ) -> Result<Vec<StoredBacklogLine>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
-    // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
-    // backward and filters out every other buffer's newer lines, so a quiet
-    // buffer's replay cost grew with everyone else's traffic. A row from
-    // before `sent_at` existed has its arrival.
-    let rows: Vec<StoredBacklogRow> = sqlx::query_as(
+    // The ids are the buffer's first `limit` in the order it keeps them
+    // (`bnc_kept_order!`), read from this buffer's rows alone (an ordered scan
+    // of `bnc_buffer_lookup_idx`, so a quiet buffer's restore does not grow
+    // with everyone else's traffic): a quiet conversation's newest lines are
+    // restored however busy another was. A row from before `sent_at` existed
+    // has its arrival.
+    let rows: Vec<StoredBacklogRow> = sqlx::query_as(concat!(
         "SELECT line,
                 coalesce(sent_at,
                          to_char(created_at AT TIME ZONE 'UTC',
@@ -9511,11 +9520,12 @@ pub async fn recent_bnc_backlog(
                 own_nick, own_nick_recorded
          FROM bnc_buffer
          WHERE id = ANY(ARRAY(
-             SELECT id FROM bnc_buffer
-             WHERE owner = $1 AND network = $2
-             ORDER BY id DESC LIMIT $3))
-         ORDER BY id",
-    )
+             SELECT id FROM (",
+        bnc_kept_order!(),
+        ") ordered
+             ORDER BY kept LIMIT $3))
+         ORDER BY id"
+    ))
     .bind(&key.owner)
     .bind(&key.network)
     .bind(limit)

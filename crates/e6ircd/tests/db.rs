@@ -7749,6 +7749,54 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
     assert_eq!(kept, vec!["line 5999"]);
 }
 
+/// Each conversation keeps its share of the stored backlog: a busy channel
+/// past the network's cap gives up its own older lines, never the quiet
+/// conversation's newest, and a restore of fewer lines than are stored still
+/// brings back each conversation's newest.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_buffer_trim_keeps_each_conversations_share() {
+    let url = support::test_db("bnc_buffer_trim_keeps_each_conversations_share").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("owner"),
+        "busy",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    let names = e6irc_client::NetworkNames::default();
+    let persist = async |line: &str| {
+        db::persist_bnc_line(&pool, &buffer, Some("me"), line, &names)
+            .await
+            .expect("persist");
+    };
+    persist(":bob!b@h PRIVMSG me :are you there?").await;
+    persist(":carol!c@h PRIVMSG #quiet :morning").await;
+    for i in 0..5_100 {
+        persist(&format!(":dan!d@h PRIVMSG #busy :flood {i}")).await;
+    }
+    db::trim_bnc_buffer(&pool, &buffer).await.expect("trim");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM bnc_buffer WHERE owner = 'owner' AND network = 'busy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 5_000, "the network's cap still bounds the whole");
+    let restored = db::recent_bnc_lines(&pool, "owner", "busy", 10)
+        .await
+        .expect("read");
+    assert_eq!(restored.len(), 10);
+    assert_eq!(restored[0], ":bob!b@h PRIVMSG me :are you there?");
+    assert_eq!(restored[1], ":carol!c@h PRIVMSG #quiet :morning");
+    assert_eq!(
+        restored.last().map(String::as_str),
+        Some(":dan!d@h PRIVMSG #busy :flood 5099")
+    );
+}
+
 /// The upstream decides how long its lines are: a backlog of long lines is
 /// trimmed to its byte cap, oldest first, well before its row cap.
 #[tokio::test]

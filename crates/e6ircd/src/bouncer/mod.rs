@@ -3671,7 +3671,7 @@ fn emit_failure_notice(
     let seq = if live_only {
         buffer.position()
     } else {
-        buffer.push(line.clone())
+        buffer.push_said(line.clone(), None)
     };
     let entry = BufferedLine { seq, line };
     let event = if live_only {
@@ -4160,10 +4160,58 @@ impl Replay {
     }
 }
 
-/// One ring position: a line, or where a new upstream session began.
+/// Which share of a ring a line is held in. A network's lines share one ring,
+/// and a busy channel used to evict, oldest first, the private message and the
+/// quiet channel's conversation the owner had not read yet. Each conversation
+/// now holds a share of its own, and the ring makes room from the largest
+/// ([`Buffer::evict_one`]), so a conversation keeps its newest lines for as
+/// long as another holds more; the network's cap and bytes still bound the
+/// whole. Storage keeps the same shares ([`crate::db::trim_bnc_buffer`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Share {
+    /// A message of one conversation, by its folded name (a channel, or the
+    /// other party of a private conversation): the conversation storage
+    /// files it under (`crate::db::bnc_line_target`).
+    Conversation(String),
+    /// Everything else that is not the session's own: others' membership, a
+    /// numeric, the bouncer's notices.
+    Other,
+    /// The session's own `NICK`, `JOIN`, `PART`, `QUIT`, a `KICK` of it, and
+    /// where a session began: what the ring's head state follows, so they go
+    /// only from the front, oldest first, as the head advances past them.
+    Pinned,
+}
+
+impl Share {
+    /// The share of `line`, said while the session's own nick was `own`.
+    fn of(line: &str, own: Option<&str>, names: &e6irc_client::NetworkNames) -> Self {
+        if let Some(target) = crate::db::bnc_line_target(line, own, names) {
+            return Self::Conversation(names.fold(&target));
+        }
+        let (Ok(message), Some(own)) = (e6irc_proto::message::Message::parse(line), own) else {
+            return Self::Other;
+        };
+        let ours = message
+            .source
+            .as_ref()
+            .is_some_and(|source| names.eq(source.name, own));
+        let pinned = match message.command.to_ascii_uppercase().as_str() {
+            "NICK" | "JOIN" | "PART" | "QUIT" => ours,
+            "KICK" => message
+                .params
+                .get(1)
+                .is_some_and(|kicked| kicked.split(',').any(|kicked| names.eq(kicked, own))),
+            _ => false,
+        };
+        if pinned { Self::Pinned } else { Self::Other }
+    }
+}
+
+/// One ring position: a line in its share, or where a new upstream session
+/// began.
 #[derive(Debug, Clone)]
 enum RingEntry {
-    Line(BufferedLine),
+    Line(BufferedLine, Share),
     Session {
         seq: u64,
         snapshot: IrcSessionSnapshot,
@@ -4173,14 +4221,14 @@ enum RingEntry {
 impl RingEntry {
     fn seq(&self) -> u64 {
         match self {
-            Self::Line(line) => line.seq,
+            Self::Line(line, _) => line.seq,
             Self::Session { seq, .. } => *seq,
         }
     }
 
     fn line(&self) -> Option<&BufferedLine> {
         match self {
-            Self::Line(line) => Some(line),
+            Self::Line(line, _) => Some(line),
             Self::Session { .. } => None,
         }
     }
@@ -4195,8 +4243,9 @@ impl RingEntry {
 pub(crate) const BACKLOG_BYTES_PER_LINE: usize = e6irc_proto::message::MAX_LINE_LEN;
 
 /// Bounded ring of recent upstream lines, for playback on attach: at most
-/// `cap` positions and `byte_cap` bytes of lines, the oldest going first, and
-/// none older than history retention keeps.
+/// `cap` positions and `byte_cap` bytes of lines, room made from the largest
+/// conversation's oldest line first ([`Share`]), and none older than history
+/// retention keeps.
 pub struct Buffer {
     entries: std::collections::VecDeque<RingEntry>,
     cap: usize,
@@ -4204,6 +4253,11 @@ pub struct Buffer {
     byte_cap: usize,
     /// The bytes of the lines held.
     bytes: usize,
+    /// How many lines each share holds.
+    shares: std::collections::HashMap<Share, usize>,
+    /// The newest position the ring has let go of: a cursor at or past it has
+    /// every successor still held.
+    evicted_through: u64,
     /// Identifies this ring's lifetime; part of every cursor it hands out.
     epoch: u64,
     /// The position the next pushed line takes. Starts above `cap` so the
@@ -4214,10 +4268,12 @@ pub struct Buffer {
     /// `bnc_buffer`, and this ring neither keeps nor replays them either.
     retention: crate::core::HistoryRetention,
     /// The session's state as of the oldest entry held — its nick and
-    /// channels — advanced by every entry the ring evicts, so an attaching client is brought to it before the
-    /// replay begins and reads each replayed line in the state it was said
-    /// in (§10.1). `None` while the oldest lines are ones restored from
-    /// rows stored before migration 0096, whose nick was not stored with them
+    /// channels — advanced by every entry the ring evicts from its front, so
+    /// an attaching client is brought to it before the replay begins and
+    /// reads each replayed line in the state it was said in (§10.1). What the
+    /// ring lets go of elsewhere ([`Buffer::evict_one`]) changes none of it.
+    /// `None` while the oldest lines are ones restored from rows stored
+    /// before migration 0096, whose nick was not stored with them
     /// ([`restored_head`]).
     head: Option<IrcSessionState>,
     /// How the network names things and what it said of itself, which the
@@ -4239,6 +4295,8 @@ impl Buffer {
             cap,
             byte_cap: cap.max(1).saturating_mul(BACKLOG_BYTES_PER_LINE),
             bytes: 0,
+            shares: std::collections::HashMap::new(),
+            evicted_through: 0,
             epoch,
             next_seq: cap as u64 + 1,
             retention: crate::core::HistoryRetention::default(),
@@ -4273,7 +4331,7 @@ impl Buffer {
     /// Drop the lines at the front that history retention no longer keeps.
     fn evict_expired(&mut self) {
         let cutoff = self.cutoff();
-        while let Some(RingEntry::Line(line)) = self.entries.front() {
+        while let Some(RingEntry::Line(line, _)) = self.entries.front() {
             if Self::keeps(line, cutoff) {
                 break;
             }
@@ -4281,18 +4339,31 @@ impl Buffer {
         }
     }
 
+    /// Account for a line leaving the ring.
+    fn forget(&mut self, line: &BufferedLine, share: &Share) {
+        self.bytes -= line.line.len();
+        self.evicted_through = self.evicted_through.max(line.seq);
+        if let Some(held) = self.shares.get_mut(share) {
+            *held -= 1;
+            if *held == 0 {
+                self.shares.remove(share);
+            }
+        }
+    }
+
     /// Drop the oldest entry, advancing the head state past it.
     fn evict_oldest(&mut self) {
         match self.entries.pop_front() {
-            Some(RingEntry::Line(line)) => {
-                self.bytes -= line.line.len();
+            Some(RingEntry::Line(line, share)) => {
+                self.forget(&line, &share);
                 if let Some(head) = &mut self.head {
                     // Every line held was published within the channel
                     // bound, so none takes the head past it.
                     drop(head.observe(&line.line));
                 }
             }
-            Some(RingEntry::Session { snapshot, .. }) => {
+            Some(RingEntry::Session { seq, snapshot }) => {
+                self.evicted_through = self.evicted_through.max(seq);
                 self.head = Some(IrcSessionState::at(
                     &snapshot,
                     self.names.clone(),
@@ -4303,29 +4374,77 @@ impl Buffer {
         }
     }
 
-    /// Take the next position, evicting the oldest entry when full.
+    /// Make room for one more. The session's own lines and session
+    /// boundaries at the front go first: the head takes them in, and an
+    /// attaching client is brought to the state they made all the same.
+    /// Otherwise the oldest line of the share that holds the most (the oldest
+    /// such share's, among equals) goes, wherever it is in the ring — never
+    /// the newest line, and never a pinned one but from the front; with no
+    /// share holding more than one line, the oldest entry goes.
+    fn evict_one(&mut self) {
+        if matches!(
+            self.entries.front(),
+            Some(RingEntry::Session { .. } | RingEntry::Line(_, Share::Pinned))
+        ) {
+            self.evict_oldest();
+            return;
+        }
+        let largest = self
+            .shares
+            .iter()
+            .filter(|(share, _)| **share != Share::Pinned)
+            .map(|(_, held)| *held)
+            .max()
+            .unwrap_or(0);
+        let newest = self.entries.len().saturating_sub(1);
+        let victim = (largest > 1)
+            .then(|| {
+                self.entries.iter().position(|entry| {
+                    matches!(entry, RingEntry::Line(_, share)
+                        if *share != Share::Pinned && self.shares.get(share) == Some(&largest))
+                })
+            })
+            .flatten()
+            .filter(|index| *index > 0 && *index < newest);
+        match victim.and_then(|index| self.entries.remove(index)) {
+            Some(RingEntry::Line(line, share)) => self.forget(&line, &share),
+            Some(RingEntry::Session { .. }) => unreachable!("only a line is chosen"),
+            None => self.evict_oldest(),
+        }
+    }
+
+    /// Take the next position, making room when full.
     fn next_position(&mut self) -> u64 {
         // `>=` (not `==`) so a zero/under-filled cap can never let the ring
         // grow without bound.
         while self.entries.len() >= self.cap.max(1) {
-            self.evict_oldest();
+            self.evict_one();
         }
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
     }
 
-    /// Retain `line` as the newest, returning the position it took. Older
-    /// entries go while the lines held pass `byte_cap` — never this one, so a
+    /// Retain `line` as the newest, returning the position it took. Room is
+    /// made while the lines held pass `byte_cap` — never from this one, so a
     /// ring always holds its newest line.
+    #[cfg(test)]
     fn push(&mut self, line: String) -> u64 {
+        self.push_said(line, None)
+    }
+
+    /// [`Buffer::push`] of a line said while the session's own nick was
+    /// `own`, which decides its [`Share`].
+    fn push_said(&mut self, line: String, own: Option<&str>) -> u64 {
         self.evict_expired();
+        let share = Share::of(&line, own, &self.names);
         let seq = self.next_position();
         self.bytes += line.len();
+        *self.shares.entry(share.clone()).or_default() += 1;
         self.entries
-            .push_back(RingEntry::Line(BufferedLine { seq, line }));
+            .push_back(RingEntry::Line(BufferedLine { seq, line }, share));
         while self.bytes > self.byte_cap && self.entries.len() > 1 {
-            self.evict_oldest();
+            self.evict_one();
         }
         seq
     }
@@ -4372,16 +4491,15 @@ impl Buffer {
     }
 
     /// The lines after `after`, when that cursor names a position of this ring
-    /// whose every successor is still retained; otherwise the whole ring, with
-    /// `resumed` false so the client knows to start its transcript over.
+    /// whose every successor is still retained — none was let go of after it,
+    /// from the front or from a share ([`Buffer::evict_one`]); otherwise the
+    /// whole ring, with `resumed` false so the client knows to start its
+    /// transcript over.
     fn replay_after(&self, after: Option<ReplayCursor>) -> Replay {
         let honoured = after.is_some_and(|cursor| {
             cursor.epoch == self.epoch
                 && cursor.seq < self.next_seq
-                && self
-                    .entries
-                    .front()
-                    .is_none_or(|oldest| cursor.seq + 1 >= oldest.seq())
+                && cursor.seq >= self.evicted_through
         });
         let from = after
             .filter(|_| honoured)
@@ -4391,8 +4509,8 @@ impl Buffer {
         let cutoff = self.cutoff();
         for entry in self.entries.iter().filter(|entry| entry.seq() >= from) {
             match entry {
-                RingEntry::Line(line) if !Self::keeps(line, cutoff) => {}
-                RingEntry::Line(line) => lines.push(line.clone()),
+                RingEntry::Line(line, _) if !Self::keeps(line, cutoff) => {}
+                RingEntry::Line(line, _) => lines.push(line.clone()),
                 RingEntry::Session { snapshot, .. } => {
                     boundaries.push((lines.len(), snapshot.clone()));
                 }
@@ -5348,9 +5466,15 @@ impl NetworkHandle {
             if buf.bytes + line.len() > buf.byte_cap {
                 break;
             }
+            let said_by = match own_nick {
+                crate::db::StoredOwnNick::Nick(nick) => Some(nick.as_str()),
+                crate::db::StoredOwnNick::NoNick | crate::db::StoredOwnNick::NotRecorded => None,
+            };
+            let share = Share::of(&line, said_by, &buf.names);
             buf.bytes += line.len();
+            *buf.shares.entry(share.clone()).or_default() += 1;
             buf.entries
-                .push_front(RingEntry::Line(BufferedLine { seq, line }));
+                .push_front(RingEntry::Line(BufferedLine { seq, line }, share));
             restored.push(own_nick);
         }
         if !restored.is_empty() {
@@ -6015,7 +6139,13 @@ impl DriverEnds {
     pub fn emit_line(&self, line: String) {
         let line = ingest(line);
         self.record_input(line.len());
-        self.publish_buffered(line);
+        let own = self
+            .irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .nick
+            .clone();
+        self.publish_buffered(line, own.as_deref());
     }
 
     /// [`DriverEnds::emit_line`] for a line of the IRC session begun with
@@ -6051,6 +6181,8 @@ impl DriverEnds {
     ) -> Result<SessionChange, ChannelLimitExceeded> {
         let line = ingest(line);
         let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        // The nick the line was said under, before a rename it is.
+        let said_by = irc_session.nick.clone();
         let change = irc_session.observe(&line)?;
         self.record_input(line.len());
         // What the network says about itself as it welcomes this session is
@@ -6085,7 +6217,7 @@ impl DriverEnds {
             return Ok(change);
         }
         match origin {
-            None => self.publish_buffered(line),
+            None => self.publish_buffered(line, said_by.as_deref()),
             Some(origin) => self.publish_echo(line, origin),
         }
         // The raw line was delivered, so the client believes in a membership
@@ -6120,7 +6252,9 @@ impl DriverEnds {
         }
     }
 
-    fn publish_buffered(&self, line: String) {
+    /// Retain `line`, said while the session's own nick was `said_by`, and
+    /// publish it.
+    fn publish_buffered(&self, line: String, said_by: Option<&str>) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
         // What the backlog keeps nothing of is told live, at the ring's
         // position, and never retained or stored (the persistence task
@@ -6133,7 +6267,7 @@ impl DriverEnds {
             );
             return;
         }
-        let seq = buffer.push(line.clone());
+        let seq = buffer.push_said(line.clone(), said_by);
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above. Keep the buffer lock through the
         // publish: attach takes that lock before subscribing and snapshotting,
@@ -6153,7 +6287,11 @@ impl DriverEnds {
         let seq = if told_live_only(&line) {
             buffer.position()
         } else {
-            buffer.push(line.clone())
+            // An echo is said by the session itself, under the nick it shows.
+            let said_by = e6irc_proto::message::Message::parse(&line)
+                .ok()
+                .and_then(|message| message.source.map(|source| source.name.to_string()));
+            buffer.push_said(line.clone(), said_by.as_deref())
         };
         drop(self.events.send(DriverEvent::Echo {
             line: BufferedLine { seq, line },
@@ -6323,7 +6461,7 @@ impl DriverEnds {
                 line: notice,
             })));
         } else {
-            self.publish_buffered(notice);
+            self.publish_buffered(notice, None);
         }
     }
 
@@ -11217,6 +11355,73 @@ mod tests {
 
     fn replayed(replay: &Replay) -> Vec<String> {
         untimed(replay.lines.iter().map(|entry| entry.line.as_str()))
+    }
+
+    /// A busy channel makes room from its own oldest lines, not from a quiet
+    /// conversation's: the private message and the quiet channel's line said
+    /// before a flood of the busy channel are still held after it, while the
+    /// ring keeps to its cap.
+    #[test]
+    fn a_busy_channel_does_not_evict_a_quiet_conversation() {
+        let mut ring = Buffer::new(10);
+        ring.push_said(":bob!b@h PRIVMSG me :are you there?".into(), Some("me"));
+        ring.push_said(":carol!c@h PRIVMSG #quiet :morning".into(), Some("me"));
+        for n in 0..100 {
+            ring.push_said(format!(":dan!d@h PRIVMSG #busy :flood {n}"), Some("me"));
+        }
+        let held = untimed(ring.snapshot());
+        assert_eq!(held.len(), 10, "{held:?}");
+        assert!(held.contains(&":bob!b@h PRIVMSG me :are you there?".to_string()));
+        assert!(held.contains(&":carol!c@h PRIVMSG #quiet :morning".to_string()));
+        assert_eq!(
+            held.last().map(String::as_str),
+            Some(":dan!d@h PRIVMSG #busy :flood 99")
+        );
+        assert!(held.contains(&":dan!d@h PRIVMSG #busy :flood 92".to_string()));
+        assert!(!held.contains(&":dan!d@h PRIVMSG #busy :flood 91".to_string()));
+    }
+
+    /// A line let go of from the middle of the ring is a gap after every
+    /// cursor before it: such a cursor is refused, and the whole ring
+    /// replayed, rather than resumed past a line it never showed.
+    #[test]
+    fn a_cursor_before_a_line_let_go_of_is_refused() {
+        let mut ring = Buffer::new(4);
+        let first = ring.push_said(":bob!b@h PRIVMSG me :hello".into(), Some("me"));
+        ring.push_said(":dan!d@h PRIVMSG #busy :one".into(), Some("me"));
+        ring.push_said(":dan!d@h PRIVMSG #busy :two".into(), Some("me"));
+        let cursor = ring.replay_after(None).cursor_at(first);
+        assert!(ring.replay_after(Some(cursor)).resumed);
+        for line in ["three", "four"] {
+            ring.push_said(format!(":dan!d@h PRIVMSG #busy :{line}"), Some("me"));
+        }
+        assert!(
+            untimed(ring.snapshot()).contains(&":bob!b@h PRIVMSG me :hello".to_string()),
+            "the front was kept"
+        );
+        assert!(!ring.replay_after(Some(cursor)).resumed);
+    }
+
+    /// The session's own rename, joins and parts go only from the front, so
+    /// the head state that a replay starts from stays the state at its
+    /// oldest line.
+    #[test]
+    fn the_sessions_own_lines_go_only_from_the_front() {
+        let mut ring = Buffer::new(4);
+        ring.push_said(":me!u@h NICK :you".into(), Some("me"));
+        for n in 0..10 {
+            ring.push_said(format!(":dan!d@h PRIVMSG #busy :flood {n}"), Some("you"));
+        }
+        assert!(
+            !untimed(ring.snapshot()).contains(&":me!u@h NICK :you".to_string()),
+            "it went from the front"
+        );
+        assert_eq!(
+            ring.head.as_ref().and_then(|head| head.nick.clone()),
+            None,
+            "a head that began knowing no nick learns none from a rename"
+        );
+        assert_eq!(ring.shares.get(&Share::Pinned), None);
     }
 
     /// A cursor is honoured exactly while every line after it is still held;

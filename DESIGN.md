@@ -2059,17 +2059,27 @@ Principal tables (columns abridged):
   from a driver and restored backlog from this table — remove CR/LF/NUL and
   cap one entry to the IRC wire limit. A replay cannot inject a second line or
   make the bounded buffer retain an unbounded entry.
-  Retention is per (owner, network): the persistence task counts its own
-  appends and trims to the newest `BNC_BUFFER_CAP` (5,000) rows, and of those
-  to the newest `BNC_BUFFER_BYTES` (5,000 × 512 bytes), at every
+  Retention is per (owner, network), shared out by conversation: the
+  persistence task counts its own appends and trims to `BNC_BUFFER_CAP`
+  (5,000) rows, and of those to `BNC_BUFFER_BYTES` (5,000 × 512 bytes), in
+  the order the buffer keeps its rows (`bnc_kept_order!`): the newest row of
+  every conversation (its `target`; the lines of none share one) before the
+  second newest of any, so a busy channel gives up its own older lines
+  before a quiet channel or a private conversation gives up its newest, at every
   `BNC_TRIM_INTERVAL` — a thousand ordinary lines, each line weighing one per
   512 bytes it holds (`bnc_trim_weight`), so a trim is also due after half a
   megabyte of long ones. The upstream decides how long its lines are; counted
   only in rows, 5,000 lines of eight kilobytes of tags each stood. The
   in-memory backlog is held to the same rate: `buffer_cap` lines and
-  `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), oldest first,
-  its newest line always kept, on every push and when a stored backlog is
-  restored. A start restores a network's whole `buffer_cap` from this table:
+  `buffer_cap` × 512 bytes of them (`BACKLOG_BYTES_PER_LINE`), shared out the
+  same way (`Share`: room is made from the conversation holding the most,
+  its oldest line first, and the session's own `NICK`/`JOIN`/`PART` and
+  session boundaries go only from the front, where the replay's head state
+  takes them in), its newest line always kept, on every push and when a
+  stored backlog is restored; a resume cursor before a line let go of from
+  the middle is refused, and that client replays the whole ring. A start
+  restores a network's whole `buffer_cap` from this table, in the order it
+  keeps its rows:
   `buffer_cap` is bounded by what the table keeps (`MAX_NETWORK_BUFFER_CAP`,
   the constant `BNC_BUFFER_CAP` is), so the replay the setting promises
   survives a restart. It used to accept 100,000 while the table kept 5,000 and
@@ -3237,7 +3247,11 @@ above the trait, provides for every network kind:
   attachment ends as too slow, where a parked write used to hide the network's
   removal and the client's silence from the relay for good.
 - **Detached buffering**: events accumulate in a per-network ring persisted
-  to PostgreSQL. Every line is stamped at ingest with the time it arrived when
+  to PostgreSQL, each conversation holding a share of its own (§8: a busy
+  channel used to evict, oldest first, the private message the owner had not
+  read yet; now it gives up its own older lines first, and the network's cap
+  and bytes still bound the whole, as ZNC's per-buffer and soju's
+  per-target history do). Every line is stamped at ingest with the time it arrived when
   it carries no valid `time` of its own — the upstream's lines on a network
   without `server-time` (EFnet, IRCnet, QuakeNet), and the bouncer's own
   notices — so the ring's replay, the stored `sent_at` and CHATHISTORY read one

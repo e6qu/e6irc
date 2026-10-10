@@ -462,7 +462,9 @@ driver receives upstream lines while no BNC or web client is attached.
    stale `VERSION` again), and each channel's topic and member list (the
    session's state, told to each attaching client from the session).
 2. With PostgreSQL, a persistence task stores wire-preserving lines under the
-   owner/network key and trims the network’s history to its cap.
+   owner/network key and trims the network’s history to its cap, sharing it
+   out by conversation: a busy channel gives up its own older lines before a
+   private message or a quiet channel loses its newest.
 3. On driver start, recent rows preload oldest-first into the bounded buffer.
 4. A later BNC or web attachment replays that stream before following live
    output. A client that did not negotiate `server-time` sees each replayed
