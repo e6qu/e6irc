@@ -14,13 +14,25 @@
 //!
 //! [`negotiate`] is the version handshake: a core accepts its own link version
 //! and the one before, so a core release never forces an edge restart, and
-//! refuses anything else naming both sides' versions.
+//! refuses anything else naming both sides' versions. Every frame names the
+//! version that introduced it ([`EdgeFrame::since`], [`CoreFrame::since`]),
+//! and each side refuses one newer than the version its link speaks. The two
+//! frames that open a link, `Hello` and `Welcome`, carry the fields of a later
+//! version after those of an earlier one, and which fields follow is read from
+//! the frame itself (the `Hello`'s version range, the `Welcome`'s version), so
+//! the codec needs no version to be told.
+//!
+//! Version 2 (DESIGN §19.3) adds what the edge holds for the core — session
+//! records, channel replicas and the cut state ([`held`]) — the acknowledgement
+//! of input, the frames of a graceful cut and a rebuild, the connection's TLS
+//! facts on `Open` and the cut on `Hello`.
 
 #![deny(clippy::let_underscore_must_use)]
 
 mod core_frames;
 mod edge_frames;
-mod wire;
+pub mod held;
+pub mod wire;
 
 use std::num::NonZeroU64;
 
@@ -31,9 +43,13 @@ pub use edge_frames::{
     ClosedReason, EdgeFrame, Hello, ListenerKind, ListenerReport, MAX_CERTIFICATE_PATH_LEN,
     MAX_CLOSED_TEXT_LEN, Open, Role, SessionKind, Stream, Transport, UiMessage, WriteFailure,
 };
+pub use held::{
+    Ack, Admission, Body, BodyPart, Cut, CutId, CutPart, RecordPart, Replica, ReplicaChange,
+    TlsFacts, Upload,
+};
 
 /// This release's core-link version.
-pub const LINK_VERSION: u16 = 1;
+pub const LINK_VERSION: u16 = 2;
 
 /// The oldest link version this release still speaks. A core accepts it as
 /// well as [`LINK_VERSION`]; an edge offers every version from it up.

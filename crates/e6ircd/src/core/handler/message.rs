@@ -1055,6 +1055,9 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             );
             let label = state.defer_captured_label(conn);
             let session = state.sessions.get_mut(&conn).expect("checked");
+            // The opening line only accumulates, as every line of the batch
+            // does: retained for replay until the batch closes.
+            let input_lines = vec![session.input_line()];
             session.multiline = Some(crate::core::state::MultilineBatch {
                 reference: reference.to_string(),
                 target: target.to_string(),
@@ -1063,6 +1066,7 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
                 lines: Vec::new(),
                 bytes: 0,
                 kind: None,
+                input_lines,
             });
         }
         Some('-') => {
@@ -1789,6 +1793,7 @@ pub(super) fn multiline_collect(
         return true;
     }
     let session = state.sessions.get_mut(&conn).expect("checked");
+    let line = session.input_line();
     let batch = session.multiline.as_mut().expect("checked");
     if batch.lines.len() >= MULTILINE_MAX_LINES {
         multiline_fail(
@@ -1813,6 +1818,7 @@ pub(super) fn multiline_collect(
     batch.bytes += text.len();
     batch.kind.get_or_insert(kind);
     batch.lines.push((text.to_string(), concat));
+    batch.took_line(line);
     true
 }
 

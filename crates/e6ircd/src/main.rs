@@ -32,7 +32,17 @@ const USAGE: &str = "usage:\n  \
                                      authority and the core's certificate\n  \
     e6ircd edge-credentials issue --dir <dir> --edge <name>\n  \
                                      write one edge's certificate, signed by\n  \
-                                     that authority\n\
+                                     that authority\n  \
+    e6ircd stop --handover|--final [--pid <pid>]\n  \
+                                     stop the server running here (the only\n  \
+                                     one of this user, or process <pid>) and\n  \
+                                     wait until it has: --handover leaves its\n  \
+                                     clients to the edges for the next core,\n  \
+                                     --final closes them\n  \
+    e6ircd records advance [<configuration>]\n  \
+                                     have every core write this release's\n  \
+                                     newest session-record format; no older\n  \
+                                     release can read those records\n\
 <configuration> is one of:\n  \
     --config <path>                 a TOML file (default: e6irc.toml)\n  \
     --config-from-environment       the E6IRC_* variables a container is\n  \
@@ -59,8 +69,101 @@ fn main() -> ExitCode {
         Some("healthcheck") => healthcheck(&args[1..]),
         Some("edge") => edge(&args[1..]),
         Some("edge-credentials") => edge_credentials(&args[1..]),
+        Some("stop") => stop(&args[1..]),
+        Some("records") => records(&args[1..]),
         Some("--version") => version(&args[1..]),
         _ => run(&args),
+    }
+}
+
+/// `e6ircd stop --handover|--final [--pid <pid>]` (DESIGN §19.3, D16): ask
+/// the server to stop through its stop control, print what it says, and exit
+/// 0 once it has stopped cleanly.
+fn stop(args: &[String]) -> ExitCode {
+    const CONTEXT: &str = "e6ircd stop";
+    let mut mode = None;
+    let mut pid = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--handover" if mode.is_none() => mode = Some(net::StopMode::Handover),
+            "--final" if mode.is_none() => mode = Some(net::StopMode::Final),
+            "--pid" if pid.is_none() => match rest.next().and_then(|pid| pid.parse::<u32>().ok()) {
+                Some(given) => pid = Some(given),
+                None => {
+                    eprintln!("{CONTEXT}: --pid takes a process identifier\n{USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => {
+                eprintln!("{CONTEXT}: bad arguments\n{USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(mode) = mode else {
+        eprintln!("{CONTEXT}: say which stop: --handover or --final\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(e6ircd::control::ask(pid, mode, |line| {
+        println!("{line}");
+    })) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{CONTEXT}: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `e6ircd records advance [<configuration>]` (D11): every core writes this
+/// release's newest session-record format from now on.
+fn records(args: &[String]) -> ExitCode {
+    const CONTEXT: &str = "e6ircd records advance";
+    let [verb, config_args @ ..] = args else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    if verb != "advance" {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    }
+    let config = match load_config_or_fail(config_args, CONTEXT) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let Some(database) = config.database else {
+        eprintln!(
+            "{CONTEXT}: [database] is required: a core without one writes the newest format \
+             already"
+        );
+        return ExitCode::FAILURE;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(async {
+        e6ircd::db::refuse_libpq_process_environment()?;
+        let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
+        e6ircd::db::advance_record_format(&pool).await
+    }) {
+        Ok((before, now)) if before == now => {
+            println!("the cores already write record format {now}");
+            ExitCode::SUCCESS
+        }
+        Ok((before, now)) => {
+            println!("the cores write record format {now} from now on (they wrote {before})");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{CONTEXT}: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -614,7 +717,34 @@ fn run(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match net::start_unless(config, signals.received()).await {
+        // `e6ircd stop` reaches the process here, from the start: the same
+        // stop on every operating system (DESIGN §19.3, D16).
+        let mut control = match e6ircd::control::Control::open() {
+            Ok(control) => {
+                eprintln!(
+                    "e6ircd: `e6ircd stop` reaches this process at {}",
+                    control.location()
+                );
+                Some(control)
+            }
+            Err(error) => {
+                eprintln!(
+                    "e6ircd: WARNING: the stop control cannot listen ({error}); `e6ircd stop` \
+                     cannot reach this process, and only a signal stops it"
+                );
+                None
+            }
+        };
+        let stop_while_waiting = async {
+            tokio::select! {
+                () = signals.received() => {}
+                ask = stop_asked(&mut control) => {
+                    // Nothing is served yet: every stop is the same.
+                    ask.accept().await.stopped(true).await;
+                }
+            }
+        };
+        match net::start_unless(config, stop_while_waiting).await {
             Ok(net::Started::StoppedWhileWaiting) => {
                 eprintln!("e6ircd: shutting down; this process was not serving yet");
                 ExitCode::SUCCESS
@@ -632,40 +762,52 @@ fn run(args: &[String]) -> ExitCode {
                 // queue, give the serving lease back (DESIGN §18). The flush is
                 // the correctness point — the DB worker's buffered history must
                 // reach PostgreSQL, never be dropped by an abrupt process exit.
-                let critical_failure = tokio::select! {
-                    () = signals.received() => None,
-                    failure = running.shutdown.wait_for_critical_failure() => Some(failure),
+                // In edge mode a signal is a handover (D16): the edges hold
+                // every client for the next core; `e6ircd stop` says which
+                // stop it means. A critical failure is a stop without a cut,
+                // which closes them.
+                let (critical_failure, asked, mode) = loop {
+                    tokio::select! {
+                        () = signals.received() => {
+                            let mode = if running.shutdown.hands_over() {
+                                net::StopMode::Handover
+                            } else {
+                                net::StopMode::Final
+                            };
+                            break (None, None, mode);
+                        }
+                        failure = running.shutdown.wait_for_critical_failure() => {
+                            break (Some(failure), None, net::StopMode::Final);
+                        }
+                        ask = stop_asked(&mut control) => {
+                            if ask.mode == net::StopMode::Handover
+                                && !running.shutdown.hands_over()
+                            {
+                                ask.refuse(
+                                    "this process serves its clients itself, so there is no \
+                                     edge to hand them to; stop it with --final",
+                                )
+                                .await;
+                                continue;
+                            }
+                            let mode = ask.mode;
+                            break (None, Some(ask.accept().await), mode);
+                        }
+                    }
                 };
-                if let Some(failure) = &critical_failure {
-                    eprintln!("e6ircd: {failure}");
-                } else {
-                    eprintln!("e6ircd: shutting down");
+                match (&critical_failure, mode) {
+                    (Some(failure), _) => eprintln!("e6ircd: {failure}"),
+                    (None, net::StopMode::Handover) => {
+                        eprintln!("e6ircd: shutting down, handing the clients over");
+                    }
+                    (None, net::StopMode::Final) => eprintln!("e6ircd: shutting down"),
                 }
-                match running.shutdown.run().await {
-                    net::ShutdownOutcome::Flushed if critical_failure.is_none() => {
-                        ExitCode::SUCCESS
-                    }
-                    net::ShutdownOutcome::Flushed => ExitCode::FAILURE,
-                    net::ShutdownOutcome::FlushTimedOut => {
-                        eprintln!(
-                            "e6ircd: DB flush did not complete before timeout; \
-                             buffered history may be lost"
-                        );
-                        ExitCode::FAILURE
-                    }
-                    net::ShutdownOutcome::WorkerPanicked => {
-                        eprintln!("e6ircd: DB worker panicked during shutdown");
-                        ExitCode::FAILURE
-                    }
-                    net::ShutdownOutcome::CoreTimedOut => {
-                        eprintln!("e6ircd: a core worker did not stop before shutdown timeout");
-                        ExitCode::FAILURE
-                    }
-                    net::ShutdownOutcome::CorePanicked => {
-                        eprintln!("e6ircd: a core worker panicked during shutdown");
-                        ExitCode::FAILURE
-                    }
+                let code =
+                    shutdown_code(running.shutdown.run(mode).await, critical_failure.is_none());
+                if let Some(asked) = asked {
+                    asked.stopped(code == ExitCode::SUCCESS).await;
                 }
+                code
             }
             Err(e) => {
                 eprintln!("e6ircd: failed to start: {e}");
@@ -673,6 +815,42 @@ fn run(args: &[String]) -> ExitCode {
             }
         }
     })
+}
+
+/// The next `e6ircd stop` request; never, without a control to hear it.
+async fn stop_asked(control: &mut Option<e6ircd::control::Control>) -> e6ircd::control::StopAsk {
+    match control {
+        Some(control) => control.asked().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The exit code a shutdown's outcome earns: success only for a clean one
+/// that no failure caused.
+fn shutdown_code(outcome: net::ShutdownOutcome, asked_for: bool) -> ExitCode {
+    match outcome {
+        net::ShutdownOutcome::Flushed if asked_for => ExitCode::SUCCESS,
+        net::ShutdownOutcome::Flushed => ExitCode::FAILURE,
+        net::ShutdownOutcome::FlushTimedOut => {
+            eprintln!(
+                "e6ircd: DB flush did not complete before timeout; \
+                             buffered history may be lost"
+            );
+            ExitCode::FAILURE
+        }
+        net::ShutdownOutcome::WorkerPanicked => {
+            eprintln!("e6ircd: DB worker panicked during shutdown");
+            ExitCode::FAILURE
+        }
+        net::ShutdownOutcome::CoreTimedOut => {
+            eprintln!("e6ircd: a core worker did not stop before shutdown timeout");
+            ExitCode::FAILURE
+        }
+        net::ShutdownOutcome::CorePanicked => {
+            eprintln!("e6ircd: a core worker panicked during shutdown");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The signals that ask for a graceful shutdown. On Unix that is SIGTERM (what

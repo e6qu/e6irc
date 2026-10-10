@@ -2077,7 +2077,10 @@ Principal tables (columns abridged):
   session boundaries go only from the front, where the replay's head state
   takes them in), its newest line always kept, on every push and when a
   stored backlog is restored; a resume cursor before a line let go of from
-  the middle is refused, and that client replays the whole ring. A start
+  the middle is refused, and that client replays the whole ring — across a
+  restart that continues the ring too: a trim records the newest position it
+  let go of (`let_go_through`, migration 0103), and a continued ring refuses a
+  cursor before it, or before a stored line its restore left out. A start
   restores a network's whole `buffer_cap` from this table, in the order it
   keeps its rows:
   `buffer_cap` is bounded by what the table keeps (`MAX_NETWORK_BUFFER_CAP`,
@@ -4502,7 +4505,25 @@ opening so Escape can never inherit an earlier confirmation. Every API-backed
 form also crosses one shared in-flight submission guard: the initiating action
 gains a visible and accessible progress state, every submit control in that form
 is disabled, and keyboard, pointer, or synthetic resubmission cannot issue a
-second mutation until the first operation and its view refresh finish. On phone layouts,
+second mutation until the first operation and its view refresh finish. The one
+request helper every form mutation crosses settles the form the moment the
+server accepts it: a form that creates something is reset (so a password,
+token or client secret does not stay in the page, and a second press cannot
+create it twice), and a form that edits a stored resource loses its secrets and
+its unsaved-edit marks. The refresh that follows fills an edit form without
+typing over fields the person changed and has not saved, so saving one form on
+the configuration page no longer discards unsaved edits in another. When the
+refresh rebuilds the row whose button was pressed, focus moves to the page's
+main region rather than the document. A success says what changed ("Server
+ban on `*@bad.example` removed."), never a bare "Updated.", and a change whose
+view then fails to reload says so instead of success: the refresh serializer
+hands each caller the outcome of the run that covers its request. A page's
+load failure offers Retry and is cleared by the load that succeeds. A `401`
+from any read or change means the session ended: the page says so once, with a
+Sign in link, and stops its timers, instead of offering a Retry that cannot
+succeed. Every time the console shows is the same form in one zone,
+`2026-09-28 14:05:09 UTC`. Directory filter fields refuse surrounding spaces
+in the browser, since the page refuses such a filter outright. On phone layouts,
 the active route is brought into the horizontal console-navigation viewport on
 load. The console works
 in the default build and `embed-web`; its private pages permit only that
@@ -4513,7 +4534,19 @@ own query string: its API query and its pager links are built by the shared
 `directoryQuery` from the keys that directory's operation declares, keeping
 only non-empty values, so a filter form's "All kinds" (`kind=`) or a
 page-only parameter (a second pager cursor, a one-shot notice flag) cannot
-fail the contract before the request is made.
+fail the contract before the request is made. A filter page (sessions,
+accounts, channel registry, all networks, bans, audit, monitoring) validates
+its own query with the same validator as its API, which returns a typed
+`QueryRefusal`: the API answers it as the `400` problem document naming the
+field, and the page answers it as itself, a `400` with the refusal beside the
+filter form, whose fields keep what was sent, and without reading the
+directory the query would fail again. A hand-edited or bookmarked query
+therefore never replaces the page with a problem document. The administrator
+network inventory takes an exact `kind` filter (`irc`, `local`, `matrix`,
+`discord`, `slack`; blank or unknown is refused), applied before the page is
+cut to configured and stored networks alike, and **Integrations** reads each
+platform's bridges with it, so each platform's count and list are its own
+rather than one page of every network filtered in the browser.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle
@@ -4793,7 +4826,11 @@ unbounded `tail` that loses its server — closed, or silent through two
 three-minute liveness windows, the first ending in `PING :e6irc-keepalive`
 (the shared `e6irc_client::liveness` the TUI also uses) — exits nonzero, and a
 reader that goes away (a broken pipe) ends `tail`/`history` output cleanly.
-`&` channels are joined like `#` ones. Every wait on the server — connecting
+`&` channels are joined like `#` ones. `tail` and `history` take a channel or
+a nick: a nick is the direct conversation with it — what it sent this client
+and what this client sent it — whose history is read without a `JOIN` (a
+nick cannot be joined), and this client's own nick is every direct message
+sent to it. `history --count` is at least 1. Every wait on the server — connecting
 and registering, a capability request, a join with its history, and every
 wait after `QUIT` — is bounded by `--response-timeout` (30 s by default), so
 a peer that holds the socket open with irrelevant lines cannot hang a script;
@@ -4820,7 +4857,11 @@ registration burst with a PING round trip and exits 0 only on its own echo,
 while a refusal (`e6irc_client::is_refusal`: a 400–599 numeric or `FAIL`,
 shared with the TUI) or no verdict within the timeout is a nonzero exit. `raw`
 prints every server line to stdout and each refusal to stderr, and exits
-nonzero if any line was refused. `--tls-name` requires `--tls`.
+nonzero if any line was refused. `--tls-name` requires `--tls`. `api` takes
+its method in any case (`get` is GET; sent as typed it would be an unknown
+method the server refuses), and every API origin — `--base`, the one cached
+by `login` — is compared in one spelling (scheme and host in lower case, the
+default port left out) and refused when it carries a user name or password.
 Every authentication mode requests the same optional server-time,
 message-tags, and account-tag metadata capabilities, so changing credentials
 cannot silently reduce the information delivered to the caller.
@@ -4913,7 +4954,13 @@ BNC network. It has bounded channel/query buffers, Alt-Left/Right, Alt-b/f
 letters are ignored rather than typed),
 bounded scrollback, a relay/status strip, an active-first conversation rail,
 a visible horizontally-following composer caret, `/help`, `/join`, `/msg`,
-`/win`, `/raw`, literal-slash escape with `//`, `/quit`, Ctrl-End return to the
+`/me`, `/win` (the conversation rail numbers each buffer as `/win` takes it),
+`/raw`, literal-slash escape with `//`, `/quit`, Tab nick completion (the
+word before the caret completes to a member of the conversation in view —
+from NAMES, JOIN and speech, forgotten on PART, QUIT and KICK, followed
+through NICK, at most 10,000 per conversation, said once when reached — as
+`nick: ` at the start of a line and `nick ` elsewhere; Tab again offers the
+next match), Ctrl-End return to the
 latest message, Ctrl-C exit (Esc clears the composer; it does not quit), automatic reconnect with the same explicit
 request, and loud disconnect/write/drop state. The steady-state read is
 bounded by a three-minute liveness window measured from the server's last
@@ -4959,7 +5006,9 @@ changes, so direct messages and its own JOIN/PART are recognised. Every error
 numeric, FAIL/WARN/NOTE, ERROR, and KICK is rendered: a message refused by a
 moderated channel is said in the buffer it was sent from instead of standing
 there as a delivered-looking local echo. The slash-command grammar is
-closed: malformed
+closed (`/join` takes exactly one name that is a channel on this network, so
+neither `#a,#b` nor a bare `chat` opens a buffer whose lines would go
+elsewhere, and a `+k` channel's key as one word after it): malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
@@ -5008,15 +5057,32 @@ buffer is in scrollback, new messages increase its unread count and cannot
 advance its marker; returning to the live end clears that count and queues the
 latest marker. Unread counts are visible and history/live overlap is
 deduplicated by stable message ID.
-The composer and socket-writer queue are both bounded. A message is locally
-echoed only after bounded-queue admission; a full queue, disconnected socket,
+The composer and socket-writer queue are both bounded. On a server that
+offers `echo-message` the client asks for it, and its own messages are shown
+as the server echoes them, with their message ID and time: a local copy has
+neither, so history loaded after a reconnect showed each sent line a second
+time and the read marker could not pass it. On a server without it a message
+is locally echoed only after bounded-queue admission, and each conversation
+keeps the texts of its local copies no server copy has matched yet (at most
+256): a line of this client's in a history batch with such a text is that
+copy, not shown again, though its time still moves the read position. A
+channel key — one the TUI's `/join #c key` or a raw `JOIN` sent — is kept in
+the process's memory only, never written anywhere, and a reconnect rejoins
+the channel with it; leaving the channel, or joining it again without a key,
+forgets it (at most 256 are kept). What this person said
+from another client attached to the same network is not counted unread. A
+full queue, disconnected socket,
 or over-limit complete IRC line leaves the input available and reports the
 refusal. A read-marker update that meets a full writer queue remains pending
 instead of being lost.
 Capability refusal fails visibly rather than degrading into a different
-experience. A pseudo-terminal journey drives the real full-screen binary
-against e6ircd and proves inbound rendering, outbound delivery, clean exit,
-and terminal restoration — including after SIGTERM, SIGINT and SIGHUP, each of
+experience. A `NO_COLOR` variable with any non-empty value (the no-color.org
+convention) draws the whole screen without colour, a coloured background
+becoming reverse video. A pseudo-terminal journey drives the real full-screen
+binary against e6ircd and proves inbound rendering, outbound delivery,
+reconnect and rejoin after the daemon restarts with input typed while offline
+kept and sent only once connected, Tab completion, `/me`, clean exit, and
+terminal restoration — including after SIGTERM, SIGINT and SIGHUP, each of
 which must still send `QUIT`. “Multi-buffer” means several channels/queries inside
 one connection, not several simultaneous networks; the BNC is the
 cross-network multiplexer.
@@ -5734,10 +5800,11 @@ Layers, bottom to top:
   everything after it, including deliveries that arrive from other shards
   while they drain. Durable
   network/history state is continuously persisted; there is no separate
-  driver-checkpoint format. In edge mode a stop still closes every client
-  with the core's own `ERROR` before its links end; the handover stop that
-  closes none, with `e6ircd stop --final` as the one that does, is the
-  graceful rebuild's (§19.3, `PLAN.md` phase 4).
+  driver-checkpoint format. In edge mode a stop — SIGTERM or `e6ircd stop
+  --handover` — is a handover (D16): the core cuts its links before anything
+  tells a client goodbye, and the edges hold every client for the next core
+  (§19.3); `e6ircd stop --final` closes every client with the core's own
+  `ERROR`, as a stop without edges always does.
 - Main owns and supervises the core and PostgreSQL worker join handles while
   serving; listener join handles have explicit supervisors. Any unexpected
   completion or panic names the failed task, initiates the same bounded drain,
@@ -5847,10 +5914,10 @@ same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
 Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
-(the `e6irc-edge` crate), phase 2 (the in-process link) and phase 3 (the
-process boundary: `e6ircd edge` and the core link between processes) have
-landed — "Phase 1 as built", "Phase 2 as built" and "Phase 3 as built" below —
-and phase 4 (the graceful rebuild) is next. Until a phase lands, the rest of
+(the `e6irc-edge` crate), phase 2 (the in-process link), phase 3 (the process
+boundary: `e6ircd edge` and the core link between processes) and phase 4 (the
+graceful rebuild) have landed — "Phase 1 as built" to "Phase 4 as built"
+below — and phase 5 (crash takeover) is next. Until a phase lands, the rest of
 this document describes the running system; §19.9 lists the sections each
 phase rewrites.
 
@@ -6185,6 +6252,169 @@ phase rewrites.
     and, with PostgreSQL, `/ws/ui` and attach through an edge and the roster.
     irctest's green list also runs through an edge in CI
     (`E6IRC_IRCTEST_EDGE=1`).
+- **Phase 4 as built.** A graceful core restart keeps every client: the
+  stopping core cuts its links, the edges hold every session, and the next
+  core rebuilds them from what the edges hold (§19.3). A crash, a kill or a
+  link reset still closes sessions loudly (phase 5).
+  - *Link version 2.* `LINK_VERSION` is 2 and the core accepts 1 and 2. A
+    frame knows the version it first appears in (`since()`), and one newer
+    than the link's is a decode-level refusal. Version 2 adds, after every
+    version 1 field so a version 1 reader's bytes are unchanged: the cut the
+    edge holds in `Hello` (encoded when the `Hello`'s own newest version is
+    2 or more), the admission in `Welcome` (`Serve`, `Hold`, `Upload`),
+    `Open` with the connection's TLS facts as its own kind (the protocol
+    version, the cipher suite, the name the client asked for, the digest of
+    its certificate), and the held-state frames: the core's `Pause`,
+    `Resume`, `Ack`, `Record`, `Replica`, `CutState` and `Cut`, and the
+    edge's `Paused`, `Upload`, `RecordUpload`, `ReplicaUpload`, `CutUpload`
+    and `UploadDone`. A version 1 edge is always served at once and holds
+    nothing: a handover closes its clients with the core's own `ERROR`, as
+    before. WHOIS shows the TLS facts to the user itself and to operators
+    (`671 … :is using a secure connection [TLSv1.3, TLS13_…]`).
+  - *Bodies* (`core::record`). A session's record, a live chat socket's and
+    an attachment's record, a channel's state, a member's entry and the cut
+    state are bodies the edge holds without
+    reading: a format number, the writer's clock origin, then the fields.
+    Every monotonic reading is written as the writer's and moved onto the
+    reader's clock by the difference of the two origins (`ClockOrigin`, the
+    wall clock less the monotonic one, read once per process), so an
+    unchanged session writes the same bytes and is not sent again. A body is
+    cut into parts of at most 512 KiB, at most 1,024 of them. The record is
+    built by destructuring the session whole, every field recorded or named
+    with where it comes from instead, and read back by destructuring the
+    record whole (`rebuild_session`), so a field added to either does not
+    compile until it is placed. Format 1 is every field but the TLS facts,
+    format 2 adds them; a release reads both and writes the one
+    `record_format.written` says — 1 until `e6ircd records advance` (D11),
+    announced so every serving core follows at once — and refuses any other
+    format by number, closing that one session loudly (`server upgrade:
+    session state unreadable`). A core without a database has nowhere to
+    stage the window and writes the newest format.
+  - *Held state, as it changes.* After every event a shard publishes the
+    record and acknowledgement of each session that changed, and each
+    changed channel's replica to every edge hosting one of its members, on
+    the owner shard's stream; a record or acknowledgement follows the output
+    sent before it (`SessionLink::hold_record`, `hold_ack`), so an edge never
+    holds a record ahead of what its client was sent. An edge holds each
+    channel's newest state and its own members' entries; the next core takes
+    the state of the highest revision across edges and the union of the
+    members. A channel rebuilt this way keeps its `created_at`, and its hot
+    history ring is marked not the whole record, so a read falls through to
+    the database at its front.
+  - *Acknowledgement after effect.* The core numbers each session's input
+    lines as its shard handles them, per link; `Ack { through, retained }`
+    says every line through `through` is done with, except the ones an
+    accumulation still holds — the `AUTHENTICATE` chunks of an unfinished
+    SASL exchange and the lines of an open multiline batch — which the edge
+    keeps and replays first on the next link. The retained set is the union
+    of those accumulations' own line lists, so an accumulation cannot hold a
+    line the acknowledgement forgets. A capability negotiation in progress is
+    in the record, and its lines are not retained: replaying them would
+    answer them twice.
+  - *The cut* (`LinkServer::cut`, on `e6ircd stop --handover` or, in edge
+    mode, SIGTERM — D16): the core sends `Pause` on every stream and waits up
+    to 5 s for each `Paused`, which follows every line the edge sent before
+    it; waits up to 10 s until every line is handled, nothing passes between
+    shards and no database round trip is awaited, then closes each session
+    still waiting, loudly (`server restarting: a request did not complete`);
+    cuts every shard, which republishes every record and replica and handles
+    nothing more; lets each stream's pumps send what their sessions were
+    last given (10 s); sends the cut state — WHOWAS, the LUSERS maximum, the
+    account-creation buckets and the edges cut — on the first stream and
+    `Cut { cut, epoch }` on every stream; and records the cut in the roster.
+    Drivers, the core, the database flush and the lease release then run as
+    for any stop, and no client hears a word.
+  - *The edge holds.* An edge whose every stream ended with the same `Cut`
+    holds every session for the next core for at most ten minutes (D12's
+    core-absence limit); any other end closes them loudly, as before. While
+    a stream is not live a client's lines wait: its reader stops at the line
+    it could not send, and the socket's own backpressure holds the rest.
+    Output the edge was given before the cut is still written, and what is
+    written after the cut is reported to the next core, never the last.
+  - *The rebuild* (`RebuildGate`). A core whose roster names a cut waits for
+    the edges it names, at most 30 s; one without a database waits 1 s for
+    an edge presenting a cut. An edge presenting the awaited cut is told
+    `Upload`, one presenting none or another is told `Hold` (or `Serve`, once
+    the rebuild is over) and closes what it holds, loudly — re-admitting a
+    late edge's sessions is phase 5. An uploading edge sends, per stream,
+    each session's `Upload` (kind, address, transport, TLS facts, time since
+    its last line, the bytes not yet written, the lines of unknown fate and
+    whether the client left in the gap) and record, then its replicas and
+    the cut state, then `UploadDone`. The core rebuilds each channel on its
+    owner shard, then each session on its own, in the records' original
+    directory order with new directory keys; re-authorizes every login
+    against the account's standing and the credential's liveness, and every
+    address against the server bans; ends each session whose client left in
+    the gap as that client would have; and sends `Resume`. The edge replays
+    each session's retained lines, numbered afresh, then lets input flow.
+    Two records naming one nick keep it for the one that opened first; a
+    session the per-address limit refuses is closed saying so. Until the
+    rebuild is over the core opens no session of its own (`RebuildDone`), so
+    the `local` driver cannot create a channel the rebuild is about to
+    restore.
+  - *Live chat sockets and attachments.* A `/ws/ui` socket's record
+    (`UiRecord`) names its account and network, whether its composer may
+    send, its credential (kind and digest, never the secret) and the ring
+    position its client was sent everything through; a bouncer attachment's
+    (`AttachRecord`) names its account and credential, its network (the
+    account's own or the shared one), the nick it registered with, its
+    capabilities, its ring position, the nick, channels and ISUPPORT it was
+    shown and the last status it was told. Each is republished after what it
+    wrote, when it changed. The next core reads the credential again (a
+    revoked or expired one ends the socket as it would have; the attachment's
+    login is checked with the IRC logins), leases the account's authority
+    again, and resumes: the socket replays after its cursor as a returning
+    client's does; the attachment is not welcomed again — its mirror is what
+    the record says it was shown, the lines after its position follow, then
+    the session as it is now, and any ISUPPORT or status that changed. A
+    position the ring cannot honour is said in a notice, never guessed
+    across.
+  - *Durable ring epochs* (migration 0102). Each stored backlog line keeps
+    the ring position it took, and each backlog its ring epoch
+    (`bnc_ring_positions`, keyed as `bnc_buffer` is, so configured networks
+    have one too). A stop that stored every line records the last position
+    it handed out; the next start continues the epoch after it, the restored
+    lines at their own positions and anything the driver said before the
+    restore moved past them (no client has been handed a cursor by then), so
+    a `ReplayCursor` from before the restart names the same line. A start
+    withdraws the claim at once, so a process that dies without storing
+    everything leaves none, and the start after it begins a new epoch.
+  - *The `local` driver's session* lives in the core, so no edge holds it
+    (D13, homing it on an edge, is not built): the cut closes it first,
+    loudly, as the server restarting, with every other session no edge holds
+    (one on a version 1 link), and the next core's driver joins again once
+    the rebuild is over.
+  - *Stops* (`control`). `e6ircd stop --handover|--final [--pid <pid>]`
+    reaches the server through a local control endpoint named by its process
+    identifier — a Unix socket in `e6ircd-<uid>` under `$XDG_RUNTIME_DIR` or
+    the temporary directory, a directory only that user may enter; a named
+    pipe refusing remote clients on Windows — says which stop it means, and
+    returns once the server has stopped, saying whether cleanly. `--final`
+    closes every client with the core's own `ERROR`; `--handover` in a
+    process that serves its own clients is refused, and that process serves
+    on.
+  - *Evidence.* `core::record`'s tests round-trip records of many shapes in
+    both formats, refuse every format outside the window and every truncated
+    body, and move monotonic readings between origins; the `held_bodies`
+    fuzz target holds that no body panics a reader and that a body read is
+    written back byte for byte. The edge's tests hold the acknowledgement,
+    the handover's count of unconfirmed lines, the replay's numbering and the
+    report of written bytes across a handover. The zero-drop suite's
+    graceful scenarios (`zero_drop.rs`, all six cells) restart a core under
+    TCP, TLS and `/ws/irc` clients — a numbered message stream before and
+    after, a line sent in the gap, a client half way through registering, an
+    open multiline batch, WHOWAS and the LUSERS maximum, a channel's topic,
+    modes and ranks, the TLS facts — with nothing lost, repeated or said;
+    stop with `--final`; refuse a handover without edges; and hand over on
+    SIGTERM. `edge_tier.rs` restarts a core after every step of a scripted
+    two-client conversation onto a core of another shard count and compares
+    the transcripts line for line with an unrestarted run; with PostgreSQL
+    (in `db-tests`, and on macOS and Windows in `zero-drop-database` with
+    PostgreSQL 18 installed natively, D15) it keeps a live chat socket, a
+    bouncer attachment and a SASL exchange across graceful restarts, advances
+    the record format under a served session, and sees the `local` driver
+    quit and rejoin; `bouncer.rs` holds the durable ring epoch across a clean
+    restart.
 
 ### 19.2 The core link
 

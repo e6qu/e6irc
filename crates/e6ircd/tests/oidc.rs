@@ -162,7 +162,7 @@ async fn full_oidc_login_provisions_account_and_session() {
         .expect("account count");
     assert_eq!(accounts, 1, "no account was provisioned under another name");
     drop(pool);
-    running.shutdown.run().await;
+    running.shutdown.run(e6ircd::net::StopMode::Final).await;
 
     let db_url = support::test_db("full_oidc_login_provisions_account_and_session").await;
     let running = net::start(dex_login_config(db_url, dex_url, http_addr))

@@ -212,16 +212,19 @@ created from a different accepted connection.
 
 **Flow.**
 
-1. Open the network detail page. Its **NickServ account** section leads with the
-   account and password pair for an account already held; open **Register a new
-   NickServ account** beneath it. The IRC transcript remains visible beside it.
+1. Open the network detail page. Its **NickServ account** section links to the
+   network's settings in the chat client, the one place an account and password
+   already held are saved; open **Register a new NickServ account** beneath it.
+   The IRC transcript remains visible beside it.
 2. Enter an email address and new password. The closed owner-scoped endpoint
    sends the ordinary IRC command `PRIVMSG NickServ :REGISTER password email`.
 3. Read NickServ's response in the transcript, check the email, and return with
    its code. Submitting the code sends
    `PRIVMSG NickServ :VERIFY REGISTER nick code`.
 4. Confirm NickServ's success in the transcript, then save the account and
-   password. The normal network replacement path seals the password and
+   password in the network's settings, which step 3 links to (the register
+   form is emptied once NickServ has the command, so the password is typed
+   there again). The normal network replacement path seals the password and
    reconnects with SASL, using the strongest mechanism the network offers
    (SCRAM-SHA-512 on Libera) and saying which one logged in.
 5. An attached IRC client may perform the same exchange with normal
@@ -276,8 +279,16 @@ recovery token are redacted in the synthesized echo while still being sent
 upstream verbatim, so the console never becomes a place credentials
 accumulate.
 
-**Evidence.** The parked lifecycle/error-code pairings, generic parked-state
-recovery, and the redaction classifier have unit tests.
+**Evidence.** `tools/test-oidc-browser.mjs`, run in Chromium, Firefox, and
+WebKit against a local live upstream, opens the console, reads a replayed
+`PRIVMSG` off it as the wire line, types an IRC line there that the upstream
+receives verbatim, and finds that line shown beside the replies. After the
+same journey registers and verifies an upstream account through the real
+driver, it opens the chat afresh, opens the console, reads both of the
+upstream NickServ's replies back off it as the wire lines the network sent,
+and finds neither the password nor the emailed code there. The parked
+lifecycle/error-code pairings, generic parked-state recovery, and the
+redaction classifier have unit tests.
 
 ## Diagnose an upstream connection
 
@@ -403,11 +414,12 @@ PLAIN.
 5. The client receives buffered lines and live driver output; commands are
    relayed back to the same driver. The sender's own messages reach the
    stream exactly once: the upstream's echo when it offers `echo-message`
-   (which the driver asks for), otherwise one the driver synthesizes. The
-   account's other attached sessions and the detached buffer always see them,
-   and the sender itself sees its echo exactly when it negotiated
-   `echo-message` on attach. Adding the upstream identity prefix never creates
-   an over-limit echo; trailing text is fitted on a UTF-8 boundary.
+   (the driver asks for it), which arrives only for a line the upstream
+   accepted, and otherwise an echo the driver synthesizes when it writes the
+   line. The account's other attached sessions and the detached buffer
+   always see them, and the sender itself sees its echo exactly when it
+   negotiated `echo-message` on attach. Adding the upstream identity prefix
+   never creates an over-limit echo; trailing text is fitted on a UTF-8 boundary.
 6. The client is brought to the session as it stood at the oldest replayed
    line (its nick and the JOINs the replay no longer contains), shown the
    replay, and brought to the session now; every channel it is shown joined

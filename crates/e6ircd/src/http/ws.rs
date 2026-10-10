@@ -453,6 +453,8 @@ pub(super) async fn ws_ui(
         .lease(pool_of(&state), credential.revocable())
         .await;
     let grant = UiGrant {
+        account: account.clone(),
+        network: params.network.clone(),
         handle,
         authority: UiSocketAuthority {
             composer,
@@ -639,6 +641,7 @@ pub(super) async fn ws_ui_conn(
     if socket.send(snapshot_event(cursor)).await.is_err() {
         return;
     }
+    socket.hold(cursor);
     loop {
         tokio::select! {
             // The credential that opened the socket was revoked or expired:
@@ -682,6 +685,7 @@ pub(super) async fn ws_ui_conn(
                     {
                         break;
                     }
+                    socket.hold(cursor);
                 }
                 Ok(DriverEvent::Echo { line: entry, origin }) => {
                     // The echo took a ring position whether or not this socket
@@ -697,6 +701,7 @@ pub(super) async fn ws_ui_conn(
                     {
                         break;
                     }
+                    socket.hold(cursor);
                 }
                 Ok(DriverEvent::Status { status, revision }) => {
                     if !crate::bouncer::accept_status_revision(&mut status_revision, revision) {
@@ -753,7 +758,8 @@ pub(super) async fn ws_ui_conn(
             },
             message = socket.recv() => match message {
                 Some(UiMessage::Text(t)) => {
-                    let request = match composer_request(&t, session_authority) {
+                    // Read per request: the network's 005 can change CHANTYPES.
+                    let request = match composer_request(&t, session_authority, &handle.names()) {
                         Ok(request) => request,
                         Err(error) => {
                             let event = composer_result_event(cursor, ComposerResult::Rejected {
@@ -867,9 +873,26 @@ async fn send_unavailable(socket: &mut UiSocket) {
 pub(super) struct UiSocket {
     link: e6irc_edge::link::SessionLink,
     inbound: e6irc_queue::Receiver<UiMessage>,
+    /// The record its edge holds, when its edge holds one.
+    held: Option<UiHeld>,
 }
 
 impl UiSocket {
+    /// Have the edge hold that the client has been sent everything through
+    /// `cursor`, after what was sent before this.
+    fn hold(&mut self, cursor: crate::bouncer::ReplayCursor) {
+        let Some(held) = &mut self.held else {
+            return;
+        };
+        held.record.cursor = Some(cursor.recorded());
+        held.revision += 1;
+        let body = held
+            .record
+            .encode(held.format.get(), held.origin)
+            .expect("a live chat socket's record is within every body bound");
+        self.link.hold_record(held.revision, body);
+    }
+
     /// Send one text message, and wait until it is on the client's socket.
     async fn send(&mut self, text: String) -> Result<(), SendFailure> {
         within_send_deadline(
@@ -899,6 +922,10 @@ impl UiSocket {
 /// do and until when, its place among the account's sockets, where replay
 /// resumes, how long a silent peer is believed, and what its link buffers.
 pub(crate) struct UiGrant {
+    /// Whose socket it is, and the name of the account's network it follows:
+    /// what its record names for the next core.
+    pub(super) account: String,
+    pub(super) network: String,
     pub(super) handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
     pub(super) authority: UiSocketAuthority,
     pub(super) slot: Option<UiSocketSlot>,
@@ -919,12 +946,40 @@ pub(crate) struct UiGrant {
 /// the core's half, [`ws_ui_conn`]. Each ends the other.
 fn ui_halves(
     grant: UiGrant,
+    holding: Option<HoldingUi>,
 ) -> (
     e6irc_edge::link::EdgeSession,
     e6irc_queue::Sender<UiMessage>,
     impl Future<Output = ()> + Send + 'static,
 ) {
-    let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", grant.sendq_bytes);
+    let (link, edge, held) = match holding {
+        None => {
+            let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", grant.sendq_bytes);
+            (link, edge, None)
+        }
+        Some(HoldingUi { in_flight, format }) => {
+            let (link, edge) =
+                e6irc_edge::link::holding_waiting_session("ui-sendq", grant.sendq_bytes, in_flight);
+            let record = crate::core::record::UiRecord {
+                account: grant.account.clone(),
+                network: grant.network.clone(),
+                may_send: matches!(grant.authority.composer, ComposerAuthority::MaySend),
+                credential: grant.authority.credential.credential().recorded(),
+                cursor: None,
+                liveness_ms: u64::try_from(grant.liveness.as_millis()).unwrap_or(u64::MAX),
+            };
+            let held = UiHeld {
+                record,
+                format,
+                origin: crate::core::record::ClockOrigin::of(
+                    crate::net::wall_clock(),
+                    crate::net::mono_clock(),
+                ),
+                revision: 0,
+            };
+            (link, edge, Some(held))
+        }
+    };
     // The client's messages the core has not taken: at most one of the largest
     // it reads, as the socket read one at a time.
     let (sender, inbound) = e6irc_queue::weighted_queue(
@@ -937,7 +992,11 @@ fn ui_halves(
     );
     let core = ws_ui_conn(
         grant.handle,
-        UiSocket { link, inbound },
+        UiSocket {
+            link,
+            inbound,
+            held,
+        },
         grant.authority,
         grant.slot,
         grant.resume,
@@ -948,7 +1007,8 @@ fn ui_halves(
 /// Serve one live chat socket in this process, both halves together.
 pub(super) async fn serve_ui(grant: UiGrant, socket: WebSocket) {
     let liveness = grant.liveness;
-    let (edge, sender, core) = ui_halves(grant);
+    // Its own edge holds nothing for another core.
+    let (edge, sender, core) = ui_halves(grant, None);
     tokio::join!(
         e6irc_edge::websocket::serve_ui_socket(socket, edge, sender, liveness),
         core,
@@ -956,16 +1016,86 @@ pub(super) async fn serve_ui(grant: UiGrant, socket: WebSocket) {
 }
 
 /// Start the core's half of a live chat socket an edge holds: what the link
-/// server opens its `Ui` session with.
+/// server opens its `Ui` session with, or resumes it with after a rebuild.
+/// An edge that holds its sessions for the next core (`holding`) is given the
+/// socket's record, republished as its cursor moves.
 pub(crate) fn open_granted_ui(
     grant: UiGrant,
+    holding: Option<HoldingUi>,
 ) -> (
     e6irc_edge::link::EdgeSession,
     e6irc_queue::Sender<UiMessage>,
 ) {
-    let (edge, sender, core) = ui_halves(grant);
+    let (edge, sender, core) = ui_halves(grant, holding);
     tokio::spawn(core);
     (edge, sender)
+}
+
+/// A live chat socket whose edge holds it for the next core (link version
+/// 2): the bytes already sent and not yet written (a socket a rebuild
+/// resumes), and the body format its record is written in.
+pub(crate) struct HoldingUi {
+    pub(crate) in_flight: u64,
+    pub(crate) format: crate::core::RecordFormatCell,
+}
+
+/// What a live chat socket gives its edge to hold: its record, republished
+/// as the client's cursor moves.
+struct UiHeld {
+    record: crate::core::record::UiRecord,
+    format: crate::core::RecordFormatCell,
+    origin: crate::core::record::ClockOrigin,
+    revision: u64,
+}
+
+/// The grant a live chat socket's record resumes on this core after a
+/// rebuild (DESIGN §19.3): the account's network, its place among the
+/// account's sockets, and its credential read again — one revoked or expired
+/// meanwhile ends the socket as it would have — with the replay starting after
+/// the cursor the record holds. `Err` names why it cannot resume.
+pub(crate) async fn resume_ui(
+    state: &Arc<AppState>,
+    record: crate::core::record::UiRecord,
+) -> Result<UiGrant, &'static str> {
+    let crate::core::record::UiRecord {
+        account,
+        network,
+        may_send,
+        credential: (kind, digest),
+        cursor,
+        liveness_ms,
+    } = record;
+    let credential = crate::db::RevocableCredential::from_recorded(kind, &digest)
+        .ok_or("server upgrade: session state unreadable")?;
+    let registry = super::registry_of(state);
+    let handle = registry
+        .get_owned(&account, &network)
+        .ok_or("the network is gone")?;
+    let slot = state.ui_sockets.admit(&account);
+    let credential = state
+        .credential_watch
+        .lease(pool_of(state), credential)
+        .await;
+    Ok(UiGrant {
+        account,
+        network,
+        handle,
+        authority: UiSocketAuthority {
+            composer: if may_send {
+                ComposerAuthority::MaySend
+            } else {
+                ComposerAuthority::ReadOnly
+            },
+            credential,
+            store: pool_of(state).clone(),
+        },
+        slot,
+        resume: cursor.map(|cursor| {
+            ReplayRequest::After(crate::bouncer::ReplayCursor::from_recorded(cursor))
+        }),
+        liveness: std::time::Duration::from_millis(liveness_ms),
+        sendq_bytes: state.sendq_bytes,
+    })
 }
 
 #[derive(Debug)]
@@ -1085,6 +1215,7 @@ fn composer_command_refusal(command: &str, authority: SessionAuthority) -> Optio
 fn composer_request(
     frame: &str,
     authority: SessionAuthority,
+    names: &e6irc_client::NetworkNames,
 ) -> Result<ComposerRequest, ComposerRequestError> {
     if frame.len() > MAX_UI_WS_FRAME {
         return Err(ComposerRequestError {
@@ -1096,7 +1227,7 @@ fn composer_request(
         request_id: None,
         message: "invalid composer request",
     })?;
-    let line = match slash_to_irc(&frame.message, &frame.target) {
+    let line = match slash_to_irc(&frame.message, &frame.target, names) {
         Ok(line) => line,
         Err(message) => {
             return Err(ComposerRequestError {
@@ -1205,7 +1336,17 @@ fn composer_result_event(
 }
 
 /// Map a composer message to one complete IRC command.
-pub(super) fn slash_to_irc(message: &str, target: &str) -> Result<String, &'static str> {
+///
+/// `names` is how the network names things (its `CHANTYPES`): `/part` and
+/// `/topic` take an optional channel before their text, and only the network
+/// can say whether the first word is one. Every command that carries free
+/// text (`/part`'s reason, `/topic`, `/away`) sends it as the trailing
+/// parameter, so a sentence is never cut to its first word.
+pub(super) fn slash_to_irc(
+    message: &str,
+    target: &str,
+    names: &e6irc_client::NetworkNames,
+) -> Result<String, &'static str> {
     let (cmd, rest) = match message.strip_prefix('/') {
         Some(body) => match body.split_once(' ') {
             Some((c, r)) => (c.to_ascii_lowercase(), r),
@@ -1222,6 +1363,15 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> Result<String, &'stat
         }
     };
     let rest = rest.trim_start();
+    // `/part #a,#b reason`, `/topic #a text`: the channel named first, else the
+    // open conversation, and the rest as text.
+    let named_channel = || -> Option<(&str, &str)> {
+        let (first, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let channel = first.split(',').next().unwrap_or(first);
+        names
+            .is_channel(channel)
+            .then(|| (first, text.trim_start()))
+    };
     let line = match cmd.as_str() {
         "" => return Err("slash command is empty; nothing was sent"),
         "raw" if rest.is_empty() => return Err("/raw requires an IRC command; nothing was sent"),
@@ -1233,17 +1383,42 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> Result<String, &'stat
         "me" => format!("PRIVMSG {target} :\u{1}ACTION {rest}\u{1}"),
         "join" if rest.is_empty() => return Err("/join requires a channel; nothing was sent"),
         "join" => format!("JOIN {rest}"),
-        "part" if rest.is_empty() && target.is_empty() => {
-            return Err("/part requires an active channel or channel name; nothing was sent");
+        "part" => {
+            let (channel, reason) = match named_channel() {
+                Some(named) => named,
+                None if target.is_empty() => {
+                    return Err(
+                        "/part requires an active channel or channel name; nothing was sent",
+                    );
+                }
+                None => (target, rest),
+            };
+            if reason.is_empty() {
+                format!("PART {channel}")
+            } else {
+                format!("PART {channel} :{reason}")
+            }
         }
-        "part" if rest.is_empty() => format!("PART {target}"),
-        "part" => format!("PART {rest}"),
         "nick" if rest.is_empty() => return Err("/nick requires a nickname; nothing was sent"),
         "nick" => format!("NICK {rest}"),
-        "topic" if target.is_empty() => {
-            return Err("/topic requires an active channel; nothing was sent");
+        // Without text `/topic` asks for the topic: `TOPIC #c :` would clear it.
+        "topic" => {
+            let (channel, text) = match named_channel() {
+                Some(named) => named,
+                None if target.is_empty() => {
+                    return Err("/topic requires an active channel; nothing was sent");
+                }
+                None => (target, rest),
+            };
+            if text.is_empty() {
+                format!("TOPIC {channel}")
+            } else {
+                format!("TOPIC {channel} :{text}")
+            }
         }
-        "topic" => format!("TOPIC {target} :{rest}"),
+        // Without text `/away` says you are back.
+        "away" if rest.is_empty() => "AWAY".to_string(),
+        "away" => format!("AWAY :{rest}"),
         // `/msg <target> <text>`
         "msg" => {
             let Some((to, text)) = rest.split_once(char::is_whitespace) else {
@@ -1503,6 +1678,7 @@ mod tests {
         let request = composer_request(
             r##"{"id":"send-1","target":"#rust","message":"hi"}"##,
             SessionAuthority::Upstream,
+            &e6irc_client::NetworkNames::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1514,6 +1690,7 @@ mod tests {
         let injection = composer_request(
             r##"{"id":"send-2","target":"#rust","message":"hi\r\nJOIN #bad"}"##,
             SessionAuthority::Upstream,
+            &e6irc_client::NetworkNames::default(),
         )
         .expect_err("embedded delimiter must reject the whole request");
         assert_eq!(
@@ -1528,8 +1705,12 @@ mod tests {
             "message": "x".repeat(e6irc_proto::message::MAX_LINE_LEN),
         })
         .to_string();
-        let overlong = composer_request(&frame, SessionAuthority::Upstream)
-            .expect_err("over-long line must be refused");
+        let overlong = composer_request(
+            &frame,
+            SessionAuthority::Upstream,
+            &e6irc_client::NetworkNames::default(),
+        )
+        .expect_err("over-long line must be refused");
         assert_eq!(
             overlong.request_id.as_ref().map(ComposerRequestId::as_str),
             Some("send-3")
@@ -1543,18 +1724,26 @@ mod tests {
         })
         .to_string();
         assert!(
-            composer_request(&tagged, SessionAuthority::Upstream)
-                .expect("the independent client-tag allowance")
-                .line
-                .starts_with("@example=")
+            composer_request(
+                &tagged,
+                SessionAuthority::Upstream,
+                &e6irc_client::NetworkNames::default()
+            )
+            .expect("the independent client-tag allowance")
+            .line
+            .starts_with("@example=")
         );
 
         let oversized_envelope = "x".repeat(MAX_UI_WS_FRAME + 1);
         assert!(
-            composer_request(&oversized_envelope, SessionAuthority::Upstream)
-                .expect_err("oversized JSON envelope")
-                .message
-                .contains("bounded envelope")
+            composer_request(
+                &oversized_envelope,
+                SessionAuthority::Upstream,
+                &e6irc_client::NetworkNames::default()
+            )
+            .expect_err("oversized JSON envelope")
+            .message
+            .contains("bounded envelope")
         );
 
         for malformed in [
@@ -1564,8 +1753,12 @@ mod tests {
             r##"{"id":"send-7","target":"","message":"hello"}"##,
             r##"{"id":"send-8","target":"","message":"/me waves"}"##,
         ] {
-            let error = composer_request(malformed, SessionAuthority::Upstream)
-                .expect_err("an empty IRC command must not be acknowledged as sent");
+            let error = composer_request(
+                malformed,
+                SessionAuthority::Upstream,
+                &e6irc_client::NetworkNames::default(),
+            )
+            .expect_err("an empty IRC command must not be acknowledged as sent");
             assert!(error.message.contains("nothing was sent"), "{error:?}");
         }
     }
@@ -1586,8 +1779,12 @@ mod tests {
             "/raw MARKREAD #rust",
         ] {
             let frame = serde_json::json!({ "id": "a1", "target": "#rust", "message": message });
-            let error = composer_request(&frame.to_string(), SessionAuthority::Upstream)
-                .expect_err(message);
+            let error = composer_request(
+                &frame.to_string(),
+                SessionAuthority::Upstream,
+                &e6irc_client::NetworkNames::default(),
+            )
+            .expect_err(message);
             assert_eq!(
                 error.request_id.as_ref().map(ComposerRequestId::as_str),
                 Some("a1")
@@ -1602,7 +1799,12 @@ mod tests {
         for message in ["QUIT", "/me will QUIT soon", "/msg friend PING me"] {
             let frame = serde_json::json!({ "target": "#rust", "message": message });
             assert!(
-                composer_request(&frame.to_string(), SessionAuthority::Upstream).is_ok(),
+                composer_request(
+                    &frame.to_string(),
+                    SessionAuthority::Upstream,
+                    &e6irc_client::NetworkNames::default()
+                )
+                .is_ok(),
                 "{message}"
             );
         }
@@ -1619,8 +1821,12 @@ mod tests {
             "/raw NICK x",
         ] {
             let frame = serde_json::json!({ "id": "b1", "target": "#general", "message": message });
-            let error = composer_request(&frame.to_string(), SessionAuthority::Provider)
-                .expect_err(message);
+            let error = composer_request(
+                &frame.to_string(),
+                SessionAuthority::Provider,
+                &e6irc_client::NetworkNames::default(),
+            )
+            .expect_err(message);
             assert!(
                 error.message.contains("provider account"),
                 "{message}: {error:?}"
@@ -1631,12 +1837,24 @@ mod tests {
             );
             // The same command on an IRC network is the upstream's to answer.
             assert!(
-                composer_request(&frame.to_string(), SessionAuthority::Upstream).is_ok(),
+                composer_request(
+                    &frame.to_string(),
+                    SessionAuthority::Upstream,
+                    &e6irc_client::NetworkNames::default()
+                )
+                .is_ok(),
                 "{message}"
             );
         }
         let frame = serde_json::json!({ "target": "#general", "message": "hello" });
-        assert!(composer_request(&frame.to_string(), SessionAuthority::Provider).is_ok());
+        assert!(
+            composer_request(
+                &frame.to_string(),
+                SessionAuthority::Provider,
+                &e6irc_client::NetworkNames::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1644,6 +1862,7 @@ mod tests {
         let uncorrelated = composer_request(
             r##"{"target":"","message":"/join #rust"}"##,
             SessionAuthority::Upstream,
+            &e6irc_client::NetworkNames::default(),
         )
         .expect("uncorrelated command");
         assert_eq!(uncorrelated.line, "JOIN #rust");
@@ -1667,7 +1886,12 @@ mod tests {
             r##"{"target":"#rust","message":"hello","extra":true}"##,
         ] {
             assert!(
-                composer_request(frame, SessionAuthority::Upstream).is_err(),
+                composer_request(
+                    frame,
+                    SessionAuthority::Upstream,
+                    &e6irc_client::NetworkNames::default()
+                )
+                .is_err(),
                 "accepted {frame}"
             );
         }
@@ -1744,6 +1968,8 @@ mod ui_socket_bound_tests {
                     ws.on_upgrade(move |socket| {
                         serve_ui(
                             UiGrant {
+                                account: "Alice".into(),
+                                network: "test".into(),
                                 handle,
                                 authority: UiSocketAuthority {
                                     composer: ComposerAuthority::MaySend,

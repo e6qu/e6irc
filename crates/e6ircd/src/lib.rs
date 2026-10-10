@@ -8,6 +8,7 @@ pub(crate) mod account_authority;
 pub(crate) mod account_deletion;
 pub mod bouncer;
 pub mod config;
+pub mod control;
 pub mod core;
 pub mod db;
 pub mod edge_credentials;

@@ -17,24 +17,25 @@
         <h2>Find a channel</h2>
         <p>Matches the whole channel or founder name, ignoring case.</p>
       </div>
-      {% if has_filters || has_cursor %}
+      {% if filters.narrowed() %}
         <a class="secondary-link" href="/console/admin/channels">Clear</a>
       {% endif %}
     </div>
+    {% include "console_query_refusal.html" %}
     <form class="field-grid" method="get" action="/console/admin/channels">
       <label class="field">
         <span>Channel name</span>
-        <input name="name" value="{{ name }}" maxlength="50" autocomplete="off"
+        <input name="name" value="{{ filters.value("name") }}" maxlength="50" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off"
                placeholder="#operations" />
       </label>
       <label class="field">
         <span>Founder account</span>
-        <input name="founder" value="{{ founder }}" maxlength="64" autocomplete="off"
+        <input name="founder" value="{{ filters.value("founder") }}" maxlength="64" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off"
                placeholder="alice" />
       </label>
       <label class="field">
         <span>Rows per page</span>
-        <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"
+        <input type="number" name="limit" value="{{ filters.value_or("limit", "50") }}" min="1" max="1000"
                inputmode="numeric" required />
       </label>
       <div class="form-actions field-wide">
@@ -56,7 +57,7 @@
         <caption class="sr-only">Registered channel directory</caption>
         <thead><tr><th>ID</th><th>Channel</th><th>Founder</th><th>Registered (UTC)</th><th>Retained policy</th><th>Access</th><th>Actions</th></tr></thead>
         <tbody id="admin-channel-rows" data-api-admin-channel-list data-csrf="{{ shell.csrf }}">
-          <tr><td colspan="7" class="empty">Loading registered channels…</td></tr>
+          <tr><td colspan="7" class="empty">{% if filters.refused() %}Correct the filter above to list registered channels.{% else %}Loading registered channels…{% endif %}</td></tr>
         </tbody>
       </table>
     </div>

@@ -33,6 +33,10 @@ shown and rejected explicitly. Invalid/rejected credentials are fatal until
 configuration changes rather than retried forever. Network/transient failures
 use bounded backoff and visible error categories. A failed bridge-inventory
 read is announced in each affected platform list and offers an in-place retry.
+Each platform's list is read with the inventory's exact `kind` filter, so its
+count and rows are that platform's own; past the inventory's largest page the
+count says so (`1000+`) and links to the rest in **All networks**, filtered to
+that platform.
 Inbound identities/channel names are sanitized and validated before entering
 IRC state.
 Reverse delivery supports `PRIVMSG`; malformed messages, unsupported commands,
@@ -89,18 +93,23 @@ or deliberately chooses anonymous IRC.
 - `e6irc send TARGET MESSAGE` connects, optionally authenticates with a SASL
   password, joins a channel when needed, sends, drains the server response, and
   exits nonzero on join/delivery failure.
-- `e6irc tail TARGET [--count N]` follows matching PRIVMSG lines and answers
-  PING; `--json` emits one object per message with source, target, text, and
-  structured IRCv3 tags.
+- `e6irc tail TARGET [--count N]` follows a conversation and answers PING: a
+  channel, the direct conversation with a nick (both directions), or with the
+  client's own nick every direct message sent to it; `--json` emits one object
+  per message with source, target, text, and structured IRCv3 tags.
 - `e6irc raw` sends stdin IRC lines.
-- `e6irc history TARGET [--count N]` negotiates/queries CHATHISTORY.
+- `e6irc history TARGET [--count N]` negotiates/queries CHATHISTORY for a
+  channel (joined first) or a direct conversation with a nick (both
+  directions, no `JOIN`); `--count` is at least 1.
 - `e6irc login --base ORIGIN` starts the RFC 8628 device flow, prints the
   verification URI and user code, polls within the server's explicit bounds,
   and atomically saves the issued bearer token.
-- `e6irc api METHOD PATH` performs one bounded HTTP/HTTPS REST request. An
-  explicit token, `E6IRC_API_TOKEN`, or the login cache supplies bearer
-  authentication; with no `--base`, it uses the cached issuing origin or
-  fails if none exists.
+- `e6irc api METHOD PATH` performs one bounded HTTP/HTTPS REST request; the
+  method is taken in any case. An explicit token, `E6IRC_API_TOKEN`, or the
+  login cache supplies bearer authentication; with no `--base`, it uses the
+  cached issuing origin or fails if none exists. Origins are compared in one
+  spelling (lower-case scheme and host, no default port), and one carrying a
+  user name or password is refused.
 - IRC authentication is anonymous, a paired SASL account and password (the
   strongest of SCRAM-SHA-512, SCRAM-SHA-256 and PLAIN the server offers),
   direct OAUTHBEARER, or
@@ -125,7 +134,13 @@ connection/API telemetry.
 
 **Evidence.** Real-socket/API tests cover send, delivery failure, PLAIN and
 OAUTHBEARER, credential-shape rejection, history, structured tail, TLS, and
-REST. The database job drives the actual binary through e6ircd's device
+REST; `cli_history_reads_a_direct_conversation_without_joining` and
+`cli_tail_follows_a_direct_conversation` drive the binary against a scripted
+server for a nick target, and `a_device_poll_that_cannot_succeed_fails_by_name`
+holds denial, expiry and an unknown device error to their own failures;
+`cli_refuses_a_tls_server_it_cannot_verify` runs the binary with `--tls` against
+a real e6ircd whose certificate no public CA issued and requires a nonzero
+exit naming the certificate. The database job drives the actual binary through e6ircd's device
 endpoint, approves its real PostgreSQL grant, verifies the private cache, and
 uses its cached origin/token against `/api/v1/me`.
 
@@ -155,23 +170,31 @@ private to the current user.
    current destination, connection state, and unread work. Receive into bounded
    buffers, switch with Alt-Left/Right, scroll with Page Up/Down, return live
    with Ctrl-End, edit the composer with character-safe cursor movement, and
-   use `/help`, `/join`, `/msg`, one-based or named `/win`, `/raw`, `//` for a
-   literal leading slash, and `/quit`. Malformed or unknown commands remain
-   editable and explain their refusal.
+   use `/help`, `/join` (one channel of this network, and its key if it has
+   one), `/msg`, `/me`, one-based
+   or named `/win` (the rail shows each buffer's number), `/raw`, `//` for a
+   literal leading slash, and `/quit`; Tab completes the word before the caret
+   to a member of the conversation in view, and again cycles the matches.
+   Malformed or unknown commands remain editable and explain their refusal.
+   `NO_COLOR` draws the screen without colour.
 5. Channel/direct messages create and update RFC1459-casefolded buffers;
    history/live overlap with the same message ID is represented once;
    server-originated text
    is represented by terminal-safe types.
 6. A live disconnect starts bounded-delay reconnect attempts with the same
    explicit transport/authentication request, rejoins every channel whose
-   self-JOIN was confirmed, and reloads marker-relative history. The composer
+   self-JOIN was confirmed (a keyed channel with the key it was joined with,
+   kept in memory only), and reloads marker-relative history. The composer
    visibly marks itself offline and retains editable input, while submission is
    refused. Anything racing the disconnect is counted and reported rather than
    replayed late or shown as a false successful send.
 7. The composer and outbound writer queue are bounded. A complete over-limit
-   line or full queue retains/refuses input without local echo; accepted input
-   is echoed only after queue admission, and a read-marker write remains
-   pending when admission is temporarily unavailable.
+   line or full queue retains/refuses input without local echo. On a server
+   offering `echo-message` a sent message is shown as the server echoes it,
+   with its message ID, so a reconnect's history cannot show it twice; without
+   it, accepted input is echoed only after queue admission, and the same line
+   met again in a reconnect's history is recognised as that copy. A read-marker write
+   remains pending when admission is temporarily unavailable.
 
 **Visible failures and recovery.** Transport, TLS, SASL, capability, history,
 writer-queue, line-limit, and server-protocol failures are visible in the
@@ -188,10 +211,21 @@ fuzzed with arbitrary server messages; authentication/transport argument
 shapes, disconnect refusal, transport failure, and bounded queue/scrollback
 behavior are tested. Duplex protocol tests prove capability refusal,
 marker-relative CHATHISTORY, and batch completion. A pseudo-terminal test
-drives the real full-screen binary against a real e6ircd, proves the relay-desk
-route/status/conversation framing, command help, inbound rendering, and
-outbound delivery, enters `/quit`, and requires clean alternate-screen
-restoration.
+(`tools/test-tui-pty.py`) drives the real full-screen binary against a real
+e6ircd, proves the relay-desk route/status/conversation framing, command help,
+inbound rendering, and outbound delivery; stops the daemon and proves the
+reconnecting state, that a line typed while offline is not sent but kept, and
+that after the daemon restarts the client rejoins its channels — a keyed one
+with its key — and sends the kept line; proves Tab completion and `/me` reach the channel; enters `/quit`,
+and requires clean alternate-screen restoration. Model tests
+(`an_own_message_is_shown_once_across_a_history_replay`,
+`tab_completes_and_cycles_channel_members`,
+`slash_join_takes_exactly_one_channel`,
+`a_local_copy_is_recognised_in_history_without_echo_message`,
+`a_keyed_channel_is_rejoined_with_its_key_until_it_is_left`,
+`a_reconnect_rejoins_a_keyed_channel_with_its_key`) and
+`echo_message_is_asked_for_when_offered` and
+`no_color_draws_the_screen_without_colour` hold the rest.
 Shared-client tests also prove that anonymous, PLAIN, and OAUTHBEARER
 registration request the same metadata capabilities and that malformed or
 over-limit steady-state input is a typed, visible rejection rather than a

@@ -291,16 +291,20 @@
         <p>
           Anything starting with <code>/</code> is sent to the server. These are
           handled locally; every other slash command is forwarded to IRC as
-          typed, so the whole protocol is reachable from the message box.
+          typed, so the whole protocol is reachable from the message box. A
+          forwarded command's words are separate parameters: put a
+          <code>:</code> before text that has spaces, as in
+          <code>/kick #channel nick :the reason</code>.
         </p>
         <ul id="help-commands">
           <li><code>/join #channel</code> — join a channel</li>
-          <li><code>/part [#channel]</code> — leave a channel</li>
+          <li><code>/part [#channel] [reason]</code> — leave a channel</li>
           <li><code>/query nick [message]</code> — open a private conversation</li>
           <li><code>/msg nick text</code> — send without opening a conversation</li>
           <li><code>/notice nick text</code> — send a notice</li>
           <li><code>/nick name</code> — change nickname</li>
-          <li><code>/topic [text]</code> — read or set the topic</li>
+          <li><code>/topic [#channel] [text]</code> — read or set the topic</li>
+          <li><code>/away [message]</code> — mark yourself away, or back</li>
           <li><code>/me action</code> — send an action</li>
           <li><code>/raw COMMAND</code> — send a literal IRC line</li>
         </ul>

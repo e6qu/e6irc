@@ -193,6 +193,11 @@ impl HistoryRing {
         self.complete
     }
 
+    /// The place of the newest entry the ring has shed, if any.
+    pub(crate) fn shed_through(&self) -> Option<&(Millis, String)> {
+        self.shed_through.as_ref()
+    }
+
     /// The newest timestamp among the entries held, in every scope, in
     /// constant time.
     pub(crate) fn latest(&self) -> Latest {
@@ -322,6 +327,32 @@ impl HotHistory {
             evicted.push(cold);
         }
         evicted
+    }
+
+    /// Restore a conversation's ring as a session's record held it: its
+    /// entries, in their order, whether they are the whole record and what it
+    /// had shed. A ring this store holds already under `key` — a participant
+    /// on this shard restored it first — is kept: both copies were given the
+    /// same entries.
+    pub(crate) fn restore(
+        &mut self,
+        key: HistoryKey,
+        complete: bool,
+        shed_through: Option<(Millis, String)>,
+        entries: Vec<HistoryEntry>,
+    ) {
+        if self.rings.contains_key(&key) {
+            return;
+        }
+        let mut ring = HistoryRing::new(complete);
+        for entry in entries {
+            ring.push(entry, usize::MAX);
+        }
+        ring.complete = complete;
+        ring.shed_through = shed_through;
+        self.bytes += ring.bytes;
+        self.recency.touch(&key);
+        self.insert(key, ring);
     }
 
     /// Mark `key`'s ring as no longer the whole record.

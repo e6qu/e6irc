@@ -153,7 +153,7 @@ async fn runtime_shards_deliver_and_stop_together() {
         assert!(offline.contains(&watched), "{offline}");
 
         assert_eq!(
-            running.shutdown.run().await,
+            running.shutdown.run(net::StopMode::Final).await,
             net::ShutdownOutcome::Flushed,
             "all {core_workers} shards must stop cleanly"
         );
@@ -204,7 +204,7 @@ fn shutdown_delivers_every_closing_error_before_it_returns() {
         let ended = client.read_to_end(&mut received);
         (received, ended)
     });
-    let outcome = runtime.block_on(running.shutdown.run());
+    let outcome = runtime.block_on(running.shutdown.run(net::StopMode::Final));
     // What `main` does next: the runtime, and every task still in it, ends.
     drop(runtime);
     assert_eq!(outcome, net::ShutdownOutcome::Flushed);

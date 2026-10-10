@@ -22,7 +22,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
     else delete document.documentElement.dataset.theme;
   };
+  // A form that edits a stored resource. A refresh fills it from the server
+  // without typing over what the person has changed and not yet saved.
+  const editForms = new WeakSet();
   const preserveFormEdits = (form) => {
+    editForms.add(form);
     const mark = (event) => {
       const field = event.target;
       if (field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement) {
@@ -32,13 +36,38 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     form.addEventListener("input", mark);
     form.addEventListener("change", mark);
   };
+  // A secret shown with its reveal control is masked again.
+  const concealSecret = (field) => {
+    const reveal = field.parentElement?.classList.contains("secret-input") ? field.parentElement.querySelector(".reveal") : null;
+    if (!(reveal instanceof HTMLButtonElement) || field.type !== "text") return;
+    field.type = "password";
+    reveal.textContent = "Show";
+    reveal.setAttribute("aria-pressed", "false");
+    ariaName(reveal, "Show password");
+  };
+  // What a form holds once the server has accepted it. A form that creates
+  // something starts empty again, so a second press cannot create it twice and
+  // a password, token or client secret does not stay in the page. A form that
+  // edits a stored resource loses its secrets and its unsaved-edit marks, so
+  // the refresh that follows shows what was stored.
+  const settleSavedForm = (form) => {
+    if (!editForms.has(form)) {
+      form.reset();
+    } else {
+      for (const field of form.elements) {
+        if (field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement) {
+          delete field.dataset.apiEdited;
+        }
+        if (field instanceof HTMLInputElement && (field.type === "password" || field.parentElement?.classList.contains("secret-input"))) {
+          field.value = "";
+        }
+      }
+    }
+    for (const field of form.querySelectorAll(".secret-input > input")) concealSecret(field);
+  };
   const hydrateTextInput = (form, name, value) => {
     const field = form.elements.namedItem(name);
     if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.value = value;
-  };
-  const hydrateCheckbox = (form, name, checked) => {
-    const field = form.elements.namedItem(name);
-    if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.checked = checked;
   };
   if (consoleTheme instanceof HTMLSelectElement) {
     const loaded = loadSettings(() => localStorage);
@@ -145,6 +174,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   }
 
   const configurationResult = document.getElementById("configuration-api-result");
+  // The server refused this page's query and says so beside its filter form;
+  // the directory would be refused again, so it is not read until the query
+  // is corrected.
+  const queryRefused = document.getElementById("query-refusal") !== null;
 
   const apiOperation = (method, url) => {
     const parsed = new URL(url, window.location.origin);
@@ -158,13 +191,42 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   const consoleApiContract = apiContractLoader(fetch);
 
+  // A session that ended while the page was open (it expired, or was signed
+  // out elsewhere) fails every read and change with 401, and each failure
+  // offered Retry, which cannot succeed. The page says so once, above
+  // everything, with the way back, and stops its timers.
+  let sessionEndedNotice = null;
+  const noticeSessionEnded = (error) => {
+    if (!(error instanceof Error) || error.status !== 401 || sessionEndedNotice) return;
+    stopBackgroundRefreshes();
+    sessionEndedNotice = element("div", "banner-error");
+    sessionEndedNotice.setAttribute("role", "alert");
+    const signIn = element("a", "", "Sign in again");
+    signIn.href = "/login";
+    sessionEndedNotice.append(element("span", "", "Your session has ended, so nothing on this page can be loaded or changed. "), signIn);
+    (document.querySelector("main") ?? document.body).prepend(sessionEndedNotice);
+  };
+  const watchingSession = async (request) => {
+    try {
+      return await request();
+    } catch (error) {
+      noticeSessionEnded(error);
+      throw error;
+    }
+  };
+
+  // Every form's mutation crosses here, so every form is settled the moment
+  // the server accepts it, before the view refreshes -- never left holding
+  // what it just sent.
   const apiRequest = async (form, operation, body) => {
     const contract = await consoleApiContract();
-    return getOperationJson(fetch, contract, operation.method, operation.url, {
+    const value = await watchingSession(() => getOperationJson(fetch, contract, operation.method, operation.url, {
       credentials: "same-origin",
       csrf: form.querySelector('input[name="csrf"]')?.value,
       json: body,
-    });
+    }));
+    settleSavedForm(form);
+    return value;
   };
 
   const runFormSubmission = async (form, operation, explicitTrigger) => {
@@ -195,6 +257,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     try {
       return await operation();
     } finally {
+      // The refresh after a change rebuilds the rows it lists, and the button
+      // that was pressed goes with its row: focus fell to the document, and a
+      // keyboard user started again from the top of the page.
+      if (!form.isConnected && (document.activeElement === null || document.activeElement === document.body)) {
+        document.getElementById("console-main")?.focus();
+      }
       activeFormSubmissions.delete(form);
       if (previousBusy === null) form.removeAttribute("aria-busy");
       else form.setAttribute("aria-busy", previousBusy);
@@ -299,36 +367,39 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   const apiRead = async (url) => {
     const operation = apiOperation("GET", url);
-    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
+    const contract = await consoleApiContract();
+    return watchingSession(() => getOperationJson(fetch, contract, operation.method, operation.url, {
       cache: "no-store",
       credentials: "same-origin",
-    });
+    }));
   };
 
   const apiCollection = (value, field) => value[field];
 
+  // One refresh of a region at a time; a request made while one runs is
+  // answered by the next run. Each caller gets the outcome of the run that
+  // covers its request: a caller refreshing after a change used to get
+  // undefined -- read as success -- when its request was only queued, or when
+  // the refresh failed.
   const serializeRefresh = (refresh, reportQueued) => {
-    let running = false;
-    let queued = false;
+    let running = null;
+    let queued = null;
     let asked = false;
-    return async (byPerson = false) => {
+    const run = () => {
+      const announce = asked;
+      asked = false;
+      running = refresh(announce).finally(() => { running = null; });
+      return running;
+    };
+    return (byPerson = false) => {
       asked ||= byPerson;
-      if (running) {
-        queued = true;
-        if (byPerson) reportQueued();
-        return;
-      }
-      running = true;
-      try {
-        do {
-          queued = false;
-          const announce = asked;
-          asked = false;
-          await refresh(announce);
-        } while (queued);
-      } finally {
-        running = false;
-      }
+      if (!running) return run();
+      if (byPerson) reportQueued();
+      queued ??= running.catch(() => undefined).then(() => {
+        queued = null;
+        return run();
+      });
+      return queued;
     };
   };
 
@@ -401,6 +472,25 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (className) node.className = className;
     if (name === "th" && text === undefined) text = "Actions";
     if (text !== undefined) node.textContent = String(text);
+    return node;
+  };
+
+  // Every time the console shows, in one form and one zone: the API's UTC
+  // instants as "2026-09-28 14:05:09 UTC". The network page showed the
+  // browser's local time with no zone beside tables that showed raw UTC
+  // instants, so two times on one screen could not be compared.
+  const utcTime = (value) => {
+    const at = new Date(value);
+    if (typeof value !== "string" || Number.isNaN(at.getTime())) {
+      throw new Error(`The server returned an invalid time: ${String(value)}.`);
+    }
+    const instant = at.toISOString();
+    return `${instant.slice(0, 10)} ${instant.slice(11, 19)} UTC`;
+  };
+  // The same, as a <time> element carrying the instant itself.
+  const timeElement = (value) => {
+    const node = element("time", "", utcTime(value));
+    node.dateTime = value;
     return node;
   };
 
@@ -548,6 +638,29 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     button.type = "button";
     button.addEventListener("click", retry);
     return button;
+  };
+
+  // A page's result line. It says how the last thing asked for went, or that
+  // the page's data failed to load, with Retry. A load failure stays until a
+  // load succeeds: a Retry that worked used to leave the failure and its
+  // button on the page beside the data it had loaded.
+  const showResult = (node, message, success) => {
+    if (!(node instanceof HTMLElement)) return;
+    delete node.dataset.loadFailure;
+    node.replaceChildren(message);
+    node.className = success ? "banner-success" : "banner-error";
+  };
+  const showLoadFailure = (node, error, fallback, retry) => {
+    if (!(node instanceof HTMLElement)) return;
+    node.replaceChildren(element("span", "", error instanceof Error ? error.message : fallback), retryButton(retry));
+    node.className = "banner-error";
+    node.dataset.loadFailure = "true";
+  };
+  const clearLoadFailure = (node) => {
+    if (!(node instanceof HTMLElement) || node.dataset.loadFailure !== "true") return;
+    delete node.dataset.loadFailure;
+    node.replaceChildren();
+    node.className = "";
   };
 
   const tableLoadFailure = (body, columns, error, retry) => {
@@ -817,7 +930,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   }
 
-  const operationTime = (value, absent) => value === null ? absent : new Date(value).toLocaleString();
+  const operationTime = (value, absent) => value === null ? absent : utcTime(value);
 
   const networkOperationsHealth = (view) => {
     const health = element("div", "health-strip");
@@ -990,7 +1103,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
 
   const renderServerLog = (panel, entries) => {
-    const lines = entries.map((entry) => `${new Date(entry.at_ms).toISOString()} — ${entry.component} — ${entry.severity}: ${entry.message}`);
+    const lines = entries.map((entry) => `${utcTime(new Date(entry.at_ms).toISOString())} — ${entry.component} — ${entry.severity}: ${entry.message}`);
     fillLog(logIn(panel, "Live server logs"), lines, "No operational events have been recorded yet.");
   };
 
@@ -1066,14 +1179,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         overviewRoot.querySelector("[data-overview-metrics]").replaceChildren(...metrics.map(([label, value, detail]) => append(element("div", "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail))));
         overviewRoot.querySelector("[data-overview-counts]").replaceChildren(...[[stats.accounts, "Accounts"], [stats.registered_channels, "Registered channels"], [stats.server_bans, "Server bans"]].map(([value, label]) => append(element("div", "card"), element("div", "n", value), element("div", "l", label))));
         overviewSection(overviewRoot.querySelector("[data-overview-accounts]"), "Newest accounts", "/console/accounts", ["Name"], apiCollection(accounts, "accounts", "account directory").map((entry) => [entry.name]));
-        overviewSection(overviewRoot.querySelector("[data-overview-channels]"), "Newest registered channels", "/console/admin/channels", ["Channel", "Founder", "Registered (UTC)"], apiCollection(channels, "channels", "channel directory").map((entry) => [entry.name, entry.founder, entry.created_at]));
-        overviewSection(overviewRoot.querySelector("[data-overview-bans]"), "Newest server bans", "/console/bans", ["Kind", "Mask", "Reason", "Set by", "Created (UTC)"], apiCollection(bans, "bans", "server-ban directory").map((entry) => [entry.kind, entry.mask, entry.reason, entry.set_by, entry.created_at]));
-        overviewSection(overviewRoot.querySelector("[data-overview-audit]"), "Recent audited actions", "/console/audit", ["When (UTC)", "Actor", "Action", "Target", "Detail"], apiCollection(audit, "audit", "audit directory").map((entry) => [entry.at, entry.actor, entry.action, entry.target, entry.detail]));
+        overviewSection(overviewRoot.querySelector("[data-overview-channels]"), "Newest registered channels", "/console/admin/channels", ["Channel", "Founder", "Registered (UTC)"], apiCollection(channels, "channels", "channel directory").map((entry) => [entry.name, entry.founder, utcTime(entry.created_at)]));
+        overviewSection(overviewRoot.querySelector("[data-overview-bans]"), "Newest server bans", "/console/bans", ["Kind", "Mask", "Reason", "Set by", "Created (UTC)"], apiCollection(bans, "bans", "server-ban directory").map((entry) => [entry.kind, entry.mask, entry.reason, entry.set_by, utcTime(entry.created_at)]));
+        overviewSection(overviewRoot.querySelector("[data-overview-audit]"), "Recent audited actions", "/console/audit", ["When (UTC)", "Actor", "Action", "Target", "Detail"], apiCollection(audit, "audit", "audit directory").map((entry) => [utcTime(entry.at), entry.actor, entry.action, entry.target, entry.detail]));
+        clearLoadFailure(document.getElementById("overview-api-result"));
       } catch (error) {
-        const result = document.getElementById("overview-api-result");
-        if (!(result instanceof HTMLElement)) return;
-        result.replaceChildren(element("span", "", error instanceof Error ? error.message : "Overview failed to load."), retryButton(() => void refreshOverview()));
-        result.className = "banner-error";
+        // The heading said "Loading overview…" for as long as the page was open.
+        overviewRoot.querySelector("#overview").textContent = "Overview unavailable";
+        showLoadFailure(document.getElementById("overview-api-result"), error, "Overview failed to load.", () => void refreshOverview());
       }
     };
     void refreshOverview();
@@ -1348,11 +1461,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   };
 
-  const setConfigurationResult = (message, success) => {
-    if (!configurationResult) return;
-    configurationResult.textContent = message;
-    configurationResult.className = success ? "banner-success" : "banner-error";
-  };
+  const setConfigurationResult = (message, success) => showResult(configurationResult, message, success);
 
   let refreshConfiguration;
 
@@ -1368,6 +1477,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
 
   for (const form of document.querySelectorAll("[data-api-configuration-patch]")) {
+    preserveFormEdits(form);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       let body;
@@ -1383,6 +1493,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   for (const form of document.querySelectorAll("[data-api-network-create]")) {
     form.addEventListener("change", () => syncNetworkForm(form));
+    // `reset` fires before the fields are reset, and a reset fires no change.
+    form.addEventListener("reset", () => window.setTimeout(() => syncNetworkForm(form)));
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       let body;
@@ -1457,14 +1569,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
   }
 
+  // The settings form is refreshed after every change on the page -- adding an
+  // operator, removing a provider -- and a refresh that typed over it lost
+  // every setting changed there and not yet saved.
   const configurationValue = (form, name, value) => {
     const field = form.elements.namedItem(name);
-    if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) field.value = value ?? "";
+    if ((field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) && field.dataset.apiEdited !== "true") field.value = value ?? "";
   };
 
   const configurationChecked = (form, name, checked) => {
     const field = form.elements.namedItem(name);
-    if (field instanceof HTMLInputElement) field.checked = Boolean(checked);
+    if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.checked = Boolean(checked);
   };
 
   const configurationListeners = (listeners) => listeners.map((listener) => {
@@ -1533,7 +1648,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const revision = String(view.revision);
     root.querySelector("[data-configuration-revision]").textContent = `Revision ${revision}`;
     const provenance = root.querySelector("[data-configuration-provenance]");
-    provenance.replaceChildren(append(element("span", "", "Last changed by "), element("strong", "", view.updated_by)), element("span", "", view.updated_at));
+    provenance.replaceChildren(append(element("span", "", "Last changed by "), element("strong", "", view.updated_by)), timeElement(view.updated_at));
     const bootstrap = root.querySelector("[data-configuration-bootstrap]");
     const httpBind = runtime.http_bind || "dedicated WebSocket listener only";
     const release = runtime.release_revision || "not set";
@@ -1633,11 +1748,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     refreshConfiguration = async () => {
       try {
         renderConfiguration(configurationRoot, await apiRead("/api/v1/admin/configuration"));
+        clearLoadFailure(configurationResult);
       } catch (error) {
-        const result = document.getElementById("configuration-api-result");
-        if (!(result instanceof HTMLElement)) return false;
-        result.replaceChildren(element("span", "", error instanceof Error ? error.message : "Configuration failed to load."), retryButton(() => void refreshConfiguration()));
-        result.className = "banner-error";
+        showLoadFailure(configurationResult, error, "Configuration failed to load.", () => void refreshConfiguration());
         return false;
       }
       return true;
@@ -1671,7 +1784,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
         for (const ban of bans) {
           const row = document.createElement("tr");
-          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at, ban.expires_at || "Permanent"].forEach((value) => {
+          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, utcTime(ban.created_at), ban.expires_at ? utcTime(ban.expires_at) : "Permanent"].forEach((value) => {
             const cell = document.createElement("td");
             cell.textContent = String(value || "");
             row.append(cell);
@@ -1682,6 +1795,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           form.action = `/api/v1/admin/bans/${ban.id}`;
           form.dataset.apiBanDelete = "";
           form.dataset.confirm = `Remove ${ban.kind} ${ban.mask}?`;
+          form.dataset.removed = `Server ban on ${ban.mask} removed.`;
           const csrf = hiddenInput("csrf", adminBanRows.dataset.csrf || "");
           const id = hiddenInput("id", ban.id);
           const button = document.createElement("button");
@@ -1699,19 +1813,15 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       return true;
     };
-    void refreshBanDirectory();
+    if (!queryRefused) void refreshBanDirectory();
   }
-  const setBanResult = (message, success) => {
-    if (!banResult) return;
-    banResult.textContent = message;
-    banResult.className = success ? "banner-success" : "banner-error";
-  };
+  const setBanResult = (message, success) => showResult(banResult, message, success);
 
-  const mutateBan = (form, url, method, body) => runFormSubmission(form, async () => {
+  const mutateBan = (form, url, method, body, success) => runFormSubmission(form, async () => {
     try {
       await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(refreshBanDirectory);
-      setBanResult("Updated.", true);
+      setBanResult(success, true);
     } catch (error) {
       setBanResult(error instanceof Error ? error.message : "Server-ban request failed.", false);
     }
@@ -1737,7 +1847,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
         body.duration_minutes = minutes;
       }
-      void mutateBan(form, "/api/v1/admin/bans", "POST", body);
+      void mutateBan(form, "/api/v1/admin/bans", "POST", body, `Server ban on ${mask} added and enforced.`);
     });
   }
 
@@ -1752,20 +1862,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       setBanResult("The server-ban ID is invalid. Reload and try again.", false);
       return;
     }
-    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE");
+    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", undefined, form.dataset.removed || "Server ban removed.");
   });
 
   const sessionResult = document.getElementById("session-api-result");
-  const setSessionResult = (message, success) => {
-    if (!sessionResult) return;
-    sessionResult.textContent = message;
-    sessionResult.className = success ? "banner-success" : "banner-error";
-  };
+  const setSessionResult = (message, success) => showResult(sessionResult, message, success);
 
-  const mutateSession = (form, url, message, refresh) => runFormSubmission(form, async () => {
+  const mutateSession = (form, url, message, refresh, success) => runFormSubmission(form, async () => {
     try {
       await apiRequest(form, apiMutation("DELETE", url));
       await refresh();
+      setSessionResult(success, true);
     } catch (error) {
       setSessionResult(error instanceof Error ? error.message : message, false);
     }
@@ -1777,7 +1884,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const csrf = sessionPage.dataset.csrf;
     const browserSessions = sessionPage.querySelector("[data-api-browser-sessions]");
     const connections = sessionPage.querySelector("[data-api-live-connections]");
-    const filters = sessionPage.querySelector("[data-api-connection-filter]");
     const clear = sessionPage.querySelector("[data-api-session-clear]");
     const pagePath = own ? "/console/my-sessions" : "/console/sessions";
     const apiPath = own ? "/api/v1/me/connections" : "/api/v1/admin/connections";
@@ -1803,10 +1909,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       renderConnections(connectionData, query);
       if (own) renderBrowserSessions(await apiRead("/api/v1/me/sessions"));
     };
-    const refreshAfterMutation = async () => {
-      await refresh();
-      setSessionResult("Updated.", true);
-    };
     const renderBrowserSessions = (data) => {
       if (!(browserSessions instanceof HTMLElement)) return;
       browserSessions.replaceChildren();
@@ -1822,7 +1924,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         revokeOthers.append(csrfInput(), formButton("Sign out others", "danger"));
         revokeOthers.addEventListener("submit", (event) => {
           event.preventDefault();
-          void mutateSession(revokeOthers, "/api/v1/me/sessions?except=current", "Browser-session request failed.", refreshAfterMutation);
+          void mutateSession(revokeOthers, "/api/v1/me/sessions?except=current", "Browser-session request failed.", refresh, "Every other browser session was signed out.");
         });
         heading.append(revokeOthers);
       }
@@ -1843,14 +1945,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           revoke.append(csrfInput(), formButton("Sign out", "danger"));
           revoke.addEventListener("submit", (event) => {
             event.preventDefault();
-            void mutateSession(revoke, `/api/v1/me/sessions/${encodeURIComponent(row.id)}`, "Browser-session request failed.", refreshAfterMutation);
+            void mutateSession(revoke, `/api/v1/me/sessions/${encodeURIComponent(row.id)}`, "Browser-session request failed.", refresh, "That browser session was signed out.");
           });
           action.append(revoke);
         }
-        const created = element("time", "", row.created_at || "—");
-        created.dateTime = row.created_at || "";
-        const expires = element("time", "", row.expires_at || "—");
-        expires.dateTime = row.expires_at || "";
+        const created = timeElement(row.created_at);
+        const expires = timeElement(row.expires_at);
         body.append(append(element("tr"), element("td", "session-agent", row.user_agent || "Unknown browser"), element("td", "", sessionMethod(row)), element("td", "", created), element("td", "", expires), action));
       }
       const table = append(captionedTable("Browser sessions"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "Browser"), element("th", "", "Sign-in method"), element("th", "", "Created"), element("th", "", "Expires"), element("th", "", "Actions"))), body);
@@ -1873,8 +1973,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         for (const row of rows) {
           const client = append(element("td"), append(element("strong"), element("code", "", row.nick)), row.oper ? element("span", "tag", "oper") : document.createTextNode(""), append(element("div", "meta"), element("code", "", `${row.user}@${row.host}`)));
           const account = row.account ? element("code", "", row.account) : element("span", "meta", "—");
-          const connected = element("time", "", row.connected_at || "—");
-          connected.dateTime = row.connected_at || "";
+          const connected = timeElement(row.connected_at);
           const disconnect = document.createElement("form");
           disconnect.className = "cell-form";
           disconnect.dataset.confirm = `Disconnect connection ${row.id} (${row.nick})?`;
@@ -1886,7 +1985,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
             event.preventDefault();
             const value = reason.value.trim();
             const suffix = value ? `?reason=${encodeURIComponent(value)}` : "";
-            void mutateSession(disconnect, `${apiPath}/${encodeURIComponent(row.id)}${suffix}`, "Disconnect request failed.", refreshAfterMutation);
+            void mutateSession(disconnect, `${apiPath}/${encodeURIComponent(row.id)}${suffix}`, "Disconnect request failed.", refresh, `Connection ${row.id} (${row.nick}) was disconnected.`);
           });
           body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
         }
@@ -1895,33 +1994,16 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       connections.append(fillPager(element("div", "pager"), directoryPage(query, "before_id", data.next_before_id), "Showing the newest matching connections.", "Showing an older page.", "Older connections", pagePath));
     };
-    if (filters instanceof HTMLFormElement) {
-      const query = connectionQuery();
-      for (const input of filters.elements) {
-        if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = query.get(input.name) || (input.name === "limit" ? "50" : "");
-      }
-    }
     if (clear instanceof HTMLAnchorElement) clear.href = pagePath;
-    void refresh().catch((error) => {
-      setSessionResult(error instanceof Error ? error.message : "Session data could not be loaded.", false);
-    });
+    const load = () => refresh()
+      .then(() => clearLoadFailure(sessionResult))
+      .catch((error) => showLoadFailure(sessionResult, error, "Session data could not be loaded.", () => void load()));
+    if (!queryRefused) void load();
   }
 
   const accountResult = document.getElementById("account-api-result");
   const accountSecret = document.getElementById("account-api-secret");
-  const setAccountResult = (message, success) => {
-    if (!accountResult) return;
-    accountResult.textContent = message;
-    accountResult.className = success ? "banner-success" : "banner-error";
-  };
-  const accountLoadFailure = (error, retry) => {
-    if (!accountResult) return;
-    accountResult.replaceChildren(
-      element("span", "", error instanceof Error ? error.message : "Account data failed to load."),
-      retryButton(retry),
-    );
-    accountResult.className = "banner-error";
-  };
+  const setAccountResult = (message, success) => showResult(accountResult, message, success);
 
   const showAccountSecret = (kind, value) => {
     if (!accountSecret) return;
@@ -2025,10 +2107,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       for (const credential of credentials) {
         const row = element("tr");
         const label = credential.label || (credential.kind === "local_password" ? "Primary password" : "");
-        append(row, append(element("td"), element("span", "tag", credential.kind)), element("td", "", label), element("td", "", credential.created_at), element("td", "", credential.last_used_at || "Never"));
+        append(row, append(element("td"), element("span", "tag", credential.kind)), element("td", "", label), append(element("td"), timeElement(credential.created_at)), credential.last_used_at ? append(element("td"), timeElement(credential.last_used_at)) : element("td", "", "Never"));
         const actions = element("td");
         if (credential.kind === "app_password") {
-          const form = element("form", "cell-form"); form.method = "post"; form.action = `/api/v1/me/credentials/${encodeURIComponent(credential.id)}`; form.dataset.confirm = "Revoke this app password?";
+          const form = element("form", "cell-form"); form.method = "post"; form.action = `/api/v1/me/credentials/${encodeURIComponent(credential.id)}`; form.dataset.confirm = `Revoke the app password ${label}?`; form.dataset.removed = `App password ${label} revoked.`;
           form.dataset.apiAccountAccessDelete = "";
           const button = element("button", "danger", "Revoke"); button.type = "submit";
           form.append(hiddenInput("csrf", csrf), button); actions.append(form);
@@ -2066,10 +2148,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       for (const identity of identities) {
         const card = element("article");
-        const copy = element("div"); append(copy, element("strong", "", identity.issuer), element("code", "", identity.subject), element("small", "", `Linked ${identity.created_at}`));
+        const copy = element("div"); append(copy, element("strong", "", identity.issuer), element("code", "", identity.subject), element("small", "", `Linked ${utcTime(identity.created_at)}`));
         card.append(copy);
         if (identities.length > 1 || hasLocalPassword) {
-          const form = element("form"); form.method = "post"; form.action = `/api/v1/me/identities/${encodeURIComponent(identity.id)}`; form.dataset.confirm = "Unlink this identity and revoke its browser sessions?";
+          const form = element("form"); form.method = "post"; form.action = `/api/v1/me/identities/${encodeURIComponent(identity.id)}`; form.dataset.confirm = `Unlink ${identity.issuer} and revoke its browser sessions?`; form.dataset.removed = `${identity.issuer} unlinked.`;
           form.dataset.apiAccountAccessDelete = "";
           const button = element("button", "danger", "Unlink"); button.type = "submit";
           form.append(hiddenInput("csrf", csrf), button); card.append(form);
@@ -2128,9 +2210,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (accountContactEmail.dataset.apiEdited !== "true") {
           accountContactEmail.value = profile.contact_email ?? "";
         }
+        clearLoadFailure(accountResult);
       } catch (error) {
         if (revision !== profileReadRevision) return true;
-        accountLoadFailure(error, () => void refreshContactEmail());
+        showLoadFailure(accountResult, error, "Account data failed to load.", () => void refreshContactEmail());
         return false;
       }
       return true;
@@ -2201,7 +2284,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         for (const token of tokens) {
           const row = document.createElement("tr");
           const scopes = token.scopes.join(", ");
-          [token.label, scopes, token.created_at, token.expires_at].forEach((value) => {
+          [token.label, scopes, utcTime(token.created_at), utcTime(token.expires_at)].forEach((value) => {
             const cell = document.createElement("td");
             cell.textContent = String(value || "");
             row.append(cell);
@@ -2241,7 +2324,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const [refresh, success, failure] = form.matches("[data-api-account-token-delete]")
       ? [refreshTokens, "Token revoked.", "Token directory failed to load."]
       : form.matches("[data-api-account-access-delete]")
-        ? [refreshAccountAccess, "Updated.", "Account data failed to load."]
+        ? [refreshAccountAccess, form.dataset.removed || "Removed.", "Account data failed to load."]
         : [];
     if (success === undefined) return;
     event.preventDefault();
@@ -2300,7 +2383,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
         for (const event of activity) {
           const row = document.createElement("tr");
-          [event.at, event.action, event.actor, event.target, event.detail]
+          [utcTime(event.at), event.action, event.actor, event.target, event.detail]
             .forEach((value, index) => {
               const cell = document.createElement("td");
               cell.textContent = String(value || "");
@@ -2337,7 +2420,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           const target = document.createElement("code");
           target.textContent = String(marker.target || "");
           const timestamp = document.createElement("span");
-          timestamp.textContent = String(marker.timestamp || "");
+          timestamp.textContent = utcTime(marker.timestamp);
           entry.append(target, timestamp);
           accountReadMarkers.append(entry);
         }
@@ -2351,11 +2434,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   const adminAccountResult = document.getElementById("admin-account-api-result");
   const adminAccountSecret = document.getElementById("admin-account-api-secret");
   let refreshAdminAccounts;
-  const setAdminAccountResult = (message, success) => {
-    if (!adminAccountResult) return;
-    adminAccountResult.textContent = message;
-    adminAccountResult.className = success ? "banner-success" : "banner-error";
-  };
+  const setAdminAccountResult = (message, success) => showResult(adminAccountResult, message, success);
   const mutateAdminAccount = (form, method, body, failure) => submitMutation(
     form,
     method,
@@ -2395,7 +2474,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const csrf = adminAccountsPage.dataset.csrf || "";
     const invitationHost = adminAccountsPage.querySelector("[data-api-admin-invitations]");
     const accountHost = adminAccountsPage.querySelector("[data-api-admin-accounts]");
-    const filters = adminAccountsPage.querySelector("[data-api-admin-accounts-filter]");
     const capability = () => hiddenInput("csrf", csrf);
     const button = (text, className) => { const node = element("button", className, text); node.type = "submit"; return node; };
     // The page carries both directories' cursors; each API query takes only its own.
@@ -2403,16 +2481,18 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const pager = (text, cursor, parameter) => fillPager(element("div", "pager"), directoryPage(pageQuery(), parameter, cursor), "Showing the newest page.", "Showing an older page.", text, "/console/accounts");
     const renderInvitations = (data) => {
       if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = apiCollection(data, "invitations", "invitation directory");
-      if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = captionedTable("Pending account invitations"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
+      if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = captionedTable("Pending account invitations"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = timeElement(invitation.expires_at); body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
     };
     const renderAccounts = (data) => {
       if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
-      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = captionedTable("Account directory"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; form.append(capability(), hiddenInput(key === "suspension" ? "suspended" : "administrator", value), button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const { label: deletionLabel, control: confirmation } = labelledControl("input", "confirmation", `Type ${account.name} to delete`); confirmation.autocomplete = "off"; confirmation.required = true; deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
+      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = captionedTable("Account directory"); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td", "account-actions"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; form.append(capability(), hiddenInput(key === "suspension" ? "suspended" : "administrator", value), button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const { label: deletionLabel, control: confirmation } = labelledControl("input", "confirmation", `Type ${account.name} to delete`); confirmation.autocomplete = "off"; confirmation.required = true; deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = timeElement(account.created_at); const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "account-posture", loginMethods), element("td", "account-posture", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
     refreshAdminAccounts = async () => { const params = pageQuery(); const accounts = directoryQuery(params, ["name", "limit", "before_id"]); const invitations = directoryQuery(params, ["limit"]); if (params.has("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accountData, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${accounts}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accountData); renderInvitations(invitationData); };
-    if (filters instanceof HTMLFormElement) { const params = pageQuery(); for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = params.get(input.name) || ""; }
-    void refreshAdminAccounts().catch((error) => setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false));
+    const load = () => refreshAdminAccounts()
+      .then(() => clearLoadFailure(adminAccountResult))
+      .catch((error) => showLoadFailure(adminAccountResult, error, "Account directory failed to load.", () => void load()));
+    if (!queryRefused) void load();
   }
 
   const adminNetworkResult = document.getElementById("admin-network-api-result");
@@ -2448,6 +2528,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         form.method = "post";
         form.action = `/api/v1/admin/networks/${encodeURIComponent(network.owner)}/${encodeURIComponent(network.name)}`;
         form.dataset.apiAdminNetworkToggle = "";
+        form.dataset.networkLabel = `${network.owner}/${network.name}`;
         const csrf = hiddenInput("csrf", adminNetworkRows.dataset.csrf || "");
         const enabled = hiddenInput("enabled", !network.enabled);
         const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable";
@@ -2459,7 +2540,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (adminNetworkRows instanceof HTMLElement) {
     refreshAdminNetworks = async () => {
       try {
-        const query = directoryQuery(window.location.search, ["limit", "after"], { limit: "100" });
+        const query = directoryQuery(window.location.search, ["kind", "limit", "after"], { limit: "100" });
         const result = await apiRead(`/api/v1/admin/networks?${query}`);
         renderAdminNetworks(apiCollection(result, "networks", "network directory"));
         const pager = document.getElementById("admin-network-pager");
@@ -2470,7 +2551,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       return true;
     };
-    void refreshAdminNetworks();
+    if (!queryRefused) void refreshAdminNetworks();
   }
   document.addEventListener("submit", (event) => {
     const form = event.target;
@@ -2478,33 +2559,23 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     event.preventDefault();
     const enabled = fieldValue(new FormData(form), "enabled");
     if (enabled !== "true" && enabled !== "false") {
-      if (adminNetworkResult) {
-        adminNetworkResult.textContent = "The requested network state is invalid. Reload and try again.";
-        adminNetworkResult.className = "banner-error";
-      }
+      showResult(adminNetworkResult, "The requested network state is invalid. Reload and try again.", false);
       return;
     }
+    const name = form.dataset.networkLabel || "Network";
     void runFormSubmission(form, async () => {
       try {
         await apiRequest(form, apiMutation("PATCH", form.action), { enabled: enabled === "true" });
         await refreshAfterMutation(refreshAdminNetworks);
-        if (!adminNetworkResult) return;
-        adminNetworkResult.textContent = "Network state updated.";
-        adminNetworkResult.className = "banner-success";
+        showResult(adminNetworkResult, `${name} ${enabled === "true" ? "enabled" : "disabled"}.`, true);
       } catch (error) {
-        if (!adminNetworkResult) return;
-        adminNetworkResult.textContent = error instanceof Error ? error.message : "Network lifecycle change failed.";
-        adminNetworkResult.className = "banner-error";
+        showResult(adminNetworkResult, error instanceof Error ? error.message : "Network lifecycle change failed.", false);
       }
     });
   });
 
   const ownerNetworkResult = document.getElementById("network-api-result");
-  const setOwnerNetworkResult = (message, success) => {
-    if (!ownerNetworkResult) return;
-    ownerNetworkResult.textContent = message;
-    ownerNetworkResult.className = success ? "banner-success" : "banner-error";
-  };
+  const setOwnerNetworkResult = (message, success) => showResult(ownerNetworkResult, message, success);
 
   const ownerNetworkRows = document.querySelector("[data-api-owner-network-list]");
   const ownerNetworkCount = document.getElementById("owner-network-count");
@@ -2664,7 +2735,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   };
 
-  const mutateOwnerNetwork = async (form, url, method, body) => {
+  const mutateOwnerNetwork = async (form, url, method, body, success) => {
     const result = await submitMutation(
       form,
       method,
@@ -2684,7 +2755,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
     try {
       await refreshAfterMutation(ownerNetworkRefresher(form));
-      setOwnerNetworkResult("Updated.", true);
+      setOwnerNetworkResult(success, true);
     } catch (error) {
       showOwnerNetworkFailure(form, error);
     }
@@ -2707,7 +2778,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         : kind === "slack"
           ? { ...base, sasl_account: secretValue(fields, "sasl_account") }
           : base;
-      void mutateOwnerNetwork(form, form.action, "POST", body);
+      void mutateOwnerNetwork(form, form.action, "POST", body, `Bridge ${name} added.`);
     });
   }
 
@@ -2737,7 +2808,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   for (const form of document.querySelectorAll("[data-api-owner-bridge-update]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      void mutateOwnerNetwork(form, form.action, "PUT", bridgeUpdate(form));
+      void mutateOwnerNetwork(form, form.action, "PUT", bridgeUpdate(form), "Bridge saved; its connection was replaced.");
     });
   }
 
@@ -2745,48 +2816,56 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (integrations instanceof HTMLElement) {
     const account = integrations.dataset.account || "";
     const csrf = integrations.dataset.csrf || "";
-    const render = (networks) => {
-      for (const kind of ["matrix", "discord", "slack"]) {
-        const target = integrations.querySelector(`[data-integration-list="${kind}"]`);
-        const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
-        if (!(target instanceof HTMLElement)) continue;
-        const entries = networks.filter((network) => network.kind === kind);
-        if (count) count.textContent = String(entries.length);
-        target.replaceChildren();
-        if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
-        const table = captionedTable(`${kind[0].toUpperCase()}${kind.slice(1)} bridges`);
-        table.append(append(document.createElement("thead"), append(element("tr"), ...["Status", "Network", "Owner", "Actions"].map((heading) => element("th", "", heading)))));
-        const body = document.createElement("tbody");
-        for (const network of entries) {
-          const row = document.createElement("tr"); const runtime = network.runtime;
-          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state));
-          const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
-          const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
-          const actions = document.createElement("td"); actions.className = "row-actions";
-          if (network.owner === account && network.shared !== true && network.configured !== true) {
-            for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
-            const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = hiddenInput("csrf", csrf); const enabled = hiddenInput("enabled", !network.enabled); const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
-            const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = hiddenInput("csrf", csrf); const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
-          } else actions.textContent = network.shared === true || network.configured === true ? "Managed configuration" : `Managed by ${network.owner}`;
-          row.append(status, name, owner, actions); body.append(row);
-        }
-        table.append(body); target.append(scrollRegion(`${kind} bridges`, table));
+    // One platform's list, from a read of exactly its kind. Filtering one
+    // page of every network by kind here showed a platform's count and list
+    // for that page only: a bridge past the first hundred networks of any kind
+    // was missing, and its platform said it had none.
+    const render = (kind, target, count, entries, nextAfter) => {
+      if (count) count.textContent = nextAfter === null ? String(entries.length) : `${entries.length}+`;
+      target.replaceChildren();
+      if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); return; }
+      const table = captionedTable(`${kind[0].toUpperCase()}${kind.slice(1)} bridges`);
+      table.append(append(document.createElement("thead"), append(element("tr"), ...["Status", "Network", "Owner", "Actions"].map((heading) => element("th", "", heading)))));
+      const body = document.createElement("tbody");
+      for (const network of entries) {
+        const row = document.createElement("tr"); const runtime = network.runtime;
+        const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state));
+        const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
+        const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
+        const actions = document.createElement("td"); actions.className = "row-actions";
+        if (network.owner === account && network.shared !== true && network.configured !== true) {
+          for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
+          const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = hiddenInput("csrf", csrf); const enabled = hiddenInput("enabled", !network.enabled); const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
+          const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = hiddenInput("csrf", csrf); const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
+        } else actions.textContent = network.shared === true || network.configured === true ? "Managed configuration" : `Managed by ${network.owner}`;
+        row.append(status, name, owner, actions); body.append(row);
+      }
+      table.append(body); target.append(scrollRegion(`${kind} bridges`, table));
+      // The inventory's largest page; the rest of a platform's bridges are
+      // one link away, in the fleet view filtered to that platform.
+      if (nextAfter !== null) {
+        const more = element("a", "secondary-link", `More ${kind} bridges`);
+        more.href = `/console/admin/networks?${new URLSearchParams({ kind, limit: "1000", after: nextAfter })}`;
+        target.append(more);
+      }
+    };
+    const refreshPlatform = async (target) => {
+      const kind = target.dataset.integrationList || "";
+      const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
+      try {
+        const result = await apiRead(`/api/v1/admin/networks?${new URLSearchParams({ kind, limit: "1000" })}`);
+        render(kind, target, count, apiCollection(result, "networks", "integration directory"), result.next_after);
+        return true;
+      } catch (error) {
+        if (count) count.textContent = "—";
+        listLoadFailure(target, error, () => void refreshPlatform(target));
+        return false;
       }
     };
     refreshIntegrations = async () => {
-      try {
-        const query = directoryQuery(window.location.search, ["limit", "after"], { limit: "100" });
-        const result = await apiRead(`/api/v1/admin/networks?${query}`);
-        render(apiCollection(result, "networks", "integration directory"));
-        const pager = integrations.querySelector("[data-integration-pager]");
-        if (pager instanceof HTMLElement) fillPager(pager, directoryPage(query, "after", result.next_after), "Showing the first networks.", "Showing a later page.", "More networks", "/console/integrations");
-      } catch (error) {
-        integrations.querySelectorAll("[data-integration-list]").forEach((target) => {
-          if (target instanceof HTMLElement) listLoadFailure(target, error, () => void refreshIntegrations());
-        });
-        return false;
-      }
-      return true;
+      const platforms = Array.from(integrations.querySelectorAll("[data-integration-list]"));
+      const loaded = await Promise.all(platforms.map(refreshPlatform));
+      return loaded.every(Boolean);
     };
     void refreshIntegrations();
   }
@@ -2811,8 +2890,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       refreshOwnerBridgeEditor = async () => {
         try {
           render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
+          clearLoadFailure(ownerNetworkResult);
         } catch (error) {
-          setOwnerNetworkResult(error instanceof Error ? error.message : "Bridge configuration failed to load.", false);
+          // The form stays hidden until the bridge is read, so a failure
+          // without Retry left nothing on the page to do.
+          showLoadFailure(ownerNetworkResult, error, "Bridge configuration failed to load.", () => void refreshOwnerBridgeEditor());
           return false;
         }
         return true;
@@ -2833,27 +2915,23 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         setOwnerNetworkResult("The requested network state is invalid. Reload and try again.", false);
         return;
       }
-      void mutateOwnerNetwork(form, form.action, "PATCH", { enabled: enabled === "true" });
+      const name = decodeURIComponent(new URL(form.action).pathname.split("/").pop() || "");
+      void mutateOwnerNetwork(form, form.action, "PATCH", { enabled: enabled === "true" }, `${name} ${enabled === "true" ? "enabled" : "disabled"}.`);
     } else if (form.matches("[data-api-owner-network-delete]")) {
       event.preventDefault();
-      void mutateOwnerNetwork(form, form.action, "DELETE");
+      const name = decodeURIComponent(new URL(form.action).pathname.split("/").pop() || "");
+      void mutateOwnerNetwork(form, form.action, "DELETE", undefined, `${name} removed.`);
     }
   });
 
   const ownerNetworkDetail = document.querySelector("[data-api-owner-network-detail]");
   if (ownerNetworkDetail instanceof HTMLElement) {
     const name = ownerNetworkDetail.dataset.networkName || "";
-    let currentNetwork = null;
     const setField = (field, value) => { const node = ownerNetworkDetail.querySelector(`[data-network-field="${field}"]`); if (node) node.textContent = value; };
     const detailResult = document.getElementById("network-api-result");
-    const showFailure = (error, retry) => {
-      if (!(detailResult instanceof HTMLElement)) return;
-      detailResult.replaceChildren(element("span", "", error instanceof Error ? error.message : "Network details failed to load."), retryButton(retry));
-      detailResult.className = "banner-error";
-    };
+    const showFailure = (error, retry) => showLoadFailure(detailResult, error, "Network details failed to load.", retry);
     const render = (network) => {
-      currentNetwork = network;
-      if (detailResult instanceof HTMLElement) { detailResult.replaceChildren(); detailResult.className = ""; }
+      clearLoadFailure(detailResult);
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
@@ -2879,8 +2957,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (chat instanceof HTMLAnchorElement) chat.href = `/?network=${encodeURIComponent(network.name)}`;
         // The credentials live in one editor; this page points at it rather
         // than carrying a second form with rules of its own.
-        const settings = accountSetup.querySelector("[data-network-settings]");
-        if (settings instanceof HTMLAnchorElement) {
+        for (const settings of accountSetup.querySelectorAll("a[data-network-settings]")) {
           settings.href = `/?network=${encodeURIComponent(network.name)}&settings=1`;
         }
         const warning = accountSetup.querySelector("[data-network-registration-warning]");
@@ -2943,14 +3020,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
-        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.successor ? `${channel.founder} (successor ${channel.successor})` : channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = hiddenInput("csrf", adminChannelRows.dataset.csrf || ""); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
+        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.successor ? `${channel.founder} (successor ${channel.successor})` : channel.founder, utcTime(channel.created_at), `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; form.dataset.removed = `${channel.name} unregistered.`; const csrf = hiddenInput("csrf", adminChannelRows.dataset.csrf || ""); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
       } catch (error) {
         tableLoadFailure(adminChannelRows, 7, error, () => void refreshAdminChannelDirectory());
         return false;
       }
       return true;
     };
-    void refreshAdminChannelDirectory();
+    if (!queryRefused) void refreshAdminChannelDirectory();
   }
 
   const adminAuditRows = document.querySelector("[data-api-admin-audit-list]");
@@ -2977,7 +3054,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         }
         for (const entry of entries) {
           const row = document.createElement("tr");
-          [entry.id, entry.at, entry.actor, entry.action, entry.target, entry.detail]
+          [entry.id, utcTime(entry.at), entry.actor, entry.action, entry.target, entry.detail]
             .forEach((value, index) => {
               const cell = document.createElement("td");
               cell.textContent = String(value || "");
@@ -2992,24 +3069,20 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         tableLoadFailure(adminAuditRows, 6, error, () => void refreshAuditDirectory());
       }
     };
-    void refreshAuditDirectory();
+    if (!queryRefused) void refreshAuditDirectory();
   }
 
-  const setChannelResult = (message, success) => {
-    if (!channelResult) return;
-    channelResult.textContent = message;
-    channelResult.className = success ? "banner-success" : "banner-error";
-  };
+  const setChannelResult = (message, success) => showResult(channelResult, message, success);
 
   let refreshOwnedChannels;
   const channelRefresher = () => ownedChannelList instanceof HTMLElement
     ? refreshOwnedChannels
     : refreshAdminChannelDirectory;
-  const mutateChannel = (form, url, method, body) => runFormSubmission(form, async () => {
+  const mutateChannel = (form, url, method, body, success) => runFormSubmission(form, async () => {
     try {
       await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(channelRefresher());
-      setChannelResult("Updated.", true);
+      setChannelResult(success, true);
     } catch (error) {
       setChannelResult(error instanceof Error ? error.message : "Channel request failed.", false);
     }
@@ -3040,21 +3113,23 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const card = element("article", "panel channel-control");
         const access = apiCollection(channel, "access", "channel access");
         card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${channel.successor ? `Successor ${channel.successor}` : "No successor"} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
-        const topic = form(url, (node) => { const { label, control: area } = labelledControl("textarea", "topic", "Retained topic"); area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; node.append(label); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
-        const lock = form(url, (node) => { const { label, control } = labelledControl("input", "mlock", "Mode lock"); control.value = channel.mlock || ""; node.append(label); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
-        const keep = form(url, (node) => { const select = namedControl("select", "enabled", `Topic retention for ${channel.name}`); for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));
+        const topic = form(url, (node) => { const { label, control: area } = labelledControl("textarea", "topic", "Retained topic"); area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; node.append(label); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }, `Retained topic of ${channel.name} saved.`));
+        const lock = form(url, (node) => { const { label, control } = labelledControl("input", "mlock", "Mode lock"); control.value = channel.mlock || ""; node.append(label); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }, `Mode lock of ${channel.name} saved.`));
+        const keep = form(url, (node) => { const select = namedControl("select", "enabled", `Topic retention for ${channel.name}`); for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }, `Topic retention of ${channel.name} applied.`));
         const controls = element("div", "channel-control-grid"); controls.append(topic, lock, keep); card.append(controls);
         const grants = element("section", "control-block access-control"); grants.append(element("h3", "", "Channel access"));
-        for (const grant of access) { const row = element("div", "compact-list"); row.append(element("code", "", grant.account), element("span", "tag", `+${grant.flags}`)); const remove = form(`${url}/access/${encodeURIComponent(grant.account)}`, () => {}); submit(remove, "Remove", (node) => mutateChannel(node, node.action, "DELETE"), `Remove ${grant.account} from ${channel.name} access?`); row.append(remove); grants.append(row); }
-        const add = form(`${url}/access`, (node) => { node.append(namedControl("input", "account", `Account to grant access on ${channel.name}`)); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) node.append(labelledControl("input", name, text, "check").label); }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }); }); grants.append(add); card.append(grants);
-        const transfer = form(url, (node) => { node.append(namedControl("input", "account", `New founder account for ${channel.name}`)); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
-        const drop = form(url, () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE"), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
+        for (const grant of access) { const row = element("div", "compact-list"); row.append(element("code", "", grant.account), element("span", "tag", `+${grant.flags}`)); const remove = form(`${url}/access/${encodeURIComponent(grant.account)}`, () => {}); submit(remove, "Remove", (node) => mutateChannel(node, node.action, "DELETE", undefined, `${grant.account} removed from ${channel.name} access.`), `Remove ${grant.account} from ${channel.name} access?`); row.append(remove); grants.append(row); }
+        const add = form(`${url}/access`, (node) => { node.append(namedControl("input", "account", `Account to grant access on ${channel.name}`)); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) node.append(labelledControl("input", name, text, "check").label); }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }, `Access for ${account} on ${channel.name} saved.`); }); grants.append(add); card.append(grants);
+        const transfer = form(url, (node) => { node.append(namedControl("input", "account", `New founder account for ${channel.name}`)); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }, `${channel.name} transferred to ${account}.`); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
+        const drop = form(url, () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE", undefined, `${channel.name} unregistered.`), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
       }
     };
     refreshOwnedChannels = async () => {
       renderOwnedChannels(await apiRead("/api/v1/me/channels"));
     };
-    void refreshOwnedChannels().catch((error) => { ownedChannelList.textContent = error instanceof Error ? error.message : "Registered channels failed to load."; });
+    const load = () => refreshOwnedChannels()
+      .catch((error) => listLoadFailure(ownedChannelList, error, () => void load()));
+    void load();
   }
 
   for (const form of document.querySelectorAll("[data-api-channel-register]")) {
@@ -3065,7 +3140,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         setChannelResult("Enter the channel to register.", false);
         return;
       }
-      void mutateChannel(form, form.action, "POST", { name });
+      void mutateChannel(form, form.action, "POST", { name }, `${name} registered to your account.`);
     });
   }
 
@@ -3076,7 +3151,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-admin-channel-drop]")) return;
     event.preventDefault();
-    void mutateChannel(form, form.action, "DELETE");
+    void mutateChannel(form, form.action, "DELETE", undefined, form.dataset.removed || "Channel unregistered.");
   });
 
   for (const field of document.querySelectorAll('input[type="password"]')) addRevealControl(field);

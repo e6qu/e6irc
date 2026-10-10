@@ -111,3 +111,9 @@ name = "link_frames"
 path = "fuzz_targets/link_frames.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "held_bodies"
+path = "fuzz_targets/held_bodies.rs"
+test = false
+doc = false

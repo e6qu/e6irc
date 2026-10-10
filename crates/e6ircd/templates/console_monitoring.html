@@ -6,10 +6,12 @@
       <h1>Monitoring</h1>
       <p class="lede">Live process health, IRC traffic, connection pressure, upstream availability, latency, and errors.</p>
     </div>
+    {% if minutes.is_some() %}
     <div>
       <span class="live-pill"><span class="pulse"></span>Live</span>
       <button type="button" data-refresh-target="#monitoring-panel">Refresh</button>
     </div>
+    {% endif %}
   </div>
   <div class="monitoring-toolbar">
     <strong>History window</strong>
@@ -20,6 +22,8 @@
       {% endfor %}
     </div>
   </div>
+  {% include "console_query_refusal.html" %}
+  {% if let Some(minutes) = minutes %}
   <div id="monitoring-panel"
        data-api-admin-monitoring
        data-minutes="{{ minutes }}"
@@ -28,4 +32,5 @@
     <div class="chart-empty">Loading monitoring data…</div>
   </div>
   <p id="monitoring-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
+  {% endif %}
 {% endblock %}

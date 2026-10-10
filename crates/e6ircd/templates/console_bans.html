@@ -53,28 +53,29 @@
         <h2>Find a ban</h2>
         <p>Matches the whole mask, ignoring case.</p>
       </div>
-      {% if has_filters || has_cursor %}
+      {% if filters.narrowed() %}
         <a class="secondary-link" href="/console/bans">Clear</a>
       {% endif %}
     </div>
+    {% include "console_query_refusal.html" %}
     <form class="field-grid" method="get" action="/console/bans">
       <label class="field">
         <span>Policy kind</span>
         <select name="kind">
           <option value="">All kinds</option>
-          <option value="kline"{% if kind == "kline" %} selected{% endif %}>K-Line</option>
-          <option value="dline"{% if kind == "dline" %} selected{% endif %}>D-Line</option>
-          <option value="xline"{% if kind == "xline" %} selected{% endif %}>X-Line</option>
+          <option value="kline"{% if filters.value("kind") == "kline" %} selected{% endif %}>K-Line</option>
+          <option value="dline"{% if filters.value("kind") == "dline" %} selected{% endif %}>D-Line</option>
+          <option value="xline"{% if filters.value("kind") == "xline" %} selected{% endif %}>X-Line</option>
         </select>
       </label>
       <label class="field">
         <span>Mask</span>
-        <input name="mask" value="{{ mask }}" maxlength="512" autocomplete="off"
+        <input name="mask" value="{{ filters.value("mask") }}" maxlength="512" pattern="\S(?:.*\S)?" title="The whole value, with no spaces before or after it" autocomplete="off"
                placeholder="*@bad.example" />
       </label>
       <label class="field">
         <span>Rows per page</span>
-        <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"
+        <input type="number" name="limit" value="{{ filters.value_or("limit", "50") }}" min="1" max="1000"
                inputmode="numeric" required />
       </label>
       <div class="form-actions field-wide">
@@ -96,12 +97,12 @@
         <caption class="sr-only">Persisted server-ban policy</caption>
         <thead><tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th>Expires (UTC)</th><th>Actions</th></tr></thead>
         <tbody id="admin-ban-rows" data-api-admin-ban-list data-csrf="{{ shell.csrf }}">
-          <tr><td colspan="8" class="empty">Loading server bans…</td></tr>
+          <tr><td colspan="8" class="empty">{% if filters.refused() %}Correct the filter above to list server bans.{% else %}Loading server bans…{% endif %}</td></tr>
         </tbody>
       </table>
     </div>
     <div class="pager" id="admin-ban-pager">
-      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching rules.{% endif %}</span>
+      <span class="meta">{% if filters.value("before_id") != "" %}Showing an older page.{% else %}Showing the newest matching rules.{% endif %}</span>
     </div>
   </section>
 {% endblock %}

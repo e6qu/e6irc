@@ -23,6 +23,7 @@ const PAGE_STATE = new Map([
   ["reconnectTimer", "cleared by stopLiveConnection, which the reset runs"],
   ["terminalSocket", "set by stopLiveConnection, cleared by connect()"],
   ["nextSendId", "request ids only need to be unique for the page"],
+  ["receivedRows", "row order only needs to increase for the page"],
   ["pendingSends", "rejected into input history by the reset"],
   ["sentHistory", "input history is the person's, and how a rejected send is retried"],
   ["historyIdx", "position in the person's input history"],

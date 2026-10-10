@@ -22,6 +22,10 @@ screenshots in a platform directory (`…/linux/`, ignored by git): a local run
 compares against local renders, and `--update-snapshots` there never
 overwrites the committed baselines. Only a macOS run changes those.
 
+`pnpm test:visual` starts its own Vite server on port 4173 and refuses a busy
+port rather than reusing whatever answers there, which may be another
+checkout's code. Set `E6IRC_VISUAL_PORT` to run beside another copy.
+
 The production bundle has no runtime package dependencies; the chat client is
 implemented with browser DOM and WebSocket APIs.
 

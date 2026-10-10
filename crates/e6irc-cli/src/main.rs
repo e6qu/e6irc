@@ -178,7 +178,9 @@ enum Command {
     /// it (by echo-message) or refused it. A server without echo-message
     /// cannot confirm delivery, and the command fails before sending.
     Send { target: String, message: String },
-    /// Follow messages sent to a channel/nick, printing one per line. A server
+    /// Follow a conversation, printing one message per line: a channel, a
+    /// direct conversation with a nick (what they send you and what you send
+    /// them), or with your own nick every direct message sent to you. A server
     /// silent for three minutes is sent a PING; one silent for three more ends
     /// the command with a failure.
     Tail {
@@ -194,13 +196,14 @@ enum Command {
     /// to stdout, and each refusal (an error numeric or FAIL) to stderr. Exits
     /// nonzero when any line was refused.
     Raw,
-    /// Print the most recent history of a channel via CHATHISTORY.
+    /// Print the most recent history of a channel, or of a direct
+    /// conversation with a nick (both directions), via CHATHISTORY.
     History {
         target: String,
         /// Lines to print: at most the server's CHATHISTORY limit, which a
         /// larger count is cut to with a warning.
-        #[arg(long, default_value_t = 20)]
-        count: usize,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
+        count: u64,
     },
     /// Make one bounded authenticated HTTP/HTTPS REST API request and print
     /// the response body. Exit status is nonzero on a non-2xx response.
@@ -407,6 +410,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         } => {
             let mut tail = Tail {
                 target: &target,
+                own_nick: &own_nick,
                 wanted: (count != 0).then_some(count),
                 json,
                 names: NetworkNames::default(),
@@ -418,6 +422,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             tail.follow(&mut conn, LIVENESS_WINDOW, &mut stdout).await
         }
         Command::History { target, count } => {
+            let count = usize::try_from(count).unwrap_or(usize::MAX);
             conn.require_capabilities(
                 &["batch", "draft/chathistory", "server-time"],
                 |event: RelayEvent| {
@@ -438,15 +443,19 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 );
             }
             let names = conn.names().clone();
-            for event in conn.join_with_latest_history(&target, count).await? {
+            // A channel is joined to read it; a direct conversation has
+            // nothing to join, and a JOIN of a nick is refused.
+            let events = if names.is_channel(&target) {
+                conn.join_with_latest_history(&target, count).await?
+            } else {
+                conn.latest_history(&target, count).await?
+            };
+            for event in events {
                 let Some(message) = reported(event) else {
                     continue;
                 };
                 if matches!(message.command.as_str(), "PRIVMSG" | "NOTICE")
-                    && message
-                        .params
-                        .first()
-                        .is_some_and(|candidate| names.eq(candidate, &target))
+                    && in_conversation(&names, &own_nick, &target, &message)
                 {
                     let from = message
                         .source
@@ -612,9 +621,41 @@ async fn finish_quietly(
     }
 }
 
+/// Whether `message` belongs to the conversation `target` names, seen by
+/// `own_nick`: a channel's messages; with another nick, what they sent this
+/// client and what this client sent them; with this client's own nick, every
+/// direct message sent to it. The server relays a message with the *sender's*
+/// spelling of each name, so every comparison folds case under the network's
+/// CASEMAPPING — a raw equality would silently miss messages.
+fn in_conversation(
+    names: &NetworkNames,
+    own_nick: &str,
+    target: &str,
+    message: &OwnedMessage,
+) -> bool {
+    let Some(to) = message.params.first() else {
+        return false;
+    };
+    if names.is_channel(target) || names.eq(target, own_nick) {
+        return names.eq(to, target);
+    }
+    let Some(from) = message
+        .source
+        .as_deref()
+        .and_then(|source| source.split('!').next())
+    else {
+        return false;
+    };
+    (names.eq(from, target) && names.eq(to, own_nick))
+        || (names.eq(from, own_nick) && names.eq(to, target))
+}
+
 /// What `tail` follows and how it prints.
 struct Tail<'a> {
     target: &'a str,
+    /// The nickname the server registered this client under: a direct
+    /// conversation is the messages between it and the target.
+    own_nick: &'a str,
     /// Stop after this many messages; `None` follows until the server goes.
     wanted: Option<usize>,
     json: bool,
@@ -701,15 +742,8 @@ impl Tail<'_> {
         message: &OwnedMessage,
         out: &mut impl std::io::Write,
     ) -> std::io::Result<Option<std::io::Result<()>>> {
-        // The server relays a channel message with the *sender's* spelling of
-        // the target, so the comparison must fold case under the network's
-        // CASEMAPPING — a raw equality would silently miss messages sent to a
-        // differently-cased name.
         if message.command != "PRIVMSG"
-            || !message
-                .params
-                .first()
-                .is_some_and(|target| self.names.eq(target, self.target))
+            || !in_conversation(&self.names, self.own_nick, self.target, message)
         {
             return Ok(None);
         }
@@ -1000,6 +1034,7 @@ mod tests {
         let window = std::time::Duration::from_millis(150);
         let mut tail = Tail {
             target: "bob",
+            own_nick: "me",
             wanted: None,
             json: false,
             names: NetworkNames::default(),
@@ -1091,6 +1126,7 @@ mod tests {
         let mut connection = Connection::connect(&address).await.unwrap();
         let mut tail = Tail {
             target: "#a[",
+            own_nick: "me",
             wanted: Some(LINES),
             json: false,
             names: NetworkNames::default(),
@@ -1263,5 +1299,29 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["text"], hostile);
         assert_eq!(parsed["tags"][0]["value"], hostile);
+    }
+
+    fn line(raw: &str) -> OwnedMessage {
+        OwnedMessage::from(&e6irc_proto::message::Message::parse(raw).unwrap())
+    }
+
+    /// A direct conversation is both directions between this client and the
+    /// nick; `tail bob` printed nothing forever, because nothing is ever
+    /// addressed *to* bob on this client's connection.
+    #[test]
+    fn a_conversation_is_a_channel_or_both_directions_with_a_nick() {
+        let names = NetworkNames::default();
+        let belongs = |target: &str, raw: &str| in_conversation(&names, "Me", target, &line(raw));
+        // A channel, under the network's case mapping.
+        assert!(belongs("#Room", ":x!u@h PRIVMSG #room :hi"));
+        assert!(!belongs("#room", ":x!u@h PRIVMSG #other :hi"));
+        // A nick: what they sent this client, and what it sent them.
+        assert!(belongs("bob", ":Bob!u@h PRIVMSG me :to me"));
+        assert!(belongs("bob", ":me!u@h PRIVMSG BOB :to bob"));
+        assert!(!belongs("bob", ":carol!u@h PRIVMSG me :someone else"));
+        assert!(!belongs("bob", ":bob!u@h PRIVMSG #room :in a channel"));
+        // This client's own nick: every direct message sent to it.
+        assert!(belongs("me", ":carol!u@h PRIVMSG Me :hello"));
+        assert!(!belongs("me", ":me!u@h PRIVMSG carol :sent"));
     }
 }
