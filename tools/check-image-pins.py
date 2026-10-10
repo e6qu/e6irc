@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Every container image this repository pulls is pinned by digest, one each.
+"""Every container image this repository pulls is pinned by digest, one each,
+and none is pulled from Docker Hub.
 
 A tag can be moved to other code; a digest cannot. In every tracked file other
 than documentation (`*.md`), each image reference must carry `@sha256:`:
 
   - `FROM IMAGE` (and `COPY --from=IMAGE`) in a Dockerfile or Containerfile,
-    other than an earlier build stage;
+    other than an earlier build stage, and its `# syntax=IMAGE` frontend;
   - `image: IMAGE` and `container: IMAGE` in a workflow or compose file (a job
-    container, a service container, a compose service);
+    container, a service container, a compose service), and BuildKit's
+    `driver-opts: image=IMAGE`;
   - the image operand of `docker run` / `docker create` / `docker pull`, in a
     shell script or a workflow's `run:` step.
 
@@ -18,6 +20,12 @@ other mention of an image found above, anywhere else (a Python constant, a
 script's default value), must carry the digest too, and every reference to one
 `NAME:TAG` must carry the same digest: a script that runs a pinned image by its
 tag alone, or by another digest than CI, runs an image CI never qualified.
+
+Each reference also names its registry, and that registry is not Docker Hub:
+Docker Hub limits anonymous pulls per address, and the shared CI runners
+exhaust that limit. Docker's official images come from their copy at
+public.ecr.aws/docker/library, other Docker Hub images from mirror.gcr.io, at
+the index digest Docker Hub serves for the tag.
 """
 
 from __future__ import annotations
@@ -40,6 +48,20 @@ FLAGS = frozenset(
     "-d --detach --rm -i --interactive -t --tty -it -ti --init --privileged "
     "--read-only -q --quiet --all-tags -a --disable-content-trust".split()
 )
+
+
+# A first path component that names a registry host; anything else (`postgres`,
+# `matrixconduit/matrix-conduit`) is a Docker Hub repository.
+DOCKER_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
+
+
+def from_docker_hub(name: str) -> bool:
+    first, _, rest = name.partition("/")
+    if not rest:
+        return True
+    if "." not in first and ":" not in first and first != "localhost":
+        return True
+    return first in DOCKER_HUB_HOSTS
 
 
 # This guard's contract test writes unpinned references on purpose.
@@ -105,6 +127,9 @@ def references(path: Path, text: str) -> list[tuple[int, str]]:
     lines = text.splitlines()
     if is_dockerfile(path):
         stages: set[str] = set()
+        syntax = re.match(r"^#\s*syntax\s*=\s*(\S+)\s*$", lines[0]) if lines else None
+        if syntax and not dynamic(syntax.group(1)):
+            found.append((1, syntax.group(1)))
         for number, line in logical_lines(lines):
             words = line.split()
             if not words or words[0].startswith("#"):
@@ -137,6 +162,10 @@ def references(path: Path, text: str) -> list[tuple[int, str]]:
                 key = re.match(r"^\s*-?\s*(image|container):\s*(\S+)\s*$", code)
                 if key and not dynamic(key.group(2)) and key.group(2) not in local:
                     found.append((number, key.group(2).strip("'\"")))
+                driver = re.match(r"^\s*driver-opts:\s*\|?\s*(.*)$", code)
+                for option in re.findall(r"(?:^|[\s,])image=(\S+?)(?=,|\s|$)", driver.group(1) if driver else ""):
+                    if not dynamic(option):
+                        found.append((number, option.strip("'\"")))
             for match in re.finditer(r"docker\s+(run|create|pull)\s+(.*)", code):
                 # The command ends at a shell operator or the end of a `$(…)`.
                 command = re.split(r"[);|&`]", match.group(2), maxsplit=1)[0]
@@ -181,6 +210,8 @@ def check(root: Path) -> tuple[list[str], int]:
                 continue
             if parsed.group("digest") is None:
                 problems.append(f"{where}: {image} is not pinned by digest")
+            if from_docker_hub(parsed.group("name")):
+                problems.append(f"{where}: {image} is pulled from Docker Hub")
             named.add(parsed.group("name") + (f":{parsed.group('tag')}" if parsed.group("tag") else ""))
 
     # Every mention of a referenced NAME:TAG, in any file: pinned, and to one digest.

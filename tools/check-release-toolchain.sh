@@ -3,7 +3,8 @@
 # this repository must name that release and no other, so a new Rust release
 # (or a moved `stable`) cannot give CI, the native release archives and the
 # container image three different compilers under one tag:
-#   - the Dockerfile's build stage is `FROM rust:<channel>-bookworm@sha256:…`
+#   - the Dockerfile's build stage is
+#     `FROM public.ecr.aws/docker/library/rust:<channel>-bookworm@sha256:…`
 #     and records that release in its pin comment;
 #   - every `toolchain:` input in .github/workflows names the channel, except
 #     CI's `fuzz-smoke` job, which needs a pinned `nightly-YYYY-MM-DD` for
@@ -32,9 +33,9 @@ if ! printf '%s\n' "$channel" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 
 # The Dockerfile's Rust build stage, by tag, and the version its pin comment records.
-image_versions="$(sed -n 's/^FROM rust:\([^@ ]*\)-bookworm@sha256:[0-9a-f]\{64\} .*/\1/p' Dockerfile | sort -u)"
+image_versions="$(sed -n 's|^FROM public\.ecr\.aws/docker/library/rust:\([^@ ]*\)-bookworm@sha256:[0-9a-f]\{64\} .*|\1|p' Dockerfile | sort -u)"
 if [ "$image_versions" != "$channel" ]; then
-  problem "the Dockerfile builds FROM rust:'${image_versions:-none}'-bookworm, not rust:$channel-bookworm (rust-toolchain.toml)"
+  problem "the Dockerfile builds FROM public.ecr.aws/docker/library/rust:'${image_versions:-none}'-bookworm, not rust:$channel-bookworm (rust-toolchain.toml)"
 fi
 if ! grep -Eq "^#   rust:${channel//./\\.}-bookworm " Dockerfile; then
   problem "the Dockerfile's pin comment does not record rust:$channel-bookworm"

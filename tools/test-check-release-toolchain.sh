@@ -74,9 +74,9 @@ replace_first "$repo/.github/workflows/ci.yml" 'RUSTUP_TOOLCHAIN: nightly-' ''
 expect_fail "fuzz-smoke without RUSTUP_TOOLCHAIN"
 replace_first "$repo/.github/workflows/ci.yml" 'CARGO_TERM_COLOR: always' '  RUSTUP_TOOLCHAIN: stable'
 expect_fail 'RUSTUP_TOOLCHAIN overriding the file workflow-wide'
-replace_first "$repo/Dockerfile" 'FROM rust:' 'FROM rust:1.0.0-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build'
+replace_first "$repo/Dockerfile" 'FROM public.ecr.aws/docker/library/rust:' 'FROM public.ecr.aws/docker/library/rust:1.0.0-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build'
 expect_fail 'the Dockerfile on another release'
-replace_first "$repo/Dockerfile" 'FROM rust:' 'FROM rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build'
+replace_first "$repo/Dockerfile" 'FROM public.ecr.aws/docker/library/rust:' 'FROM public.ecr.aws/docker/library/rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build'
 expect_fail 'the Dockerfile on a floating tag'
 replace_first "$repo/Dockerfile" '#   rust:' '#   rust:1.0.0-bookworm  resolved 2000-01-01'
 expect_fail "the Dockerfile's pin comment naming another release"
