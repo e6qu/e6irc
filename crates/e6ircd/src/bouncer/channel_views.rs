@@ -82,6 +82,34 @@ pub(super) struct ChannelView {
     /// The `353` channel type (`=` public, `@` secret, `*` private).
     symbol: char,
     members: MemberList,
+    /// The channel's settings (every mode but the list and membership ones),
+    /// each with its argument, once a `324` said them, and followed through
+    /// every `MODE` since; `None` until then.
+    modes: Option<std::collections::BTreeMap<char, Option<String>>>,
+    /// When the channel was created (Unix seconds), as `329` said.
+    created: Option<String>,
+}
+
+/// What a channel mode is, as the network's `CHANMODES` and `PREFIX` say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeKind {
+    /// A list (`b`, `e`, `I`): its entries are not the channel's settings.
+    List,
+    /// A member's status (`o`, `v`): followed in the member list.
+    Membership,
+    /// A setting, with or without an argument (`k`, `l`, `n`, `t`).
+    Setting,
+}
+
+fn mode_kind(features: &UpstreamFeatures, mode: char) -> ModeKind {
+    let chanmodes = isupport_value(features, "CHANMODES").unwrap_or("beI,k,l,imnpst");
+    if chanmodes.split(',').next().unwrap_or("").contains(mode) {
+        ModeKind::List
+    } else if Prefix::of(features).modes.contains(&mode) {
+        ModeKind::Membership
+    } else {
+        ModeKind::Setting
+    }
 }
 
 impl ChannelView {
@@ -90,6 +118,58 @@ impl ChannelView {
             topic: Topic::Unknown,
             symbol: '=',
             members: MemberList::Receiving(HashMap::new()),
+            modes: None,
+            created: None,
+        }
+    }
+
+    /// The channel's settings as `324` (and `329`, when its creation time
+    /// is known) say them, each within one IRC line; `None` while they are
+    /// not known.
+    pub(super) fn modes_reply(
+        &self,
+        server: &str,
+        nick: &str,
+        channel: &str,
+    ) -> Option<Vec<String>> {
+        let modes = self.modes.as_ref()?;
+        let letters: String = modes.keys().collect();
+        let arguments: Vec<&str> = modes.values().flatten().map(String::as_str).collect();
+        let mut line = format!(":{server} 324 {nick} {channel} +{letters}");
+        for argument in arguments {
+            line.push(' ');
+            line.push_str(argument);
+        }
+        if line.len() + 2 > e6irc_proto::message::MAX_LINE_LEN {
+            return None;
+        }
+        let mut lines = vec![line];
+        if let Some(created) = &self.created {
+            lines.push(format!(":{server} 329 {nick} {channel} {created}"));
+        }
+        Some(lines)
+    }
+
+    /// Follow the settings a channel `MODE` (or the `324` stating them all)
+    /// changes.
+    fn follow_settings<S: AsRef<str>>(
+        &mut self,
+        features: &UpstreamFeatures,
+        modes: &str,
+        arguments: &[S],
+    ) {
+        let Some(settings) = self.modes.as_mut() else {
+            return;
+        };
+        for (adding, mode, argument) in channel_mode_changes(features, modes, arguments) {
+            if mode_kind(features, mode) != ModeKind::Setting {
+                continue;
+            }
+            if adding {
+                settings.insert(mode, argument.map(str::to_string));
+            } else {
+                settings.remove(&mode);
+            }
         }
     }
 
@@ -448,6 +528,12 @@ impl ChannelViews {
                     && let MemberList::Receiving(members) = &mut view.members
                 {
                     view.members = MemberList::Complete(std::mem::take(members));
+                    // Every server says a channel's topic (332) before its
+                    // member list: one that said none after our JOIN has
+                    // none.
+                    if view.topic == Topic::Unknown {
+                        view.topic = Topic::Unset;
+                    }
                 }
             }
             // RPL_NOTOPIC, RPL_TOPIC, RPL_TOPICWHOTIME.
@@ -495,6 +581,24 @@ impl ChannelViews {
                     }
                 };
             }
+            // RPL_CHANNELMODEIS: `324 <nick> <channel> <modes> [<arguments>...]`,
+            // every setting at once.
+            "324" if message.params.len() >= 3 => {
+                let Some(view) = self.channels.get_mut(&names.fold(message.params[1])) else {
+                    return;
+                };
+                view.modes = Some(std::collections::BTreeMap::new());
+                view.follow_settings(features, message.params[2], &message.params[3..]);
+            }
+            // RPL_CREATIONTIME: `329 <nick> <channel> <seconds>`.
+            "329" => {
+                if let (Some(view), Some(created)) = (
+                    param(1).and_then(|channel| self.channels.get_mut(&names.fold(channel))),
+                    param(2),
+                ) {
+                    view.created = Some(created.to_string());
+                }
+            }
             "MODE" => {
                 let (Some(channel), Some(modes)) = (param(0), param(1)) else {
                     return;
@@ -502,6 +606,7 @@ impl ChannelViews {
                 let Some(view) = self.channels.get_mut(&names.fold(channel)) else {
                     return;
                 };
+                view.follow_settings(features, modes, &message.params[2..]);
                 let Some(members) = view.members.members_mut() else {
                     return;
                 };

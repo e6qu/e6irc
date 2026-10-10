@@ -816,6 +816,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // and must not make a silent upstream look alive while someone types.
     let mut awaiting_keepalive = false;
     let mut silence = super::SilenceDeadline::new(config.keepalive_idle);
+    let mut settings_asked = SettingsToAsk::default();
     loop {
         // Past the upstream's flood allowance, the attachments' commands wait
         // in the shared queue until a token is back; the upstream's lines keep
@@ -834,6 +835,20 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     return outcome;
                 }
             }
+            // A channel just joined is asked its settings once, so a client's
+            // `MODE #chan` is answered by the session; asked only while no
+            // attached client's command waits, so the owner's lines go first.
+            () = std::future::ready(()), if blocked.is_none()
+                && regain.is_none()
+                && !ends.has_queued_commands()
+                && settings_asked.has_next() =>
+            {
+                if let Some(line) = settings_asked.next(ends)
+                    && pacer.write(&mut conn, &line).await.is_err()
+                {
+                    return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                }
+            }
             () = &mut stop, if regain.is_some() => {
                 say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
                 return super::SessionOutcome::Stopped;
@@ -847,8 +862,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // a PING, a reply or framing, and is simply relayed. A bad
                     // line must not drop the link — it is delivered, not fatal.
                     let Some(message) = parsed else {
-                        if track(ends, &shared.joined, &mut identity, &mut requested_nicks, ends.emit_session_line(raw)).is_err() {
-                            return dropped(super::NetworkFailure::ChannelLimitExceeded);
+                        match track(ends, &shared.joined, &mut identity, &mut requested_nicks, ends.emit_session_line(raw)) {
+                            Ok(joined) => settings_asked.joined(joined),
+                            Err(_) => return dropped(super::NetworkFailure::ChannelLimitExceeded),
                         }
                         continue;
                     };
@@ -922,8 +938,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                             } else {
                                 echoes.publish(ends, &message, line, origin, &identity.nick, conn.names())
                             };
-                            if track(ends, &shared.joined, &mut identity, &mut requested_nicks, emitted).is_err() {
-                                return dropped(super::NetworkFailure::ChannelLimitExceeded);
+                            match track(ends, &shared.joined, &mut identity, &mut requested_nicks, emitted) {
+                                Ok(joined) => settings_asked.joined(joined),
+                                Err(_) => return dropped(super::NetworkFailure::ChannelLimitExceeded),
                             }
                         }
                     }
@@ -1287,8 +1304,13 @@ pub(super) fn track(
     identity: &mut SelfIdentity,
     requested_nicks: &mut RequestedNicks,
     emitted: Result<super::SessionChange, super::ChannelLimitExceeded>,
-) -> Result<(), super::ChannelLimitExceeded> {
+) -> Result<Vec<String>, super::ChannelLimitExceeded> {
     let mut change = emitted?;
+    let joined_now: Vec<String> = change
+        .joined
+        .iter()
+        .map(|channel| channel.as_str().to_string())
+        .collect();
     if let Some(shown) = change.shown_identity.take() {
         if let Some(user) = shown.user {
             identity.user = user;
@@ -1316,7 +1338,48 @@ pub(super) fn track(
     // intent survives a transport drop: only a confirmed JOIN/PART/KICK changes
     // it, so an unrelated numeric cannot erase channels still awaiting
     // confirmation on this new session.
-    joined.apply(change, &ends.names())
+    joined.apply(change, &ends.names())?;
+    Ok(joined_now)
+}
+
+/// The channels just joined whose settings (`MODE #chan`, answered with `324`
+/// and `329`) the driver has still to ask the upstream, oldest first. The
+/// answers are the session's, followed by its channel views, so that every
+/// attached client's `MODE #chan` is answered from them
+/// ([`super::DriverEnds::answered_by_session`]) instead of from the upstream
+/// one client and one channel at a time. Bounded by the channels a session is
+/// tracked in.
+#[derive(Default)]
+struct SettingsToAsk(std::collections::VecDeque<String>);
+
+impl SettingsToAsk {
+    fn joined(&mut self, channels: Vec<String>) {
+        for channel in channels {
+            if self.0.len() < super::MAX_TRACKED_CHANNELS && !self.0.contains(&channel) {
+                self.0.push_back(channel);
+            }
+        }
+    }
+
+    fn has_next(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// The next question, for a channel the session is still in.
+    fn next(&mut self, ends: &DriverEnds) -> Option<String> {
+        let names = ends.names();
+        let session = ends.irc_session_snapshot()?;
+        while let Some(channel) = self.0.pop_front() {
+            if session
+                .channels
+                .iter()
+                .any(|member| names.eq(member, &channel))
+            {
+                return Some(format!("MODE {channel}"));
+            }
+        }
+        None
+    }
 }
 
 /// A client's line as the upstream is to be sent it (see

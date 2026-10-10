@@ -1411,7 +1411,20 @@ async fn restore_ring(
                 Some(crate::db::StoredRing {
                     epoch,
                     clean_through: Some(through),
-                }) => match handle.continue_ring(epoch, through, lines) {
+                }) => match handle.continue_ring(
+                    epoch,
+                    through,
+                    lines,
+                    match crate::db::bnc_ring_let_go(pool, owner, network, restore).await {
+                        Ok(let_go) => let_go,
+                        // Unknown: every position stored is taken as let go
+                        // of, so no cursor of the old ring resumes past a gap.
+                        Err(e) => {
+                            eprintln!("bnc: what {owner}/{network} let go of is unreadable: {e}");
+                            Some(through)
+                        }
+                    },
+                ) {
                     Ok(renumbered) => (Some(renumbered), None),
                     Err(lines) => {
                         eprintln!(

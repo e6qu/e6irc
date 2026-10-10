@@ -1059,9 +1059,11 @@ pub(super) async fn network_account_command(
         crate::bouncer::SendOutcome::Full => retry_later(
             "Upstream command queue is full",
             "nothing was sent; retry after the interval in the Retry-After header",
-            retry_after_seconds(handle.full_queue_retry_after()),
+            retry_after_seconds(crate::bouncer::UPSTREAM_WRITE_DEADLINE),
         ),
-        crate::bouncer::SendOutcome::Closed | crate::bouncer::SendOutcome::Unavailable => problem(
+        crate::bouncer::SendOutcome::Closed
+        | crate::bouncer::SendOutcome::Unavailable
+        | crate::bouncer::SendOutcome::Disconnected => problem(
             StatusCode::CONFLICT,
             "IRC network is not connected",
             Some("nothing was sent; repair or enable the network before registering an account"),
@@ -2746,6 +2748,15 @@ pub(super) async fn network_history(
         Ok(handle) => handle,
         Err(response) => return response.into(),
     };
+    // A ring is paged once its stored backlog is restored into it, as an
+    // attach replays it: before, a just-started network's ring is not yet
+    // the one a reader's cursor names (a clean restart continues its epoch
+    // only then), and the cursor was refused as unjoinable. One stopped
+    // meanwhile is paged from storage alone.
+    let handle = match handle {
+        Some(handle) if handle.wait_for_history().await => Some(handle),
+        _ => None,
+    };
     if params.target.is_empty() {
         return problem_at_field(
             StatusCode::BAD_REQUEST,
@@ -2840,7 +2851,7 @@ pub(super) async fn network_history(
             };
             let Some(ring) = handle
                 .as_ref()
-                .and_then(|handle| handle.history_through(cursor))
+                .and_then(|handle| handle.history_through(cursor, &target))
             else {
                 return unjoinable_history(
                     "The cursor names no position of this network's running buffer; read with `seam`.",
@@ -2873,7 +2884,11 @@ pub(super) async fn network_history(
             let skip = older.len().saturating_sub(limit as usize);
             let mut lines: Vec<String> =
                 older[skip..].iter().map(|line| line.line.clone()).collect();
-            if skip > 0 {
+            // A page the ring fills to its limit goes on from before its
+            // oldest line, ring or storage: storage is read only for what
+            // the page has room for, and a page with none left used to end
+            // the paging there.
+            if skip > 0 || (lines.len() as i64 == limit && !older.is_empty()) {
                 let before = ring.cursor_before(older[skip].seq).to_string();
                 return json_no_store(ConversationHistoryResponse {
                     lines,

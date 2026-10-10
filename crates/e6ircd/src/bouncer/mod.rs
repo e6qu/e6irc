@@ -1024,7 +1024,7 @@ pub(crate) type DriverSession<C> =
 /// does not carry one (a registered session it closed with a stated reason).
 /// Returns `false` when the network was stopped while waiting.
 async fn wait_for_reconnect<C>(
-    ends: &DriverEnds,
+    ends: &mut DriverEnds,
     carried: Carried<'_, C>,
     event: ConnectionEvent,
     upstream_reason: Option<&str>,
@@ -1032,6 +1032,7 @@ async fn wait_for_reconnect<C>(
     sleep: impl Future<Output = ()>,
 ) -> bool {
     ends.publish(event, Some(delay), upstream_reason);
+    ends.refuse_queued();
     idle_until(ends, carried, sleep).await
 }
 
@@ -1040,8 +1041,9 @@ async fn wait_for_reconnect<C>(
 /// (which drops the handle). Work the driver carries keeps finishing while it
 /// is parked: a message already accepted for delivery is delivered or said to
 /// be undelivered, never held without a word for as long as the park lasts.
-async fn park<C>(ends: &DriverEnds, carried: Carried<'_, C>, event: ConnectionEvent) {
+async fn park<C>(ends: &mut DriverEnds, carried: Carried<'_, C>, event: ConnectionEvent) {
     ends.emit(event);
+    ends.refuse_queued();
     ends.emit_line(
         ":*bnc* NOTICE * :upstream rejected this network's credentials or registration; \
          not reconnecting until this network is reconfigured"
@@ -1157,7 +1159,7 @@ pub(crate) async fn run_with_backoff_carrying<C>(
         }
         ends.begin_attempt();
         let started = tokio::time::Instant::now();
-        let (failure, upstream_reason, at_least) = match session(&config, ends).await {
+        let ended = match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             SessionOutcome::AuthRejected(rejection) => {
                 park(
@@ -1169,38 +1171,10 @@ pub(crate) async fn run_with_backoff_carrying<C>(
                 return;
             }
             SessionOutcome::RegistrationRejected(rejection) => {
-                let refusal = Refusal::Registration(rejection);
-                match retry_refusal(
-                    ends,
-                    carried,
-                    &backoff,
-                    refusal,
-                    &mut consecutive_rejections,
-                    &mut last_refusal,
-                )
-                .await
-                {
-                    RefusalHandled::Retrying => continue,
-                    RefusalHandled::Ended => return,
-                }
+                Err(Refusal::Registration(rejection))
             }
             #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-            SessionOutcome::ConfigurationRejected(refusal) => {
-                let refusal = Refusal::Configuration(refusal);
-                match retry_refusal(
-                    ends,
-                    carried,
-                    &backoff,
-                    refusal,
-                    &mut consecutive_rejections,
-                    &mut last_refusal,
-                )
-                .await
-                {
-                    RefusalHandled::Retrying => continue,
-                    RefusalHandled::Ended => return,
-                }
-            }
+            SessionOutcome::ConfigurationRejected(refusal) => Err(Refusal::Configuration(refusal)),
             #[cfg(feature = "discord")]
             SessionOutcome::ReconnectRequested => {
                 if idle_until(ends, carried, tokio::time::sleep(RECONNECT_REQUEST_PAUSE)).await {
@@ -1208,14 +1182,33 @@ pub(crate) async fn run_with_backoff_carrying<C>(
                 }
                 return;
             }
-            SessionOutcome::Dropped(failure) => (failure, None, std::time::Duration::ZERO),
+            SessionOutcome::Dropped(failure) => Ok((failure, None, std::time::Duration::ZERO)),
             #[cfg(any(feature = "discord", feature = "slack"))]
-            SessionOutcome::DroppedFor { failure, at_least } => (failure, None, at_least),
-            SessionOutcome::ClosedByUpstream(closed) => (
+            SessionOutcome::DroppedFor { failure, at_least } => Ok((failure, None, at_least)),
+            SessionOutcome::ClosedByUpstream(closed) => Ok((
                 NetworkFailure::ConnectionLost,
                 Some(closed),
                 std::time::Duration::ZERO,
-            ),
+            )),
+        };
+        // A refusal takes its own schedule, and may park.
+        let (failure, upstream_reason, at_least) = match ended {
+            Ok(dropped) => dropped,
+            Err(refusal) => {
+                match retry_refusal(
+                    ends,
+                    carried,
+                    &backoff,
+                    refusal,
+                    &mut consecutive_rejections,
+                    &mut last_refusal,
+                )
+                .await
+                {
+                    RefusalHandled::Retrying => continue,
+                    RefusalHandled::Ended => return,
+                }
+            }
         };
         // Only a session that actually registered proves the upstream accepts
         // this configuration. A drop *before* that (a throttled dial between
@@ -1249,7 +1242,7 @@ enum RefusalHandled {
 
 /// Count `refusal` against the run of its kind and act on its retry policy.
 async fn retry_refusal<C>(
-    ends: &DriverEnds,
+    ends: &mut DriverEnds,
     carried: Carried<'_, C>,
     backoff: &Backoff,
     refusal: Refusal,
@@ -3721,7 +3714,7 @@ fn emit_failure_notice(
     let seq = if live_only {
         buffer.position()
     } else {
-        buffer.push(line.clone())
+        buffer.push_said(line.clone(), None)
     };
     let entry = BufferedLine { seq, line };
     let event = if live_only {
@@ -4129,11 +4122,15 @@ pub struct BufferedLine {
     pub line: String,
 }
 
-/// The ring as a reader paging back from a cursor sees it: every retained
-/// line, oldest first, of which the first `held_after` are at or before the
-/// cursor. When `successors_retained`, every line after the cursor is still
-/// in the ring, so what the reader holds after it the ring holds too, and
-/// older history can be joined to the ring's own oldest line.
+/// The ring as a reader paging back through one conversation from a cursor
+/// sees it: every retained line, oldest first, of which the first
+/// `held_after` are at or before the cursor. When `successors_retained`,
+/// every line of the conversation after the cursor is still in the ring, so
+/// what the reader holds of it after the cursor the ring holds too, and older
+/// history can be joined to the conversation's own oldest line in the ring.
+/// A conversation's lines leave the ring oldest first, whether from the front
+/// or from its share ([`Buffer::evict_one`]), so what the ring holds of it is
+/// always its newest lines, none missing between.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingHistory {
     epoch: u64,
@@ -4151,6 +4148,15 @@ impl RingHistory {
             seq: seq.saturating_sub(1),
         }
     }
+}
+
+/// What a restore from storage put in the ring.
+struct Restored {
+    /// Each row restored, and the position it took.
+    positions: Vec<(i64, u64)>,
+    /// The newest stored position of a line that did not fit, when one did
+    /// not.
+    not_restored: Option<u64>,
 }
 
 /// What [`NetworkHandle::continue_ring`] did to the positions the driver's
@@ -4263,10 +4269,58 @@ impl Replay {
     }
 }
 
-/// One ring position: a line, or where a new upstream session began.
+/// Which share of a ring a line is held in. A network's lines share one ring,
+/// and a busy channel used to evict, oldest first, the private message and the
+/// quiet channel's conversation the owner had not read yet. Each conversation
+/// now holds a share of its own, and the ring makes room from the largest
+/// ([`Buffer::evict_one`]), so a conversation keeps its newest lines for as
+/// long as another holds more; the network's cap and bytes still bound the
+/// whole. Storage keeps the same shares ([`crate::db::trim_bnc_buffer`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Share {
+    /// A message of one conversation, by its folded name (a channel, or the
+    /// other party of a private conversation): the conversation storage
+    /// files it under (`crate::db::bnc_line_target`).
+    Conversation(String),
+    /// Everything else that is not the session's own: others' membership, a
+    /// numeric, the bouncer's notices.
+    Other,
+    /// The session's own `NICK`, `JOIN`, `PART`, `QUIT`, a `KICK` of it, and
+    /// where a session began: what the ring's head state follows, so they go
+    /// only from the front, oldest first, as the head advances past them.
+    Pinned,
+}
+
+impl Share {
+    /// The share of `line`, said while the session's own nick was `own`.
+    fn of(line: &str, own: Option<&str>, names: &e6irc_client::NetworkNames) -> Self {
+        if let Some(target) = crate::db::bnc_line_target(line, own, names) {
+            return Self::Conversation(names.fold(&target));
+        }
+        let (Ok(message), Some(own)) = (e6irc_proto::message::Message::parse(line), own) else {
+            return Self::Other;
+        };
+        let ours = message
+            .source
+            .as_ref()
+            .is_some_and(|source| names.eq(source.name, own));
+        let pinned = match message.command.to_ascii_uppercase().as_str() {
+            "NICK" | "JOIN" | "PART" | "QUIT" => ours,
+            "KICK" => message
+                .params
+                .get(1)
+                .is_some_and(|kicked| kicked.split(',').any(|kicked| names.eq(kicked, own))),
+            _ => false,
+        };
+        if pinned { Self::Pinned } else { Self::Other }
+    }
+}
+
+/// One ring position: a line in its share, or where a new upstream session
+/// began.
 #[derive(Debug, Clone)]
 enum RingEntry {
-    Line(BufferedLine),
+    Line(BufferedLine, Share),
     Session {
         seq: u64,
         snapshot: IrcSessionSnapshot,
@@ -4276,14 +4330,14 @@ enum RingEntry {
 impl RingEntry {
     fn seq(&self) -> u64 {
         match self {
-            Self::Line(line) => line.seq,
+            Self::Line(line, _) => line.seq,
             Self::Session { seq, .. } => *seq,
         }
     }
 
     fn line(&self) -> Option<&BufferedLine> {
         match self {
-            Self::Line(line) => Some(line),
+            Self::Line(line, _) => Some(line),
             Self::Session { .. } => None,
         }
     }
@@ -4298,8 +4352,9 @@ impl RingEntry {
 pub(crate) const BACKLOG_BYTES_PER_LINE: usize = e6irc_proto::message::MAX_LINE_LEN;
 
 /// Bounded ring of recent upstream lines, for playback on attach: at most
-/// `cap` positions and `byte_cap` bytes of lines, the oldest going first, and
-/// none older than history retention keeps.
+/// `cap` positions and `byte_cap` bytes of lines, room made from the largest
+/// conversation's oldest line first ([`Share`]), and none older than history
+/// retention keeps.
 pub struct Buffer {
     entries: std::collections::VecDeque<RingEntry>,
     cap: usize,
@@ -4307,6 +4362,19 @@ pub struct Buffer {
     byte_cap: usize,
     /// The bytes of the lines held.
     bytes: usize,
+    /// How many lines each share holds.
+    shares: std::collections::HashMap<Share, usize>,
+    /// The newest position the ring has let go of: a cursor at or past it has
+    /// every successor still held.
+    evicted_through: u64,
+    /// The newest position each share has let go of, from the front or from
+    /// its middle: its lines go oldest first, so every line of the share
+    /// after it is still held.
+    let_go: std::collections::HashMap<Share, u64>,
+    /// The newest position a share may have let go of that the ring cannot
+    /// name the share of: what storage let go of before a continued ring
+    /// restored the rest (migration 0103).
+    let_go_floor: u64,
     /// Identifies this ring's lifetime; part of every cursor it hands out.
     /// A ring continuing a stored one takes its epoch
     /// ([`NetworkHandle::continue_ring`]).
@@ -4322,10 +4390,12 @@ pub struct Buffer {
     /// `bnc_buffer`, and this ring neither keeps nor replays them either.
     retention: crate::core::HistoryRetention,
     /// The session's state as of the oldest entry held — its nick and
-    /// channels — advanced by every entry the ring evicts, so an attaching client is brought to it before the
-    /// replay begins and reads each replayed line in the state it was said
-    /// in (§10.1). `None` while the oldest lines are ones restored from
-    /// rows stored before migration 0096, whose nick was not stored with them
+    /// channels — advanced by every entry the ring evicts from its front, so
+    /// an attaching client is brought to it before the replay begins and
+    /// reads each replayed line in the state it was said in (§10.1). What the
+    /// ring lets go of elsewhere ([`Buffer::evict_one`]) changes none of it.
+    /// `None` while the oldest lines are ones restored from rows stored
+    /// before migration 0096, whose nick was not stored with them
     /// ([`restored_head`]).
     head: Option<IrcSessionState>,
     /// How the network names things and what it said of itself, which the
@@ -4347,6 +4417,10 @@ impl Buffer {
             cap,
             byte_cap: cap.max(1).saturating_mul(BACKLOG_BYTES_PER_LINE),
             bytes: 0,
+            shares: std::collections::HashMap::new(),
+            evicted_through: 0,
+            let_go: std::collections::HashMap::new(),
+            let_go_floor: 0,
             epoch,
             next_seq: cap as u64 + 1,
             first_seq: cap as u64 + 1,
@@ -4382,7 +4456,7 @@ impl Buffer {
     /// Drop the lines at the front that history retention no longer keeps.
     fn evict_expired(&mut self) {
         let cutoff = self.cutoff();
-        while let Some(RingEntry::Line(line)) = self.entries.front() {
+        while let Some(RingEntry::Line(line, _)) = self.entries.front() {
             if Self::keeps(line, cutoff) {
                 break;
             }
@@ -4390,18 +4464,33 @@ impl Buffer {
         }
     }
 
+    /// Account for a line leaving the ring.
+    fn forget(&mut self, line: &BufferedLine, share: &Share) {
+        self.bytes -= line.line.len();
+        self.evicted_through = self.evicted_through.max(line.seq);
+        let let_go = self.let_go.entry(share.clone()).or_default();
+        *let_go = (*let_go).max(line.seq);
+        if let Some(held) = self.shares.get_mut(share) {
+            *held -= 1;
+            if *held == 0 {
+                self.shares.remove(share);
+            }
+        }
+    }
+
     /// Drop the oldest entry, advancing the head state past it.
     fn evict_oldest(&mut self) {
         match self.entries.pop_front() {
-            Some(RingEntry::Line(line)) => {
-                self.bytes -= line.line.len();
+            Some(RingEntry::Line(line, share)) => {
+                self.forget(&line, &share);
                 if let Some(head) = &mut self.head {
                     // Every line held was published within the channel
                     // bound, so none takes the head past it.
                     drop(head.observe(&line.line));
                 }
             }
-            Some(RingEntry::Session { snapshot, .. }) => {
+            Some(RingEntry::Session { seq, snapshot }) => {
+                self.evicted_through = self.evicted_through.max(seq);
                 self.head = Some(IrcSessionState::at(
                     &snapshot,
                     self.names.clone(),
@@ -4412,29 +4501,77 @@ impl Buffer {
         }
     }
 
-    /// Take the next position, evicting the oldest entry when full.
+    /// Make room for one more. The session's own lines and session
+    /// boundaries at the front go first: the head takes them in, and an
+    /// attaching client is brought to the state they made all the same.
+    /// Otherwise the oldest line of the share that holds the most (the oldest
+    /// such share's, among equals) goes, wherever it is in the ring — never
+    /// the newest line, and never a pinned one but from the front; with no
+    /// share holding more than one line, the oldest entry goes.
+    fn evict_one(&mut self) {
+        if matches!(
+            self.entries.front(),
+            Some(RingEntry::Session { .. } | RingEntry::Line(_, Share::Pinned))
+        ) {
+            self.evict_oldest();
+            return;
+        }
+        let largest = self
+            .shares
+            .iter()
+            .filter(|(share, _)| **share != Share::Pinned)
+            .map(|(_, held)| *held)
+            .max()
+            .unwrap_or(0);
+        let newest = self.entries.len().saturating_sub(1);
+        let victim = (largest > 1)
+            .then(|| {
+                self.entries.iter().position(|entry| {
+                    matches!(entry, RingEntry::Line(_, share)
+                        if *share != Share::Pinned && self.shares.get(share) == Some(&largest))
+                })
+            })
+            .flatten()
+            .filter(|index| *index > 0 && *index < newest);
+        match victim.and_then(|index| self.entries.remove(index)) {
+            Some(RingEntry::Line(line, share)) => self.forget(&line, &share),
+            Some(RingEntry::Session { .. }) => unreachable!("only a line is chosen"),
+            None => self.evict_oldest(),
+        }
+    }
+
+    /// Take the next position, making room when full.
     fn next_position(&mut self) -> u64 {
         // `>=` (not `==`) so a zero/under-filled cap can never let the ring
         // grow without bound.
         while self.entries.len() >= self.cap.max(1) {
-            self.evict_oldest();
+            self.evict_one();
         }
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
     }
 
-    /// Retain `line` as the newest, returning the position it took. Older
-    /// entries go while the lines held pass `byte_cap` — never this one, so a
+    /// Retain `line` as the newest, returning the position it took. Room is
+    /// made while the lines held pass `byte_cap` — never from this one, so a
     /// ring always holds its newest line.
+    #[cfg(test)]
     fn push(&mut self, line: String) -> u64 {
+        self.push_said(line, None)
+    }
+
+    /// [`Buffer::push`] of a line said while the session's own nick was
+    /// `own`, which decides its [`Share`].
+    fn push_said(&mut self, line: String, own: Option<&str>) -> u64 {
         self.evict_expired();
+        let share = Share::of(&line, own, &self.names);
         let seq = self.next_position();
         self.bytes += line.len();
+        *self.shares.entry(share.clone()).or_default() += 1;
         self.entries
-            .push_back(RingEntry::Line(BufferedLine { seq, line }));
+            .push_back(RingEntry::Line(BufferedLine { seq, line }, share));
         while self.bytes > self.byte_cap && self.entries.len() > 1 {
-            self.evict_oldest();
+            self.evict_one();
         }
         seq
     }
@@ -4483,15 +4620,37 @@ impl Buffer {
     /// Every retained line with its position, as of one instant, and how many
     /// of them are at or before `through`; `None` for another ring's cursor,
     /// or a position the ring has not reached. See [`RingHistory`].
-    fn history_through(&self, through: ReplayCursor) -> Option<RingHistory> {
+    fn history_through(&self, through: ReplayCursor, conversation: &str) -> Option<RingHistory> {
         if through.epoch != self.epoch || through.seq >= self.next_seq {
             return None;
         }
         let lines: Vec<BufferedLine> = self.lines().cloned().collect();
         let held_after = lines.partition_point(|line| line.seq <= through.seq);
-        let successors_retained = lines
-            .first()
-            .is_none_or(|oldest| oldest.seq <= through.seq + 1);
+        // Nothing of the conversation after the cursor was let go of: not
+        // from its share, nor before what a restore could name the share of,
+        // nor by history retention, which lets go of the oldest lines and
+        // so of everything at or before the newest it expired.
+        let share = Share::Conversation(conversation.to_string());
+        let cutoff = self.cutoff();
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                RingEntry::Line(line, held) if *held == share && !Self::keeps(line, cutoff) => {
+                    Some(line.seq)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let let_go = self
+            .let_go
+            .get(&share)
+            .copied()
+            .unwrap_or(0)
+            .max(self.let_go_floor)
+            .max(expired);
+        let successors_retained = through.seq >= let_go;
         Some(RingHistory {
             epoch: self.epoch,
             lines,
@@ -4501,12 +4660,15 @@ impl Buffer {
     }
 
     /// The lines after `after`, when that cursor names a position of this ring
-    /// whose every successor is still retained; otherwise the whole ring, with
-    /// `resumed` false so the client knows to start its transcript over.
+    /// whose every successor is still retained — none was let go of after it,
+    /// from the front or from a share ([`Buffer::evict_one`]); otherwise the
+    /// whole ring, with `resumed` false so the client knows to start its
+    /// transcript over.
     fn replay_after(&self, after: Option<ReplayCursor>) -> Replay {
         let honoured = after.is_some_and(|cursor| {
             cursor.epoch == self.epoch
                 && cursor.seq < self.next_seq
+                && cursor.seq >= self.evicted_through
                 && self
                     .entries
                     .front()
@@ -4520,8 +4682,8 @@ impl Buffer {
         let cutoff = self.cutoff();
         for entry in self.entries.iter().filter(|entry| entry.seq() >= from) {
             match entry {
-                RingEntry::Line(line) if !Self::keeps(line, cutoff) => {}
-                RingEntry::Line(line) => lines.push(line.clone()),
+                RingEntry::Line(line, _) if !Self::keeps(line, cutoff) => {}
+                RingEntry::Line(line, _) => lines.push(line.clone()),
                 RingEntry::Session { snapshot, .. } => {
                     boundaries.push((lines.len(), snapshot.clone()));
                 }
@@ -4650,16 +4812,17 @@ impl Drop for ReplyRoute {
 /// which is nothing but tags, is answered here, to its sender alone, rather
 /// than refused by the network in front of every attached client. The echo of
 /// what is sent is made from the returned line, so it never shows a tag the
-/// network did not carry. A `NAMES` of a channel whose member list the
-/// session follows is answered from it, as soju answers one: the browser asks
-/// for every joined channel's list on each connect, and each question would
-/// otherwise be a line of the upstream's flood allowance.
+/// network did not carry. A `NAMES`, `MODE` or `TOPIC` of a channel the
+/// session follows is answered from what it follows, as soju and ZNC answer
+/// them ([`DriverEnds::answered_by_session`]): clients ask them of every
+/// channel on each connect, and each question would otherwise be a line of
+/// the upstream's flood allowance.
 pub(super) fn carriable(
     cmd: &ClientCommand,
     client_tags: ClientTags,
     ends: &DriverEnds,
 ) -> Option<String> {
-    if let Some(answer) = ends.names_from_session(&cmd.line) {
+    if let Some(answer) = ends.answered_by_session(&cmd.line) {
         for line in answer {
             ends.answer(cmd.origin, line);
         }
@@ -4706,6 +4869,85 @@ fn own_rename(line: &str, own: &str, names: &e6irc_client::NetworkNames) -> Opti
     (message.command.eq_ignore_ascii_case("NICK") && names.eq(source.name, own))
         .then(|| message.params.first().map(|nick| (*nick).to_string()))
         .flatten()
+}
+
+/// The UTC date of `at`, `YYYY-MM-DD`.
+fn utc_date(at: e6irc_proto::time::Millis) -> String {
+    e6irc_proto::time::server_time(at)[..10].to_string()
+}
+
+/// A replayed message for a client that did not negotiate `server-time`, with
+/// the time it was said (its `time`, which every retained line carries) at
+/// the head of its text, as ZNC replays a buffer to such a client:
+/// `[HH:MM:SS]` in UTC, with the date as well when it was not said `today`,
+/// and after `ACTION ` for a `/me`. Anything else — membership, a numeric, a
+/// CTCP reply, a line with no valid `time` — is replayed as it is. The text is
+/// cut to fit the line, never sent past it.
+fn replayed_with_its_time<'line>(line: &'line str, today: &str) -> std::borrow::Cow<'line, str> {
+    use std::borrow::Cow;
+    let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
+        return Cow::Borrowed(line);
+    };
+    let command = parsed.command.to_ascii_uppercase();
+    let (true, [target, text]) = (
+        matches!(command.as_str(), "PRIVMSG" | "NOTICE"),
+        parsed.params.as_slice(),
+    ) else {
+        return Cow::Borrowed(line);
+    };
+    let Some(said) = line_time(line) else {
+        return Cow::Borrowed(line);
+    };
+    let stamp = e6irc_proto::time::server_time(said);
+    let stamp = if stamp[..10] == *today {
+        format!("[{}]", &stamp[11..19])
+    } else {
+        format!("[{} {}]", &stamp[..10], &stamp[11..19])
+    };
+    let text = match crate::sanitize::ctcp_action(text) {
+        Some(action) => format!("\u{1}ACTION {stamp} {action}\u{1}"),
+        None if text.starts_with('\u{1}') => return Cow::Borrowed(line),
+        None => format!("{stamp} {text}"),
+    };
+    let tags = line
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(tags, _)| format!("@{tags} "))
+        .unwrap_or_default();
+    let source = e6irc_client::OwnedMessage::from(&parsed)
+        .source
+        .map(|source| format!(":{source} "))
+        .unwrap_or_default();
+    // The wire's 512 bytes bound the line without its tags.
+    let head = format!("{source}{command} {target} :");
+    Cow::Owned(format!(
+        "{tags}{head}{}",
+        crate::core::fit_trailing(&head, &text)
+    ))
+}
+
+/// Why a line sent to a network that has no session was not sent.
+pub(crate) const NOT_CONNECTED: &str =
+    "the network is not connected (it is connecting or reconnecting)";
+
+/// What the sender of `line` is told when it was never sent, and `why`: by
+/// its command and target, as ZNC's "Your message to #chan got lost" names
+/// them.
+pub(crate) fn unsent_notice(line: &str, why: &str) -> String {
+    let what = match e6irc_proto::message::Message::parse(line) {
+        Ok(message) => {
+            let command = message.command.to_ascii_uppercase();
+            match (command.as_str(), message.params.first()) {
+                ("PRIVMSG" | "NOTICE" | "TAGMSG", Some(target)) => {
+                    format!("your message to {target}")
+                }
+                (_, Some(target)) => format!("your {command} {target}"),
+                (_, None) => format!("your {command}"),
+            }
+        }
+        Err(_) => "a line you sent".to_string(),
+    };
+    bnc_notice("*", &format!("{what} was not sent: {why}"))
 }
 
 /// A `*bnc*` NOTICE to `target` (`*`, or a channel), its text fitted to the
@@ -5136,9 +5378,17 @@ const BRIDGE_PACING_POLL: std::time::Duration = std::time::Duration::from_millis
 pub enum SendOutcome {
     /// The line was queued for the upstream.
     Sent,
-    /// The bounded queue is full (upstream reconnecting / congested). The line
-    /// was not queued; the caller must tell the client loudly.
+    /// The bounded queue is full: the upstream is connected and the lines
+    /// before this one wait on its flood allowance. The line was not queued;
+    /// the caller must tell the client loudly.
     Full,
+    /// The network has no session to send it on: it is connecting, or
+    /// reconnecting after a drop or a refusal. The line was not queued, as ZNC
+    /// ("Your message got lost, you are not connected to IRC") and soju
+    /// ("Disconnected from upstream network") refuse it: queued, it waited for
+    /// the next session — minutes later, or hours, while a ban or a throttle
+    /// was retried — and was then sent out of every context it was written in.
+    Disconnected,
     /// The driver is gone; the caller should detach.
     Closed,
     /// Registration or authentication is terminally parked. No driver loop
@@ -5157,24 +5407,13 @@ impl NetworkHandle {
     ///
     /// The command queue is bounded and *shared by every client attached to the
     /// network*. A blocking send would make one client's backlog (e.g. a burst
-    /// during an upstream reconnect) stall every *other* attached client's
+    /// paste on a slow flood allowance) stall every *other* attached client's
     /// delivery loop — a cross-tenant head-of-line stall on operator-shared
     /// networks. So this never waits: a full queue returns [`SendOutcome::Full`]
     /// and the caller surfaces it to the client loudly (the same discipline the
     /// core's SendQ uses — bound, then act, never silently block or drop).
     pub fn send(&self, line: &str) -> SendOutcome {
         self.send_from(0, line)
-    }
-
-    /// How long after a [`SendOutcome::Full`] the same send can be expected to
-    /// find room: a connected driver drains the queue or declares the upstream
-    /// dead within [`UPSTREAM_WRITE_DEADLINE`]; a reconnecting one drains
-    /// nothing before its next attempt, so that wait comes first.
-    pub fn full_queue_retry_after(&self) -> std::time::Duration {
-        let until_next_attempt = self.runtime_snapshot().next_retry_at.map_or(0, |at| {
-            at.as_millis().saturating_sub(epoch_millis().as_millis())
-        });
-        std::time::Duration::from_millis(until_next_attempt) + UPSTREAM_WRITE_DEADLINE
     }
 
     /// As [`NetworkHandle::send`], but the command carries the sending
@@ -5185,11 +5424,21 @@ impl NetworkHandle {
         if let Err(error) = parse_client_line(line) {
             return SendOutcome::Rejected(error);
         }
-        if matches!(
-            self.runtime_snapshot().lifecycle,
-            NetworkLifecycle::AuthenticationFailed | NetworkLifecycle::RegistrationFailed
-        ) {
-            return SendOutcome::Unavailable;
+        match self.runtime_snapshot().lifecycle {
+            NetworkLifecycle::AuthenticationFailed | NetworkLifecycle::RegistrationFailed => {
+                return SendOutcome::Unavailable;
+            }
+            NetworkLifecycle::Connecting | NetworkLifecycle::Reconnecting => {
+                return SendOutcome::Disconnected;
+            }
+            // A session registered under an alternative nickname is one: what
+            // is sent waits, bounded by the regain window, for the configured
+            // nickname (§10.3), and is told it was not sent if that never
+            // comes.
+            NetworkLifecycle::Connected
+            | NetworkLifecycle::RegainingNickname
+            | NetworkLifecycle::OwnerSuspended
+            | NetworkLifecycle::OwnerDeleted => {}
         }
         match self.commands.try_send(ClientCommand {
             origin,
@@ -5248,11 +5497,16 @@ impl NetworkHandle {
 
     /// [`Self::buffer_through`], and whether every line after `through` is
     /// still retained (see [`Buffer::history_through`]).
-    pub fn history_through(&self, through: ReplayCursor) -> Option<RingHistory> {
+    /// `conversation` is the folded name of the conversation paged.
+    pub fn history_through(
+        &self,
+        through: ReplayCursor,
+        conversation: &str,
+    ) -> Option<RingHistory> {
         self.buffer
             .lock()
             .expect("buffer poisoned")
-            .history_through(through)
+            .history_through(through, conversation)
     }
 
     /// Establish one exact boundary between detached-buffer/session replay and
@@ -5375,9 +5629,11 @@ impl NetworkHandle {
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         // Each restored line takes the position just below the current
         // oldest: older than everything pushed, in storage order.
+        // A new ring: what did not fit is before its oldest line.
         Self::restore_front(&mut buf, older, |buf, _| {
             buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1
         })
+        .positions
     }
 
     /// Continue the stored ring `epoch`, whose every line through position
@@ -5394,11 +5650,18 @@ impl NetworkHandle {
     /// ([`crate::db::claim_bnc_ring`]) — and is not restored. The lines back,
     /// changing nothing, when the positions do not fit the claim: not rising,
     /// or past `through`. The caller then restores them as a new epoch.
+    ///
+    /// `let_go` is the newest position of the epoch that storage let go of
+    /// from among the lines it keeps — a busy conversation's older lines,
+    /// trimmed from the middle ([`crate::db::bnc_ring_let_go`]): a cursor
+    /// before it is refused, as the running ring refuses one before a line it
+    /// let go of.
     pub(crate) fn continue_ring(
         &self,
         epoch: u64,
         through: u64,
         older: Vec<crate::db::StoredBacklogLine>,
+        let_go: Option<u64>,
     ) -> Result<Renumbered, Vec<crate::db::StoredBacklogLine>> {
         let mut last = 0u64;
         let fits = older.iter().filter_map(|stored| stored.seq).all(|seq| {
@@ -5420,16 +5683,22 @@ impl NetworkHandle {
         };
         for entry in &mut buf.entries {
             match entry {
-                RingEntry::Line(line) => line.seq += renumbered.shift,
+                RingEntry::Line(line, _) => line.seq += renumbered.shift,
                 RingEntry::Session { seq, .. } => *seq += renumbered.shift,
             }
         }
         buf.next_seq += renumbered.shift;
         buf.epoch = epoch;
         // Its rows keep the positions they have.
-        drop(Self::restore_front(&mut buf, older, |_, stored| {
+        let not_restored = Self::restore_front(&mut buf, older, |_, stored| {
             stored.seq.expect("only lines with a position are restored")
-        }));
+        })
+        .not_restored;
+        buf.let_go_floor = let_go.unwrap_or(0).max(not_restored.unwrap_or(0));
+        buf.evicted_through = buf
+            .evicted_through
+            .max(let_go.unwrap_or(0))
+            .max(not_restored.unwrap_or(0));
         Ok(renumbered)
     }
 
@@ -5440,12 +5709,13 @@ impl NetworkHandle {
     }
 
     /// [`Self::preload_front`]'s restore, each line at the position
-    /// `position` gives it: each row restored, with that position.
+    /// `position` gives it: each row restored, with that position, and the
+    /// newest position of a line that did not fit, when one did not.
     fn restore_front(
         buf: &mut Buffer,
         older: Vec<crate::db::StoredBacklogLine>,
         position: impl Fn(&Buffer, &crate::db::StoredBacklogLine) -> u64,
-    ) -> Vec<(i64, u64)> {
+    ) -> Restored {
         let older: Vec<crate::db::StoredBacklogLine> = older
             .into_iter()
             .filter(|stored| {
@@ -5456,6 +5726,7 @@ impl NetworkHandle {
         // The own nicks of the lines restored, newest first.
         let mut restored = Vec::new();
         let mut positions = Vec::new();
+        let mut not_restored = older.iter().rev().nth(room).and_then(|stored| stored.seq);
         for stored in older.iter().rev().take(room) {
             let seq = position(buf, stored);
             let crate::db::StoredBacklogLine {
@@ -5473,11 +5744,18 @@ impl NetworkHandle {
             // one a line arrived through.
             let line = stamp_time(crate::sanitize::upstream_line(line.clone()), stored_at);
             if buf.bytes + line.len() > buf.byte_cap {
+                not_restored = not_restored.max(stored.seq);
                 break;
             }
+            let said_by = match own_nick {
+                crate::db::StoredOwnNick::Nick(nick) => Some(nick.as_str()),
+                crate::db::StoredOwnNick::NoNick | crate::db::StoredOwnNick::NotRecorded => None,
+            };
+            let share = Share::of(&line, said_by, &buf.names);
             buf.bytes += line.len();
+            *buf.shares.entry(share.clone()).or_default() += 1;
             buf.entries
-                .push_front(RingEntry::Line(BufferedLine { seq, line }));
+                .push_front(RingEntry::Line(BufferedLine { seq, line }, share));
             restored.push(own_nick);
             positions.push((*id, seq));
         }
@@ -5485,7 +5763,10 @@ impl NetworkHandle {
             let (names, features) = (buf.names.clone(), buf.features.clone());
             buf.head = restored_head(restored.into_iter().rev(), names, features);
         }
-        positions
+        Restored {
+            positions,
+            not_restored,
+        }
     }
 
     /// The most lines the replay buffer holds: the network's `buffer_cap`.
@@ -6016,22 +6297,30 @@ impl DriverEnds {
         self.reply_routes.deliver(origin, line);
     }
 
-    /// The session's own answer to `line` when it is a `NAMES` of one channel
-    /// the session is in and follows the complete member list of.
-    fn names_from_session(&self, line: &str) -> Option<Vec<String>> {
+    /// The session's own answer to `line` when it asks about one channel the
+    /// session is in what the session follows of it: its member list
+    /// (`NAMES #chan`), its settings (`MODE #chan`) or its topic (`TOPIC
+    /// #chan`), each once it is known. These are what a client asks of every
+    /// channel it is shown joined — irssi and WeeChat ask `MODE` and `NAMES`
+    /// for each — so asked of the upstream, an attach of a client in a
+    /// hundred channels held the queue every attached client shares for
+    /// minutes at the upstream's flood allowance, and past the queue's bound
+    /// the questions were dropped. soju and ZNC answer them the same way.
+    fn answered_by_session(&self, line: &str) -> Option<Vec<String>> {
         let message = e6irc_proto::message::Message::parse(line).ok()?;
-        if !message.command.eq_ignore_ascii_case("NAMES") {
-            return None;
-        }
         let [channel] = message.params.as_slice() else {
             return None;
         };
         let session = self.irc_session.lock().expect("IRC session state poisoned");
         let nick = MiddleParam::echo(session.nick.as_deref()?).to_string();
         let shown = session.channels.get(&session.names.fold(channel))?;
-        session
-            .view(channel)?
-            .names_reply("*bnc*", &nick, shown.as_str(), &session.features)
+        let view = session.view(channel)?;
+        match message.command.to_ascii_uppercase().as_str() {
+            "NAMES" => view.names_reply("*bnc*", &nick, shown.as_str(), &session.features),
+            "MODE" => view.modes_reply("*bnc*", &nick, shown.as_str()),
+            "TOPIC" => view.topic_reply("*bnc*", &nick, shown.as_str()),
+            _ => None,
+        }
     }
 
     /// The bouncer's own answer to attachment `origin`'s command.
@@ -6170,7 +6459,13 @@ impl DriverEnds {
     pub fn emit_line(&self, line: String) {
         let line = ingest(line);
         self.record_input(line.len());
-        self.publish_buffered(line);
+        let own = self
+            .irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .nick
+            .clone();
+        self.publish_buffered(line, own.as_deref());
     }
 
     /// [`DriverEnds::emit_line`] for a line of the IRC session begun with
@@ -6206,6 +6501,8 @@ impl DriverEnds {
     ) -> Result<SessionChange, ChannelLimitExceeded> {
         let line = ingest(line);
         let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        // The nick the line was said under, before a rename it is.
+        let said_by = irc_session.nick.clone();
         let change = irc_session.observe(&line)?;
         self.record_input(line.len());
         // What the network says about itself as it welcomes this session is
@@ -6240,7 +6537,7 @@ impl DriverEnds {
             return Ok(change);
         }
         match origin {
-            None => self.publish_buffered(line),
+            None => self.publish_buffered(line, said_by.as_deref()),
             Some(origin) => self.publish_echo(line, origin),
         }
         // The raw line was delivered, so the client believes in a membership
@@ -6275,7 +6572,9 @@ impl DriverEnds {
         }
     }
 
-    fn publish_buffered(&self, line: String) {
+    /// Retain `line`, said while the session's own nick was `said_by`, and
+    /// publish it.
+    fn publish_buffered(&self, line: String, said_by: Option<&str>) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
         // What the backlog keeps nothing of is told live, at the ring's
         // position, and never retained or stored (the persistence task
@@ -6288,7 +6587,7 @@ impl DriverEnds {
             );
             return;
         }
-        let seq = buffer.push(line.clone());
+        let seq = buffer.push_said(line.clone(), said_by);
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above. Keep the buffer lock through the
         // publish: attach takes that lock before subscribing and snapshotting,
@@ -6308,7 +6607,11 @@ impl DriverEnds {
         let seq = if told_live_only(&line) {
             buffer.position()
         } else {
-            buffer.push(line.clone())
+            // An echo is said by the session itself, under the nick it shows.
+            let said_by = e6irc_proto::message::Message::parse(&line)
+                .ok()
+                .and_then(|message| message.source.map(|source| source.name.to_string()));
+            buffer.push_said(line.clone(), said_by.as_deref())
         };
         drop(self.events.send(DriverEvent::Echo {
             line: BufferedLine { seq, line },
@@ -6497,7 +6800,7 @@ impl DriverEnds {
                 line: notice,
             })));
         } else {
-            self.publish_buffered(notice);
+            self.publish_buffered(notice, None);
         }
     }
 
@@ -6573,6 +6876,27 @@ impl DriverEnds {
                 self.commands.recv().await
             }
             cmd = self.commands.recv() => cmd,
+        }
+    }
+
+    /// Whether an attached client's command waits in the queue: what the
+    /// driver asks on its own behalf waits for none.
+    pub(crate) fn has_queued_commands(&self) -> bool {
+        !self.commands.is_empty()
+    }
+
+    /// Tell each sender of a line still queued that it was not sent: the
+    /// session it was queued for has ended, and the lifecycle published just
+    /// before this refuses every later send ([`SendOutcome::Disconnected`],
+    /// [`SendOutcome::Unavailable`]), so what is drained here is everything
+    /// that will never be. Each is named by its command and target, never its
+    /// text, which may be a password for services.
+    fn refuse_queued(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            self.answer(
+                command.origin,
+                unsent_notice(&command.line, "the network disconnected before it went out"),
+            );
         }
     }
 
@@ -6924,30 +7248,29 @@ async fn relay_attached(
         mut write,
         holding,
     } = link;
-    // Revoked between the lease and here: the attachment never begins.
-    if let Some(revocation) = authority.revocation() {
-        return detach_revoked(&mut write, revocation).await;
-    }
-    let Some(shutdown) = network_to_attach(handle, &mut write).await? else {
-        return Ok(AttachEnd::NetworkRemoved);
-    };
     // A raw IRC client has no cursor to present. Its account's read markers
     // are its position instead: each conversation is replayed from where the
     // account stopped reading it, the whole of one it has no marker for.
     let read_positions = ReadPositions::of(handle, account).await;
-    let attach_id = handle.next_attachment_id();
-    let AttachSnapshot {
-        attachment,
-        events,
-        replay,
-        session: session_snapshot,
-        features,
-        names,
-        head,
-        current,
-    } = handle.subscribe_with_replay_snapshot(None);
-    // The answers to this client's own commands reach it here, and only here.
-    let replies = handle.route_replies(attach_id);
+    let OpenedAttachment {
+        shutdown,
+        attach_id,
+        snapshot:
+            AttachSnapshot {
+                attachment,
+                events,
+                replay,
+                session: session_snapshot,
+                features,
+                names,
+                head,
+                current,
+            },
+        replies,
+    } = match open_attachment(handle, &authority, &mut write, None).await? {
+        Ok(opened) => opened,
+        Err(end) => return Ok(end),
+    };
 
     // The welcome is of the same instant as the replay: an ISUPPORT or
     // CLIENTTAGDENY change made after it reaches this client live, and none
@@ -7108,23 +7431,25 @@ pub(crate) async fn resume_attached(
         mut write,
         holding,
     } = link;
-    if let Some(revocation) = authority.revocation() {
-        return detach_revoked(&mut write, revocation).await;
-    }
-    let Some(shutdown) = network_to_attach(handle, &mut write).await? else {
-        return Ok(AttachEnd::NetworkRemoved);
+    let cursor = cursor.map(ReplayCursor::from_recorded);
+    let OpenedAttachment {
+        shutdown,
+        attach_id,
+        snapshot:
+            AttachSnapshot {
+                attachment,
+                events,
+                replay,
+                features,
+                names,
+                current,
+                ..
+            },
+        replies,
+    } = match open_attachment(handle, &authority, &mut write, cursor).await? {
+        Ok(opened) => opened,
+        Err(end) => return Ok(end),
     };
-    let attach_id = handle.next_attachment_id();
-    let AttachSnapshot {
-        attachment,
-        events,
-        replay,
-        features,
-        names,
-        current,
-        ..
-    } = handle.subscribe_with_replay_snapshot(cursor.map(ReplayCursor::from_recorded));
-    let replies = handle.route_replies(attach_id);
     // A relay publishes its record only once the client is welcomed, under a
     // nick.
     let Some(shown_nick) = shown_nick else {
@@ -7215,6 +7540,47 @@ pub(crate) async fn resume_attached(
     .await
 }
 
+/// What an attachment, new or resumed, begins with: its account still
+/// authorised (or the client told it is not, and how the attachment ended),
+/// the network still there with its history loaded, its id, the replay from
+/// `cursor` with the live events from the same instant, and the route its
+/// own replies reach it by.
+async fn open_attachment<W>(
+    handle: &NetworkHandle,
+    authority: &AccountLease,
+    write: &mut W,
+    cursor: Option<ReplayCursor>,
+) -> std::io::Result<Result<OpenedAttachment, AttachEnd>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Revoked between the lease and here: the attachment never begins.
+    if let Some(revocation) = authority.revocation() {
+        return detach_revoked(write, revocation).await.map(Err);
+    }
+    let Some(shutdown) = network_to_attach(handle, write).await? else {
+        return Ok(Err(AttachEnd::NetworkRemoved));
+    };
+    let attach_id = handle.next_attachment_id();
+    let snapshot = handle.subscribe_with_replay_snapshot(cursor);
+    // The answers to this client's own commands reach it here, and only here.
+    let replies = handle.route_replies(attach_id);
+    Ok(Ok(OpenedAttachment {
+        shutdown,
+        attach_id,
+        snapshot,
+        replies,
+    }))
+}
+
+/// See [`open_attachment`].
+struct OpenedAttachment {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    attach_id: u64,
+    snapshot: AttachSnapshot,
+    replies: ReplyRoute,
+}
+
 /// The network's stop signal, once its history is loaded; `None`, the client
 /// told, when it is removed before or meanwhile.
 async fn network_to_attach<W>(
@@ -7271,6 +7637,7 @@ where
     } = replay;
     let mut boundaries = boundaries.into_iter().peekable();
     let mut already_read = 0usize;
+    let today = utc_date(epoch_millis());
     for (index, entry) in lines.into_iter().enumerate() {
         while let Some((_, began)) = boundaries.next_if(|(at, _)| *at == index) {
             let began =
@@ -7297,7 +7664,14 @@ where
                 channel.as_str().to_string(),
             );
         }
-        if let Some(line) = filter_tags(line, audience.caps) {
+        // A client without server-time would show every replayed message as
+        // said now; it is told when in the text itself, as ZNC tells it.
+        let line = if audience.caps.server_time {
+            std::borrow::Cow::Borrowed(line)
+        } else {
+            replayed_with_its_time(line, &today)
+        };
+        if let Some(line) = filter_tags(&line, audience.caps) {
             write.write_all(line.as_bytes()).await?;
             write.write_all(b"\r\n").await?;
         }
@@ -7809,7 +8183,7 @@ where
                 if !handled {
                     match attachment.handle.send_from(attachment.id, &text) {
                         SendOutcome::Sent => {}
-                        // Full: the upstream is congested/reconnecting.
+                        // Full: the connected upstream is congested.
                         // Drop this line loudly rather than block —
                         // blocking here would stall every other client
                         // sharing this network's queue. Never silent.
@@ -7823,6 +8197,11 @@ where
                         }
                         SendOutcome::Closed => {
                             return Ok(Some(AttachEnd::DriverStopped));
+                        }
+                        SendOutcome::Disconnected => {
+                            let notice = unsent_notice(&text, NOT_CONNECTED);
+                            write.write_all(format!("{notice}\r\n").as_bytes()).await?;
+                            write.flush().await?;
                         }
                         SendOutcome::Unavailable => {
                             write
@@ -8784,24 +9163,77 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_retry_waits_for_the_next_attempt_and_the_write_deadline() {
+    fn a_send_without_a_session_is_refused_not_queued() {
         let (handle, ends) = NetworkHandle::channels(16);
+        assert_eq!(
+            handle.send("PRIVMSG #room :early"),
+            SendOutcome::Disconnected
+        );
         ends.begin_attempt();
         ends.emit(ConnectionEvent::Connected);
-        assert_eq!(handle.full_queue_retry_after(), UPSTREAM_WRITE_DEADLINE);
-
-        handle.runtime.failed(
-            FailureDisposition::Retry {
-                next_attempt_in: Some(std::time::Duration::from_secs(20)),
-            },
+        assert_eq!(handle.send("PRIVMSG #room :now"), SendOutcome::Sent);
+        ends.emit(ConnectionEvent::Reconnecting(
             NetworkFailure::ConnectionLost,
-            None,
+        ));
+        assert_eq!(
+            handle.send("PRIVMSG #room :late"),
+            SendOutcome::Disconnected
         );
-        let wait = handle.full_queue_retry_after();
+        ends.emit(ConnectionEvent::RegainingNickname(NicknameRegain::new(
+            "alice_", "alice",
+        )));
+        assert_eq!(
+            handle.send("PRIVMSG #room :waits for the nickname"),
+            SendOutcome::Sent,
+            "a session under the alternative nickname holds what is sent"
+        );
+    }
+
+    /// A line still queued when its session ends is never sent: its sender
+    /// is told, by command and target and never by its text, as soon as the
+    /// driver says it is reconnecting; another attachment hears nothing.
+    #[tokio::test]
+    async fn a_line_queued_when_the_session_ends_is_told_unsent() {
+        let (handle, mut ends) = NetworkHandle::channels(16);
+        let mut sender = handle.route_replies(5);
+        let mut other = handle.route_replies(6);
+        ends.begin_attempt();
+        ends.emit(ConnectionEvent::Connected);
+        for line in ["PRIVMSG NickServ :IDENTIFY hunter2", "JOIN #later"] {
+            assert_eq!(handle.send_from(5, line), SendOutcome::Sent);
+        }
+        let waited = wait_for_reconnect(
+            &mut ends,
+            Carried::<()> {
+                config: &(),
+                next: None,
+            },
+            ConnectionEvent::Reconnecting(NetworkFailure::ConnectionLost),
+            None,
+            std::time::Duration::from_secs(1),
+            std::future::ready(()),
+        )
+        .await;
+        assert!(waited);
+        let first = sender.recv().await;
         assert!(
-            wait > UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(19)
-                && wait <= UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(20),
-            "{wait:?}"
+            first.ends_with(
+                "your message to NickServ was not sent: the network disconnected before it went out"
+            ),
+            "{first}"
+        );
+        assert!(!first.contains("hunter2"), "{first}");
+        assert!(sender.recv().await.ends_with(
+            ":your JOIN #later was not sent: the network disconnected before it went out"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), other.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            ends.commands.try_recv().is_err(),
+            "nothing is left for the next session"
         );
     }
 
@@ -8812,6 +9244,7 @@ mod tests {
     #[test]
     fn a_full_command_queue_is_told_live_and_never_retained() {
         let (handle, ends) = NetworkHandle::channels(16);
+        handle.runtime.connected();
         ends.emit_line(":peer PRIVMSG #room :kept".to_string());
         let mut events = handle.subscribe();
         for n in 0..BNC_COMMAND_QUEUE {
@@ -9291,7 +9724,7 @@ mod tests {
             .collect();
         assert_eq!(kept, [":me!u@h JOIN #room", ":op!o@h PRIVMSG #room :hello"]);
         let answer = ends
-            .names_from_session("NAMES #room")
+            .answered_by_session("NAMES #room")
             .expect("the session follows the member list");
         assert!(answer[0].ends_with("353 me = #room :me @op"), "{answer:?}");
     }
@@ -10999,7 +11432,7 @@ mod tests {
     /// network was "reconnecting" after a failure with no next attempt at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_retry_is_published_with_its_next_attempt_time_in_one_step() {
-        let (handle, ends) = NetworkHandle::channels(4);
+        let (handle, mut ends) = NetworkHandle::channels(4);
         let handle = std::sync::Arc::new(handle);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = std::thread::spawn({
@@ -11020,7 +11453,7 @@ mod tests {
         });
         for _ in 0..20_000 {
             let waited = wait_for_reconnect(
-                &ends,
+                &mut ends,
                 Carried::<()> {
                     config: &(),
                     next: None,
@@ -11172,9 +11605,8 @@ mod tests {
     async fn a_bridge_answers_join_and_nick_itself_before_it_connects() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let (client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::bridge_channels(4);
-        let attach = spawn_attach_as_alice(server, handle);
+        let (client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
         let (read, mut write) = tokio::io::split(client);
         write
             .write_all(b"NICK alice\r\nNICK bob\r\nJOIN #general\r\nJOIN\r\n")
@@ -11208,30 +11640,6 @@ mod tests {
         attach.await.expect("attach task").expect("attach result");
     }
 
-    /// `alice`'s attach to `handle` over `server`, with no capabilities, as a
-    /// task.
-    fn spawn_attach_as_alice(
-        server: tokio::io::DuplexStream,
-        handle: NetworkHandle,
-    ) -> tokio::task::JoinHandle<std::io::Result<AttachEnd>> {
-        tokio::spawn(async move {
-            attach(
-                attach_link::over_stream(server).await,
-                ClientInput::default(),
-                &handle,
-                AttachCaps::default(),
-                account_lease::lease_for_test("alice"),
-                Greeting {
-                    server_name: "bnc.test",
-                    network: "net",
-                    requested_nick: "alice",
-                },
-                ATTACH_LIVENESS_INTERVAL,
-            )
-            .await
-        })
-    }
-
     /// A bridge's own JOIN answer echoes each requested channel as one middle
     /// parameter: `JOIN :#a b` used to answer `437 alice #a b :…` and
     /// `JOIN ::x` `437 alice :x :…`, both of which shift the reply's
@@ -11241,9 +11649,8 @@ mod tests {
     async fn a_bridge_join_echoes_an_unframeable_channel_as_a_placeholder() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let (client, server) = tokio::io::duplex(4096);
         let (handle, _ends) = NetworkHandle::bridge_channels(4);
-        let attach = spawn_attach_as_alice(server, handle);
+        let (client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
         let (read, mut write) = tokio::io::split(client);
         write
             .write_all(b"JOIN :#a b\r\nJOIN ::x\r\n")
@@ -11278,8 +11685,8 @@ mod tests {
     async fn raw_attach_snapshot_renames_and_rejoins_the_downstream_client() {
         use tokio::io::AsyncReadExt;
 
-        let (mut client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::channels(4);
+        handle.runtime.connected();
         ends.begin_irc_session("upstreamNick".to_string());
         ends.emit_session_line(":upstreamNick!u@h JOIN #current".to_string())
             .expect("within the channel limit");
@@ -11287,7 +11694,7 @@ mod tests {
         for index in 0..4 {
             ends.emit_line(format!(":srv NOTICE upstreamNick :filler {index}"));
         }
-        let attach = spawn_attach_as_alice(server, handle);
+        let (mut client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
 
         let mut bytes = vec![0; 4096];
         let mut output = String::new();
@@ -11371,10 +11778,9 @@ mod tests {
     async fn registered_attach_keeps_cap_and_sasl_off_the_shared_upstream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (mut client, server) = tokio::io::duplex(4096);
         let (handle, mut ends) = NetworkHandle::channels(4);
         ends.begin_irc_session("alice".to_string());
-        let attach = spawn_attach_as_alice(server, handle);
+        let (mut client, attach) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
 
         let mut bytes = vec![0; 4096];
         tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
@@ -11668,7 +12074,7 @@ mod tests {
             seq: Some(seq),
         };
         let misfit = handle
-            .continue_ring(7, 100, vec![stored("late", 101)])
+            .continue_ring(7, 100, vec![stored("late", 101)], None)
             .expect_err("a position past the claim");
         assert_eq!(misfit.len(), 1);
         assert_eq!(handle.ring_position(), (fresh_epoch, said_at));
@@ -11678,6 +12084,7 @@ mod tests {
                 7,
                 100,
                 vec![stored("one", 98), stored("two", 99), stored("three", 100)],
+                None,
             )
             .expect("the positions fit");
         assert_eq!(renumbered.now(said_at), 101);
@@ -11756,6 +12163,7 @@ mod tests {
                     stored(2, "two", at(2)),
                     stored(3, "three", at(3)),
                 ],
+                None,
             )
             .expect("the new positions fit the new epoch");
         let replay = second
@@ -11776,31 +12184,201 @@ mod tests {
         );
     }
 
+    /// A continued ring refuses a cursor before a position storage let go of
+    /// from among what it keeps — a busy conversation's line trimmed from
+    /// the middle — and honours one after it.
+    #[test]
+    fn a_continued_ring_refuses_a_cursor_before_a_line_storage_let_go_of() {
+        let (handle, _ends) = NetworkHandle::channels(8);
+        let stored = |text: &str, seq| crate::db::StoredBacklogLine {
+            id: 0,
+            line: format!(":a!a@h PRIVMSG #c :{text}"),
+            stored_at: "2026-01-01T00:00:00.000Z".into(),
+            own_nick: crate::db::StoredOwnNick::NoNick,
+            seq: Some(seq),
+        };
+        handle
+            .continue_ring(
+                7,
+                100,
+                vec![stored("one", 97), stored("four", 100)],
+                Some(99),
+            )
+            .expect("the positions fit");
+        let buffer = handle.buffer.lock().expect("buffer");
+        assert!(
+            !buffer
+                .replay_after(Some(ReplayCursor { epoch: 7, seq: 97 }))
+                .resumed,
+            "98 and 99 were trimmed from the middle"
+        );
+        assert!(
+            buffer
+                .replay_after(Some(ReplayCursor { epoch: 7, seq: 99 }))
+                .resumed
+        );
+    }
+
     fn replayed(replay: &Replay) -> Vec<String> {
         untimed(replay.lines.iter().map(|entry| entry.line.as_str()))
+    }
+
+    /// `text` said in `channel`, as the ring holds it.
+    fn said(channel: &str, text: &str) -> String {
+        format!(":peer!p@h PRIVMSG {channel} :{text}")
     }
 
     #[test]
     fn history_through_says_whether_the_lines_after_the_cursor_are_kept() {
         let mut ring = Buffer::new(2);
-        let first = ring.push("one".into());
-        let second = ring.push("two".into());
+        let first = ring.push(said("#c", "one"));
+        let second = ring.push(said("#c", "two"));
         let at_first = ring.replay_after(None).cursor_at(first);
-        let kept = ring.history_through(at_first).expect("this ring's cursor");
+        let kept = ring
+            .history_through(at_first, "#c")
+            .expect("this ring's cursor");
         assert_eq!(kept.lines.len(), 2);
         assert_eq!((kept.held_after, kept.successors_retained), (1, true));
         assert_eq!(kept.cursor_before(second), at_first);
         // "one" is gone, but everything after it is kept.
-        ring.push("three".into());
-        let kept = ring.history_through(at_first).expect("this ring's cursor");
+        ring.push(said("#c", "three"));
+        let kept = ring
+            .history_through(at_first, "#c")
+            .expect("this ring's cursor");
         assert_eq!((kept.held_after, kept.successors_retained), (0, true));
         // "two" is gone too: a reader holding it holds what the ring does not.
-        ring.push("four".into());
-        let evicted = ring.history_through(at_first).expect("this ring's cursor");
+        ring.push(said("#c", "four"));
+        let evicted = ring
+            .history_through(at_first, "#c")
+            .expect("this ring's cursor");
         assert_eq!(
             (evicted.held_after, evicted.successors_retained),
             (0, false)
         );
+    }
+
+    /// A busy channel's flood lets lines go from the middle of the ring: a
+    /// quiet conversation paged from any cursor still finds every line of it
+    /// after the cursor held, and a busy one is joinable exactly from the
+    /// cursors whose successors it still holds — its lines go oldest first.
+    #[test]
+    fn history_through_is_exact_when_lines_go_from_the_middle() {
+        let mut ring = Buffer::new(6);
+        let lobby: Vec<u64> = (1..=4)
+            .map(|n| ring.push(said("#lobby", &format!("lobby-{n}"))))
+            .collect();
+        let busy: Vec<u64> = (1..=20)
+            .map(|n| ring.push(said("#busy", &format!("busy-{n}"))))
+            .collect();
+        let cursor = |seq| ring.replay_after(None).cursor_at(seq);
+        let held = |ring: &Buffer, conversation: &str| {
+            untimed(ring.snapshot())
+                .into_iter()
+                .filter(|line| line.contains(&format!("PRIVMSG {conversation} ")))
+                .count()
+        };
+        assert_eq!(held(&ring, "#lobby"), 2, "{:?}", ring.snapshot());
+        assert_eq!(held(&ring, "#busy"), 4, "{:?}", ring.snapshot());
+        // #lobby lost its two oldest lines: from its second on, the rest is
+        // held, so a cursor at it joins; one before it does not.
+        let at_lobby_1 = cursor(lobby[1]);
+        let paged = ring
+            .history_through(at_lobby_1, "#lobby")
+            .expect("this ring's cursor");
+        assert!(paged.successors_retained);
+        let before_lobby_1 = cursor(lobby[0]);
+        assert!(
+            !ring
+                .history_through(before_lobby_1, "#lobby")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+        // #busy lost every line but its last four, from the middle of the
+        // ring: a cursor before them does not join, one at the last lost does.
+        assert!(
+            !ring
+                .history_through(cursor(busy[14]), "#busy")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+        assert!(
+            ring.history_through(cursor(busy[15]), "#busy")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+        // A conversation the flood never touched is joinable from anywhere.
+        assert!(
+            ring.history_through(cursor(busy[0]), "#quiet")
+                .expect("this ring's cursor")
+                .successors_retained
+        );
+    }
+
+    /// A busy channel makes room from its own oldest lines, not from a quiet
+    /// conversation's: the private message and the quiet channel's line said
+    /// before a flood of the busy channel are still held after it, while the
+    /// ring keeps to its cap.
+    #[test]
+    fn a_busy_channel_does_not_evict_a_quiet_conversation() {
+        let mut ring = Buffer::new(10);
+        ring.push_said(":bob!b@h PRIVMSG me :are you there?".into(), Some("me"));
+        ring.push_said(":carol!c@h PRIVMSG #quiet :morning".into(), Some("me"));
+        for n in 0..100 {
+            ring.push_said(format!(":dan!d@h PRIVMSG #busy :flood {n}"), Some("me"));
+        }
+        let held = untimed(ring.snapshot());
+        assert_eq!(held.len(), 10, "{held:?}");
+        assert!(held.contains(&":bob!b@h PRIVMSG me :are you there?".to_string()));
+        assert!(held.contains(&":carol!c@h PRIVMSG #quiet :morning".to_string()));
+        assert_eq!(
+            held.last().map(String::as_str),
+            Some(":dan!d@h PRIVMSG #busy :flood 99")
+        );
+        assert!(held.contains(&":dan!d@h PRIVMSG #busy :flood 92".to_string()));
+        assert!(!held.contains(&":dan!d@h PRIVMSG #busy :flood 91".to_string()));
+    }
+
+    /// A line let go of from the middle of the ring is a gap after every
+    /// cursor before it: such a cursor is refused, and the whole ring
+    /// replayed, rather than resumed past a line it never showed.
+    #[test]
+    fn a_cursor_before_a_line_let_go_of_is_refused() {
+        let mut ring = Buffer::new(4);
+        let first = ring.push_said(":bob!b@h PRIVMSG me :hello".into(), Some("me"));
+        ring.push_said(":dan!d@h PRIVMSG #busy :one".into(), Some("me"));
+        ring.push_said(":dan!d@h PRIVMSG #busy :two".into(), Some("me"));
+        let cursor = ring.replay_after(None).cursor_at(first);
+        assert!(ring.replay_after(Some(cursor)).resumed);
+        for line in ["three", "four"] {
+            ring.push_said(format!(":dan!d@h PRIVMSG #busy :{line}"), Some("me"));
+        }
+        assert!(
+            untimed(ring.snapshot()).contains(&":bob!b@h PRIVMSG me :hello".to_string()),
+            "the front was kept"
+        );
+        assert!(!ring.replay_after(Some(cursor)).resumed);
+    }
+
+    /// The session's own rename, joins and parts go only from the front, so
+    /// the head state that a replay starts from stays the state at its
+    /// oldest line.
+    #[test]
+    fn the_sessions_own_lines_go_only_from_the_front() {
+        let mut ring = Buffer::new(4);
+        ring.push_said(":me!u@h NICK :you".into(), Some("me"));
+        for n in 0..10 {
+            ring.push_said(format!(":dan!d@h PRIVMSG #busy :flood {n}"), Some("you"));
+        }
+        assert!(
+            !untimed(ring.snapshot()).contains(&":me!u@h NICK :you".to_string()),
+            "it went from the front"
+        );
+        assert_eq!(
+            ring.head.as_ref().and_then(|head| head.nick.clone()),
+            None,
+            "a head that began knowing no nick learns none from a rename"
+        );
+        assert_eq!(ring.shares.get(&Share::Pinned), None);
     }
 
     /// A cursor is honoured exactly while every line after it is still held;
@@ -11975,10 +12553,14 @@ mod tests {
         (client, task)
     }
 
-    /// Attach with default capabilities, read everything the attach writes
-    /// (server-time tags stripped) and let it finish.
+    /// Attach with server-time, read everything the attach writes (its
+    /// `time` tags stripped) and let it finish.
     async fn attach_to_completion(handle: NetworkHandle) -> String {
-        let (mut client, task) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
+        let caps = AttachCaps {
+            server_time: true,
+            ..AttachCaps::default()
+        };
+        let (mut client, task) = attach_task(std::sync::Arc::new(handle), caps);
         let output = untimed(attach_output(&mut client).await.lines()).join("\n");
         drop(client);
         task.await.expect("attach task").expect("attach");
@@ -12402,6 +12984,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_member_lists_are_asked_for_a_bounded_few() {
         let (handle, mut ends) = NetworkHandle::channels(2);
+        handle.runtime.connected();
         ends.begin_irc_session("alice".to_string());
         for n in 0..10 {
             ends.emit_session_line(format!(":alice!u@h JOIN #c{n}"))
@@ -12455,6 +13038,132 @@ mod tests {
                 Some(asked.to_string())
             );
         }
+    }
+
+    /// A client without server-time is told when each replayed message was
+    /// said in its text, as ZNC tells it: the time today, the date too
+    /// before today, after `ACTION ` for a `/me`, within the line; anything
+    /// that is not a message, and a CTCP reply, is replayed as it is.
+    #[test]
+    fn a_replayed_message_carries_its_time_for_a_client_without_server_time() {
+        let today = "2026-10-10";
+        let at = |time: &str, rest: &str| format!("@time={time};msgid=x {rest}");
+        assert_eq!(
+            replayed_with_its_time(
+                &at(
+                    "2026-10-10T09:05:03.250Z",
+                    ":bob!b@h PRIVMSG #room :hello there"
+                ),
+                today
+            ),
+            "@time=2026-10-10T09:05:03.250Z;msgid=x :bob!b@h PRIVMSG #room :[09:05:03] hello there"
+        );
+        assert_eq!(
+            replayed_with_its_time(
+                &at("2026-10-09T23:59:59.000Z", ":bob!b@h NOTICE me :yesterday"),
+                today
+            ),
+            "@time=2026-10-09T23:59:59.000Z;msgid=x :bob!b@h NOTICE me :[2026-10-09 23:59:59] yesterday"
+        );
+        assert_eq!(
+            replayed_with_its_time(
+                &at(
+                    "2026-10-10T12:00:00.000Z",
+                    ":bob!b@h PRIVMSG #room :\u{1}ACTION waves\u{1}"
+                ),
+                today
+            ),
+            "@time=2026-10-10T12:00:00.000Z;msgid=x :bob!b@h PRIVMSG #room :\u{1}ACTION [12:00:00] waves\u{1}"
+        );
+        for kept in [
+            at(
+                "2026-10-10T12:00:00.000Z",
+                ":bob!b@h NOTICE me :\u{1}VERSION irssi\u{1}",
+            ),
+            at("2026-10-10T12:00:00.000Z", ":bob!b@h JOIN #room"),
+            ":bob!b@h PRIVMSG #room :no time of its own".to_string(),
+        ] {
+            assert_eq!(replayed_with_its_time(&kept, today), kept);
+        }
+        let long = at(
+            "2026-10-10T12:00:00.000Z",
+            &format!(":bob!b@h PRIVMSG #room :{}", "x".repeat(480)),
+        );
+        let stamped = replayed_with_its_time(&long, today);
+        let body = stamped.split_once(' ').expect("tagged").1;
+        assert_eq!(body.len(), 510, "fitted to the wire");
+    }
+
+    /// A channel's settings, once a `324` said them, are followed through
+    /// every `MODE` and answer a client's `MODE #chan` with its creation
+    /// time; its topic answers `TOPIC #chan`, and a channel that said no
+    /// topic before its member list has none. A list mode, a member's status
+    /// and a query the session cannot answer are the upstream's.
+    #[tokio::test]
+    async fn a_mode_or_topic_the_session_can_answer_does_not_reach_the_upstream() {
+        let (handle, ends) = a_session_in_room(16, &[]);
+        let mut replies = handle.route_replies(7);
+        let command = |line: &str| ClientCommand {
+            origin: 7,
+            line: line.to_string(),
+        };
+        assert_eq!(
+            carriable(&command("MODE #room"), ClientTags::Relayed, &ends),
+            Some("MODE #room".to_string()),
+            "not known before the upstream said them"
+        );
+        for line in [
+            ":up 324 alice #room +nst",
+            ":up 329 alice #room 1700000000",
+            ":op!o@h MODE #room +kl-t+bo hunter2 10 *!*@spam peer",
+        ] {
+            ends.emit_session_line(line.to_string()).expect("tracked");
+        }
+        assert_eq!(
+            carriable(&command("MODE #Room"), ClientTags::Relayed, &ends),
+            None
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 324 alice #room +klns hunter2 10"
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 329 alice #room 1700000000"
+        );
+        assert_eq!(
+            carriable(&command("TOPIC #room"), ClientTags::Relayed, &ends),
+            None
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 332 alice #room :the topic"
+        );
+        for asked in [
+            "MODE #room b",
+            "MODE #room +i",
+            "MODE alice",
+            "TOPIC #room :new",
+            "MODE #other",
+        ] {
+            assert_eq!(
+                carriable(&command(asked), ClientTags::Relayed, &ends),
+                Some(asked.to_string()),
+                "{asked}"
+            );
+        }
+        ends.emit_session_line(":alice!u@h JOIN #quiet".to_string())
+            .expect("tracked");
+        ends.emit_session_line(":up 366 alice #quiet :End of /NAMES list".to_string())
+            .expect("tracked");
+        assert_eq!(
+            carriable(&command("TOPIC #quiet"), ClientTags::Relayed, &ends),
+            None
+        );
+        assert_eq!(
+            without_tag(&replies.recv().await, "time"),
+            ":*bnc* 331 alice #quiet :No topic is set"
+        );
     }
 
     /// The bouncer's own numerics to an attached client are addressed to the
