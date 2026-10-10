@@ -51,7 +51,7 @@ pub(crate) use revocation::CredentialWatch;
 use sessions::*;
 pub(crate) use ws::UiSocketLimiter;
 use ws::*;
-pub(crate) use ws::{UiGrant, open_granted_ui};
+pub(crate) use ws::{HoldingUi, UiGrant, open_granted_ui, resume_ui};
 
 /// The database pool for an unauthenticated endpoint, or a 503 problem
 /// response when the server runs without one. (Authenticated endpoints use

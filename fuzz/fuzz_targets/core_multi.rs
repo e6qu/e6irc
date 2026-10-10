@@ -79,6 +79,7 @@ fuzz_target!(|data: &[u8]| {
             tx,
             host: format!("h{id}.example"),
             transport: ConnectionTransport::Tcp,
+            tls: None,
         });
     }
 

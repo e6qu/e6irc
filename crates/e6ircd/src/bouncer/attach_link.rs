@@ -50,6 +50,9 @@ fn inbound_weight(inbound: &Inbound) -> usize {
 pub struct AttachLink {
     pub(super) lines: ClientLines,
     pub(super) write: DeadlineWriter<LineWriter>,
+    /// When its edge holds it for the next core (link version 2): what its
+    /// record is written with.
+    pub(super) holding: Option<super::AttachHolding>,
 }
 
 /// An attached client's lines, as the edge framed them.
@@ -158,29 +161,69 @@ impl Sessions {
 pub struct AttachPort {
     sessions: Arc<Sessions>,
     serve: Arc<dyn Fn(AttachLink, ClientIp) + Send + Sync>,
+    /// What resumes an attachment a rebuild takes from its edge's record.
+    resume: Arc<dyn Fn(AttachLink, ClientIp, crate::core::record::AttachRecord) + Send + Sync>,
+}
+
+/// How an attachment's link is handed over: to the attach logic from its
+/// registration, or to resume from its record.
+enum Handoff {
+    Serve,
+    Resume(crate::core::record::AttachRecord),
 }
 
 impl AttachPort {
-    pub fn new(serve: impl Fn(AttachLink, ClientIp) + Send + Sync + 'static) -> Self {
+    pub fn new(
+        serve: impl Fn(AttachLink, ClientIp) + Send + Sync + 'static,
+        resume: impl Fn(AttachLink, ClientIp, crate::core::record::AttachRecord) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             sessions: Arc::default(),
             serve: Arc::new(serve),
+            resume: Arc::new(resume),
         }
     }
-}
 
-impl CorePort for AttachPort {
-    async fn open(
+    /// Open an attachment whose edge holds it for the next core (link version
+    /// 2), its record written in `format`.
+    pub(crate) fn open_holding(
         &self,
         conn: ConnId,
-        host: String,
-        _transport: ConnectionTransport,
+        address: std::net::IpAddr,
         sendq_bytes: usize,
-    ) -> Option<EdgeSession> {
-        let address = host
-            .parse::<std::net::IpAddr>()
-            .expect("the edge opens a session under its client's address");
-        let (link, edge) = e6irc_edge::link::waiting_session("attach-sendq", sendq_bytes);
+        format: crate::core::RecordFormatCell,
+    ) -> EdgeSession {
+        let (link, edge) =
+            e6irc_edge::link::holding_waiting_session("attach-sendq", sendq_bytes, 0);
+        self.hand_over(conn, address, link, Some(format), Handoff::Serve);
+        edge
+    }
+
+    /// Resume an attachment a rebuild takes from `record`, with `in_flight`
+    /// bytes its edge still holds unwritten.
+    pub(crate) fn resume(
+        &self,
+        conn: ConnId,
+        address: std::net::IpAddr,
+        sendq_bytes: usize,
+        in_flight: u64,
+        format: crate::core::RecordFormatCell,
+        record: crate::core::record::AttachRecord,
+    ) -> EdgeSession {
+        let (link, edge) =
+            e6irc_edge::link::holding_waiting_session("attach-sendq", sendq_bytes, in_flight);
+        self.hand_over(conn, address, link, Some(format), Handoff::Resume(record));
+        edge
+    }
+
+    fn hand_over(
+        &self,
+        conn: ConnId,
+        address: std::net::IpAddr,
+        link: e6irc_edge::link::SessionLink,
+        format: Option<crate::core::RecordFormatCell>,
+        handoff: Handoff,
+    ) {
         let (sender, inbound) = e6irc_queue::weighted_queue(
             e6irc_queue::Config {
                 name: "attach-inbound",
@@ -198,13 +241,33 @@ impl CorePort for AttachPort {
                 sessions: self.sessions.clone(),
             },
         };
-        (self.serve)(
-            AttachLink {
-                lines,
-                write: DeadlineWriter::new(LineWriter::new(link), PEER_WRITE_DEADLINE),
-            },
-            ClientIp::new(address),
-        );
+        let link = AttachLink {
+            lines,
+            write: DeadlineWriter::new(LineWriter::new(link), PEER_WRITE_DEADLINE),
+            holding: format.map(super::AttachHolding::unnamed),
+        };
+        match handoff {
+            Handoff::Serve => (self.serve)(link, ClientIp::new(address)),
+            Handoff::Resume(record) => (self.resume)(link, ClientIp::new(address), record),
+        }
+    }
+}
+
+impl CorePort for AttachPort {
+    async fn open(
+        &self,
+        conn: ConnId,
+        host: String,
+        _transport: ConnectionTransport,
+        _tls: Option<e6irc_link::TlsFacts>,
+        sendq_bytes: usize,
+    ) -> Option<EdgeSession> {
+        let address = host
+            .parse::<std::net::IpAddr>()
+            .expect("the edge opens a session under its client's address");
+        let (link, edge) = e6irc_edge::link::waiting_session("attach-sendq", sendq_bytes);
+        // Its own edge holds nothing for another core.
+        self.hand_over(conn, address, link, None, Handoff::Serve);
         Some(edge)
     }
 
@@ -242,12 +305,15 @@ where
     }
     let (opened, link) = tokio::sync::oneshot::channel();
     let opened = Mutex::new(Some(opened));
-    let port = AttachPort::new(move |link, _client| {
-        let opened = opened.lock().expect("test port").take();
-        if let Some(opened) = opened {
-            drop(opened.send(link));
-        }
-    });
+    let port = AttachPort::new(
+        move |link, _client| {
+            let opened = opened.lock().expect("test port").take();
+            if let Some(opened) = opened {
+                drop(opened.send(link));
+            }
+        },
+        |_, _, _| unreachable!("the test port resumes nothing"),
+    );
     tokio::spawn(e6irc_edge::connection::serve_conn(
         stream,
         e6irc_edge::connection::AcceptedConnection {
@@ -255,6 +321,7 @@ where
             peer: "192.0.2.1:6697".parse().expect("test peer"),
             transport: ConnectionTransport::Tcp,
             task: e6irc_edge::connection::ConnectionTasks::default().task(),
+            tls: None,
         },
         port,
         e6irc_edge::connection::Outbound::with_sendq(64 * 1024),
@@ -271,7 +338,10 @@ mod tests {
     fn port_handing_over(
         opened: tokio::sync::mpsc::UnboundedSender<(AttachLink, ClientIp)>,
     ) -> AttachPort {
-        AttachPort::new(move |link, client| drop(opened.send((link, client))))
+        AttachPort::new(
+            move |link, client| drop(opened.send((link, client))),
+            |_, _, _| unreachable!("the test port resumes nothing"),
+        )
     }
 
     /// Lines the edge handed over arrive in the batch they came in, the end
@@ -286,6 +356,7 @@ mod tests {
                 ConnId(7),
                 "192.0.2.9".into(),
                 ConnectionTransport::Tcp,
+                None,
                 4096,
             )
             .await
@@ -318,6 +389,7 @@ mod tests {
                     ConnId(conn),
                     "192.0.2.9".into(),
                     ConnectionTransport::Tcp,
+                    None,
                     4096,
                 )
                 .await
@@ -344,6 +416,7 @@ mod tests {
                 ConnId(3),
                 "192.0.2.9".into(),
                 ConnectionTransport::Tcp,
+                None,
                 4096,
             )
             .await
@@ -361,6 +434,7 @@ mod tests {
         let AttachLink {
             mut lines,
             mut write,
+            holding: _,
         } = over_stream(server).await;
         write
             .write_all(b":bnc NOTICE * :hello\r\n")

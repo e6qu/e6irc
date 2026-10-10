@@ -23,6 +23,13 @@ use super::{
 };
 use crate::observability::Telemetry;
 
+mod held;
+pub(crate) use held::{
+    ChannelRebuild, HeldSinks, RebuiltMember, RecordFormatCell, ReplicaSink, SessionRebuild,
+    Unsettled, adopt_shared, export_shared,
+};
+use held::{HeldMarks, ReplicaLedger, SaslBuffer};
+
 /// Casefolded channel-name key. Constructible only via
 /// [`ServerState::chan_key`], so a display-cased name can never index
 /// the channel table — that bug class is unrepresentable.
@@ -32,6 +39,12 @@ pub struct ChanKey(String);
 impl ChanKey {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The key of `name` under `casemap`: the one folding rule, which
+    /// [`ServerState::chan_key`] applies under the server's casemapping.
+    pub(crate) fn fold(casemap: CaseMapping, name: &str) -> Self {
+        ChanKey(casemap.casefold(name))
     }
 
     /// A key from a name the test has already folded.
@@ -995,6 +1008,8 @@ pub(crate) struct PublicUser {
     pub(crate) registered_only: bool,
     /// Umode +Z: the connection is TLS end to end ([`Session::secure`]).
     pub(crate) secure: bool,
+    /// What the TLS the edge terminated negotiated ([`Session::tls`]).
+    pub(crate) tls: Option<e6irc_link::TlsFacts>,
     pub(crate) signon: e6irc_proto::time::Millis,
     pub(crate) idle_since: IdleSince,
 }
@@ -1016,6 +1031,7 @@ impl PublicUser {
             wallops: session.wallops,
             registered_only: session.registered_only,
             secure: session.secure(),
+            tls: session.tls.clone(),
             signon: session.signon,
             idle_since: session.idle_since.clone(),
         }
@@ -1036,6 +1052,7 @@ impl PublicUser {
             && self.wallops == session.wallops
             && self.registered_only == session.registered_only
             && self.secure == session.secure()
+            && self.tls == session.tls
             && self.signon == session.signon
     }
 
@@ -1332,6 +1349,8 @@ pub(crate) struct CoreDirectories {
     pub(crate) password_policy: crate::identity::PasswordPolicy,
     /// The order of the connection directory.
     pub(crate) directory_keys: DirectoryKeys,
+    /// What the shards write for their edges to hold.
+    pub(crate) held: HeldSinks,
 }
 
 /// Where a session sorts in the connection directory: a key the core gives it
@@ -1354,7 +1373,7 @@ impl DirectoryKey {
 pub(crate) struct DirectoryKeys(Arc<std::sync::atomic::AtomicU64>);
 
 impl DirectoryKeys {
-    fn next(&self) -> DirectoryKey {
+    pub(crate) fn next(&self) -> DirectoryKey {
         DirectoryKey(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
     }
 }
@@ -1864,6 +1883,9 @@ pub(crate) struct Session {
     /// host it opened with (a later SETHOST changes only what is shown).
     limit_key: e6irc_edge::address::SessionLimitKey,
     pub transport: crate::core::ConnectionTransport,
+    /// What the TLS its edge terminated negotiated, when the edge terminated
+    /// TLS for it: fixed when it opened.
+    pub(crate) tls: Option<e6irc_link::TlsFacts>,
     /// Registration state and the identity fields, as one sum type (see
     /// [`Registration`]): a registered connection *has* a nick/user/realname.
     reg: Registration,
@@ -1891,8 +1913,9 @@ pub(crate) struct Session {
     /// verdict is that command's labeled response.
     pub sasl_verify: Option<PendingServiceReply>,
     /// Accumulates 400-byte AUTHENTICATE continuation chunks (SASL spec)
-    /// until a short line completes the payload.
-    pub sasl_buf: String,
+    /// until a short line completes the payload, with the input lines that
+    /// carried them, retained for replay meanwhile.
+    pub(crate) sasl_buf: SaslBuffer,
     /// Credential-verification attempts made on this connection, capped so a
     /// single socket can't drive unbounded argon2 work (unauth CPU DoS / online
     /// brute-force). Never reset — the budget is per connection lifetime.
@@ -2027,6 +2050,9 @@ pub(crate) struct Session {
     /// record in the [`UserDirectory`], also copied into every channel it is
     /// in. `None` until it registers.
     published: Option<Arc<PublicUser>>,
+    /// What its edge last held of it, and how many of its input lines were
+    /// handled on its link.
+    held_marks: HeldMarks,
 }
 
 /// Most CHATHISTORY requests one session may have waiting on the database at
@@ -3976,6 +4002,9 @@ pub(crate) struct MultilineBatch {
     /// PRIVMSG or NOTICE, taken from the first line; the batch is one message,
     /// so it cannot change kind partway through.
     pub kind: Option<crate::core::MessageKind>,
+    /// The input lines that went into the batch — its opening `BATCH` and
+    /// each message — retained for replay until it closes or is abandoned.
+    pub(crate) input_lines: Vec<u64>,
 }
 
 /// Why a closed [`MultilineBatch`] is no message at all.
@@ -4251,6 +4280,15 @@ pub(crate) struct Channel {
     ///
     /// [`HistoryFloor`]: crate::core::HistoryFloor
     pub created_at: e6irc_proto::time::Millis,
+    /// The revision of the channel's replica the edges hold.
+    pub(crate) revision: u64,
+    /// Members whose entry may have changed since the replica was last
+    /// published.
+    replica_dirty: Vec<ConnId>,
+    /// Whether the channel's history ring may be the whole record: false for
+    /// a channel a rebuild resumed, whose earlier history this process never
+    /// held.
+    pub(crate) history_whole: bool,
 }
 
 /// Proof that a `+s` (secret) channel must look non-existent to a connection.
@@ -4284,6 +4322,9 @@ impl Channel {
             invited: HashSet::new(),
             last_knock: None,
             created_at,
+            revision: 0,
+            replica_dirty: Vec::new(),
+            history_whole: true,
         }
     }
 
@@ -4307,6 +4348,7 @@ impl Channel {
     }
 
     pub fn member_mut(&mut self, conn: ConnId) -> Option<&mut MemberModes> {
+        self.replica_dirty.push(conn);
         self.members.get_mut(&conn).map(|member| &mut member.modes)
     }
 
@@ -4373,6 +4415,7 @@ impl Channel {
         identity: MemberIdentity,
         modes: MemberModes,
     ) {
+        self.replica_dirty.push(recipient.conn());
         self.members.insert(
             recipient.conn(),
             ChannelMember {
@@ -4386,6 +4429,7 @@ impl Channel {
     }
 
     pub fn remove_member(&mut self, conn: ConnId) -> Option<MemberModes> {
+        self.replica_dirty.push(conn);
         let removed = self.members.remove(&conn).map(|member| member.modes);
         if removed.is_some() {
             self.recipients.get_mut().take();
@@ -4847,6 +4891,15 @@ pub(crate) struct ServerState {
     /// [`Session::paced_who`]), so it
     /// cannot outlive the connection it answers.
     pub(crate) pacing: HashSet<ConnId>,
+    /// Where this process's monotonic clock started on the wall clock: what
+    /// the bodies it writes for its edges carry.
+    clock_origin: crate::core::record::ClockOrigin,
+    /// The format those bodies are written in, and where channel replicas go.
+    held_sinks: HeldSinks,
+    /// What the edges were last told of each channel this shard owns.
+    replicated: HashMap<ChanKey, ReplicaLedger>,
+    /// Cut: the shard handles nothing more (DESIGN §19.3).
+    frozen: bool,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -5137,11 +5190,7 @@ impl ServerState {
         batch: Option<String>,
         sweep: crate::core::list::ChannelSweep,
     ) {
-        let id = ChannelListRequestId(self.channel_list_id);
-        self.channel_list_id = self
-            .channel_list_id
-            .checked_add(1)
-            .expect("channel LIST request identifiers exhausted");
+        let id = self.next_channel_list_id();
         let shards = self.channels.shard_count();
         let session = self
             .sessions
@@ -5158,6 +5207,16 @@ impl ServerState {
             previous.is_none(),
             "a connection has one LIST and one NAMES in progress"
         );
+    }
+
+    /// A LIST request identifier no request of this shard's had.
+    fn next_channel_list_id(&mut self) -> ChannelListRequestId {
+        let id = ChannelListRequestId(self.channel_list_id);
+        self.channel_list_id = self
+            .channel_list_id
+            .checked_add(1)
+            .expect("channel LIST request identifiers exhausted");
+        id
     }
 
     /// Ask channel shard `shard` for the next page of `conn`'s LIST: at most
@@ -5396,6 +5455,7 @@ impl ServerState {
     /// to tell those members.
     pub(crate) fn publish_changed_channels(&mut self) {
         let touched = self.channels.take_touched();
+        self.publish_held_channels(&touched);
         for key in &touched {
             let published = self.channels.get(key).map(|channel| PublicChannel {
                 name: channel.name.clone(),
@@ -5451,7 +5511,9 @@ impl ServerState {
     /// `sync_channel_member` itself; several never did, and were papered over
     /// by a sync on every line the client sent.)
     pub(crate) fn publish_changed_sessions(&mut self) {
-        for conn in self.sessions.take_touched() {
+        let touched = self.sessions.take_touched();
+        self.publish_held_sessions(&touched);
+        for conn in touched {
             match self.sessions.get(&conn) {
                 None => self.users.withdraw(conn),
                 Some(session) if !session.is_registered() => {}
@@ -5784,6 +5846,7 @@ impl ServerState {
         directories: CoreDirectories,
     ) -> Self {
         let started_at = (config.clock)();
+        let clock_origin = crate::core::record::ClockOrigin::of(started_at, (config.mono_clock)());
         Self {
             shard,
             telemetry,
@@ -5843,6 +5906,10 @@ impl ServerState {
             channel_control_id: 0,
             pacing: HashSet::new(),
             channel_list_id: 0,
+            clock_origin,
+            held_sinks: directories.held,
+            replicated: HashMap::new(),
+            frozen: false,
         }
     }
 
@@ -5918,6 +5985,12 @@ impl ServerState {
         // must be able to fall back rather than report an empty batch. One
         // rule for channels and conversations alike.
         let whole_record = !self.config.sasl_enabled;
+        // A channel a rebuild resumed had history this process never held.
+        let whole_record = whole_record
+            && key
+                .channel()
+                .and_then(|channel| self.channels.get(&channel))
+                .is_none_or(|channel| channel.history_whole);
         // Evicted targets keep no ring at all; their history is served from
         // Postgres.
         let bounds = crate::core::hot_history::HotHistoryBounds {
@@ -6150,7 +6223,7 @@ impl ServerState {
 
     /// Key a channel name for lookup/storage.
     pub fn chan_key(&self, name: &str) -> ChanKey {
-        ChanKey(self.casemap.casefold(name))
+        ChanKey::fold(self.casemap, name)
     }
 
     /// Key an account name for an in-core account map, under the server
@@ -6862,6 +6935,7 @@ impl ServerState {
         tx: crate::core::SendQueue,
         host: String,
         transport: crate::core::ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
     ) {
         let opened_at = (self.config.mono_clock)();
         // The shown host rides as a middle parameter (WHO, WHOIS): an IPv6
@@ -6880,6 +6954,7 @@ impl ServerState {
                     .map(|address| address.to_canonical()),
                 host,
                 transport,
+                tls,
                 reg: Registration::Registering {
                     nick: None,
                     user: None,
@@ -6892,7 +6967,7 @@ impl ServerState {
                 login: None,
                 sasl: SaslState::default(),
                 sasl_verify: None,
-                sasl_buf: String::new(),
+                sasl_buf: SaslBuffer::default(),
                 credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
                 verify_epoch: 0,
@@ -6918,6 +6993,7 @@ impl ServerState {
                 label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
                 flood_exempt: false,
+                held_marks: HeldMarks::default(),
                 // Every monotonic watermark is seeded from the open time, never a
                 // zero `MonoMillis` sentinel. A zero would be indistinguishable
                 // from a real early reading (the mono epoch IS process start), so
@@ -8229,6 +8305,7 @@ mod session_store_tests {
             tx,
             "host.test".into(),
             crate::core::ConnectionTransport::Tcp,
+            None,
         );
     }
 

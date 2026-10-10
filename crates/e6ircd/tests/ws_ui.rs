@@ -765,23 +765,15 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     }
 }
 
-/// "Load earlier" pages back through one conversation: the running ring
-/// first, then the stored backlog the ring has evicted, joined without a
-/// line twice or missing — identical lines included — and from storage alone
-/// at a held line when no ring position can say where the reader begins.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
-    let url =
-        support::test_db("conversation_history_pages_from_the_ring_into_storage_exactly").await;
-    let pool = e6ircd::db::connect_and_migrate(&url)
-        .await
-        .expect("connect");
+/// The account, its token, and lines a crashed run stored for `up`'s #lobby
+/// (`stored-1`, `stored-2`): the next start begins a new epoch and restores
+/// them at other ring positions than they were stored at.
+async fn history_account(url: &e6ircd::db::DatabaseUrl) -> String {
+    let pool = e6ircd::db::connect_and_migrate(url).await.expect("connect");
     e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
         .await
         .expect("acct");
     let token = issue_api_token(&pool, "alice", "web").await.expect("token");
-    // What an earlier run of the network stored.
     let buffer = e6ircd::db::open_bnc_buffer(
         &pool,
         Some("alice"),
@@ -797,14 +789,21 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
             Some("alicebnc"),
             &format!("@time=2026-01-01T00:00:00.00{millis}Z :peer!u@h PRIVMSG #lobby :{body}"),
             &e6irc_client::NetworkNames::default(),
+            millis,
         )
         .await
         .expect("seed");
     }
-    drop(pool);
+    token
+}
 
-    let up = upstream().await;
-    let config = Config {
+/// A server whose network `up` (ring of `buffer_cap`) is alice's on `up_addr`.
+fn history_config(
+    url: &e6ircd::db::DatabaseUrl,
+    up_addr: std::net::SocketAddr,
+    buffer_cap: usize,
+) -> Config {
+    Config {
         server_name: "irc.web.example".into(),
         network_name: "Web".into(),
         listeners: vec![ListenerConfig {
@@ -820,7 +819,7 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
             hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
-            url,
+            url: url.clone(),
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
             max_connections: None,
         }),
@@ -828,15 +827,13 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
             kind: e6ircd::config::NetworkKind::Irc,
             name: "up".into(),
             owner: Some("alice".into()),
-            addr: up.to_string(),
+            addr: up_addr.to_string(),
             tls: false,
             nick: "alicebnc".into(),
             username: Some("tester".into()),
             realname: Some("alicebnc".into()),
             autojoin: vec!["#lobby".into()],
-            // A ring this small has evicted most of the conversation by the
-            // time it is paged, so the pages have to continue into storage.
-            buffer_cap: 4,
+            buffer_cap,
             sasl_account: None,
             sasl_password: None,
             server_password: None,
@@ -847,11 +844,13 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
-    };
-    let running = net::start(config).await.expect("start");
-    let http = running.http_addr.expect("http bound");
-    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    }
+}
 
+/// A peer in #lobby says eight lines there — two of them identical, back to
+/// back, since identical text is not identity — and one elsewhere; returns
+/// everything #lobby holds, oldest first, the stored lines included.
+async fn converse(up: std::net::SocketAddr) -> (e6irc_client::Connection, Vec<String>) {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
@@ -869,8 +868,6 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
             break;
         }
     }
-    // Two identical lines back to back: identical text is not identity, and
-    // both must come back once each.
     let said = [
         "live-1", "live-2", "live-3", "live-4", "live-5", "same", "same", "live-6",
     ];
@@ -882,82 +879,42 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
     peer.send_line("PRIVMSG #elsewhere :not this conversation")
         .await
         .unwrap();
-    let expected: Vec<&str> = ["stored-1", "stored-2"].into_iter().chain(said).collect();
+    let expected = ["stored-1", "stored-2"]
+        .into_iter()
+        .chain(said)
+        .map(String::from)
+        .collect();
+    (peer, expected)
+}
 
-    let get = |query: String| {
-        let token = token.clone();
-        async move {
-            let (status, body) = http_req(
-                http,
-                &format!(
-                    "GET /api/v1/me/networks/up/history?target=%23lobby&{query} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-                ),
-            )
-            .await;
-            let value: serde_json::Value = serde_json::from_str(&body).expect("json");
-            (status, value)
-        }
-    };
-    let bodies = |lines: &serde_json::Value| -> Vec<String> {
-        lines
-            .as_array()
-            .expect("lines")
-            .iter()
-            .map(|line| {
-                let line = line.as_str().expect("line");
-                line.rsplit_once(" :").expect("a message").1.to_string()
-            })
-            .collect()
-    };
+/// "Load earlier" pages back through one conversation: the running ring
+/// first, then the stored backlog the ring has evicted, joined at the rows
+/// its lines were stored at, without a line twice or missing — identical
+/// lines included — and from storage alone at a line the reader holds.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
+    let url =
+        support::test_db("conversation_history_pages_from_the_ring_into_storage_exactly").await;
+    let token = history_account(&url).await;
+    let up = upstream().await;
+    // A ring this small has evicted most of the conversation by the time it
+    // is paged, so the pages have to continue into storage.
+    let running = net::start(history_config(&url, up, 4))
+        .await
+        .expect("start");
+    let http = running.http_addr.expect("http bound");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    let (_peer, expected) = converse(up).await;
+    let newest = stored_whole(http, &token, &expected).await;
 
-    // The newest page of storage, once everything said is stored.
-    let newest = tokio::time::timeout(deadline::HANG, async {
-        loop {
-            let (status, page) = get("limit=500".into()).await;
-            assert_eq!(status, 200, "{page}");
-            if bodies(&page["lines"]) == expected {
-                return page;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the conversation is never stored whole");
-    assert_eq!(newest["before"], serde_json::Value::Null, "nothing older");
-
-    // A reader holding nothing pages back from its socket's position.
-    let mut socket = {
-        let mut req = "ws://HOST/ws/ui?network=up"
-            .replace("HOST", &http.to_string())
-            .into_client_request()
-            .unwrap();
-        req.headers_mut()
-            .insert("authorization", format!("Bearer {token}").parse().unwrap());
-        tokio_tungstenite::connect_async(req)
-            .await
-            .expect("ws/ui connect")
-            .0
-    };
-    let events = events_until_snapshot(&mut socket).await;
-    let position = events
-        .last()
-        .and_then(|event| event["cursor"].as_str())
-        .expect("boundary cursor")
-        .to_string();
-    let mut pages = Vec::new();
-    let mut before = position.clone();
-    loop {
-        let (status, page) = get(format!("limit=3&before={}", before.replace(':', "%3A"))).await;
-        assert_eq!(status, 200, "{page}");
-        pages.push(bodies(&page["lines"]));
-        match page["before"].as_str() {
-            Some(next) => before = next.to_string(),
-            None => break,
-        }
-        assert!(pages.len() < 10, "paging never ends: {pages:?}");
-    }
-    let joined: Vec<String> = pages.iter().rev().flatten().cloned().collect();
-    assert_eq!(joined, expected, "pages: {pages:?}");
+    let position = snapshot_cursor(http, &token).await;
+    let pages = page_back(http, &token, &position).await;
+    assert_eq!(
+        pages.iter().rev().flatten().cloned().collect::<Vec<_>>(),
+        expected,
+        "{pages:?}"
+    );
     assert!(
         pages.len() >= 3,
         "the ring and storage both took part: {pages:?}"
@@ -966,31 +923,31 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
     // A position the ring has evicted past cannot be joined to what the
     // reader holds; it is told to read with `seam` instead.
     let epoch = position.split_once(':').expect("cursor").0;
-    let (status, refusal) = get(format!("before={epoch}%3A1")).await;
+    let (status, refusal) = history(http, &token, &format!("before={epoch}%3A1")).await;
     assert_eq!(status, 409, "{refusal}");
     assert_eq!(refusal["field"], "before", "{refusal}");
 
     // From storage alone, at a line the reader holds.
-    let held = newest["lines"]
-        .as_array()
-        .unwrap()
+    let held = newest
         .iter()
-        .map(|line| line.as_str().unwrap())
         .find(|line| line.ends_with(":live-3"))
         .expect("live-3 stored");
-    let seam: String = url_encode(held);
-    let (status, page) = get(format!("seam={seam}&held=1&limit=500")).await;
+    let seam = url_encode(held);
+    let (status, page) = history(http, &token, &format!("seam={seam}&held=1&limit=500")).await;
     assert_eq!(status, 200, "{page}");
     assert_eq!(
         bodies(&page["lines"]),
         ["stored-1", "stored-2", "live-1", "live-2"]
     );
     assert_eq!(page["before"], serde_json::Value::Null);
-    let (status, refusal) =
-        get("seam=%3Anobody%20PRIVMSG%20%23lobby%20%3Anever&held=1".into()).await;
+    let (status, refusal) = history(
+        http,
+        &token,
+        "seam=%3Anobody%20PRIVMSG%20%23lobby%20%3Anever&held=1",
+    )
+    .await;
     assert_eq!(status, 409, "{refusal}");
     assert_eq!(refusal["field"], "seam", "{refusal}");
-
     // Requests that say two things, or nothing usable.
     for (query, field) in [
         ("held=1".to_string(), "held"),
@@ -998,9 +955,139 @@ async fn conversation_history_pages_from_the_ring_into_storage_exactly() {
         ("before=row%3Anot-a-row".to_string(), "before"),
         ("before=nonsense".to_string(), "before"),
     ] {
-        let (status, refusal) = get(query.clone()).await;
+        let (status, refusal) = history(http, &token, &query).await;
         assert_eq!(status, 400, "{query}: {refusal}");
         assert_eq!(refusal["field"], field, "{query}: {refusal}");
+    }
+    running.shutdown.run(net::StopMode::Final).await;
+}
+
+/// The cursors "Load earlier" pages from are ring positions, which a clean
+/// restart keeps (migration 0102): a reader's cursor from before it still
+/// names its place, and pages on exactly. Before it, lines a crashed run
+/// stored sit in the ring at positions other than they were stored at, and
+/// are joined to storage by their exact text instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn conversation_history_cursors_survive_a_clean_restart() {
+    let url = support::test_db("conversation_history_cursors_survive_a_clean_restart").await;
+    let token = history_account(&url).await;
+    let up = upstream().await;
+    // Large enough to hold the restored lines beside everything said.
+    let running = net::start(history_config(&url, up, 1000))
+        .await
+        .expect("start A");
+    let http = running.http_addr.expect("http bound");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    let (_peer, expected) = converse(up).await;
+    stored_whole(http, &token, &expected).await;
+    let position = snapshot_cursor(http, &token).await;
+    let pages = page_back(http, &token, &position).await;
+    assert_eq!(
+        pages.iter().rev().flatten().cloned().collect::<Vec<_>>(),
+        expected,
+        "{pages:?}"
+    );
+
+    running.shutdown.run(net::StopMode::Final).await;
+    let running = net::start(history_config(&url, up, 1000))
+        .await
+        .expect("start B");
+    let http = running.http_addr.expect("http bound");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    let pages = page_back(http, &token, &position).await;
+    assert_eq!(
+        pages.iter().rev().flatten().cloned().collect::<Vec<_>>(),
+        expected,
+        "{pages:?}"
+    );
+    running.shutdown.run(net::StopMode::Final).await;
+}
+
+/// `GET /api/v1/me/networks/up/history?target=#lobby&<query>`.
+async fn history(http: std::net::SocketAddr, token: &str, query: &str) -> (u16, serde_json::Value) {
+    let (status, body) = http_req(
+        http,
+        &format!(
+            "GET /api/v1/me/networks/up/history?target=%23lobby&{query} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    (status, serde_json::from_str(&body).expect("json"))
+}
+
+/// What each line of a page said.
+fn bodies(lines: &serde_json::Value) -> Vec<String> {
+    lines
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|line| {
+            let line = line.as_str().expect("line");
+            line.rsplit_once(" :").expect("a message").1.to_string()
+        })
+        .collect()
+}
+
+/// The newest page of storage once it holds exactly `expected`, as raw lines.
+async fn stored_whole(http: std::net::SocketAddr, token: &str, expected: &[String]) -> Vec<String> {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let (status, page) = history(http, token, "limit=500").await;
+            assert_eq!(status, 200, "{page}");
+            if bodies(&page["lines"]) == expected {
+                assert_eq!(page["before"], serde_json::Value::Null, "nothing older");
+                return page["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|line| line.as_str().unwrap().to_string())
+                    .collect();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the conversation is never stored whole")
+}
+
+/// The replay boundary's cursor a fresh `/ws/ui` attach is handed.
+async fn snapshot_cursor(http: std::net::SocketAddr, token: &str) -> String {
+    let mut req = format!("ws://{http}/ws/ui?network=up")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let mut socket = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws/ui connect")
+        .0;
+    let events = events_until_snapshot(&mut socket).await;
+    events
+        .last()
+        .and_then(|event| event["cursor"].as_str())
+        .expect("boundary cursor")
+        .to_string()
+}
+
+/// Every page back from `before`, three lines at a time, newest page first.
+async fn page_back(http: std::net::SocketAddr, token: &str, before: &str) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    let mut before = before.to_string();
+    loop {
+        let (status, page) = history(
+            http,
+            token,
+            &format!("limit=3&before={}", before.replace(':', "%3A")),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        pages.push(bodies(&page["lines"]));
+        match page["before"].as_str() {
+            Some(next) => before = next.to_string(),
+            None => return pages,
+        }
+        assert!(pages.len() < 10, "paging never ends: {pages:?}");
     }
 }
 

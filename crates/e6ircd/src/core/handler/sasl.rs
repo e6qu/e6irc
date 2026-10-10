@@ -268,7 +268,10 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 {
                     true
                 } else {
-                    session.sasl_buf.push_str(piece);
+                    // Retained for replay until the payload completes: a
+                    // chunk only accumulates in this core's memory.
+                    let line = session.input_line();
+                    session.sasl_buf.push(piece, line);
                     false
                 }
             };
@@ -292,8 +295,12 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
             if arg.len() == e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN {
                 return; // more chunks to come
             }
-            let payload =
-                std::mem::take(&mut state.sessions.get_mut(&conn).expect("checked").sasl_buf);
+            let payload = state
+                .sessions
+                .get_mut(&conn)
+                .expect("checked")
+                .sasl_buf
+                .take();
             // Only one credential verify may be outstanding per connection: each
             // is offloaded and its reply routed by ambient flags, so two in
             // flight would cross-attribute (an IDENTIFY or a still-pending

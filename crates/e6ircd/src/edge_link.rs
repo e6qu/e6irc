@@ -27,7 +27,9 @@
 //! own session's credit.
 //!
 //! A link that ends ends every session it carried: an IRC session quits as
-//! `Edge link lost`, and the edge closes each client loudly on its side.
+//! `Edge link lost`, and the edge closes each client loudly on its side —
+//! unless the core cut it gracefully (link version 2, [`held`]): the edge then
+//! holds its sessions for the next core, which rebuilds them.
 
 use std::collections::HashMap;
 use std::io;
@@ -57,6 +59,9 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::core::{CoreIngress, Input};
 use crate::observability::{ErrorKind, Telemetry};
+
+mod held;
+pub(crate) use held::{PendingCut, ReplicaRoutes};
 
 /// Where edges link, and the core's link credentials (`[edge_link]`). Its
 /// presence is edge mode: the core binds no client listener of its own.
@@ -105,6 +110,10 @@ struct Registration {
     view: LinkedEdgeView,
     generation: u64,
     over: watch::Sender<Option<LinkEnd>>,
+    /// How the core admitted the link.
+    admission: e6irc_link::Admission,
+    /// The link's session streams, by index, while they run.
+    streams: Mutex<HashMap<u16, Arc<SessionStream>>>,
 }
 
 /// Why a link ends from the core's side.
@@ -115,6 +124,10 @@ enum LinkEnd {
     /// The core is stopping and has ended every session: what they were last
     /// given is sent before the link closes.
     CoreStopping,
+    /// The core cut the link gracefully: every stream sent what its sessions
+    /// were last given, their records and replicas, and the `Cut`, and the
+    /// edge holds the sessions for the next core.
+    Cut,
 }
 
 impl Registration {
@@ -250,6 +263,30 @@ impl Roster {
         }
     }
 
+    /// Record that `edges` hold the sessions of `cut`: the next core waits
+    /// for them. A core without a database keeps no roster past itself; the
+    /// cut state each edge holds names the others.
+    async fn record_cut(&self, edges: &[EdgeName], cut: e6irc_link::CutId) {
+        if let Self::Database(pool) = self {
+            let names: Vec<String> = edges.iter().map(|edge| edge.as_str().to_owned()).collect();
+            if let Err(error) = crate::db::roster::record_cut(pool, &names, cut.get()).await {
+                eprintln!(
+                    "e6ircd: the roster could not record the cut ({error}); the next core finds \
+                     the edges holding it as they link"
+                );
+            }
+        }
+    }
+
+    /// The cut a rebuild resumed is done with.
+    async fn clear_cut(&self, cut: e6irc_link::CutId) {
+        if let Self::Database(pool) = self
+            && let Err(error) = crate::db::roster::clear_cut(pool, cut.get()).await
+        {
+            eprintln!("e6ircd: the roster could not clear the rebuilt cut: {error}");
+        }
+    }
+
     async fn unlink(&self, edge: &EdgeName) {
         if let Self::Database(pool) = self
             && let Err(error) = crate::db::roster::unlink_edge(pool, edge.as_str()).await
@@ -316,6 +353,8 @@ pub(crate) struct LinkServer {
     pub(crate) edges: Arc<LinkedEdges>,
     roster: Roster,
     pub(crate) http: Option<crate::http::LinkRouters>,
+    /// The rebuild of the sessions the edges hold from the last core's cut.
+    rebuild: held::RebuildGate,
 }
 
 /// What [`LinkServer::new`] takes beyond its fields' own values.
@@ -333,15 +372,18 @@ pub(crate) struct LinkServerParts {
     pub(crate) edges: Arc<LinkedEdges>,
     pub(crate) pool: Option<sqlx::PgPool>,
     pub(crate) http: Option<crate::http::LinkRouters>,
+    /// The cut the roster says the edges hold, which this core rebuilds.
+    pub(crate) pending_cut: Option<PendingCut>,
 }
 
 impl LinkServer {
     pub(crate) fn new(parts: LinkServerParts) -> Self {
+        let has_database = parts.pool.is_some();
         let streams = u16::try_from(parts.core_tx.shard_count().len())
             .ok()
             .filter(|streams| *streams <= e6irc_link::MAX_STREAMS)
             .expect("configuration validation bounds the core shards by the link's streams");
-        Self {
+        let server = Self {
             acceptor: parts.acceptor,
             epoch: parts.epoch,
             streams,
@@ -359,7 +401,13 @@ impl LinkServer {
                 None => Roster::Memory(Mutex::default()),
             },
             http: parts.http,
+            rebuild: held::RebuildGate::new(parts.pending_cut, !has_database),
+        };
+        if server.rebuild.is_open() {
+            // Nothing to rebuild: the core's own sessions start now.
+            server.core_tx.directories().held.rebuilt.done();
         }
+        server
     }
 
     /// End every edge's link: the core is stopping, and every session it
@@ -462,6 +510,7 @@ async fn serve_connection(server: Arc<LinkServer>, tcp: tokio::net::TcpStream, p
         slot: admitted.registration.view.slot,
         streams: server.streams,
         terms: server.terms.clone(),
+        admission: admitted.registration.admission,
     };
     if let Err(error) = write_frame(&mut tls, &CoreFrame::Welcome(welcome)).await {
         server.telemetry.record_error(ErrorKind::Link);
@@ -539,6 +588,7 @@ async fn admit(
                 .roster
                 .link(&hello.edge, hello.slot, server.epoch, &server.edges)
                 .await?;
+            let admission = server.rebuild.admit(&hello.edge, version, hello.cut);
             let registration = Arc::new(Registration {
                 view: LinkedEdgeView {
                     name: hello.edge.clone(),
@@ -550,6 +600,8 @@ async fn admit(
                 },
                 generation: server.edges.generations.fetch_add(1, Ordering::SeqCst),
                 over: watch::Sender::new(None),
+                admission,
+                streams: Mutex::default(),
             });
             let replaced = server
                 .edges
@@ -564,10 +616,16 @@ async fn admit(
                 );
                 replaced.end(LinkEnd::Lost);
             }
+            server.joined(&registration);
             eprintln!(
-                "e6ircd: edge {} linked (slot {}, link version {version})",
+                "e6ircd: edge {} linked (slot {}, link version {version}, {})",
                 hello.edge,
-                slot.get()
+                slot.get(),
+                match admission {
+                    e6irc_link::Admission::Serve => "serving",
+                    e6irc_link::Admission::Hold => "holding its sessions until the rebuild",
+                    e6irc_link::Admission::Upload => "uploading the sessions it holds",
+                }
             );
             Ok(Admitted {
                 version,
@@ -644,6 +702,8 @@ struct CoreSession {
 struct SessionStream {
     server: Arc<LinkServer>,
     index: u16,
+    /// The link version the edge's link speaks.
+    version: u16,
     /// The edge's slot: every session it opens is numbered in it.
     slot: Slot,
     out: mpsc::Sender<CoreFrame>,
@@ -653,6 +713,22 @@ struct SessionStream {
     pusher: mpsc::UnboundedSender<Input>,
     /// A peer that broke the protocol: the link ends.
     fault: watch::Sender<Option<String>>,
+    /// The link it belongs to.
+    registration: Arc<Registration>,
+    /// Set when the core cuts: each pump sends what its session was last
+    /// given and stops, without ending the session.
+    cutting: watch::Sender<bool>,
+    /// A clone per running pump; its receiver hears the last go.
+    pumps: Mutex<Option<mpsc::Sender<()>>>,
+    pumps_done: tokio::sync::Mutex<mpsc::Receiver<()>>,
+    /// The replicas this stream carries to the edge, in the order the shard
+    /// published them.
+    replicas: Mutex<Option<mpsc::UnboundedSender<e6irc_link::Replica>>>,
+    replica_forwarder: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Answered when the edge says it has paused its input on this stream.
+    paused: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// What the edge uploaded on this stream from the cut it holds.
+    uploads: Mutex<held::StreamUploads>,
 }
 
 impl SessionStream {
@@ -667,16 +743,36 @@ impl SessionStream {
         let (out, mut frames) = mpsc::channel(STREAM_QUEUE);
         let (pusher, inputs) = mpsc::unbounded_channel();
         let lines_in_flight = Arc::new(AtomicU32::new(0));
+        let (pumps, pumps_done) = mpsc::channel(1);
+        let (replicas, replicas_queued) = mpsc::unbounded_channel();
         let stream = Arc::new(SessionStream {
             server: server.clone(),
             index,
+            version: registration.view.version,
             slot: registration.view.slot,
             out: out.clone(),
             sessions: Arc::default(),
             lines_in_flight: lines_in_flight.clone(),
             pusher,
             fault: watch::Sender::new(None),
+            registration: registration.clone(),
+            cutting: watch::Sender::new(false),
+            pumps: Mutex::new(Some(pumps)),
+            pumps_done: tokio::sync::Mutex::new(pumps_done),
+            replicas: Mutex::new(Some(replicas)),
+            replica_forwarder: Mutex::new(Some(tokio::spawn(held::forward_replicas(
+                replicas_queued,
+                out.clone(),
+            )))),
+            paused: Mutex::default(),
+            uploads: Mutex::default(),
         });
+        registration
+            .streams
+            .lock()
+            .expect("link streams")
+            .insert(index, stream.clone());
+        server.resume_if_open(&stream);
         let mut writer = tokio::spawn(async move { write_frames(write_half, &mut frames).await });
         let pushing = tokio::spawn(push_lines(
             server.core_tx.clone(),
@@ -698,6 +794,7 @@ impl SessionStream {
             },
             end = registration.over() => match end {
                 LinkEnd::CoreStopping => ("the core is stopping".to_string(), true),
+                LinkEnd::Cut => ("the core cut it; the edge holds its sessions".to_string(), true),
                 LinkEnd::Lost => ("the edge linked again, or another of its connections ended".to_string(), false),
             },
             fault = faults.wait_for(Option::is_some) => match fault {
@@ -709,6 +806,12 @@ impl SessionStream {
             "e6ircd: session stream {index} of edge {} ended: {ended}",
             registration.view.name
         );
+        registration
+            .streams
+            .lock()
+            .expect("link streams")
+            .remove(&index);
+        stream.close_replicas();
         if graceful {
             // The core ended every session: each pump sends what its session
             // was last given, then `End`, and the writer sends it all before
@@ -748,6 +851,16 @@ impl SessionStream {
     async fn read<R: AsyncRead + Unpin>(self: Arc<Self>, read_half: R) -> io::Result<()> {
         let mut reader = FrameReader::new(read_half);
         while let Some(frame) = reader.next::<EdgeFrame>().await? {
+            if frame.since() > self.version {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "core link: a frame of link version {} on a link of version {}",
+                        frame.since(),
+                        self.version
+                    ),
+                ));
+            }
             match frame {
                 EdgeFrame::Open(session, open) => self.open(session, open).await,
                 EdgeFrame::Line(session, line) => {
@@ -771,6 +884,23 @@ impl SessionStream {
                         "core link: Hello after the handshake",
                     ));
                 }
+                EdgeFrame::Paused => {
+                    let asked = self.paused.lock().expect("pause answer").take();
+                    match asked {
+                        Some(answer) => drop(answer.send(())),
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "core link: Paused, which this core did not ask for",
+                            ));
+                        }
+                    }
+                }
+                EdgeFrame::Upload(session, upload) => self.upload(session, upload)?,
+                EdgeFrame::RecordUpload(session, part) => self.upload_record(session, part)?,
+                EdgeFrame::ReplicaUpload(replica) => self.upload_replica(replica)?,
+                EdgeFrame::CutUpload(part) => self.upload_cut(part)?,
+                EdgeFrame::UploadDone => self.upload_done()?,
             }
         }
         Ok(())
@@ -853,7 +983,7 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                self.open_irc(session, ClientIp::new(address), transport, guard);
+                self.open_irc(session, ClientIp::new(address), transport, None, guard);
             }
             SessionKind::Irc => {
                 let Some(guard) = self.server.limiter.try_acquire(client) else {
@@ -871,7 +1001,7 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                self.open_irc(session, client, transport, guard);
+                self.open_irc(session, client, transport, open.tls, guard);
             }
             SessionKind::Attach => {
                 let Some(port) = self.server.attach.clone() else {
@@ -899,34 +1029,26 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                let edge = port
-                    .open(conn, client.to_string(), transport, self.server.sendq_bytes)
+                let edge = if self.version >= 2 {
+                    // Its edge holds it for the next core.
+                    port.open_holding(
+                        conn,
+                        open.address,
+                        self.server.sendq_bytes,
+                        self.server.core_tx.directories().held.format.clone(),
+                    )
+                } else {
+                    port.open(
+                        conn,
+                        client.to_string(),
+                        transport,
+                        open.tls,
+                        self.server.sendq_bytes,
+                    )
                     .await
-                    .expect("the attach port always opens");
-                let window = u32::try_from(crate::bouncer::ATTACH_INBOUND_BYTES).expect("small");
-                let (input, inputs) = mpsc::unbounded_channel();
-                let in_flight = Arc::new(AtomicU64::new(0));
-                tokio::spawn(feed_attach(
-                    port,
-                    conn,
-                    session,
-                    inputs,
-                    self.out.clone(),
-                    in_flight.clone(),
-                    window,
-                ));
-                self.start(
-                    session,
-                    SessionKind::Attach,
-                    edge,
-                    Some((input, in_flight, window)),
-                    guard.into(),
-                );
-                drop(
-                    self.out
-                        .send(CoreFrame::Credit(Credit::Session(session, window)))
-                        .await,
-                );
+                    .expect("the attach port always opens")
+                };
+                self.feed_attach_session(session, port, edge, guard).await;
             }
             SessionKind::Ui => {
                 let Some(UpgradeGrant::Ui(grant)) = self.server.upgrades.take(conn) else {
@@ -939,32 +1061,84 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                let (edge, inbound) = crate::http::open_granted_ui(*grant);
-                let window = u32::try_from(e6irc_link::MAX_UI_MESSAGE_LEN).expect("small");
-                let (input, inputs) = mpsc::unbounded_channel();
-                let in_flight = Arc::new(AtomicU64::new(0));
-                tokio::spawn(feed_ui(
-                    inbound,
-                    session,
-                    inputs,
-                    self.out.clone(),
-                    in_flight.clone(),
-                    window,
-                ));
-                self.start(
-                    session,
-                    SessionKind::Ui,
-                    edge,
-                    Some((input, in_flight, window)),
-                    SessionHold::default(),
-                );
-                drop(
-                    self.out
-                        .send(CoreFrame::Credit(Credit::Session(session, window)))
-                        .await,
-                );
+                self.start_ui(session, *grant, 0).await;
             }
         }
+    }
+
+    /// Carry an attach session's lines to its attachment, on its own
+    /// credit, and pump its output.
+    pub(super) async fn feed_attach_session(
+        self: &Arc<Self>,
+        session: SessionId,
+        port: crate::bouncer::AttachPort,
+        edge: EdgeSession,
+        guard: e6irc_edge::address::ConnGuard,
+    ) {
+        let conn = ConnId(session.get());
+        let window = u32::try_from(crate::bouncer::ATTACH_INBOUND_BYTES).expect("small");
+        let (input, inputs) = mpsc::unbounded_channel();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        tokio::spawn(feed_attach(
+            port,
+            conn,
+            session,
+            inputs,
+            self.out.clone(),
+            in_flight.clone(),
+            window,
+        ));
+        self.start(
+            session,
+            SessionKind::Attach,
+            edge,
+            Some((input, in_flight, window)),
+            guard.into(),
+        );
+        drop(
+            self.out
+                .send(CoreFrame::Credit(Credit::Session(session, window)))
+                .await,
+        );
+    }
+
+    /// Start a live chat socket's core half on this stream, with `in_flight`
+    /// bytes already sent and not yet written (a socket a rebuild resumes);
+    /// an edge of link version 2 holds its record.
+    pub(super) async fn start_ui(
+        self: &Arc<Self>,
+        session: SessionId,
+        grant: crate::http::UiGrant,
+        in_flight: u64,
+    ) {
+        let holding = (self.version >= 2).then(|| crate::http::HoldingUi {
+            in_flight,
+            format: self.server.core_tx.directories().held.format.clone(),
+        });
+        let (edge, inbound) = crate::http::open_granted_ui(grant, holding);
+        let window = u32::try_from(e6irc_link::MAX_UI_MESSAGE_LEN).expect("small");
+        let (input, inputs) = mpsc::unbounded_channel();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        tokio::spawn(feed_ui(
+            inbound,
+            session,
+            inputs,
+            self.out.clone(),
+            in_flight.clone(),
+            window,
+        ));
+        self.start(
+            session,
+            SessionKind::Ui,
+            edge,
+            Some((input, in_flight, window)),
+            SessionHold::default(),
+        );
+        drop(
+            self.out
+                .send(CoreFrame::Credit(Credit::Session(session, window)))
+                .await,
+        );
     }
 
     /// Open an IRC session on its shard, in order with its lines.
@@ -973,13 +1147,18 @@ impl SessionStream {
         session: SessionId,
         client: ClientIp,
         transport: ConnectionTransport,
+        tls: Option<e6irc_link::TlsFacts>,
         guard: e6irc_edge::address::ConnGuard,
     ) {
         let (input, edge) = self.server.core_tx.open_input(
             ConnId(session.get()),
             client.to_string(),
             transport,
+            tls,
             self.server.sendq_bytes,
+            // An edge of link version 2 holds the session's record for the
+            // next core.
+            self.version >= 2,
         );
         if self.pusher.send(input).is_err() {
             return;
@@ -1011,13 +1190,21 @@ impl SessionStream {
                 window,
             },
         );
+        let Some(alive) = self.pumps.lock().expect("stream pumps").clone() else {
+            // The stream is being cut: a session it opens now is the next
+            // core's, and the edge holds it.
+            return;
+        };
         let pump = Pump {
             exemption: edge.flood_exemption(),
+            held: edge.held_signal(),
             edge,
             session,
             controls,
             out: self.out.clone(),
             stream: Arc::downgrade(self),
+            cutting: self.cutting.subscribe(),
+            _alive: alive,
             _task: self.server.connections.task(),
             _hold: hold,
         };
@@ -1281,19 +1468,88 @@ async fn feed_ui(
 struct Pump {
     edge: EdgeSession,
     exemption: e6irc_edge::meter::FloodExemption,
+    /// Wakes when the core publishes what the edge holds.
+    held: e6irc_edge::link::HeldSignal,
     session: SessionId,
     controls: mpsc::UnboundedReceiver<Control>,
     out: mpsc::Sender<CoreFrame>,
     stream: std::sync::Weak<SessionStream>,
+    /// The core is cutting: send what is left, and stop without `End`.
+    cutting: watch::Receiver<bool>,
+    _alive: mpsc::Sender<()>,
     _task: e6irc_edge::connection::ConnectionTask,
     _hold: SessionHold,
 }
 
 impl Pump {
+    /// Send what the core published for the edge to hold whose output has
+    /// been sent: the record in parts, then the acknowledgement.
+    async fn send_held(&mut self) -> bool {
+        for held in self.edge.take_held() {
+            match held {
+                e6irc_edge::link::Held::Record { revision, body } => {
+                    let parts = e6irc_link::BodyPart::split(&body)
+                        .expect("a session record is within the body part count");
+                    for part in parts {
+                        let frame = CoreFrame::Record(
+                            self.session,
+                            e6irc_link::RecordPart { revision, part },
+                        );
+                        if self.out.send(frame).await.is_err() {
+                            return false;
+                        }
+                    }
+                }
+                e6irc_edge::link::Held::Ack(ack) => {
+                    if self
+                        .out
+                        .send(CoreFrame::Ack(self.session, ack))
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The cut: everything the session was given goes out, then what the
+    /// edge holds of it, and the pump stops with the session still open.
+    async fn flush_for_cut(mut self) {
+        while let Some(envelope) = self.edge.try_take() {
+            let final_line = self.edge.is_final(&envelope);
+            let Output(bytes) = envelope.payload;
+            let frame = if final_line {
+                CoreFrame::Kill(self.session, bytes)
+            } else {
+                CoreFrame::Output(self.session, bytes)
+            };
+            if self.out.send(frame).await.is_err() {
+                return;
+            }
+        }
+        self.send_held().await;
+    }
+
     async fn run(mut self) {
         let mut controls_open = true;
         loop {
+            if *self.cutting.borrow() {
+                return self.flush_for_cut().await;
+            }
             tokio::select! {
+                changed = self.cutting.changed() => {
+                    if changed.is_err() || *self.cutting.borrow() {
+                        return self.flush_for_cut().await;
+                    }
+                }
+                () = self.held.published() => {
+                    if !self.send_held().await {
+                        return;
+                    }
+                }
                 taken = self.edge.take() => match taken {
                     Some(envelope) => {
                         let final_line = self.edge.is_final(&envelope);
@@ -1304,6 +1560,9 @@ impl Pump {
                             CoreFrame::Output(self.session, bytes)
                         };
                         if self.out.send(frame).await.is_err() {
+                            return;
+                        }
+                        if !self.send_held().await {
                             return;
                         }
                     }

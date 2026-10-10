@@ -2528,7 +2528,10 @@ async fn read_marker_preloaded_after_restart() {
     }
     // A restart: the first process stops (and gives the serving lease back)
     // before the second serves.
-    assert_eq!(running.shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        running.shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
 
     // Second boot on the same database: the marker must be present immediately.
     let running2 = net::start(make_config()).await.expect("restart");
@@ -3343,6 +3346,7 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         None,
         ":s NOTICE * :backlog",
         &e6irc_client::NetworkNames::default(),
+        1,
     )
     .await
     .expect("persist case variant");
@@ -3471,6 +3475,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
             Some("mc"),
             &format!(":s PRIVMSG #x :m{i}"),
             &e6irc_client::NetworkNames::default(),
+            2,
         )
         .await
         .expect("persist");
@@ -3605,6 +3610,7 @@ async fn a_stored_backlog_line_keeps_the_own_nick_it_was_said_under() {
             own_nick,
             line,
             &e6irc_client::NetworkNames::default(),
+            3,
         )
         .await
         .expect("persist");
@@ -3693,6 +3699,7 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
             Some("alice"),
             &line,
             &e6irc_client::NetworkNames::default(),
+            4,
         )
         .await
         .expect("persist");
@@ -3742,6 +3749,7 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
         Some("alice"),
         "@msgid=m11;time=2026-01-01T00:00:11.000Z :n!u@h PRIVMSG #room :TAGMSG is a command",
         &e6irc_client::NetworkNames::default(),
+        5,
     )
     .await
     .expect("persist");
@@ -3754,6 +3762,7 @@ async fn a_history_page_counts_only_lines_the_client_can_receive() {
         Some("alice"),
         "@msgid=t1;time=2026-01-01T00:00:12.000Z;+typing=active :n!u@h TAGMSG #quiet",
         &e6irc_client::NetworkNames::default(),
+        6,
     )
     .await
     .expect("persist");
@@ -3802,6 +3811,7 @@ async fn bnc_conversations_are_keyed_the_networks_way_and_named_as_spelled() {
         Some("dev[m]"),
         "@time=2026-01-01T00:00:01.000Z :Alice[m]!u@h PRIVMSG dev[m] :hello",
         &rfc1459,
+        7,
     )
     .await
     .expect("persist");
@@ -3822,6 +3832,7 @@ async fn bnc_conversations_are_keyed_the_networks_way_and_named_as_spelled() {
             Some("dev[m]"),
             &format!("@time=2026-01-01T00:00:0{time}.000Z {line}"),
             &ascii,
+            8,
         )
         .await
         .expect("persist");
@@ -4141,6 +4152,7 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
         Some("alice"),
         "@msgid=shared :a!u@h PRIVMSG #one :first",
         &e6irc_client::NetworkNames::default(),
+        9,
     )
     .await
     .expect("persist first target");
@@ -4157,6 +4169,7 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
         Some("alice"),
         "@msgid=shared :a!u@h PRIVMSG #two :second",
         &e6irc_client::NetworkNames::default(),
+        10,
     )
     .await
     .expect("persist second target");
@@ -4195,6 +4208,7 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
             Some("alice"),
             line,
             &e6irc_client::NetworkNames::default(),
+            11,
         )
         .await
         .expect("persist direct message");
@@ -7758,6 +7772,7 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
                 None,
                 &format!("line {i}"),
                 &e6irc_client::NetworkNames::default(),
+                12,
             )
             .await
             .expect("persist");
@@ -7809,6 +7824,7 @@ async fn bnc_buffer_trim_bounds_the_bytes_stored() {
             None,
             &format!("@+x={tags} :n!u@h PRIVMSG #c :line {i}"),
             &names,
+            13,
         )
         .await
         .expect("persist");
@@ -11474,6 +11490,7 @@ async fn every_bouncer_history_window_has_the_specified_boundary_and_direction()
             Some("alice"),
             &format!("@msgid=m{id};time=2026-01-01T00:00:0{id}.000Z :n!u@h PRIVMSG #room :{id}"),
             &e6irc_client::NetworkNames::default(),
+            14,
         )
         .await
         .expect("persist");
@@ -12283,7 +12300,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     let running = net::start(document(Some(ADMINS), "first-client-secret"))
         .await
         .expect("first start");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
     let imported = db::load_managed_config(&pool).await.expect("imported");
     assert_eq!(imported.revision, 1);
@@ -12296,7 +12313,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     let running = net::start(document(Some(ADMINS), "first-client-secret"))
         .await
         .expect("unchanged restart");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 
     // Removing an administrator from the statement cannot quietly keep them.
     let refused = refusal(document(Some(r#"["alice"]"#), "first-client-secret")).await;
@@ -12330,7 +12347,7 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     let running = net::start(document(None, "first-client-secret"))
         .await
         .expect("an unstated setting is not a conflict");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
     let current = db::load_managed_config(&pool).await.expect("current");
     assert_eq!(current.settings.admin_accounts, ["carol"]);
     assert_eq!(
@@ -13077,7 +13094,7 @@ async fn nickserv_and_chanserv_services_over_a_real_server() {
     .expect("carol became founder in the live core");
     carol.send("PRIVMSG NickServ :INFO dave").await;
     carol.expect("\x02dave\x02 is not registered.").await;
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 }
 
 /// The target principal a seeded audit row names, by the kind its action

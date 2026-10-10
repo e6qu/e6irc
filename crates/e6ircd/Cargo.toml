@@ -198,9 +198,11 @@ tokio-tungstenite = { version = "0.29.0", default-features = false }
 futures-util = { version = "0.3", optional = true, default-features = false }
 
 # libc 0.2.186 is already in the tree (tokio, aws-lc-sys); named here for the
-# one `prctl(PR_SET_DUMPABLE, 0)` at start, which keeps secrets out of core
-# files and away from same-user ptrace.
-[target.'cfg(target_os = "linux")'.dependencies]
+# one `prctl(PR_SET_DUMPABLE, 0)` at start on Linux, which keeps secrets out of
+# core files and away from same-user ptrace, and for the user identifier the
+# stop control's directory is named by and checked against on every Unix
+# (`control`).
+[target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.186", default-features = false }
 
 [dev-dependencies]

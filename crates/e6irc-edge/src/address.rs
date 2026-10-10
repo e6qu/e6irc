@@ -108,6 +108,17 @@ pub enum SessionLimitKey {
     InProcess(String),
 }
 
+impl SessionLimitKey {
+    /// The host text [`PeerLimitKey::for_session_host`] maps back to this very
+    /// key: how a key is carried where only text travels (a core's cut state).
+    pub fn as_host(&self) -> String {
+        match self {
+            Self::Address(PeerLimitKey(address)) => address.to_string(),
+            Self::InProcess(name) => name.clone(),
+        }
+    }
+}
+
 /// A refused or failed connection attempt from one peer, by class; each class
 /// is summarised separately so a TLS scanner and an over-limit client from the
 /// same address are two stories, not one count.
