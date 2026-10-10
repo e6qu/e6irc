@@ -1522,6 +1522,30 @@ Maintainer decisions implemented for high availability (DESIGN §1, §7.3, §8,
   failover can roll the lease row back; the first upgrade to this release
   stops every process.
 
+Bug sweep 8 reviewed the native clients and audited every journey's evidence.
+It fixes, each with a test that failed before:
+
+- **The TUI showed each line it sent twice after a reconnect.** Its only copy
+  was a local echo without a message ID or time, so the reconnect's
+  marker-relative history — which holds the sent line, the marker never
+  having passed it — could not be recognised as the same message. The TUI now
+  asks for `echo-message` when offered and shows the server's echo; what the
+  person said from another attached client is not counted unread.
+- **`e6irc tail NICK` printed nothing, forever, and `e6irc history NICK`
+  failed on `JOIN NICK`.** A nick target is now the direct conversation in
+  both directions, read without a `JOIN`; `history --count 0`, a command that
+  could do nothing, is refused.
+- **`e6irc api` compared origins by spelling and took `get` as an unknown
+  method.** `https://IRC.example:443` is the origin a token cached for
+  `https://irc.example` belongs to; an origin carrying a user name or password
+  is refused; the method is taken in any case.
+- **TUI `/join chat` and `/join #a,#b` opened buffers whose lines went to a
+  nickname or to two channels.** `/join` takes one channel of the network.
+- The TUI gains `/me`, Tab nick completion over bounded per-conversation
+  membership, numbered conversations in the rail, and `NO_COLOR`; the
+  pseudo-terminal journey now restarts the daemon and proves reconnect,
+  rejoin, input kept while offline, completion and `/me`.
+
 ## Edge tier
 
 Goal: e6irc deploys and redeploys without dropping a client connection

@@ -4761,7 +4761,11 @@ unbounded `tail` that loses its server — closed, or silent through two
 three-minute liveness windows, the first ending in `PING :e6irc-keepalive`
 (the shared `e6irc_client::liveness` the TUI also uses) — exits nonzero, and a
 reader that goes away (a broken pipe) ends `tail`/`history` output cleanly.
-`&` channels are joined like `#` ones. Every wait on the server — connecting
+`&` channels are joined like `#` ones. `tail` and `history` take a channel or
+a nick: a nick is the direct conversation with it — what it sent this client
+and what this client sent it — whose history is read without a `JOIN` (a
+nick cannot be joined), and this client's own nick is every direct message
+sent to it. `history --count` is at least 1. Every wait on the server — connecting
 and registering, a capability request, a join with its history, and every
 wait after `QUIT` — is bounded by `--response-timeout` (30 s by default), so
 a peer that holds the socket open with irrelevant lines cannot hang a script;
@@ -4788,7 +4792,11 @@ registration burst with a PING round trip and exits 0 only on its own echo,
 while a refusal (`e6irc_client::is_refusal`: a 400–599 numeric or `FAIL`,
 shared with the TUI) or no verdict within the timeout is a nonzero exit. `raw`
 prints every server line to stdout and each refusal to stderr, and exits
-nonzero if any line was refused. `--tls-name` requires `--tls`.
+nonzero if any line was refused. `--tls-name` requires `--tls`. `api` takes
+its method in any case (`get` is GET; sent as typed it would be an unknown
+method the server refuses), and every API origin — `--base`, the one cached
+by `login` — is compared in one spelling (scheme and host in lower case, the
+default port left out) and refused when it carries a user name or password.
 Every authentication mode requests the same optional server-time,
 message-tags, and account-tag metadata capabilities, so changing credentials
 cannot silently reduce the information delivered to the caller.
@@ -4881,7 +4889,13 @@ BNC network. It has bounded channel/query buffers, Alt-Left/Right, Alt-b/f
 letters are ignored rather than typed),
 bounded scrollback, a relay/status strip, an active-first conversation rail,
 a visible horizontally-following composer caret, `/help`, `/join`, `/msg`,
-`/win`, `/raw`, literal-slash escape with `//`, `/quit`, Ctrl-End return to the
+`/me`, `/win` (the conversation rail numbers each buffer as `/win` takes it),
+`/raw`, literal-slash escape with `//`, `/quit`, Tab nick completion (the
+word before the caret completes to a member of the conversation in view —
+from NAMES, JOIN and speech, forgotten on PART, QUIT and KICK, followed
+through NICK, at most 10,000 per conversation, said once when reached — as
+`nick: ` at the start of a line and `nick ` elsewhere; Tab again offers the
+next match), Ctrl-End return to the
 latest message, Ctrl-C exit (Esc clears the composer; it does not quit), automatic reconnect with the same explicit
 request, and loud disconnect/write/drop state. The steady-state read is
 bounded by a three-minute liveness window measured from the server's last
@@ -4927,7 +4941,9 @@ changes, so direct messages and its own JOIN/PART are recognised. Every error
 numeric, FAIL/WARN/NOTE, ERROR, and KICK is rendered: a message refused by a
 moderated channel is said in the buffer it was sent from instead of standing
 there as a delivered-looking local echo. The slash-command grammar is
-closed: malformed
+closed (`/join` takes exactly one name that is a channel on this network, so
+neither `#a,#b` nor a bare `chat` opens a buffer whose lines would go
+elsewhere): malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
@@ -4976,15 +4992,25 @@ buffer is in scrollback, new messages increase its unread count and cannot
 advance its marker; returning to the live end clears that count and queues the
 latest marker. Unread counts are visible and history/live overlap is
 deduplicated by stable message ID.
-The composer and socket-writer queue are both bounded. A message is locally
-echoed only after bounded-queue admission; a full queue, disconnected socket,
+The composer and socket-writer queue are both bounded. On a server that
+offers `echo-message` the client asks for it, and its own messages are shown
+as the server echoes them, with their message ID and time: a local copy has
+neither, so history loaded after a reconnect showed each sent line a second
+time and the read marker could not pass it. On a server without it a message
+is locally echoed only after bounded-queue admission. What this person said
+from another client attached to the same network is not counted unread. A
+full queue, disconnected socket,
 or over-limit complete IRC line leaves the input available and reports the
 refusal. A read-marker update that meets a full writer queue remains pending
 instead of being lost.
 Capability refusal fails visibly rather than degrading into a different
-experience. A pseudo-terminal journey drives the real full-screen binary
-against e6ircd and proves inbound rendering, outbound delivery, clean exit,
-and terminal restoration — including after SIGTERM, SIGINT and SIGHUP, each of
+experience. A `NO_COLOR` variable with any non-empty value (the no-color.org
+convention) draws the whole screen without colour, a coloured background
+becoming reverse video. A pseudo-terminal journey drives the real full-screen
+binary against e6ircd and proves inbound rendering, outbound delivery,
+reconnect and rejoin after the daemon restarts with input typed while offline
+kept and sent only once connected, Tab completion, `/me`, clean exit, and
+terminal restoration — including after SIGTERM, SIGINT and SIGHUP, each of
 which must still send `QUIT`. “Multi-buffer” means several channels/queries inside
 one connection, not several simultaneous networks; the BNC is the
 cross-network multiplexer.

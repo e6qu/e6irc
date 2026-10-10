@@ -279,8 +279,13 @@ recovery token are redacted in the synthesized echo while still being sent
 upstream verbatim, so the console never becomes a place credentials
 accumulate.
 
-**Evidence.** The parked lifecycle/error-code pairings, generic parked-state
-recovery, and the redaction classifier have unit tests.
+**Evidence.** `tools/test-oidc-browser.mjs`, run in Chromium, Firefox, and
+WebKit against a local live upstream, opens the console, reads a replayed
+`PRIVMSG` off it as the wire line, types an IRC line there that the upstream
+receives verbatim, and finds that line shown beside the replies. The parked
+lifecycle/error-code pairings, generic parked-state recovery, and the
+redaction classifier have unit tests. No test reads a NickServ exchange back
+off the console.
 
 ## Diagnose an upstream connection
 
@@ -406,11 +411,12 @@ PLAIN.
 5. The client receives buffered lines and live driver output; commands are
    relayed back to the same driver. The sender's own messages reach the
    stream exactly once: the upstream's echo when it offers `echo-message`
-   (which the driver asks for), otherwise one the driver synthesizes. The
-   account's other attached sessions and the detached buffer always see them,
-   and the sender itself sees its echo exactly when it negotiated
-   `echo-message` on attach. Adding the upstream identity prefix never creates
-   an over-limit echo; trailing text is fitted on a UTF-8 boundary.
+   (the driver asks for it), which arrives only for a line the upstream
+   accepted, and otherwise an echo the driver synthesizes when it writes the
+   line. The account's other attached sessions and the detached buffer
+   always see them, and the sender itself sees its echo exactly when it
+   negotiated `echo-message` on attach. Adding the upstream identity prefix
+   never creates an over-limit echo; trailing text is fitted on a UTF-8 boundary.
 6. The client is brought to the session as it stood at the oldest replayed
    line (its nick and the JOINs the replay no longer contains), shown the
    replay, and brought to the session now; every channel it is shown joined

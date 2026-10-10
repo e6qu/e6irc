@@ -16,7 +16,7 @@ a design target rather than current behavior.
 | [Audit privileged changes](administration-and-monitoring.md#audit-privileged-changes) | Proven | Core audit events and atomic PostgreSQL mutation/audit tests | — |
 | [Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge) | Partially proven | All-feature management journey, live pinned Matrix oracle, and real-socket Discord/Slack HTTP+WebSocket protocol oracles in both directions | Live Discord/Slack provider qualification requires commercial credentials |
 | [Use the scripting CLI](bridges-clients-and-automation.md#use-the-scripting-cli) | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON executable journeys | — |
-| [Use the terminal UI](bridges-clients-and-automation.md#use-the-terminal-ui) | Proven | Real pseudo-terminal/e6ircd journey plus duplex protocol, model, and fuzz tests | — |
+| [Use the terminal UI](bridges-clients-and-automation.md#use-the-terminal-ui) | Proven | Real pseudo-terminal/e6ircd journey (including daemon restart, reconnect and rejoin) plus duplex protocol, model, and fuzz tests | — |
 | [Build another native client](bridges-clients-and-automation.md#build-another-native-client) | Proven | Shared-client tests plus CLI, TUI, load, TLS, and live-server consumers | — |
 | [Automate the REST API](bridges-clients-and-automation.md#automate-the-rest-api) | Proven | Exact router/OpenAPI catalog and real HTTP/PostgreSQL resource-family tests | OpenAPI schemas remain hand-authored and directly tested |
 | [Register and configure a channel](channels-and-account.md#register-and-configure-a-channel) | Proven | Core, PostgreSQL, services, console, and REST lifecycle tests | — |
@@ -174,7 +174,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `postgres-recovery` | isolated empty PostgreSQL first boot plus live stop/start degradation and recovery under HTTP and IRC traffic |
 | `production-container` | deployable image and embedded web-client shape; the built distroless image booted with its real command against PostgreSQL to a served `/healthz`, a ready `/readyz`, the login page, its own `healthcheck` probe, user 10001, no shell, a missing variable refused by name, and a clean exit on SIGTERM within the stop budget |
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
-| `native-client-journeys` | real pseudo-terminal render/message/terminal-restore journey (the deterministic archive contract runs in `guards`) |
+| `native-client-journeys` | real pseudo-terminal render/message/reconnect-and-rejoin/completion/terminal-restore journey (the deterministic archive contract runs in `guards`) |
 | `shauth-sso` | exact external single-sign-on/logout integration |
 | `irctest`, `irctest-edge`, `irctest-services` | IRC and services conformance; the green list runs in one process (`irctest`) and, in parallel, through an edge (`irctest-edge`) |
 | `matrix-bridge` | bidirectional live bridge behavior |
