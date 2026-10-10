@@ -398,8 +398,8 @@ export function existingChannelBuffer(buffers, name, names = DEFAULT_NAMES) {
 }
 
 // Empty a buffer's transcript so the server's full replay can refill it. The
-// persisted history loaded into it went with the lines, so "Load earlier" is
-// offered again rather than hidden for the rest of the page's life.
+// history loaded into it went with the lines, so its paging starts over and
+// "Load earlier" is offered again.
 export function clearTranscript(buffer) {
   // A history read still out was read against the transcript this ends.
   buffer.transcriptEpoch = (buffer.transcriptEpoch ?? 0) + 1;
@@ -407,7 +407,9 @@ export function clearTranscript(buffer) {
   buffer.unread = 0;
   buffer.mentions = 0;
   buffer.pendingVisibleMessages = 0;
-  buffer.historyLoaded = false;
+  buffer.historyBefore = undefined;
+  buffer.historyExhausted = false;
+  buffer.historyRows = 0;
 }
 
 export function topicReply(params) {
@@ -627,69 +629,88 @@ export function composerRequests(text, target, nick) {
   return splitUtf8(form.body, budget).map(form.compose);
 }
 
-// Prepend older history to the live buffer. Stable msgids suppress a line
-// present on both sides; unidentified rows remain distinct, because content
-// equality is not identity. The cap applies last, to the oldest rows.
-export function prependHistory(history, live, limit) {
-  const seen = new Set();
-  for (const line of live) {
-    if (line.identity) seen.add(line.identity);
-  }
-  const prependReversed = [];
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const line = history[index];
-    if (line.identity && seen.has(line.identity)) continue;
-    if (line.identity) seen.add(line.identity);
-    prependReversed.push(line);
-  }
-  prependReversed.reverse();
-  return [...prependReversed, ...live].slice(-limit);
-}
-
-// What a row is matched by at the seam between history and the live buffer:
-// its exact wire line; for a line of our own, what it said, since this page
-// shows its own sends as local echoes that have no wire line; nothing for a
-// join or part notice, which history has no counterpart for.
-function seamKey(line, isMine) {
-  if (line.sender != null && isMine(line.sender)) return `mine\n${line.kind}\n${line.text}`;
-  return typeof line.wire === "string" && line.wire.length > 0 ? line.wire : null;
-}
-
-// Merge history that may overlap the live buffer, for when the server could
-// not bound it by ring position (see `oldestRingFloor`). The API page and the
-// socket replay can share an ordered suffix / prefix even when an upstream
-// supplies no msgid; remove only that exact ordered sequence, never arbitrary
-// equal bodies elsewhere. Live rows without a seam key take no part: letting
-// a join notice stop the match would prepend the whole overlap again.
-export function mergeTimeline(history, live, limit, isMine = () => false) {
-  const keyed = live.map((line) => seamKey(line, isMine)).filter((key) => key !== null);
-  let overlap = 0;
-  const maximum = Math.min(history.length, keyed.length);
-  for (let size = 1; size <= maximum; size += 1) {
-    const historyStart = history.length - size;
-    let matches = true;
-    for (let index = 0; index < size; index += 1) {
-      const older = seamKey(history[historyStart + index], isMine);
-      if (older === null || older !== keyed[index]) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) overlap = size;
-  }
-  return prependHistory(history.slice(0, history.length - overlap), live, limit);
-}
-
-// Every row a buffer holds records `ringFloor`: the socket's replay cursor
-// before the line that made it (for a local echo, before the echo's own ring
-// line, which this socket is never sent). Rows arrive in ring order, so the
-// oldest row's floor bounds the buffer: every later ring line addressed here is
-// already a row. History read `through` it therefore holds nothing twice.
-// `undefined` when the buffer has no rows (all of its history is new to it),
-// `null` when its oldest row came first in a full replay (the page holds the
-// buffer from the ring's start).
+// Every row a buffer holds from the live socket records `ringFloor`: the
+// socket's replay cursor before the line that made it (for a local echo,
+// before the echo's own ring line, which this socket is never sent). Rows
+// arrive in ring order, so the oldest row's floor bounds the buffer: every
+// later ring line addressed here is already a row. `undefined` when the buffer
+// has no rows, `null` when its oldest row came first in a full replay or from
+// a history page -- no socket position says where it begins.
 export function oldestRingFloor(lines) {
   return lines.length ? lines[0].ringFloor ?? null : undefined;
+}
+
+// The oldest row the server sent (a line with its exact wire text), as the
+// history API's `seam`, with how many byte-identical copies of it are held;
+// null when no row has one.
+export function historySeam(lines) {
+  const oldest = lines.find((line) => typeof line.wire === "string" && line.wire.length > 0);
+  if (!oldest) return null;
+  return { seam: oldest.wire, held: lines.filter((line) => line.wire === oldest.wire).length };
+}
+
+// Where a conversation's next older page is read from (the query of
+// `GET /api/v1/me/networks/{name}/history`, less its target), given what its
+// buffer holds and the socket's cursor:
+// - the cursor the last page handed back, while the buffer still begins
+//   where that page ended;
+// - else the socket position before the oldest row, when that row came from
+//   the socket (the server reads the ring there, then storage);
+// - else, with no rows at all, the socket's own cursor;
+// - else the oldest row the server sent, by its exact line (`historySeam`);
+// - else nothing: the newest page.
+export function historyQuery(buffer, socketCursor) {
+  if (typeof buffer.historyBefore === "string") return { before: buffer.historyBefore };
+  const floor = oldestRingFloor(buffer.lines);
+  if (typeof floor === "string") return { before: floor };
+  if (floor === undefined && socketCursor) return { before: socketCursor };
+  const seam = historySeam(buffer.lines);
+  return seam ? { seam: seam.seam, held: String(seam.held) } : {};
+}
+
+// The local echoes of this page's own sends held in front of the oldest row
+// the server sent: when a page is joined at that row (a `seam`), storage holds
+// these echoes as lines older than it, and they are the page's newest rows.
+export function echoesBeforeSeam(lines, isMine) {
+  const echoes = [];
+  for (const line of lines) {
+    if (typeof line.wire === "string" && line.wire.length > 0) break;
+    if (line.sender != null && isMine(line.sender)) echoes.push(line);
+  }
+  return echoes;
+}
+
+// An older page joined in front of what a buffer holds. The server reads only
+// what is older than the buffer, so the page shares no row with it, except:
+// - lines that arrived on the socket while the page was being read
+//   (`arrived`, their exact wire text), which a page of storage can include;
+// - local echoes held before the joining line (`echoes`), when the page was
+//   joined at a held line rather than a socket position: storage holds each
+//   as a line of ours with the same text.
+// Each such row is removed once, newest first; nothing else is compared.
+export function joinHistory(page, held, { arrived = [], echoes = [], isMine = () => false } = {}) {
+  const arrivedWires = new Map();
+  for (const wire of arrived) arrivedWires.set(wire, (arrivedWires.get(wire) ?? 0) + 1);
+  const pendingEchoes = echoes.map((echo) => `${echo.kind}\n${echo.text}`);
+  const kept = [];
+  for (let index = page.length - 1; index >= 0; index -= 1) {
+    const row = page[index];
+    const copies = arrivedWires.get(row.wire) ?? 0;
+    if (copies > 0) {
+      arrivedWires.set(row.wire, copies - 1);
+      continue;
+    }
+    if (row.sender != null && isMine(row.sender)) {
+      const echo = pendingEchoes.lastIndexOf(`${row.kind}\n${row.text}`);
+      if (echo !== -1) {
+        pendingEchoes.splice(echo, 1);
+        continue;
+      }
+    }
+    kept.push(row);
+  }
+  kept.reverse();
+  return [...kept, ...held];
 }
 
 // What a buffer's action button does: "leave" a joined channel, "close" a

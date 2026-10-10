@@ -95,17 +95,25 @@ survive process restart.
    position the ring has evicted — is answered with a typed `replay full`
    event and the whole ring, and the client starts its transcript over with one
    "history reloaded" note rather than guessing at an overlap.
-3. Every row records the replay cursor before its line, and **Load earlier**
-   reads the buffer `through` the oldest row's cursor, so history holds only
-   lines older than the buffer and nothing is matched by content. When the
-   server cannot bound the read (the network restarted, or is stopped and its
-   lines are persisted history) it refuses the cursor with 409, and only then
-   does the client read the whole page and remove the exact ordered overlap at
-   the seam — matching wire lines, and its own lines against their local
-   echoes, past join/part notices — plus shared message identifiers, without
-   conflating distinct identical messages.
-4. Loading history expands the active buffer by one bounded page, so older
-   context remains visible even when the normal live window was already full.
+3. **Load earlier** pages back through one conversation with
+   `GET /api/v1/me/networks/{name}/history?target=…`: the running ring first,
+   then the persisted backlog, so it reaches past the ring and works while the
+   network is stopped, a page at a time until storage holds nothing older.
+   Every row records the replay cursor before its line, and the first page is
+   read `before` the oldest row's cursor, a ring position that a clean restart
+   keeps; storage is joined to the ring at the row the conversation's oldest
+   ring line was stored at — by its ring position, or, for a line a new epoch
+   restored elsewhere, by its exact millisecond-stamped text and the number of
+   identical copies the ring holds — and then pages by storage order. When no
+   ring position can say where the reader's transcript begins (after a crash,
+   on a stopped network, or once the ring moved past it) the server answers
+   409 and the client joins at the exact text of the oldest line it was sent. Nothing is matched by content beyond
+   lines that arrived while a page was read and the stored copies of the
+   reader's own local echoes at a `seam`, each removed once, so distinct
+   identical messages stay distinct.
+4. Each page widens the conversation's bounded window by the rows it brought
+   (up to 5,000), so older context remains visible even when the normal live
+   window was already full.
    A read that finds nothing older says so; a read that returns after the
    transcript was replaced (a `replay full`, the conversation closed, another
    network opened) is discarded and offered again rather than merged into a
@@ -155,8 +163,14 @@ authorization. Buffers, requested history, and deduplication indexes are
 bounded; upstream text is rendered as text, while replay/database failures are
 visible and classified without logging conversation bodies.
 
-**Evidence.** Browser tests exercise replay boundaries, history races,
-deduplication, older-history positioning, and the out-of-view live-message recovery control with
+**Evidence.** PostgreSQL integration tests drive a real upstream into a
+four-line ring and page a conversation from the ring into storage with
+identical back-to-back lines, each exactly once, then refuse an evicted
+position and read from storage at a held line; and page through lines a new
+epoch restored at other positions, then, after a clean restart, page again
+from the cursor handed out before it. Browser tests exercise replay
+boundaries, history races, paging, the 409 fallback to a held line, local-echo
+joining, older-history positioning, and the out-of-view live-message recovery control with
 deterministic transport. The full-stack browser case also
 drives a real upstream line through persistence, the multiplexer, and
 WebSocket into Chromium, gracefully restarts the daemon, and verifies that the

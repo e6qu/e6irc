@@ -4129,6 +4129,30 @@ pub struct BufferedLine {
     pub line: String,
 }
 
+/// The ring as a reader paging back from a cursor sees it: every retained
+/// line, oldest first, of which the first `held_after` are at or before the
+/// cursor. When `successors_retained`, every line after the cursor is still
+/// in the ring, so what the reader holds after it the ring holds too, and
+/// older history can be joined to the ring's own oldest line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingHistory {
+    epoch: u64,
+    pub lines: Vec<BufferedLine>,
+    pub held_after: usize,
+    pub successors_retained: bool,
+}
+
+impl RingHistory {
+    /// The cursor just before the line at `seq`: paging on from it reads the
+    /// lines older than that one.
+    pub fn cursor_before(&self, seq: u64) -> ReplayCursor {
+        ReplayCursor {
+            epoch: self.epoch,
+            seq: seq.saturating_sub(1),
+        }
+    }
+}
+
 /// What [`NetworkHandle::continue_ring`] did to the positions the driver's
 /// lines took before it: each below `below` is `shift` higher now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4454,6 +4478,26 @@ impl Buffer {
                 .map(|entry| entry.line.clone())
                 .collect(),
         )
+    }
+
+    /// Every retained line with its position, as of one instant, and how many
+    /// of them are at or before `through`; `None` for another ring's cursor,
+    /// or a position the ring has not reached. See [`RingHistory`].
+    fn history_through(&self, through: ReplayCursor) -> Option<RingHistory> {
+        if through.epoch != self.epoch || through.seq >= self.next_seq {
+            return None;
+        }
+        let lines: Vec<BufferedLine> = self.lines().cloned().collect();
+        let held_after = lines.partition_point(|line| line.seq <= through.seq);
+        let successors_retained = lines
+            .first()
+            .is_none_or(|oldest| oldest.seq <= through.seq + 1);
+        Some(RingHistory {
+            epoch: self.epoch,
+            lines,
+            held_after,
+            successors_retained,
+        })
     }
 
     /// The lines after `after`, when that cursor names a position of this ring
@@ -5200,6 +5244,15 @@ impl NetworkHandle {
             .lock()
             .expect("buffer poisoned")
             .lines_through(through)
+    }
+
+    /// [`Self::buffer_through`], and whether every line after `through` is
+    /// still retained (see [`Buffer::history_through`]).
+    pub fn history_through(&self, through: ReplayCursor) -> Option<RingHistory> {
+        self.buffer
+            .lock()
+            .expect("buffer poisoned")
+            .history_through(through)
     }
 
     /// Establish one exact boundary between detached-buffer/session replay and
@@ -11673,6 +11726,29 @@ mod tests {
 
     fn replayed(replay: &Replay) -> Vec<String> {
         untimed(replay.lines.iter().map(|entry| entry.line.as_str()))
+    }
+
+    #[test]
+    fn history_through_says_whether_the_lines_after_the_cursor_are_kept() {
+        let mut ring = Buffer::new(2);
+        let first = ring.push("one".into());
+        let second = ring.push("two".into());
+        let at_first = ring.replay_after(None).cursor_at(first);
+        let kept = ring.history_through(at_first).expect("this ring's cursor");
+        assert_eq!(kept.lines.len(), 2);
+        assert_eq!((kept.held_after, kept.successors_retained), (1, true));
+        assert_eq!(kept.cursor_before(second), at_first);
+        // "one" is gone, but everything after it is kept.
+        ring.push("three".into());
+        let kept = ring.history_through(at_first).expect("this ring's cursor");
+        assert_eq!((kept.held_after, kept.successors_retained), (0, true));
+        // "two" is gone too: a reader holding it holds what the ring does not.
+        ring.push("four".into());
+        let evicted = ring.history_through(at_first).expect("this ring's cursor");
+        assert_eq!(
+            (evicted.held_after, evicted.successors_retained),
+            (0, false)
+        );
     }
 
     /// A cursor is honoured exactly while every line after it is still held;

@@ -9977,6 +9977,146 @@
         "summary": "Read the bounded owner-scoped component log (oldest-first)"
       }
     },
+    "/api/v1/me/networks/{name}/history": {
+      "get": {
+        "description": "One conversation's lines older than what the reader holds, a page at a time: the running network's buffer first, then the persisted backlog, so it reaches past the buffer and works while the network is stopped. Give `before` (a `/ws/ui` replay cursor when the reader holds every line after it, or a previous page's `before`) or `seam` and `held` (the exact text of the oldest line the reader holds, and how many byte-identical copies of it it holds), or neither for the newest page. Lines come in the order the buffer held them; nothing is matched by content.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The conversation: a channel, or the other party of a direct conversation.",
+            "in": "query",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "A `/ws/ui` replay cursor, or a previous page's `before`.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The exact text of the oldest line the reader holds, when no cursor can say where its transcript begins.",
+            "in": "query",
+            "name": "seam",
+            "required": false,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "How many byte-identical copies of `seam` the reader holds (default 1).",
+            "in": "query",
+            "name": "held",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "before": {
+                      "description": "Where the next older page begins; null when nothing older is held.",
+                      "minLength": 1,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "lines": {
+                      "items": {
+                        "maxLength": 8701,
+                        "type": "string"
+                      },
+                      "maxItems": 500,
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "lines",
+                    "before"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "a page of the conversation"
+          },
+          "400": {
+            "description": "an empty `target`, a limit outside its range, a `before` that is not a cursor, `held` without `seam`, or both `before` and `seam` (`field` names it)"
+          },
+          "401": {
+            "description": "not signed in, or the token or session is invalid or expired"
+          },
+          "403": {
+            "description": "the account is suspended, the token lacks the scope this method needs, or a cookie-authenticated unsafe method carried no valid X-E6IRC-CSRF value"
+          },
+          "404": {
+            "description": "no such network"
+          },
+          "408": {
+            "description": "the request passed the 30-second deadline (a problem document)"
+          },
+          "409": {
+            "description": "the page cannot be joined exactly to what the reader holds: `before` names no position of the running buffer, or the buffer no longer holds every line after it, or storage holds no such `seam`; read with `seam` (`field` names which)"
+          },
+          "413": {
+            "description": "the request body is larger than 1 MiB (a problem document)"
+          },
+          "429": {
+            "description": "the account's request budget is spent; Retry-After gives the seconds to wait"
+          },
+          "503": {
+            "description": "no database configured, or the database is unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          },
+          {
+            "secureBrowserSession": []
+          }
+        ],
+        "summary": "Page back through one conversation's history (oldest-first)"
+      }
+    },
     "/api/v1/me/networks/{name}/operations": {
       "get": {
         "description": "Returns owner-scoped typed runtime state, persisted backlog metadata, and the newest 100 detached upstream lines. Secret material is never returned.",
