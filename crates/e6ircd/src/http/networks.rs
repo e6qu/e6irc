@@ -2790,18 +2790,11 @@ pub(super) async fn network_history(
             crate::db::bnc_conversation_history(pool, &account, &name, &target, before, limit).await
         }
     };
-    // The stored row of a ring line at its ring position.
-    let at_position = |seq: u64, line: String| {
+    // The stored row of `line`, the copy `which` names.
+    let locate = |line: String, which: crate::db::StoredCopy| {
         let (account, name, target) = (account.clone(), name.clone(), target.clone());
         async move {
-            crate::db::bnc_conversation_line_at(pool, &account, &name, &target, seq, &line).await
-        }
-    };
-    // The stored row holding the oldest of `held` copies of `line`.
-    let locate = |line: String, held: i64| {
-        let (account, name, target) = (account.clone(), name.clone(), target.clone());
-        async move {
-            crate::db::bnc_conversation_line_id(pool, &account, &name, &target, &line, held).await
+            crate::db::bnc_conversation_line(pool, &account, &name, &target, &line, which).await
         }
     };
     let stored_page = |rows: Vec<crate::db::ConversationHistoryRow>, asked: i64| {
@@ -2894,31 +2887,28 @@ pub(super) async fn network_history(
             // when it holds none of them.
             let remaining = limit - lines.len() as i64;
             let mut seam = None;
-            for line in &conversation {
+            'lines: for line in &conversation {
                 // By its ring position, which storage keeps with each line
                 // (migration 0102): exact within this epoch, identical lines
                 // included. A line a new epoch restored sits at another
                 // position than it was stored at; it is found by its exact
                 // text, past the identical copies the ring holds.
-                match at_position(line.seq, line.line.clone()).await {
-                    Ok(Some(id)) => {
-                        seam = Some(id);
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(e) => return history_unavailable(e),
-                }
                 let held = conversation
                     .iter()
                     .filter(|other| other.line == line.line)
                     .count() as i64;
-                match locate(line.line.clone(), held).await {
-                    Ok(Some(id)) => {
-                        seam = Some(id);
-                        break;
+                for which in [
+                    crate::db::StoredCopy::AtPosition(line.seq),
+                    crate::db::StoredCopy::OldestOfHeld(held),
+                ] {
+                    match locate(line.line.clone(), which).await {
+                        Ok(Some(id)) => {
+                            seam = Some(id);
+                            break 'lines;
+                        }
+                        Ok(None) => {}
+                        Err(e) => return history_unavailable(e),
                     }
-                    Ok(None) => {}
-                    Err(e) => return history_unavailable(e),
                 }
             }
             let rows = match read(seam, remaining).await {
@@ -2942,7 +2932,7 @@ pub(super) async fn network_history(
                     Some("held"),
                 );
             }
-            let id = match locate(seam, held).await {
+            let id = match locate(seam, crate::db::StoredCopy::OldestOfHeld(held)).await {
                 Ok(Some(id)) => id,
                 Ok(None) => {
                     return unjoinable_history(

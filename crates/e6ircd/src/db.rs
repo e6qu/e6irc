@@ -9648,59 +9648,48 @@ pub struct ConversationHistoryRow {
     pub line: String,
 }
 
+/// Which stored copy of a ring line [`bnc_conversation_line`] finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredCopy {
+    /// The one stored at this ring position (migration 0102). A position
+    /// repeats only across epochs, whose rows are older, so the newest such
+    /// row is this epoch's.
+    AtPosition(u64),
+    /// Of this many byte-identical copies a reader holds — the newest of
+    /// them — the oldest.
+    OldestOfHeld(i64),
+}
+
 /// The stored row of conversation `target` (as the network folds it) whose
-/// text is exactly `line`: of `held` byte-identical copies a reader holds,
-/// the oldest — a reader holds the newest of them. `None` when storage holds
-/// fewer than `held`, so no page can be joined to that line exactly.
-pub async fn bnc_conversation_line_id(
+/// text is exactly `line`, the copy `which` names. `None` when storage holds
+/// no such copy (the line failed to store, a new epoch restored it at another
+/// position, or fewer copies are stored than are held), so no page can be
+/// joined to that line exactly.
+pub async fn bnc_conversation_line(
     pool: &PgPool,
     owner: &str,
     network: &str,
     target: &str,
     line: &str,
-    held: i64,
+    which: StoredCopy,
 ) -> Result<Option<i64>, DbError> {
     let key = BncBufferKey::new(owner, network);
+    let (position, skip) = match which {
+        StoredCopy::AtPosition(seq) => (Some(ring_position(seq)?), 0),
+        StoredCopy::OldestOfHeld(held) => (None, (held - 1).max(0)),
+    };
     sqlx::query_scalar(
         "SELECT id FROM bnc_buffer
          WHERE owner = $1 AND network = $2 AND target = $3 AND line = $4
-         ORDER BY id DESC OFFSET $5 LIMIT 1",
+           AND ($5::BIGINT IS NULL OR seq = $5)
+         ORDER BY id DESC OFFSET $6 LIMIT 1",
     )
     .bind(&key.owner)
     .bind(&key.network)
     .bind(target)
     .bind(line)
-    .bind((held - 1).max(0))
-    .fetch_optional(pool)
-    .await
-    .map_err(query_error)
-}
-
-/// The stored row of conversation `target` that holds ring position `seq`
-/// with exactly `line`: a ring line as storage keeps it (migration 0102). A
-/// ring position repeats only across epochs, whose rows are older, so the
-/// newest such row is this epoch's; `None` when this ring's line was not
-/// stored at its position (it failed to store, or a new epoch restored it at
-/// another position).
-pub async fn bnc_conversation_line_at(
-    pool: &PgPool,
-    owner: &str,
-    network: &str,
-    target: &str,
-    seq: u64,
-    line: &str,
-) -> Result<Option<i64>, DbError> {
-    let key = BncBufferKey::new(owner, network);
-    sqlx::query_scalar(
-        "SELECT id FROM bnc_buffer
-         WHERE owner = $1 AND network = $2 AND target = $3 AND seq = $4 AND line = $5
-         ORDER BY id DESC LIMIT 1",
-    )
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(target)
-    .bind(ring_position(seq)?)
-    .bind(line)
+    .bind(position)
+    .bind(skip)
     .fetch_optional(pool)
     .await
     .map_err(query_error)
