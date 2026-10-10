@@ -2728,12 +2728,14 @@ fn unjoinable_history(detail: &'static str, field: &'static str) -> Response {
 /// reaches past the ring and works while the network is stopped.
 ///
 /// Nothing is matched by content. The ring part is the conversation's ring
-/// lines at or before the reader's cursor. The ring and storage share no
-/// position, so storage is joined at the stored copy of the conversation's
-/// oldest ring line — its exact text, stamped with its millisecond time, past
-/// as many identical copies as the ring holds — which is sound only when the
-/// reader holds every ring line after its cursor (409 otherwise). Storage then
-/// pages by row id, which is the order the ring held its lines in.
+/// lines at or before the reader's cursor, a ring position that survives a
+/// restart which stored every line (migration 0102). Storage is joined at the
+/// stored row of the conversation's oldest ring line: the row stored at that
+/// line's ring position, or — for a line a new epoch restored at another
+/// position — the row with its exact millisecond-stamped text past as many
+/// identical copies as the ring holds. That is sound only when the reader
+/// holds every ring line after its cursor (409 otherwise). Storage then pages
+/// by row id, since positions repeat across epochs and ids do not.
 pub(super) async fn network_history(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
@@ -2786,6 +2788,13 @@ pub(super) async fn network_history(
         let (account, name, target) = (account.clone(), name.clone(), target.clone());
         async move {
             crate::db::bnc_conversation_history(pool, &account, &name, &target, before, limit).await
+        }
+    };
+    // The stored row of a ring line at its ring position.
+    let at_position = |seq: u64, line: String| {
+        let (account, name, target) = (account.clone(), name.clone(), target.clone());
+        async move {
+            crate::db::bnc_conversation_line_at(pool, &account, &name, &target, seq, &line).await
         }
     };
     // The stored row holding the oldest of `held` copies of `line`.
@@ -2886,6 +2895,19 @@ pub(super) async fn network_history(
             let remaining = limit - lines.len() as i64;
             let mut seam = None;
             for line in &conversation {
+                // By its ring position, which storage keeps with each line
+                // (migration 0102): exact within this epoch, identical lines
+                // included. A line a new epoch restored sits at another
+                // position than it was stored at; it is found by its exact
+                // text, past the identical copies the ring holds.
+                match at_position(line.seq, line.line.clone()).await {
+                    Ok(Some(id)) => {
+                        seam = Some(id);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return history_unavailable(e),
+                }
                 let held = conversation
                     .iter()
                     .filter(|other| other.line == line.line)

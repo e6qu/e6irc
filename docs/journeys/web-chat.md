@@ -100,13 +100,14 @@ survive process restart.
    then the persisted backlog, so it reaches past the ring and works while the
    network is stopped, a page at a time until storage holds nothing older.
    Every row records the replay cursor before its line, and the first page is
-   read `before` the oldest row's cursor; storage is joined to the ring at the
-   stored copy of the conversation's oldest ring line, by its exact
-   millisecond-stamped text and the number of identical copies the ring holds,
-   and then pages by storage order. When no ring position can say where the
-   reader's transcript begins (the network restarted or stopped, or the ring
-   moved past it) the server answers 409 and the client joins at the exact
-   text of the oldest line it was sent. Nothing is matched by content beyond
+   read `before` the oldest row's cursor, a ring position that a clean restart
+   keeps; storage is joined to the ring at the row the conversation's oldest
+   ring line was stored at — by its ring position, or, for a line a new epoch
+   restored elsewhere, by its exact millisecond-stamped text and the number of
+   identical copies the ring holds — and then pages by storage order. When no
+   ring position can say where the reader's transcript begins (after a crash,
+   on a stopped network, or once the ring moved past it) the server answers
+   409 and the client joins at the exact text of the oldest line it was sent. Nothing is matched by content beyond
    lines that arrived while a page was read and the stored copies of the
    reader's own local echoes at a `seam`, each removed once, so distinct
    identical messages stay distinct.
@@ -162,10 +163,12 @@ authorization. Buffers, requested history, and deduplication indexes are
 bounded; upstream text is rendered as text, while replay/database failures are
 visible and classified without logging conversation bodies.
 
-**Evidence.** A PostgreSQL integration test drives a real upstream into a
-four-line ring and pages a conversation from the ring into storage with
-identical back-to-back lines, each exactly once, then refuses an evicted
-position and reads from storage at a held line. Browser tests exercise replay
+**Evidence.** PostgreSQL integration tests drive a real upstream into a
+four-line ring and page a conversation from the ring into storage with
+identical back-to-back lines, each exactly once, then refuse an evicted
+position and read from storage at a held line; and page through lines a new
+epoch restored at other positions, then, after a clean restart, page again
+from the cursor handed out before it. Browser tests exercise replay
 boundaries, history races, paging, the 409 fallback to a held line, local-echo
 joining, older-history positioning, and the out-of-view live-message recovery control with
 deterministic transport. The full-stack browser case also

@@ -4674,16 +4674,19 @@ one begins (`before`), and `null` when storage holds nothing older. Nothing is
 matched by content. Each row records the replay cursor before its line (a local
 echo, the cursor when its send was accepted), so every later ring line for that
 conversation is already a row, and the first page is read `before` the oldest
-row's cursor: the conversation's ring lines at or before it. The ring and
-storage share no position, so storage is joined at the stored copy of the
-conversation's oldest ring line — its exact text, stamped with its millisecond
-time by the bouncer, past as many byte-identical copies as the ring holds (a
-line storage failed to keep moves the join to the next one it did keep) — which
-is sound only while the ring still holds every line after the reader's cursor;
-otherwise, after a restart, or on a stopped network, the server answers 409 and
-the client joins at the exact text of the oldest line the server sent it
-(`seam`, with how many identical copies it holds). Storage pages by row id, the
-order the ring held its lines in. Rows that arrived on the socket while a page
+row's cursor: the conversation's ring lines at or before it. Cursors are ring
+positions, which a clean restart keeps (§19.3, migration 0102), so a reader's
+cursor stays good across one. Storage is joined at the stored row of the
+conversation's oldest ring line: the row stored at that line's ring position
+(`bnc_buffer.seq`), or — for a line a new epoch restored at another position —
+the row with its exact millisecond-stamped text, past as many byte-identical
+copies as the ring holds (a line storage failed to keep moves the join to the
+next one it did keep). That is sound only while the ring still holds every line
+after the reader's cursor; otherwise, after a crash, or on a stopped network,
+the server answers 409 and the client joins at the exact text of the oldest
+line the server sent it (`seam`, with how many identical copies it holds).
+Storage pages by row id, the order the ring held its lines in: positions repeat
+across epochs, ids do not. Rows that arrived on the socket while a page
 was read, and, for a page joined at a `seam`, the local echoes held before that
 line (storage holds each as our own line), are the only rows a page can share
 with the buffer, and each is removed once. Each page widens the conversation's

@@ -9676,6 +9676,36 @@ pub async fn bnc_conversation_line_id(
     .map_err(query_error)
 }
 
+/// The stored row of conversation `target` that holds ring position `seq`
+/// with exactly `line`: a ring line as storage keeps it (migration 0102). A
+/// ring position repeats only across epochs, whose rows are older, so the
+/// newest such row is this epoch's; `None` when this ring's line was not
+/// stored at its position (it failed to store, or a new epoch restored it at
+/// another position).
+pub async fn bnc_conversation_line_at(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    seq: u64,
+    line: &str,
+) -> Result<Option<i64>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    sqlx::query_scalar(
+        "SELECT id FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND target = $3 AND seq = $4 AND line = $5
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(target)
+    .bind(ring_position(seq)?)
+    .bind(line)
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)
+}
+
 /// Up to `limit` stored rows of conversation `target` of `(owner, network)`
 /// stored before row `before` (all of them without one), oldest first, in
 /// storage order — the order the ring held them in.
