@@ -383,7 +383,7 @@ impl LinkServer {
             .ok()
             .filter(|streams| *streams <= e6irc_link::MAX_STREAMS)
             .expect("configuration validation bounds the core shards by the link's streams");
-        Self {
+        let server = Self {
             acceptor: parts.acceptor,
             epoch: parts.epoch,
             streams,
@@ -402,7 +402,12 @@ impl LinkServer {
             },
             http: parts.http,
             rebuild: held::RebuildGate::new(parts.pending_cut, !has_database),
+        };
+        if server.rebuild.is_open() {
+            // Nothing to rebuild: the core's own sessions start now.
+            server.core_tx.directories().held.rebuilt.done();
         }
+        server
     }
 
     /// End every edge's link: the core is stopping, and every session it
@@ -1024,8 +1029,16 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                let edge = port
-                    .open(
+                let edge = if self.version >= 2 {
+                    // Its edge holds it for the next core.
+                    port.open_holding(
+                        conn,
+                        open.address,
+                        self.server.sendq_bytes,
+                        self.server.core_tx.directories().held.format.clone(),
+                    )
+                } else {
+                    port.open(
                         conn,
                         client.to_string(),
                         transport,
@@ -1033,31 +1046,9 @@ impl SessionStream {
                         self.server.sendq_bytes,
                     )
                     .await
-                    .expect("the attach port always opens");
-                let window = u32::try_from(crate::bouncer::ATTACH_INBOUND_BYTES).expect("small");
-                let (input, inputs) = mpsc::unbounded_channel();
-                let in_flight = Arc::new(AtomicU64::new(0));
-                tokio::spawn(feed_attach(
-                    port,
-                    conn,
-                    session,
-                    inputs,
-                    self.out.clone(),
-                    in_flight.clone(),
-                    window,
-                ));
-                self.start(
-                    session,
-                    SessionKind::Attach,
-                    edge,
-                    Some((input, in_flight, window)),
-                    guard.into(),
-                );
-                drop(
-                    self.out
-                        .send(CoreFrame::Credit(Credit::Session(session, window)))
-                        .await,
-                );
+                    .expect("the attach port always opens")
+                };
+                self.feed_attach_session(session, port, edge, guard).await;
             }
             SessionKind::Ui => {
                 let Some(UpgradeGrant::Ui(grant)) = self.server.upgrades.take(conn) else {
@@ -1073,6 +1064,42 @@ impl SessionStream {
                 self.start_ui(session, *grant, 0).await;
             }
         }
+    }
+
+    /// Carry an attach session's lines to its attachment, on its own
+    /// credit, and pump its output.
+    pub(super) async fn feed_attach_session(
+        self: &Arc<Self>,
+        session: SessionId,
+        port: crate::bouncer::AttachPort,
+        edge: EdgeSession,
+        guard: e6irc_edge::address::ConnGuard,
+    ) {
+        let conn = ConnId(session.get());
+        let window = u32::try_from(crate::bouncer::ATTACH_INBOUND_BYTES).expect("small");
+        let (input, inputs) = mpsc::unbounded_channel();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        tokio::spawn(feed_attach(
+            port,
+            conn,
+            session,
+            inputs,
+            self.out.clone(),
+            in_flight.clone(),
+            window,
+        ));
+        self.start(
+            session,
+            SessionKind::Attach,
+            edge,
+            Some((input, in_flight, window)),
+            guard.into(),
+        );
+        drop(
+            self.out
+                .send(CoreFrame::Credit(Credit::Session(session, window)))
+                .await,
+        );
     }
 
     /// Start a live chat socket's core half on this stream, with `in_flight`

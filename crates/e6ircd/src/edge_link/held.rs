@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 
 use super::{LinkEnd, LinkServer, LinkedEdges, Registration, SessionStream};
 use crate::core::record::{
-    ChannelState, ClockOrigin, CutState, MemberEntry, SessionRecord, UiRecord,
+    AttachRecord, ChannelState, ClockOrigin, CutState, MemberEntry, SessionRecord, UiRecord,
 };
 use crate::core::{CoreShardId, Input};
 
@@ -520,16 +520,18 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
             server.roster.clear_cut(cut).await;
         }
         server.rebuild.opened();
+        server.core_tx.directories().held.rebuilt.done();
         for registration in uploaded.iter().chain(held.iter()) {
             for stream in registration.streams.lock().expect("link streams").values() {
                 stream.resume();
             }
         }
         eprintln!(
-            "e6ircd: rebuilt {} sessions, {} live chat sockets and {} channels from {} edges in \
-             {} ms; every edge is resumed",
+            "e6ircd: rebuilt {} sessions, {} live chat sockets, {} attachments and {} channels \
+             from {} edges in {} ms; every edge is resumed",
             rebuilt.sessions,
             rebuilt.sockets,
+            rebuilt.attachments,
             rebuilt.channels,
             uploaded.len(),
             started.elapsed().as_millis()
@@ -544,6 +546,8 @@ struct Rebuilt {
     channels: usize,
     /// Live chat sockets resumed.
     sockets: usize,
+    /// Bouncer attachments resumed.
+    attachments: usize,
 }
 
 /// One session an edge uploaded, with the stream it came on.
@@ -595,6 +599,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
     let mut rebuilt = Rebuilt::default();
     let mut sessions: Vec<UploadedSession> = Vec::new();
     let mut sockets: Vec<(Arc<SessionStream>, SessionId, Upload, UiRecord)> = Vec::new();
+    let mut attachments: Vec<(Arc<SessionStream>, SessionId, Upload, AttachRecord)> = Vec::new();
     let mut channels: HashMap<Bytes, MergedChannel> = HashMap::new();
     let mut cut_state: Option<CutState> = None;
     for registration in uploaded {
@@ -661,9 +666,10 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                         Ok(record) => sockets.push((stream.clone(), id, upload, record)),
                         Err(error) => refuse_held(&stream, id, &upload, unreadable(error)).await,
                     },
-                    SessionKind::Attach => {
-                        refuse_held(&stream, id, &upload, "server restarting").await;
-                    }
+                    SessionKind::Attach => match AttachRecord::decode(bytes, origin) {
+                        Ok(record) => attachments.push((stream.clone(), id, upload, record)),
+                        Err(error) => refuse_held(&stream, id, &upload, unreadable(error)).await,
+                    },
                 }
             }
         }
@@ -856,7 +862,62 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
         resume_socket(server, &stream, id, &upload, record).await;
         rebuilt.sockets += 1;
     }
+    let attachment_logins: Vec<(ConnId, String, crate::identity::CredentialId)> = attachments
+        .iter()
+        .map(|(_, id, _, record)| (ConnId(id.get()), record.account.clone(), record.credential))
+        .collect();
+    let revoked: HashMap<ConnId, &'static str> = revoked_logins(server, attachment_logins)
+        .await
+        .into_iter()
+        .collect();
+    for (stream, id, upload, record) in attachments {
+        match revoked.get(&ConnId(id.get())) {
+            Some(reason) => refuse_held(&stream, id, &upload, reason).await,
+            None => {
+                resume_attachment(server, &stream, id, &upload, record).await;
+                rebuilt.attachments += 1;
+            }
+        }
+    }
     rebuilt
+}
+
+/// Resume a bouncer attachment on this core from its record; one this core
+/// has no bouncer for is closed, saying so.
+async fn resume_attachment(
+    server: &LinkServer,
+    stream: &Arc<SessionStream>,
+    id: SessionId,
+    upload: &Upload,
+    record: AttachRecord,
+) {
+    let Some(port) = server.attach.clone() else {
+        refuse_held(
+            stream,
+            id,
+            upload,
+            "this server has no bouncer to attach to",
+        )
+        .await;
+        return;
+    };
+    let client = ClientIp::new(upload.address);
+    let Some(guard) = server.limiter.try_acquire(client) else {
+        refuse_held(stream, id, upload, "Too many connections from your address").await;
+        return;
+    };
+    let edge = port.resume(
+        ConnId(id.get()),
+        upload.address,
+        server.sendq_bytes,
+        upload.unwritten,
+        server.core_tx.directories().held.format.clone(),
+        record,
+    );
+    stream.feed_attach_session(id, port, edge, guard).await;
+    if let Some(reason) = upload.closed.clone() {
+        stream.closed(id, session_closed(reason));
+    }
 }
 
 /// Resume a live chat socket on this core: its account's network, its
@@ -884,38 +945,42 @@ async fn resume_socket(
     }
 }
 
-/// Check every rebuilt login against the database as the live revocation
-/// paths do (DESIGN §2): a deleted or suspended account, or a revoked app
-/// password or personal access token, ends the session. A core without a
-/// database has no accounts to check.
+/// Check every rebuilt IRC login against the database as the live
+/// revocation paths do (DESIGN §2), ending each that is no longer good.
 async fn reauthorize(
     server: &LinkServer,
     logins: Vec<(ConnId, String, crate::identity::CredentialId)>,
 ) {
+    for (conn, reason) in revoked_logins(server, logins).await {
+        close(server, conn, reason).await;
+    }
+}
+
+/// The logins of `logins` that are no longer good, each with why: a deleted
+/// or suspended account, or a revoked app password or personal access token.
+/// Without an answer from the database no login can be trusted, and each is
+/// named. A core without a database has no accounts to check.
+async fn revoked_logins(
+    server: &LinkServer,
+    logins: Vec<(ConnId, String, crate::identity::CredentialId)>,
+) -> Vec<(ConnId, &'static str)> {
     let super::Roster::Database(pool) = &server.roster else {
-        return;
+        return Vec::new();
     };
     if logins.is_empty() {
-        return;
+        return Vec::new();
     }
     let authorities = match crate::db::every_account_authority(pool).await {
         Ok(authorities) => authorities,
         Err(error) => {
-            // Without the answer no login can be trusted: every rebuilt login
-            // ends, loudly, rather than resume unchecked.
             eprintln!(
                 "e6ircd: the rebuild could not re-check account standing ({error}); every \
                  rebuilt login is ended"
             );
-            for (conn, _, _) in logins {
-                close(
-                    server,
-                    conn,
-                    "server restarting: login could not be re-checked",
-                )
-                .await;
-            }
-            return;
+            return logins
+                .into_iter()
+                .map(|(conn, _, _)| (conn, "server restarting: login could not be re-checked"))
+                .collect();
         }
     };
     let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
@@ -940,21 +1005,22 @@ async fn reauthorize(
             HashSet::new()
         }
     };
-    for (conn, account, credential) in logins {
-        let reason = match standing.get(&casemap.casefold(&account)) {
-            None => Some("Account permanently deleted"),
-            Some(true) => Some("Account suspended"),
-            Some(false) => match credential {
-                crate::identity::CredentialId::Issued(issued) if !stored.contains(&issued) => {
-                    Some(issued.revocation_reason())
-                }
-                _ => None,
-            },
-        };
-        if let Some(reason) = reason {
-            close(server, conn, reason).await;
-        }
-    }
+    logins
+        .into_iter()
+        .filter_map(|(conn, account, credential)| {
+            let reason = match standing.get(&casemap.casefold(&account)) {
+                None => Some("Account permanently deleted"),
+                Some(true) => Some("Account suspended"),
+                Some(false) => match credential {
+                    crate::identity::CredentialId::Issued(issued) if !stored.contains(&issued) => {
+                        Some(issued.revocation_reason())
+                    }
+                    _ => None,
+                },
+            };
+            reason.map(|reason| (conn, reason))
+        })
+        .collect()
 }
 
 async fn close(server: &LinkServer, conn: ConnId, reason: &str) {
@@ -1015,6 +1081,8 @@ pub(crate) struct Handover {
     pub(crate) edges: Vec<EdgeName>,
     /// Sessions closed because the work they waited on did not settle.
     pub(crate) unsettled: usize,
+    /// Sessions closed because no edge holds them.
+    pub(crate) unheld: usize,
 }
 
 impl LinkServer {
@@ -1075,6 +1143,21 @@ impl LinkServer {
         // 2. Settle: every line handed to its shard, nothing between shards,
         //    no database round trip awaited.
         handover.unsettled = self.settle(&holding).await;
+        // 2b. A session no edge holds — the `local` driver's, which the core
+        //     itself holds (D13 is not built), and any on a version 1 link —
+        //     ends now, loudly, so its channels see it go before the cut
+        //     rather than keep it with no session behind it; then the quits
+        //     settle.
+        match self.core_tx.close_unheld("server restarting").await {
+            Ok(0) => {}
+            Ok(closed) => {
+                handover.unheld = closed;
+                handover.unsettled += self.settle(&holding).await;
+            }
+            Err(error) => {
+                eprintln!("e6ircd: the sessions no edge holds could not be closed: {error}")
+            }
+        }
         // 3. Cut every shard: the records and replicas are published whole,
         //    and nothing is handled afterwards.
         let buckets = match self.core_tx.cut().await {

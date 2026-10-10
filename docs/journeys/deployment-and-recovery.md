@@ -252,10 +252,14 @@ configuration and each edge's configuration.
    each linked edge's listeners and certificates as it reports them.
 
 **Visible failures and recovery.** A core stopped with a handover — `e6ircd
-stop --handover`, or SIGTERM in edge mode — leaves every IRC client to its
-edge: nothing is closed or said, lines typed meanwhile are delivered after,
-and the next core on the link's address rebuilds each session from what the
-edge uploads, within the edge's ten-minute hold. `e6ircd stop --final` closes
+stop --handover`, or SIGTERM in edge mode — leaves every client to its edge
+(IRC, `/ws/ui` and bouncer attach alike): nothing is closed or said, lines
+typed meanwhile are delivered after, and the next core on the link's address
+rebuilds each session from what the edge uploads, within the edge's
+ten-minute hold. The bouncer's `local` network quits as the server
+restarting and joins again once the next core has rebuilt; `e6ircd records
+advance` moves every core to the newest record format once no older release
+will run again. `e6ircd stop --final` closes
 every client with the core's own `ERROR`. A core that crashes, or a link that
 is reset, closes every client loudly: `ERROR :Closing Link: <host> (server
 restarting)` from the edge, close 1012 on `/ws/ui`; HTTP requests meanwhile
@@ -301,7 +305,15 @@ console page.
 link's refusals; with PostgreSQL,
 `a_live_chat_socket_and_an_attach_reach_the_bouncer_through_an_edge` and
 `the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners` prove
-`/ws/ui`, attach, the roster and the console. `fuzz/fuzz_targets/link_frames.rs`
+`/ws/ui`, attach, the roster and the console;
+`a_graceful_restart_after_any_step_changes_no_transcript` restarts after
+every step of a scripted conversation, and
+`a_live_chat_socket_survives_a_graceful_restart`,
+`a_bouncer_attachment_survives_a_graceful_restart`,
+`a_sasl_exchange_and_a_format_advance_span_graceful_restarts`,
+`a_local_driver_session_quits_before_a_graceful_restart_and_rejoins` and
+`a_ring_keeps_its_epoch_and_positions_across_a_clean_restart` prove the
+rebuild of what PostgreSQL backs. `fuzz/fuzz_targets/link_frames.rs`
 covers the codec, and irctest's green list runs through an edge in CI.
 
 ## Recover from PostgreSQL interruption

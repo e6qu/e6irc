@@ -754,6 +754,26 @@ registering again.
 **Revision** — the counter every session record and channel replica carries;
 at a rebuild the highest revision of a channel's replicas wins.
 
+**Record format** — the numbered layout of a session record, channel
+replica, live chat socket or attachment record and cut state. A release reads
+its own format and the one before, and writes the one before until the
+operator runs `e6ircd records advance`; any other format is refused by number
+and its session closed loudly.
+
+**Clock origin** — where a process's monotonic clock started, on the wall
+clock: written into every record so the next core moves each monotonic
+reading onto its own clock.
+
+**Stop control** — the local endpoint each serving process listens on (a
+Unix socket in a directory private to its user, a named pipe on Windows) that
+`e6ircd stop --handover|--final` asks to stop through, the same on every
+operating system.
+
+**Ring epoch** — the identifier of one network's backlog ring that every
+`ReplayCursor` names. It is stored, with each line's ring position, so a ring
+whose last stop stored every line continues its epoch after a restart and a
+cursor handed out before it still names the same line.
+
 **Cut** — the marker a stopping core sends every edge once it has quiesced:
 "everything up to here is final". It carries the **cut state**, the small
 global state no session owns (WHOWAS, the LUSERS maximum). A crash leaves no

@@ -72,6 +72,41 @@ pub(crate) trait ReplicaSink: Send + Sync + 'static {
 pub(crate) struct HeldSinks {
     pub(crate) format: RecordFormatCell,
     pub(crate) replicas: Arc<std::sync::OnceLock<Arc<dyn ReplicaSink>>>,
+    /// Whether the rebuild of what the edges hold is over (DESIGN §19.3):
+    /// until it is, the core opens no session of its own — the `local`
+    /// driver's — which would make channels the rebuild is about to restore.
+    pub(crate) rebuilt: RebuildDone,
+}
+
+/// Whether the core has rebuilt what its edges held; true where there is
+/// nothing to rebuild.
+#[derive(Clone)]
+pub(crate) struct RebuildDone(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for RebuildDone {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(true)))
+    }
+}
+
+impl RebuildDone {
+    /// A rebuild is to come: the core's own sessions wait for it.
+    pub(crate) fn pending(&self) {
+        self.0.send_replace(false);
+    }
+
+    /// The rebuild is over, or there is none.
+    pub(crate) fn done(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Resolves once the rebuild is over.
+    pub(crate) async fn wait(&self) {
+        let mut done = self.0.subscribe();
+        // The sender lives as long as this handle: `wait_for` ends only on
+        // the value.
+        drop(done.wait_for(|done| *done).await);
+    }
 }
 
 /// `AUTHENTICATE` chunks accumulating toward a payload, with the input lines
@@ -685,6 +720,24 @@ impl ServerState {
                 );
             }
         }
+    }
+
+    /// Close, with `reason`, every session of this shard whose edge holds
+    /// nothing for the next core — in edge mode the `local` driver's, which
+    /// lives in the core itself, and any on a version 1 link — so its client
+    /// and its channels hear it end before the cut rather than nothing. How
+    /// many were closed.
+    pub(crate) fn close_unheld(&mut self, reason: &str) -> usize {
+        let unheld: Vec<ConnId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| !session.output.holds())
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in &unheld {
+            self.close_with_error(*conn, reason);
+        }
+        unheld.len()
     }
 
     /// What keeps this shard from being cut exactly now.

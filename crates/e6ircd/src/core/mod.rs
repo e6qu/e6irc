@@ -457,6 +457,18 @@ impl CoreIngress {
         .await
     }
 
+    /// Close, with `reason`, every session whose edge holds nothing for the
+    /// next core (DESIGN §19.3): its client and its channels are told it
+    /// ended before the cut, rather than nothing. How many were closed.
+    pub(crate) async fn close_unheld(&self, reason: &'static str) -> Result<usize, String> {
+        let closed = self
+            .ask_each(std::time::Duration::from_secs(5), |reply| {
+                Input::CloseUnheld { reason, reply }
+            })
+            .await?;
+        Ok(closed.into_iter().sum())
+    }
+
     /// Cut every shard; the account-creation buckets they held.
     pub(crate) async fn cut(
         &self,
@@ -540,6 +552,7 @@ impl Input {
             | Input::AccountDeleted { .. }
             | Input::RefuseVerdictsInFlight { .. }
             | Input::Settled { .. }
+            | Input::CloseUnheld { .. }
             | Input::Cut { .. }
             | Input::AdoptBuckets { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
@@ -969,6 +982,12 @@ pub enum Input {
     /// Say what keeps this shard from being cut exactly now (DESIGN §19.3).
     Settled {
         reply: tokio::sync::oneshot::Sender<state::Unsettled>,
+    },
+    /// Close, with `reason`, each of this shard's sessions whose edge holds
+    /// nothing for the next core; the answer is how many.
+    CloseUnheld {
+        reason: &'static str,
+        reply: tokio::sync::oneshot::Sender<usize>,
     },
     /// Cut this shard: republish everything its edges hold, and handle nothing
     /// more. The answer is the account-creation buckets the cut carries.
@@ -3286,6 +3305,10 @@ impl Core {
                 handler::overlong(&mut self.state, conn, label.as_deref());
             }
             Input::Settled { reply } => drop(reply.send(self.state.unsettled())),
+            Input::CloseUnheld { reason, reply } => {
+                // An asker that is gone needs no count.
+                reply.send(self.state.close_unheld(reason)).ok();
+            }
             Input::Cut { reply } => drop(reply.send(self.state.cut())),
             Input::AdoptBuckets { buckets } => self.state.adopt_registration_buckets(&buckets),
             Input::RebuildSession(rebuild) => self.state.rebuild_session(*rebuild),

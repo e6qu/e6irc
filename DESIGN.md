@@ -5664,10 +5664,11 @@ Layers, bottom to top:
   everything after it, including deliveries that arrive from other shards
   while they drain. Durable
   network/history state is continuously persisted; there is no separate
-  driver-checkpoint format. In edge mode a stop still closes every client
-  with the core's own `ERROR` before its links end; the handover stop that
-  closes none, with `e6ircd stop --final` as the one that does, is the
-  graceful rebuild's (§19.3, `PLAN.md` phase 4).
+  driver-checkpoint format. In edge mode a stop — SIGTERM or `e6ircd stop
+  --handover` — is a handover (D16): the core cuts its links before anything
+  tells a client goodbye, and the edges hold every client for the next core
+  (§19.3); `e6ircd stop --final` closes every client with the core's own
+  `ERROR`, as a stop without edges always does.
 - Main owns and supervises the core and PostgreSQL worker join handles while
   serving; listener join handles have explicit supervisors. Any unexpected
   completion or panic names the failed task, initiates the same bounded drain,
@@ -5777,10 +5778,10 @@ same host or another, gracefully or after a crash, while every client socket
 stays open. This is §1's "redeploy without dropping connections"; the terms
 are defined in [`docs/terminology.md`](docs/terminology.md) ("Edge tier").
 Status: designed, and built in the phases of `PLAN.md` "Edge tier"; phase 1
-(the `e6irc-edge` crate), phase 2 (the in-process link) and phase 3 (the
-process boundary: `e6ircd edge` and the core link between processes) have
-landed — "Phase 1 as built", "Phase 2 as built" and "Phase 3 as built" below —
-and phase 4 (the graceful rebuild) is next. Until a phase lands, the rest of
+(the `e6irc-edge` crate), phase 2 (the in-process link), phase 3 (the process
+boundary: `e6ircd edge` and the core link between processes) and phase 4 (the
+graceful rebuild) have landed — "Phase 1 as built" to "Phase 4 as built"
+below — and phase 5 (crash takeover) is next. Until a phase lands, the rest of
 this document describes the running system; §19.9 lists the sections each
 phase rewrites.
 
@@ -6134,8 +6135,9 @@ phase rewrites.
     nothing: a handover closes its clients with the core's own `ERROR`, as
     before. WHOIS shows the TLS facts to the user itself and to operators
     (`671 … :is using a secure connection [TLSv1.3, TLS13_…]`).
-  - *Bodies* (`core::record`). A session's record, a channel's state, a
-    member's entry and the cut state are bodies the edge holds without
+  - *Bodies* (`core::record`). A session's record, a live chat socket's and
+    an attachment's record, a channel's state, a member's entry and the cut
+    state are bodies the edge holds without
     reading: a format number, the writer's clock origin, then the fields.
     Every monotonic reading is written as the writer's and moved onto the
     reader's clock by the difference of the two origins (`ClockOrigin`, the
@@ -6210,7 +6212,42 @@ phase rewrites.
     the gap as that client would have; and sends `Resume`. The edge replays
     each session's retained lines, numbered afresh, then lets input flow.
     Two records naming one nick keep it for the one that opened first; a
-    session the per-address limit refuses is closed saying so.
+    session the per-address limit refuses is closed saying so. Until the
+    rebuild is over the core opens no session of its own (`RebuildDone`), so
+    the `local` driver cannot create a channel the rebuild is about to
+    restore.
+  - *Live chat sockets and attachments.* A `/ws/ui` socket's record
+    (`UiRecord`) names its account and network, whether its composer may
+    send, its credential (kind and digest, never the secret) and the ring
+    position its client was sent everything through; a bouncer attachment's
+    (`AttachRecord`) names its account and credential, its network (the
+    account's own or the shared one), the nick it registered with, its
+    capabilities, its ring position, the nick, channels and ISUPPORT it was
+    shown and the last status it was told. Each is republished after what it
+    wrote, when it changed. The next core reads the credential again (a
+    revoked or expired one ends the socket as it would have; the attachment's
+    login is checked with the IRC logins), leases the account's authority
+    again, and resumes: the socket replays after its cursor as a returning
+    client's does; the attachment is not welcomed again — its mirror is what
+    the record says it was shown, the lines after its position follow, then
+    the session as it is now, and any ISUPPORT or status that changed. A
+    position the ring cannot honour is said in a notice, never guessed
+    across.
+  - *Durable ring epochs* (migration 0102). Each stored backlog line keeps
+    the ring position it took, and each backlog its ring epoch
+    (`bnc_ring_positions`, keyed as `bnc_buffer` is, so configured networks
+    have one too). A stop that stored every line records the last position
+    it handed out; the next start continues the epoch after it, the restored
+    lines at their own positions and anything the driver said before the
+    restore moved past them (no client has been handed a cursor by then), so
+    a `ReplayCursor` from before the restart names the same line. A start
+    withdraws the claim at once, so a process that dies without storing
+    everything leaves none, and the start after it begins a new epoch.
+  - *The `local` driver's session* lives in the core, so no edge holds it
+    (D13, homing it on an edge, is not built): the cut closes it first,
+    loudly, as the server restarting, with every other session no edge holds
+    (one on a version 1 link), and the next core's driver joins again once
+    the rebuild is over.
   - *Stops* (`control`). `e6ircd stop --handover|--final [--pid <pid>]`
     reaches the server through a local control endpoint named by its process
     identifier — a Unix socket in `e6ircd-<uid>` under `$XDG_RUNTIME_DIR` or
@@ -6233,7 +6270,15 @@ phase rewrites.
     open multiline batch, WHOWAS and the LUSERS maximum, a channel's topic,
     modes and ranks, the TLS facts — with nothing lost, repeated or said;
     stop with `--final`; refuse a handover without edges; and hand over on
-    SIGTERM.
+    SIGTERM. `edge_tier.rs` restarts a core after every step of a scripted
+    two-client conversation onto a core of another shard count and compares
+    the transcripts line for line with an unrestarted run; with PostgreSQL
+    (in `db-tests`, and on macOS and Windows in `zero-drop-database` with
+    PostgreSQL 18 installed natively, D15) it keeps a live chat socket, a
+    bouncer attachment and a SASL exchange across graceful restarts, advances
+    the record format under a served session, and sees the `local` driver
+    quit and rejoin; `bouncer.rs` holds the durable ring epoch across a clean
+    restart.
 
 ### 19.2 The core link
 

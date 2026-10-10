@@ -30,12 +30,15 @@ where
 {
     let (opened, link) = tokio::sync::oneshot::channel();
     let opened = Mutex::new(Some(opened));
-    let port = AttachPort::new(move |link, _client| {
-        let opened = opened.lock().expect("test port").take();
-        if let Some(opened) = opened {
-            drop(opened.send(link));
-        }
-    });
+    let port = AttachPort::new(
+        move |link, _client| {
+            let opened = opened.lock().expect("test port").take();
+            if let Some(opened) = opened {
+                drop(opened.send(link));
+            }
+        },
+        |_, _, _| unreachable!("the test port resumes nothing"),
+    );
     tokio::spawn(serve_conn(
         stream,
         AcceptedConnection {

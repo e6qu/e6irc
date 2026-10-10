@@ -252,6 +252,9 @@ async fn await_welcome(
 
 async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Stopped;
+    // A core rebuilding what its edges held opens no session of its own until
+    // it has: this one's channels are among those it restores.
+    session.core.core_tx.directories().held.rebuilt.wait().await;
     let conn = match session.core.next_conn.allocate() {
         Ok(conn) => conn,
         Err(error) => {

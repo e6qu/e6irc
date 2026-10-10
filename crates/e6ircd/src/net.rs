@@ -291,10 +291,11 @@ impl ShutdownHandle {
                 let handover = links.cut(cut, epoch).await;
                 eprintln!(
                     "e6ircd: handed over to the next core: cut {:#x}, {} edges hold the \
-                     sessions ({} closed as unsettled)",
+                     sessions ({} closed as unsettled, {} that no edge holds closed)",
                     cut.get(),
                     handover.edges.len(),
-                    handover.unsettled
+                    handover.unsettled,
+                    handover.unheld
                 );
                 true
             }
@@ -1126,6 +1127,11 @@ async fn serve(
             .map_err(io::Error::other)?;
     let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders)
         .with_command_flood(command_flood);
+    // In edge mode the edges may hold sessions for this core to rebuild: the
+    // core's own sessions wait until the link server knows (DESIGN §19.3).
+    if config.edge_link.is_some() {
+        core_tx.directories().held.rebuilt.pending();
+    }
     // Followed live from here on (`CoreIngress::adopt_live_settings`).
     core_tx
         .set_anti_spam_exit_message_time_seconds(config.limits.anti_spam_exit_message_time_seconds);

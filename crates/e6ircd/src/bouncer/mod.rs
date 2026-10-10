@@ -11393,6 +11393,15 @@ mod tests {
         assert_eq!(ring.entries.len(), 2, "the stale line was evicted");
     }
 
+    /// Each capability has its own bit in an attachment's record, so every
+    /// combination comes back as it went.
+    #[test]
+    fn attach_capabilities_round_trip_through_their_bits() {
+        for bits in 0..(1u16 << 10) {
+            assert_eq!(AttachCaps::from_bits(bits).bits(), bits);
+        }
+    }
+
     /// A ring whose last stop stored every line continues its epoch: each
     /// restored line has the position it had, so a cursor from before the
     /// restart resumes exactly; a line the driver said before the restore

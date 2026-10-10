@@ -1864,6 +1864,8 @@ mod ui_socket_bound_tests {
                     ws.on_upgrade(move |socket| {
                         serve_ui(
                             UiGrant {
+                                account: "Alice".into(),
+                                network: "test".into(),
                                 handle,
                                 authority: UiSocketAuthority {
                                     composer: ComposerAuthority::MaySend,

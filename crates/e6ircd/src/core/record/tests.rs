@@ -482,6 +482,27 @@ fn arbitrary_bytes_never_panic_a_reader() {
 }
 
 #[test]
+fn an_attachment_record_round_trips_in_both_formats() {
+    let record = AttachRecord {
+        account: "alice".into(),
+        credential: CredentialId::Issued(IssuedCredential::ApiToken(12)),
+        shared: true,
+        network: "Libera".into(),
+        requested_nick: "alice/libera".into(),
+        caps: 0b10_1101_0011,
+        cursor: Some((77, 1234)),
+        shown_nick: Some("alice_".into()),
+        shown_channels: vec!["#rust".into(), "#e6irc".into()],
+        shown_isupport: vec!["CHANTYPES=#".into(), "NETWORK=Libera".into()],
+        status_revision: 9,
+    };
+    for format in [RecordFormat::PREVIOUS, RecordFormat::NEWEST] {
+        let body = record.encode(format, WRITER).expect("encode");
+        assert_eq!(AttachRecord::decode(body, WRITER), Ok(record.clone()));
+    }
+}
+
+#[test]
 fn a_live_chat_socket_record_round_trips_in_both_formats() {
     for cursor in [None, Some((0x1234_5678_9abc, 42))] {
         let record = UiRecord {

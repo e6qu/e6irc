@@ -176,10 +176,11 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | real pseudo-terminal render/message/terminal-restore journey (the deterministic archive contract runs in `guards`) |
 | `shauth-sso` | exact external single-sign-on/logout integration |
+| `zero-drop-database` | the graceful rebuild's PostgreSQL scenarios (a live chat socket, a bouncer attachment, a SASL exchange and the record-format window across graceful restarts, the `local` driver's session, durable ring epochs) on macOS and Windows with PostgreSQL 18 installed natively |
 | `irctest`, `irctest-edge`, `irctest-services` | IRC and services conformance; the green list runs in one process (`irctest`) and, in parallel, through an edge (`irctest-edge`) |
 | `matrix-bridge` | bidirectional live bridge behavior |
 | `loom` | queue concurrency interleavings |
-| `fuzz-smoke` | parser, tag escaping, stateful core, multi-client core, core-link frames, and hostile TUI server output |
+| `fuzz-smoke` | parser, tag escaping, stateful core, multi-client core, core-link frames, the bodies edges hold, and hostile TUI server output |
 | `size-report` | informational release binary-size visibility |
 | `ci-ok` | the single required check: it needs every job above and fails unless each one succeeded, so a failed, cancelled, or skipped job cannot merge green; the release workflow publishes only from a `main` commit whose CI run concluded successfully |
 
