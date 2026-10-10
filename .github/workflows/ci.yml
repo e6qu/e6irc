@@ -28,7 +28,12 @@ on:
 # (tools/check-image-pins.py requires a digest on every image any tracked file
 # pulls, and one digest per image everywhere); to refresh one, resolve its tag
 # with `docker buildx imagetools inspect IMAGE:TAG` and update the digest and
-# this date together.
+# this date together. None comes from Docker Hub, which limits anonymous pulls
+# per address and which the shared runners exhaust: Docker's official images
+# come from their copy on Amazon's public registry
+# (public.ecr.aws/docker/library), other Docker Hub images from Google's
+# mirror (mirror.gcr.io), each at the index digest Docker Hub serves for the
+# tag (tools/check-image-pins.py refuses a Docker Hub reference).
 #   postgres:18-alpine, ghcr.io/dexidp/dex:v2.41.1,
 #   mcr.microsoft.com/playwright:v1.61.1-noble,
 #   matrixconduit/matrix-conduit:v0.9.0   resolved 2026-09-21
@@ -161,7 +166,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        image: public.ecr.aws/docker/library/postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -199,7 +204,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        image: public.ecr.aws/docker/library/postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -290,7 +295,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        image: public.ecr.aws/docker/library/postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -545,7 +550,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        image: public.ecr.aws/docker/library/postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: irctest
@@ -633,7 +638,7 @@ jobs:
           docker run -d --name conduit -p 16167:6167 \
             -e CONDUIT_CONFIG=/etc/conduit.toml \
             -v "$PWD/vendor/tests/external-oracles/conduit/conduit.toml:/etc/conduit.toml:ro" \
-            matrixconduit/matrix-conduit:v0.9.0@sha256:4ae051b1b56ee9c1292ffc87653da6078a52310f71aa4fe701c66432159997dd
+            mirror.gcr.io/matrixconduit/matrix-conduit:v0.9.0@sha256:4ae051b1b56ee9c1292ffc87653da6078a52310f71aa4fe701c66432159997dd
           for i in $(seq 1 40); do
             curl -sf http://127.0.0.1:16167/_matrix/client/versions >/dev/null && break
             [ "$i" = 40 ] && { echo "conduit did not become ready"; docker logs conduit; exit 1; }
