@@ -98,17 +98,26 @@ export function namesDiffer(a, b) {
 }
 
 // Re-key a Map of buffers (keyed by fold) under `names`. Two buffers that the
-// new rules make one name are merged into the first: its lines, then the
-// other's, with their unread counts added. Returns the new map and each
-// merged pair, so the page can say what it merged.
-export function rekeyBuffers(buffers, names) {
+// new rules make one name are merged into the first: their rows interleaved in
+// the order the page received them (each row's `order`; loaded history, which
+// has none, stays in front), capped at `limit`, with their unread counts
+// added, and joined when either was. Returns the new map and each merged
+// pair, so the page can say what it merged.
+export function rekeyBuffers(buffers, names, limit = Infinity) {
   const rekeyed = new Map();
   const merged = [];
   for (const buffer of buffers.values()) {
     const key = buffer.key === SERVER_KEY ? SERVER_KEY : fold(buffer.display, names);
     const existing = rekeyed.get(key);
     if (existing) {
-      existing.lines.push(...buffer.lines);
+      const received = (line) => line?.order ?? -Infinity;
+      existing.lines = [...existing.lines, ...buffer.lines]
+        .map((line, index) => [line, index])
+        .sort(([a, first], [b, second]) => received(a) - received(b) || first - second)
+        .map(([line]) => line)
+        .slice(-limit);
+      if (buffer.joined) existing.joined = true;
+      if (!existing.topic && buffer.topic) existing.topic = buffer.topic;
       existing.unread += buffer.unread;
       existing.mentions += buffer.mentions;
       for (const [, member] of buffer.nicks) existing.nicks.set(fold(member.name, names), member);
@@ -392,6 +401,8 @@ export function existingChannelBuffer(buffers, name, names = DEFAULT_NAMES) {
 // persisted history loaded into it went with the lines, so "Load earlier" is
 // offered again rather than hidden for the rest of the page's life.
 export function clearTranscript(buffer) {
+  // A history read still out was read against the transcript this ends.
+  buffer.transcriptEpoch = (buffer.transcriptEpoch ?? 0) + 1;
   buffer.lines.length = 0;
   buffer.unread = 0;
   buffer.mentions = 0;
@@ -439,6 +450,66 @@ const BIDI_CONTROLS = /[\u202A-\u202E\u2066-\u2069]/g;
 
 export function stripBidiControls(text) {
   return String(text ?? "").replace(BIDI_CONTROLS, "");
+}
+
+// ---- what a row is --------------------------------------------------------
+//
+// Something a person said: a message, a notice, or an action (an event that
+// keeps its actor). A join, part, quit, nick or topic notice has no sender;
+// it is news about the conversation, not a message in it.
+export function isSaid(line) {
+  return line.kind === "msg" || line.kind === "notice" || (line.kind === "event" && line.sender != null);
+}
+
+// What an unread count counts: what was said, a refusal the page reports
+// ("error"), and e6irc's own notes in the console ("server"). Membership
+// notices are not unread messages -- a busy channel's joins and parts made
+// the badge, and its "N unread messages" label, count arrivals -- and the
+// console's copy of each wire line ("wire") is counted where it is read.
+export function countsAsUnread(line) {
+  return isSaid(line) || line.kind === "error" || line.kind === "server";
+}
+
+// ---- replies the person has to see -------------------------------------
+//
+// The console shows every line, but it is rarely the conversation being
+// read. A refusal -- an error numeric (400-599) or an IRCv3 FAIL -- answers
+// something the person or the bouncer asked for, and seen only there it is a
+// silent failure: a message to a moderated channel reads as delivered, a
+// mistyped /join does nothing, a /nick that is taken changes nothing. The
+// replies that answer a person's own question (WHOIS, AWAY) are the same:
+// asked from a channel, the answer never showed up there.
+const PERSONAL_REPLIES = new Set([
+  "276", "301", "305", "306", "307", "311", "312", "313", "317", "319", "320",
+  "330", "338", "378", "671",
+]);
+
+// `{ failure, subject, text }` for a line the person has to see, or null.
+// `subject` is the channel, nick or command it names first (null when it names
+// none), where the page shows it when that conversation is open.
+export function replyReport(message) {
+  const { command, params } = message;
+  if (command === "FAIL") {
+    // FAIL <command> <code> [<context>...] :<description>
+    if (params.length < 3) return null;
+    const context = params.slice(2, -1);
+    return Object.freeze({
+      failure: true,
+      subject: context[0] ?? null,
+      text: stripFormatting(`${params[0]}${context.length ? ` ${context.join(" ")}` : ""}: ${params.at(-1)}`),
+    });
+  }
+  const failure = /^[45]\d\d$/.test(command);
+  if (!failure && !PERSONAL_REPLIES.has(command)) return null;
+  // <me> [subject...] :text
+  if (params.length < 2) return null;
+  const subjects = params.slice(1, -1);
+  const said = params.at(-1);
+  return Object.freeze({
+    failure,
+    subject: subjects[0] ?? null,
+    text: stripFormatting(subjects.length ? `${subjects.join(" ")}: ${said}` : said),
+  });
 }
 
 // A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text". Any other

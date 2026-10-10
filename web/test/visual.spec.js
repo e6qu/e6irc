@@ -2049,8 +2049,9 @@ test("/msg, /notice, /ME and a raw PRIVMSG are shown where they were sent", asyn
     socket.onMessage((frame) => {
       const request = JSON.parse(frame);
       if (!request.id) return;
-      requests.push(request.message);
       socket.send(JSON.stringify({ t: "sent", v: request.id }));
+      // The page's own member-list requests are not what was typed.
+      if (!request.message.startsWith("/raw NAMES ")) requests.push(request.message);
     });
   });
   await mockSession(page, [ircNetwork("Libera")]);
@@ -2087,8 +2088,9 @@ test("a message longer than one IRC line goes as several, each shown once", asyn
     socket.onMessage((frame) => {
       const request = JSON.parse(frame);
       if (!request.id) return;
-      requests.push(request.message);
       socket.send(JSON.stringify({ t: "sent", v: request.id }));
+      // The page's own member-list requests are not what was typed.
+      if (!request.message.startsWith("/raw NAMES ")) requests.push(request.message);
     });
   });
   await mockSession(page, [ircNetwork("Libera")]);
@@ -2236,4 +2238,232 @@ test("enabling the open network opens one live socket, not two", async ({ page }
   await expect(page.locator("#status")).toContainText("Libera: connected");
   await page.waitForTimeout(500);
   expect(sockets).toBe(1);
+});
+
+// ---- bug sweep 8: refusals, unread, kicks, history races, re-renders -------
+
+// A chat attached to the given channels whose socket answers every request the
+// page correlates: with `answer(request)` when it returns a frame, else `sent`.
+async function chatWith(page, channels, answer = () => null, lines = null) {
+  let upstream;
+  const requests = [];
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    attachReplay(socket, lines ?? channels.map((channel) => `:viewer!u@h JOIN ${channel}`), channels);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      requests.push(request);
+      const reply = answer(request);
+      if (reply) socket.send(JSON.stringify(reply));
+      else if (request.id) socket.send(JSON.stringify({ t: "sent", v: request.id }));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await expect(page.locator("#status")).toContainText("Libera: connected");
+  return { requests, send: (line, position = 100) => upstream.send(lineEvent(line, position)), socket: () => upstream };
+}
+
+test("a refusal from the network is said where it applies, not only in the console", async ({ page }) => {
+  const chat = await chatWith(page, ["#only", "#other"]);
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  const messages = page.getByLabel("Messages");
+  // The message was queued, so it echoes; the network then refuses it.
+  await page.getByRole("textbox", { name: "Message" }).fill("hello");
+  await page.getByRole("textbox", { name: "Message" }).press("Enter");
+  chat.send(":irc.example 404 viewer #only :Cannot send to channel");
+  await expect(messages.locator(".line-error")).toHaveText([/Error: #only: Cannot send to channel/]);
+  // One naming no open conversation answers what was just done, here.
+  chat.send(":irc.example 403 viewer #typo :No such channel", 101);
+  await expect(messages.locator(".line-error").last()).toContainText("Error: #typo: No such channel");
+  // A refusal about another open conversation goes there, and is unread.
+  chat.send(":irc.example 482 viewer #other :You're not channel operator", 102);
+  await expect(page.getByRole("button", { name: /^Open #other/ })).toHaveAccessibleName("Open #other, 1 unread message");
+  // The answer to the person's own question shows up where they asked it.
+  chat.send(":irc.example 311 viewer bob ~b host.example * :Bob Real", 103);
+  await expect(messages.locator(".line-server", { hasText: "bob ~b host.example *: Bob Real" })).toHaveCount(1);
+  await expectAccessible(page);
+});
+
+test("a refused join or leave is said, not left as a console notice", async ({ page }) => {
+  const refused = new Set(["/join #busy", "/part #only"]);
+  const chat = await chatWith(page, ["#only"], (request) => refused.has(request.message)
+    ? { t: "send-error", v: request.id, message: "upstream busy; line not sent, try again" }
+    : null);
+  await page.getByLabel("Join a channel").fill("#busy");
+  await page.getByRole("button", { name: "Join channel" }).click();
+  await expect(page.locator('[data-alert="join"]')).toContainText("Could not join #busy. upstream busy");
+  await page.getByRole("button", { name: "Leave #only" }).click();
+  await expect(page.locator('[data-alert="leave"]')).toContainText("Could not leave #only. upstream busy");
+  // Both went correlated, so the server could answer them.
+  const asked = chat.requests.filter((request) => refused.has(request.message));
+  expect(asked).toHaveLength(2);
+  expect(asked.every((request) => request.id)).toBe(true);
+});
+
+test("a refused member list is said and asked for again, never left waiting", async ({ page }) => {
+  let refusals = 0;
+  const chat = await chatWith(page, ["#only"], (request) => {
+    if (request.message !== "/raw NAMES #only") return null;
+    refusals += 1;
+    return { t: "send-error", v: request.id, message: "upstream busy; line not sent, try again" };
+  });
+  await expect(page.locator('[data-alert="members-refresh"]')).toContainText("Could not refresh the members of #only");
+  // The upstream reconnects: the page asks again rather than believing the
+  // refused request is still on its way.
+  chat.socket().send(JSON.stringify({ t: "status", v: "disconnected" }));
+  chat.socket().send(JSON.stringify({ t: "status", v: "connected" }));
+  await expect.poll(() => refusals).toBe(2);
+});
+
+test("a bridge offers no Join, which it would only refuse", async ({ page }) => {
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => attachReplay(socket, [], ["#general"], 1, { nick: "me" }));
+  await mockSession(page, [ircNetwork("Team", { kind: "slack", addr: "https://slack.com/api", nick: "", username: null, realname: null })]);
+  await page.goto("/?network=Team");
+  await expect(page.locator("#status")).toContainText("Team: connected");
+  await expect(page.getByLabel("Join a channel")).toBeHidden();
+});
+
+test("the open conversation counts as unread while the tab is hidden", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.pageHidden = false;
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => window.pageHidden });
+  });
+  const chat = await chatWith(page, ["#only"]);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  await page.evaluate(() => { window.pageHidden = true; });
+  chat.send(":bob!u@h PRIVMSG #only :while you were away");
+  await expect(page).toHaveTitle("(1) e6irc");
+  await page.evaluate(() => {
+    window.pageHidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(page).toHaveTitle("e6irc");
+});
+
+test("joins, parts, quits and topics are not unread messages", async ({ page }) => {
+  const chat = await chatWith(page, ["#only", "#other"]);
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  chat.send(":irc.example 353 viewer = #other :viewer bob", 101);
+  chat.send(":irc.example 366 viewer #other :End of /NAMES list", 102);
+  chat.send(":carol!u@h JOIN #other", 103);
+  chat.send(":carol!u@h PART #other :later", 104);
+  chat.send(":bob!u@h QUIT :gone", 105);
+  chat.send(":dave!u@h TOPIC #other :new words", 106);
+  await expect(page.getByRole("button", { name: /^Open #other/ })).toHaveAccessibleName("Open #other");
+  await expect(page).toHaveTitle("e6irc");
+  await page.getByRole("button", { name: /^Open #other/ }).click();
+  await expect(page.getByLabel("Messages").locator(".line-event")).toHaveText([
+    /carol joined/, /carol left \(later\)/, /bob quit \(gone\)/, /dave changed the topic to: new words/,
+  ]);
+});
+
+test("a kick keeps the channel's transcript, marked past, where the person was reading", async ({ page }) => {
+  const chat = await chatWith(page, ["#only"], () => null, [":viewer!u@h JOIN #only", ":bob!u@h PRIVMSG #only :before"]);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  chat.send(":op!u@h KICK #only viewer :behave");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  const messages = page.getByLabel("Messages");
+  await expect(messages.locator(".line-msg", { hasText: "before" })).toHaveCount(1);
+  await expect(messages.getByText("You were kicked by op (behave)")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: /^Open #only/ })).toHaveAccessibleName(/past channel, not currently joined/);
+  // A line still in flight for the channel opens nothing once it is closed.
+  await page.getByRole("button", { name: "Close conversation with #only" }).click();
+  chat.send(":carol!u@h JOIN #only", 101);
+  chat.send(":carol!u@h PART #only", 102);
+  await expect(page.getByLabel("Messages").getByText("« :carol!u@h PART #only")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: /^Open #only/ })).toHaveCount(0);
+});
+
+test("someone who quits is said to have gone in the conversation with them", async ({ page }) => {
+  const chat = await chatWith(page, [], () => null, [":bob!u@h PRIVMSG viewer :hi"]);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("bob");
+  chat.send(":bob!u@h QUIT :bye");
+  await expect(page.getByLabel("Messages").locator(".line-event")).toHaveText([/bob quit \(bye\)/]);
+});
+
+test("/query of a channel says to join it rather than opening a private-looking buffer", async ({ page }) => {
+  const chat = await chatWith(page, ["#only"]);
+  await page.getByRole("textbox", { name: "Message" }).fill("/query #elsewhere hi");
+  await page.getByRole("textbox", { name: "Message" }).press("Enter");
+  await expect(page.locator('[data-alert="send"]')).toContainText("#elsewhere is a channel");
+  await expect(page.getByRole("button", { name: /^Open #elsewhere/ })).toHaveCount(0);
+  expect(chat.requests.map((request) => request.message)).not.toContain("hi");
+});
+
+test("history that arrives after the transcript was reloaded is not merged into it", async ({ page }) => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const chat = await chatWith(page, ["#only", "#other"]);
+  await mockBuffer(page, async (route) => {
+    await gate;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ lines: [":bob!u@h PRIVMSG #only :older"] }) });
+  });
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  await page.getByRole("button", { name: "Load earlier messages" }).click();
+  await expect(page.locator("#load-earlier")).toHaveText("Loading…");
+  // The one control reads for the conversation that is open.
+  await page.getByRole("button", { name: /^Open #other/ }).click();
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toBeEnabled();
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  // The server replays the whole ring while the read is out.
+  const socket = chat.socket();
+  socket.send(JSON.stringify({ t: "replay", v: "full" }));
+  socket.send(lineEvent(":viewer!u@h JOIN #only", 1));
+  socket.send(lineEvent(":bob!u@h PRIVMSG #only :live", 2));
+  await expect(page.getByLabel("Messages").locator(".line-msg")).toHaveText([/live/]);
+  release();
+  await expect(page.locator('[data-alert="history"]')).toContainText("reloaded while its earlier messages were loading");
+  await expect(page.getByLabel("Messages").locator(".line-msg")).toHaveText([/live/]);
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toBeEnabled();
+});
+
+test("a history read that finds nothing says so", async ({ page }) => {
+  await chatWith(page, ["#only"]);
+  await mockBuffer(page, (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ lines: [] }) }));
+  await page.getByRole("button", { name: "Load earlier messages" }).click();
+  await expect(page.locator('[data-alert="history"]')).toContainText("No earlier messages in #only");
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toBeHidden();
+});
+
+test("a line to a background conversation redraws only that conversation's entry", async ({ page }) => {
+  const chat = await chatWith(page, ["#a", "#b", "#c", "#d", "#e"]);
+  await page.getByRole("button", { name: /^Open #a/ }).click();
+  await page.evaluate(() => {
+    window.redrawn = new Set();
+    new MutationObserver((records) => {
+      for (const record of records) {
+        const node = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        const item = node.closest("#buffers > li");
+        if (item) window.redrawn.add(item.dataset.key);
+      }
+    }).observe(document.getElementById("buffers"), { subtree: true, childList: true, characterData: true, attributes: true });
+  });
+  chat.send(":bob!u@h PRIVMSG #c :hello");
+  await expect(page.getByRole("button", { name: /^Open #c/ })).toHaveAccessibleName("Open #c, 1 unread message");
+  expect(await page.evaluate(() => [...window.redrawn])).toEqual(["#c"]);
+});
+
+test("a populated transcript passes the accessibility checks", async ({ page }) => {
+  await chatWith(page, ["#only"], () => null, [
+    ":viewer!u@h JOIN #only",
+    ":bob!u@h PRIVMSG #only :hello https://example.test/",
+    ":carol!u@h JOIN #only",
+  ]);
+  await expect(page.getByLabel("Messages").locator(".line")).toHaveCount(2);
+  await expectAccessible(page);
+});
+
+test("a session snapshot leaves a reader where they scrolled to", async ({ page }) => {
+  const lines = [":viewer!u@h JOIN #only", ...Array.from({ length: 80 }, (_, index) => `:bob!u@h PRIVMSG #only :line ${index}`)];
+  const chat = await chatWith(page, ["#only"], () => null, lines);
+  const messages = page.getByLabel("Messages");
+  await expect(messages.locator(".line-msg")).toHaveCount(80);
+  await messages.evaluate((list) => { list.scrollTop = 0; });
+  // The upstream reconnected: the bouncer states its session again.
+  chat.socket().send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"], isupport: [] }));
+  chat.send(":irc.example 005 viewer CHANTYPES=# :are supported", 200);
+  await expect(page.getByRole("button", { name: "Leave #only" })).toBeVisible();
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(await messages.evaluate((list) => list.scrollTop)).toBe(0);
 });

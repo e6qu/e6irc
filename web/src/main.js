@@ -45,10 +45,12 @@ import {
   chatMessageRoute,
   clearTranscript,
   composerRequests,
+  countsAsUnread,
   existingChannelBuffer,
   fold as foldUnder,
   isChannel as isChannelUnder,
   isPrefixMode,
+  isSaid,
   kickPairs,
   memberRank,
   membershipTargets,
@@ -66,6 +68,7 @@ import {
   reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
+  replyReport,
   seededNick,
   splitSigil,
   stripBidiControls,
@@ -287,10 +290,36 @@ let replayIsHistory = false;
 let memberTracking = true;
 let nextSendId = 0;
 const pendingSends = new Map();
+let receivedRows = 0;
 
-function sendComposer(target, message, requestId = undefined) {
+function sendComposer(target, message, requestId) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return false;
   socket.send(serializeComposerRequest({ id: requestId, target, message }));
+  return true;
+}
+
+function nextRequestId() {
+  nextSendId += 1;
+  return nextSendId.toString(36);
+}
+
+// A request the page makes on the person's behalf -- a join, a leave, a member
+// list -- carries an id like a typed message, so the server answers it with
+// `sent` or `send-error`. Sent without one, a refusal came back only as a
+// notice in the console, which is not where the person who pressed Join or
+// Leave is looking. `what` completes "Could not …", under the alert `key`;
+// `settled(accepted)` runs once the server has answered, or when the
+// connection closes first. False when there is no live connection.
+function sendControl(message, { key, what, settled = () => {} }) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  const requestId = nextRequestId();
+  pendingSends.set(requestId, { control: { key, what, settled } });
+  try {
+    sendComposer("", message, requestId);
+  } catch (error) {
+    pendingSends.delete(requestId);
+    throw error;
+  }
   return true;
 }
 
@@ -329,6 +358,11 @@ function acceptPendingSend(requestId) {
   const pending = pendingSends.get(requestId);
   if (!pending) return false;
   pendingSends.delete(requestId);
+  if (pending.control) {
+    clearAlert(pending.control.key);
+    pending.control.settled(true);
+    return true;
+  }
   const { buffer, target, text } = pending;
   if (!buffer) {
     // Sent from the console: show the line that went out, so the console reads
@@ -344,6 +378,11 @@ function rejectPendingSend(requestId, message) {
   const pending = pendingSends.get(requestId);
   if (!pending) return false;
   pendingSends.delete(requestId);
+  if (pending.control) {
+    showAlert(pending.control.key, errorMessage(pending.control.what, new Error(message)), "error");
+    pending.control.settled(false);
+    return true;
+  }
   rememberSentText(pending.typed);
   // Said once. A failure used to go into the console buffer as well, which is
   // rarely the buffer being read and worded it differently from the alert.
@@ -371,10 +410,15 @@ function restoreRejectedMessage(text) {
 }
 
 function rejectAllPendingSends(reason) {
-  if (pendingSends.size === 0) return;
-  const count = pendingSends.size;
-  for (const pending of pendingSends.values()) rememberSentText(pending.typed);
+  const pending = [...pendingSends.values()];
   pendingSends.clear();
+  // A request the page made for itself is made again by the next connection
+  // (its member lists) or is the person's to repeat; it is no message of theirs.
+  for (const { control } of pending) control?.settled(false);
+  const messages = pending.filter(({ control }) => !control);
+  if (messages.length === 0) return;
+  const count = messages.length;
+  for (const message of messages) rememberSentText(message.typed);
   showAlert(
     "unconfirmed",
     `${count} message(s) were not confirmed before ${reason}; use input history to retry.`,
@@ -461,14 +505,21 @@ function requestNames(buffer) {
     return;
   }
   namesRequested.add(buffer.key);
+  // A refusal ("upstream busy") must not leave the list waiting for a reply
+  // that will never come: the request is forgotten, so the next resync asks
+  // again, and the refusal is said.
+  const forget = (accepted) => {
+    if (!accepted) namesRequested.delete(buffer.key);
+  };
+  const what = `refresh the members of ${buffer.display}`;
   try {
-    if (!sendComposer("", `/raw NAMES ${buffer.display}`)) {
-      namesRequested.delete(buffer.key);
-      showAlert("members", `Could not refresh members for ${buffer.display}.`, "error");
+    if (!sendControl(`/raw NAMES ${buffer.display}`, { key: "members-refresh", what, settled: forget })) {
+      forget(false);
+      showAlert("members-refresh", errorMessage(what, new Error("The live connection is closed")), "error");
     }
-  } catch {
-    namesRequested.delete(buffer.key);
-    showAlert("members", `Could not refresh members for ${buffer.display}.`, "error");
+  } catch (error) {
+    forget(false);
+    showAlert("members-refresh", errorMessage(what, error), "error");
   }
 }
 
@@ -509,20 +560,21 @@ function applySessionSnapshot({ nick, channels, isupport }, { reapplied = false 
     if (!buffer) continue;
     // A reconnect begins with an empty authoritative membership set and fills
     // it as upstream JOINs are confirmed. Keep the transcript as an archived
-    // buffer during that transition; only an explicit PART/KICK closes it.
-    buffer.joined = false;
-    buffer.nicks.clear();
-    buffer.membershipKnown = false;
-    buffer.membersTruncated = false;
-    namesSnapshots.delete(key);
-    namesRequested.delete(key);
+    // buffer during that transition; only an explicit PART closes it.
+    archiveChannel(buffer);
   }
   for (const channel of reconciliation.joined) {
     const buffer = ensureBuffer(channel, "channel");
-    if (buffer.kind === "channel") buffer.joined = true;
+    if (buffer.kind !== "channel") continue;
+    buffer.joined = true;
+    // Joined by a snapshot rather than by a JOIN line this page saw, no NAMES
+    // reply need be on its way: without asking, its member list could wait on
+    // "…" for good. requestNames asks once per channel, and only once the
+    // replay is over and the upstream is connected.
+    if (!buffer.membershipKnown) requestNames(buffer);
   }
   renderBufferList();
-  renderActive();
+  renderHeader();
 }
 
 // Adopt the network's naming rules. Buffers, their member lists and the
@@ -540,7 +592,7 @@ function adoptNames(next, { quiet = false } = {}) {
   if (!namesDiffer(previous, next)) return;
   const newKey = new Map([...buffers.values()].map((buffer) => [buffer.key, buffer.key === SERVER ? SERVER : fold(buffer.display)]));
   const moved = (key) => newKey.get(key) ?? fold(key);
-  const { buffers: rekeyed, merged } = rekeyBuffers(buffers, ircNames);
+  const { buffers: rekeyed, merged } = rekeyBuffers(buffers, ircNames, MAX_LOADED_LINES);
   buffers.clear();
   for (const [key, buffer] of rekeyed) buffers.set(key, buffer);
   for (const set of [namesSnapshots, namesRequested, requestedJoins]) {
@@ -553,7 +605,9 @@ function adoptNames(next, { quiet = false } = {}) {
     addServer(`Under the network's case mapping ${into} is ${kept}; their conversations were merged.`);
   }
   renderBufferList();
-  renderActive();
+  // Only a merge changes a transcript; a new key for the same one does not.
+  if (merged.length) renderActive();
+  else renderHeader();
 }
 
 // Buffers and nicks are keyed by their casefold; the original casing is kept in
@@ -582,6 +636,8 @@ function ensureBuffer(name, kind) {
     mentions: 0,
     pendingVisibleMessages: 0,
     historyLoaded: false,
+    historyLoading: false,
+    transcriptEpoch: 0,
     joined: kind === "channel" ? false : null,
     membershipKnown: false,
     membersTruncated: false,
@@ -611,9 +667,21 @@ function bufferLabel(b) {
 
 function updateTitle() {
   let unread = 0;
-  for (const b of buffers.values()) if (b.key !== active) unread += b.unread;
+  for (const b of buffers.values()) unread += b.unread;
   document.title = unread > 0 ? `(${unread}) e6irc` : "e6irc";
 }
+
+// The open conversation is read once the page is seen again.
+function markActiveRead() {
+  const b = buffers.get(active);
+  if (!b || (b.unread === 0 && b.mentions === 0)) return;
+  b.unread = 0;
+  b.mentions = 0;
+  renderBufferList();
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) markActiveRead();
+});
 
 // Bring a rendered list in line with `entries`, keeping every item that is
 // still there: its element is updated in place and moved only when it is out
@@ -621,7 +689,14 @@ function updateTitle() {
 // list that changes under the person (conversations on each new line, members
 // on each JOIN, PART and MODE) goes through here. An item that did have to
 // move gets its focus back.
-function reconcileList(container, entries, { key, create, update }) {
+//
+// `signature` is everything `update` draws from an entry. An item whose
+// signature has not changed is not drawn again: every line to a background
+// conversation re-renders this list, and a join in a large channel the member
+// list, so redrawing every item each time rebuilt up to hundreds of rows (and
+// thousands of members) per line.
+const drawnSignature = new WeakMap();
+function reconcileList(container, entries, { key, signature, create, update }) {
   const focused = document.activeElement;
   const hadFocus = focused instanceof HTMLElement && container.contains(focused);
   const existing = new Map();
@@ -636,7 +711,11 @@ function reconcileList(container, entries, { key, create, update }) {
       item = create();
       item.dataset.key = itemKey;
     }
-    update(item, entry);
+    const drawn = signature(entry);
+    if (drawnSignature.get(item) !== drawn) {
+      update(item, entry);
+      drawnSignature.set(item, drawn);
+    }
     if (item === next) next = next.nextElementSibling;
     else container.insertBefore(item, next);
   }
@@ -713,6 +792,7 @@ function renderBufferList() {
   });
   reconcileList(buffersEl, order, {
     key: (b) => b.key,
+    signature: (b) => JSON.stringify([b.key === active, b.kind, b.joined, b.display, b.unread, b.mentions]),
     create: bufferListItem,
     update: updateBufferListItem,
   });
@@ -782,9 +862,17 @@ function messageRow(line) {
   return row;
 }
 
-function renderActive({ atLatest = true } = {}) {
+// Everything about the open conversation but its transcript: its name, topic,
+// action, history control and members. What changes a conversation's state
+// and not its lines (a session snapshot, a kick, a rename) redraws only this:
+// rebuilding the transcript as well moved a reader who had scrolled back to
+// the newest line, and read nothing new.
+function renderHeader() {
   const b = buffers.get(active);
   routeNetworkEl.textContent = network || "";
+  // A bridge's channels are its configuration: the server refuses a JOIN
+  // there, so the page does not offer one.
+  el("join-form").hidden = !memberTracking;
   bufnameEl.textContent = bufferLabel(b);
   buftopicEl.textContent = b ? b.topic : "";
   const action = bufferAction(b, memberTracking);
@@ -796,13 +884,13 @@ function renderActive({ atLatest = true } = {}) {
     bufferActionEl.title = label;
     bufferActionEl.setAttribute("aria-label", label);
   }
-  // "Load earlier" is offered for a real conversation buffer (channel/DM) whose
-  // persisted backlog hasn't been pulled yet, and only when attached (network set).
-  const loadEarlierEl = el("load-earlier");
-  if (loadEarlierEl) {
-    const eligible = !!network && !!b && b.kind !== "server" && !b.historyLoaded;
-    loadEarlierEl.hidden = !eligible;
-  }
+  renderLoadEarlier();
+  renderNickList();
+}
+
+function renderActive({ atLatest = true } = {}) {
+  const b = buffers.get(active);
+  renderHeader();
   // Switching buffers replaces a complete historical transcript. Mark that
   // replacement busy and quiet so assistive technology announces only later
   // live additions, not every already-read line as a new message.
@@ -813,7 +901,6 @@ function renderActive({ atLatest = true } = {}) {
   if (b) b.pendingVisibleMessages = 0;
   renderJumpLatest();
   announceTranscriptWhenSettled();
-  renderNickList();
 }
 
 // The transcript is announced as it grows only once it holds live traffic: a
@@ -896,6 +983,7 @@ function renderNickList() {
   }
   reconcileList(nicksEl, members, {
     key: (m) => fold(m.name),
+    signature: (m) => `${nickPrefix(m.modes, channelModes)} ${m.name}`,
     create: nickListItem,
     update: (li, m) => {
       const button = li.firstElementChild;
@@ -997,12 +1085,13 @@ bufferActionEl.addEventListener("click", () => {
     showNotConnected(`${buffer.display} was not left.`);
     return;
   }
+  const what = `leave ${buffer.display}`;
   try {
-    if (!sendComposer("", `/part ${buffer.display}`)) {
+    if (!sendControl(`/part ${buffer.display}`, { key: "leave", what })) {
       showNotConnected(`${buffer.display} was not left.`);
     }
-  } catch {
-    showAlert("send", `The request to leave ${buffer.display} was not sent.`, "error");
+  } catch (error) {
+    showAlert("leave", errorMessage(what, error), "error");
   }
 });
 
@@ -1033,29 +1122,33 @@ function lineTime(tags, useCurrentTime = true) {
 // the actor of a `/me` action (shown in the text, with no `from`).
 function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null, sender = from } = {}) {
   const b = ensureBuffer(bufName, bufKind);
-  // A highlight: someone else's channel/DM message or action that names us.
-  const mention = (kind === "msg" || kind === "event") && sender != null && !isMe(sender) && mentionsMe(text);
   const line = {
     ...lineTime(tags),
     from,
     sender,
     text,
     kind,
-    mention,
+    mention: false,
     identity: messageIdentity(tags),
     wire,
     // The ring position before this row's line (see oldestRingFloor): the line
     // being handled has not yet moved the cursor past it, and a local echo's
     // own ring line comes after every line already received.
     ringFloor: replayCursor,
+    // The order this page received it in, which merging two conversations
+    // keeps (rekeyBuffers).
+    order: (receivedRows += 1),
   };
-  // The console's copy of each received line ("wire") is not another unread
-  // message: the line is counted where it is read. Replayed history is the
+  const mine = sender != null && isMe(sender);
+  // A highlight: something someone else said that names us.
+  line.mention = isSaid(line) && !mine && mentionsMe(text);
+  // Only what is said is unread (countsAsUnread): not a membership notice, and
+  // not the console's copy of each received line. Replayed history is the
   // backlog, not news, and no replay is a reason to raise a desktop
   // notification about something that was said while the page was away.
   // Nor is a line you sent yourself, wherever it lands.
-  const counts = kind !== "wire" && !(replaying && replayIsHistory) && !(sender != null && isMe(sender));
-  if (!replaying && !(sender != null && isMe(sender))) maybeNotify(b, line);
+  const counts = countsAsUnread(line) && !(replaying && replayIsHistory) && !mine;
+  if (!replaying && isSaid(line) && !mine) maybeNotify(b, line);
   b.lines.push(line);
   const lineLimit = b.historyLoaded ? MAX_LOADED_LINES : MAX_LINES;
   if (b.lines.length > lineLimit) b.lines.shift();
@@ -1075,6 +1168,13 @@ function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null,
       b.pendingVisibleMessages += 1;
     }
     renderJumpLatest();
+    // Open in a tab nobody is looking at is not read: counted, the tab's
+    // title says so, and showing the tab again reads it (markActiveRead).
+    if (counts && document.hidden) {
+      b.unread += 1;
+      if (line.mention) b.mentions += 1;
+      updateTitle();
+    }
   } else if (counts) {
     b.unread += 1;
     if (line.mention) b.mentions += 1;
@@ -1083,7 +1183,47 @@ function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null,
 }
 
 const addServer = (text, wire = null) => addLine(SERVER, "server", "server", null, text, { wire });
-const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
+// A notice about a conversation (a join, a part, a rename, a topic) belongs
+// to one that is open; it is never a reason to open one. A line that arrives
+// after this page left a channel would otherwise put a phantom "past" channel
+// in the list.
+function addEvent(name, text, kind = "event") {
+  const b = buffers.get(fold(name));
+  if (b && b.key !== SERVER) addLine(b.display, kind, b.kind, null, text);
+}
+
+// A channel this session is no longer in, whatever took it away (a kick, an
+// authoritative snapshot without it): its transcript stays, marked past, and
+// what it knew of the membership goes.
+function archiveChannel(buffer) {
+  buffer.joined = false;
+  buffer.nicks.clear();
+  buffer.membershipKnown = false;
+  buffer.membersTruncated = false;
+  namesSnapshots.delete(buffer.key);
+  namesRequested.delete(buffer.key);
+}
+
+// Show a reply the person has to see (replyReport). One naming an open
+// conversation goes there, whenever it arrived; otherwise a live one answers
+// what the person just did, so it goes where they are. The console already
+// shows the wire line, so there only a refusal is said again, in words and
+// counted.
+function showReply({ failure, subject, text: said }) {
+  const kind = failure ? "error" : "server";
+  const text = failure ? `Error: ${said}` : said;
+  const named = subject === null ? null : buffers.get(fold(subject));
+  if (named && named.key !== SERVER) {
+    addLine(named.display, kind, named.kind, null, text);
+    return;
+  }
+  const open = replaying ? null : buffers.get(active);
+  if (open && open.key !== SERVER) {
+    addLine(open.display, kind, open.kind, null, text);
+    return;
+  }
+  if (failure) addLine(SERVER, kind, "server", null, text);
+}
 
 function addNick(chan, nick, render = true) {
   const { name, modes } = splitSigil(nick, channelModes);
@@ -1129,6 +1269,8 @@ function removeNickEverywhere(nick, text) {
   for (const b of buffers.values()) {
     if (b.kind === "channel" && b.nicks.delete(key)) addEvent(b.display, text);
   }
+  // The conversation with them says so too: a message sent now reaches nobody.
+  if (buffers.get(key)?.kind === "dm") addEvent(key, text);
   if (active) renderNickList();
 }
 
@@ -1150,7 +1292,7 @@ function renameNick(from, to) {
     if (active === fromKey) active = conversation.key;
     addEvent(toName, `${fromName} is now ${toName}`);
     renderBufferList();
-    if (active === conversation.key) renderActive();
+    if (active === conversation.key) renderHeader();
   }
   for (const b of buffers.values()) {
     if (b.kind !== "channel") continue;
@@ -1307,7 +1449,16 @@ function handleLine(raw) {
       const by = m.nick ? ` by ${m.nick}` : "";
       for (const [channel, target] of pairs) {
         if (isMe(target)) {
-          closeBuffer(channel);
+          // Kept, marked past, with the kick at the end of its transcript: a
+          // kick is not the person closing the conversation, and deleting it
+          // threw away what led up to it and moved them out of it.
+          const buffer = existingChannelBuffer(buffers, channel, ircNames);
+          if (buffer) {
+            archiveChannel(buffer);
+            addEvent(buffer.display, `You were kicked${by}${reason}`, "server");
+            renderBufferList();
+            if (buffer.key === active) renderHeader();
+          }
           addServer(`You were kicked from ${channel}${by}${reason}.`, raw);
         } else {
           removeNick(channel, target);
@@ -1341,7 +1492,6 @@ function handleLine(raw) {
         for (const { mode, adding, argument } of modeChanges(channelModes, m.params[1] || "", m.params.slice(2))) {
           if (argument && isPrefixMode(channelModes, mode)) setNickMode(chan, argument, mode, adding);
         }
-      } else {
       }
       break;
     }
@@ -1354,7 +1504,10 @@ function handleLine(raw) {
     case "TOPIC":
       if (m.params[0] && m.params[1] !== undefined) {
         setTopic(m.params[0], m.params[1]);
-        addEvent(m.params[0], `${m.nick || "?"} set the topic`);
+        const topic = stripFormatting(m.params[1]);
+        addEvent(m.params[0], topic
+          ? `${m.nick || "?"} changed the topic to: ${topic}`
+          : `${m.nick || "?"} cleared the topic`);
       }
       break;
     case "332": { // RPL_TOPIC: <me> <chan> :topic
@@ -1392,9 +1545,13 @@ function handleLine(raw) {
       }
       break;
     }
-    default:
-      // Numerics and everything else land in the server buffer: a numeric's
-      // human text, a command with its source and subject.
+    default: {
+      // Everything else is in the console already, as the wire line. A
+      // refusal, or the answer to a question the person asked, is also said
+      // where they will read it.
+      const report = replyReport(m);
+      if (report) showReply(report);
+    }
   }
 }
 
@@ -1678,6 +1835,8 @@ const sentHistory = [];
 let historyIdx = -1; // -1 = editing a fresh line, not browsing history
 let historyDraft = ""; // the in-progress line, restored when browsing past the end
 messageInput.addEventListener("keydown", (e) => {
+  // While an input method composes, the arrows choose among its candidates.
+  if (e.isComposing) return;
   if (e.key === "ArrowUp") {
     if (historyIdx === -1) {
       if (sentHistory.length === 0) return;
@@ -1720,6 +1879,13 @@ composer.addEventListener("submit", (e) => {
     const [, nick, message] = query;
     if (!nick) {
       showAlert("send", "/query needs a nickname: /query <nick> [message]. Nothing was sent.", "error");
+      return;
+    }
+    // A conversation with a channel is joining it; opened as a direct
+    // message it was a private-looking buffer whose lines went to the
+    // channel's buffer instead.
+    if (isChannel(nick)) {
+      showAlert("send", `${nick} is a channel, not a nickname: join it with /join ${nick}. Nothing was sent.`, "error");
       return;
     }
     setActive(ensureBuffer(nick, "dm").display);
@@ -1802,13 +1968,14 @@ function requestJoin(chan) {
     return false;
   }
   rememberRequestedJoins(chan);
+  const what = `join ${chan}`;
   try {
-    if (!sendComposer("", `/join ${chan}`)) {
+    if (!sendControl(`/join ${chan}`, { key: "join", what })) {
       showNotConnected("cannot join yet.");
       return false;
     }
-  } catch {
-    showNotConnected("cannot join yet.");
+  } catch (error) {
+    showAlert("join", errorMessage(what, error), "error");
     return false;
   }
   return true;
@@ -2714,23 +2881,39 @@ function keepNetworkListCurrent() {
 
 // ---- load earlier history ----------------------------------------------
 
+// "Load earlier" is offered for a conversation (channel or direct message)
+// whose earlier history has not been read yet, and says so while it is being
+// read. It is one control shared by every conversation, so it is drawn from
+// the open one each time: drawn from the request, it stayed disabled and
+// reading "Loading…" in whatever conversation the person moved to meanwhile.
+function renderLoadEarlier() {
+  const button = el("load-earlier");
+  const b = buffers.get(active);
+  button.hidden = !(network && b && b.kind !== "server" && !b.historyLoaded);
+  button.disabled = Boolean(b?.historyLoading);
+  button.textContent = b?.historyLoading ? "Loading…" : "Load earlier messages";
+}
+
 // Pull the network's persisted backlog and prepend the active buffer's older
 // messages. Persisted and live raw lines retain any upstream identity tags;
 // exact ordered wire overlap handles servers that do not send msgids. One-shot
 // per buffer.
 async function loadEarlier() {
   const b = buffers.get(active);
-  if (!network || !b || b.kind === "server" || b.historyLoaded) return;
-  const btn = el("load-earlier");
-  const restore = () => {
-    if (!btn) return;
-    btn.disabled = false;
-    btn.textContent = "Load earlier messages";
+  if (!network || !b || b.kind === "server" || b.historyLoaded || b.historyLoading) return;
+  b.historyLoading = true;
+  renderLoadEarlier();
+  // What the answer is merged into must still be what it was read against:
+  // a replay that starts the transcript over (clearTranscript), the
+  // conversation being closed, or another network being opened while the
+  // request is out each make it an answer to a question nobody is asking now,
+  // and merged anyway it put lines in the transcript twice.
+  const epoch = b.transcriptEpoch;
+  const current = () => buffers.get(b.key) === b && b.transcriptEpoch === epoch;
+  const settle = () => {
+    b.historyLoading = false;
+    if (b.key === active) renderLoadEarlier();
   };
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Loading…";
-  }
   // Every ring line after the buffer's oldest row's floor is already a row
   // here (oldestRingFloor), so history is read through that position and holds
   // nothing twice. An empty buffer holds nothing yet: everything up to the
@@ -2752,12 +2935,21 @@ async function loadEarlier() {
       }
     }
     if (!bounded) lines = backlogFrom(await apiGet(page));
-    clearAlert("history");
   } catch (error) {
-    showAlert("history", errorMessage("load earlier messages", error), "error");
-    restore();
+    settle();
+    if (current()) showAlert("history", errorMessage("load earlier messages", error), "error");
     return;
   }
+  settle();
+  if (!current()) {
+    // Offered again (unless the conversation is gone): the transcript it
+    // belonged to is not the one on screen.
+    if (buffers.get(b.key) === b) {
+      showAlert("history", `The ${bufferLabel(b)} transcript was reloaded while its earlier messages were loading. Load them again.`);
+    }
+    return;
+  }
+  clearAlert("history");
   const rebuilt = [];
   for (const raw of lines) {
     const m = parseIrc(raw);
@@ -2784,14 +2976,16 @@ async function loadEarlier() {
   // History is older context, never authority over the live buffer. Messages
   // can arrive while this request is in flight, and local echoes may not exist
   // in persisted input at all, so replacing `b.lines` loses user-visible data.
+  const held = b.lines.length;
   b.lines = bounded
     ? prependHistory(rebuilt, b.lines, MAX_LOADED_LINES)
     : mergeTimeline(rebuilt, b.lines, MAX_LOADED_LINES, isMe);
   b.historyLoaded = true;
-  // The control is one node shared by every conversation: left as it was
-  // during the request, it stayed disabled and reading "Loading…" for the rest
-  // of the page's life, and no other conversation could load its history.
-  restore();
+  // The control goes away either way; without a word, a read that found
+  // nothing looked like a button that did nothing.
+  if (b.lines.length <= held) {
+    showAlert("history", `No earlier messages in ${bufferLabel(b)} are held by the server.`);
+  }
   // Loading older context is an explicit reader action. Keep that context in
   // view instead of snapping back to the live edge where it cannot be seen.
   if (b.key === active) renderActive({ atLatest: false });
