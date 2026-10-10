@@ -20,7 +20,11 @@ as CI's `visual-regression` job (macos-15) makes them. Fonts rasterize
 differently elsewhere, so on any other platform `pnpm test:visual` keeps its
 screenshots in a platform directory (`…/linux/`, ignored by git): a local run
 compares against local renders, and `--update-snapshots` there never
-overwrites the committed baselines. Only a macOS run changes those.
+overwrites the committed baselines. Only a macOS run changes those. A
+platform's first run, with no such directory yet, records it and says so
+instead of comparing; Playwright would otherwise fail each screenshot test once
+while writing its render, which looked like flaky tests. Delete the directory
+to record afresh.
 
 `pnpm test:visual` starts its own Vite server on port 4173 and refuses a busy
 port rather than reusing whatever answers there, which may be another
