@@ -40,7 +40,9 @@ use e6irc_link::{
 use tokio::sync::mpsc;
 
 use super::{LinkEnd, LinkServer, LinkedEdges, Registration, SessionStream};
-use crate::core::record::{ChannelState, ClockOrigin, CutState, MemberEntry, SessionRecord};
+use crate::core::record::{
+    ChannelState, ClockOrigin, CutState, MemberEntry, SessionRecord, UiRecord,
+};
 use crate::core::{CoreShardId, Input};
 
 /// How long the next core waits for the edges holding a cut (D12).
@@ -524,9 +526,10 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
             }
         }
         eprintln!(
-            "e6ircd: rebuilt {} sessions and {} channels from {} edges in {} ms; every edge is \
-             resumed",
+            "e6ircd: rebuilt {} sessions, {} live chat sockets and {} channels from {} edges in \
+             {} ms; every edge is resumed",
             rebuilt.sessions,
+            rebuilt.sockets,
             rebuilt.channels,
             uploaded.len(),
             started.elapsed().as_millis()
@@ -539,6 +542,8 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
 struct Rebuilt {
     sessions: usize,
     channels: usize,
+    /// Live chat sockets resumed.
+    sockets: usize,
 }
 
 /// One session an edge uploaded, with the stream it came on.
@@ -589,6 +594,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
     let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
     let mut rebuilt = Rebuilt::default();
     let mut sessions: Vec<UploadedSession> = Vec::new();
+    let mut sockets: Vec<(Arc<SessionStream>, SessionId, Upload, UiRecord)> = Vec::new();
     let mut channels: HashMap<Bytes, MergedChannel> = HashMap::new();
     let mut cut_state: Option<CutState> = None;
     for registration in uploaded {
@@ -623,25 +629,41 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                     .apply(replica);
             }
             for (id, (upload, body)) in uploads.sessions {
-                let record = match body.joined() {
-                    Some(bytes) => SessionRecord::decode(bytes, origin).map_err(|error| {
-                        eprintln!(
-                            "e6ircd: session {} held by edge {}: {error}",
-                            id.get(),
-                            registration.view.name
-                        );
-                        "server upgrade: session state unreadable"
-                    }),
-                    None => Err("server restarting: session state missing"),
+                let unreadable = |error: crate::core::record::RecordError| {
+                    eprintln!(
+                        "e6ircd: session {} held by edge {}: {error}",
+                        id.get(),
+                        registration.view.name
+                    );
+                    "server upgrade: session state unreadable"
                 };
-                match record {
-                    Ok(record) => sessions.push(UploadedSession {
-                        stream: stream.clone(),
+                let Some(bytes) = body.joined() else {
+                    refuse_held(
+                        &stream,
                         id,
-                        upload,
-                        record,
-                    }),
-                    Err(reason) => refuse_held(&stream, id, &upload, reason).await,
+                        &upload,
+                        "server restarting: session state missing",
+                    )
+                    .await;
+                    continue;
+                };
+                match upload.kind {
+                    SessionKind::Irc => match SessionRecord::decode(bytes, origin) {
+                        Ok(record) => sessions.push(UploadedSession {
+                            stream: stream.clone(),
+                            id,
+                            upload,
+                            record,
+                        }),
+                        Err(error) => refuse_held(&stream, id, &upload, unreadable(error)).await,
+                    },
+                    SessionKind::Ui => match UiRecord::decode(bytes, origin) {
+                        Ok(record) => sockets.push((stream.clone(), id, upload, record)),
+                        Err(error) => refuse_held(&stream, id, &upload, unreadable(error)).await,
+                    },
+                    SessionKind::Attach => {
+                        refuse_held(&stream, id, &upload, "server restarting").await;
+                    }
                 }
             }
         }
@@ -675,15 +697,6 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
         ),
         None => {}
     }
-    // Only an IRC session is rebuilt by this release; a bouncer attachment or
-    // a live chat socket held from a cut is closed loudly.
-    let (irc, others): (Vec<UploadedSession>, Vec<UploadedSession>) = sessions
-        .into_iter()
-        .partition(|session| session.upload.kind == SessionKind::Irc);
-    for other in others {
-        refuse_held(&other.stream, other.id, &other.upload, "server restarting").await;
-    }
-    let mut sessions = irc;
     // Directory keys are given again in the records' original order, so a
     // directory walk still meets the sessions in the order they opened.
     sessions.sort_by_key(|session| session.record.directory_key);
@@ -839,7 +852,36 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
         }
     }
     reauthorize(server, logins).await;
+    for (stream, id, upload, record) in sockets {
+        resume_socket(server, &stream, id, &upload, record).await;
+        rebuilt.sockets += 1;
+    }
     rebuilt
+}
+
+/// Resume a live chat socket on this core: its account's network, its
+/// credential read again, its replay after the cursor its record holds. One
+/// that cannot resume is closed, saying why.
+async fn resume_socket(
+    server: &LinkServer,
+    stream: &Arc<SessionStream>,
+    id: SessionId,
+    upload: &Upload,
+    record: UiRecord,
+) {
+    let Some(http) = &server.http else {
+        refuse_held(stream, id, upload, "server restarting").await;
+        return;
+    };
+    match crate::http::resume_ui(&http.state, record).await {
+        Ok(grant) => {
+            stream.start_ui(id, grant, upload.unwritten).await;
+            if let Some(reason) = upload.closed.clone() {
+                stream.closed(id, session_closed(reason));
+            }
+        }
+        Err(reason) => refuse_held(stream, id, upload, reason).await,
+    }
 }
 
 /// Check every rebuilt login against the database as the live revocation

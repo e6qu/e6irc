@@ -606,27 +606,48 @@ fn spawn_bnc_listener(
 }
 
 /// The attach logic as a session of the core link reaches it: each session
-/// opened is served by `bouncer::bnc_serve`, whichever edge accepted it.
+/// opened is served by `bouncer::bnc_serve`, whichever edge accepted it, and
+/// each a rebuild resumes by `bouncer::bnc_resume`.
 fn attach_port(
     registry: Arc<crate::bouncer::Registry>,
     pool: sqlx::PgPool,
     server_name: String,
     telemetry: Arc<Telemetry>,
 ) -> crate::bouncer::AttachPort {
-    crate::bouncer::AttachPort::new(move |link, client| {
-        let registry = registry.clone();
-        let pool = pool.clone();
-        let server_name = server_name.clone();
-        let telemetry = telemetry.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
-            {
-                telemetry.record_error(ErrorKind::Bouncer);
-                eprintln!("bnc connection from {client} failed: {e}");
-            }
-        });
-    })
+    let resume = {
+        let (registry, server_name, telemetry) =
+            (registry.clone(), server_name.clone(), telemetry.clone());
+        move |link, client, record| {
+            let registry = registry.clone();
+            let server_name = server_name.clone();
+            let telemetry = telemetry.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::bouncer::bnc_resume(link, registry, &server_name, client, record).await
+                {
+                    telemetry.record_error(ErrorKind::Bouncer);
+                    eprintln!("bnc attachment of {client} failed after a restart: {e}");
+                }
+            });
+        }
+    };
+    crate::bouncer::AttachPort::new(
+        move |link, client| {
+            let registry = registry.clone();
+            let pool = pool.clone();
+            let server_name = server_name.clone();
+            let telemetry = telemetry.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
+                {
+                    telemetry.record_error(ErrorKind::Bouncer);
+                    eprintln!("bnc connection from {client} failed: {e}");
+                }
+            });
+        },
+        resume,
+    )
 }
 
 /// Unix-epoch milliseconds. Message timestamps are stamped from this, and

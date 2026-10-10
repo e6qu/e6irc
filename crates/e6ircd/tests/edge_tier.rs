@@ -589,6 +589,100 @@ async fn a_live_chat_socket_and_an_attach_reach_the_bouncer_through_an_edge() {
     .expect("the upstream's line through the attach");
 }
 
+/// Read `socket` until a text message contains `needle`; the socket must not
+/// end first.
+async fn ui_until(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    needle: &str,
+) -> String {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Frame::Text(text))) if text.contains(needle) => return text.to_string(),
+                Some(Ok(_)) => {}
+                other => panic!("the socket ended before {needle:?}: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no message with {needle:?}"))
+}
+
+/// A graceful restart keeps a live chat socket (DESIGN §19.3): the edge holds
+/// it, and the next core resumes it from its record — its account's network,
+/// its credential read again, its replay after the cursor its client read
+/// through — so the socket stays open and its client sees the network's
+/// lines and sends as before.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_live_chat_socket_survives_a_graceful_restart() {
+    let url = support::test_db("a_live_chat_socket_survives_a_graceful_restart").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("account");
+    let alice = token(&pool, "alice").await;
+    let up = upstream().await;
+    let credentials = Credentials::new("restart-ui", &["edge-a"]);
+    let core = database_core(&credentials, url.clone(), "127.0.0.1:0", up).await;
+    let link = core.edge_link_addr.expect("link");
+    let edge = Edge::start(&credentials, "edge-a", link).await;
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    let mut peer = peer_on(up).await;
+
+    let mut request = format!("ws://{}/ws/ui?network=up", edge.web)
+        .into_client_request()
+        .expect("request");
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {alice}").parse().expect("header"),
+    );
+    let (mut ui, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("a live chat socket through the edge");
+    ui_until(&mut ui, "\"t\":\"snapshot\"").await;
+    peer.send_line("PRIVMSG #lobby :before the restart")
+        .await
+        .expect("send");
+    ui_until(&mut ui, "before the restart").await;
+
+    core.shutdown.run(net::StopMode::Handover).await;
+    let _next = database_core(&credentials, url, &link.to_string(), up).await;
+    // Resumed: the replay boundary again, after only what the socket had not
+    // been sent.
+    let boundary = ui_until(&mut ui, "\"t\":\"snapshot\"").await;
+    assert!(!boundary.contains("before the restart"), "{boundary}");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    peer.send_line("PRIVMSG #lobby :after the restart")
+        .await
+        .expect("send");
+    ui_until(&mut ui, "after the restart").await;
+    ui.send(Frame::text(
+        serde_json::json!({ "id": "after-1", "target": "#lobby", "message": "still composing" })
+            .to_string(),
+    ))
+    .await
+    .expect("compose");
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let message = peer.next_message().await.expect("read").expect("a line");
+            if message
+                .params
+                .iter()
+                .any(|param| param == "still composing")
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the composer's line upstream after the restart");
+}
+
 /// The roster keeps an edge's slot: a core that follows another on the same
 /// database gives a linking edge the slot the roster holds for it, and the
 /// row says when it linked and under which epoch. The console shows the

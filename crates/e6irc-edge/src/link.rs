@@ -179,6 +179,19 @@ pub fn waiting_session(name: &'static str, sendq_bytes: usize) -> (SessionLink, 
     (link, edge)
 }
 
+/// A [`waiting_session`] whose edge holds the session's record for the core
+/// ([`holding_session`]), with `in_flight` bytes already sent and not yet
+/// written.
+pub fn holding_waiting_session(
+    name: &'static str,
+    sendq_bytes: usize,
+    in_flight: u64,
+) -> (SessionLink, EdgeSession) {
+    let (link, edge) = holding_session(name, sendq_bytes, in_flight);
+    link.wake_on_drained(Arc::default());
+    (link, edge)
+}
+
 /// What both ends of one session's link share in process.
 struct Shared {
     /// The bytes the edge has written to the client socket: every `Drained`.
@@ -584,6 +597,12 @@ impl LineWriter {
             partial: Vec::new(),
             pending: None,
         }
+    }
+
+    /// The core end it writes through: what a holding session publishes its
+    /// record on ([`SessionLink::hold_record`]).
+    pub fn link(&self) -> &SessionLink {
+        &self.link
     }
 
     fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

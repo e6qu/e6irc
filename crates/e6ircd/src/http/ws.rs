@@ -453,6 +453,8 @@ pub(super) async fn ws_ui(
         .lease(pool_of(&state), credential.revocable())
         .await;
     let grant = UiGrant {
+        account: account.clone(),
+        network: params.network.clone(),
         handle,
         authority: UiSocketAuthority {
             composer,
@@ -639,6 +641,7 @@ pub(super) async fn ws_ui_conn(
     if socket.send(snapshot_event(cursor)).await.is_err() {
         return;
     }
+    socket.hold(cursor);
     loop {
         tokio::select! {
             // The credential that opened the socket was revoked or expired:
@@ -682,6 +685,7 @@ pub(super) async fn ws_ui_conn(
                     {
                         break;
                     }
+                    socket.hold(cursor);
                 }
                 Ok(DriverEvent::Echo { line: entry, origin }) => {
                     // The echo took a ring position whether or not this socket
@@ -697,6 +701,7 @@ pub(super) async fn ws_ui_conn(
                     {
                         break;
                     }
+                    socket.hold(cursor);
                 }
                 Ok(DriverEvent::Status { status, revision }) => {
                     if !crate::bouncer::accept_status_revision(&mut status_revision, revision) {
@@ -858,9 +863,26 @@ async fn send_unavailable(socket: &mut UiSocket) {
 pub(super) struct UiSocket {
     link: e6irc_edge::link::SessionLink,
     inbound: e6irc_queue::Receiver<UiMessage>,
+    /// The record its edge holds, when its edge holds one.
+    held: Option<UiHeld>,
 }
 
 impl UiSocket {
+    /// Have the edge hold that the client has been sent everything through
+    /// `cursor`, after what was sent before this.
+    fn hold(&mut self, cursor: crate::bouncer::ReplayCursor) {
+        let Some(held) = &mut self.held else {
+            return;
+        };
+        held.record.cursor = Some(cursor.recorded());
+        held.revision += 1;
+        let body = held
+            .record
+            .encode(held.format.get(), held.origin)
+            .expect("a live chat socket's record is within every body bound");
+        self.link.hold_record(held.revision, body);
+    }
+
     /// Send one text message, and wait until it is on the client's socket.
     async fn send(&mut self, text: String) -> Result<(), SendFailure> {
         within_send_deadline(
@@ -890,6 +912,10 @@ impl UiSocket {
 /// do and until when, its place among the account's sockets, where replay
 /// resumes, how long a silent peer is believed, and what its link buffers.
 pub(crate) struct UiGrant {
+    /// Whose socket it is, and the name of the account's network it follows:
+    /// what its record names for the next core.
+    pub(super) account: String,
+    pub(super) network: String,
     pub(super) handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
     pub(super) authority: UiSocketAuthority,
     pub(super) slot: Option<UiSocketSlot>,
@@ -910,12 +936,40 @@ pub(crate) struct UiGrant {
 /// the core's half, [`ws_ui_conn`]. Each ends the other.
 fn ui_halves(
     grant: UiGrant,
+    holding: Option<HoldingUi>,
 ) -> (
     e6irc_edge::link::EdgeSession,
     e6irc_queue::Sender<UiMessage>,
     impl Future<Output = ()> + Send + 'static,
 ) {
-    let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", grant.sendq_bytes);
+    let (link, edge, held) = match holding {
+        None => {
+            let (link, edge) = e6irc_edge::link::waiting_session("ui-sendq", grant.sendq_bytes);
+            (link, edge, None)
+        }
+        Some(HoldingUi { in_flight, format }) => {
+            let (link, edge) =
+                e6irc_edge::link::holding_waiting_session("ui-sendq", grant.sendq_bytes, in_flight);
+            let record = crate::core::record::UiRecord {
+                account: grant.account.clone(),
+                network: grant.network.clone(),
+                may_send: matches!(grant.authority.composer, ComposerAuthority::MaySend),
+                credential: grant.authority.credential.credential().recorded(),
+                cursor: None,
+                liveness_ms: u64::try_from(grant.liveness.as_millis()).unwrap_or(u64::MAX),
+            };
+            let held = UiHeld {
+                record,
+                format,
+                origin: crate::core::record::ClockOrigin::of(
+                    crate::net::wall_clock(),
+                    crate::net::mono_clock(),
+                ),
+                revision: 0,
+            };
+            (link, edge, Some(held))
+        }
+    };
     // The client's messages the core has not taken: at most one of the largest
     // it reads, as the socket read one at a time.
     let (sender, inbound) = e6irc_queue::weighted_queue(
@@ -928,7 +982,11 @@ fn ui_halves(
     );
     let core = ws_ui_conn(
         grant.handle,
-        UiSocket { link, inbound },
+        UiSocket {
+            link,
+            inbound,
+            held,
+        },
         grant.authority,
         grant.slot,
         grant.resume,
@@ -939,7 +997,8 @@ fn ui_halves(
 /// Serve one live chat socket in this process, both halves together.
 pub(super) async fn serve_ui(grant: UiGrant, socket: WebSocket) {
     let liveness = grant.liveness;
-    let (edge, sender, core) = ui_halves(grant);
+    // Its own edge holds nothing for another core.
+    let (edge, sender, core) = ui_halves(grant, None);
     tokio::join!(
         e6irc_edge::websocket::serve_ui_socket(socket, edge, sender, liveness),
         core,
@@ -947,16 +1006,86 @@ pub(super) async fn serve_ui(grant: UiGrant, socket: WebSocket) {
 }
 
 /// Start the core's half of a live chat socket an edge holds: what the link
-/// server opens its `Ui` session with.
+/// server opens its `Ui` session with, or resumes it with after a rebuild.
+/// An edge that holds its sessions for the next core (`holding`) is given the
+/// socket's record, republished as its cursor moves.
 pub(crate) fn open_granted_ui(
     grant: UiGrant,
+    holding: Option<HoldingUi>,
 ) -> (
     e6irc_edge::link::EdgeSession,
     e6irc_queue::Sender<UiMessage>,
 ) {
-    let (edge, sender, core) = ui_halves(grant);
+    let (edge, sender, core) = ui_halves(grant, holding);
     tokio::spawn(core);
     (edge, sender)
+}
+
+/// A live chat socket whose edge holds it for the next core (link version
+/// 2): the bytes already sent and not yet written (a socket a rebuild
+/// resumes), and the body format its record is written in.
+pub(crate) struct HoldingUi {
+    pub(crate) in_flight: u64,
+    pub(crate) format: crate::core::RecordFormatCell,
+}
+
+/// What a live chat socket gives its edge to hold: its record, republished
+/// as the client's cursor moves.
+struct UiHeld {
+    record: crate::core::record::UiRecord,
+    format: crate::core::RecordFormatCell,
+    origin: crate::core::record::ClockOrigin,
+    revision: u64,
+}
+
+/// The grant a live chat socket's record resumes on this core after a
+/// rebuild (DESIGN §19.3): the account's network, its place among the
+/// account's sockets, and its credential read again — one revoked or expired
+/// meanwhile ends the socket as it would have — with the replay starting after
+/// the cursor the record holds. `Err` names why it cannot resume.
+pub(crate) async fn resume_ui(
+    state: &Arc<AppState>,
+    record: crate::core::record::UiRecord,
+) -> Result<UiGrant, &'static str> {
+    let crate::core::record::UiRecord {
+        account,
+        network,
+        may_send,
+        credential: (kind, digest),
+        cursor,
+        liveness_ms,
+    } = record;
+    let credential = crate::db::RevocableCredential::from_recorded(kind, &digest)
+        .ok_or("server upgrade: session state unreadable")?;
+    let registry = super::registry_of(state);
+    let handle = registry
+        .get_owned(&account, &network)
+        .ok_or("the network is gone")?;
+    let slot = state.ui_sockets.admit(&account);
+    let credential = state
+        .credential_watch
+        .lease(pool_of(state), credential)
+        .await;
+    Ok(UiGrant {
+        account,
+        network,
+        handle,
+        authority: UiSocketAuthority {
+            composer: if may_send {
+                ComposerAuthority::MaySend
+            } else {
+                ComposerAuthority::ReadOnly
+            },
+            credential,
+            store: pool_of(state).clone(),
+        },
+        slot,
+        resume: cursor.map(|cursor| {
+            ReplayRequest::After(crate::bouncer::ReplayCursor::from_recorded(cursor))
+        }),
+        liveness: std::time::Duration::from_millis(liveness_ms),
+        sendq_bytes: state.sendq_bytes,
+    })
 }
 
 #[derive(Debug)]

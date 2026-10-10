@@ -475,7 +475,26 @@ fn arbitrary_bytes_never_panic_a_reader() {
         }
         drop(ChannelState::decode(bytes.clone(), WRITER));
         drop(MemberEntry::decode(bytes.clone(), WRITER));
+        drop(UiRecord::decode(bytes.clone(), WRITER));
         drop(CutState::decode(bytes, WRITER));
     }
     assert!(read > 0, "no mutation read: the round trip went unchecked");
+}
+
+#[test]
+fn a_live_chat_socket_record_round_trips_in_both_formats() {
+    for cursor in [None, Some((0x1234_5678_9abc, 42))] {
+        let record = UiRecord {
+            account: "alice".into(),
+            network: "Libera".into(),
+            may_send: cursor.is_some(),
+            credential: (1, Bytes::from_static(&[9; 32])),
+            cursor,
+            liveness_ms: 30_000,
+        };
+        for format in [RecordFormat::PREVIOUS, RecordFormat::NEWEST] {
+            let body = record.encode(format, WRITER).expect("encode");
+            assert_eq!(UiRecord::decode(body, WRITER), Ok(record.clone()));
+        }
+    }
 }

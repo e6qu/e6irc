@@ -1221,5 +1221,178 @@ impl CutState {
     }
 }
 
+/// The most bytes of a credential's digest a record holds: a SHA-256 digest
+/// is 32.
+const MAX_DIGEST: usize = 64;
+
+/// A live chat socket (`/ws/ui`), as its edge holds it for the next core: whose
+/// it is and on which of the account's networks, what its credential lets it
+/// do and which credential that is (read again at the rebuild), and the ring
+/// position its client has read through, where the next core's replay starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiRecord {
+    pub account: String,
+    pub network: String,
+    /// The composer may send (the credential grants writing).
+    pub may_send: bool,
+    /// The credential's kind and digest ([`crate::db::RevocableCredential`]).
+    pub credential: (u8, Bytes),
+    /// The ring's epoch and position after the last line the client was
+    /// sent; `None` before the replay was sent.
+    pub cursor: Option<(u64, u64)>,
+    pub liveness_ms: u64,
+}
+
+impl UiRecord {
+    pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
+        let Self {
+            account,
+            network,
+            may_send,
+            credential: (kind, digest),
+            cursor,
+            liveness_ms,
+        } = self;
+        body(format, clock, |w| {
+            w.text("account", account)?;
+            w.text("network", network)?;
+            w.bool(*may_send);
+            w.w.u8(*kind);
+            w.w.bytes("credential digest", digest, MAX_DIGEST)?;
+            w.w.option(cursor.as_ref(), |w, (epoch, seq)| {
+                w.u64(*epoch);
+                w.u64(*seq);
+                Ok(())
+            })?;
+            w.u64(*liveness_ms);
+            Ok(())
+        })
+    }
+
+    pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
+        let mut r = BodyReader::new(bytes, clock)?;
+        let record = Self {
+            account: r.text("account")?,
+            network: r.text("network")?,
+            may_send: r.bool("may send")?,
+            credential: (
+                r.r.u8("credential kind")?,
+                r.r.bytes("credential digest", MAX_DIGEST)?,
+            ),
+            cursor: r
+                .r
+                .option("cursor", |r| Ok((r.u64("epoch")?, r.u64("seq")?)))?,
+            liveness_ms: r.u64("liveness")?,
+        };
+        r.finish()?;
+        Ok(record)
+    }
+}
+
+/// A bouncer attachment, as its edge holds it for the next core: whose it is
+/// and with which credential (both checked again at the rebuild), the network
+/// it is attached to — the account's own, or the shared one of that name — and
+/// the nick it registered with, its capabilities, the ring position it has
+/// been sent everything through, and what it has been shown of the session:
+/// its nick, its channels and the ISUPPORT it was told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachRecord {
+    pub account: String,
+    pub credential: crate::identity::CredentialId,
+    /// The shared (ownerless) network of that name, not the account's own.
+    pub shared: bool,
+    pub network: String,
+    pub requested_nick: String,
+    /// `AttachCaps`, as its bits.
+    pub caps: u16,
+    pub cursor: Option<(u64, u64)>,
+    pub shown_nick: Option<String>,
+    pub shown_channels: Vec<String>,
+    pub shown_isupport: Vec<String>,
+    /// The newest connection status the client was told.
+    pub status_revision: u64,
+}
+
+impl AttachRecord {
+    pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
+        let Self {
+            account,
+            credential,
+            shared,
+            network,
+            requested_nick,
+            caps,
+            cursor,
+            shown_nick,
+            shown_channels,
+            shown_isupport,
+            status_revision,
+        } = self;
+        body(format, clock, |w| {
+            w.text("account", account)?;
+            write_credential(w, *credential);
+            w.bool(*shared);
+            w.text("network", network)?;
+            w.text("requested nick", requested_nick)?;
+            w.w.u16(*caps);
+            w.w.option(cursor.as_ref(), |w, (epoch, seq)| {
+                w.u64(*epoch);
+                w.u64(*seq);
+                Ok(())
+            })?;
+            w.opt_text("shown nick", shown_nick.as_deref())?;
+            for (field, list) in [
+                ("shown channels", shown_channels),
+                ("shown ISUPPORT", shown_isupport),
+            ] {
+                w.count(field, list.len())?;
+                for item in list {
+                    w.text(field, item)?;
+                }
+            }
+            w.u64(*status_revision);
+            Ok(())
+        })
+    }
+
+    pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
+        let mut r = BodyReader::new(bytes, clock)?;
+        let account = r.text("account")?;
+        let credential = read_credential(&mut r)?;
+        let shared = r.bool("shared")?;
+        let network = r.text("network")?;
+        let requested_nick = r.text("requested nick")?;
+        let caps = r.r.u16("capabilities")?;
+        let cursor =
+            r.r.option("cursor", |r| Ok((r.u64("epoch")?, r.u64("seq")?)))?;
+        let shown_nick = r.opt_text("shown nick")?;
+        let mut lists = [Vec::new(), Vec::new()];
+        for (field, list) in ["shown channels", "shown ISUPPORT"]
+            .into_iter()
+            .zip(&mut lists)
+        {
+            for _ in 0..r.count(field)? {
+                list.push(r.text(field)?);
+            }
+        }
+        let [shown_channels, shown_isupport] = lists;
+        let status_revision = r.u64("status revision")?;
+        r.finish()?;
+        Ok(Self {
+            account,
+            credential,
+            shared,
+            network,
+            requested_nick,
+            caps,
+            cursor,
+            shown_nick,
+            shown_channels,
+            shown_isupport,
+            status_revision,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

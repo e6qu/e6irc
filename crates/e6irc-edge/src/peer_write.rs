@@ -155,6 +155,11 @@ impl<W> DeadlineWriter<W> {
         self.inner
     }
 
+    /// The writer it bounds.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
     fn bound<T>(&mut self, cx: &mut Context<'_>, poll: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
         if poll.is_ready() {
             self.stalled_since = None;

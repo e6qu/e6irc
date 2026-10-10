@@ -1070,32 +1070,48 @@ impl SessionStream {
                     .await;
                     return;
                 };
-                let (edge, inbound) = crate::http::open_granted_ui(*grant);
-                let window = u32::try_from(e6irc_link::MAX_UI_MESSAGE_LEN).expect("small");
-                let (input, inputs) = mpsc::unbounded_channel();
-                let in_flight = Arc::new(AtomicU64::new(0));
-                tokio::spawn(feed_ui(
-                    inbound,
-                    session,
-                    inputs,
-                    self.out.clone(),
-                    in_flight.clone(),
-                    window,
-                ));
-                self.start(
-                    session,
-                    SessionKind::Ui,
-                    edge,
-                    Some((input, in_flight, window)),
-                    SessionHold::default(),
-                );
-                drop(
-                    self.out
-                        .send(CoreFrame::Credit(Credit::Session(session, window)))
-                        .await,
-                );
+                self.start_ui(session, *grant, 0).await;
             }
         }
+    }
+
+    /// Start a live chat socket's core half on this stream, with `in_flight`
+    /// bytes already sent and not yet written (a socket a rebuild resumes);
+    /// an edge of link version 2 holds its record.
+    pub(super) async fn start_ui(
+        self: &Arc<Self>,
+        session: SessionId,
+        grant: crate::http::UiGrant,
+        in_flight: u64,
+    ) {
+        let holding = (self.version >= 2).then(|| crate::http::HoldingUi {
+            in_flight,
+            format: self.server.core_tx.directories().held.format.clone(),
+        });
+        let (edge, inbound) = crate::http::open_granted_ui(grant, holding);
+        let window = u32::try_from(e6irc_link::MAX_UI_MESSAGE_LEN).expect("small");
+        let (input, inputs) = mpsc::unbounded_channel();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        tokio::spawn(feed_ui(
+            inbound,
+            session,
+            inputs,
+            self.out.clone(),
+            in_flight.clone(),
+            window,
+        ));
+        self.start(
+            session,
+            SessionKind::Ui,
+            edge,
+            Some((input, in_flight, window)),
+            SessionHold::default(),
+        );
+        drop(
+            self.out
+                .send(CoreFrame::Credit(Credit::Session(session, window)))
+                .await,
+        );
     }
 
     /// Open an IRC session on its shard, in order with its lines.
