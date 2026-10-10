@@ -1,12 +1,14 @@
 //! Client-side connection library shared by e6irc-cli and e6irc-tui.
 //!
 //! An async wrapper over plaintext or public-CA TLS sockets that frames IRC
-//! lines with `e6irc-proto` and drives anonymous, SASL PLAIN, or SASL
-//! OAUTHBEARER registration. [`ConnectionOptions`] is the single owned request
+//! lines with `e6irc-proto` and drives anonymous, SASL password (SCRAM or
+//! PLAIN), SASL OAUTHBEARER, or client-certificate (SASL EXTERNAL, or the
+//! certificate alone) registration. [`ConnectionOptions`] is the single owned request
 //! used by both native clients, including reconnects.
 
 #![deny(clippy::let_underscore_must_use)]
 
+pub mod client_certificate;
 pub mod credentials;
 pub mod liveness;
 pub mod names;
@@ -15,9 +17,15 @@ pub mod token_cache;
 
 use std::io;
 
+pub use client_certificate::{
+    ClientCertificate, ClientCertificateError, Fingerprints, KeyAlgorithm,
+};
 use e6irc_proto::framing::{LineBuffer, LineEvent};
 use e6irc_proto::message::Message;
 pub use names::NetworkNames;
+/// The trust store a TLS connection verifies its server against, named here so
+/// a caller that picks one needs no TLS dependency of its own.
+pub use rustls::RootCertStore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -212,6 +220,9 @@ pub struct Connection {
     /// Whether a credential may be written to this connection, decided by how
     /// it was built ([`Transport`]).
     transport: Transport,
+    /// Whether the TLS handshake presented a client certificate, which only
+    /// [`Connection::from_tcp_tls_with_certificate`] can make true.
+    client_certificate: bool,
     /// Capabilities to ask for during registration when the server offers
     /// them, each in a request of its own ([`Connection::request_when_offered`]).
     requested_when_offered: Vec<&'static str>,
@@ -372,9 +383,16 @@ impl AdvertisedCapabilities {
                     [one] => (*one).to_owned(),
                     several => format!("one of {}", several.join(", ")),
                 };
+                // What the owner can do about it, when the network says: a
+                // certificate is what it logs in with instead of a password.
+                let instead = if offered.split(',').any(|name| name == CERTIFICATE_MECHANISM) {
+                    "; it logs in with a client certificate (SASL EXTERNAL) instead"
+                } else {
+                    ""
+                };
                 Err(SaslRejection::new(
                     SaslFailure::MechanismNotOffered,
-                    &format!("requested {requested}; the server offers {offered}"),
+                    &format!("requested {requested}; the server offers {offered}{instead}"),
                 ))
             }
             _ => Ok(()),
@@ -395,6 +413,9 @@ impl AdvertisedCapabilities {
         }
     }
 }
+
+/// The SASL mechanism that logs in with the TLS client certificate.
+const CERTIFICATE_MECHANISM: &str = "EXTERNAL";
 
 /// A SASL mechanism that authenticates with an account and password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1087,9 +1108,8 @@ impl Connection {
         server_name: &str,
         roots: rustls::RootCertStore,
     ) -> io::Result<Self> {
-        install_crypto_provider();
         stream.set_nodelay(true)?;
-        let config = rustls::ClientConfig::builder()
+        let config = tls_client_config()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
@@ -1104,9 +1124,35 @@ impl Connection {
         ))
     }
 
+    /// [`Connection::from_tcp_tls`], presenting `certificate` when the server
+    /// asks for one: what a network that recognises a client certificate
+    /// (SASL EXTERNAL, or NickServ's CertFP) authenticates. A server that asks
+    /// for none is simply not shown it.
+    pub async fn from_tcp_tls_with_certificate(
+        stream: TcpStream,
+        server_name: &str,
+        roots: rustls::RootCertStore,
+        certificate: &ClientCertificate,
+    ) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
+        let config = tls_client_config()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificate.chain(), certificate.key())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let domain = rustls_pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server name"))?;
+        let tls = connector.connect(domain, stream).await?;
+        let (reader, writer) = tokio::io::split(tls);
+        let mut connection = Self::from_halves(Box::new(reader), Box::new(writer), Transport::Tls);
+        connection.client_certificate = true;
+        Ok(connection)
+    }
+
     fn from_halves(reader: BoxRead, writer: BoxWrite, transport: Transport) -> Self {
         Self {
             transport,
+            client_certificate: false,
             requested_when_offered: Vec::new(),
             enabled: std::collections::BTreeSet::new(),
             awaiting_verdict: Vec::new(),
@@ -1819,6 +1865,20 @@ impl Connection {
             self.offer_mechanism(mechanism.name()).await?;
         }
         self.send_registration_identity(identity).await?;
+        self.password_exchange(identity.nick, account, password, mechanism)
+            .await
+    }
+
+    /// The password exchange once `mechanism` has been offered and accepted
+    /// for an exchange (its empty challenge read) and the registration identity
+    /// sent, through to the welcome.
+    async fn password_exchange(
+        &mut self,
+        nick: &str,
+        account: &str,
+        password: &str,
+        mut mechanism: PasswordMechanism,
+    ) -> io::Result<String> {
         // A network may advertise a mechanism it cannot use for this account:
         // Libera answers SCRAM's first message with `e=other-error` when the
         // account's stored password predates SCRAM. That refusal arrives before
@@ -1853,7 +1913,7 @@ impl Connection {
                 }
             };
             let Some(reason) = refused else {
-                return self.finish_sasl_then_welcome(identity.nick, name).await;
+                return self.finish_sasl_then_welcome(nick, name).await;
             };
             let Some(next) = weaker.next() else {
                 return Err(SaslRejection::new(
@@ -2042,6 +2102,152 @@ impl Connection {
             e6irc_proto::base64::encode(format!("n,,\x01auth=Bearer {token}\x01\x01").as_bytes());
         self.register_with_sasl(identity, payload, "OAUTHBEARER")
             .await
+    }
+
+    /// Register on a connection that presented a client certificate
+    /// ([`Connection::from_tcp_tls_with_certificate`]), authenticating with it.
+    ///
+    /// A server that offers SASL EXTERNAL is asked to log in with the
+    /// certificate. One that refuses it (the certificate's fingerprint is not on
+    /// the account) parks as a credential rejection, unless `password` is given
+    /// and the server offers a password mechanism: that is offered next, on the
+    /// same connection and loudly ([`Connection::sasl_notes`]), since nothing of
+    /// the password was sent yet. A server that offers no EXTERNAL is offered
+    /// the password when one is given and a mechanism for it is offered;
+    /// otherwise the connection registers with the certificate alone — what
+    /// NickServ's CertFP recognises on a network without SASL (OFTC) — and says
+    /// so in the notes.
+    pub async fn register_with_client_certificate(
+        &mut self,
+        identity: &Identity<'_>,
+        password: Option<(&str, &str)>,
+    ) -> io::Result<String> {
+        let outcome = self
+            .register_with_client_certificate_steps(identity, password)
+            .await;
+        self.told_before_it_left(outcome).await
+    }
+
+    async fn register_with_client_certificate_steps(
+        &mut self,
+        identity: &Identity<'_>,
+        password: Option<(&str, &str)>,
+    ) -> io::Result<String> {
+        if !self.client_certificate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a client certificate is presented only on a TLS connection built with one",
+            ));
+        }
+        self.send_server_password(identity).await?;
+        let negotiation = self.begin_cap().await?;
+        let offered = |advertised: &AdvertisedCapabilities, mechanism: &str| {
+            advertised.offers("sasl")
+                && advertised
+                    .sasl_mechanisms()
+                    .is_none_or(|offered| offered.split(',').any(|name| name == mechanism))
+        };
+        let external = negotiation == CapabilityNegotiation::Open
+            && offered(&self.advertised, CERTIFICATE_MECHANISM);
+        let password_mechanism = password.and_then(|_| {
+            let mechanism = self.advertised.password_mechanism();
+            (negotiation == CapabilityNegotiation::Open
+                && self.advertised.sasl_mechanisms().is_some()
+                && offered(&self.advertised, mechanism.name()))
+            .then_some(mechanism)
+        });
+        if external || password_mechanism.is_some() {
+            match self.request_capabilities(&["sasl"]).await? {
+                CapabilityVerdict::Acknowledged => {}
+                CapabilityVerdict::Refused(reason) => {
+                    return Err(SaslRejection::new(
+                        SaslFailure::CapabilityNotOffered,
+                        &format!("the server refused the sasl capability: {reason}"),
+                    )
+                    .into_error());
+                }
+            }
+            self.request_metadata_capabilities().await?;
+        }
+        if external {
+            self.offer_mechanism(CERTIFICATE_MECHANISM).await?;
+            self.send_registration_identity(identity).await?;
+            self.send_sasl_payload("").await?;
+            let refused = match self
+                .finish_sasl_then_welcome(identity.nick, CERTIFICATE_MECHANISM)
+                .await
+            {
+                Err(error)
+                    if SaslRejection::from_error(&error)
+                        .is_some_and(|rejection| rejection.failure() == SaslFailure::Failed) =>
+                {
+                    SaslRejection::from_error(&error).expect("matched above")
+                }
+                outcome => return outcome,
+            };
+            let fallback = password.zip(Some(self.advertised.password_mechanism()).filter(
+                |mechanism| {
+                    self.advertised
+                        .sasl_mechanism_offered(&[mechanism.name()])
+                        .is_ok()
+                        && self.advertised.sasl_mechanisms().is_some()
+                },
+            ));
+            let Some(((account, password), mechanism)) = fallback else {
+                return Err(SaslRejection::new(
+                    SaslFailure::Failed,
+                    &format!(
+                        "SASL EXTERNAL refused the client certificate ({}); add its fingerprint \
+                         to the account with NickServ CERT ADD",
+                        refused.diagnostic()
+                    ),
+                )
+                .into_error());
+            };
+            self.transport.admit("SASL credentials")?;
+            self.sasl_notes.push(format!(
+                "SASL EXTERNAL refused the client certificate ({}): its fingerprint is not on \
+                 the account; offering {} with the stored password",
+                refused.diagnostic(),
+                mechanism.name()
+            ));
+            self.offer_mechanism(mechanism.name()).await?;
+            return self
+                .password_exchange(identity.nick, account, password, mechanism)
+                .await;
+        }
+        if let (Some((account, password)), Some(mechanism)) = (password, password_mechanism) {
+            self.transport.admit("SASL credentials")?;
+            self.sasl_notes.push(format!(
+                "the server offers no SASL EXTERNAL; offering {} with the stored password",
+                mechanism.name()
+            ));
+            self.offer_mechanism(mechanism.name()).await?;
+            self.send_registration_identity(identity).await?;
+            return self
+                .password_exchange(identity.nick, account, password, mechanism)
+                .await;
+        }
+        self.sasl_notes.push(
+            "the server offers no SASL EXTERNAL; registering with the client certificate alone, \
+             which services that recognise its fingerprint (CertFP) log in"
+                .to_owned(),
+        );
+        match negotiation {
+            CapabilityNegotiation::Open => {
+                self.request_metadata_capabilities().await?;
+                self.send_registration_identity(identity).await?;
+                self.send_line("CAP END").await?;
+            }
+            CapabilityNegotiation::Unsupported => {
+                self.send_registration_identity(identity).await?;
+            }
+            CapabilityNegotiation::Unanswered => {
+                self.send_registration_identity(identity).await?;
+                self.send_line("CAP END").await?;
+            }
+        }
+        self.await_welcome(identity.nick).await
     }
 
     /// Register with a nick and realname, answering PINGs, until the
@@ -2849,10 +3055,14 @@ pub enum RegistrationRefusal {
     /// registered to an account other than the one this connection
     /// authenticated as. Built only by [`RegistrationRejection::regain_refused`].
     NicknameRegainRefused,
-    /// The server does not offer the SASL capability or mechanism this
+    /// The server does not offer the SASL capability at all (no `sasl` in
+    /// `CAP LS`, a refused request, no capability negotiation). Built only from
+    /// a [`SaslRejection`].
+    SaslUnavailable,
+    /// The server offers SASL, but names none of the mechanisms this
     /// connection was asked to authenticate with. Built only from a
     /// [`SaslRejection`].
-    SaslUnavailable,
+    SaslMechanismUnavailable,
     /// 906: the server aborted the SASL exchange before a verdict (services
     /// going away mid-exchange). Built only from a [`SaslRejection`].
     SaslAborted,
@@ -2880,6 +3090,10 @@ pub enum RefusalRetry {
     /// Nothing but a change to the configuration can end it: retrying changes
     /// nothing, so the client stops at once and says why.
     ParkNow,
+    /// The refusal usually ends by itself, but one that lasts is a
+    /// configuration the server will never take: [`Self::UntilItClears`] for
+    /// as long as an outage plausibly lasts, then a park.
+    OutlastThenPark,
 }
 
 /// A server-supplied registration refusal whose detail is bounded and safe to
@@ -3022,19 +3236,29 @@ impl RegistrationRefusal {
     /// welcome under another nickname parks at once: it cannot end without a
     /// shorter, or different, configured nickname; so does a nickname the
     /// network says belongs to another account.
+    ///
+    /// SASL is the one answer that can be either. Solanum withdraws the `sasl`
+    /// capability while services are down, which clears by itself; a network
+    /// that never offers it (OFTC) never will. Nothing on the wire tells them
+    /// apart, so a missing capability is outlasted for as long as an outage
+    /// plausibly lasts and then parked on. A capability that names its
+    /// mechanisms and none of the ones asked for is the network's settled
+    /// answer, not an outage: it parks at once, with the mechanisms it offers.
     pub const fn retry_policy(self) -> RefusalRetry {
         match self {
-            Self::NotRegistered
-            | Self::NetworkBanned
-            | Self::SaslUnavailable
-            | Self::SaslAborted => RefusalRetry::UntilItClears,
+            Self::NotRegistered | Self::NetworkBanned | Self::SaslAborted => {
+                RefusalRetry::UntilItClears
+            }
+            Self::SaslUnavailable => RefusalRetry::OutlastThenPark,
             Self::NicknameInUse
             | Self::InvalidNickname
             | Self::InvalidUsername
             | Self::ServerPasswordRejected
             | Self::ServerPasswordRequired
             | Self::SaslFailed => RefusalRetry::ScheduleThenPark,
-            Self::WelcomedAsAnotherNickname | Self::NicknameRegainRefused => RefusalRetry::ParkNow,
+            Self::WelcomedAsAnotherNickname
+            | Self::NicknameRegainRefused
+            | Self::SaslMechanismUnavailable => RefusalRetry::ParkNow,
         }
     }
 
@@ -3053,7 +3277,7 @@ impl RegistrationRefusal {
             }
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
             Self::NotRegistered | Self::SaslFailed | Self::SaslAborted => io::ErrorKind::Other,
-            Self::SaslUnavailable => io::ErrorKind::Unsupported,
+            Self::SaslUnavailable | Self::SaslMechanismUnavailable => io::ErrorKind::Unsupported,
         }
     }
 }
@@ -3177,9 +3401,8 @@ impl SaslRejection {
     pub fn class(self) -> SaslRejectionClass {
         let refusal = match self.failure {
             SaslFailure::Failed => return SaslRejectionClass::CredentialsRejected(self),
-            SaslFailure::MechanismNotOffered | SaslFailure::CapabilityNotOffered => {
-                RegistrationRefusal::SaslUnavailable
-            }
+            SaslFailure::MechanismNotOffered => RegistrationRefusal::SaslMechanismUnavailable,
+            SaslFailure::CapabilityNotOffered => RegistrationRefusal::SaslUnavailable,
             SaslFailure::Aborted => RegistrationRefusal::SaslAborted,
             SaslFailure::NickLocked
             | SaslFailure::TooLong
@@ -3226,6 +3449,20 @@ pub fn install_crypto_provider() {
         // process-wide provider; the builder below uses that provider.
         drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
     });
+}
+
+/// A TLS client configuration on aws-lc-rs, named for this one connection
+/// rather than read from the process-wide default. A connection constructor
+/// that installed the process default changed global state as a side effect:
+/// a process whose own start pins the provider (and refuses one installed
+/// before it, as e6ircd's does) failed after a library call had made a
+/// connection first.
+fn tls_client_config() -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("aws-lc-rs supports rustls's default protocol versions")
 }
 
 /// The public Mozilla CA trust set (webpki-roots) as a rustls store.
@@ -3643,15 +3880,19 @@ mod tests {
             Ending::SaslRefused(
                 SaslFailure::MechanismNotOffered,
                 "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; \
-                 the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE",
+                 the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE; it logs in with a client \
+                 certificate (SASL EXTERNAL) instead",
             ),
         )
         .await
         .expect("a rejection");
+        // The network's settled answer, not an outage: retried, it is only
+        // refused again, so it parks at once.
         assert!(matches!(
             rejection.class(),
             SaslRejectionClass::RegistrationRefused(refused)
-                if refused.refusal() == RegistrationRefusal::SaslUnavailable
+                if refused.refusal() == RegistrationRefusal::SaslMechanismUnavailable
+                    && refused.refusal().retry_policy() == RefusalRetry::ParkNow
         ));
     }
 
@@ -4112,7 +4353,8 @@ mod tests {
             ),
             Ending::SaslRefused(
                 SaslFailure::MechanismNotOffered,
-                "requested PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE",
+                "requested PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE; it logs in \
+                 with a client certificate (SASL EXTERNAL) instead",
             ),
         )
         .await;
@@ -5857,5 +6099,227 @@ mod tests {
             drop(connection);
             assert_eq!(server.await.unwrap(), Vec::<String>::new());
         }
+    }
+
+    /// Register a scripted connection that presented a client certificate,
+    /// and require that it sent nothing the script did not expect. Returns
+    /// the outcome and what the connection noted on the way.
+    async fn register_with_certificate(
+        steps: Vec<Step>,
+        password: Option<(&str, &str)>,
+    ) -> (io::Result<String>, Option<String>, Vec<String>) {
+        let (mut connection, server) = scripted(steps);
+        connection.transport = Transport::Tls;
+        connection.client_certificate = true;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.register_with_client_certificate(&TEST_IDENTITY, password),
+        )
+        .await
+        .expect("registration neither finished nor failed");
+        let mechanism = connection.sasl_mechanism().map(str::to_owned);
+        let notes = connection.sasl_notes().to_vec();
+        drop(connection);
+        assert_eq!(
+            server.await.unwrap(),
+            Vec::<String>::new(),
+            "the client sent lines the server never asked for"
+        );
+        (outcome, mechanism, notes)
+    }
+
+    /// A network that offers SASL EXTERNAL logs the certificate in: the
+    /// mechanism is offered, its empty response sent, and the verdict waited
+    /// for before `CAP END`.
+    #[tokio::test]
+    async fn sasl_external_logs_in_with_the_certificate() {
+        let (outcome, mechanism, notes) = register_with_certificate(
+            after_discovery(
+                ":srv CAP * LS :sasl=EXTERNAL,PLAIN server-time",
+                vec![
+                    Expect("CAP REQ :sasl"),
+                    Send(":srv CAP * ACK :sasl"),
+                    Expect("CAP REQ :server-time"),
+                    Send(":srv CAP * ACK :server-time"),
+                    Expect("AUTHENTICATE EXTERNAL"),
+                    Send("AUTHENTICATE +"),
+                    Expect("NICK nick"),
+                    Expect("USER ident 0 * :real"),
+                    Expect("AUTHENTICATE +"),
+                    Send(":srv 903 nick :SASL authentication successful"),
+                    Expect("CAP END"),
+                    Send(":srv 001 nick :Welcome"),
+                ],
+            ),
+            Some(("acct", "pw")),
+        )
+        .await;
+        assert_eq!(outcome.expect("registered"), "nick");
+        assert_eq!(mechanism.as_deref(), Some("EXTERNAL"));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// OFTC offers no SASL: the certificate alone registers, which NickServ's
+    /// CertFP recognises, and the owner is told that is what happened.
+    #[tokio::test]
+    async fn without_sasl_the_certificate_alone_registers_and_says_so() {
+        let mut steps = after_discovery(
+            ":srv CAP * LS :server-time",
+            vec![
+                Expect("CAP REQ :server-time"),
+                Send(":srv CAP * ACK :server-time"),
+            ],
+        );
+        steps.extend(IDENTITY_THEN_WELCOME);
+        let (outcome, mechanism, notes) = register_with_certificate(steps, None).await;
+        assert_eq!(outcome.expect("registered"), "nick");
+        assert_eq!(mechanism, None);
+        assert_eq!(
+            notes,
+            [
+                "the server offers no SASL EXTERNAL; registering with the client certificate \
+              alone, which services that recognise its fingerprint (CertFP) log in"
+            ]
+        );
+    }
+
+    /// A certificate whose fingerprint is not on the account yet is refused
+    /// before any password crossed: the stored password is offered next on
+    /// the same connection, loudly, so a network keeps connecting while its
+    /// owner adds the fingerprint.
+    #[tokio::test]
+    async fn a_refused_certificate_falls_back_to_the_stored_password() {
+        let (outcome, mechanism, notes) = register_with_certificate(
+            after_discovery(
+                ":srv CAP * LS :sasl=EXTERNAL,PLAIN",
+                vec![
+                    Expect("CAP REQ :sasl"),
+                    Send(":srv CAP * ACK :sasl"),
+                    Expect("AUTHENTICATE EXTERNAL"),
+                    Send("AUTHENTICATE +"),
+                    Expect("NICK nick"),
+                    Expect("USER ident 0 * :real"),
+                    Expect("AUTHENTICATE +"),
+                    Send(":srv 904 nick :SASL authentication failed"),
+                    Expect("AUTHENTICATE PLAIN"),
+                    Send("AUTHENTICATE +"),
+                    // base64("\0acct\0pw")
+                    Expect("AUTHENTICATE AGFjY3QAcHc="),
+                    Send(":srv 903 nick :SASL authentication successful"),
+                    Expect("CAP END"),
+                    Send(":srv 001 nick :Welcome"),
+                ],
+            ),
+            Some(("acct", "pw")),
+        )
+        .await;
+        assert_eq!(outcome.expect("registered"), "nick");
+        assert_eq!(mechanism.as_deref(), Some("PLAIN"));
+        assert_eq!(
+            notes,
+            [
+                "SASL EXTERNAL refused the client certificate (SASL authentication failed): its \
+              fingerprint is not on the account; offering PLAIN with the stored password"
+            ]
+        );
+    }
+
+    /// With no password to fall back to, a refused certificate is a verdict on
+    /// the credential, which says what to do about it.
+    #[tokio::test]
+    async fn a_refused_certificate_alone_is_a_credential_rejection_that_says_what_to_do() {
+        let (outcome, _, _) = register_with_certificate(
+            after_discovery(
+                ":srv CAP * LS :sasl=EXTERNAL,PLAIN",
+                vec![
+                    Expect("CAP REQ :sasl"),
+                    Send(":srv CAP * ACK :sasl"),
+                    Expect("AUTHENTICATE EXTERNAL"),
+                    Send("AUTHENTICATE +"),
+                    Expect("NICK nick"),
+                    Expect("USER ident 0 * :real"),
+                    Expect("AUTHENTICATE +"),
+                    Send(":srv 904 nick :SASL authentication failed"),
+                ],
+            ),
+            None,
+        )
+        .await;
+        let error = outcome.expect_err("refused");
+        let rejection = SaslRejection::from_error(&error).expect("a typed SASL rejection");
+        assert_eq!(rejection.failure(), SaslFailure::Failed);
+        assert_eq!(
+            rejection.diagnostic(),
+            "SASL EXTERNAL refused the client certificate (SASL authentication failed); add its \
+             fingerprint to the account with NickServ CERT ADD"
+        );
+    }
+
+    /// A connection that presented no certificate cannot register "with" one:
+    /// that would be an unauthenticated registration under a name that says
+    /// otherwise.
+    #[tokio::test]
+    async fn registering_with_a_certificate_needs_a_connection_that_presented_one() {
+        let (mut connection, _server) = scripted(Vec::new());
+        let error = connection
+            .register_with_client_certificate(&TEST_IDENTITY, None)
+            .await
+            .expect_err("no certificate was presented");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The certificate really crosses the TLS handshake: a server that asks
+    /// for one receives exactly it.
+    #[tokio::test]
+    async fn the_tls_handshake_presents_the_client_certificate() {
+        install_crypto_provider();
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_certificate = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&server_key)
+            .unwrap();
+        let client_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let client_certificate = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&client_key)
+            .unwrap();
+        let certificate =
+            ClientCertificate::from_pem(&client_certificate.pem(), &client_key.serialize_pem())
+                .unwrap();
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots.add(client_certificate.der().clone()).unwrap();
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(client_roots))
+                .build()
+                .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_certificate.der().clone()],
+                rustls_pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(socket).await.unwrap();
+            let presented = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &presented)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_certificate.der().clone()).unwrap();
+        let stream = TcpStream::connect(address).await.unwrap();
+        let connection =
+            Connection::from_tcp_tls_with_certificate(stream, "localhost", roots, &certificate)
+                .await
+                .expect("handshake");
+        assert!(connection.client_certificate);
+        assert_eq!(server.await.unwrap(), certificate.fingerprint_sha256());
     }
 }

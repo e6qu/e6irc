@@ -51,3 +51,10 @@ windows-sys = { version = "0.61.2", default-features = false, features = [
 # Paused time for the capability-discovery deadline tests: a scripted server
 # that never answers `CAP LS` must be waited out in virtual seconds.
 tokio = { version = "1.53.0", default-features = false, features = ["test-util"] }
+# rcgen 0.14.8 (2026-05-11), already in the tree for the edge and the daemon:
+# client certificates and a server certificate for the client-certificate and
+# SASL EXTERNAL tests.
+rcgen = { version = "0.14.8", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }

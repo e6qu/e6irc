@@ -109,6 +109,9 @@ fn permanent_refusal(error: &io::Error) -> Option<String> {
             "the network requires a server password; give one with --server-password-file, \
              E6IRC_SERVER_PASSWORD, or --server-password"
         }
+        RegistrationRefusal::SaslMechanismUnavailable => {
+            "the server offers none of the SASL mechanisms this client can log in with"
+        }
         RegistrationRefusal::InvalidNickname
         | RegistrationRefusal::InvalidUsername
         | RegistrationRefusal::NicknameInUse
