@@ -460,7 +460,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: e6qu/shauth
-          ref: 0fda680cba964e5768ed75a9c3e5b7230c418ca6
+          ref: 226ffffb9a046378334098c9bf34cc31776c34d4
           path: .test-deps/shauth
       - run: npm install --global pnpm@11.15.1
       - run: pnpm -C web install --frozen-lockfile
