@@ -868,6 +868,13 @@ both native clients — one parser to fuzz, one behavior everywhere.
   tokio-rustls, tungstenite, tokio-tungstenite, reqwest and sqlx.
 - Periodic pruning: a dependency whose justification no longer holds is
   removed, not kept out of inertia.
+- No code, tests included, changes the process environment. Once a second
+  thread exists, `std::env::set_var` races C code that reads the environment
+  without Rust's lock (glibc's resolver reads `LOCALDOMAIN` and `RES_OPTIONS`
+  inside `getaddrinfo`), and a race there is a segmentation fault. Code that
+  needs a setting takes it as a value, read once at the process's boundary,
+  so a test passes its own. `clippy.toml` disallows `set_var` and
+  `remove_var`.
 - **Up-to-date, with a 24-hour cooldown**: dependencies are kept current,
   but a version is only adopted once it has been published on crates.io
   (or npm, for `web/`) for **at least 24 hours** — a supply-chain guard

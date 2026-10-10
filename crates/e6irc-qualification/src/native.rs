@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
@@ -17,11 +18,12 @@ pub(super) fn run(kind: TargetKind, target: &str) -> ProbeReport {
         Ok(runtime) => runtime,
         Err(_) => return ProbeReport::uniform(PhaseOutcome::Failed),
     };
+    let settings = Settings::capture(|name| env::var(name).ok());
     runtime.block_on(async move {
         match kind {
-            TargetKind::Discord => discord(target).await,
-            TargetKind::Slack => slack(target).await,
-            TargetKind::Oidc => oidc(target).await,
+            TargetKind::Discord => discord(&settings, target).await,
+            TargetKind::Slack => slack(&settings, target).await,
+            TargetKind::Oidc => oidc(&settings, target).await,
             TargetKind::PublicIrc | TargetKind::Scale => ProbeReport::uniform(PhaseOutcome::Failed),
         }
     })
@@ -61,10 +63,6 @@ fn not_run(kind: TargetKind) -> ProbeReport {
 struct Secret(String);
 
 impl Secret {
-    fn setting(name: &str) -> Option<Self> {
-        Self::parse(env::var(name).ok()?)
-    }
-
     fn parse(value: String) -> Option<Self> {
         (!value.is_empty() && value.len() <= 4096 && !value.contains(char::is_control))
             .then_some(Self(value))
@@ -75,8 +73,77 @@ impl Secret {
     }
 }
 
-fn environment_value(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
+/// A setting a native campaign reads, named by its environment variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Setting {
+    DiscordBotToken,
+    DiscordChannelId,
+    DiscordApiBase,
+    SlackBotToken,
+    SlackAppToken,
+    SlackChannelId,
+    SlackApiBase,
+    OidcClientId,
+    OidcClientSecret,
+}
+
+impl Setting {
+    const ALL: [Self; 9] = [
+        Self::DiscordBotToken,
+        Self::DiscordChannelId,
+        Self::DiscordApiBase,
+        Self::SlackBotToken,
+        Self::SlackAppToken,
+        Self::SlackChannelId,
+        Self::SlackApiBase,
+        Self::OidcClientId,
+        Self::OidcClientSecret,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::DiscordBotToken => "E6IRC_DISCORD_BOT_TOKEN",
+            Self::DiscordChannelId => "E6IRC_DISCORD_CHANNEL_ID",
+            Self::DiscordApiBase => "E6IRC_DISCORD_API_BASE",
+            Self::SlackBotToken => "E6IRC_SLACK_BOT_TOKEN",
+            Self::SlackAppToken => "E6IRC_SLACK_APP_TOKEN",
+            Self::SlackChannelId => "E6IRC_SLACK_CHANNEL_ID",
+            Self::SlackApiBase => "E6IRC_SLACK_API_BASE",
+            Self::OidcClientId => "E6IRC_OIDC_CLIENT_ID",
+            Self::OidcClientSecret => "E6IRC_OIDC_CLIENT_SECRET",
+        }
+    }
+}
+
+/// The campaign settings, read once from a source before any campaign runs.
+/// Campaigns take them as a value instead of reading the process environment,
+/// so nothing ever has to change the environment to configure one: changing it
+/// while another thread's C code (glibc's resolver, for one) reads it is
+/// undefined behaviour.
+struct Settings(BTreeMap<Setting, String>);
+
+impl Settings {
+    fn capture(read: impl Fn(&'static str) -> Option<String>) -> Self {
+        Self(
+            Setting::ALL
+                .into_iter()
+                .filter_map(|setting| {
+                    Some((
+                        setting,
+                        read(setting.name()).filter(|value| !value.is_empty())?,
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    fn value(&self, setting: Setting) -> Option<String> {
+        self.0.get(&setting).cloned()
+    }
+
+    fn secret(&self, setting: Setting) -> Option<Secret> {
+        Secret::parse(self.value(setting)?)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -569,16 +636,18 @@ fn marker(kind: &str) -> String {
     format!("e6irc-qualification-{kind}-{}", super::now_ms())
 }
 
-async fn discord(_target: &str) -> ProbeReport {
-    let Some(token) = Secret::setting("E6IRC_DISCORD_BOT_TOKEN") else {
+async fn discord(settings: &Settings, _target: &str) -> ProbeReport {
+    let Some(token) = settings.secret(Setting::DiscordBotToken) else {
         return not_run(TargetKind::Discord);
     };
-    let Some(channel) =
-        environment_value("E6IRC_DISCORD_CHANNEL_ID").and_then(DiscordChannelId::parse)
+    let Some(channel) = settings
+        .value(Setting::DiscordChannelId)
+        .and_then(DiscordChannelId::parse)
     else {
         return not_run(TargetKind::Discord);
     };
-    let base = environment_value("E6IRC_DISCORD_API_BASE")
+    let base = settings
+        .value(Setting::DiscordApiBase)
         .unwrap_or_else(|| "https://discord.com/api/v10".into());
     let Some(base) = safe_url(&base).await else {
         return not_run(TargetKind::Discord);
@@ -799,15 +868,18 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &Secret) -> PhaseOutcom
     outcome
 }
 
-async fn slack(_target: &str) -> ProbeReport {
+async fn slack(settings: &Settings, _target: &str) -> ProbeReport {
     let (Some(bot), Some(app), Some(channel)) = (
-        Secret::setting("E6IRC_SLACK_BOT_TOKEN"),
-        Secret::setting("E6IRC_SLACK_APP_TOKEN"),
-        environment_value("E6IRC_SLACK_CHANNEL_ID").and_then(SlackChannelId::parse),
+        settings.secret(Setting::SlackBotToken),
+        settings.secret(Setting::SlackAppToken),
+        settings
+            .value(Setting::SlackChannelId)
+            .and_then(SlackChannelId::parse),
     ) else {
         return not_run(TargetKind::Slack);
     };
-    let base = environment_value("E6IRC_SLACK_API_BASE")
+    let base = settings
+        .value(Setting::SlackApiBase)
         .unwrap_or_else(|| "https://slack.com/api/".into());
     let Some(base) = safe_url(&base).await else {
         return not_run(TargetKind::Slack);
@@ -1106,10 +1178,10 @@ fn slack_hello(frame: &str) -> bool {
     )
 }
 
-async fn oidc(target: &str) -> ProbeReport {
+async fn oidc(settings: &Settings, target: &str) -> ProbeReport {
     let (Some(client_id), Some(secret)) = (
-        Secret::setting("E6IRC_OIDC_CLIENT_ID"),
-        Secret::setting("E6IRC_OIDC_CLIENT_SECRET"),
+        settings.secret(Setting::OidcClientId),
+        settings.secret(Setting::OidcClientSecret),
     ) else {
         return not_run(TargetKind::Oidc);
     };

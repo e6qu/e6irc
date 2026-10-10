@@ -1,0 +1,10 @@
+# Changing the process environment is undefined behaviour once a second
+# thread exists: C code on any thread (glibc's resolver inside getaddrinfo,
+# for one) reads it with no lock Rust's standard library could take. Tests run
+# on parallel threads and the daemons run on multi-threaded runtimes, so code
+# that needs a setting takes it as a value instead of reading one the process
+# changed.
+disallowed-methods = [
+  { path = "std::env::set_var", reason = "pass the setting as a value; changing the environment races C code reading it" },
+  { path = "std::env::remove_var", reason = "pass the setting as a value; changing the environment races C code reading it" },
+]
