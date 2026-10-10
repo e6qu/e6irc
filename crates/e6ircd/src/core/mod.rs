@@ -13,6 +13,7 @@ mod handler;
 pub(crate) mod history_request;
 mod hot_history;
 mod list;
+pub(crate) mod local_home;
 mod middle;
 mod paced;
 pub mod record;
@@ -458,12 +459,21 @@ impl CoreIngress {
     }
 
     /// Close, with `reason`, every session whose edge holds nothing for the
-    /// next core (DESIGN §19.3): its client and its channels are told it
+    /// next core (DESIGN §19.3) — the core's own sessions too unless an edge
+    /// homes them (`local_homed`): its client and its channels are told it
     /// ended before the cut, rather than nothing. How many were closed.
-    pub(crate) async fn close_unheld(&self, reason: &'static str) -> Result<usize, String> {
+    pub(crate) async fn close_unheld(
+        &self,
+        reason: &'static str,
+        local_homed: bool,
+    ) -> Result<usize, String> {
         let closed = self
             .ask_each(std::time::Duration::from_secs(5), |reply| {
-                Input::CloseUnheld { reason, reply }
+                Input::CloseUnheld {
+                    reason,
+                    local_homed,
+                    reply,
+                }
             })
             .await?;
         Ok(closed.into_iter().sum())
@@ -984,9 +994,11 @@ pub enum Input {
         reply: tokio::sync::oneshot::Sender<state::Unsettled>,
     },
     /// Close, with `reason`, each of this shard's sessions whose edge holds
-    /// nothing for the next core; the answer is how many.
+    /// nothing for the next core — the core's own too when no edge homes
+    /// them (`local_homed` false); the answer is how many.
     CloseUnheld {
         reason: &'static str,
+        local_homed: bool,
         reply: tokio::sync::oneshot::Sender<usize>,
     },
     /// Cut this shard: republish everything its edges hold, and handle nothing
@@ -3305,9 +3317,15 @@ impl Core {
                 handler::overlong(&mut self.state, conn, label.as_deref());
             }
             Input::Settled { reply } => drop(reply.send(self.state.unsettled())),
-            Input::CloseUnheld { reason, reply } => {
+            Input::CloseUnheld {
+                reason,
+                local_homed,
+                reply,
+            } => {
                 // An asker that is gone needs no count.
-                reply.send(self.state.close_unheld(reason)).ok();
+                reply
+                    .send(self.state.close_unheld(reason, local_homed))
+                    .ok();
             }
             Input::Cut { reply } => drop(reply.send(self.state.cut())),
             Input::AdoptBuckets { buckets } => self.state.adopt_registration_buckets(&buckets),

@@ -39,13 +39,14 @@ use crate::core::record::{
 };
 
 /// The body format every shard writes (D11), shared and set live: the format
-/// before this release's newest until the operator advances it.
+/// before this release's newest until the operator advances it — the stored
+/// one, or a core without a database `[edge_link] record_format`.
 #[derive(Clone)]
 pub(crate) struct RecordFormatCell(Arc<AtomicU16>);
 
 impl Default for RecordFormatCell {
     fn default() -> Self {
-        Self(Arc::new(AtomicU16::new(RecordFormat::NEWEST.number())))
+        Self(Arc::new(AtomicU16::new(RecordFormat::PREVIOUS.number())))
     }
 }
 
@@ -76,6 +77,8 @@ pub(crate) struct HeldSinks {
     /// until it is, the core opens no session of its own — the `local`
     /// driver's — which would make channels the rebuild is about to restore.
     pub(crate) rebuilt: RebuildDone,
+    /// The core's own sessions, homed on an edge across a cut (D13).
+    pub(crate) homes: Arc<crate::core::local_home::LocalHomes>,
 }
 
 /// Whether the core has rebuilt what its edges held; true where there is
@@ -723,15 +726,19 @@ impl ServerState {
     }
 
     /// Close, with `reason`, every session of this shard whose edge holds
-    /// nothing for the next core — in edge mode the `local` driver's, which
-    /// lives in the core itself, and any on a version 1 link — so its client
-    /// and its channels hear it end before the cut rather than nothing. How
-    /// many were closed.
-    pub(crate) fn close_unheld(&mut self, reason: &str) -> usize {
+    /// nothing for the next core — any on a version 1 link, and the core's
+    /// own (the `local` driver's, which no client socket carries) unless an
+    /// edge homes them (`local_homed`, D13) — so its client and its channels
+    /// hear it end before the cut rather than nothing. How many were closed.
+    pub(crate) fn close_unheld(&mut self, reason: &str, local_homed: bool) -> usize {
         let unheld: Vec<ConnId> = self
             .sessions
             .iter()
-            .filter(|(_, session)| !session.output.holds())
+            .filter(|(_, session)| {
+                !session.output.holds()
+                    || (!local_homed
+                        && session.transport == crate::core::ConnectionTransport::Local)
+            })
             .map(|(conn, _)| *conn)
             .collect();
         for conn in &unheld {
@@ -811,6 +818,13 @@ impl ServerState {
     pub(crate) fn cut(&mut self) -> Vec<(String, f64, e6irc_proto::time::MonoMillis)> {
         let conns: Vec<ConnId> = self.sessions.iter().map(|(conn, _)| *conn).collect();
         self.publish_held_sessions(&conns);
+        // The core's own sessions (slot 0) had no edge to hold their
+        // memberships until the cut homed them on one (D13): they are told
+        // whole now, to that edge.
+        for ledger in self.replicated.values_mut() {
+            ledger.slots.remove(&0);
+            ledger.members.retain(|conn, _| slot_of(*conn) != 0);
+        }
         let keys: Vec<ChanKey> = self.channels.channels.keys().cloned().collect();
         self.publish_held_channels(&keys);
         self.frozen = true;
@@ -1261,21 +1275,14 @@ impl ServerState {
                 MemberModes { op, voice },
             );
         }
-        // What the edges hold is what this rebuilt: nothing to tell them.
+        // The edges gave up the replicas they held when they uploaded them:
+        // the channel's next publication — its next change, or the cut —
+        // tells every edge with a member here the channel whole, at a
+        // revision past the one rebuilt.
         channel.replica_dirty.clear();
-        let slots: HashSet<u16> = channel.members().map(|(conn, _)| slot_of(conn)).collect();
         let ledger = ReplicaLedger {
             revision,
-            state: Some(
-                channel_state(&channel)
-                    .encode(self.held_sinks.format.get(), self.clock_origin)
-                    .expect("a channel's state is within every body bound"),
-            ),
-            members: channel
-                .members()
-                .map(|(conn, modes)| (conn, entry_of(modes)))
-                .collect(),
-            slots,
+            ..ReplicaLedger::default()
         };
         self.replicated.insert(chan_key.clone(), ledger);
         self.channels.entry(chan_key).or_insert(channel);

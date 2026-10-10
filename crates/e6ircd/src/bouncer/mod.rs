@@ -5852,6 +5852,40 @@ impl DriverEnds {
         self.publish_session(snapshot);
     }
 
+    /// Take up an IRC session that went on while this process was not there —
+    /// the `local` network's, which the core's rebuild resumed (D13): `lines`
+    /// say what a welcome would have of the network, and the session's
+    /// channels as joining them would have. They are taken into the session's
+    /// state and reach neither the backlog nor anyone attached; the session is
+    /// then published once, as it is now, so an attached client that was
+    /// shown it reconciles to no change. What each line changed, in order.
+    pub(crate) fn resume_irc_session(
+        &self,
+        nick: String,
+        lines: Vec<String>,
+    ) -> Result<Vec<SessionChange>, ChannelLimitExceeded> {
+        let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        irc_session.begin(nick);
+        irc_session.in_burst = false;
+        let changes = lines
+            .into_iter()
+            .map(|line| irc_session.observe(&ingest(line)))
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let mut buffer = self.buffer.lock().expect("buffer poisoned");
+            buffer.adopt(&irc_session.names, &irc_session.features);
+        }
+        drop(
+            self.events
+                .send(DriverEvent::Features(irc_session.features.clone())),
+        );
+        let snapshot = irc_session
+            .snapshot()
+            .expect("a begun IRC session has a nick");
+        self.publish_session(snapshot);
+        Ok(changes)
+    }
+
     /// Mark where a session began, in the ring and live, while the caller
     /// holds the session lock: a client replaying past the boundary
     /// reconciles to it exactly as a client attached at the time did.
@@ -6230,6 +6264,25 @@ impl DriverEnds {
         let line = ingest(line);
         self.runtime.record_input(line.len());
         self.publish_echo(line, origin);
+    }
+
+    /// The session this driver took up across a restart is connected, as it
+    /// was before (D13): the state is set and published as any connection's,
+    /// and nothing is said or buffered — the backlog already holds the change
+    /// to connected that the process before recorded.
+    pub(crate) fn connected_across_restart(&self) {
+        let revision = self.runtime.connected();
+        eprintln!(
+            "bnc: {} connected, taken up across a restart",
+            self.runtime.label()
+        );
+        let status = DriverConnectionStatus::Connected;
+        drop(self.events.send(DriverEvent::Status { status, revision }));
+        // The next change is a transition from here.
+        self.buffered_status
+            .lock()
+            .expect("buffered status poisoned")
+            .record(status);
     }
 
     /// Report a connection-state change, updating the sticky connection state

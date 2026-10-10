@@ -333,7 +333,12 @@ fn configured_driver(
             first_dial: super::FirstDial::Immediate,
             nick_regain: super::NickRegainTiming::default(),
         };
-        return Ok(Box::new(super::LocalDriver::new(core.clone(), config)));
+        let home = crate::core::local_home::LocalHomeKey::new(e.owner.as_deref(), &e.name);
+        return Ok(Box::new(super::LocalDriver::new(
+            core.clone(),
+            config,
+            home,
+        )));
     }
     let realname = match e.kind {
         NetworkKind::Irc | NetworkKind::Local => e.realname.clone().ok_or_else(|| {

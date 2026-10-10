@@ -2454,6 +2454,17 @@ impl Config {
                 "at least one [[listeners]] required".into(),
             ));
         }
+        if let Some(edge_link) = &self.edge_link {
+            edge_link.record_format().map_err(ConfigError::Invalid)?;
+            if edge_link.record_format.is_some() && self.database.is_some() {
+                return Err(ConfigError::Invalid(
+                    "[edge_link] record_format is for a core without a database: with one, \
+                     every core writes the stored format, which `e6ircd records advance` \
+                     advances"
+                        .into(),
+                ));
+            }
+        }
         // Each core shard has one session stream on every edge's link.
         if self.edge_link.is_some() && self.core_workers > usize::from(e6irc_link::MAX_STREAMS) {
             return Err(ConfigError::Invalid(format!(
@@ -5777,5 +5788,45 @@ account_claim = "preferred_username"
             stored.bootstrap_drift(&from(&stating), None).unwrap(),
             ["listeners[0].addr", "network_name"]
         );
+    }
+
+    #[test]
+    fn a_core_without_a_database_writes_the_configured_record_format_and_refuses_one_it_cannot() {
+        use crate::core::record::RecordFormat;
+        let edge_mode = |record_format: Option<u16>, database: bool| Config {
+            server_name: "irc.example.test".into(),
+            edge_link: Some(crate::edge_link::EdgeLinkConfig {
+                addr: "127.0.0.1:6680".parse().expect("address"),
+                credentials: e6irc_edge::core_link::tls::LinkCredentialFiles {
+                    ca: "ca.pem".into(),
+                    cert: "core.pem".into(),
+                    key: "core.key".into(),
+                },
+                record_format,
+            }),
+            database: database.then(|| {
+                toml::from_str(r#"url = "postgres://e6irc@db.example.test/e6irc""#)
+                    .expect("database")
+            }),
+            ..Config::default()
+        };
+        let unstated = edge_mode(None, false);
+        unstated.validate().expect("valid");
+        let link = unstated.edge_link.as_ref().expect("edge mode");
+        assert_eq!(link.record_format(), Ok(RecordFormat::PREVIOUS));
+        let advanced = edge_mode(Some(RecordFormat::NEWEST.number()), false);
+        advanced.validate().expect("valid");
+        let link = advanced.edge_link.as_ref().expect("edge mode");
+        assert_eq!(link.record_format(), Ok(RecordFormat::NEWEST));
+
+        let unwritable = edge_mode(Some(RecordFormat::NEWEST.number() + 1), false);
+        let refusal = unwritable.validate().expect_err("unwritable").to_string();
+        assert!(refusal.contains("does not write"), "{refusal}");
+        let beside_the_stored = edge_mode(Some(RecordFormat::NEWEST.number()), true);
+        let refusal = beside_the_stored
+            .validate()
+            .expect_err("stored")
+            .to_string();
+        assert!(refusal.contains("e6ircd records advance"), "{refusal}");
     }
 }

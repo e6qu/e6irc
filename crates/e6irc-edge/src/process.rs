@@ -75,6 +75,28 @@ pub struct EdgeSection {
     /// key.
     #[serde(flatten)]
     pub credentials: LinkCredentialFiles,
+    /// The core-absence limit (decision D12): how long, in seconds, the edge
+    /// holds the sessions of a cut for the next core before it closes them,
+    /// loudly. Between [`CORE_ABSENCE_LIMIT_SECONDS`]'s bounds.
+    #[serde(default = "default_core_absence_limit_seconds")]
+    pub core_absence_limit_seconds: u64,
+}
+
+/// The bounds of `[edge] core_absence_limit_seconds`: at least long enough for
+/// a core to start, at most an hour — clients held longer than that are
+/// better told the server restarted than left waiting on a silent socket.
+pub const CORE_ABSENCE_LIMIT_SECONDS: std::ops::RangeInclusive<u64> = 10..=3600;
+
+/// D12's ten minutes.
+const fn default_core_absence_limit_seconds() -> u64 {
+    10 * 60
+}
+
+impl EdgeSection {
+    /// How long the edge holds a cut's sessions for the next core.
+    pub fn core_absence_limit(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.core_absence_limit_seconds)
+    }
 }
 
 /// An IRC listener.
@@ -147,6 +169,14 @@ impl EdgeConfig {
         let name = EdgeName::new(&self.edge.name).map_err(invalid)?;
         if self.edge.core.is_empty() {
             return Err(invalid("[edge] core names no address to reach the core at"));
+        }
+        if !CORE_ABSENCE_LIMIT_SECONDS.contains(&self.edge.core_absence_limit_seconds) {
+            return Err(invalid(format!(
+                "[edge] core_absence_limit_seconds must be between {} and {}, not {}",
+                CORE_ABSENCE_LIMIT_SECONDS.start(),
+                CORE_ABSENCE_LIMIT_SECONDS.end(),
+                self.edge.core_absence_limit_seconds
+            )));
         }
         if self.listeners.is_empty() && self.http.is_none() && self.attach.is_none() {
             return Err(invalid(
@@ -331,6 +361,7 @@ pub async fn run(
             core: config.edge.core.clone(),
             connector: credentials.edge_connector()?,
             listeners: reports,
+            core_absence_limit: config.edge.core_absence_limit(),
         },
         linked,
     ));

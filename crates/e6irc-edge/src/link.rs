@@ -154,6 +154,15 @@ impl HeldSignal {
     pub async fn published(&self) {
         self.0.held_wake.notified().await;
     }
+
+    /// Whether something the core published is not yet taken
+    /// ([`EdgeSession::take_held`]).
+    pub fn pending(&self) -> bool {
+        self.0.held.as_ref().is_some_and(|held| {
+            let slot = held.lock().expect("held slot");
+            slot.record.is_some() || slot.ack.is_some()
+        })
+    }
 }
 
 /// What a holding session's edge is given to hold, in the order it was
@@ -236,10 +245,38 @@ impl EdgeEnded {
 }
 
 impl From<EdgeEnded> for io::Error {
+    /// A writer's failure as a failed send; an end with none as
+    /// [`EdgeGone`].
     fn from(ended: EdgeEnded) -> Self {
-        ended.failure().into_error()
+        match ended.0 {
+            Some(failure) => failure.into_error(),
+            None => io::Error::new(io::ErrorKind::BrokenPipe, EdgeGone),
+        }
     }
 }
+
+/// The edge's end of a session went away with no failure of its writer: the
+/// edge let the session go — its client left, or its link to the core ended
+/// or was cut — and the core's end has no one to write to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeGone;
+
+impl EdgeGone {
+    /// Whether `error` is the core's end finding the edge's gone.
+    pub fn is(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.downcast_ref::<Self>().is_some())
+    }
+}
+
+impl std::fmt::Display for EdgeGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the edge let the session go")
+    }
+}
+
+impl std::error::Error for EdgeGone {}
 
 /// The core's end of one session's link: its remote send queue, and the frames
 /// the core sends the edge. Dropping it is the `End` frame.

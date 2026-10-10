@@ -766,7 +766,11 @@ async fn a_graceful_restart_keeps_every_client_of_every_transport() {
         "{}",
         core.process.said()
     );
-    edge.until("holding 5 sessions for the next core", 1).await;
+    edge.until(
+        "holding 5 sessions and 0 of the core's own for the next core",
+        1,
+    )
+    .await;
     // Sent while no core is there: the edge holds it for the next.
     alice.send("PRIVMSG #zero :during the gap").await;
 
@@ -882,7 +886,11 @@ async fn a_terminated_core_hands_its_clients_over() {
         "{}",
         core.process.said()
     );
-    edge.until("holding 1 sessions for the next core", 1).await;
+    edge.until(
+        "holding 1 sessions and 0 of the core's own for the next core",
+        1,
+    )
+    .await;
     let _next = deployment.core("next.toml", &link.to_string(), "").await;
     edge.until("uploaded 1 sessions", 1).await;
     alice.send("PING :resumed").await;

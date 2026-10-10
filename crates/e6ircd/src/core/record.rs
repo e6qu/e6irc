@@ -1394,5 +1394,50 @@ impl AttachRecord {
     }
 }
 
+/// The most bytes of the session record a [`LocalRecord`] carries: as many
+/// as one body holds.
+const MAX_NESTED_BODY: usize =
+    e6irc_link::held::MAX_BODY_PART * e6irc_link::held::MAX_BODY_PARTS as usize;
+
+/// A session of the core's own homed on an edge across a cut (decision D13):
+/// which `local` bouncer network it is — its owner, none for a shared one,
+/// and its name, each folded — and the session's record as its shard wrote
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRecord {
+    pub owner: Option<String>,
+    pub network: String,
+    /// A [`SessionRecord`] body.
+    pub session: Bytes,
+}
+
+impl LocalRecord {
+    pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
+        let Self {
+            owner,
+            network,
+            session,
+        } = self;
+        body(format, clock, |w| {
+            w.opt_text("owner", owner.as_deref())?;
+            w.text("network", network)?;
+            w.w.bytes("session record", session, MAX_NESTED_BODY)
+        })
+    }
+
+    pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
+        let mut r = BodyReader::new(bytes, clock)?;
+        let owner = r.opt_text("owner")?;
+        let network = r.text("network")?;
+        let session = r.r.bytes("session record", MAX_NESTED_BODY)?;
+        r.finish()?;
+        Ok(Self {
+            owner,
+            network,
+            session,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -6212,15 +6212,16 @@ phase rewrites.
     `Open` with the connection's TLS facts as its own kind (the protocol
     version, the cipher suite, the name the client asked for, the digest of
     its certificate), and the held-state frames: the core's `Pause`,
-    `Resume`, `Ack`, `Record`, `Replica`, `CutState` and `Cut`, and the
-    edge's `Paused`, `Upload`, `RecordUpload`, `ReplicaUpload`, `CutUpload`
-    and `UploadDone`. A version 1 edge is always served at once and holds
+    `Resume`, `Ack`, `Record`, `Replica`, `CutState`, `Cut` and `Home`, and
+    the edge's `Paused`, `Upload`, `RecordUpload`, `ReplicaUpload`,
+    `CutUpload`, `UploadDone` and `HomeUpload`. A version 1 edge is always served at once and holds
     nothing: a handover closes its clients with the core's own `ERROR`, as
     before. WHOIS shows the TLS facts to the user itself and to operators
     (`671 … :is using a secure connection [TLSv1.3, TLS13_…]`).
   - *Bodies* (`core::record`). A session's record, a live chat socket's and
-    an attachment's record, a channel's state, a member's entry and the cut
-    state are bodies the edge holds without
+    an attachment's record, a homed `local` session's record (`LocalRecord`:
+    its network, and its session record), a channel's state, a member's
+    entry and the cut state are bodies the edge holds without
     reading: a format number, the writer's clock origin, then the fields.
     Every monotonic reading is written as the writer's and moved onto the
     reader's clock by the difference of the two origins (`ClockOrigin`, the
@@ -6235,8 +6236,11 @@ phase rewrites.
     `record_format.written` says — 1 until `e6ircd records advance` (D11),
     announced so every serving core follows at once — and refuses any other
     format by number, closing that one session loudly (`server upgrade:
-    session state unreadable`). A core without a database has nowhere to
-    stage the window and writes the newest format.
+    session state unreadable`). A core without a database takes the format
+    from its configuration, `[edge_link] record_format`: unstated, the
+    previous one; stated, advanced to it once every core that may take over
+    writes it. A format this release does not write refuses the start, and so
+    does stating one beside a database, whose stored format governs.
   - *Held state, as it changes.* After every event a shard publishes the
     record and acknowledgement of each session that changed, and each
     changed channel's replica to every edge hosting one of its members, on
@@ -6259,21 +6263,26 @@ phase rewrites.
     in the record, and its lines are not retained: replaying them would
     answer them twice.
   - *The cut* (`LinkServer::cut`, on `e6ircd stop --handover` or, in edge
-    mode, SIGTERM — D16): the core sends `Pause` on every stream and waits up
-    to 5 s for each `Paused`, which follows every line the edge sent before
-    it; waits up to 10 s until every line is handled, nothing passes between
+    mode, SIGTERM — D16): a core still rebuilding finishes first (at most
+    60 s), so what it cuts is whole; then it sends `Pause` on every stream
+    its input flows on — `Resume` and `Pause` go under one lock per stream,
+    so each goes at most once and in order, and a stream never resumed is
+    paused as it is — and waits up to 5 s for each `Paused`, which follows
+    every line the edge sent before it; waits up to 10 s until every line is handled, nothing passes between
     shards and no database round trip is awaited, then closes each session
     still waiting, loudly (`server restarting: a request did not complete`);
     cuts every shard, which republishes every record and replica and handles
-    nothing more; lets each stream's pumps send what their sessions were
+    nothing more; homes the core's own sessions on the first edge holding
+    the cut (below); lets each stream's pumps send what their sessions were
     last given (10 s); sends the cut state — WHOWAS, the LUSERS maximum, the
     account-creation buckets and the edges cut — on the first stream and
     `Cut { cut, epoch }` on every stream; and records the cut in the roster.
     Drivers, the core, the database flush and the lease release then run as
     for any stop, and no client hears a word.
   - *The edge holds.* An edge whose every stream ended with the same `Cut`
-    holds every session for the next core for at most ten minutes (D12's
-    core-absence limit); any other end closes them loudly, as before. While
+    holds every session for the next core for at most its core-absence limit
+    (D12): `[edge] core_absence_limit_seconds`, ten minutes unless stated,
+    between 10 s and an hour. Any other end closes them loudly, as before. While
     a stream is not live a client's lines wait: its reader stops at the line
     it could not send, and the socket's own backpressure holds the rest.
     Output the edge was given before the cut is still written, and what is
@@ -6292,8 +6301,13 @@ phase rewrites.
     directory order with new directory keys; re-authorizes every login
     against the account's standing and the credential's liveness, and every
     address against the server bans; ends each session whose client left in
-    the gap as that client would have; and sends `Resume`. The edge replays
-    each session's retained lines, numbered afresh, then lets input flow.
+    the gap as that client would have; and sends `Resume` to every edge then
+    linked, an edge linking later resuming itself. The edge takes a stream's
+    gate from a `Resume` until it has replayed each session's retained
+    lines, numbered afresh, and lets input flow, so a `Pause` after it is
+    answered after the replay. An edge gives its replicas up as it uploads
+    them, so a rebuilt channel's next publication — its next change, or the
+    next cut — tells every edge with a member the channel whole.
     Two records naming one nick keep it for the one that opened first; a
     session the per-address limit refuses is closed saying so. Until the
     rebuild is over the core opens no session of its own (`RebuildDone`), so
@@ -6326,11 +6340,27 @@ phase rewrites.
     a `ReplayCursor` from before the restart names the same line. A start
     withdraws the claim at once, so a process that dies without storing
     everything leaves none, and the start after it begins a new epoch.
-  - *The `local` driver's session* lives in the core, so no edge holds it
-    (D13, homing it on an edge, is not built): the cut closes it first,
-    loudly, as the server restarting, with every other session no edge holds
-    (one on a version 1 link), and the next core's driver joins again once
-    the rebuild is over.
+  - *The `local` driver's session* (D13, `core::local_home`) lives in the
+    core, with no socket and so no edge of its own. In edge mode its link is
+    a holding one: its shard publishes its record like any session's, and the
+    driver hands each record it reads past to `LocalHomes`. The cut homes
+    every such session on the first edge that holds it — slot 0's replicas,
+    the sessions' memberships, are routed there and told whole, and once the
+    drivers have taken the records the cut published (10 s), `Home` and the
+    `LocalRecord` go on the session's stream before `Cut`. The edge holds
+    them beside its own sessions and uploads them (`HomeUpload`, then the
+    record); the next core claims each identifier from its own allocator,
+    rebuilds the session with the others and parks its link for the
+    network's driver. The driver takes it up instead of registering: it asks
+    `VERSION`, `TOPIC` and `NAMES` of each channel and a `PING`, takes the
+    answers into the network's state with no line reaching the backlog or an
+    attachment, publishes the session once, and relays on — its channels see
+    no QUIT and no JOIN, and an attachment no change. A session not yet
+    registered, or whose record is unreadable, is not resumed, and its driver
+    registers anew; one no driver takes up within 10 s of the rebuild (its
+    network is gone) is closed. Without an edge to home it on, the cut closes
+    it first, loudly, as the server restarting, with every other session no
+    edge holds (one on a version 1 link).
   - *Stops* (`control`). `e6ircd stop --handover|--final [--pid <pid>]`
     reaches the server through a local control endpoint named by its process
     identifier — a Unix socket in `e6ircd-<uid>` under `$XDG_RUNTIME_DIR` or
@@ -6354,14 +6384,18 @@ phase rewrites.
     modes and ranks, the TLS facts — with nothing lost, repeated or said;
     stop with `--final`; refuse a handover without edges; and hand over on
     SIGTERM. `edge_tier.rs` restarts a core after every step of a scripted
-    two-client conversation onto a core of another shard count and compares
-    the transcripts line for line with an unrestarted run; with PostgreSQL
+    two-client conversation twice in a row, onto a core of another shard
+    count and back, and compares the transcripts line for line with an
+    unrestarted run; with PostgreSQL
     (in `db-tests`, and on macOS and Windows in `zero-drop-database` with
     PostgreSQL 18 installed natively, D15) it keeps a live chat socket, a
     bouncer attachment and a SASL exchange across graceful restarts, advances
-    the record format under a served session, and sees the `local` driver
-    quit and rejoin; `bouncer.rs` holds the durable ring epoch across a clean
-    restart.
+    the record format under a served session, and keeps the `local` driver's
+    session and its attachment across two graceful restarts with no QUIT, no
+    JOIN and no second welcome; `bouncer.rs` holds the durable ring epoch
+    across a clean restart. Unit tests hold the edge's core-absence limit and
+    its bounds, the database-less record format, the allocator's claim of a
+    resumed identifier, and the edge's upload of a homed record.
 
 ### 19.2 The core link
 
@@ -6378,9 +6412,9 @@ phase rewrites.
   `u32 length | u8 kind | u64 session | payload`, fuzzed by `link_frames`
   (round trip, bounds, no panic, no frame admitted past its bound).
 - **Session kinds**: `Irc` (TCP, TLS or `/ws/irc`, to the core shards),
-  `Attach` (bouncer attach logic), `Ui` (`ws_ui_conn`), `Upstream` (an
-  edge-held outbound IRC socket, §19.4) and `Local` (the socketless home of a
-  `local` driver session, D13).
+  `Attach` (bouncer attach logic), `Ui` (`ws_ui_conn`) and `Upstream` (an
+  edge-held outbound IRC socket, §19.4). A `local` driver session has no
+  kind: no edge opens one, and a cut homes it on an edge with `Home` (D13).
 - **Frames by kind.** `Irc` and `Attach` carry IRC lines both ways. A `Ui`
   session carries WebSocket messages: its `Output` is one text message, the
   client's messages reach the core as `Message` frames (a text message, or
@@ -6416,7 +6450,8 @@ phase rewrites.
   `Open` (identifier, kind, client address and its provenance, listener,
   transport, TLS facts, WebSocket mode), `Line` (with an input sequence
   number), `OverlongLine`, `Closed` (with a reason), `Drained` (bytes written
-  to the client socket), `RecordUpload` and `ReplicaUpload` (rebuild only),
+  to the client socket), `RecordUpload`, `ReplicaUpload` and `HomeUpload`
+  (rebuild only),
   `UpstreamLine`. Upgrade authorization is no frame: the edge forwards the
   upgrade request over its HTTP link connections, marked with the
   identifier it will open the session under, and the core's own handler
@@ -6430,7 +6465,8 @@ phase rewrites.
   input acknowledgement), `Kill` (discard the queue, send this final
   `ERROR`), `End` (drain, then close), `Pause` and `Resume`, `Record` (a whole
   record with its revision), `Replica` (whole or a delta, with the channel's
-  revision), `Cut`, `Credit`, `UpstreamControl`.
+  revision), `Cut`, `Home` (a core's own session homed at a cut), `Credit`,
+  `UpstreamControl`.
 - **Flow control.** Client to core: the edge meters each session, and each
   stream runs on *credits* the core grants equal to its free shard-queue
   capacity, replacing today's awaited push into the core queue. An edge out of
@@ -6499,8 +6535,9 @@ phase rewrites.
      is the same on every operating system, and Windows' only one), or the
      console. In edge mode a stop is a handover; `e6ircd stop --final` is the
      only stop that closes clients (D16).
-  3. A quiesces: `Pause` to every edge (edges keep reading into a bounded
-     per-session input buffer of 64 KiB, and credits stop); the shards drain;
+  3. A quiesces: `Pause` to every edge (a client's input waits in its
+     socket: the edge reads no line it cannot send, and nothing is lost);
+     the shards drain;
      every database round trip in flight (SASL and IDENTIFY verdicts,
      CHATHISTORY pages, MARKREAD, ChanServ, server-ban verdicts) completes, so
      `deferred_replies` reaches 0 and held output is released; HTTP requests
@@ -6574,9 +6611,10 @@ phase rewrites.
   and client address is checked against account standing, credential
   liveness and server bans exactly as the live paths check them (§2).
 - **What clients observe.**
-  - *A gap* is a pause: typed lines are buffered at the edge and delivered in
-    order at `Resume`; past the 64 KiB input bound the edge stops reading (the
-    client's own TCP backpressure). Nothing is closed. The edge does not
+  - *A gap* is a pause: typed lines wait in the client's own socket — the
+    edge stops at the line it could not send and reads no further, so the
+    client's TCP backpressure holds the rest and nothing is lost — and are
+    delivered in order at `Resume`. Nothing is closed. The edge does not
     answer client PINGs: a 5 s gap is far below common ping timeouts, and the
     core-absence limit (§19.7) bounds the longest gap.
   - *A graceful cut is exact*: no line duplicated or lost, and no
@@ -6636,8 +6674,8 @@ the edge (D7):
   cannot place is dropped with the router's attachment-level notice and never
   enters the ring (the `ReplyRouter` invariant, §2).
 - **Bridges stay in the core** (§1, non-goals). The **`local` driver's**
-  session is homed on an edge as a socketless `Local` session (D13), so its
-  record and membership survive as any client's do.
+  session is homed at each cut on an edge that holds it (`Home`, D13), so
+  its record and membership survive as any client's do.
 
 ### 19.5 Edge upgrade
 
@@ -6766,7 +6804,8 @@ preference:
   counterpart of the takeover's `pg_terminate_backend`.
 - **Core-absence limit** (D12). A core crashing during an outage cannot be
   replaced until the database returns, so edges hold paused clients for at
-  most `edge.core_absence_limit` (default 10 minutes) and then close them with
+  most `[edge] core_absence_limit_seconds` (default 10 minutes, from 10 s to
+  an hour) and then close them with
   `ERROR :Closing Link … (server unavailable)`: loud, bounded, configurable.
 
 ### 19.8 Warm standby
@@ -6848,8 +6887,11 @@ Each rewrite lands in the phase that makes it true (`PLAN.md`, "Edge tier"):
 - **D11 Record-format window**: read N and N−1; keep writing the previous
   version until `e6ircd records advance`.
 - **D12 Core absence**: a 10-minute core-absence limit, then an explicit
-  close; a 30 s roster wait.
+  close; a 30 s roster wait. Built: the limit is the edge's
+  `core_absence_limit_seconds`.
 - **D13 `local` driver sessions**: homed on an edge as socketless sessions.
+  Built: homed at the cut on the first edge holding it, and taken up by the
+  driver without registering again (§19.1, phase 4 as built).
 - **D14 Windows under the Service Control Manager**: overlap drain; live
   handover under any other supervisor.
 - **D15 Continuous integration on macOS and Windows**: PostgreSQL 18
@@ -6865,16 +6907,29 @@ Each rewrite lands in the phase that makes it true (`PLAN.md`, "Edge tier"):
 
 ### 19.11 Evidence
 
-- **Codec and records**: the `link_frames` fuzz target; property tests that a
-  record body of version N decodes under N and N+1; the replica merge picks
-  the highest revision, and the member union equals live membership.
-- **Restart at every step, in process**: `CoreScheduler` runs a scripted
-  multi-client, multi-shard scenario and, at every event boundary, takes the
-  edges' records and replicas, builds a fresh core with a different shard
-  count, and continues. A graceful restart reproduces the no-restart
-  transcripts byte for byte (message-identifier stems aside); a crash may
-  differ only by the counted catch-up lines and `INPUT_UNCONFIRMED` notes. The
-  `core_multi` fuzz target gains a "restart now" event.
+- **Codec and records**: the `link_frames` fuzz target (every frame round
+  trips, none is admitted past its bound, none panics a reader) and the
+  `held_bodies` one (no body panics a reader; a body read is written back
+  byte for byte); `core::record`'s tests round-trip every body in both
+  formats of the window and refuse every format outside it.
+- **Restart at every step, over a real link**
+  (`a_graceful_restart_after_any_step_changes_no_transcript`): a scripted
+  two-client conversation — registration, channel state, ranks, nick
+  changes, away, private messages, the monitor list, replies — runs through
+  a real edge process's link, and after each of its steps in turn the core
+  is gracefully restarted twice in a row, onto a core of another shard
+  count and back. Every run's transcripts equal the unrestarted run's line
+  for line (tags and the welcome's server facts aside). The link, the
+  pumps, the pause, settle and cut, and the upload are the ones a deployment
+  runs, which an in-process scheduler handing records from core to core
+  would step around; a crash, and its catch-up lines and
+  `INPUT_UNCONFIRMED` notes, is phase 5's.
+- **irctest** runs its green list through an edge in CI
+  (`E6IRC_IRCTEST_EDGE=1`) and never restarts the server in the middle of a
+  test. Its assertions are per reply and its tests do not repeat, so a
+  restart at some point of each would prove less than the restart after
+  every step above, which compares whole transcripts at every step of one
+  conversation, deterministically.
 - **Driver restart**: the `irc` driver against a scripted upstream through
   both `UpstreamPort` implementations, restarted mid-registration, mid-LIST
   and mid-echo; the upstream sees no `QUIT` and no second `NICK` or `USER`,

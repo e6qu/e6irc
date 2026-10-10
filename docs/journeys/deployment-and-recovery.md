@@ -234,11 +234,14 @@ configuration and each edge's configuration.
    writes the certificate authority and the core's certificate, and
    `e6ircd edge-credentials issue --dir <dir> --edge <name>` one edge's.
    Neither overwrites a file.
-2. Give the core `[edge_link]` (the link address and its credentials) and
-   no `[[listeners]]` or `[bnc]`, which edge mode refuses; `check-config`
-   reads the link credentials as start does.
+2. Give the core `[edge_link]` (the link address and its credentials, and —
+   without a database — the `record_format` it writes once advanced) and no
+   `[[listeners]]` or `[bnc]`, which edge mode refuses; `check-config` reads
+   the link credentials as start does.
 3. Give each edge an `[edge]` section (its name, the core addresses it dials,
-   its credentials) and its `[[listeners]]`, `[http]` and `[attach]` ports,
+   its credentials, and how long it holds its clients for an absent core,
+   `core_absence_limit_seconds`) and its `[[listeners]]`, `[http]` and
+   `[attach]` ports,
    each optionally behind a load balancer speaking the PROXY protocol
    version 2 (`proxy_protocol = true`).
 4. Start both, in either order. The edge binds its ports at once, dials the
@@ -256,10 +259,12 @@ stop --handover`, or SIGTERM in edge mode — leaves every client to its edge
 (IRC, `/ws/ui` and bouncer attach alike): nothing is closed or said, lines
 typed meanwhile are delivered after, and the next core on the link's address
 rebuilds each session from what the edge uploads, within the edge's
-ten-minute hold. The bouncer's `local` network quits as the server
-restarting and joins again once the next core has rebuilt; `e6ircd records
-advance` moves every core to the newest record format once no older release
-will run again. `e6ircd stop --final` closes
+core-absence limit (`[edge] core_absence_limit_seconds`, ten minutes unless
+stated). The bouncer's `local` network's session is held by an edge too: its
+channels see no QUIT and no JOIN, and its attachments no change. `e6ircd
+records advance` moves every core to the newest record format once no older
+release will run again; a core without a database writes the format its
+`[edge_link] record_format` names, the previous one unless stated. `e6ircd stop --final` closes
 every client with the core's own `ERROR`. A core that crashes, or a link that
 is reset, closes every client loudly: `ERROR :Closing Link: <host> (server
 restarting)` from the edge, close 1012 on `/ws/ui`; HTTP requests meanwhile
@@ -306,15 +311,17 @@ link's refusals; with PostgreSQL,
 `a_live_chat_socket_and_an_attach_reach_the_bouncer_through_an_edge` and
 `the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners` prove
 `/ws/ui`, attach, the roster and the console;
-`a_graceful_restart_after_any_step_changes_no_transcript` restarts after
-every step of a scripted conversation, and
+`a_graceful_restart_after_any_step_changes_no_transcript` restarts twice in
+a row after every step of a scripted conversation, and
 `a_live_chat_socket_survives_a_graceful_restart`,
 `a_bouncer_attachment_survives_a_graceful_restart`,
 `a_sasl_exchange_and_a_format_advance_span_graceful_restarts`,
-`a_local_driver_session_quits_before_a_graceful_restart_and_rejoins` and
+`a_local_driver_session_survives_a_graceful_restart_unseen` and
 `a_ring_keeps_its_epoch_and_positions_across_a_clean_restart` prove the
 rebuild of what PostgreSQL backs. `fuzz/fuzz_targets/link_frames.rs`
-covers the codec, and irctest's green list runs through an edge in CI.
+covers the codec, and irctest's green list runs through an edge in CI, never
+restarting the server in the middle of a test: the restart after every step
+is the restart evidence (DESIGN §19.11).
 
 ## Recover from PostgreSQL interruption
 

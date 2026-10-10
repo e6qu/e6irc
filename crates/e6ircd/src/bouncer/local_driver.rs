@@ -2,6 +2,14 @@
 //! core. It gives a BNC user an always-on presence on the local network
 //! (with backlog), exactly like the `irc` driver gives them presence on
 //! an external one — but over the core queue instead of a socket.
+//!
+//! In edge mode its session survives a graceful restart (decision D13): its
+//! link is a holding one, whose records the driver hands the core's
+//! [`LocalHomes`] for a cut to home on an edge, and the next core rebuilds the
+//! session and hands it back. The driver then takes it up where it was — asks
+//! the core what a welcome would have told and what its channels hold, and
+//! tells nobody — instead of registering again: its channels see no QUIT and
+//! no JOIN.
 
 use std::sync::Arc;
 
@@ -10,6 +18,7 @@ use e6irc_edge::connection::CorePort;
 use super::irc_driver::{JoinedChannels, UpstreamControl};
 use super::upstream_identity::AutojoinChannel;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
+use crate::core::local_home::{LocalHomeKey, LocalHomes, ResumedLocal};
 use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, EdgeSession};
 
 /// The in-process network's name — the driver `kind`, the session host, and the
@@ -43,6 +52,10 @@ const LOCAL_SESSION_HOST: &str = LOCAL_NETWORK;
 /// answers in; `labeled-response` and `batch` would add nothing here.
 const LOCAL_CAPABILITIES: &str = "account-tag echo-message message-tags server-time";
 
+/// The token of the `PING` that ends a resumed session's questions: its
+/// `PONG` follows every answer before it.
+const RESUMED_TOKEN: &str = "e6irc-resumed";
+
 /// Handles into the core, so the driver can open an in-process session.
 #[derive(Clone)]
 pub struct CoreHandles {
@@ -54,6 +67,7 @@ pub struct CoreHandles {
 
 pub struct LocalDriver {
     core: CoreHandles,
+    home: LocalHomeKey,
     nick: String,
     username: String,
     realname: String,
@@ -63,10 +77,12 @@ pub struct LocalDriver {
 
 impl LocalDriver {
     /// Build a local driver from the same `NetworkConfig` the `irc`
-    /// driver uses (addr/tls/sasl are ignored — there is no socket).
-    pub fn new(core: CoreHandles, config: NetworkConfig) -> Self {
+    /// driver uses (addr/tls/sasl are ignored — there is no socket), for the
+    /// network `home` names.
+    pub(crate) fn new(core: CoreHandles, config: NetworkConfig, home: LocalHomeKey) -> Self {
         Self {
             core,
+            home,
             // Already parsed: the same one-parameter guarantees hold for the
             // lines this driver injects into the in-process core.
             nick: config.nick.to_string(),
@@ -88,6 +104,7 @@ impl NetworkDriver for LocalDriver {
         let this = *self;
         let session = LocalSession {
             core: this.core,
+            home: this.home,
             nick: this.nick,
             username: this.username,
             realname: this.realname,
@@ -101,6 +118,8 @@ impl NetworkDriver for LocalDriver {
 /// Per-session configuration for the local driver, reconnected on each drop.
 struct LocalSession {
     core: CoreHandles,
+    /// Which network this is, as a restart homes its session.
+    home: LocalHomeKey,
     nick: String,
     username: String,
     realname: String,
@@ -159,17 +178,35 @@ impl<'a> CoreLines<'a> {
     }
 }
 
-/// The core's next line to the in-process session, its CRLF stripped — only
-/// the frame's, not all trailing whitespace, since a trailing parameter may
-/// end in spaces. The session is its own writer, so taking a line is writing
-/// it ([`EdgeSession::pop`]). `None` once the core has ended the session.
-async fn next_output(edge: &mut EdgeSession) -> Option<String> {
-    let line = edge.pop().await?.payload.0;
-    Some(
-        String::from_utf8_lossy(&line)
-            .trim_end_matches(['\r', '\n'])
-            .to_string(),
-    )
+/// The session's link as the driver reads it: the edge's end, and the homes
+/// it hands what the core publishes for the session to be held.
+struct SessionEnd<'a> {
+    conn: ConnId,
+    edge: &'a mut EdgeSession,
+    homes: &'a LocalHomes,
+}
+
+impl SessionEnd<'_> {
+    /// The core's next line to the in-process session, its CRLF stripped —
+    /// only the frame's, not all trailing whitespace, since a trailing
+    /// parameter may end in spaces. The session is its own writer, so taking a
+    /// line is writing it ([`EdgeSession::pop`]), and what the core published
+    /// after the lines taken is taken with it. `None` once the core has ended
+    /// the session.
+    async fn next_output(&mut self) -> Option<String> {
+        let line = self.edge.pop().await?.payload.0;
+        self.homes.hold(self.conn, self.edge);
+        Some(
+            String::from_utf8_lossy(&line)
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        )
+    }
+
+    /// Take what the core published for the session to be held.
+    fn take_held(&mut self) {
+        self.homes.hold(self.conn, self.edge);
+    }
 }
 
 /// Read the core's replies until it welcomes the session under the configured
@@ -180,13 +217,13 @@ async fn next_output(edge: &mut EdgeSession) -> Option<String> {
 async fn await_welcome(
     session: &LocalSession,
     lines: &mut CoreLines<'_>,
-    edge: &mut EdgeSession,
+    end: &mut SessionEnd<'_>,
     ends: &DriverEnds,
 ) -> Result<Welcome, super::SessionOutcome> {
     use super::SessionOutcome::{Dropped, RegistrationRejected, Stopped};
     let mut capabilities_acknowledged = false;
     loop {
-        let Some(line) = next_output(edge).await else {
+        let Some(line) = end.next_output().await else {
             return Err(Dropped(super::NetworkFailure::ConnectionLost));
         };
         let Ok(parsed) = e6irc_proto::message::Message::parse(&line) else {
@@ -250,33 +287,74 @@ async fn await_welcome(
     }
 }
 
+/// The session one attempt drives: one a rebuild resumed for this network,
+/// or a new one, registered here.
+enum Taken {
+    Resumed {
+        nick: String,
+        user: String,
+        channels: Vec<String>,
+    },
+    Opened,
+}
+
 async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Stopped;
     // A core rebuilding what its edges held opens no session of its own until
-    // it has: this one's channels are among those it restores.
-    session.core.core_tx.directories().held.rebuilt.wait().await;
-    let conn = match session.core.next_conn.allocate() {
-        Ok(conn) => conn,
-        Err(error) => {
-            eprintln!("local bouncer connection stopped: {error}");
-            return Stopped;
+    // it has: this one's channels are among those it restores, and the
+    // session itself may be.
+    let held = session.core.core_tx.directories().held;
+    held.rebuilt.wait().await;
+    let homes = held.homes;
+    let (conn, mut edge, taken) = match homes.take_resumed(&session.home) {
+        Some(ResumedLocal {
+            conn,
+            edge,
+            nick,
+            user,
+            channels,
+        }) => (
+            conn,
+            edge,
+            Taken::Resumed {
+                nick,
+                user,
+                channels,
+            },
+        ),
+        None => {
+            let conn = match session.core.next_conn.allocate() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    eprintln!("local bouncer connection stopped: {error}");
+                    return Stopped;
+                }
+            };
+            let Some(edge) = open(session, conn, &homes).await else {
+                return Stopped; // core shutting down
+            };
+            (conn, edge, Taken::Opened)
         }
     };
-    let Some(mut edge) = session
-        .core
-        .core_tx
-        .open(
+    let outcome = {
+        // Followed while it lasts, so a cut finds its record.
+        let _followed = homes
+            .homing()
+            .then(|| homes.follow(conn, session.home.clone(), &edge));
+        let mut end = SessionEnd {
             conn,
-            LOCAL_SESSION_HOST.into(),
-            crate::core::ConnectionTransport::Local,
-            None,
-            session.core.sendq_bytes,
-        )
-        .await
-    else {
-        return Stopped; // core shutting down
+            edge: &mut edge,
+            homes: &homes,
+        };
+        match taken {
+            Taken::Resumed {
+                nick,
+                user,
+                channels,
+            } => resume_session(session, ends, &mut end, nick, user, channels).await,
+            Taken::Opened => drive_session(session, ends, &mut end).await,
+        }
     };
-    let outcome = drive_session(session, ends, conn, &mut edge).await;
     // The one way out of an opened core session, whatever ended it: close it
     // rather than leave it — holding the nickname — for the core's liveness
     // reaper. Queue closure here already means the core is gone.
@@ -295,15 +373,29 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
     outcome
 }
 
-/// Register the opened core session `conn` and relay it until it ends.
+/// Open `conn`'s session in the core: on a link whose records are held in
+/// edge mode, so a cut can home it. `None` when the core is shutting down.
+async fn open(session: &LocalSession, conn: ConnId, homes: &LocalHomes) -> Option<EdgeSession> {
+    let core = &session.core.core_tx;
+    let (open, edge) = core.open_input(
+        conn,
+        LOCAL_SESSION_HOST.into(),
+        crate::core::ConnectionTransport::Local,
+        None,
+        session.core.sendq_bytes,
+        homes.homing(),
+    );
+    core.push(open).await.ok().map(|_sequence| edge)
+}
+
+/// Register the opened core session and relay it until it ends.
 async fn drive_session(
     session: &LocalSession,
     ends: &mut DriverEnds,
-    conn: ConnId,
-    edge: &mut EdgeSession,
+    end: &mut SessionEnd<'_>,
 ) -> super::SessionOutcome {
     use super::SessionOutcome::Stopped;
-    let mut lines = CoreLines::new(&session.core.core_tx, conn, edge);
+    let mut lines = CoreLines::new(&session.core.core_tx, end.conn, end.edge);
     // Register in-process. Queueing NICK and USER is only a request: the core
     // answers like any server, and it is the welcome that makes a session. The
     // capability request holds registration until `CAP END`, so the core has
@@ -322,7 +414,7 @@ async fn drive_session(
         _ = ends.stop_signal() => Err(Stopped),
         welcome = tokio::time::timeout(
             WELCOME_DEADLINE,
-            await_welcome(session, &mut lines, edge, ends),
+            await_welcome(session, &mut lines, end, ends),
         ) => welcome.unwrap_or(Err(super::SessionOutcome::Dropped(
             super::NetworkFailure::RegistrationTimedOut,
         ))),
@@ -349,151 +441,371 @@ async fn drive_session(
     if ends.emit_session_line(welcome.line).is_err() {
         return super::SessionOutcome::Dropped(super::NetworkFailure::ChannelLimitExceeded);
     }
-    // The core answers each attached client's commands on this one session,
-    // in order, like any server; see `super::replies`.
-    let mut router = super::replies::ReplyRouter::default();
-    let mut echoes = super::irc_driver::UpstreamEchoes::default();
-    let mut requested_nicks = super::irc_driver::RequestedNicks::default();
-    let mut identity = super::irc_driver::SelfIdentity {
-        nick: welcome.nick.clone(),
-        user: session.username.clone(),
-        host: LOCAL_SESSION_HOST.to_string(),
-    };
+    let relay = Relay::new(
+        session,
+        lines,
+        super::irc_driver::SelfIdentity {
+            nick: welcome.nick,
+            user: session.username.clone(),
+            host: LOCAL_SESSION_HOST.to_string(),
+        },
+    );
+    relay.run(ends, end, Vec::new()).await
+}
 
+/// Take up the session a rebuild resumed (D13), registered as `nick` (user
+/// `user`) and in `channels`: ask the core what a welcome would have said of
+/// the network (`VERSION`'s ISUPPORT) and what each channel holds (`TOPIC`,
+/// `NAMES`), take the answers into the session's state without anyone seeing
+/// them, and relay on. What the core says meanwhile that is not an answer is
+/// relayed once the state is taken up.
+async fn resume_session(
+    session: &LocalSession,
+    ends: &mut DriverEnds,
+    end: &mut SessionEnd<'_>,
+    nick: String,
+    user: String,
+    channels: Vec<String>,
+) -> super::SessionOutcome {
+    use super::SessionOutcome::Stopped;
+    let mut lines = CoreLines::new(&session.core.core_tx, end.conn, end.edge);
+    let questions = std::iter::once("VERSION".to_owned())
+        .chain(
+            channels
+                .iter()
+                .flat_map(|channel| [format!("TOPIC {channel}"), format!("NAMES {channel}")]),
+        )
+        .chain(std::iter::once(format!("PING :{RESUMED_TOKEN}")));
+    for line in questions {
+        if !lines.say(line).await {
+            return Stopped;
+        }
+    }
+    let answered = tokio::select! {
+        _ = ends.stop_signal() => Err(Stopped),
+        answers = tokio::time::timeout(WELCOME_DEADLINE, resumed_answers(&mut lines, end, ends))
+            => answers.unwrap_or(Err(super::SessionOutcome::Dropped(
+                super::NetworkFailure::RegistrationTimedOut,
+            ))),
+    };
+    let (answers, deferred) = match answered {
+        Ok(answered) => answered,
+        Err(outcome) => return outcome,
+    };
+    let names = e6irc_client::NetworkNames::default();
+    // The ISUPPORT first, then each channel as joining it would have told it:
+    // our JOIN, then its topic and members.
+    let isupport = answers
+        .iter()
+        .filter(|(_, message)| message.command == "005")
+        .map(|(line, _)| line.clone());
+    let joined = channels.iter().flat_map(|channel| {
+        let own_join = format!(":{nick}!{user}@{LOCAL_SESSION_HOST} JOIN {channel}");
+        let answers = answers
+            .iter()
+            .filter(|(_, message)| {
+                answered_channel(message).is_some_and(|named| names.eq(named, channel))
+            })
+            .map(|(line, _)| line.clone());
+        std::iter::once(own_join).chain(answers).collect::<Vec<_>>()
+    });
+    let burst: Vec<String> = isupport.chain(joined).collect();
+    ends.set_client_tags(super::ClientTags::Relayed);
+    let changes = match ends.resume_irc_session(nick.clone(), burst) {
+        Ok(changes) => changes,
+        Err(super::ChannelLimitExceeded) => {
+            return super::SessionOutcome::Dropped(super::NetworkFailure::ChannelLimitExceeded);
+        }
+    };
+    let mut relay = Relay::new(
+        session,
+        lines,
+        super::irc_driver::SelfIdentity {
+            nick,
+            user,
+            host: LOCAL_SESSION_HOST.to_string(),
+        },
+    );
+    for change in changes {
+        if super::irc_driver::track(
+            ends,
+            &session.joined,
+            &mut relay.identity,
+            &mut relay.requested_nicks,
+            Ok(change),
+        )
+        .is_err()
+        {
+            return super::SessionOutcome::Dropped(super::NetworkFailure::ChannelLimitExceeded);
+        }
+    }
+    ends.connected_across_restart();
+    relay.run(ends, end, deferred).await
+}
+
+/// The channel a reply about one names: a topic's (`331`, `332`, `333`) or a
+/// member list's (`353`, `366`).
+fn answered_channel(message: &e6irc_client::OwnedMessage) -> Option<&str> {
+    let index = match message.command.as_str() {
+        "331" | "332" | "333" | "366" => 1,
+        "353" => 2,
+        _ => return None,
+    };
+    message.params.get(index).map(String::as_str)
+}
+
+/// A line the core sent while a resumed session's questions were answered,
+/// parsed.
+type Answer = (String, e6irc_client::OwnedMessage);
+
+/// Read the core's answers to a resumed session's questions, up to the
+/// `PONG` of [`RESUMED_TOKEN`]: the numerics addressed to the session, and
+/// apart from them every other line, in order, for the relay to take once the
+/// session's state is taken up. The core's own `PING` is answered here.
+async fn resumed_answers(
+    lines: &mut CoreLines<'_>,
+    end: &mut SessionEnd<'_>,
+    ends: &DriverEnds,
+) -> Result<(Vec<Answer>, Vec<String>), super::SessionOutcome> {
+    let mut answers = Vec::new();
+    let mut deferred = Vec::new();
     loop {
-        // Past the session's command allowance, the attachments' commands
-        // wait until a token is back; the core's output keeps flowing.
-        let blocked = lines.meter.blocked_until(tokio::time::Instant::now());
-        tokio::select! {
-            () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
-            // Core output -> buffer + broadcast (attach playback/live).
-            out = next_output(edge) => match out {
-                Some(line) => {
-                    let message = e6irc_proto::message::Message::parse(&line)
-                        .ok()
-                        .map(|parsed| e6irc_client::OwnedMessage::from(&parsed));
-                    // The in-process session is a real registered session, so
-                    // the liveness reaper PINGs it after ~2 min idle, and the
-                    // core ends it with `ERROR` on a KILL, a GHOST or a ban:
-                    // the session's own business, read as the `irc` driver
-                    // reads an upstream's, never an attached client's line.
-                    match message
-                        .as_ref()
-                        .and_then(|message| super::irc_driver::upstream_control(message, ends))
-                    {
-                        Some(UpstreamControl::Answer(answer)) => {
-                            if !lines.say(answer).await {
-                                return Stopped;
-                            }
-                            continue;
-                        }
-                        Some(UpstreamControl::Capabilities | UpstreamControl::Consumed) => continue,
-                        Some(UpstreamControl::Closed(closed)) => {
-                            return super::SessionOutcome::ClosedByUpstream(closed);
-                        }
-                        None => {}
+        let Some(line) = end.next_output().await else {
+            return Err(super::SessionOutcome::Dropped(
+                super::NetworkFailure::ConnectionLost,
+            ));
+        };
+        let Ok(parsed) = e6irc_proto::message::Message::parse(&line) else {
+            deferred.push(line);
+            continue;
+        };
+        let message = e6irc_client::OwnedMessage::from(&parsed);
+        if message.command == "PONG"
+            && message.params.last().map(String::as_str) == Some(RESUMED_TOKEN)
+        {
+            return Ok((answers, deferred));
+        }
+        if message.command == "PING" {
+            match super::irc_driver::upstream_control(&message, ends) {
+                Some(UpstreamControl::Answer(answer)) => {
+                    if !lines.say(answer).await {
+                        return Err(super::SessionOutcome::Stopped);
                     }
-                    if let Some(message) = &message {
-                        super::irc_driver::follow_membership(
-                            ends,
-                            &session.joined,
-                            message,
-                            &ends.names(),
+                }
+                _ => deferred.push(line),
+            }
+            continue;
+        }
+        let numeric =
+            message.command.len() == 3 && message.command.bytes().all(|byte| byte.is_ascii_digit());
+        if numeric {
+            answers.push((line, message));
+        } else {
+            deferred.push(line);
+        }
+    }
+}
+
+/// A registered session's relay between the core and the network's
+/// attachments.
+struct Relay<'a> {
+    session: &'a LocalSession,
+    lines: CoreLines<'a>,
+    /// The core answers each attached client's commands on this one
+    /// session, in order, like any server; see `super::replies`.
+    router: super::replies::ReplyRouter,
+    echoes: super::irc_driver::UpstreamEchoes,
+    requested_nicks: super::irc_driver::RequestedNicks,
+    identity: super::irc_driver::SelfIdentity,
+}
+
+impl<'a> Relay<'a> {
+    fn new(
+        session: &'a LocalSession,
+        lines: CoreLines<'a>,
+        identity: super::irc_driver::SelfIdentity,
+    ) -> Self {
+        Self {
+            session,
+            lines,
+            router: super::replies::ReplyRouter::default(),
+            echoes: super::irc_driver::UpstreamEchoes::default(),
+            requested_nicks: super::irc_driver::RequestedNicks::default(),
+            identity,
+        }
+    }
+
+    /// Relay `first`, then everything else, until the session ends.
+    async fn run(
+        mut self,
+        ends: &mut DriverEnds,
+        end: &mut SessionEnd<'_>,
+        first: Vec<String>,
+    ) -> super::SessionOutcome {
+        use super::SessionOutcome::Stopped;
+        for line in first {
+            if let Some(outcome) = self.output(ends, line).await {
+                return outcome;
+            }
+        }
+        let published = end.edge.held_signal();
+        loop {
+            // Past the session's command allowance, the attachments' commands
+            // wait until a token is back; the core's output keeps flowing.
+            let blocked = self.lines.meter.blocked_until(tokio::time::Instant::now());
+            tokio::select! {
+                () = tokio::time::sleep_until(blocked.unwrap_or_else(tokio::time::Instant::now)), if blocked.is_some() => {}
+                // What the core publishes for the session to be held.
+                () = published.published() => end.take_held(),
+                // Core output -> buffer + broadcast (attach playback/live).
+                out = end.next_output() => match out {
+                    Some(line) => {
+                        if let Some(outcome) = self.output(ends, line).await {
+                            return outcome;
+                        }
+                    }
+                    // Core closed our session: reconnect with a fresh ConnId
+                    // (and emit Disconnected via run_with_backoff) rather than
+                    // die.
+                    None => {
+                        return super::SessionOutcome::Dropped(
+                            super::NetworkFailure::ConnectionLost,
                         );
                     }
-                    let own_nick = identity.nick.clone();
-                    let classified = match &message {
-                        Some(message) => router.classify(
-                            message,
-                            line,
-                            &ends.names(),
-                            &own_nick,
-                            std::time::Instant::now(),
-                        ),
-                        None => super::replies::Upstream::Session { line, origin: None },
-                    };
-                    match classified {
-                        // A correlation PING's answer: the commands sent since
-                        // want one of their own.
-                        super::replies::Upstream::Consumed => {
-                            if let Some(barrier) = router.barrier_due()
-                                && !lines.say(barrier).await
-                            {
-                                return Stopped;
-                            }
-                        }
-                        super::replies::Upstream::Reply { line, origin } => {
-                            ends.emit_reply(origin, line);
-                        }
-                        super::replies::Upstream::Session { line, origin } => {
-                            // Our own message, echoed by the core: the one echo
-                            // of the line an attachment sent.
-                            let emitted = match &message {
-                                Some(message) => echoes.publish(
-                                    ends,
-                                    message,
-                                    line,
-                                    origin,
-                                    &own_nick,
-                                    &ends.names(),
-                                ),
-                                None => ends.emit_session_line(line),
-                            };
-                            if super::irc_driver::track(
-                                ends,
-                                &session.joined,
-                                &mut identity,
-                                &mut requested_nicks,
-                                emitted,
-                            )
-                            .is_err()
-                            {
-                                return super::SessionOutcome::Dropped(
-                                    super::NetworkFailure::ChannelLimitExceeded,
-                                );
-                            }
+                },
+                // Downstream command -> core.
+                cmd = ends.next_command(), if blocked.is_none() => match cmd {
+                    Some(cmd) => {
+                        if let Some(outcome) = self.command(ends, cmd).await {
+                            return outcome;
                         }
                     }
-                }
-                // Core closed our session: reconnect with a fresh ConnId (and
-                // emit Disconnected via run_with_backoff) rather than die.
-                None => {
-                    return super::SessionOutcome::Dropped(super::NetworkFailure::ConnectionLost);
-                }
-            },
-            // Downstream command -> core.
-            cmd = ends.next_command(), if blocked.is_none() => match cmd {
-                Some(cmd) => {
-                    let Some(line) = super::irc_driver::outgoing(
-                        &cmd,
-                        super::ClientTags::Relayed,
-                        ends,
-                        &session.joined,
-                    ) else {
-                        continue;
-                    };
-                    requested_nicks.observe(&line);
-                    let written = router.forward(
-                        cmd.origin,
-                        &line,
-                        super::replies::Correlation::Order,
-                        &ends.names(),
-                        std::time::Instant::now(),
-                    );
-                    for line in std::iter::once(written).chain(router.barrier_due()) {
-                        if !lines.say(line).await {
-                            return Stopped;
-                        }
-                    }
-                    // The core echoes what it accepts (`echo-message`); the
-                    // echo is routed back to the attachment that sent it.
-                    echoes.sent(&line, cmd.origin, &ends.names());
-                }
-                // Every handle dropped: stop for good (no reconnect — the
-                // network was removed).
-                None => return Stopped,
-            },
+                    // Every handle dropped: stop for good (no reconnect — the
+                    // network was removed).
+                    None => return Stopped,
+                },
+            }
         }
+    }
+
+    /// Relay one line of the core's; the session's end, when it ends it.
+    async fn output(
+        &mut self,
+        ends: &mut DriverEnds,
+        line: String,
+    ) -> Option<super::SessionOutcome> {
+        use super::SessionOutcome::Stopped;
+        let message = e6irc_proto::message::Message::parse(&line)
+            .ok()
+            .map(|parsed| e6irc_client::OwnedMessage::from(&parsed));
+        // The in-process session is a real registered session, so the
+        // liveness reaper PINGs it after ~2 min idle, and the core ends it
+        // with `ERROR` on a KILL, a GHOST or a ban: the session's own
+        // business, read as the `irc` driver reads an upstream's, never an
+        // attached client's line.
+        match message
+            .as_ref()
+            .and_then(|message| super::irc_driver::upstream_control(message, ends))
+        {
+            Some(UpstreamControl::Answer(answer)) => {
+                return (!self.lines.say(answer).await).then_some(Stopped);
+            }
+            Some(UpstreamControl::Capabilities | UpstreamControl::Consumed) => return None,
+            Some(UpstreamControl::Closed(closed)) => {
+                return Some(super::SessionOutcome::ClosedByUpstream(closed));
+            }
+            None => {}
+        }
+        if let Some(message) = &message {
+            super::irc_driver::follow_membership(
+                ends,
+                &self.session.joined,
+                message,
+                &ends.names(),
+            );
+        }
+        let own_nick = self.identity.nick.clone();
+        let classified = match &message {
+            Some(message) => self.router.classify(
+                message,
+                line,
+                &ends.names(),
+                &own_nick,
+                std::time::Instant::now(),
+            ),
+            None => super::replies::Upstream::Session { line, origin: None },
+        };
+        match classified {
+            // A correlation PING's answer: the commands sent since want one
+            // of their own.
+            super::replies::Upstream::Consumed => {
+                if let Some(barrier) = self.router.barrier_due()
+                    && !self.lines.say(barrier).await
+                {
+                    return Some(Stopped);
+                }
+            }
+            super::replies::Upstream::Reply { line, origin } => {
+                ends.emit_reply(origin, line);
+            }
+            super::replies::Upstream::Session { line, origin } => {
+                // Our own message, echoed by the core: the one echo of the
+                // line an attachment sent.
+                let emitted = match &message {
+                    Some(message) => {
+                        self.echoes
+                            .publish(ends, message, line, origin, &own_nick, &ends.names())
+                    }
+                    None => ends.emit_session_line(line),
+                };
+                if super::irc_driver::track(
+                    ends,
+                    &self.session.joined,
+                    &mut self.identity,
+                    &mut self.requested_nicks,
+                    emitted,
+                )
+                .is_err()
+                {
+                    return Some(super::SessionOutcome::Dropped(
+                        super::NetworkFailure::ChannelLimitExceeded,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Send one attachment's command to the core; the session's end, when the
+    /// core is gone.
+    async fn command(
+        &mut self,
+        ends: &mut DriverEnds,
+        cmd: super::ClientCommand,
+    ) -> Option<super::SessionOutcome> {
+        let line = super::irc_driver::outgoing(
+            &cmd,
+            super::ClientTags::Relayed,
+            ends,
+            &self.session.joined,
+        )?;
+        self.requested_nicks.observe(&line);
+        let written = self.router.forward(
+            cmd.origin,
+            &line,
+            super::replies::Correlation::Order,
+            &ends.names(),
+            std::time::Instant::now(),
+        );
+        for line in std::iter::once(written).chain(self.router.barrier_due()) {
+            if !self.lines.say(line).await {
+                return Some(super::SessionOutcome::Stopped);
+            }
+        }
+        // The core echoes what it accepts (`echo-message`); the echo is routed
+        // back to the attachment that sent it.
+        self.echoes.sent(&line, cmd.origin, &ends.names());
+        None
     }
 }
 
@@ -524,6 +836,7 @@ mod tests {
     fn local_session(core_tx: Sender<Input>, autojoin: Vec<String>) -> LocalSession {
         LocalSession {
             core: core_handles(core_tx),
+            home: LocalHomeKey::new(None, LOCAL_NETWORK),
             nick: "alice".into(),
             username: "ident".into(),
             realname: "Alice".into(),
@@ -1010,6 +1323,7 @@ mod tests {
         let driver = Box::new(LocalDriver::new(
             core_handles(core_tx),
             NetworkConfig::default(),
+            LocalHomeKey::new(None, LOCAL_NETWORK),
         ));
         let (handle, run) = driver.prepare().split();
         let mut events = handle.subscribe();
@@ -1037,5 +1351,81 @@ mod tests {
             stopped(task).await,
             super::super::SessionOutcome::Stopped
         ));
+    }
+
+    /// A session a rebuild resumed is taken up, never registered again (D13):
+    /// the driver asks the core what a welcome and each channel would have
+    /// told, takes the answers in with no line reaching the backlog or an
+    /// attachment, publishes the session once, and relays what the core said
+    /// meanwhile after it.
+    #[tokio::test]
+    async fn a_resumed_session_is_taken_up_without_registering_or_a_line_buffered() {
+        let (core_tx, mut core_rx) = core_queue(16);
+        let session = local_session(core_tx, Vec::new());
+        let (mut out_tx, edge) = crate::core::holding_send_queue("sendq", 8 * 512, 0);
+        session.core.core_tx.directories().held.homes.resume(
+            session.home.clone(),
+            ResumedLocal {
+                conn: ConnId(7),
+                edge,
+                nick: "alice".into(),
+                user: "ident".into(),
+                channels: vec!["#room".into()],
+            },
+        );
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        let task = tokio::spawn(async move { session_once(&session, &mut ends).await });
+        for expected in [
+            "VERSION",
+            "TOPIC #room",
+            "NAMES #room",
+            "PING :e6irc-resumed",
+        ] {
+            let Input::Line { conn, line } = core_rx.pop().await.expect("a question").payload
+            else {
+                panic!("expected {expected:?}");
+            };
+            assert_eq!(conn, ConnId(7));
+            assert_eq!(String::from_utf8(line).unwrap(), expected);
+        }
+        for line in [
+            ":e6.example 351 alice e6ircd e6.example :a server",
+            ":e6.example 005 alice CASEMAPPING=rfc1459 CHANTYPES=# :are supported",
+            ":e6.example 332 alice #room :the topic",
+            ":bob!bob@host PRIVMSG #room :meanwhile",
+            ":e6.example 353 alice = #room :@alice bob",
+            ":e6.example 366 alice #room :End of /NAMES list",
+            ":e6.example PONG e6.example :e6irc-resumed",
+        ] {
+            core_says(&mut out_tx, line).await;
+        }
+        let mut seen = Vec::new();
+        let relayed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await.expect("an event") {
+                    super::super::DriverEvent::Line(buffered) => return buffered.line,
+                    other => seen.push(other),
+                }
+            }
+        })
+        .await
+        .expect("the line said meanwhile is relayed");
+        assert!(relayed.ends_with("PRIVMSG #room :meanwhile"), "{relayed}");
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                super::super::DriverEvent::Session(super::super::IrcSessionSnapshot {
+                    nick,
+                    channels,
+                }) if nick == "alice" && channels == &["#room".to_owned()]
+            )),
+            "{seen:?}"
+        );
+        assert_eq!(
+            handle.runtime_snapshot().lifecycle,
+            super::super::NetworkLifecycle::Connected
+        );
+        task.abort();
     }
 }

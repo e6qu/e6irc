@@ -73,6 +73,32 @@ pub struct EdgeLinkConfig {
     pub addr: SocketAddr,
     #[serde(flatten)]
     pub credentials: e6irc_edge::core_link::tls::LinkCredentialFiles,
+    /// The body format a core without a database writes for its edges (D11):
+    /// unstated, the format before this release's newest, so a core of the
+    /// release before reads what this one leaves; stated, advanced to it once
+    /// every core that may take over writes it. A core with a database writes
+    /// the stored format (`e6ircd records advance`) and refuses this.
+    #[serde(default)]
+    pub record_format: Option<u16>,
+}
+
+impl EdgeLinkConfig {
+    /// The body format a core without a database writes; a refusal names a
+    /// format this release does not write.
+    pub(crate) fn record_format(&self) -> Result<crate::core::record::RecordFormat, String> {
+        use crate::core::record::RecordFormat;
+        match self.record_format {
+            None => Ok(RecordFormat::PREVIOUS),
+            Some(number) => RecordFormat::read(number).ok_or_else(|| {
+                format!(
+                    "[edge_link] record_format = {number} is a format this release does not \
+                     write (it writes {} and {})",
+                    RecordFormat::PREVIOUS.number(),
+                    RecordFormat::NEWEST.number()
+                )
+            }),
+        }
+    }
 }
 
 /// Lines each session stream may have in flight to its shard's queue: as
@@ -156,6 +182,9 @@ impl Registration {
 pub(crate) struct LinkedEdges {
     live: Mutex<HashMap<EdgeName, Arc<Registration>>>,
     generations: AtomicU64,
+    /// The slot of the edge a cut homes the core's own sessions on (D13):
+    /// slot 0's replicas — their channel memberships — go there.
+    local_home: Mutex<Option<u16>>,
 }
 
 impl LinkedEdges {
@@ -345,6 +374,9 @@ pub(crate) struct LinkServer {
     pub(crate) terms: EdgeTerms,
     pub(crate) sendq_bytes: usize,
     pub(crate) core_tx: CoreIngress,
+    /// The core's own connection identifiers (slot 0), which a rebuild of
+    /// its own sessions claims from.
+    pub(crate) next_conn: Arc<crate::core::ConnectionIdAllocator>,
     pub(crate) attach: Option<crate::bouncer::AttachPort>,
     pub(crate) upgrades: Arc<EdgeUpgrades>,
     pub(crate) limiter: ConnLimiter,
@@ -364,6 +396,7 @@ pub(crate) struct LinkServerParts {
     pub(crate) terms: EdgeTerms,
     pub(crate) sendq_bytes: usize,
     pub(crate) core_tx: CoreIngress,
+    pub(crate) next_conn: Arc<crate::core::ConnectionIdAllocator>,
     pub(crate) attach: Option<crate::bouncer::AttachPort>,
     pub(crate) upgrades: Arc<EdgeUpgrades>,
     pub(crate) limiter: ConnLimiter,
@@ -390,6 +423,7 @@ impl LinkServer {
             terms: parts.terms,
             sendq_bytes: parts.sendq_bytes,
             core_tx: parts.core_tx,
+            next_conn: parts.next_conn,
             attach: parts.attach,
             upgrades: parts.upgrades,
             limiter: parts.limiter,
@@ -727,6 +761,9 @@ struct SessionStream {
     replica_forwarder: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Answered when the edge says it has paused its input on this stream.
     paused: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Whether the edge's input flows on this stream: `Resume` and `Pause`
+    /// are sent under it, so each goes at most once and never out of order.
+    control: tokio::sync::Mutex<held::StreamControl>,
     /// What the edge uploaded on this stream from the cut it holds.
     uploads: Mutex<held::StreamUploads>,
 }
@@ -765,6 +802,7 @@ impl SessionStream {
                 out.clone(),
             )))),
             paused: Mutex::default(),
+            control: tokio::sync::Mutex::new(held::StreamControl::of(registration.admission)),
             uploads: Mutex::default(),
         });
         registration
@@ -772,7 +810,7 @@ impl SessionStream {
             .lock()
             .expect("link streams")
             .insert(index, stream.clone());
-        server.resume_if_open(&stream);
+        server.resume_if_open(&stream).await;
         let mut writer = tokio::spawn(async move { write_frames(write_half, &mut frames).await });
         let pushing = tokio::spawn(push_lines(
             server.core_tx.clone(),
@@ -901,6 +939,7 @@ impl SessionStream {
                 EdgeFrame::ReplicaUpload(replica) => self.upload_replica(replica)?,
                 EdgeFrame::CutUpload(part) => self.upload_cut(part)?,
                 EdgeFrame::UploadDone => self.upload_done()?,
+                EdgeFrame::HomeUpload(session) => self.upload_home(session)?,
             }
         }
         Ok(())

@@ -24,6 +24,14 @@
 //! channels, then its sessions, in the records' original directory order;
 //! re-authorizes every login against the database (§2) and every address
 //! against the server bans; and resumes every edge.
+//!
+//! **The core's own sessions** (decision D13; [`crate::core::local_home`]):
+//! the `local` bouncer network's in-process sessions have no edge of their
+//! own, so a cut homes them on the first edge that holds it — their records
+//! (`Home`, then `Record`) and their channel memberships (slot 0's replicas)
+//! — and the rebuild hands each back to its network's driver, which takes it
+//! up instead of registering again. Without an edge to home them on they
+//! end before the cut, as any session no edge holds.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -40,8 +48,10 @@ use e6irc_link::{
 use tokio::sync::mpsc;
 
 use super::{LinkEnd, LinkServer, LinkedEdges, Registration, SessionStream};
+use crate::core::local_home::{LocalHomeKey, ResumedLocal};
 use crate::core::record::{
-    AttachRecord, ChannelState, ClockOrigin, CutState, MemberEntry, SessionRecord, UiRecord,
+    AttachRecord, ChannelState, ClockOrigin, CutState, LocalRecord, MemberEntry,
+    RecordedRegistration, SessionRecord, UiRecord,
 };
 use crate::core::{CoreShardId, Input};
 
@@ -56,12 +66,22 @@ const DISCOVERY_WAIT: Duration = Duration::from_secs(1);
 /// How long a cut waits for each stream's `Paused`.
 const PAUSE_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a cut asked of a core still rebuilding waits for the rebuild: the
+/// wait for the edges, then the rebuild itself.
+const REBUILD_FINISH_WAIT: Duration = Duration::from_secs(2 * ROSTER_WAIT.as_secs());
+
 /// How long a cut waits for the work in flight to settle before it closes
 /// the sessions still waiting.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
 
-/// How long a cut waits for each stream's pumps to send what is left.
+/// How long a cut waits for each stream's pumps to send what is left, and
+/// for the core's own sessions to take their records.
 const FLUSH_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a session of the core's own that a rebuild resumed waits for its
+/// network's driver — which starts once the rebuild is over — before it is
+/// closed: its network is gone from this core's configuration.
+const LOCAL_CLAIM_WAIT: Duration = Duration::from_secs(10);
 
 /// The cut the roster says the edges hold: its identifier and the edges it
 /// was sent to.
@@ -77,6 +97,15 @@ pub(crate) struct ReplicaRoutes(pub(crate) Arc<LinkedEdges>);
 
 impl crate::core::ReplicaSink for ReplicaRoutes {
     fn send(&self, slot: u16, shard: CoreShardId, replica: Replica) {
+        // Slot 0 is the core's own: its sessions' memberships go to the edge
+        // a cut homes them on, and nowhere before.
+        let slot = match slot {
+            0 => match *self.0.local_home.lock().expect("local home") {
+                Some(home) => home,
+                None => return,
+            },
+            slot => slot,
+        };
         let registration = self
             .0
             .live
@@ -123,6 +152,8 @@ pub(super) async fn forward_replicas(
 #[derive(Default)]
 pub(super) struct StreamUploads {
     sessions: HashMap<SessionId, (Upload, Body)>,
+    /// The core's own sessions the last core homed on this edge.
+    homed: HashMap<SessionId, Body>,
     replicas: Vec<Replica>,
     cut: Option<(CutId, Body)>,
     done: bool,
@@ -147,7 +178,7 @@ impl SessionStream {
 
     pub(super) fn upload(&self, session: SessionId, upload: Upload) -> io::Result<()> {
         self.uploading()?;
-        self.check_owned(session)?;
+        self.check_owned(session, self.slot.get())?;
         let mut uploads = self.uploads.lock().expect("stream uploads");
         if uploads
             .sessions
@@ -162,14 +193,32 @@ impl SessionStream {
         Ok(())
     }
 
+    /// A session of the last core's own, homed on this edge at its cut.
+    pub(super) fn upload_home(&self, session: SessionId) -> io::Result<()> {
+        self.uploading()?;
+        self.check_owned(session, 0)?;
+        let mut uploads = self.uploads.lock().expect("stream uploads");
+        if uploads.homed.insert(session, Body::default()).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "core link: a homed session uploaded twice",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn upload_record(&self, session: SessionId, part: RecordPart) -> io::Result<()> {
         self.uploading()?;
         let mut uploads = self.uploads.lock().expect("stream uploads");
-        let Some((_, body)) = uploads.sessions.get_mut(&session) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "core link: a record uploaded for a session not uploaded",
-            ));
+        let uploads = &mut *uploads;
+        let body = match uploads.sessions.get_mut(&session) {
+            Some((_, body)) => body,
+            None => uploads.homed.get_mut(&session).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "core link: a record uploaded for a session not uploaded",
+                )
+            })?,
         };
         body.gather(part.part)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
@@ -208,10 +257,10 @@ impl SessionStream {
         Ok(())
     }
 
-    /// A session of this stream's: numbered in its edge's slot, on this
-    /// stream's shard.
-    fn check_owned(&self, session: SessionId) -> io::Result<()> {
-        let in_slot = session.get() >> e6irc_link::SLOT_SHIFT == u64::from(self.slot.get());
+    /// A session of this stream's: numbered in `slot` — its edge's, or the
+    /// core's own (0) for a homed one — on this stream's shard.
+    fn check_owned(&self, session: SessionId, slot: u16) -> io::Result<()> {
+        let in_slot = session.get() >> e6irc_link::SLOT_SHIFT == u64::from(slot);
         let on_stream =
             e6irc_edge::core_link::remote::stream_of(session, usize::from(self.server.streams))
                 == usize::from(self.index);
@@ -233,12 +282,59 @@ impl SessionStream {
         drop(self.replicas.lock().expect("stream replicas").take());
     }
 
-    /// Send `Resume` once: the edge sends input again.
-    fn resume(&self) {
-        let out = self.out.clone();
-        tokio::spawn(async move {
-            drop(out.send(CoreFrame::Resume).await);
-        });
+    /// Send `Resume`, once, unless a cut paused the stream first: the edge
+    /// sends input again.
+    async fn resume(&self) {
+        let mut control = self.control.lock().await;
+        if *control == StreamControl::Held {
+            *control = StreamControl::Flowing;
+            // A link that is gone has no input to resume.
+            drop(self.out.send(CoreFrame::Resume).await);
+        }
+    }
+
+    /// Stop the edge's input on this stream for a cut.
+    async fn pause(&self) -> Pausing {
+        let mut control = self.control.lock().await;
+        let was = std::mem::replace(&mut *control, StreamControl::Paused);
+        if was != StreamControl::Flowing {
+            return Pausing::NeverResumed;
+        }
+        if self.out.send(CoreFrame::Pause).await.is_ok() {
+            Pausing::Asked
+        } else {
+            Pausing::Gone
+        }
+    }
+}
+
+/// How a stream was paused for a cut.
+enum Pausing {
+    /// `Pause` was sent: the edge answers `Paused`.
+    Asked,
+    /// Its input never flowed, so it is paused as it is.
+    NeverResumed,
+    /// Its link is gone.
+    Gone,
+}
+
+/// Whether an edge's input flows on one stream, as the core has said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamControl {
+    /// Admitted to hold or upload: input waits for `Resume`.
+    Held,
+    Flowing,
+    /// A cut paused it: nothing resumes it again.
+    Paused,
+}
+
+impl StreamControl {
+    /// A stream of a link admitted with `admission`.
+    pub(super) fn of(admission: Admission) -> Self {
+        match admission {
+            Admission::Serve => Self::Flowing,
+            Admission::Hold | Admission::Upload => Self::Held,
+        }
     }
 }
 
@@ -255,7 +351,6 @@ enum GateState {
         cut: Option<CutId>,
         expected: HashSet<EdgeName>,
         uploading: HashMap<EdgeName, EdgeUpload>,
-        held: Vec<Arc<Registration>>,
         deadline: tokio::time::Instant,
     },
     /// The rebuild is running.
@@ -280,7 +375,6 @@ impl RebuildGate {
             cut,
             expected,
             uploading: HashMap::new(),
-            held: Vec::new(),
             deadline,
         };
         let state = match pending {
@@ -351,27 +445,20 @@ impl RebuildGate {
         }
     }
 
-    /// Note that a registration joined the rebuild with `admission`.
+    /// Note that a registration joined the rebuild with `admission`: one
+    /// that uploads is waited for. Every edge linked when the rebuild is over
+    /// is resumed then.
     fn joined(&self, registration: &Arc<Registration>) {
         let mut state = self.state.lock().expect("rebuild gate");
-        match &mut *state {
-            GateState::Waiting {
-                uploading, held, ..
-            } => match registration.admission {
-                Admission::Upload => {
-                    uploading.insert(
-                        registration.view.name.clone(),
-                        EdgeUpload {
-                            registration: registration.clone(),
-                        },
-                    );
-                }
-                Admission::Hold => held.push(registration.clone()),
-                Admission::Serve => {}
-            },
-            // The rebuild is running: the edge is resumed when it is done.
-            GateState::Rebuilding => {}
-            GateState::Open => {}
+        if let GateState::Waiting { uploading, .. } = &mut *state
+            && registration.admission == Admission::Upload
+        {
+            uploading.insert(
+                registration.view.name.clone(),
+                EdgeUpload {
+                    registration: registration.clone(),
+                },
+            );
         }
     }
 
@@ -423,18 +510,12 @@ impl RebuildGate {
     fn take_for_rebuild(&self) -> Option<TakenForRebuild> {
         let mut state = self.state.lock().expect("rebuild gate");
         match std::mem::replace(&mut *state, GateState::Rebuilding) {
-            GateState::Waiting {
-                cut,
-                uploading,
-                held,
-                ..
-            } => Some(TakenForRebuild {
+            GateState::Waiting { cut, uploading, .. } => Some(TakenForRebuild {
                 cut,
                 uploaded: uploading
                     .into_values()
                     .map(|upload| upload.registration)
                     .collect(),
-                held,
             }),
             other => {
                 *state = other;
@@ -459,7 +540,6 @@ impl RebuildGate {
 struct TakenForRebuild {
     cut: Option<CutId>,
     uploaded: Vec<Arc<Registration>>,
-    held: Vec<Arc<Registration>>,
 }
 
 /// The edges a registration's uploaded cut state names.
@@ -497,20 +577,15 @@ impl LinkServer {
 
     /// A stream of a link admitted to hold or upload that started after the
     /// rebuild: resume it.
-    pub(super) fn resume_if_open(&self, stream: &SessionStream) {
-        if stream.registration.admission != Admission::Serve && self.rebuild.is_open() {
-            stream.resume();
+    pub(super) async fn resume_if_open(&self, stream: &SessionStream) {
+        if self.rebuild.is_open() {
+            stream.resume().await;
         }
     }
 }
 
 fn spawn_rebuild(server: Arc<LinkServer>) {
-    let Some(TakenForRebuild {
-        cut,
-        uploaded,
-        held,
-    }) = server.rebuild.take_for_rebuild()
-    else {
+    let Some(TakenForRebuild { cut, uploaded }) = server.rebuild.take_for_rebuild() else {
         return;
     };
     tokio::spawn(async move {
@@ -520,16 +595,38 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
             server.roster.clear_cut(cut).await;
         }
         server.rebuild.opened();
-        server.core_tx.directories().held.rebuilt.done();
-        for registration in uploaded.iter().chain(held.iter()) {
-            for stream in registration.streams.lock().expect("link streams").values() {
-                stream.resume();
+        // Every edge linked now — those that uploaded, those held, and any
+        // that linked while the rebuild ran — is resumed; one whose stream
+        // starts after `opened` resumes it itself (`resume_if_open`).
+        let registrations: Vec<Arc<Registration>> = server
+            .edges
+            .live
+            .lock()
+            .expect("linked edges")
+            .values()
+            .cloned()
+            .collect();
+        for registration in registrations {
+            let streams: Vec<Arc<SessionStream>> = registration
+                .streams
+                .lock()
+                .expect("link streams")
+                .values()
+                .cloned()
+                .collect();
+            for stream in streams {
+                stream.resume().await;
             }
         }
+        server.core_tx.directories().held.rebuilt.done();
+        if rebuilt.local > 0 {
+            tokio::spawn(close_unclaimed(server.clone()));
+        }
         eprintln!(
-            "e6ircd: rebuilt {} sessions, {} live chat sockets, {} attachments and {} channels \
-             from {} edges in {} ms; every edge is resumed",
+            "e6ircd: rebuilt {} sessions ({} of the core's own), {} live chat sockets, {} \
+             attachments and {} channels from {} edges in {} ms; every edge is resumed",
             rebuilt.sessions,
+            rebuilt.local,
             rebuilt.sockets,
             rebuilt.attachments,
             rebuilt.channels,
@@ -539,10 +636,28 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
     });
 }
 
+/// Close each session of the core's own that the rebuild resumed and no
+/// driver took up within [`LOCAL_CLAIM_WAIT`]: its network is not this
+/// core's.
+async fn close_unclaimed(server: Arc<LinkServer>) {
+    tokio::time::sleep(LOCAL_CLAIM_WAIT).await;
+    for (key, resumed) in server.core_tx.directories().held.homes.unclaimed() {
+        eprintln!(
+            "e6ircd: no local network {key} took up its session {} within {}s of the rebuild; \
+             it is closed",
+            resumed.conn.0,
+            LOCAL_CLAIM_WAIT.as_secs()
+        );
+        close(&server, resumed.conn, "local network removed").await;
+    }
+}
+
 /// What a rebuild resumed.
 #[derive(Default)]
 struct Rebuilt {
     sessions: usize,
+    /// Of the sessions, the core's own.
+    local: usize,
     channels: usize,
     /// Live chat sockets resumed.
     sockets: usize,
@@ -554,8 +669,50 @@ struct Rebuilt {
 struct UploadedSession {
     stream: Arc<SessionStream>,
     id: SessionId,
-    upload: Upload,
+    origin: Uploaded,
     record: SessionRecord,
+}
+
+/// Whose a session an edge uploaded is.
+enum Uploaded {
+    /// A client's, as the edge knows it.
+    Client(Upload),
+    /// The core's own, of this `local` network, registered under `nick` and
+    /// `user`, which the last core homed on the edge.
+    Home {
+        key: LocalHomeKey,
+        nick: String,
+        user: String,
+    },
+}
+
+impl UploadedSession {
+    /// The address the session opened with: its client's, or the host the
+    /// core's own sessions open with.
+    fn address(&self) -> String {
+        match &self.origin {
+            Uploaded::Client(upload) => ClientIp::new(upload.address).to_string(),
+            Uploaded::Home { .. } => self.record.host.clone(),
+        }
+    }
+
+    /// Resume it no further, saying why: its client is told; a session of
+    /// the core's own is named in the log, and its driver registers anew.
+    async fn refuse(&self, reason: &str) {
+        match &self.origin {
+            Uploaded::Client(upload) => refuse_held(&self.stream, self.id, upload, reason).await,
+            Uploaded::Home { key, .. } => refuse_home(key, self.id, reason),
+        }
+    }
+}
+
+/// Resume a session of the core's own no further: its driver registers anew.
+fn refuse_home(key: &LocalHomeKey, id: SessionId, reason: &str) {
+    eprintln!(
+        "e6ircd: the session {} of local network {key} is not resumed ({reason}); its driver \
+         registers anew",
+        id.get()
+    );
 }
 
 /// One channel as the edges' replicas hold it.
@@ -657,7 +814,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                         Ok(record) => sessions.push(UploadedSession {
                             stream: stream.clone(),
                             id,
-                            upload,
+                            origin: Uploaded::Client(upload),
                             record,
                         }),
                         Err(error) => refuse_held(&stream, id, &upload, unreadable(error)).await,
@@ -670,6 +827,22 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                         Ok(record) => attachments.push((stream.clone(), id, upload, record)),
                         Err(error) => refuse_held(&stream, id, &upload, unreadable(error)).await,
                     },
+                }
+            }
+            for (id, body) in uploads.homed {
+                match homed_session(body, origin) {
+                    Ok((origin, record)) => sessions.push(UploadedSession {
+                        stream: stream.clone(),
+                        id,
+                        origin,
+                        record,
+                    }),
+                    Err(reason) => eprintln!(
+                        "e6ircd: the session {} of the core's own held by edge {} is not \
+                         resumed: {reason}; its driver registers anew",
+                        id.get(),
+                        registration.view.name
+                    ),
                 }
             }
         }
@@ -718,13 +891,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
         if let Some(nick) = nick
             && !nicks.insert(casemap.casefold(nick))
         {
-            refuse_held(
-                &session.stream,
-                session.id,
-                &session.upload,
-                "server restarting: nick taken",
-            )
-            .await;
+            session.refuse("server restarting: nick taken").await;
             continue;
         }
         resumed.push(session);
@@ -746,6 +913,8 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
     // Channels first, on their owners, so a session's shard finds its
     // channels there.
     let mut session_channels: HashMap<SessionId, Vec<String>> = HashMap::new();
+    // The channels' names as spelled, for the core's own sessions' drivers.
+    let mut channel_names: HashMap<SessionId, Vec<String>> = HashMap::new();
     for (key, merged) in channels {
         let Some((revision, state)) = merged.state else {
             continue;
@@ -762,6 +931,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
             }
         };
         let chan_key = crate::core::FoldedChannel::fold(casemap, &state.name);
+        let name = state.name.clone();
         let mut members = Vec::new();
         for (member, entry) in merged.members {
             let Some(session) = records.get(&member) else {
@@ -771,7 +941,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                 continue;
             };
             let conn = ConnId(member.get());
-            let address = ClientIp::new(session.upload.address).to_string();
+            let address = session.address();
             if let Some(member) = crate::core::RebuiltMember::of(
                 conn,
                 shards.session_owner(conn).shard(),
@@ -785,6 +955,10 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                     .entry(session.id)
                     .or_default()
                     .push(chan_key.as_str().to_owned());
+                channel_names
+                    .entry(session.id)
+                    .or_default()
+                    .push(name.clone());
             }
         }
         if members.is_empty() {
@@ -820,26 +994,51 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
         })
         .collect();
     for session in resumed {
+        let address = session.address();
         let UploadedSession {
             stream,
             id,
-            upload,
+            origin,
             record,
         } = session;
-        let Some(tx) = stream.resume_irc(id, &upload) else {
-            continue;
-        };
         let conn = ConnId(id.get());
+        let (tx, resumed_local) = match &origin {
+            Uploaded::Client(upload) => match stream.resume_irc(id, upload) {
+                Some(tx) => (tx, None),
+                None => continue,
+            },
+            Uploaded::Home { key, nick, user } => {
+                // Its identifier is the last core's: this core must never
+                // give it out again.
+                if !server.next_conn.claim(conn) {
+                    refuse_home(key, id, "its identifier may be another session's here");
+                    continue;
+                }
+                let (tx, edge) = crate::core::holding_send_queue("sendq", server.sendq_bytes, 0);
+                let resumed = ResumedLocal {
+                    conn,
+                    edge,
+                    nick: nick.clone(),
+                    user: user.clone(),
+                    channels: channel_names.remove(&id).unwrap_or_default(),
+                };
+                (tx, Some((key.clone(), resumed)))
+            }
+        };
+        let (since_input_ms, unconfirmed, closed) = match origin {
+            Uploaded::Client(upload) => (upload.since_input_ms, upload.unconfirmed, upload.closed),
+            Uploaded::Home { .. } => (0, 0, None),
+        };
         let rebuild = crate::core::SessionRebuild {
             conn,
             record,
             tx,
             directory_key: directories.directory_keys.next(),
-            address: ClientIp::new(upload.address).to_string(),
-            since_input_ms: upload.since_input_ms,
+            address,
+            since_input_ms,
             channels: session_channels.remove(&id).unwrap_or_default(),
             idle_since: idle[&id].clone(),
-            unconfirmed: upload.unconfirmed,
+            unconfirmed,
         };
         if server
             .core_tx
@@ -851,9 +1050,13 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
             return rebuilt;
         }
         rebuilt.sessions += 1;
+        if let Some((key, resumed)) = resumed_local {
+            directories.held.homes.resume(key, resumed);
+            rebuilt.local += 1;
+        }
         // A client that left while no core was there has its session end
         // now, as it would have: its channels see it go.
-        if let Some(reason) = upload.closed {
+        if let Some(reason) = closed {
             stream.closed(id, session_closed(reason));
         }
     }
@@ -880,6 +1083,24 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
         }
     }
     rebuilt
+}
+
+/// A session of the core's own as its edge held it: its network, and its
+/// record — one not yet registered is not resumed, as its driver registers
+/// anew anyway.
+fn homed_session(body: Body, origin: ClockOrigin) -> Result<(Uploaded, SessionRecord), String> {
+    let bytes = body.joined().ok_or("its record is missing")?;
+    let homed = LocalRecord::decode(bytes, origin).map_err(|error| error.to_string())?;
+    let record = SessionRecord::decode(homed.session, origin).map_err(|error| error.to_string())?;
+    let RecordedRegistration::Registered { nick, user, .. } = &record.registration else {
+        return Err("it was not registered yet".into());
+    };
+    let origin = Uploaded::Home {
+        key: LocalHomeKey::new(homed.owner.as_deref(), &homed.network),
+        nick: nick.clone(),
+        user: user.clone(),
+    };
+    Ok((origin, record))
 }
 
 /// Resume a bouncer attachment on this core from its record; one this core
@@ -1035,6 +1256,50 @@ async fn close(server: &LinkServer, conn: ConnId, reason: &str) {
     );
 }
 
+/// The frames that home one of the core's own sessions on an edge: `Home`,
+/// then its record in parts. `None`, said, when the record cannot be sent.
+fn home_frames(
+    record: &crate::core::local_home::HomedRecord,
+    format: crate::core::record::RecordFormat,
+    origin: ClockOrigin,
+) -> Option<Vec<CoreFrame>> {
+    let id = SessionId::new(record.conn.0).expect("a session identifier is never 0");
+    let homed = LocalRecord {
+        owner: record.key.owner.clone(),
+        network: record.key.network.clone(),
+        session: record.body.clone(),
+    };
+    let parts = homed
+        .encode(format, origin)
+        .map_err(|error| error.to_string())
+        .and_then(|body| {
+            BodyPart::split(&body).ok_or_else(|| "past the body part count".to_owned())
+        });
+    match parts {
+        Ok(parts) => Some(
+            std::iter::once(CoreFrame::Home(id))
+                .chain(parts.into_iter().map(|part| {
+                    CoreFrame::Record(
+                        id,
+                        RecordPart {
+                            revision: record.revision,
+                            part,
+                        },
+                    )
+                }))
+                .collect(),
+        ),
+        Err(error) => {
+            eprintln!(
+                "e6ircd: the session {} of local network {} cannot be homed ({error}); it ends \
+                 with this core",
+                record.conn.0, record.key
+            );
+            None
+        }
+    }
+}
+
 /// Close a session the edge held that this core does not resume, telling
 /// its client why.
 async fn refuse_held(stream: &SessionStream, id: SessionId, upload: &Upload, reason: &str) {
@@ -1083,6 +1348,8 @@ pub(crate) struct Handover {
     pub(crate) unsettled: usize,
     /// Sessions closed because no edge holds them.
     pub(crate) unheld: usize,
+    /// The core's own sessions homed on an edge (D13).
+    pub(crate) homed: usize,
 }
 
 impl LinkServer {
@@ -1108,19 +1375,45 @@ impl LinkServer {
             );
         }
         let mut handover = Handover::default();
+        // 0. A core still rebuilding what its edges hold finishes first: what
+        //    it cuts is then whole, and the streams it resumes are resumed
+        //    before they are paused.
+        let rebuilt = self.core_tx.directories().held.rebuilt;
+        if tokio::time::timeout(REBUILD_FINISH_WAIT, rebuilt.wait())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "e6ircd: the rebuild did not finish within {}s of the cut being asked; the cut \
+                 goes ahead without what it had not rebuilt",
+                REBUILD_FINISH_WAIT.as_secs()
+            );
+        }
         // 1. Pause every stream, and hear it pause.
         let mut paused = Vec::new();
         for registration in &holding {
-            for stream in registration.streams.lock().expect("link streams").values() {
+            let streams: Vec<Arc<SessionStream>> = registration
+                .streams
+                .lock()
+                .expect("link streams")
+                .values()
+                .cloned()
+                .collect();
+            for stream in streams {
                 let (answer, answered) = tokio::sync::oneshot::channel();
                 *stream.paused.lock().expect("pause answer") = Some(answer);
-                paused.push((registration.clone(), stream.out.clone(), answered));
+                paused.push((registration.clone(), stream, answered));
             }
         }
         let mut holding_paused = Vec::new();
-        for (registration, out, answered) in paused {
-            let heard = out.send(CoreFrame::Pause).await.is_ok()
-                && matches!(tokio::time::timeout(PAUSE_WAIT, answered).await, Ok(Ok(())));
+        for (registration, stream, answered) in paused {
+            let heard = match stream.pause().await {
+                Pausing::Asked => {
+                    matches!(tokio::time::timeout(PAUSE_WAIT, answered).await, Ok(Ok(())))
+                }
+                Pausing::NeverResumed => true,
+                Pausing::Gone => false,
+            };
             if !heard {
                 eprintln!(
                     "e6ircd: edge {} did not pause within {}s; its link is not cut, and its \
@@ -1143,12 +1436,22 @@ impl LinkServer {
         // 2. Settle: every line handed to its shard, nothing between shards,
         //    no database round trip awaited.
         handover.unsettled = self.settle(&holding).await;
-        // 2b. A session no edge holds — the `local` driver's, which the core
-        //     itself holds (D13 is not built), and any on a version 1 link —
-        //     ends now, loudly, so its channels see it go before the cut
-        //     rather than keep it with no session behind it; then the quits
-        //     settle.
-        match self.core_tx.close_unheld("server restarting").await {
+        // 2b. The core's own sessions — the `local` driver's — are homed on
+        //     the first edge that holds the cut, and their memberships (slot
+        //     0's replicas) go there from now on (D13). A session no edge
+        //     holds — one on a version 1 link, or the core's own with no edge
+        //     to home it on — ends now, loudly, so its channels see it go
+        //     before the cut rather than keep it with no session behind it;
+        //     then the quits settle.
+        let home = holding.first().cloned();
+        *self.edges.local_home.lock().expect("local home") = home
+            .as_ref()
+            .map(|registration| registration.view.slot.get());
+        match self
+            .core_tx
+            .close_unheld("server restarting", home.is_some())
+            .await
+        {
             Ok(0) => {}
             Ok(closed) => {
                 handover.unheld = closed;
@@ -1186,6 +1489,31 @@ impl LinkServer {
             .encode(format, origin)
             .expect("the cut state is within every body bound");
         let parts = BodyPart::split(&body).expect("the cut state is within the body part count");
+        // 3b. The core's own sessions, once their drivers have taken the
+        //     records the cut published: each is homed on its stream of the
+        //     home edge.
+        let mut homed: HashMap<u16, Vec<CoreFrame>> = HashMap::new();
+        if home.is_some() {
+            let records = self
+                .core_tx
+                .directories()
+                .held
+                .homes
+                .gathered(FLUSH_WAIT)
+                .await;
+            for record in records {
+                let Some(frames) = home_frames(&record, format, origin) else {
+                    continue;
+                };
+                let id = SessionId::new(record.conn.0).expect("a session identifier is never 0");
+                let index = e6irc_edge::core_link::remote::stream_of(id, usize::from(self.streams));
+                homed
+                    .entry(u16::try_from(index).expect("a stream index fits"))
+                    .or_default()
+                    .extend(frames);
+                handover.homed += 1;
+            }
+        }
         // 4. Each stream: its pumps send what is left and stop; the first
         //    stream carries the cut state; every stream ends with the cut.
         for registration in &holding {
@@ -1220,6 +1548,14 @@ impl LinkServer {
                         registration.view.name,
                         FLUSH_WAIT.as_secs()
                     );
+                }
+                if home
+                    .as_ref()
+                    .is_some_and(|home| Arc::ptr_eq(home, registration))
+                {
+                    for frame in homed.remove(&stream.index).unwrap_or_default() {
+                        drop(stream.out.send(frame).await);
+                    }
                 }
                 if stream.index == 0 {
                     for part in &parts {

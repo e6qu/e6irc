@@ -154,6 +154,7 @@ async fn a_core_below_the_accepted_epoch_is_refused_and_dialing_goes_on() {
                     .edge_connector()
                     .expect("connector"),
                 listeners: Vec::new(),
+                core_absence_limit: std::time::Duration::from_secs(600),
             },
             linked,
         ),
@@ -349,14 +350,18 @@ fn record_parts_gather_into_the_newest_whole_record() {
         .gather_record(part(1, 0, true, b"one"))
         .expect("gathered");
     assert_eq!(
-        state.record.as_ref().and_then(|(_, body)| body.joined()),
+        state
+            .record
+            .whole
+            .as_ref()
+            .and_then(|(_, body)| body.joined()),
         Some(Bytes::from_static(b"one"))
     );
     state
         .gather_record(part(2, 0, false, b"tw"))
         .expect("gathered");
     assert_eq!(
-        state.record.as_ref().map(|(revision, _)| *revision),
+        state.record.whole.as_ref().map(|(revision, _)| *revision),
         Some(1),
         "a partial record replaces nothing"
     );
@@ -372,6 +377,7 @@ fn record_parts_gather_into_the_newest_whole_record() {
     assert_eq!(
         state
             .record
+            .whole
             .as_ref()
             .map(|(revision, body)| (*revision, body.joined())),
         Some((2, Some(Bytes::from_static(b"two"))))
@@ -402,4 +408,40 @@ fn a_held_channel_uploads_its_state_then_its_members() {
         Some(&ReplicaChange::State(Bytes::from_static(b"state")))
     );
     assert!(replicas.iter().all(|replica| replica.revision == 4));
+}
+
+/// A session the core homed here uploads its newest whole record, and
+/// nothing while its first record is still in parts.
+#[test]
+fn a_homed_session_uploads_its_newest_whole_record() {
+    let session = SessionId::new(3).expect("an identifier");
+    let part = |revision, index, last, bytes: &'static [u8]| RecordPart {
+        revision,
+        part: e6irc_link::BodyPart {
+            index,
+            last,
+            bytes: Bytes::from_static(bytes),
+        },
+    };
+    let mut homed = HeldRecord::default();
+    homed.gather(part(1, 0, false, b"on")).expect("gathered");
+    assert!(homed.upload(session).is_empty(), "no whole record yet");
+    homed.gather(part(1, 1, true, b"e")).expect("gathered");
+    homed.gather(part(2, 0, false, b"tw")).expect("gathered");
+    let uploaded: Vec<(u64, Bytes)> = homed
+        .upload(session)
+        .into_iter()
+        .map(|frame| match frame {
+            EdgeFrame::RecordUpload(id, RecordPart { revision, part }) if id == session => {
+                (revision, part.bytes)
+            }
+            other => panic!("not this session's record: {other:?}"),
+        })
+        .collect();
+    let joined: Vec<u8> = uploaded
+        .iter()
+        .flat_map(|(_, bytes)| bytes.to_vec())
+        .collect();
+    assert!(uploaded.iter().all(|(revision, _)| *revision == 1));
+    assert_eq!(joined, b"one");
 }
