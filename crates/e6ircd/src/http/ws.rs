@@ -806,6 +806,15 @@ pub(super) async fn ws_ui_conn(
                             send_unavailable(&mut socket).await;
                             break;
                         }
+                        crate::bouncer::SendOutcome::Disconnected => {
+                            let event = composer_result_event(cursor, ComposerResult::Rejected {
+                                request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
+                                message: "the network is not connected (it is connecting or reconnecting); nothing was sent",
+                            });
+                            if socket.send(event).await.is_err() {
+                                break;
+                            }
+                        }
                         crate::bouncer::SendOutcome::Unavailable => {
                             let event = composer_result_event(cursor, ComposerResult::Rejected {
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
@@ -1523,6 +1532,19 @@ pub(super) fn status_event(status: ConnStatus, reason: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// The composer's reading of `frame` on a network whose session
+    /// `authority` decides, named as RFC 1459 names things.
+    fn composed(
+        frame: &serde_json::Value,
+        authority: SessionAuthority,
+    ) -> Result<ComposerRequest, ComposerRequestError> {
+        composer_request(
+            &frame.to_string(),
+            authority,
+            &e6irc_client::NetworkNames::default(),
+        )
+    }
+
     #[test]
     fn connected_sticky_status_does_not_serialize_a_historical_failure() {
         let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
@@ -1770,12 +1792,7 @@ mod tests {
             "/raw MARKREAD #rust",
         ] {
             let frame = serde_json::json!({ "id": "a1", "target": "#rust", "message": message });
-            let error = composer_request(
-                &frame.to_string(),
-                SessionAuthority::Upstream,
-                &e6irc_client::NetworkNames::default(),
-            )
-            .expect_err(message);
+            let error = composed(&frame, SessionAuthority::Upstream).expect_err(message);
             assert_eq!(
                 error.request_id.as_ref().map(ComposerRequestId::as_str),
                 Some("a1")
@@ -1790,12 +1807,7 @@ mod tests {
         for message in ["QUIT", "/me will QUIT soon", "/msg friend PING me"] {
             let frame = serde_json::json!({ "target": "#rust", "message": message });
             assert!(
-                composer_request(
-                    &frame.to_string(),
-                    SessionAuthority::Upstream,
-                    &e6irc_client::NetworkNames::default()
-                )
-                .is_ok(),
+                composed(&frame, SessionAuthority::Upstream).is_ok(),
                 "{message}"
             );
         }
@@ -1812,12 +1824,7 @@ mod tests {
             "/raw NICK x",
         ] {
             let frame = serde_json::json!({ "id": "b1", "target": "#general", "message": message });
-            let error = composer_request(
-                &frame.to_string(),
-                SessionAuthority::Provider,
-                &e6irc_client::NetworkNames::default(),
-            )
-            .expect_err(message);
+            let error = composed(&frame, SessionAuthority::Provider).expect_err(message);
             assert!(
                 error.message.contains("provider account"),
                 "{message}: {error:?}"
@@ -1828,24 +1835,12 @@ mod tests {
             );
             // The same command on an IRC network is the upstream's to answer.
             assert!(
-                composer_request(
-                    &frame.to_string(),
-                    SessionAuthority::Upstream,
-                    &e6irc_client::NetworkNames::default()
-                )
-                .is_ok(),
+                composed(&frame, SessionAuthority::Upstream).is_ok(),
                 "{message}"
             );
         }
         let frame = serde_json::json!({ "target": "#general", "message": "hello" });
-        assert!(
-            composer_request(
-                &frame.to_string(),
-                SessionAuthority::Provider,
-                &e6irc_client::NetworkNames::default()
-            )
-            .is_ok()
-        );
+        assert!(composed(&frame, SessionAuthority::Provider).is_ok());
     }
 
     #[test]

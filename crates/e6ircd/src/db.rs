@@ -3838,26 +3838,8 @@ async fn handle_request(
             topic,
             label,
         } => {
-            let result = match persist_channel_registration(
-                pool,
-                &channel,
-                &founder_account,
-                &topic,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("db: channel registration failed: {error}");
-                    crate::core::ChannelRegistrationResult::Unavailable
-                }
-            };
-            // Counted here, once, for both ways of being unavailable: the
-            // error arm above used to count it too, so every failed
-            // registration was recorded as two database errors.
-            if matches!(result, crate::core::ChannelRegistrationResult::Unavailable) {
-                record_database_error(telemetry);
-            }
+            let result =
+                register_channel(pool, telemetry, &channel, &founder_account, &topic).await;
             core_tx
                 .push(Input::ChannelRegistrationPersisted {
                     owner,
@@ -3878,21 +3860,8 @@ async fn handle_request(
             founder_account,
             topic,
         } => {
-            let result = match persist_channel_registration(
-                pool,
-                &channel,
-                &founder_account,
-                &topic,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    record_database_error(telemetry);
-                    eprintln!("db: owner channel registration failed: {error}");
-                    crate::core::ChannelRegistrationResult::Unavailable
-                }
-            };
+            let result =
+                register_channel(pool, telemetry, &channel, &founder_account, &topic).await;
             core_tx
                 .push(Input::OwnedChannelRegistrationResult {
                     owner,
@@ -7054,6 +7023,31 @@ pub async fn drop_channel(
     Ok(Ok(()))
 }
 
+/// Register `channel` for `founder_account`, for a session's `REGISTER` and
+/// an owner's API request alike. A registration that is unavailable is one
+/// database error, counted here once for both ways of being unavailable (an
+/// error, or storage answering so). The owner's path, written apart from the
+/// session's, counted only the first.
+async fn register_channel(
+    pool: &PgPool,
+    telemetry: Option<&Telemetry>,
+    channel: &str,
+    founder_account: &str,
+    topic: &Option<(String, String, u64)>,
+) -> crate::core::ChannelRegistrationResult {
+    let result = match persist_channel_registration(pool, channel, founder_account, topic).await {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("db: channel registration failed: {error}");
+            crate::core::ChannelRegistrationResult::Unavailable
+        }
+    };
+    if matches!(result, crate::core::ChannelRegistrationResult::Unavailable) {
+        record_database_error(telemetry);
+    }
+    result
+}
+
 /// Insert one registered channel with its initial retained topic and audit
 /// record as one transition. Both ChanServ and the owner HTTP control plane use
 /// this function; only their authorization and response transports differ.
@@ -9518,7 +9512,9 @@ pub async fn claim_bnc_ring(
     sqlx::query(
         "INSERT INTO bnc_ring_positions (owner, network, epoch, clean_through)
          VALUES ($1, $2, $3, NULL)
-         ON CONFLICT (owner, network) DO UPDATE SET epoch = $3, clean_through = NULL",
+         ON CONFLICT (owner, network) DO UPDATE SET epoch = $3, clean_through = NULL,
+             let_go_through = CASE WHEN bnc_ring_positions.epoch = $3
+                                   THEN bnc_ring_positions.let_go_through END",
     )
     .bind(&key.owner)
     .bind(&key.network)
@@ -9704,46 +9700,93 @@ pub async fn trim_bnc_buffer(pool: &PgPool, buffer: &BncBuffer) -> Result<(), Db
     Ok(())
 }
 
-/// Delete up to `limit` of the oldest lines beyond the caps of one canonical
-/// (owner, network) buffer; returns how many went. The row-cap boundary is one
-/// index probe (`OFFSET cap` into `bnc_buffer_lookup_idx`, newest first); the
-/// byte-cap boundary is the newest row at which the lines from the newest back
-/// pass [`BNC_BUFFER_BYTES`], a running sum over at most the row cap's rows
-/// (older ones are beyond the row cap anyway). Everything at or below the
-/// later boundary goes, and the batch is named by primary key.
+/// The rows of one (owner, network) buffer in the order it keeps them, each
+/// with its place in that order (`kept`) and the bytes of it and every row
+/// kept before it (`kept_bytes`): a row's `depth` is how many newer rows its
+/// own conversation (`target`; every line of no conversation shares one) has,
+/// and the newest of every conversation is kept before the second newest of
+/// any. A busy channel therefore gives up its older lines before a quiet
+/// conversation gives up its newest — the share the ring keeps
+/// (`bouncer::Share`) — and the network's caps still bound the whole.
+macro_rules! bnc_kept_order {
+    () => {
+        "SELECT id, line,
+                row_number() OVER (ORDER BY depth, id DESC) AS kept,
+                sum(octet_length(line)) OVER (ORDER BY depth, id DESC) AS kept_bytes
+         FROM (SELECT id, line,
+                      row_number() OVER (PARTITION BY target ORDER BY id DESC) AS depth
+               FROM bnc_buffer
+               WHERE owner = $1 AND network = $2) per_conversation"
+    };
+}
+
+/// Delete up to `limit` of the lines beyond the caps of one canonical
+/// (owner, network) buffer, in the order it keeps them ([`bnc_kept_order!`]);
+/// returns how many went. A row goes when it is past the row cap in that
+/// order, or when the rows up to it pass [`BNC_BUFFER_BYTES`]; the batch is
+/// named by primary key, oldest first. The newest ring position deleted is
+/// recorded as let go of (migration 0103), so a continued ring refuses a
+/// cursor before it ([`bnc_ring_let_go`]).
 async fn trim_bnc_buffer_batch(
     pool: &PgPool,
     owner: &str,
     network: &str,
     limit: u64,
 ) -> Result<u64, DbError> {
-    sqlx::query(
-        "DELETE FROM bnc_buffer WHERE id = ANY(ARRAY(
-             SELECT id FROM bnc_buffer
-             WHERE owner = $1 AND network = $2 AND id <= greatest(
-                 (SELECT id FROM bnc_buffer
-                  WHERE owner = $1 AND network = $2
-                  ORDER BY id DESC OFFSET $3 LIMIT 1),
-                 (SELECT id FROM (
-                      SELECT id, sum(octet_length(line)) OVER (ORDER BY id DESC) AS newer
-                      FROM (SELECT id, line FROM bnc_buffer
-                            WHERE owner = $1 AND network = $2
-                            ORDER BY id DESC LIMIT $3) newest
-                  ) running
-                  WHERE newer > $5
-                  ORDER BY id DESC LIMIT 1)
-             )
-             ORDER BY id LIMIT $4))",
-    )
+    sqlx::query_scalar::<_, i64>(concat!(
+        "WITH gone AS (
+             DELETE FROM bnc_buffer WHERE id = ANY(ARRAY(
+                 SELECT id FROM (",
+        bnc_kept_order!(),
+        ") ordered
+                 WHERE kept > $3 OR kept_bytes > $5
+                 ORDER BY id LIMIT $4))
+             RETURNING seq),
+         noted AS (
+             UPDATE bnc_ring_positions
+             SET let_go_through = greatest(let_go_through, (SELECT max(seq) FROM gone))
+             WHERE owner = $1 AND network = $2
+               AND (SELECT max(seq) FROM gone) IS NOT NULL)
+         SELECT count(*) FROM gone"
+    ))
     .bind(owner)
     .bind(network)
     .bind(BNC_BUFFER_CAP)
     .bind(limit as i64)
     .bind(BNC_BUFFER_BYTES)
-    .execute(pool)
+    .fetch_one(pool)
     .await
-    .map(|result| result.rows_affected())
+    .map(i64::cast_unsigned)
     .map_err(query_error)
+}
+
+/// The newest position of `(owner, network)`'s ring that its stored backlog
+/// let go of from among what it keeps: deleted by a trim (migration 0103), or
+/// stored but not among the `restore` rows a start restores. A continued
+/// ring refuses a cursor before it: the client would resume past a line it
+/// never saw.
+pub async fn bnc_ring_let_go(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    restore: i64,
+) -> Result<Option<u64>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let (trimmed, unrestored): (Option<i64>, Option<i64>) = sqlx::query_as(concat!(
+        "SELECT (SELECT let_go_through FROM bnc_ring_positions
+                 WHERE owner = $1 AND network = $2),
+                (SELECT max(seq) FROM bnc_buffer WHERE id = ANY(ARRAY(
+                     SELECT id FROM (",
+        bnc_kept_order!(),
+        ") ordered WHERE kept > $3)))"
+    ))
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(restore)
+    .fetch_one(pool)
+    .await
+    .map_err(query_error)?;
+    Ok(trimmed.max(unrestored).map(i64::cast_unsigned))
 }
 
 /// The most recent `limit` persisted lines for `(owner, network)`,
@@ -9820,12 +9863,13 @@ pub async fn recent_bnc_backlog(
     limit: i64,
 ) -> Result<Vec<StoredBacklogLine>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
-    // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
-    // backward and filters out every other buffer's newer lines, so a quiet
-    // buffer's replay cost grew with everyone else's traffic. A row from
-    // before `sent_at` existed has its arrival.
-    let rows: Vec<StoredBacklogRow> = sqlx::query_as(
+    // The ids are the buffer's first `limit` in the order it keeps them
+    // (`bnc_kept_order!`), read from this buffer's rows alone (an ordered scan
+    // of `bnc_buffer_lookup_idx`, so a quiet buffer's restore does not grow
+    // with everyone else's traffic): a quiet conversation's newest lines are
+    // restored however busy another was. A row from before `sent_at` existed
+    // has its arrival.
+    let rows: Vec<StoredBacklogRow> = sqlx::query_as(concat!(
         "SELECT line,
                 coalesce(sent_at,
                          to_char(created_at AT TIME ZONE 'UTC',
@@ -9833,11 +9877,12 @@ pub async fn recent_bnc_backlog(
                 own_nick, own_nick_recorded, seq
          FROM bnc_buffer
          WHERE id = ANY(ARRAY(
-             SELECT id FROM bnc_buffer
-             WHERE owner = $1 AND network = $2
-             ORDER BY id DESC LIMIT $3))
-         ORDER BY id",
-    )
+             SELECT id FROM (",
+        bnc_kept_order!(),
+        ") ordered
+             ORDER BY kept LIMIT $3))
+         ORDER BY id"
+    ))
     .bind(&key.owner)
     .bind(&key.network)
     .bind(limit)

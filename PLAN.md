@@ -1564,7 +1564,7 @@ Two bouncer decisions of the maintainer's (DESIGN §10.3), each with tests that
 drive the real driver, the daemon and PostgreSQL:
 
 - **Channels joined at runtime survive a restart and an edit.** A stored IRC
-  network remembers every channel the upstream confirmed (migration 0103),
+  network remembers every channel the upstream confirmed (migration 0104),
   its learned key sealed; a restart or an edit rejoins them beside the
   autojoin; a `PART`, a `KICK` (told with its reason), a refused rejoin (told
   with its reason) or the owner's removal on the console or the API forgets
