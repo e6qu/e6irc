@@ -465,7 +465,9 @@ driver receives upstream lines while no BNC or web client is attached.
    owner/network key and trims the network’s history to its cap.
 3. On driver start, recent rows preload oldest-first into the bounded buffer.
 4. A later BNC or web attachment replays that stream before following live
-   output.
+   output. A client that did not negotiate `server-time` sees each replayed
+   message with its time at the head of its text (`[09:05:03]`, with the
+   date when it was not today, in UTC), as ZNC shows a buffer.
 5. Deleting a network purges its casefolded buffer; another network’s history
    is untouched.
 

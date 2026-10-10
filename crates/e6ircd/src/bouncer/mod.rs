@@ -4580,6 +4580,61 @@ fn own_rename(line: &str, own: &str, names: &e6irc_client::NetworkNames) -> Opti
         .flatten()
 }
 
+/// The UTC date of `at`, `YYYY-MM-DD`.
+fn utc_date(at: e6irc_proto::time::Millis) -> String {
+    e6irc_proto::time::server_time(at)[..10].to_string()
+}
+
+/// A replayed message for a client that did not negotiate `server-time`, with
+/// the time it was said (its `time`, which every retained line carries) at
+/// the head of its text, as ZNC replays a buffer to such a client:
+/// `[HH:MM:SS]` in UTC, with the date as well when it was not said `today`,
+/// and after `ACTION ` for a `/me`. Anything else — membership, a numeric, a
+/// CTCP reply, a line with no valid `time` — is replayed as it is. The text is
+/// cut to fit the line, never sent past it.
+fn replayed_with_its_time<'line>(line: &'line str, today: &str) -> std::borrow::Cow<'line, str> {
+    use std::borrow::Cow;
+    let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
+        return Cow::Borrowed(line);
+    };
+    let command = parsed.command.to_ascii_uppercase();
+    let (true, [target, text]) = (
+        matches!(command.as_str(), "PRIVMSG" | "NOTICE"),
+        parsed.params.as_slice(),
+    ) else {
+        return Cow::Borrowed(line);
+    };
+    let Some(said) = line_time(line) else {
+        return Cow::Borrowed(line);
+    };
+    let stamp = e6irc_proto::time::server_time(said);
+    let stamp = if stamp[..10] == *today {
+        format!("[{}]", &stamp[11..19])
+    } else {
+        format!("[{} {}]", &stamp[..10], &stamp[11..19])
+    };
+    let text = match crate::sanitize::ctcp_action(text) {
+        Some(action) => format!("\u{1}ACTION {stamp} {action}\u{1}"),
+        None if text.starts_with('\u{1}') => return Cow::Borrowed(line),
+        None => format!("{stamp} {text}"),
+    };
+    let tags = line
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(tags, _)| format!("@{tags} "))
+        .unwrap_or_default();
+    let source = e6irc_client::OwnedMessage::from(&parsed)
+        .source
+        .map(|source| format!(":{source} "))
+        .unwrap_or_default();
+    // The wire's 512 bytes bound the line without its tags.
+    let head = format!("{source}{command} {target} :");
+    Cow::Owned(format!(
+        "{tags}{head}{}",
+        crate::core::fit_trailing(&head, &text)
+    ))
+}
+
 /// Why a line sent to a network that has no session was not sent.
 pub(crate) const NOT_CONNECTED: &str =
     "the network is not connected (it is connecting or reconnecting)";
@@ -6828,6 +6883,7 @@ async fn relay_attached(
     } = replay;
     let mut boundaries = boundaries.into_iter().peekable();
     let mut already_read = 0usize;
+    let today = utc_date(epoch_millis());
     for (index, entry) in lines.into_iter().enumerate() {
         while let Some((_, began)) = boundaries.next_if(|(at, _)| *at == index) {
             let began =
@@ -6859,7 +6915,14 @@ async fn relay_attached(
                 channel.as_str().to_string(),
             );
         }
-        if let Some(line) = filter_tags(line, caps) {
+        // A client without server-time would show every replayed message as
+        // said now; it is told when in the text itself, as ZNC tells it.
+        let line = if caps.server_time {
+            std::borrow::Cow::Borrowed(line)
+        } else {
+            replayed_with_its_time(line, &today)
+        };
+        if let Some(line) = filter_tags(&line, caps) {
             write.write_all(line.as_bytes()).await?;
             write.write_all(b"\r\n").await?;
         }
@@ -11328,10 +11391,14 @@ mod tests {
         (client, task)
     }
 
-    /// Attach with default capabilities, read everything the attach writes
-    /// (server-time tags stripped) and let it finish.
+    /// Attach with server-time, read everything the attach writes (its
+    /// `time` tags stripped) and let it finish.
     async fn attach_to_completion(handle: NetworkHandle) -> String {
-        let (mut client, task) = attach_task(std::sync::Arc::new(handle), AttachCaps::default());
+        let caps = AttachCaps {
+            server_time: true,
+            ..AttachCaps::default()
+        };
+        let (mut client, task) = attach_task(std::sync::Arc::new(handle), caps);
         let output = untimed(attach_output(&mut client).await.lines()).join("\n");
         drop(client);
         task.await.expect("attach task").expect("attach");
@@ -11809,6 +11876,60 @@ mod tests {
                 Some(asked.to_string())
             );
         }
+    }
+
+    /// A client without server-time is told when each replayed message was
+    /// said in its text, as ZNC tells it: the time today, the date too
+    /// before today, after `ACTION ` for a `/me`, within the line; anything
+    /// that is not a message, and a CTCP reply, is replayed as it is.
+    #[test]
+    fn a_replayed_message_carries_its_time_for_a_client_without_server_time() {
+        let today = "2026-10-10";
+        let at = |time: &str, rest: &str| format!("@time={time};msgid=x {rest}");
+        assert_eq!(
+            replayed_with_its_time(
+                &at(
+                    "2026-10-10T09:05:03.250Z",
+                    ":bob!b@h PRIVMSG #room :hello there"
+                ),
+                today
+            ),
+            "@time=2026-10-10T09:05:03.250Z;msgid=x :bob!b@h PRIVMSG #room :[09:05:03] hello there"
+        );
+        assert_eq!(
+            replayed_with_its_time(
+                &at("2026-10-09T23:59:59.000Z", ":bob!b@h NOTICE me :yesterday"),
+                today
+            ),
+            "@time=2026-10-09T23:59:59.000Z;msgid=x :bob!b@h NOTICE me :[2026-10-09 23:59:59] yesterday"
+        );
+        assert_eq!(
+            replayed_with_its_time(
+                &at(
+                    "2026-10-10T12:00:00.000Z",
+                    ":bob!b@h PRIVMSG #room :\u{1}ACTION waves\u{1}"
+                ),
+                today
+            ),
+            "@time=2026-10-10T12:00:00.000Z;msgid=x :bob!b@h PRIVMSG #room :\u{1}ACTION [12:00:00] waves\u{1}"
+        );
+        for kept in [
+            at(
+                "2026-10-10T12:00:00.000Z",
+                ":bob!b@h NOTICE me :\u{1}VERSION irssi\u{1}",
+            ),
+            at("2026-10-10T12:00:00.000Z", ":bob!b@h JOIN #room"),
+            ":bob!b@h PRIVMSG #room :no time of its own".to_string(),
+        ] {
+            assert_eq!(replayed_with_its_time(&kept, today), kept);
+        }
+        let long = at(
+            "2026-10-10T12:00:00.000Z",
+            &format!(":bob!b@h PRIVMSG #room :{}", "x".repeat(480)),
+        );
+        let stamped = replayed_with_its_time(&long, today);
+        let body = stamped.split_once(' ').expect("tagged").1;
+        assert_eq!(body.len(), 510, "fitted to the wire");
     }
 
     /// A channel's settings, once a `324` said them, are followed through

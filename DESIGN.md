@@ -3260,7 +3260,14 @@ above the trait, provides for every network kind:
   separate from the ircd core's per-account markers (§11) because a BNC
   target lives on an external network the core knows nothing about.
 - **Playback**: attaching clients receive the detached ring,
-  tag-filtered by their negotiated caps. A raw IRC client presents no cursor,
+  tag-filtered by their negotiated caps. A client that did not negotiate
+  `server-time` would show every replayed message as said now, so each
+  replayed `PRIVMSG` and `NOTICE` carries its time at the head of its text,
+  as ZNC replays a buffer: `[HH:MM:SS]` in UTC, `[YYYY-MM-DD HH:MM:SS]` when
+  it was not said today, after `ACTION ` for a `/me`, the text cut to fit the
+  line; a CTCP reply, membership and numerics are replayed as they are, and
+  live lines are never changed. A client with `server-time` is sent the
+  `time` tag instead. A raw IRC client presents no cursor,
   so its account's read markers (`bnc_read_markers`, the `draft/read-marker`
   positions it set with `MARKREAD`) are its position, conversation by
   conversation: a message of a conversation the account has a marker for is
