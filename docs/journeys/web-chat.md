@@ -28,7 +28,8 @@ available; at least one owned/shared network is enabled for chat.
    opens the dialog in place.
 4. Opening a network opens `/ws/ui` for it and renders connection state; it
    never invents “connected” from stored configuration alone. A disabled network
-   still opens, says why chat is unavailable, and links to where it is enabled.
+   still opens, says why chat is unavailable, and offers **Enable** in place;
+   one this server cannot run links to its console page.
 5. The initial snapshot/replay establishes buffers before live events are
    applied.
 6. A skip link reaches the chat log. Conversation and member activation use
@@ -41,7 +42,9 @@ available; at least one owned/shared network is enabled for chat.
    conversation. Escape closes it and restores the trigger; choosing a buffer
    closes the rail and returns focus to the composer.
 
-**Visible failures and recovery.** An expired session redirects to login.
+**Visible failures and recovery.** Loading the application without a session
+redirects to login; a session that expires while the page is open is reported
+with a **Sign in** action, and the socket's retry loop stops.
 REST failure, WebSocket authentication failure, absent/disabled network,
 registry unavailability, upstream connection failure, and socket closure each
 produce a visible state. Retrying must create one new attachment rather than
@@ -103,8 +106,14 @@ survive process restart.
    conflating distinct identical messages.
 4. Loading history expands the active buffer by one bounded page, so older
    context remains visible even when the normal live window was already full.
-5. Server-time determines presentation ordering where supplied; arrival order
-   remains the fallback.
+   A read that finds nothing older says so; a read that returns after the
+   transcript was replaced (a `replay full`, the conversation closed, another
+   network opened) is discarded and offered again rather than merged into a
+   transcript it was not read for. The control reflects the open conversation,
+   so a read in progress in one never disables it in another.
+5. Rows are shown in the order the bouncer's ring holds them, which is the
+   order the network sent them; server-time supplies each row's displayed time
+   where the line carries it, and the arrival time is shown otherwise.
 6. Channel and direct-message buffers are created on demand and remain bounded.
 7. An authoritative reconnect snapshot updates which channels are currently
    joined without deleting their transcript. A channel no longer present is
@@ -131,10 +140,10 @@ new-message control is a native button with an exact accessible count and
 returns the reader to the latest line without moving them to another buffer.
 Every row of the sidebar network list is a link named for the network and its
 state; there is no separate network selector. A disabled network, or one this
-server cannot run, still opens: its page says why chat is unavailable, links to
-the network's console page where it can be enabled or reconfigured, and opens
-no socket, so keyboard and pointer users never land in a composer that cannot
-attach.
+server cannot run, still opens: its page says why chat is unavailable, offers
+**Enable** for a disabled one and a link to the network's console page for one
+that must be reconfigured, and opens no socket, so keyboard and pointer users
+never land in a composer that cannot attach.
 
 **Rejected sends.** A correlated server refusal never creates a local echo or
 automatically retries. It leaves the reason visible and offers a **Restore
@@ -168,9 +177,13 @@ current network and conversation selection.
    Internal commands use the same shape without `id`; `/raw ` deliberately
    requests one complete IRC line instead.
 2. `/help` shows the supported ordinary IRC grammar. `/query` opens a direct
-   conversation, `/msg` and `/notice` address explicit targets, and `/quote`
-   is the conventional alias for `/raw`; none requires a configuration-only
-   action.
+   conversation (a channel name is refused with a pointer to `/join`), `/msg`
+   and `/notice` address explicit targets, and `/quote` is the conventional
+   alias for `/raw`; none requires a configuration-only action. `/topic`
+   without text reads the topic rather than clearing it; `/part`, `/topic`
+   and `/away` send their text whole as the trailing parameter, and `/part`
+   and `/topic` take an optional leading channel, recognised by the network's
+   own `CHANTYPES`.
 3. The server validates the whole derived line, admits it to the selected
    driver's bounded queue, and returns a correlated `sent` or `send-error`
    event. Missing `/raw`, `/quote`, `/me`, `/join`, `/nick`, `/msg`, `/notice`,
@@ -193,20 +206,37 @@ current network and conversation selection.
    requests, each echoed once; the composer carries no misleading length cap.
 5. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
    labels, including comma-separated membership targets and multi-target KICK.
+   Being kicked keeps the channel's transcript, marked **past**, with the kick
+   at its end; a membership, topic or rename notice for a conversation that is
+   not open never opens one. A quit is also said in the direct conversation
+   with whoever quit.
 6. Direct messages create query buffers. Closing a query removes only the
    local view; leaving a channel sends PART and waits for the resulting state.
+   Joining from the sidebar, **Leave**, and the member-list refresh are
+   correlated requests like a typed message, so a refusal is an alert naming
+   the action; a refused member-list refresh is asked for again on the next
+   resync instead of leaving the list waiting. A bridge, whose channels are its
+   configuration, offers no Join box.
    STATUSMSG targets such as `@#ops` and `+#ops` route to `#ops`; persisted
    history uses this same routing policy, including the server-notice rule.
 7. Inactive conversations retain both unread traffic and unread direct-mention
    counts, so attention-worthy traffic is distinguishable before switching. A
-   `/me` action naming the reader is a mention. The console's copy of each line
+   `/me` action naming the reader is a mention. Only what was said is counted:
+   joins, parts, quits, renames and topic changes are not unread messages. While
+   the tab is hidden the open conversation counts too, so the tab title shows
+   activity in it, and showing the tab again reads it. The console's copy of each line
    is not counted again, a full replay (first attach, or `replay full`) is the
    backlog rather than unread traffic, and no replay raises a desktop
    notification; the lines a resumed replay delivers were missed while the
    page was away and count as unread. The conversation and member lists update
    their existing entries in place, so a new line or a member change never
    takes keyboard focus from the entry it is on.
-8. Errors from the driver or IRC server appear in the relevant status path.
+8. Errors from the driver or IRC server appear where they apply: a refusal
+   numeric (400–599) or an IRCv3 `FAIL` is shown as an error row in the open
+   conversation it names, else — arriving live — in the conversation being
+   read, and otherwise in the console, and is counted as unread there. The
+   answers to the person's own questions (WHOIS, AWAY) are shown where they
+   asked.
    The **console**, the first entry in the conversations, holds the whole
    exchange: every exact safe inbound wire line beside e6irc's own notices, so
    state changes, numerics, service replies, and parser presentation can be
@@ -228,7 +258,13 @@ are bounded; acceptance/refusal is correlated by opaque request identifier and
 message bodies stay out of metrics.
 
 **Evidence.** Browser state tests cover NAMES, direct-message close, channel
-leave, delayed acknowledgement, and refusal without false echo. A real local
+leave, delayed acknowledgement, and refusal without false echo; refusal
+numerics routed to the named, open, or console conversation; refused Join,
+Leave and member-list requests; the kick that keeps a transcript; unread
+counting of said lines only, including the open conversation in a hidden tab;
+and that a background line redraws only its own conversation entry. The
+server's composer grammar (`/topic`, `/part`, `/away`) is unit-tested in
+`crates/e6ircd/src/http/mod.rs`. A real local
 IRC peer observes the Chromium composer’s exact PRIVMSG after a correlated
 server acknowledgement and sends a peer message back through the driver and
 `/ws/ui`; protocol tests cover malformed-frame recovery, injection/length
@@ -269,7 +305,7 @@ chat.
 
 **Visible failures and recovery.** An unsupported Notifications API, denied
 permission, or notification-construction error leaves notifications disabled
-and explains the condition through an application alert or the server buffer.
+and explains the condition through an application alert.
 Unavailable or corrupt local storage does not prevent chat: the application
 uses a safe in-tab preference value, reports the storage failure, and can
 persist again when the browser facility recovers. Invalid stored preference

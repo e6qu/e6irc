@@ -3,6 +3,11 @@
 //! lists. The reader refuses anything past a field's bound, a length that runs
 //! past the payload, text that is not UTF-8 and a payload with bytes left
 //! over, so a decoded frame is exactly what an encoder could have written.
+//!
+//! The core writes the bodies of its session records, channel replicas and
+//! cut state (DESIGN §19.2), which the edge stores without reading, in the
+//! same primitives: one set of bounds-checked readers for every byte that
+//! crosses the link.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -13,29 +18,34 @@ use crate::{DecodeError, EncodeError};
 /// Writes one frame's payload.
 pub struct Writer<'a>(pub(crate) &'a mut BytesMut);
 
-impl Writer<'_> {
-    pub(crate) fn u8(&mut self, value: u8) {
+impl<'a> Writer<'a> {
+    /// A writer appending to `out`.
+    pub fn new(out: &'a mut BytesMut) -> Self {
+        Self(out)
+    }
+
+    pub fn u8(&mut self, value: u8) {
         self.0.put_u8(value);
     }
 
-    pub(crate) fn u16(&mut self, value: u16) {
+    pub fn u16(&mut self, value: u16) {
         self.0.put_u16(value);
     }
 
-    pub(crate) fn u32(&mut self, value: u32) {
+    pub fn u32(&mut self, value: u32) {
         self.0.put_u32(value);
     }
 
-    pub(crate) fn u64(&mut self, value: u64) {
+    pub fn u64(&mut self, value: u64) {
         self.0.put_u64(value);
     }
 
-    pub(crate) fn bool(&mut self, value: bool) {
+    pub fn bool(&mut self, value: bool) {
         self.u8(u8::from(value));
     }
 
     /// Bytes of at most `bound`, after a four-byte length.
-    pub(crate) fn bytes(
+    pub fn bytes(
         &mut self,
         field: &'static str,
         value: &[u8],
@@ -54,7 +64,7 @@ impl Writer<'_> {
     }
 
     /// Text of at most `bound` bytes.
-    pub(crate) fn text(
+    pub fn text(
         &mut self,
         field: &'static str,
         value: &str,
@@ -63,7 +73,7 @@ impl Writer<'_> {
         self.bytes(field, value.as_bytes(), bound)
     }
 
-    pub(crate) fn option<T>(
+    pub fn option<T>(
         &mut self,
         value: Option<&T>,
         write: impl FnOnce(&mut Self, &T) -> Result<(), EncodeError>,
@@ -80,7 +90,7 @@ impl Writer<'_> {
         }
     }
 
-    pub(crate) fn ip(&mut self, address: IpAddr) {
+    pub fn ip(&mut self, address: IpAddr) {
         match address {
             IpAddr::V4(v4) => {
                 self.u8(4);
@@ -93,13 +103,13 @@ impl Writer<'_> {
         }
     }
 
-    pub(crate) fn socket(&mut self, address: SocketAddr) {
+    pub fn socket(&mut self, address: SocketAddr) {
         self.ip(address.ip());
         self.u16(address.port());
     }
 
     /// A list of at most `bound` entries, after a two-byte count.
-    pub(crate) fn list<T>(
+    pub fn list<T>(
         &mut self,
         field: &'static str,
         entries: &[T],
@@ -125,6 +135,11 @@ impl Writer<'_> {
 pub struct Reader(pub(crate) Bytes);
 
 impl Reader {
+    /// A reader of `bytes`, which must be read to their end ([`Self::finish`]).
+    pub fn new(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
     fn need(&self, field: &'static str, length: usize) -> Result<(), DecodeError> {
         if self.0.remaining() < length {
             return Err(DecodeError::Truncated { field });
@@ -132,27 +147,27 @@ impl Reader {
         Ok(())
     }
 
-    pub(crate) fn u8(&mut self, field: &'static str) -> Result<u8, DecodeError> {
+    pub fn u8(&mut self, field: &'static str) -> Result<u8, DecodeError> {
         self.need(field, 1)?;
         Ok(self.0.get_u8())
     }
 
-    pub(crate) fn u16(&mut self, field: &'static str) -> Result<u16, DecodeError> {
+    pub fn u16(&mut self, field: &'static str) -> Result<u16, DecodeError> {
         self.need(field, 2)?;
         Ok(self.0.get_u16())
     }
 
-    pub(crate) fn u32(&mut self, field: &'static str) -> Result<u32, DecodeError> {
+    pub fn u32(&mut self, field: &'static str) -> Result<u32, DecodeError> {
         self.need(field, 4)?;
         Ok(self.0.get_u32())
     }
 
-    pub(crate) fn u64(&mut self, field: &'static str) -> Result<u64, DecodeError> {
+    pub fn u64(&mut self, field: &'static str) -> Result<u64, DecodeError> {
         self.need(field, 8)?;
         Ok(self.0.get_u64())
     }
 
-    pub(crate) fn bool(&mut self, field: &'static str) -> Result<bool, DecodeError> {
+    pub fn bool(&mut self, field: &'static str) -> Result<bool, DecodeError> {
         match self.u8(field)? {
             0 => Ok(false),
             1 => Ok(true),
@@ -160,11 +175,7 @@ impl Reader {
         }
     }
 
-    pub(crate) fn bytes(
-        &mut self,
-        field: &'static str,
-        bound: usize,
-    ) -> Result<Bytes, DecodeError> {
+    pub fn bytes(&mut self, field: &'static str, bound: usize) -> Result<Bytes, DecodeError> {
         let length = self.u32(field)? as usize;
         if length > bound {
             return Err(DecodeError::OverBound {
@@ -177,16 +188,12 @@ impl Reader {
         Ok(self.0.split_to(length))
     }
 
-    pub(crate) fn text(
-        &mut self,
-        field: &'static str,
-        bound: usize,
-    ) -> Result<String, DecodeError> {
+    pub fn text(&mut self, field: &'static str, bound: usize) -> Result<String, DecodeError> {
         let bytes = self.bytes(field, bound)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| DecodeError::NotUtf8 { field })
     }
 
-    pub(crate) fn option<T>(
+    pub fn option<T>(
         &mut self,
         field: &'static str,
         read: impl FnOnce(&mut Self) -> Result<T, DecodeError>,
@@ -198,7 +205,7 @@ impl Reader {
         }
     }
 
-    pub(crate) fn ip(&mut self, field: &'static str) -> Result<IpAddr, DecodeError> {
+    pub fn ip(&mut self, field: &'static str) -> Result<IpAddr, DecodeError> {
         match self.u8(field)? {
             4 => {
                 self.need(field, 4)?;
@@ -216,12 +223,12 @@ impl Reader {
         }
     }
 
-    pub(crate) fn socket(&mut self, field: &'static str) -> Result<SocketAddr, DecodeError> {
+    pub fn socket(&mut self, field: &'static str) -> Result<SocketAddr, DecodeError> {
         let ip = self.ip(field)?;
         Ok(SocketAddr::new(ip, self.u16(field)?))
     }
 
-    pub(crate) fn list<T>(
+    pub fn list<T>(
         &mut self,
         field: &'static str,
         bound: usize,
@@ -240,7 +247,7 @@ impl Reader {
 
     /// The payload was read to its end: a byte left over is a frame no
     /// encoder wrote.
-    pub(crate) fn finish(self) -> Result<(), DecodeError> {
+    pub fn finish(self) -> Result<(), DecodeError> {
         if self.0.has_remaining() {
             return Err(DecodeError::TrailingBytes {
                 count: self.0.remaining(),

@@ -145,6 +145,7 @@ fn our_isupport() -> HashMap<String, String> {
         tx,
         host: "h".into(),
         transport: e6ircd::core::ConnectionTransport::Tcp,
+        tls: None,
     });
     core.handle(Input::Line {
         conn,

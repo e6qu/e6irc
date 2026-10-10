@@ -201,6 +201,11 @@ impl crate::db::Follower for CredentialFollower {
 }
 
 impl CredentialLease {
+    /// The credential this lease watches.
+    pub(crate) fn credential(&self) -> &RevocableCredential {
+        &self.credential
+    }
+
     /// Record the first read of the credential's standing, unless an
     /// announcement has already ended it: a revocation heard while the read
     /// was in flight stays heard.

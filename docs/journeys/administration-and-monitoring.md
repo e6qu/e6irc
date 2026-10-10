@@ -120,7 +120,10 @@ cleared by the retry that succeeds, and the overview heading says the overview
 is unavailable rather than still loading. A session that ended while the page
 was open is said once, with a Sign in link, rather than as a retry that cannot
 succeed. A filter value with surrounding spaces is refused in the form, before
-the page, which refuses it too, is asked.
+the page is asked; a query the page refuses anyway (edited by hand, or
+bookmarked) is shown beside the filter form, whose fields keep what was sent,
+on a page that still works, never as the API's problem document in its place.
+**All networks** filters by network type with the API's exact `kind` filter.
 Invalid stored network configuration prevents reactivation before the durable
 state changes. A post-commit core/runtime reconciliation failure reports the
 exact safe partial state so retry can reconcile it.

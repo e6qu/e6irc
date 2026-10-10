@@ -325,6 +325,66 @@ async fn device_authorization_requires_an_absolute_public_url() {
     assert!(body.contains("Device authorization unavailable"), "{body}");
 }
 
+/// The device endpoints are OAuth form endpoints (RFC 8628 over RFC 6749),
+/// whose §3.1 says a parameter the server does not recognise is ignored and
+/// none may be sent twice: an unknown parameter reaches the request's next
+/// check, and a repeated one is `invalid_request` before anything else.
+#[tokio::test]
+async fn device_endpoints_ignore_unknown_parameters_and_refuse_repeated_ones() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let form_post = |path: &str, body: &str| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let oauth_error = |body: &str| {
+        serde_json::from_str::<serde_json::Value>(body).expect("an OAuth error is JSON")["error"]
+            .as_str()
+            .expect("error code")
+            .to_string()
+    };
+    const GRANT: &str = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code";
+
+    // Accepted past the form: this server has no public URL to advertise.
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/start",
+            "client_id=e6irc-test&audience=ignored",
+        ),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("Device authorization unavailable"), "{body}");
+    // Accepted past the form: this server has no database to poll.
+    let (status, _, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/token",
+            &format!("{GRANT}&device_code=d&client_id=e6irc-test&resource=ignored"),
+        ),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+
+    for (path, form) in [
+        (
+            "/api/v1/auth/device/start",
+            "client_id=e6irc-test&client_id=another".to_owned(),
+        ),
+        (
+            "/api/v1/auth/device/token",
+            format!("{GRANT}&device_code=d&device_code=e&client_id=e6irc-test"),
+        ),
+    ] {
+        let (status, _, body) = request(http, &form_post(path, &form)).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        assert_eq!(oauth_error(&body), "invalid_request", "{path}");
+    }
+}
+
 #[tokio::test]
 async fn bootstrap_routes_are_closed_when_not_configured() {
     let running = net::start(test_config()).await.expect("start");
@@ -1426,7 +1486,7 @@ async fn internal_upstreams_are_refused_unless_the_operator_allows_them() {
         "nothing was created"
     );
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -2568,7 +2628,7 @@ async fn an_autojoin_key_is_sealed_write_only_and_joined_across_a_restart() {
 
     // A restart builds the driver from the stored row, key included.
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
     let running = net::start(config()).await.expect("restart");
@@ -2613,7 +2673,7 @@ async fn an_autojoin_key_is_sealed_write_only_and_joined_across_a_restart() {
         "{details:?}"
     );
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -3589,6 +3649,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         Some("alice"),
         ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>",
         &e6irc_client::NetworkNames::default(),
+        1,
     )
     .await
     .expect("seed hostile backlog line");
@@ -3867,6 +3928,11 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, body) = request(http, &invalid_monitoring).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("Invalid monitoring window"), "{body}");
+    // The page, with its window choices and no panel reading a window that
+    // does not exist.
+    assert!(body.contains("id=\"query-refusal\""), "{body}");
+    assert!(body.contains("/console/monitoring?minutes=60"), "{body}");
+    assert!(!body.contains("data-api-admin-monitoring"), "{body}");
 
     let observability = format!(
         "GET /api/v1/admin/observability?minutes=60 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -4135,7 +4201,7 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     );
     drop(pool);
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -4568,7 +4634,7 @@ async fn console_configuration_manages_every_credential_collection() {
     verification_pool.close().await;
 
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -5569,7 +5635,12 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("<h1>Account directory</h1>"), "{page}");
     assert!(page.contains("data-api-admin-accounts-page"), "{page}");
-    assert!(!page.contains("Eve"), "{page}");
+    // The filter form keeps the name it was asked for, escaped.
+    assert!(
+        page.contains("value=\"Eve&#60;script&#62;alert(1)&#60;/script&#62;\"")
+            || page.contains("value=\"Eve&lt;script&gt;alert(1)&lt;/script&gt;\""),
+        "{page}"
+    );
     assert!(!page.contains("<script>alert(1)</script>"), "{page}");
     let (status, _, alice_page) = request(
         http,
@@ -6606,6 +6677,97 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     .await;
     assert_eq!(status, 400, "{invalid}");
     assert!(invalid.contains("Invalid audit cursor"), "{invalid}");
+
+    // Every console page that takes a query answers a refused one -- edited
+    // by hand, bookmarked, or left from an older console -- with the page
+    // itself: a 400 whose refusal sits beside the filter form, which keeps
+    // what was sent. It used to be the API's problem document, a dead end
+    // with no form and no navigation.
+    for (path, refusal, kept) in [
+        (
+            "/console/bans?kind=zline",
+            "Invalid server-ban filter",
+            None,
+        ),
+        (
+            "/console/bans?mask=%20bad",
+            "Invalid server-ban filter",
+            Some(r#"value=" bad""#),
+        ),
+        (
+            "/console/audit?actor=alice%20",
+            "Invalid audit filter",
+            Some(r#"value="alice ""#),
+        ),
+        ("/console/audit?before_id=x", "Invalid query", None),
+        (
+            "/console/admin/channels?limit=0",
+            "Invalid registered-channel limit",
+            Some(r#"value="0""#),
+        ),
+        ("/console/admin/channels?colour=red", "Invalid query", None),
+        (
+            "/console/admin/networks?kind=gopher",
+            "Invalid network-inventory filter",
+            None,
+        ),
+        (
+            "/console/admin/networks?after=nope",
+            "Invalid network-inventory cursor",
+            None,
+        ),
+        (
+            "/console/accounts?name=%20alice",
+            "Invalid account filter",
+            Some(r#"value=" alice""#),
+        ),
+        (
+            "/console/accounts?invitation_before_id=0",
+            "Invalid invitation-directory cursor",
+            None,
+        ),
+        (
+            "/console/sessions?transport=carrier",
+            "Invalid live-connection filter",
+            None,
+        ),
+        ("/console/my-sessions?account=alice", "Invalid query", None),
+        (
+            "/console/monitoring?minutes=17",
+            "Invalid monitoring window",
+            None,
+        ),
+    ] {
+        let (status, headers, page) = request(http, &cookie_get(path, &alice_session)).await;
+        assert_eq!(status, 400, "{path}: {page}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: text/html"),
+            "{path}: {headers}"
+        );
+        assert!(page.contains("id=\"query-refusal\""), "{path}: {page}");
+        assert!(page.contains(refusal), "{path}: {page}");
+        assert!(
+            page.contains("aria-label=\"Console\""),
+            "{path}: the console navigation"
+        );
+        if let Some(kept) = kept {
+            assert!(page.contains(kept), "{path} keeps {kept}: {page}");
+        }
+    }
+    // A query the page accepts shows no refusal.
+    let (status, _, page) = request(
+        http,
+        &cookie_get("/console/admin/networks?kind=slack", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(!page.contains("query-refusal"), "{page}");
+    assert!(
+        page.contains(r#"<option value="slack" selected>"#),
+        "{page}"
+    );
 }
 
 /// Admin console server-management actions: add/remove a server ban and drop a
@@ -8666,10 +8828,17 @@ async fn device_authorization_grant_flow() {
         "a device code is its own client's"
     );
 
-    // poll before approval -> authorization_pending
+    // poll before approval -> authorization_pending. A parameter the token
+    // endpoint does not define is ignored (RFC 6749 §3.1), not refused.
     let tok_body = poll_body(&device_code);
-    let (status, headers, body) =
-        request(http, &form_post("/api/v1/auth/device/token", &tok_body)).await;
+    let (status, headers, body) = request(
+        http,
+        &form_post(
+            "/api/v1/auth/device/token",
+            &format!("{tok_body}&resource=https%3A%2F%2Fignored.example"),
+        ),
+    )
+    .await;
     assert_eq!(status, 400);
     assert_eq!(oauth_error(&body), "authorization_pending");
     assert!(
@@ -9308,6 +9477,7 @@ async fn network_buffer_read() {
             Some("alice"),
             line,
             &e6irc_client::NetworkNames::default(),
+            2,
         )
         .await
         .expect("seed");
@@ -10488,7 +10658,7 @@ async fn a_bootstrap_may_leave_the_server_s_names_to_the_stored_settings() {
         .await
         .expect("the first start")
         .shutdown
-        .run()
+        .run(net::StopMode::Final)
         .await;
     let running = net::start(document(false))
         .await
@@ -11711,9 +11881,12 @@ async fn an_oidc_flow_survives_a_restart_and_is_still_answered_once() {
     // A restart, or a standby's takeover: the first process stops and gives
     // the serving lease back before the second serves.
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(60), first.shutdown.run())
-            .await
-            .expect("the first process stops within a minute"),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            first.shutdown.run(e6ircd::net::StopMode::Final)
+        )
+        .await
+        .expect("the first process stops within a minute"),
         net::ShutdownOutcome::Flushed
     );
     let second = start(process()).await;
@@ -11928,7 +12101,7 @@ async fn a_connection_test_of_a_running_network_is_refused() {
     let (status, body) = post_json(http, "/api/v1/me/network-preflight", &token, &test_body).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
 }
@@ -12478,7 +12651,13 @@ async fn configured_networks_are_the_operators_and_the_inventory_pages_them() {
         }),
         networks: vec![
             configured(Some("alice"), "OpsNet", "opsbot"),
-            configured(None, "lobby", "lobbybot"),
+            // A local network, so the inventory's kind filter has a
+            // configured network of another kind to leave out.
+            NetworkEntry {
+                kind: NetworkKind::Local,
+                addr: String::new(),
+                ..configured(None, "lobby", "lobbybot")
+            },
         ],
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -12614,6 +12793,50 @@ async fn configured_networks_are_the_operators_and_the_inventory_pages_them() {
     let (status, _, body) = get_json(http, "/api/v1/admin/networks?after=bob%2Fanet", &alice).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("after"), "{body}");
+
+    // The kind filter selects before the page is cut, configured networks
+    // and stored ones alike, so a page of one kind is never short of a
+    // network another kind pushed off it.
+    let mut irc = Vec::new();
+    let mut path = "/api/v1/admin/networks?kind=irc&limit=1".to_string();
+    loop {
+        let (status, page, body) = get_json(http, &path, &alice).await;
+        assert_eq!(status, 200, "{body}");
+        for network in page["networks"].as_array().expect("networks") {
+            assert_eq!(network["kind"], "irc", "{body}");
+            irc.push(network["name"].as_str().expect("name").to_string());
+        }
+        match page["next_after"].as_str() {
+            Some(cursor) => {
+                path = format!(
+                    "/api/v1/admin/networks?kind=irc&limit=1&after={}",
+                    cursor.replace('/', "%2F")
+                );
+            }
+            None => break,
+        }
+    }
+    assert_eq!(irc, ["OpsNet", "anet", "bnet"]);
+    let (status, local, body) = get_json(http, "/api/v1/admin/networks?kind=local", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        local["networks"].as_array().expect("networks").len(),
+        1,
+        "{body}"
+    );
+    assert_eq!(local["networks"][0]["name"], "lobby", "{body}");
+    assert_eq!(local["next_after"], serde_json::Value::Null, "{body}");
+    let (status, matrix, body) = get_json(http, "/api/v1/admin/networks?kind=matrix", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(matrix["networks"], serde_json::json!([]), "{body}");
+    // Exact and strict: a blank, unknown, or differently cased kind is
+    // refused naming the field, never read as every kind.
+    for kind in ["", "IRC", "gopher"] {
+        let (status, refusal, body) =
+            get_json(http, &format!("/api/v1/admin/networks?kind={kind}"), &alice).await;
+        assert_eq!(status, 400, "{kind}: {body}");
+        assert_eq!(refusal["field"], "kind", "{kind}: {body}");
+    }
 
     // The managed-network API: what the next start could not build is refused
     // naming the field, and a configured network cannot take a stored name.
@@ -12873,7 +13096,7 @@ async fn joined_channels_are_remembered_across_restarts_and_edits() {
     );
 
     // A restart rejoins them.
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
     membership::whois_until(up, "memo", "left", Option::is_none).await;
     let running = net::start(remembering_config(&url, &key_path))
         .await
@@ -12933,8 +13156,8 @@ async fn joined_channels_are_remembered_across_restarts_and_edits() {
     .await
     .expect("audit");
     assert_eq!(audited, 1);
-    running.shutdown.run().await;
-    upstream.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
+    upstream.shutdown.run(net::StopMode::Final).await;
 }
 
 /// A network's client certificate over the API: generated (Ed25519 or ECDSA
@@ -13089,5 +13312,5 @@ async fn a_network_client_certificate_is_generated_rotated_and_removed() {
     .await
     .expect("audit");
     assert_eq!(audited, 4, "three set, one removed");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 }

@@ -1104,7 +1104,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .expect("timeout");
     assert!(persisted, "line was not persisted to the BNC buffer");
     // A restart: server A stops, giving the serving lease back to B.
-    running_a.shutdown.run().await;
+    running_a.shutdown.run(net::StopMode::Final).await;
 
     // Server B: same DB, but the network points at a dead upstream so the
     // only content is the restored backlog. Attaching replays it. The console
@@ -1170,6 +1170,88 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .await
     .expect("timeout");
     assert!(replayed, "restored backlog was not replayed on attach");
+}
+
+/// A stop that stores every line claims its ring clean, and the next start
+/// continues the ring's epoch, so a `ReplayCursor` handed out before the
+/// restart still names the same line (DESIGN §19.3, migration 0102); the
+/// start withdraws the claim at once, so a process that then dies without
+/// storing everything leaves none behind.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_ring_keeps_its_epoch_and_positions_across_a_clean_restart() {
+    let url = bnc_account_db(
+        "a_ring_keeps_its_epoch_and_positions_across_a_clean_restart",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running_a = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start A");
+    wait_joined(up, "bncnick", "#lobby").await;
+    let pool = observer_pool(&url).await;
+    let ring = |pool: sqlx::PgPool| async move {
+        e6ircd::db::bnc_ring(&pool, "alice", "up")
+            .await
+            .expect("the stored ring")
+    };
+    let claimed = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            if let Some(ring) = ring(pool.clone()).await {
+                return ring;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the ring is claimed");
+    assert_eq!(
+        claimed.clean_through, None,
+        "a running ring claims no clean stop"
+    );
+
+    running_a.shutdown.run(net::StopMode::Final).await;
+    let stopped = ring(pool.clone()).await.expect("still stored");
+    assert_eq!(stopped.epoch, claimed.epoch);
+    let through = stopped
+        .clean_through
+        .expect("a stop that stored every line claims it");
+    let positions: Vec<Option<i64>> =
+        sqlx::query_scalar("SELECT seq FROM bnc_buffer WHERE owner = 'alice' ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("positions");
+    assert!(!positions.is_empty(), "the session's lines were stored");
+    let mut last = 0;
+    for position in positions {
+        let position = position
+            .expect("every line keeps its position")
+            .cast_unsigned();
+        assert!(
+            position > last && position <= through,
+            "{position} after {last}"
+        );
+        last = position;
+    }
+
+    let running_b = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start B");
+    let continued = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let now = ring(pool.clone()).await.expect("stored");
+            if now.clean_through.is_none() {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("B claims the ring");
+    assert_eq!(continued.epoch, claimed.epoch, "the epoch continues");
+    running_b.shutdown.run(net::StopMode::Final).await;
 }
 
 /// A network's whole `buffer_cap` survives a restart. A start used to restore
@@ -4439,7 +4521,7 @@ async fn the_backlog_cap_holds_across_restarts() {
         })
         .await
         .unwrap_or_else(|_| panic!("the {batch} batch was never fully persisted"));
-        running.shutdown.run().await;
+        running.shutdown.run(net::StopMode::Final).await;
         wait_gone(up, "bncnick").await;
     }
     // A third start trims again.
@@ -4455,7 +4537,7 @@ async fn the_backlog_cap_holds_across_restarts() {
     .await
     .expect("the final start left the backlog over the cap");
     assert_eq!(batch_rows("second").await, 600, "the newest lines are kept");
-    running.shutdown.run().await;
+    running.shutdown.run(net::StopMode::Final).await;
 }
 
 /// The attach listener's SASL PLAIN is one of the password checks the

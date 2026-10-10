@@ -11,6 +11,40 @@
           <span class="count" id="admin-network-count">…</span>
         </div>
 
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Find networks</h2>
+              <p>Shows only networks of one type.</p>
+            </div>
+            {% if filters.narrowed() %}
+              <a class="secondary-link" href="/console/admin/networks">Clear</a>
+            {% endif %}
+          </div>
+          {% include "console_query_refusal.html" %}
+          <form class="field-grid" method="get" action="/console/admin/networks">
+            <label class="field">
+              <span>Type</span>
+              <select name="kind">
+                <option value="">All types</option>
+                <option value="irc"{% if filters.value("kind") == "irc" %} selected{% endif %}>IRC</option>
+                <option value="local"{% if filters.value("kind") == "local" %} selected{% endif %}>Local</option>
+                <option value="matrix"{% if filters.value("kind") == "matrix" %} selected{% endif %}>Matrix</option>
+                <option value="discord"{% if filters.value("kind") == "discord" %} selected{% endif %}>Discord</option>
+                <option value="slack"{% if filters.value("kind") == "slack" %} selected{% endif %}>Slack</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Rows per page</span>
+              <input type="number" name="limit" value="{{ filters.value_or("limit", "100") }}" min="1" max="1000"
+                     inputmode="numeric" required />
+            </label>
+            <div class="form-actions field-wide">
+              <button class="primary" type="submit">Apply</button>
+            </div>
+          </form>
+        </section>
+
         <div class="scroll" tabindex="0" role="region" aria-label="All accounts' networks">
           <table>
             <caption class="sr-only">All accounts' networks with live state</caption>
@@ -18,7 +52,7 @@
               <tr><th>Status</th><th>Owner</th><th>Network</th><th>Type</th><th>Server</th><th>Clients</th><th>Errors</th><th>Last failure</th><th>Actions</th></tr>
             </thead>
             <tbody id="admin-network-rows" data-api-admin-network-list data-csrf="{{ shell.csrf }}">
-              <tr><td colspan="9" class="empty">Loading networks…</td></tr>
+              <tr><td colspan="9" class="empty">{% if filters.refused() %}Correct the filter above to list networks.{% else %}Loading networks…{% endif %}</td></tr>
             </tbody>
           </table>
         </div>

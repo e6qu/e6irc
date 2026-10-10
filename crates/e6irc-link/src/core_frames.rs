@@ -4,6 +4,7 @@ use std::net::IpAddr;
 
 use bytes::Bytes;
 
+use crate::held::{Ack, Admission, Cut, CutId, CutPart, RecordPart, Replica};
 use crate::wire::{Reader, Writer};
 use crate::{DecodeError, EncodeError, MAX_OUTPUT_LEN, MAX_STREAMS, SessionId, Slot, link_frame};
 
@@ -15,6 +16,13 @@ const END: u8 = 0x45;
 const FLOOD_EXEMPT: u8 = 0x46;
 const STREAM_CREDIT: u8 = 0x47;
 const SESSION_CREDIT: u8 = 0x48;
+const PAUSE: u8 = 0x49;
+const RESUME: u8 = 0x4a;
+const ACK: u8 = 0x4b;
+const RECORD: u8 = 0x4c;
+const REPLICA: u8 = 0x4d;
+const CUT_STATE: u8 = 0x4e;
+const CUT: u8 = 0x4f;
 
 /// The most trusted-proxy ranges a `Welcome` carries.
 pub const MAX_TRUSTED_PROXIES: usize = 1024;
@@ -43,6 +51,47 @@ pub enum CoreFrame {
     /// Whether the edge meters the session's lines.
     FloodExempt(SessionId, bool),
     Credit(Credit),
+    /// Send no more input on this stream, holding what clients send, and
+    /// answer `Paused`: the core is about to cut.
+    Pause,
+    /// Send input again: first the lines retained for replay, then what was
+    /// held.
+    Resume,
+    /// Which of a session's input lines the core is done with.
+    Ack(SessionId, Ack),
+    /// One part of a session's record, which the edge holds for the next core.
+    Record(SessionId, RecordPart),
+    /// A change to a channel replica the edge holds.
+    Replica(Replica),
+    /// One part of the cut state, on the first session stream, before its
+    /// `Cut`.
+    CutState(CutPart),
+    /// The stream's last frame: the core stopped gracefully, and the edge
+    /// holds its sessions for the next.
+    Cut(Cut),
+}
+
+impl CoreFrame {
+    /// The link version that introduced this frame: a link of an older
+    /// version never carries it.
+    pub fn since(&self) -> u16 {
+        match self {
+            Self::Welcome(_)
+            | Self::Refused(_)
+            | Self::Output(..)
+            | Self::Kill(..)
+            | Self::End(..)
+            | Self::FloodExempt(..)
+            | Self::Credit(_) => 1,
+            Self::Pause
+            | Self::Resume
+            | Self::Ack(..)
+            | Self::Record(..)
+            | Self::Replica(_)
+            | Self::CutState(_)
+            | Self::Cut(_) => 2,
+        }
+    }
 }
 
 /// What the core grants.
@@ -74,6 +123,9 @@ pub struct Welcome {
     /// How many session streams the edge opens: one per core shard.
     pub streams: u16,
     pub terms: EdgeTerms,
+    /// How the core admits the edge (link version 2; a version 1 link serves
+    /// at once, as `Serve` does).
+    pub admission: Admission,
 }
 
 /// The configuration an edge follows, as the core's is (DESIGN §19.2).
@@ -109,6 +161,13 @@ impl crate::sealed::Codec for CoreFrame {
             Self::FloodExempt(session, _) => (FLOOD_EXEMPT, session.get()),
             Self::Credit(Credit::Stream(_)) => (STREAM_CREDIT, 0),
             Self::Credit(Credit::Session(session, _)) => (SESSION_CREDIT, session.get()),
+            Self::Pause => (PAUSE, 0),
+            Self::Resume => (RESUME, 0),
+            Self::Ack(session, _) => (ACK, session.get()),
+            Self::Record(session, _) => (RECORD, session.get()),
+            Self::Replica(_) => (REPLICA, 0),
+            Self::CutState(_) => (CUT_STATE, 0),
+            Self::Cut(_) => (CUT, 0),
         }
     }
 
@@ -141,6 +200,17 @@ impl crate::sealed::Codec for CoreFrame {
                     Ok(())
                 })?;
                 w.u32(terms.line_credit);
+                // What link version 2 adds follows, in a Welcome of that
+                // version: its fields follow from the version it names.
+                if welcome.version >= 2 {
+                    welcome.admission.write(w);
+                } else if welcome.admission != Admission::Serve {
+                    return Err(EncodeError::OverBound {
+                        field: "admission in a version 1 Welcome",
+                        length: 1,
+                        bound: 0,
+                    });
+                }
                 Ok(())
             }
             Self::Refused(text) => w.text("refusal", text, MAX_REFUSAL_LEN),
@@ -156,6 +226,16 @@ impl crate::sealed::Codec for CoreFrame {
             }
             Self::Credit(Credit::Stream(amount) | Credit::Session(_, amount)) => {
                 w.u32(*amount);
+                Ok(())
+            }
+            Self::Pause | Self::Resume => Ok(()),
+            Self::Ack(_, ack) => ack.write(w),
+            Self::Record(_, part) => part.write(w),
+            Self::Replica(replica) => replica.write(w),
+            Self::CutState(part) => part.write(w),
+            Self::Cut(cut) => {
+                cut.cut.write(w);
+                w.u64(cut.epoch);
                 Ok(())
             }
         }
@@ -195,6 +275,11 @@ impl crate::sealed::Codec for CoreFrame {
                     })
                 })?;
                 let line_credit = r.u32("line credit")?;
+                let admission = if version >= 2 {
+                    Admission::read(r)?
+                } else {
+                    Admission::Serve
+                };
                 Self::Welcome(Welcome {
                     version,
                     epoch,
@@ -207,6 +292,7 @@ impl crate::sealed::Codec for CoreFrame {
                         command_flood,
                         line_credit,
                     },
+                    admission,
                 })
             }
             REFUSED => {
@@ -231,6 +317,31 @@ impl crate::sealed::Codec for CoreFrame {
                 Self::Credit(Credit::Stream(r.u32("credit")?))
             }
             SESSION_CREDIT => Self::Credit(Credit::Session(session_id()?, r.u32("credit")?)),
+            PAUSE => {
+                link_frame(kind, session)?;
+                Self::Pause
+            }
+            RESUME => {
+                link_frame(kind, session)?;
+                Self::Resume
+            }
+            ACK => Self::Ack(session_id()?, Ack::read(r)?),
+            RECORD => Self::Record(session_id()?, RecordPart::read(r)?),
+            REPLICA => {
+                link_frame(kind, session)?;
+                Self::Replica(Replica::read(r)?)
+            }
+            CUT_STATE => {
+                link_frame(kind, session)?;
+                Self::CutState(CutPart::read(r)?)
+            }
+            CUT => {
+                link_frame(kind, session)?;
+                Self::Cut(Cut {
+                    cut: CutId::read(r)?,
+                    epoch: r.u64("cut epoch")?,
+                })
+            }
             kind => return Err(DecodeError::UnknownKind { kind }),
         })
     }

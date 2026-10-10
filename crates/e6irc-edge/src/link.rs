@@ -39,6 +39,14 @@
 //! since the buffer never holds more than the core counts in flight, it never
 //! refuses a line the core's account admitted ([`OutputRefused::EdgeOverrun`]
 //! is that invariant broken).
+//!
+//! A session whose edge holds state for the core (link version 2, an edge in
+//! another process: [`holding_session`]) also carries the newest record of
+//! the session and the newest acknowledgement of its input
+//! ([`SessionLink::hold_record`], [`SessionLink::hold_ack`]). Each is placed
+//! after the output sent before it, and the edge's end gives it out only
+//! once that output is taken ([`EdgeSession::take_held`]): a record never
+//! runs ahead of what its client was sent.
 
 use std::future::Future;
 use std::io;
@@ -48,6 +56,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
+use e6irc_link::Ack;
 use e6irc_queue::{Envelope, Progress, PushError, Receiver, Sender, SendersGone};
 use tokio::sync::{Notify, futures::OwnedNotified};
 
@@ -65,6 +74,32 @@ pub fn weight(output: &Output) -> usize {
 /// Open one session's link with a send-queue bound of `sendq_bytes`: the
 /// core's end and the edge's end.
 pub fn session(name: &'static str, sendq_bytes: usize) -> (SessionLink, EdgeSession) {
+    open(name, sendq_bytes, None, 0)
+}
+
+/// Open one session's link whose edge holds the session's record and the
+/// acknowledgement of its input for the core ([`SessionLink::hold_record`]),
+/// with `in_flight` bytes already sent and not yet written: a session a
+/// rebuild resumes, whose edge still holds what the core before sent it.
+pub fn holding_session(
+    name: &'static str,
+    sendq_bytes: usize,
+    in_flight: u64,
+) -> (SessionLink, EdgeSession) {
+    open(
+        name,
+        sendq_bytes,
+        Some(std::sync::Mutex::default()),
+        in_flight,
+    )
+}
+
+fn open(
+    name: &'static str,
+    sendq_bytes: usize,
+    held: Option<std::sync::Mutex<HeldSlot>>,
+    in_flight: u64,
+) -> (SessionLink, EdgeSession) {
     let (buffer, taken) = e6irc_queue::weighted_queue(
         e6irc_queue::Config {
             name,
@@ -81,22 +116,56 @@ pub fn session(name: &'static str, sendq_bytes: usize) -> (SessionLink, EdgeSess
         writer_failure: OnceLock::new(),
         close: OnceLock::new(),
         killed_at: OnceLock::new(),
+        held,
+        held_wake: Notify::new(),
     });
     (
         SessionLink {
             buffer,
             capacity: sendq_bytes,
-            sent: 0,
+            sent: in_flight,
             shared: shared.clone(),
             waiting: None,
         },
         EdgeSession {
             buffer: taken,
             shared,
-            taken: 0,
+            taken: in_flight,
             written: 0,
         },
     )
+}
+
+/// The newest record and acknowledgement a holding session's core end
+/// published, each with the bytes of output sent before it.
+#[derive(Debug, Default)]
+struct HeldSlot {
+    record: Option<(u64, u64, Bytes)>,
+    ack: Option<(u64, Ack)>,
+}
+
+/// Wakes when a holding session's core publishes something for its edge to
+/// hold ([`EdgeSession::held_signal`]).
+pub struct HeldSignal(Arc<Shared>);
+
+impl HeldSignal {
+    /// Resolves at the next publication; one made before the call is not
+    /// missed (the wake is kept).
+    pub async fn published(&self) {
+        self.0.held_wake.notified().await;
+    }
+}
+
+/// What a holding session's edge is given to hold, in the order it was
+/// published after the output before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// The session's record at `revision`.
+    Record {
+        revision: u64,
+        body: Bytes,
+    },
+    Ack(Ack),
 }
 
 /// Open one session's link whose core end waits for room instead of refusing
@@ -106,6 +175,19 @@ pub fn session(name: &'static str, sendq_bytes: usize) -> (SessionLink, EdgeSess
 /// core end itself.
 pub fn waiting_session(name: &'static str, sendq_bytes: usize) -> (SessionLink, EdgeSession) {
     let (link, edge) = session(name, sendq_bytes);
+    link.wake_on_drained(Arc::default());
+    (link, edge)
+}
+
+/// A [`waiting_session`] whose edge holds the session's record for the core
+/// ([`holding_session`]), with `in_flight` bytes already sent and not yet
+/// written.
+pub fn holding_waiting_session(
+    name: &'static str,
+    sendq_bytes: usize,
+    in_flight: u64,
+) -> (SessionLink, EdgeSession) {
+    let (link, edge) = holding_session(name, sendq_bytes, in_flight);
     link.wake_on_drained(Arc::default());
     (link, edge)
 }
@@ -127,6 +209,10 @@ struct Shared {
     close: OnceLock<CloseFrame>,
     /// The buffer sequence number of the line a `Kill` sent, when one did.
     killed_at: OnceLock<u64>,
+    /// A holding session's record and acknowledgement, not yet given out.
+    held: Option<std::sync::Mutex<HeldSlot>>,
+    /// Woken when something is published to `held`.
+    held_wake: Notify,
 }
 
 /// A WebSocket close frame: its code and the reason a client can show.
@@ -205,6 +291,12 @@ impl SessionLink {
         self.capacity
     }
 
+    /// Take the bound a new core gives: an edge in another process holds its
+    /// sessions across cores, and each core's term is the one it counts by.
+    pub fn set_capacity(&mut self, sendq_bytes: usize) {
+        self.capacity = sendq_bytes;
+    }
+
     /// Bytes sent to the edge and not yet reported written to the client.
     pub fn in_flight(&self) -> usize {
         self.in_flight_given(self.shared.written.get())
@@ -268,6 +360,34 @@ impl SessionLink {
     /// exempt.
     pub fn set_flood_exempt(&self, exempt: bool) {
         self.shared.exemption.set(exempt);
+    }
+
+    /// Whether this session's edge holds its record for the core
+    /// ([`holding_session`]).
+    pub fn holds(&self) -> bool {
+        self.shared.held.is_some()
+    }
+
+    fn publish(&self, place: impl FnOnce(&mut HeldSlot, u64)) {
+        let held = self
+            .shared
+            .held
+            .as_ref()
+            .expect("only a holding session's core publishes what its edge holds");
+        place(&mut held.lock().expect("held slot"), self.sent);
+        self.shared.held_wake.notify_one();
+    }
+
+    /// Have the edge hold `body` as the session's record at `revision`, in
+    /// place of any before it, once the output sent so far is taken.
+    pub fn hold_record(&self, revision: u64, body: Bytes) {
+        self.publish(|slot, mark| slot.record = Some((mark, revision, body)));
+    }
+
+    /// Tell the edge `ack`, in place of any before it, once the output sent
+    /// so far is taken.
+    pub fn hold_ack(&self, ack: Ack) {
+        self.publish(|slot, mark| slot.ack = Some((mark, ack)));
     }
 
     fn ended(&self) -> EdgeEnded {
@@ -409,6 +529,54 @@ impl DrainedWatch {
     pub fn writer_failure(&self) -> Option<SendFailure> {
         self.shared.writer_failure.get().cloned()
     }
+
+    /// What [`Self::next`] would give, without waiting: the bytes written
+    /// since the last report, nothing new, or the end. Whatever is not
+    /// there yet wakes [`Self::wake`].
+    pub fn poll_written(&mut self) -> Written {
+        let gone = self.shared.edge_gone.load(Ordering::SeqCst);
+        let written = self.shared.written.arm();
+        if written > self.reported {
+            let delta = written - self.reported;
+            self.reported = written;
+            Written::More(delta)
+        } else if gone {
+            Written::Over
+        } else {
+            Written::Nothing
+        }
+    }
+
+    /// Whether the edge's end is gone.
+    pub fn edge_gone(&self) -> bool {
+        self.shared.edge_gone.load(Ordering::SeqCst)
+    }
+
+    /// What wakes when [`Self::poll_written`] may have something new: a wake
+    /// before the wait is kept.
+    pub fn wake(&self) -> Arc<Notify> {
+        self.wake.clone()
+    }
+
+    /// Start the reports over for a core that counts `link`'s bytes afresh:
+    /// what is written from now on is reported, and what was sent and is not
+    /// yet written — the bytes that core is to count in flight — is returned.
+    pub fn rebase(&mut self, link: &SessionLink) -> u64 {
+        let written = self.shared.written.get();
+        self.reported = written;
+        link.sent - written
+    }
+}
+
+/// What a [`DrainedWatch`] has, polled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    /// This many bytes more were written.
+    More(u64),
+    /// Nothing since the last report.
+    Nothing,
+    /// The edge's end is gone, and everything it wrote has been reported.
+    Over,
 }
 
 /// The core's end of a session whose output is a byte stream of IRC lines —
@@ -429,6 +597,12 @@ impl LineWriter {
             partial: Vec::new(),
             pending: None,
         }
+    }
+
+    /// The core end it writes through: what a holding session publishes its
+    /// record on ([`SessionLink::hold_record`]).
+    pub fn link(&self) -> &SessionLink {
+        &self.link
     }
 
     fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -555,6 +729,40 @@ impl EdgeSession {
     /// however much is still buffered: the moment the edge stops reading.
     pub fn session_over(&self) -> SendersGone<Output> {
         self.buffer.senders_gone()
+    }
+
+    /// What the core published for the edge to hold whose output before it
+    /// has all been taken: the record, then the acknowledgement. What follows
+    /// output not yet taken stays until it is.
+    pub fn take_held(&mut self) -> Vec<Held> {
+        let Some(held) = &self.shared.held else {
+            return Vec::new();
+        };
+        let mut slot = held.lock().expect("held slot");
+        let mut given = Vec::new();
+        if slot
+            .record
+            .as_ref()
+            .is_some_and(|(mark, ..)| *mark <= self.taken)
+        {
+            let (_, revision, body) = slot.record.take().expect("checked");
+            given.push(Held::Record { revision, body });
+        }
+        if slot
+            .ack
+            .as_ref()
+            .is_some_and(|(mark, _)| *mark <= self.taken)
+        {
+            let (_, ack) = slot.ack.take().expect("checked");
+            given.push(Held::Ack(ack));
+        }
+        given
+    }
+
+    /// What wakes when the core publishes something for the edge to hold,
+    /// to wait on beside [`Self::take`].
+    pub fn held_signal(&self) -> HeldSignal {
+        HeldSignal(self.shared.clone())
     }
 
     /// Say how the writer to the client socket failed, before this end goes:

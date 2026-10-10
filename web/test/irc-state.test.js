@@ -15,10 +15,12 @@ import {
   chatMessageRoute,
   clearTranscript,
   composerRequests,
+  countsAsUnread,
   existingChannelBuffer,
   fold,
   isChannel,
   isPrefixMode,
+  isSaid,
   kickPairs,
   memberRank,
   membershipTargets,
@@ -37,6 +39,7 @@ import {
   reasonSuffix,
   reconcileChannelSnapshot,
   rekeyBuffers,
+  replyReport,
   seededNick,
   splitSigil,
   splitUtf8,
@@ -500,6 +503,7 @@ test("a replay clears a transcript and offers its earlier history again", () => 
     mentions: 1,
     pendingVisibleMessages: 2,
     historyLoaded: true,
+    transcriptEpoch: 4,
   };
   clearTranscript(buffer);
   assert.deepEqual(buffer, {
@@ -508,6 +512,8 @@ test("a replay clears a transcript and offers its earlier history again", () => 
     mentions: 0,
     pendingVisibleMessages: 0,
     historyLoaded: false,
+    // A history read still out is told the transcript it was read for ended.
+    transcriptEpoch: 5,
   });
 });
 
@@ -671,4 +677,77 @@ test("an ISUPPORT token list builds the network's table from the defaults", () =
   assert.equal(modeTakesParameter(modes, "f", true), true);
   assert.deepEqual(channelModesFromIsupport([]).modes, DEFAULT_CHANNEL_MODES);
   assert.deepEqual(channelModesFromIsupport(["PREFIX=(ov)@"]).malformed, ["PREFIX=(ov)@"]);
+});
+
+test("merged conversations keep the order their rows arrived in, capped, and stay joined", () => {
+  const row = (text, order) => ({ text, order });
+  const buffer = (display, extra) => ({
+    key: fold(display), display, kind: "channel", nicks: new Map(), unread: 0, mentions: 0, topic: "", ...extra,
+  });
+  const first = buffer("#A[", { lines: [{ text: "history" }, row("one", 1), row("three", 3)], joined: false });
+  const second = buffer("#a{", { lines: [row("two", 2), row("four", 4)], joined: true, topic: "kept" });
+  const ascii = namesFromIsupport(["CASEMAPPING=ascii"]);
+  const split = new Map([[fold("#A[", ascii), first], [fold("#a{", ascii), second]]);
+  const { buffers } = rekeyBuffers(split, DEFAULT_NAMES, 4);
+  const merged = buffers.get("#a{");
+  assert.deepEqual(merged.lines.map(({ text }) => text), ["one", "two", "three", "four"]);
+  assert.equal(merged.joined, true, "a channel either spelling was in is joined");
+  assert.equal(merged.topic, "kept");
+});
+
+test("only what is said is unread: membership notices are not messages", () => {
+  const said = [
+    { kind: "msg", sender: "bob" },
+    { kind: "notice", sender: "bob" },
+    { kind: "event", sender: "bob" }, // an action
+  ];
+  const notices = [
+    { kind: "event", sender: null }, // join, part, quit, nick, topic
+    { kind: "wire", sender: null },
+  ];
+  for (const line of said) assert.ok(isSaid(line) && countsAsUnread(line), JSON.stringify(line));
+  for (const line of notices) assert.ok(!isSaid(line) && !countsAsUnread(line), JSON.stringify(line));
+  // A refusal and e6irc's own notes are for the person, though nobody said them.
+  for (const kind of ["error", "server"]) {
+    assert.ok(!isSaid({ kind, sender: null }) && countsAsUnread({ kind, sender: null }), kind);
+  }
+});
+
+test("a refusal or the answer to the person's own question is reported in words", () => {
+  const report = (line) => replyReport(parseIrc(line));
+  assert.deepEqual(report(":irc 404 me #chan :Cannot send to channel"), {
+    failure: true, subject: "#chan", text: "#chan: Cannot send to channel",
+  });
+  assert.deepEqual(report(":irc 433 me taken :Nickname is already in use"), {
+    failure: true, subject: "taken", text: "taken: Nickname is already in use",
+  });
+  assert.deepEqual(report(":irc 421 me FROB :Unknown command"), {
+    failure: true, subject: "FROB", text: "FROB: Unknown command",
+  });
+  assert.deepEqual(report(":irc 451 me :\x02You have not registered\x02"), {
+    failure: true, subject: null, text: "You have not registered",
+  });
+  assert.deepEqual(report(":irc FAIL JOIN CHANNEL_FULL #busy :Channel is full"), {
+    failure: true, subject: "#busy", text: "JOIN #busy: Channel is full",
+  });
+  assert.deepEqual(report(":irc FAIL CHATHISTORY MESSAGE_ERROR :Oops"), {
+    failure: true, subject: null, text: "CHATHISTORY: Oops",
+  });
+  assert.deepEqual(report(":irc 301 me bob :gone fishing"), {
+    failure: false, subject: "bob", text: "bob: gone fishing",
+  });
+  assert.deepEqual(report(":irc 306 me :You have been marked as being away"), {
+    failure: false, subject: null, text: "You have been marked as being away",
+  });
+  assert.deepEqual(report(":irc 311 me bob ~b host.example * :Bob Real"), {
+    failure: false, subject: "bob", text: "bob ~b host.example *: Bob Real",
+  });
+  // Everything else stays the console's: the burst, the MOTD, NAMES, and
+  // what the page handles itself.
+  for (const line of [
+    ":irc 001 me :Welcome", ":irc 372 me :- motd", ":irc 353 me = #c :a b", ":irc 318 me bob :End of WHOIS",
+    ":bob!u@h PRIVMSG #c :hi", ":irc FAIL JOIN",
+  ]) {
+    assert.equal(report(line), null, line);
+  }
 });

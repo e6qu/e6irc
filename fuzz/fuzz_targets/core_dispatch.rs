@@ -67,6 +67,7 @@ fuzz_target!(|data: &[u8]| {
         tx,
         host: "fuzz.host".into(),
         transport: ConnectionTransport::Tcp,
+        tls: None,
     });
     // Each input line is one command. Bounded so a huge input is many short
     // runs rather than one enormous one.

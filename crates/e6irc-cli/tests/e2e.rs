@@ -491,7 +491,7 @@ async fn cli_sasl_login() {
     std::fs::remove_dir_all(token_directory).unwrap();
     drop(observer);
     assert_eq!(
-        running.shutdown.run().await,
+        running.shutdown.run(e6ircd::net::StopMode::Final).await,
         e6ircd::net::ShutdownOutcome::Flushed
     );
     pool.close().await;
@@ -647,30 +647,43 @@ async fn cli_history_reads_recent_messages() {
     assert!(first < second, "wrong order: {stdout}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn client_tls_connect() {
-    use rustls_pki_types::pem::PemObject;
-
-    // self-signed cert for the test
+/// A TLS listener on a fresh loopback port with a self-signed certificate
+/// for `localhost`, written under a directory of its own named after `tag`.
+/// Yields the listener, the directory to remove, and the certificate.
+fn self_signed_tls_listener(
+    tag: &str,
+) -> (
+    e6ircd::config::ListenerConfig,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
-    let dir = std::env::temp_dir().join(format!("e6irc-clitls-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("e6irc-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+    let listener = e6ircd::config::ListenerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        tls: Some(e6ircd::config::TlsConfig {
+            cert_path: cert_path.clone(),
+            key_path,
+        }),
+        websocket: false,
+    };
+    (listener, dir, cert_path)
+}
 
+#[tokio::test(flavor = "multi_thread")]
+async fn client_tls_connect() {
+    use rustls_pki_types::pem::PemObject;
+
+    let (listener, dir, cert_path) = self_signed_tls_listener("clitls");
     let config = e6ircd::config::Config {
         server_name: "irc.clitls.example".into(),
         network_name: "CliTlsNet".into(),
-        listeners: vec![e6ircd::config::ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: Some(e6ircd::config::TlsConfig {
-                cert_path: cert_path.clone(),
-                key_path,
-            }),
-            websocket: false,
-        }],
+        listeners: vec![listener],
         ..e6ircd::config::Config::default()
     };
     let running = e6ircd::net::start(config).await.expect("start");
@@ -1545,5 +1558,112 @@ async fn cli_api_never_goes_through_a_proxy_from_the_environment() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The history of a direct conversation is both directions between the
+/// client and the nick. A nick has nothing to join: `history bob` sent
+/// `JOIN bob`, which a server refuses, so the command could not read a
+/// direct conversation at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_history_reads_a_direct_conversation_without_joining() {
+    let (address, served) = scripted_server(
+        "batch draft/chathistory server-time",
+        &[(
+            "CHATHISTORY LATEST bob * 20",
+            b":srv BATCH +h1 chathistory bob\r\n\
+              @batch=h1;time=2026-09-28T10:00:00.000Z :Bob!u@h PRIVMSG sender :from bob\r\n\
+              @batch=h1;time=2026-09-28T10:00:01.000Z :sender!u@h PRIVMSG BOB :to bob\r\n\
+              @batch=h1;time=2026-09-28T10:00:02.000Z :carol!u@h PRIVMSG sender :not bob\r\n\
+              :srv BATCH -h1",
+        )],
+        None,
+    )
+    .await;
+    let output = run_cli(address, &["--nick", "sender", "history", "bob"], "").await;
+    let seen = served.await.unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sent {seen:?}; stderr {stderr}");
+    assert_eq!(stdout, "Bob\tfrom bob\nsender\tto bob\n", "{stderr}");
+    assert!(
+        !seen.iter().any(|line| line.starts_with("JOIN")),
+        "a nick was joined: {seen:?}"
+    );
+}
+
+/// `tail bob` follows the direct conversation with bob. It printed nothing,
+/// ever: it waited for messages addressed *to* bob, which this client's
+/// connection never carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_tail_follows_a_direct_conversation() {
+    let (address, served) = scripted_server(
+        "",
+        &[(
+            "PING :e6irc-round-trip",
+            b":srv PONG srv :e6irc-round-trip\r\n\
+              :carol!u@h PRIVMSG sender :not bob\r\n\
+              :bob!u@h PRIVMSG sender :one\r\n\
+              :sender!u@h PRIVMSG bob :two",
+        )],
+        None,
+    )
+    .await;
+    let output = run_cli(
+        address,
+        &["--nick", "sender", "tail", "bob", "--count", "2"],
+        "",
+    )
+    .await;
+    drop(served);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout, "bob!u@h\tone\nsender!u@h\ttwo\n", "{stderr}");
+}
+
+/// `--count 0` asked for no history and printed none, successfully: a
+/// command that can do nothing is refused before it connects.
+#[test]
+fn cli_history_refuses_a_count_of_zero() {
+    let output = Command::new(env!("CARGO_BIN_EXE_e6irc"))
+        .args(["--server", "127.0.0.1:1", "--nick", "n", "history", "#c"])
+        .args(["--count", "0"])
+        .output()
+        .expect("run cli");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--count"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--tls` validates against the public CA set: a server whose certificate
+/// no public CA issued is refused before anything is sent, with a nonzero
+/// exit that says why — never a connection that goes on unverified.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_refuses_a_tls_server_it_cannot_verify() {
+    let (listener, dir, _) = self_signed_tls_listener("cli-untrusted");
+    let running = e6ircd::net::start(e6ircd::config::Config {
+        listeners: vec![listener],
+        ..e6ircd::config::Config::default()
+    })
+    .await
+    .expect("start");
+    let port = running.addrs[0].port();
+    let output = run_cli(
+        format!("localhost:{port}"),
+        &["--tls", "--nick", "sender", "send", "#c", "hi"],
+        "",
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.starts_with("e6irc: "), "{stderr}");
+    assert!(
+        stderr.to_ascii_lowercase().contains("certificate"),
+        "{stderr}"
     );
 }

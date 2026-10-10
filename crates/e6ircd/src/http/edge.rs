@@ -24,6 +24,9 @@ pub(crate) struct EdgeUpgrade {
 pub(crate) struct LinkRouters {
     pub(crate) full: Router,
     pub(crate) websocket_irc: Router,
+    /// The state the routers serve with, which a rebuild resumes live chat
+    /// sockets with.
+    pub(crate) state: Arc<super::AppState>,
 }
 
 impl LinkRouters {
@@ -31,6 +34,7 @@ impl LinkRouters {
         Self {
             full: super::router(state.clone()),
             websocket_irc: super::ws_irc_router(state.clone()),
+            state: state.clone(),
         }
     }
 }

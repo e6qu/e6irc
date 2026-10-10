@@ -51,7 +51,7 @@ pub(crate) use revocation::CredentialWatch;
 use sessions::*;
 pub(crate) use ws::UiSocketLimiter;
 use ws::*;
-pub(crate) use ws::{UiGrant, open_granted_ui};
+pub(crate) use ws::{HoldingUi, UiGrant, open_granted_ui, resume_ui};
 
 /// The database pool for an unauthenticated endpoint, or a 503 problem
 /// response when the server runs without one. (Authenticated endpoints use
@@ -516,6 +516,60 @@ impl IntoResponse for ResponseRejection {
 }
 
 pub(super) type ResponseResult<T> = Result<T, ResponseRejection>;
+
+/// A query string a directory refuses: a parameter that does not parse, or a
+/// filter, page size or cursor outside its rule. The API answers it as a `400`
+/// problem document naming the field; a console page shows the same words
+/// beside the filter form it came from, in the page, rather than replacing the
+/// page with a document a person cannot act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct QueryRefusal {
+    title: &'static str,
+    detail: String,
+    field: Option<&'static str>,
+}
+
+impl QueryRefusal {
+    pub(super) fn new(
+        title: &'static str,
+        detail: impl Into<String>,
+        field: Option<&'static str>,
+    ) -> Self {
+        Self {
+            title,
+            detail: detail.into(),
+            field,
+        }
+    }
+
+    /// A query string that does not parse into the directory's parameters at
+    /// all: an unknown parameter, or a value of the wrong type.
+    pub(super) fn unparsable(rejection: &axum::extract::rejection::QueryRejection) -> Self {
+        Self::new("Invalid query", rejection.body_text(), None)
+    }
+
+    /// The refusal as one sentence for a page.
+    pub(super) fn message(&self) -> String {
+        format!("{}. {}", self.title, self.detail)
+    }
+}
+
+impl From<QueryRefusal> for Response {
+    fn from(refusal: QueryRefusal) -> Self {
+        problem_at_field(
+            StatusCode::BAD_REQUEST,
+            refusal.title,
+            Some(&refusal.detail),
+            refusal.field,
+        )
+    }
+}
+
+impl From<QueryRefusal> for ResponseRejection {
+    fn from(refusal: QueryRefusal) -> Self {
+        Response::from(refusal).into()
+    }
+}
 
 pub(super) fn label_validation_error(label: &str) -> Option<String> {
     if label.is_empty() {
@@ -3489,46 +3543,122 @@ mod pages {
     struct ConsoleAccounts {
         shell: ConsoleShell,
         minimum_password_length: usize,
+        filters: PageFilters,
     }
 
     #[derive(Template)]
     #[template(path = "console_admin_channels.html")]
     struct ConsoleAdminChannels {
         shell: ConsoleShell,
-        name: String,
-        founder: String,
-        limit: usize,
-        has_filters: bool,
-        has_cursor: bool,
+        filters: PageFilters,
     }
 
     #[derive(Template)]
     #[template(path = "console_admin_networks.html")]
     struct ConsoleAdminNetworks {
         shell: ConsoleShell,
+        filters: PageFilters,
     }
 
     #[derive(Template)]
     #[template(path = "console_bans.html")]
     struct ConsoleServerBans {
         shell: ConsoleShell,
-        kind: String,
-        mask: String,
-        limit: usize,
-        has_filters: bool,
-        has_cursor: bool,
+        filters: PageFilters,
     }
 
     #[derive(Template)]
     #[template(path = "console_audit.html")]
     struct ConsoleAudit {
         shell: ConsoleShell,
-        actor: String,
-        action: String,
-        target: String,
-        limit: usize,
-        has_filters: bool,
-        has_cursor: bool,
+        filters: PageFilters,
+    }
+
+    /// A console filter page's query string. The page validates it exactly as
+    /// its API does, but a query it refuses -- hand-edited, bookmarked, or
+    /// written by an older console -- is shown in the page, beside the filter
+    /// form, whose fields keep the values that were refused so they can be
+    /// corrected; the page is then a `400` that still works. It used to be the
+    /// API's problem document in place of the page: a dead end with no form
+    /// and no navigation.
+    struct PageFilters {
+        /// The query's pairs as sent, decoded, to refill the form.
+        pairs: Vec<(String, String)>,
+        refusal: Option<QueryRefusal>,
+    }
+
+    impl PageFilters {
+        /// Parse and validate `uri`'s query as `T`. The validated query is
+        /// returned when the page has one; otherwise the refusal is kept for
+        /// the page to show.
+        fn read<T, V>(
+            uri: &axum::http::Uri,
+            validate: impl FnOnce(T) -> Result<V, QueryRefusal>,
+        ) -> (Self, Option<V>)
+        where
+            T: serde::de::DeserializeOwned,
+        {
+            let pairs = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let validated = axum::extract::Query::<T>::try_from_uri(uri)
+                .map_err(|rejection| QueryRefusal::unparsable(&rejection))
+                .and_then(|axum::extract::Query(params)| validate(params));
+            match validated {
+                Ok(query) => (
+                    Self {
+                        pairs,
+                        refusal: None,
+                    },
+                    Some(query),
+                ),
+                Err(refusal) => (
+                    Self {
+                        pairs,
+                        refusal: Some(refusal),
+                    },
+                    None,
+                ),
+            }
+        }
+
+        /// The value sent for `name`, or empty.
+        fn value(&self, name: &str) -> &str {
+            self.pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map_or("", |(_, value)| value.as_str())
+        }
+
+        /// The value sent for `name`, or `default` when none was.
+        fn value_or<'a>(&'a self, name: &str, default: &'a str) -> &'a str {
+            match self.value(name) {
+                "" => default,
+                value => value,
+            }
+        }
+
+        /// Whether the query asked for anything: a filter, a page, a size.
+        fn narrowed(&self) -> bool {
+            self.pairs.iter().any(|(_, value)| !value.is_empty())
+        }
+
+        fn refusal(&self) -> Option<String> {
+            self.refusal.as_ref().map(QueryRefusal::message)
+        }
+
+        fn refused(&self) -> bool {
+            self.refusal.is_some()
+        }
+    }
+
+    /// A filter page, as a `400` when its query was refused.
+    fn render_filter_page<T: Template>(page: T, refused: bool) -> Response {
+        let mut response = render_private(page);
+        if refused && response.status().is_success() {
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+        }
+        response
     }
 
     #[derive(Serialize)]
@@ -3581,13 +3711,13 @@ mod pages {
         }
     }
 
-    fn monitoring_window_links(window: MonitoringWindow) -> Vec<MonitoringWindowLink> {
+    fn monitoring_window_links(window: Option<MonitoringWindow>) -> Vec<MonitoringWindowLink> {
         MonitoringWindow::ALL
             .into_iter()
             .map(|candidate| MonitoringWindowLink {
                 label: candidate.label(),
                 minutes: candidate.minutes(),
-                active: candidate.minutes() == window.minutes(),
+                active: window.is_some_and(|window| candidate.minutes() == window.minutes()),
             })
             .collect()
     }
@@ -3598,20 +3728,15 @@ mod pages {
         minutes: Option<u64>,
     }
 
-    fn invalid_monitoring_window_response() -> Response {
-        problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid monitoring window",
-            Some("Choose one of 60, 360, 1,440, or 10,080 minutes."),
-        )
-    }
-
     #[derive(Template)]
     #[template(path = "console_monitoring.html")]
     struct ConsoleMonitoring {
         shell: ConsoleShell,
-        minutes: u64,
+        /// The window shown; none when the query named no window there is,
+        /// and the page shows the refusal and the windows to choose from.
+        minutes: Option<u64>,
         window_links: Vec<MonitoringWindowLink>,
+        filters: PageFilters,
     }
 
     #[derive(Template)]
@@ -3622,17 +3747,27 @@ mod pages {
 
     pub async fn console_monitoring(
         AdminPageActor(actor): AdminPageActor,
-        QueryParams(query): QueryParams<ConsoleMonitoringQuery>,
+        uri: axum::http::Uri,
     ) -> Response {
-        let window = match MonitoringWindow::from_query(query.minutes) {
-            Ok(window) => window,
-            Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
-        };
-        render_private(ConsoleMonitoring {
-            shell: console_shell(actor, "monitoring"),
-            minutes: window.minutes(),
-            window_links: monitoring_window_links(window),
-        })
+        let (filters, window) = PageFilters::read(&uri, |query: ConsoleMonitoringQuery| {
+            MonitoringWindow::from_query(query.minutes).map_err(|InvalidMonitoringWindow| {
+                QueryRefusal::new(
+                    "Invalid monitoring window",
+                    "Choose one of 60, 360, 1,440, or 10,080 minutes.",
+                    Some("minutes"),
+                )
+            })
+        });
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleMonitoring {
+                shell: console_shell(actor, "monitoring"),
+                minutes: window.map(MonitoringWindow::minutes),
+                window_links: monitoring_window_links(window),
+                filters,
+            },
+            refused,
+        )
     }
 
     /// A bounded, redacted event feed for the server components. It is live
@@ -3652,41 +3787,41 @@ mod pages {
     pub async fn console_accounts(
         State(state): State<Arc<AppState>>,
         AdminPageActor(actor): AdminPageActor,
+        uri: axum::http::Uri,
     ) -> Response {
-        render_private(ConsoleAccounts {
-            shell: console_shell(actor, "accounts"),
-            minimum_password_length: state.core_tx.password_policy().minimum_chars(),
-        })
-    }
-
-    fn console_admin_channels_build(
-        actor: PageActor,
-        query: super::device::ValidatedRegisteredChannelDirectoryQuery,
-    ) -> ConsoleAdminChannels {
-        let name = query.name.unwrap_or_default();
-        let founder = query.founder.unwrap_or_default();
-        ConsoleAdminChannels {
-            shell: console_shell(actor, "admin-channels"),
-            has_filters: !name.is_empty() || !founder.is_empty(),
-            has_cursor: query.before_id.is_some(),
-            name,
-            founder,
-            limit: query.page_size.value(),
-        }
+        let (filters, _) = PageFilters::read(&uri, super::device::validate_accounts_page_query);
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleAccounts {
+                shell: console_shell(actor, "accounts"),
+                minimum_password_length: state.core_tx.password_policy().minimum_chars(),
+                filters,
+            },
+            refused,
+        )
     }
 
     pub async fn console_admin_channels(
         AdminPageActor(actor): AdminPageActor,
-        QueryParams(params): QueryParams<super::device::RegisteredChannelDirectoryQuery>,
+        uri: axum::http::Uri,
     ) -> Response {
-        let query = match super::device::validate_registered_channel_directory_query(
-            params.with_unfilled_fields_absent(),
-            50,
-        ) {
-            Ok(query) => query,
-            Err(response) => return response.into(),
-        };
-        render_private(console_admin_channels_build(actor, query))
+        let (filters, _) = PageFilters::read(
+            &uri,
+            |params: super::device::RegisteredChannelDirectoryQuery| {
+                super::device::validate_registered_channel_directory_query(
+                    params.with_unfilled_fields_absent(),
+                    50,
+                )
+            },
+        );
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleAdminChannels {
+                shell: console_shell(actor, "admin-channels"),
+                filters,
+            },
+            refused,
+        )
     }
 
     /// The fleet-wide BNC view: every account's networks with live driver
@@ -3694,70 +3829,62 @@ mod pages {
     /// upstream without suspending the whole account.
     pub async fn console_admin_networks(
         AdminPageActor(actor): AdminPageActor,
-        QueryParams(params): QueryParams<super::device::AdminNetworkInventoryQuery>,
+        uri: axum::http::Uri,
     ) -> Response {
         // The page's own query is the inventory page the browser reads; a bad
         // one is refused here as the API would refuse it.
-        if let Err(response) = super::device::validate_admin_network_inventory_query(params) {
-            return response.into();
-        }
-        render_private(ConsoleAdminNetworks {
-            shell: console_shell(actor, "admin-networks"),
-        })
-    }
-
-    fn console_server_bans_build(
-        actor: PageActor,
-        query: super::device::ValidatedServerBanDirectoryQuery,
-    ) -> ConsoleServerBans {
-        let kind = query.kind.unwrap_or_default();
-        let mask = query.mask.unwrap_or_default();
-        ConsoleServerBans {
-            shell: console_shell(actor, "bans"),
-            has_filters: !kind.is_empty() || !mask.is_empty(),
-            has_cursor: query.before_id.is_some(),
-            kind,
-            mask,
-            limit: query.page_size.value(),
-        }
+        let (filters, _) =
+            PageFilters::read(&uri, |params: super::device::AdminNetworkInventoryQuery| {
+                super::device::validate_admin_network_inventory_query(
+                    params.with_unfilled_fields_absent(),
+                )
+            });
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleAdminNetworks {
+                shell: console_shell(actor, "admin-networks"),
+                filters,
+            },
+            refused,
+        )
     }
 
     pub async fn console_server_bans(
         AdminPageActor(actor): AdminPageActor,
-        QueryParams(params): QueryParams<super::device::ServerBanDirectoryQuery>,
+        uri: axum::http::Uri,
     ) -> Response {
-        let query = match super::device::validate_server_ban_directory_query(
-            params.with_unfilled_fields_absent(),
-            50,
-        ) {
-            Ok(query) => query,
-            Err(response) => return response.into(),
-        };
-        render_private(console_server_bans_build(actor, query))
+        let (filters, _) =
+            PageFilters::read(&uri, |params: super::device::ServerBanDirectoryQuery| {
+                super::device::validate_server_ban_directory_query(
+                    params.with_unfilled_fields_absent(),
+                    50,
+                )
+            });
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleServerBans {
+                shell: console_shell(actor, "bans"),
+                filters,
+            },
+            refused,
+        )
     }
 
     pub async fn console_audit(
         AdminPageActor(page): AdminPageActor,
-        QueryParams(params): QueryParams<super::device::AuditQuery>,
+        uri: axum::http::Uri,
     ) -> Response {
-        let query =
-            match super::device::validate_audit_query(params.with_unfilled_fields_absent(), 50) {
-                Ok(query) => query,
-                Err(response) => return response.into(),
-            };
-        let actor = query.actor.unwrap_or_default();
-        let action = query.action.unwrap_or_default();
-        let target = query.target.unwrap_or_default();
-        let has_cursor = query.before_id.is_some();
-        render_private(ConsoleAudit {
-            shell: console_shell(page, "audit"),
-            has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
-            has_cursor,
-            actor,
-            action,
-            target,
-            limit: query.page_size.value(),
-        })
+        let (filters, _) = PageFilters::read(&uri, |params: super::device::AuditQuery| {
+            super::device::validate_audit_query(params.with_unfilled_fields_absent(), 50)
+        });
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleAudit {
+                shell: console_shell(page, "audit"),
+                filters,
+            },
+            refused,
+        )
     }
 
     #[derive(Template)]
@@ -3786,6 +3913,7 @@ mod pages {
     struct ConsoleSessions {
         shell: ConsoleShell,
         own: bool,
+        filters: PageFilters,
     }
 
     #[derive(Template)]
@@ -4109,13 +4237,7 @@ mod pages {
     }
 
     /// Console → Integrations (admin) GET.
-    pub async fn console_integrations(
-        AdminPageActor(actor): AdminPageActor,
-        QueryParams(params): QueryParams<super::device::AdminNetworkInventoryQuery>,
-    ) -> Response {
-        if let Err(response) = super::device::validate_admin_network_inventory_query(params) {
-            return response.into();
-        }
+    pub async fn console_integrations(AdminPageActor(actor): AdminPageActor) -> Response {
         render_private(console_integrations_build(actor))
     }
 
@@ -4132,11 +4254,28 @@ mod pages {
     }
 
     /// Console → API-hydrated live connection directory (admin-gated).
-    pub async fn console_sessions(AdminPageActor(actor): AdminPageActor) -> Response {
-        render_private(ConsoleSessions {
-            shell: console_shell(actor, "sessions"),
-            own: false,
-        })
+    pub async fn console_sessions(
+        AdminPageActor(actor): AdminPageActor,
+        uri: axum::http::Uri,
+    ) -> Response {
+        let (filters, _) = PageFilters::read(
+            &uri,
+            |params: super::sessions::LiveConnectionQueryParams| {
+                super::sessions::validate_live_connection_query(
+                    params.with_unfilled_fields_absent(),
+                    50,
+                )
+            },
+        );
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleSessions {
+                shell: console_shell(actor, "sessions"),
+                own: false,
+                filters,
+            },
+            refused,
+        )
     }
 
     /// Console → the caller's bounded live-connection directory and durable
@@ -4144,15 +4283,31 @@ mod pages {
     pub async fn console_my_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
+        uri: axum::http::Uri,
     ) -> Response {
         let actor = match page_actor(&state, &headers, false).await {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
-        render_private(ConsoleSessions {
-            shell: console_shell(actor, "my-sessions"),
-            own: true,
-        })
+        let (filters, _) = PageFilters::read(
+            &uri,
+            |params: super::sessions::OwnLiveConnectionQueryParams| {
+                super::sessions::validate_live_connection_query(
+                    super::sessions::LiveConnectionQueryParams::from(params)
+                        .with_unfilled_fields_absent(),
+                    50,
+                )
+            },
+        );
+        let refused = filters.refused();
+        render_filter_page(
+            ConsoleSessions {
+                shell: console_shell(actor, "my-sessions"),
+                own: true,
+                filters,
+            },
+            refused,
+        )
     }
 
     /// Console → Integrations bridge editor. The browser reads the owner API
@@ -4488,25 +4643,38 @@ mod composer_tests {
     #[test]
     fn slash_commands_map_to_irc() {
         use super::slash_to_irc;
-        assert_eq!(slash_to_irc("hello", "#c").unwrap(), "PRIVMSG #c :hello");
+        let names = e6irc_client::NetworkNames::default();
         assert_eq!(
-            slash_to_irc("/me waves", "#c").unwrap(),
+            slash_to_irc("hello", "#c", &names).unwrap(),
+            "PRIVMSG #c :hello"
+        );
+        assert_eq!(
+            slash_to_irc("/me waves", "#c", &names).unwrap(),
             "PRIVMSG #c :\u{1}ACTION waves\u{1}"
         );
-        assert_eq!(slash_to_irc("/join #other", "#c").unwrap(), "JOIN #other");
-        assert_eq!(slash_to_irc("/part", "#c").unwrap(), "PART #c");
-        assert_eq!(slash_to_irc("/nick bob", "#c").unwrap(), "NICK bob");
         assert_eq!(
-            slash_to_irc("/topic new topic", "#c").unwrap(),
+            slash_to_irc("/join #other", "#c", &names).unwrap(),
+            "JOIN #other"
+        );
+        assert_eq!(slash_to_irc("/part", "#c", &names).unwrap(), "PART #c");
+        assert_eq!(slash_to_irc("/nick bob", "#c", &names).unwrap(), "NICK bob");
+        assert_eq!(
+            slash_to_irc("/topic new topic", "#c", &names).unwrap(),
             "TOPIC #c :new topic"
         );
         assert_eq!(
-            slash_to_irc("/msg bob hi bob", "#c").unwrap(),
+            slash_to_irc("/msg bob hi bob", "#c", &names).unwrap(),
             "PRIVMSG bob :hi bob"
         );
-        assert_eq!(slash_to_irc("/raw WHOIS bob", "#c").unwrap(), "WHOIS bob");
+        assert_eq!(
+            slash_to_irc("/raw WHOIS bob", "#c", &names).unwrap(),
+            "WHOIS bob"
+        );
         // unknown slash-command passes through (server answers 421)
-        assert_eq!(slash_to_irc("/frobnicate x", "#c").unwrap(), "FROBNICATE x");
+        assert_eq!(
+            slash_to_irc("/frobnicate x", "#c", &names).unwrap(),
+            "FROBNICATE x"
+        );
         for invalid in [
             ("hello", ""),
             ("/", "#c"),
@@ -4518,8 +4686,50 @@ mod composer_tests {
             ("/topic hello", ""),
             ("/msg bob", "#c"),
         ] {
-            assert!(slash_to_irc(invalid.0, invalid.1).is_err(), "{invalid:?}");
+            assert!(
+                slash_to_irc(invalid.0, invalid.1, &names).is_err(),
+                "{invalid:?}"
+            );
         }
+    }
+
+    /// `/topic` without text reads the topic (the help says so); sending
+    /// `TOPIC #c :` instead cleared it. Free text is always the trailing
+    /// parameter, so a reason or an away message is never cut to one word, and
+    /// a leading channel is recognised by the network's own CHANTYPES.
+    #[test]
+    fn free_text_commands_keep_their_whole_text_and_never_clear_by_asking() {
+        use super::slash_to_irc;
+        let names = e6irc_client::NetworkNames::default();
+        for (message, target, line) in [
+            ("/topic", "#c", "TOPIC #c"),
+            ("/topic   ", "#c", "TOPIC #c"),
+            ("/topic #other", "#c", "TOPIC #other"),
+            ("/topic #other new words", "#c", "TOPIC #other :new words"),
+            ("/topic &local set here", "", "TOPIC &local :set here"),
+            ("/part #c see you all", "#c", "PART #c :see you all"),
+            ("/part see you all", "#c", "PART #c :see you all"),
+            ("/part #a,#b bye", "#c", "PART #a,#b :bye"),
+            ("/part #other", "", "PART #other"),
+            ("/away", "#c", "AWAY"),
+            ("/away gone to lunch", "#c", "AWAY :gone to lunch"),
+        ] {
+            assert_eq!(
+                slash_to_irc(message, target, &names).as_deref(),
+                Ok(line),
+                "{message} in {target:?}"
+            );
+        }
+        for (message, target) in [("/topic", ""), ("/part bye", "")] {
+            assert!(slash_to_irc(message, target, &names).is_err(), "{message}");
+        }
+        // Only the network's own channel types name a channel.
+        let mut hash_only = e6irc_client::NetworkNames::default();
+        hash_only.adopt_tokens(["CHANTYPES=#"]);
+        assert_eq!(
+            slash_to_irc("/part &x marks the spot", "#c", &hash_only).as_deref(),
+            Ok("PART #c :&x marks the spot")
+        );
     }
 }
 

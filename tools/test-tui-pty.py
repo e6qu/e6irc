@@ -63,8 +63,8 @@ class IrcPeer:
     def send(self, line: str) -> None:
         self.socket.sendall(line.encode() + b"\r\n")
 
-    def wait_line(self, predicate, description: str) -> str:
-        deadline = time.monotonic() + TIMEOUT
+    def wait_line(self, predicate, description: str, timeout: float = TIMEOUT) -> str:
+        deadline = time.monotonic() + timeout
         seen: list[str] = []
         while time.monotonic() < deadline:
             while b"\n" in self.buffer:
@@ -90,7 +90,9 @@ class IrcPeer:
 class LineProxy:
     """A TCP relay between the TUI and e6ircd that records every line the TUI
     sends, so the journey can prove what reached the server — a read marker
-    is private to the connection that set it, and no other client sees it."""
+    is private to the connection that set it, and no other client sees it.
+    It relays each connection the TUI makes, so a reconnect goes through it
+    too; one it cannot carry upstream (the server is down) it closes."""
 
     def __init__(self, upstream_port: int) -> None:
         self.upstream_port = upstream_port
@@ -103,12 +105,22 @@ class LineProxy:
         threading.Thread(target=self.run, daemon=True).start()
 
     def run(self) -> None:
-        client, _ = self.listener.accept()
-        upstream = socket.create_connection(("127.0.0.1", self.upstream_port))
-        threading.Thread(
-            target=self.pump, args=(upstream, client, False), daemon=True
-        ).start()
-        self.pump(client, upstream, True)
+        while True:
+            try:
+                client, _ = self.listener.accept()
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(("127.0.0.1", self.upstream_port))
+            except OSError:
+                client.close()
+                continue
+            threading.Thread(
+                target=self.pump, args=(upstream, client, False), daemon=True
+            ).start()
+            threading.Thread(
+                target=self.pump, args=(client, upstream, True), daemon=True
+            ).start()
 
     def pump(self, source: socket.socket, sink: socket.socket, record: bool) -> None:
         pending = b""
@@ -271,6 +283,45 @@ def signal_ends_the_session_cleanly(port: int, peer: IrcPeer, signum: int) -> No
         proxy.close()
 
 
+def start_server(config: pathlib.Path, log) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [str(SERVER), "--config", str(config)],
+        cwd=ROOT,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def stop_server(server: subprocess.Popen[bytes]) -> None:
+    if server.poll() is None:
+        server.send_signal(signal.SIGTERM)
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+    if server.returncode != 0:
+        raise RuntimeError(f"e6ircd exited {server.returncode}")
+
+
+def observer_in_pty(port: int) -> IrcPeer:
+    peer = IrcPeer(port)
+    peer.send("NICK observer")
+    peer.send("USER observer 0 * :observer")
+    peer.wait_line(lambda line: " 001 observer " in line, "observer welcome")
+    peer.send("JOIN #pty")
+    peer.wait_line(lambda line: " 366 observer #pty " in line, "observer JOIN")
+    return peer
+
+
+def type_line(master: int, output: bytearray, text: bytes) -> None:
+    """Type `text` and then Enter, as two writes: one write would arrive as a
+    paste-like burst the terminal may deliver with the Enter inside it."""
+    os.write(master, text)
+    drain_pty(master, output, 0.3)
+    os.write(master, b"\r")
+
+
 def main() -> None:
     if not SERVER.is_file() or not TUI.is_file():
         raise RuntimeError("build e6ircd and e6irc-tui before the PTY journey")
@@ -287,12 +338,7 @@ def main() -> None:
             encoding="utf-8",
         )
         server_log = (temporary / "server.log").open("wb")
-        server = subprocess.Popen(
-            [str(SERVER), "--config", str(config)],
-            cwd=ROOT,
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
+        server = start_server(config, server_log)
         master = -1
         tui: subprocess.Popen[bytes] | None = None
         peer: IrcPeer | None = None
@@ -300,12 +346,7 @@ def main() -> None:
         output = bytearray()
         try:
             wait_for_server(port, server)
-            peer = IrcPeer(port)
-            peer.send("NICK observer")
-            peer.send("USER observer 0 * :observer")
-            peer.wait_line(lambda line: " 001 observer " in line, "observer welcome")
-            peer.send("JOIN #pty")
-            peer.wait_line(lambda line: " 366 observer #pty " in line, "observer JOIN")
+            peer = observer_in_pty(port)
 
             proxy = LineProxy(port)
             tui, master = spawn_tui(proxy.port, "ptyclient")
@@ -343,6 +384,81 @@ def main() -> None:
             read_pty_until(master, output, b"inserted")
             if any("pasted-" in line for line in proxy.lines()):
                 raise AssertionError(f"a multi-line paste was sent: {proxy.lines()!r}")
+
+            # The server goes away: the TUI says it is reconnecting, refuses
+            # to send while offline and keeps what was typed, then — the
+            # server back — reconnects through the same request, rejoins the
+            # channel it was in, and sends the kept line once it is entered.
+            # A keyed channel: joined with its key, and — below — rejoined
+            # with it after the reconnect, from memory.
+            peer.send("JOIN #vault")
+            peer.wait_line(lambda line: " 366 observer #vault " in line, "observer in #vault")
+            peer.send("MODE #vault +k sesame")
+            peer.wait_line(lambda line: " MODE #vault +k" in line, "#vault keyed")
+            type_line(master, output, b"/join #vault sesame")
+            peer.wait_line(
+                lambda line: line.startswith(":ptyclient!") and " JOIN #vault" in line,
+                "the TUI in the keyed channel",
+            )
+            type_line(master, output, b"/win #pty")
+            drain_pty(master, output, 0.3)
+            peer.close()
+            peer = None
+            stop_server(server)
+            read_pty_until(master, output, b"RECONNECTING")
+            read_pty_until(master, output, b"INPUT RETAINED")
+            type_line(master, output, b"typed while offline")
+            drain_pty(master, output, 0.5)
+            server = start_server(config, server_log)
+            wait_for_server(port, server)
+            deadline = time.monotonic() + TIMEOUT
+            while (
+                sum(line == "JOIN #pty" for line in proxy.lines()) < 2
+                or sum(line == "JOIN #vault sesame" for line in proxy.lines()) < 2
+            ):
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"the TUI never rejoined: {proxy.lines()!r}")
+                drain_pty(master, output, 0.1)
+            if any("typed while offline" in line for line in proxy.lines()):
+                raise AssertionError("a line typed while offline was sent")
+            peer = observer_in_pty(port)
+            # The network task sends its JOIN before the UI has taken the new
+            # session, and an Enter before then is refused again with the line
+            # kept: Enter until it is sent. Once it is, Enter on the empty
+            # composer sends nothing.
+            sent_kept_line = lambda line: (
+                line.startswith(":ptyclient!")
+                and " PRIVMSG #pty :typed while offline" in line
+            )
+            deadline = time.monotonic() + TIMEOUT
+            while True:
+                os.write(master, b"\r")
+                try:
+                    peer.wait_line(sent_kept_line, "the kept line", timeout=1.0)
+                    break
+                except TimeoutError:
+                    if time.monotonic() > deadline:
+                        raise
+                    drain_pty(master, output, 0.1)
+
+            # Tab completes a member of the channel, here the observer who
+            # joined after the TUI did; /me sends an action.
+            os.write(master, b"obs")
+            drain_pty(master, output, 0.3)
+            os.write(master, b"\t")
+            drain_pty(master, output, 0.3)
+            type_line(master, output, b"completed")
+            peer.wait_line(
+                lambda line: line.startswith(":ptyclient!")
+                and " PRIVMSG #pty :observer: completed" in line,
+                "a Tab-completed nick",
+            )
+            type_line(master, output, b"/me waves")
+            peer.wait_line(
+                lambda line: line.startswith(":ptyclient!")
+                and " PRIVMSG #pty :\x01ACTION waves\x01" in line,
+                "a /me action",
+            )
 
             # A resize redraws at the new size at once, not at the next event.
             mark = len(output)
@@ -385,9 +501,10 @@ def main() -> None:
                 signal_ends_the_session_cleanly(port, peer, signum)
             print(
                 "TUI PTY journey passed: product state, help, inbound, outbound, "
-                "multi-line paste refused, resize redraw, read marker and QUIT on "
-                "exit, clean restore, and the same QUIT and restore on SIGTERM, "
-                "SIGINT and SIGHUP"
+                "multi-line paste refused, reconnect and rejoin (a keyed channel with "
+                "its key) after a server restart with offline input kept, Tab completion, /me, resize "
+                "redraw, read marker and QUIT on exit, clean restore, and the same "
+                "QUIT and restore on SIGTERM, SIGINT and SIGHUP"
             )
         except Exception:
             print(output.decode("utf-8", "replace"))
@@ -408,16 +525,10 @@ def main() -> None:
                     wait_process_and_drain(tui, master, output, 3)
             if master >= 0:
                 os.close(master)
-            if server.poll() is None:
-                server.send_signal(signal.SIGTERM)
-                try:
-                    server.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    server.kill()
-                    server.wait()
-            server_log.close()
-            if server.returncode != 0:
-                raise RuntimeError(f"e6ircd exited {server.returncode}")
+            try:
+                stop_server(server)
+            finally:
+                server_log.close()
 
 
 if __name__ == "__main__":

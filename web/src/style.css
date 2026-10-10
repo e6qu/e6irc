@@ -374,9 +374,12 @@ body {
 #jump-latest:hover { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
 .line-notice .text, .line-notice .from { color: var(--muted); }
 .line-event { color: var(--muted); font-size: 0.85rem; font-style: italic; }
-.line-event .from, .line-server .from { display: none; }
-.line-event .text, .line-server .text { grid-column: 2 / -1; }
+.line-event .from, .line-server .from, .line-error .from { display: none; }
+.line-event .text, .line-server .text, .line-error .text { grid-column: 2 / -1; }
 .line-server { color: var(--muted); }
+/* A refusal from the network or the bouncer. Its text also says "Error:", so
+   colour is not the only thing that tells it apart. */
+.line-error { color: var(--off); font-weight: 650; }
 /* The console's raw exchange: every line as it went over the wire. */
 .line-wire { color: var(--muted); font: 0.72rem/1.45 var(--font-mono); }
 .line-wire .from { display: none; }

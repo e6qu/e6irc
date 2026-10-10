@@ -114,6 +114,7 @@ fn hello(edge: &str) -> Hello {
         slot: None,
         highest_epoch: 0,
         listeners: Vec::new(),
+        cut: None,
     }
 }
 
@@ -154,6 +155,21 @@ async fn the_core_welcomes_with_its_terms_and_refuses_each_hello_it_cannot_link_
         .await
         .expect("welcomed");
     assert_eq!(second.slot, Slot::new(2).expect("slot"));
+    // An edge of the release before speaks version 1 only: the core speaks it
+    // too, and admits it to serve at once, as that version knows no other way.
+    let older = say_hello(
+        link,
+        &credentials.edge("edge-b"),
+        Hello {
+            versions: VersionRange::new(1, 1).expect("range"),
+            ..hello("edge-b")
+        },
+    )
+    .await
+    .expect("welcomed");
+    assert_eq!(older.version, 1);
+    assert_eq!(older.admission, e6irc_link::Admission::Serve);
+    assert_eq!(e6irc_link::OLDEST_SPOKEN, e6irc_link::LINK_VERSION - 1);
 
     let refused = |result: Result<e6irc_link::Welcome, String>| result.expect_err("refused");
     let too_new = VersionRange::new(e6irc_link::LINK_VERSION + 1, e6irc_link::LINK_VERSION + 2)
@@ -242,6 +258,7 @@ fn free_port() -> u16 {
 /// An edge running in this process, with an IRC listener: its web and attach
 /// listeners' addresses, and its stop.
 struct Edge {
+    irc: SocketAddr,
     web: SocketAddr,
     attach: SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -284,6 +301,7 @@ impl Edge {
             None,
         ));
         let edge = Self {
+            irc,
             web,
             attach,
             stop: Some(stop),
@@ -573,6 +591,564 @@ async fn a_live_chat_socket_and_an_attach_reach_the_bouncer_through_an_edge() {
     .expect("the upstream's line through the attach");
 }
 
+/// Read `socket` until a text message contains `needle`; the socket must not
+/// end first.
+async fn ui_until(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    needle: &str,
+) -> String {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Frame::Text(text))) if text.contains(needle) => return text.to_string(),
+                Some(Ok(_)) => {}
+                other => panic!("the socket ended before {needle:?}: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no message with {needle:?}"))
+}
+
+/// A graceful restart keeps a live chat socket (DESIGN §19.3): the edge holds
+/// it, and the next core resumes it from its record — its account's network,
+/// its credential read again, its replay after the cursor its client read
+/// through — so the socket stays open and its client sees the network's
+/// lines and sends as before.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_live_chat_socket_survives_a_graceful_restart() {
+    let url = support::test_db("a_live_chat_socket_survives_a_graceful_restart").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("account");
+    let alice = token(&pool, "alice").await;
+    let up = upstream().await;
+    let credentials = Credentials::new("restart-ui", &["edge-a"]);
+    let core = database_core(&credentials, url.clone(), "127.0.0.1:0", up).await;
+    let link = core.edge_link_addr.expect("link");
+    let edge = Edge::start(&credentials, "edge-a", link).await;
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    let mut peer = peer_on(up).await;
+
+    let mut request = format!("ws://{}/ws/ui?network=up", edge.web)
+        .into_client_request()
+        .expect("request");
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {alice}").parse().expect("header"),
+    );
+    let (mut ui, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("a live chat socket through the edge");
+    ui_until(&mut ui, "\"t\":\"snapshot\"").await;
+    peer.send_line("PRIVMSG #lobby :before the restart")
+        .await
+        .expect("send");
+    ui_until(&mut ui, "before the restart").await;
+
+    core.shutdown.run(net::StopMode::Handover).await;
+    let _next = database_core(&credentials, url, &link.to_string(), up).await;
+    // Resumed: the replay boundary again, after only what the socket had not
+    // been sent.
+    let boundary = ui_until(&mut ui, "\"t\":\"snapshot\"").await;
+    assert!(!boundary.contains("before the restart"), "{boundary}");
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    peer.send_line("PRIVMSG #lobby :after the restart")
+        .await
+        .expect("send");
+    ui_until(&mut ui, "after the restart").await;
+    ui.send(Frame::text(
+        serde_json::json!({ "id": "after-1", "target": "#lobby", "message": "still composing" })
+            .to_string(),
+    ))
+    .await
+    .expect("compose");
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let message = peer.next_message().await.expect("read").expect("a line");
+            if message
+                .params
+                .iter()
+                .any(|param| param == "still composing")
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the composer's line upstream after the restart");
+}
+
+/// The next line of `attached` that has `text` as a parameter; the
+/// connection must not end first.
+async fn attached_until(attached: &mut e6irc_client::Connection, text: &str) {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let message = attached
+                .next_message()
+                .await
+                .expect("read")
+                .unwrap_or_else(|| panic!("the attachment ended before {text:?}"));
+            assert_ne!(message.command, "ERROR", "{message:?}");
+            if message.params.iter().any(|param| param == text) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no line with {text:?}"));
+}
+
+/// A graceful restart keeps a bouncer attachment (DESIGN §19.3): the edge
+/// holds it, and the next core resumes it from its record — its login checked
+/// again, its network, what it was shown — without welcoming it again: the
+/// client sees no `ERROR`, no second `001`, and the network's lines and its
+/// own sends carry on.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_bouncer_attachment_survives_a_graceful_restart() {
+    let url = support::test_db("a_bouncer_attachment_survives_a_graceful_restart").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("account");
+    let up = upstream().await;
+    let credentials = Credentials::new("restart-attach", &["edge-a"]);
+    let core = database_core(&credentials, url.clone(), "127.0.0.1:0", up).await;
+    let link = core.edge_link_addr.expect("link");
+    let edge = Edge::start(&credentials, "edge-a", link).await;
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    let mut peer = peer_on(up).await;
+    let mut attached = e6irc_client::Connection::connect(&edge.attach.to_string())
+        .await
+        .expect("connect to the attach listener");
+    attached
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("attach through the edge");
+    peer.send_line("PRIVMSG #lobby :before the restart")
+        .await
+        .expect("send");
+    attached_until(&mut attached, "before the restart").await;
+
+    core.shutdown.run(net::StopMode::Handover).await;
+    let _next = database_core(&credentials, url, &link.to_string(), up).await;
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
+    peer.send_line("PRIVMSG #lobby :after the restart")
+        .await
+        .expect("send");
+    let welcomed_again = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let message = attached
+                .next_message()
+                .await
+                .expect("read")
+                .expect("the attachment stays open");
+            assert_ne!(message.command, "ERROR", "{message:?}");
+            if message.command == "001" {
+                return true;
+            }
+            if message
+                .params
+                .iter()
+                .any(|param| param == "after the restart")
+            {
+                return false;
+            }
+        }
+    })
+    .await
+    .expect("the line after the restart");
+    assert!(!welcomed_again, "the attachment was welcomed a second time");
+    attached
+        .send_line("PRIVMSG #lobby :from the attachment")
+        .await
+        .expect("send");
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let message = peer.next_message().await.expect("read").expect("a line");
+            if message
+                .params
+                .iter()
+                .any(|param| param == "from the attachment")
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the attachment's line upstream after the restart");
+}
+
+/// One scripted client's step: who sends which line.
+const SCRIPT: &[(usize, &str)] = &[
+    (0, "NICK alice"),
+    (0, "USER alice 0 * :Alice"),
+    (1, "NICK bob"),
+    (1, "USER bob 0 * :Bob"),
+    (0, "JOIN #steps"),
+    (1, "JOIN #steps"),
+    (0, "TOPIC #steps :before or after"),
+    (0, "MODE #steps +v bob"),
+    (1, "PRIVMSG #steps :hello"),
+    (0, "NICK alice2"),
+    (1, "AWAY :gone"),
+    (0, "PRIVMSG bob :are you there"),
+    (1, "MONITOR + alice2"),
+    (0, "NAMES #steps"),
+    (1, "PART #steps :bye"),
+    (0, "WHOIS bob"),
+];
+
+/// A transcript line as two runs of one script compare it: without its tags,
+/// and without what differs between cores by design — the welcome's server
+/// facts and LUSERS counts, the MOTD, idle times.
+fn comparable(line: &str) -> Option<String> {
+    let line = match line.strip_prefix('@') {
+        Some(tagged) => tagged.split_once(' ').map_or("", |(_, rest)| rest),
+        None => line,
+    };
+    let numeric = line.split(' ').nth(1).unwrap_or("");
+    let varies = [
+        "002", "003", "004", "005", "251", "252", "253", "254", "255", "265", "266", "317", "372",
+        "375", "376", "422",
+    ];
+    (!varies.contains(&numeric)).then(|| line.to_owned())
+}
+
+/// Run [`SCRIPT`] through an edge, gracefully restarting the core after step
+/// `restart_after` (none, when `None`) onto a core with another shard count:
+/// each client's transcript.
+async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let credentials = Credentials::new(&format!("steps-{restart_after:?}"), &["edge-a"]);
+    let mut config = core_config(&credentials, "127.0.0.1:0");
+    config.core_workers = 1;
+    let mut core = Some(net::start(config).await.expect("core"));
+    let link = core
+        .as_ref()
+        .and_then(|core| core.edge_link_addr)
+        .expect("link");
+    let edge = Edge::start(&credentials, "edge-a", link).await;
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let stream = tokio::net::TcpStream::connect(edge.irc)
+            .await
+            .expect("connect");
+        let (read, write) = stream.into_split();
+        clients.push((tokio::io::BufReader::new(read), write));
+    }
+    let mut transcripts = [Vec::new(), Vec::new()];
+    for (step, (who, line)) in SCRIPT.iter().enumerate() {
+        clients[*who]
+            .1
+            .write_all(
+                format!(
+                    "{line}
+"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send");
+        // Every client has everything this step caused once it has the answer
+        // to its own PING.
+        for (index, (read, write)) in clients.iter_mut().enumerate() {
+            write
+                .write_all(
+                    format!(
+                        "PING :step{step}
+"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("ping");
+            loop {
+                let mut received = String::new();
+                tokio::time::timeout(deadline::HANG, read.read_line(&mut received))
+                    .await
+                    .unwrap_or_else(|_| panic!("client {index} waited in vain at step {step}"))
+                    .expect("read");
+                assert!(
+                    !received.is_empty(),
+                    "client {index} was closed at step {step}"
+                );
+                let received = received.trim_end().to_owned();
+                if received.contains(" PONG ") && received.ends_with(&format!(":step{step}")) {
+                    break;
+                }
+                // A registering client is asked to answer a PING of the
+                // server's own.
+                if let Some(token) = received.strip_prefix("PING ") {
+                    write
+                        .write_all(
+                            format!(
+                                "PONG {token}
+"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("pong");
+                    continue;
+                }
+                transcripts[index].extend(comparable(&received));
+            }
+        }
+        if restart_after == Some(step) {
+            let stopping = core.take().expect("the first core");
+            stopping.shutdown.run(net::StopMode::Handover).await;
+            let mut next = core_config(&credentials, &link.to_string());
+            next.core_workers = 2;
+            core = Some(net::start(next).await.expect("the next core"));
+        }
+    }
+    drop(edge);
+    if let Some(core) = core {
+        core.shutdown.run(net::StopMode::Final).await;
+    }
+    transcripts
+}
+
+/// Restart at every step (DESIGN §19.11): a scripted two-client conversation
+/// gives the same transcripts, line for line, whether the core runs it alone
+/// or is gracefully restarted after any one of its steps onto a core with
+/// another shard count — registration, channel state, ranks, nick changes,
+/// away, private messages, the monitor list and replies alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_restart_after_any_step_changes_no_transcript() {
+    let baseline = scripted_run(None).await;
+    assert!(
+        baseline[1]
+            .iter()
+            .any(|line| line.ends_with(":are you there")),
+        "{baseline:#?}"
+    );
+    for (step, said) in SCRIPT.iter().enumerate() {
+        let restarted = scripted_run(Some(step)).await;
+        for (client, (restarted, baseline)) in restarted.iter().zip(&baseline).enumerate() {
+            assert_eq!(
+                restarted, baseline,
+                "client {client}'s transcript changed by a restart after step {step} ({said:?})"
+            );
+        }
+    }
+}
+
+/// The `local` driver's session lives in the core itself, so no edge holds it
+/// across a graceful restart: it ends before the cut, loudly — its channel
+/// sees it quit as the server restarting — and joins again on the next core,
+/// never left behind with no session (DESIGN §19.3; homing it on an edge is
+/// D13).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_local_driver_session_quits_before_a_graceful_restart_and_rejoins() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let url = support::test_db("a_local_driver_session_quits_before_a_restart").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("account");
+    let credentials = Credentials::new("restart-local", &["edge-a"]);
+    let local_config = |link: &str| {
+        let mut config = core_config(&credentials, link);
+        config.database = Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        });
+        config.networks = vec![NetworkEntry {
+            kind: e6ircd::config::NetworkKind::Local,
+            name: "home".into(),
+            owner: Some("alice".into()),
+            addr: String::new(),
+            tls: false,
+            nick: "alicelocal".into(),
+            username: Some("alice".into()),
+            realname: Some("Alice Local".into()),
+            autojoin: vec!["#local".into()],
+            buffer_cap: 1000,
+            sasl_account: None,
+            sasl_password: None,
+            server_password: None,
+        }];
+        config
+    };
+    let core = net::start(local_config("127.0.0.1:0")).await.expect("core");
+    let link = core.edge_link_addr.expect("link");
+    let edge = Edge::start(&credentials, "edge-a", link).await;
+    let stream = tokio::net::TcpStream::connect(edge.irc)
+        .await
+        .expect("connect");
+    let (read, mut write) = stream.into_split();
+    let mut read = tokio::io::BufReader::new(read);
+    let mut until = async |needle: &str| -> String {
+        tokio::time::timeout(deadline::HANG, async {
+            loop {
+                let mut line = String::new();
+                read.read_line(&mut line).await.expect("read");
+                assert!(!line.is_empty(), "closed before {needle:?}");
+                if line.contains(needle) {
+                    return line;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {needle:?}"))
+    };
+    write
+        .write_all(b"NICK bob\r\nUSER bob 0 * :Bob\r\nJOIN #local\r\n")
+        .await
+        .expect("send");
+    let names = until(" 353 ").await;
+    if !names.contains("alicelocal") {
+        until(":alicelocal!").await;
+    }
+    core.shutdown.run(net::StopMode::Handover).await;
+    let quit = until(" QUIT ").await;
+    assert!(quit.starts_with(":alicelocal!"), "{quit}");
+    assert!(quit.trim_end().ends_with("server restarting"), "{quit}");
+    let _next = net::start(local_config(&link.to_string()))
+        .await
+        .expect("the next core");
+    let joined = until(" JOIN ").await;
+    assert!(joined.starts_with(":alicelocal!"), "{joined}");
+}
+
+/// A SASL exchange that spans a graceful restart completes (DESIGN §19.3):
+/// the payload's first 400-byte chunk is retained for replay rather than
+/// recorded, the edge replays it to the next core first, and the client's
+/// last chunk completes the login there. Then the record format is advanced
+/// (`e6ircd records advance`, D11) while the session is served, and the core
+/// after reads the newest format it was written in.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_sasl_exchange_and_a_format_advance_span_graceful_restarts() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let url = support::test_db("a_sasl_exchange_and_a_format_advance_span_graceful_restarts").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    // Long enough that its PLAIN payload takes two chunks.
+    let password = "correct horse battery staple ".repeat(12);
+    e6ircd::db::create_account_with_contact(&pool, "alice", &password, None)
+        .await
+        .expect("account");
+    let credentials = Credentials::new("restart-sasl", &["edge-a"]);
+    let database_config = |link: &str| {
+        let mut config = core_config(&credentials, link);
+        config.database = Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        });
+        config
+    };
+    let core = net::start(database_config("127.0.0.1:0"))
+        .await
+        .expect("core");
+    let link = core.edge_link_addr.expect("link");
+    let edge = Edge::start(&credentials, "edge-a", link).await;
+    let stream = tokio::net::TcpStream::connect(edge.irc)
+        .await
+        .expect("connect");
+    let (read, mut write) = stream.into_split();
+    let mut read = tokio::io::BufReader::new(read);
+    let mut until = async |needle: &str| -> String {
+        tokio::time::timeout(deadline::HANG, async {
+            loop {
+                let mut line = String::new();
+                read.read_line(&mut line).await.expect("read");
+                assert!(!line.is_empty(), "closed before {needle:?}");
+                assert!(!line.starts_with("ERROR"), "{line}");
+                if line.contains(needle) {
+                    return line;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {needle:?}"))
+    };
+    for line in [
+        "CAP LS 302",
+        "CAP REQ :sasl",
+        "NICK alice",
+        "USER alice 0 * :Alice",
+    ] {
+        write
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
+            .expect("send");
+    }
+    until("ACK").await;
+    write
+        .write_all(b"AUTHENTICATE PLAIN\r\n")
+        .await
+        .expect("send");
+    until("AUTHENTICATE +").await;
+    let payload = e6irc_proto::base64::encode(format!("\0alice\0{password}").as_bytes());
+    assert!(payload.len() > 400 && payload.len() < 800);
+    write
+        .write_all(format!("AUTHENTICATE {}\r\n", &payload[..400]).as_bytes())
+        .await
+        .expect("send");
+
+    core.shutdown.run(net::StopMode::Handover).await;
+    let next = net::start(database_config(&link.to_string()))
+        .await
+        .expect("the next core");
+    write
+        .write_all(format!("AUTHENTICATE {}\r\n", &payload[400..]).as_bytes())
+        .await
+        .expect("send");
+    until(" 903 ").await;
+    write.write_all(b"CAP END\r\n").await.expect("send");
+    assert!(until(" 001 ").await.contains(" 001 alice "));
+
+    // The rolling upgrade's window (D11): these cores wrote the previous
+    // format; once advanced, the serving core writes the newest, and the
+    // core after it reads that.
+    assert_eq!(
+        e6ircd::db::advance_record_format(&pool)
+            .await
+            .expect("advance"),
+        (1, 2)
+    );
+    write
+        .write_all(b"AWAY :after the advance\r\n")
+        .await
+        .expect("send");
+    until(" 306 ").await;
+    next.shutdown.run(net::StopMode::Handover).await;
+    let _third = net::start(database_config(&link.to_string()))
+        .await
+        .expect("the third core");
+    write.write_all(b"WHOIS alice\r\n").await.expect("send");
+    assert!(until(" 301 ").await.ends_with(":after the advance\r\n"));
+    let logged_in = until(" 330 ").await;
+    assert!(logged_in.contains(" alice alice "), "{logged_in}");
+}
+
 /// The roster keeps an edge's slot: a core that follows another on the same
 /// database gives a linking edge the slot the roster holds for it, and the
 /// row says when it linked and under which epoch. The console shows the
@@ -652,7 +1228,10 @@ async fn the_roster_keeps_an_edge_s_slot_and_the_console_shows_its_listeners() {
 
     // The next core, on the same database, gives edge-a its slot again.
     let first_shutdown = first.shutdown;
-    assert_eq!(first_shutdown.run().await, net::ShutdownOutcome::Flushed);
+    assert_eq!(
+        first_shutdown.run(net::StopMode::Final).await,
+        net::ShutdownOutcome::Flushed
+    );
     let _second = database_core(&credentials, url, &link.to_string(), up).await;
     a.until_accepting().await;
     let again: (i32, i64) =

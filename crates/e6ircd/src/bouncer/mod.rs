@@ -63,7 +63,7 @@ pub use nick_regain::NickRegainTiming;
 pub use serve::{ConfiguredNetwork, DriverStops, NetworkStatus, Registry};
 pub(crate) use serve::{
     ConfiguredNetworkHeld, MutationLane, RegistryRefusal, Storage as RegistryStorage,
-    UnwrittenLines, bnc_serve,
+    UnwrittenLines, bnc_resume, bnc_serve,
 };
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
@@ -2689,6 +2689,58 @@ pub struct AttachCaps {
     pub cap_302: bool,
 }
 
+impl AttachCaps {
+    /// The capabilities as a session record holds them, one bit each in the
+    /// order of the fields: every field named, so one added does not compile
+    /// until it has its bit.
+    pub(crate) fn bits(self) -> u16 {
+        let Self {
+            sasl,
+            server_time,
+            message_tags,
+            account_tag,
+            echo_message,
+            batch,
+            chathistory,
+            read_marker,
+            cap_notify,
+            cap_302,
+        } = self;
+        [
+            sasl,
+            server_time,
+            message_tags,
+            account_tag,
+            echo_message,
+            batch,
+            chathistory,
+            read_marker,
+            cap_notify,
+            cap_302,
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (at, on)| bits | (u16::from(on) << at))
+    }
+
+    /// The capabilities a record's bits name.
+    pub(crate) fn from_bits(bits: u16) -> Self {
+        let on = |at: u16| bits & (1 << at) != 0;
+        Self {
+            sasl: on(0),
+            server_time: on(1),
+            message_tags: on(2),
+            account_tag: on(3),
+            echo_message: on(4),
+            batch: on(5),
+            chathistory: on(6),
+            read_marker: on(7),
+            cap_notify: on(8),
+            cap_302: on(9),
+        }
+    }
+}
+
 /// Filter one serialized line to what the recipient negotiated. `TAGMSG` is
 /// absent without `message-tags`; for every other command, `time=` needs
 /// server-time, `account=` needs account-tag, and remaining tags need
@@ -4166,6 +4218,25 @@ pub struct BufferedLine {
     pub line: String,
 }
 
+/// What [`NetworkHandle::continue_ring`] did to the positions the driver's
+/// lines took before it: each below `below` is `shift` higher now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Renumbered {
+    below: u64,
+    shift: u64,
+}
+
+impl Renumbered {
+    /// The position a line announced at `seq` holds now.
+    pub(crate) fn now(self, seq: u64) -> u64 {
+        if seq < self.below {
+            seq + self.shift
+        } else {
+            seq
+        }
+    }
+}
+
 /// Where a client stopped reading one network's ring: the ring's lifetime and
 /// a position in it. Opaque to the client (`<epoch>:<seq>` on the wire), and
 /// self-invalidating: a ring that was replaced — the process restarted, the
@@ -4186,6 +4257,16 @@ impl ReplayCursor {
             epoch: epoch.parse().ok()?,
             seq: seq.parse().ok()?,
         })
+    }
+
+    /// The ring's epoch and the position, as a session record holds them.
+    pub(crate) fn recorded(self) -> (u64, u64) {
+        (self.epoch, self.seq)
+    }
+
+    /// The cursor a session record held.
+    pub(crate) fn from_recorded((epoch, seq): (u64, u64)) -> Self {
+        Self { epoch, seq }
     }
 }
 
@@ -4292,11 +4373,16 @@ pub struct Buffer {
     /// The bytes of the lines held.
     bytes: usize,
     /// Identifies this ring's lifetime; part of every cursor it hands out.
+    /// A ring continuing a stored one takes its epoch
+    /// ([`NetworkHandle::continue_ring`]).
     epoch: u64,
     /// The position the next pushed line takes. Starts above `cap` so the
     /// lines `preload_front` restores from storage — older than anything
     /// pushed, at most `cap` of them — take positions that stay positive.
     next_seq: u64,
+    /// The position the first pushed line took: where the lines pushed
+    /// before a restore begin.
+    first_seq: u64,
     /// How long history is kept: storage maintenance deletes older lines from
     /// `bnc_buffer`, and this ring neither keeps nor replays them either.
     retention: crate::core::HistoryRetention,
@@ -4328,6 +4414,7 @@ impl Buffer {
             bytes: 0,
             epoch,
             next_seq: cap as u64 + 1,
+            first_seq: cap as u64 + 1,
             retention: crate::core::HistoryRetention::default(),
             head: Some(IrcSessionState::default()),
             names: e6irc_client::NetworkNames::default(),
@@ -5319,25 +5406,90 @@ impl NetworkHandle {
     /// burst, whose ISUPPORT would undo the bouncer's own when replayed
     /// (§10.4), and whatever is told live only ([`told_live_only`]).
     pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) {
+        let mut buf = self.buffer.lock().expect("buffer poisoned");
+        // Each restored line takes the position just below the current
+        // oldest: older than everything pushed, in storage order.
+        Self::restore_front(&mut buf, older, |buf, _| {
+            buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1
+        });
+    }
+
+    /// Continue the stored ring `epoch`, whose every line through position
+    /// `through` is stored (a stop that stored everything said so), with its
+    /// lines `older` (oldest first, each with the position it took): a
+    /// `ReplayCursor` handed out before the restart names the same line now.
+    /// What the driver pushed before this restore — no client has seen it,
+    /// since an attach waits for history — moves up past `through`; the
+    /// answer says which events' positions moved, and by how much, so their
+    /// persistence stores the positions they have now.
+    ///
+    /// The lines back, changing nothing, when they do not fit the claim: a
+    /// line without a position, or positions not rising or past `through`.
+    /// The caller then restores them as a new epoch.
+    pub(crate) fn continue_ring(
+        &self,
+        epoch: u64,
+        through: u64,
+        older: Vec<crate::db::StoredBacklogLine>,
+    ) -> Result<Renumbered, Vec<crate::db::StoredBacklogLine>> {
+        let mut last = 0u64;
+        let fits = older.iter().all(|stored| {
+            let fits = stored.seq.is_some_and(|seq| seq > last && seq <= through);
+            last = stored.seq.unwrap_or(last);
+            fits
+        });
+        if !fits {
+            return Err(older);
+        }
+        let mut buf = self.buffer.lock().expect("buffer poisoned");
+        let renumbered = Renumbered {
+            below: buf.next_seq,
+            shift: (through + 1).saturating_sub(buf.first_seq),
+        };
+        for entry in &mut buf.entries {
+            match entry {
+                RingEntry::Line(line) => line.seq += renumbered.shift,
+                RingEntry::Session { seq, .. } => *seq += renumbered.shift,
+            }
+        }
+        buf.next_seq += renumbered.shift;
+        buf.epoch = epoch;
+        Self::restore_front(&mut buf, older, |_, stored| {
+            stored.seq.expect("every position checked above")
+        });
+        Ok(renumbered)
+    }
+
+    /// This ring's epoch, and the position of its newest line.
+    pub(crate) fn ring_position(&self) -> (u64, u64) {
+        let buf = self.buffer.lock().expect("buffer poisoned");
+        (buf.epoch, buf.position())
+    }
+
+    /// [`Self::preload_front`]'s restore, each line at the position
+    /// `position` gives it.
+    fn restore_front(
+        buf: &mut Buffer,
+        older: Vec<crate::db::StoredBacklogLine>,
+        position: impl Fn(&Buffer, &crate::db::StoredBacklogLine) -> u64,
+    ) {
         let older: Vec<crate::db::StoredBacklogLine> = older
             .into_iter()
             .filter(|stored| {
                 !is_registration_burst_line(&stored.line) && !told_live_only(&stored.line)
             })
             .collect();
-        let mut buf = self.buffer.lock().expect("buffer poisoned");
         let room = buf.cap.saturating_sub(buf.entries.len());
         // The own nicks of the lines restored, newest first.
         let mut restored = Vec::new();
-        for crate::db::StoredBacklogLine {
-            line,
-            stored_at,
-            own_nick,
-        } in older.iter().rev().take(room)
-        {
-            // Each restored line takes the position just below the current
-            // oldest: older than everything pushed, in storage order.
-            let seq = buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1;
+        for stored in older.iter().rev().take(room) {
+            let seq = position(buf, stored);
+            let crate::db::StoredBacklogLine {
+                line,
+                stored_at,
+                own_nick,
+                seq: _,
+            } = stored;
             // Neutralized here as well as in `emit_line`. These lines come back
             // from storage, which outlives the code that wrote them: a row put
             // there by an older build, a restore, or anything else with database
@@ -6747,8 +6899,8 @@ async fn relay_attached(
     link: AttachLink,
     input: ClientInput,
     handle: &NetworkHandle,
-    mut caps: AttachCaps,
-    mut authority: AccountLease,
+    caps: AttachCaps,
+    authority: AccountLease,
     greeting: Greeting<'_>,
     liveness: std::time::Duration,
 ) -> std::io::Result<AttachEnd> {
@@ -6757,47 +6909,25 @@ async fn relay_attached(
     let account = authority.account().to_string();
     let account = account.as_str();
     let AttachLink {
-        lines: mut client_lines,
+        lines: client_lines,
         mut write,
+        holding,
     } = link;
     // Revoked between the lease and here: the attachment never begins.
     if let Some(revocation) = authority.revocation() {
         return detach_revoked(&mut write, revocation).await;
     }
-
-    // Detach the client if the network is removed. The broadcast does not close
-    // on its own (the registry's `NetworkHandle` keeps an events sender), so
-    // without this an attached client would linger on a stopped network — its
-    // upstream gone but the session still open.
-    let mut shutdown = handle.shutdown.subscribe();
-    // The network may have been removed *between* the caller resolving this
-    // handle and here (the same account's own API can delete/replace it, and the
-    // handshake/upgrade before attach is a wide window). A `watch::Receiver`
-    // subscribed after the shutdown was signalled treats that value as already
-    // seen, so `changed()` below would never fire and the client would linger
-    // forever on a dead network. Check the current value once, up front.
-    if *shutdown.borrow() {
-        write
-            .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
-            .await?;
-        write.flush().await?;
+    let Some(shutdown) = network_to_attach(handle, &mut write).await? else {
         return Ok(AttachEnd::NetworkRemoved);
-    }
-    if !handle.wait_for_history().await {
-        write
-            .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
-            .await?;
-        write.flush().await?;
-        return Ok(AttachEnd::NetworkRemoved);
-    }
+    };
     // A raw IRC client has no cursor to present. Its account's read markers
     // are its position instead: each conversation is replayed from where the
     // account stopped reading it, the whole of one it has no marker for.
     let read_positions = ReadPositions::of(handle, account).await;
     let attach_id = handle.next_attachment_id();
     let AttachSnapshot {
-        attachment: _attachment,
-        mut events,
+        attachment,
+        events,
         replay,
         session: session_snapshot,
         features,
@@ -6806,7 +6936,7 @@ async fn relay_attached(
         current,
     } = handle.subscribe_with_replay_snapshot(None);
     // The answers to this client's own commands reach it here, and only here.
-    let mut replies = handle.route_replies(attach_id);
+    let replies = handle.route_replies(attach_id);
 
     // The welcome is of the same instant as the replay: an ISUPPORT or
     // CLIENTTAGDENY change made after it reaches this client live, and none
@@ -6833,7 +6963,7 @@ async fn relay_attached(
     // same up-front status `/ws/ui` sends over WebSocket, with the failure and
     // the upstream's own words when it is not connected.
     let runtime = handle.runtime_snapshot();
-    let mut status_revision = runtime.status_revision;
+    let status_revision = runtime.status_revision;
     write
         .write_all(attach_status_notice(&runtime).as_bytes())
         .await?;
@@ -6865,61 +6995,17 @@ async fn relay_attached(
         )
         .await?;
     }
-    // Playback: everything buffered while detached, in order, with tags the
-    // client didn't negotiate stripped. Where an upstream session began, the
-    // client is reconciled to it as a client attached then was.
-    let Replay {
-        lines, boundaries, ..
-    } = replay;
-    let mut boundaries = boundaries.into_iter().peekable();
-    let mut already_read = 0usize;
-    for (index, entry) in lines.into_iter().enumerate() {
-        while let Some((_, began)) = boundaries.next_if(|(at, _)| *at == index) {
-            let began =
-                IrcSessionState::at(&began, downstream_session.names.clone(), features.clone());
-            reconcile(
-                &mut write,
-                &mut downstream_session,
-                &began,
-                audience,
-                &mut untold,
-            )
-            .await?;
-        }
-        // A message of a conversation the account has read past is not
-        // replayed: its client already showed it. Only messages have a
-        // conversation, so nothing that changes membership is skipped.
-        let own_nick = downstream_session.nick.clone();
-        if read_positions.has_read(&entry.line, own_nick.as_deref(), &downstream_session.names) {
-            already_read += 1;
-            continue;
-        }
-        let (line, change) = downstream_session.mirror(&entry.line);
-        // A channel joined in the replay is told its topic and members once
-        // the replay is over, as the session knows them then: the backlog
-        // keeps no member list ([`told_live_only`]).
-        for channel in &change.joined {
-            untold.untold(
-                downstream_session.names.fold(channel.as_str()),
-                channel.as_str().to_string(),
-            );
-        }
-        if let Some(line) = filter_tags(line, caps) {
-            write.write_all(line.as_bytes()).await?;
-            write.write_all(b"\r\n").await?;
-        }
-    }
-    for (_, began) in boundaries {
-        let began = IrcSessionState::at(&began, downstream_session.names.clone(), features.clone());
-        reconcile(
-            &mut write,
-            &mut downstream_session,
-            &began,
-            audience,
-            &mut untold,
-        )
-        .await?;
-    }
+    let cursor = replay.position();
+    let already_read = replay_to(
+        &mut write,
+        &mut downstream_session,
+        replay,
+        &features,
+        audience,
+        &mut untold,
+        Some(&read_positions),
+    )
+    .await?;
     if already_read > 0 {
         write
             .write_all(
@@ -6938,53 +7024,488 @@ async fn relay_attached(
             )
             .await?;
     }
-    // Then to the session as it is now; every channel it was shown joined
-    // without its topic and members is told them, as the session knows them.
-    if current.nick.is_some() {
-        reconcile(
+    catch_up(
+        &mut write,
+        &mut downstream_session,
+        &current,
+        audience,
+        &mut untold,
+    )
+    .await?;
+    let ClientInput { pending } = input;
+    relay_live(LiveAttachment {
+        write,
+        client_lines,
+        handle,
+        caps,
+        authority,
+        greeting,
+        liveness,
+        shutdown,
+        events,
+        replies,
+        downstream_session,
+        status_revision,
+        attach_id,
+        cursor,
+        pending,
+        held: holding.and_then(|holding| AttachHeld::new(holding, &greeting, account)),
+        _attachment: attachment,
+    })
+    .await
+}
+
+/// Resume on this core an attachment its edge held from a graceful cut
+/// (DESIGN §19.3): no welcome — the client was welcomed already — but its
+/// mirror as its record says it was shown, the lines after the ring position
+/// it was sent everything through, then the session as it is now and any
+/// ISUPPORT or status that changed meanwhile. A position the ring cannot
+/// honour (lines lost with the last core) is said, never guessed across.
+pub(crate) async fn resume_attached(
+    link: AttachLink,
+    handle: &NetworkHandle,
+    authority: AccountLease,
+    record: crate::core::record::AttachRecord,
+    server_name: &str,
+    liveness: std::time::Duration,
+) -> std::io::Result<AttachEnd> {
+    use tokio::io::AsyncWriteExt;
+
+    let crate::core::record::AttachRecord {
+        account: _,
+        credential: _,
+        shared: _,
+        network,
+        requested_nick,
+        caps,
+        cursor,
+        shown_nick,
+        shown_channels,
+        shown_isupport,
+        status_revision,
+    } = record;
+    let caps = AttachCaps::from_bits(caps);
+    let greeting = Greeting {
+        server_name,
+        network: &network,
+        requested_nick: &requested_nick,
+    };
+    let account = authority.account().to_string();
+    let account = account.as_str();
+    let AttachLink {
+        lines: client_lines,
+        mut write,
+        holding,
+    } = link;
+    if let Some(revocation) = authority.revocation() {
+        return detach_revoked(&mut write, revocation).await;
+    }
+    let Some(shutdown) = network_to_attach(handle, &mut write).await? else {
+        return Ok(AttachEnd::NetworkRemoved);
+    };
+    let attach_id = handle.next_attachment_id();
+    let AttachSnapshot {
+        attachment,
+        events,
+        replay,
+        features,
+        names,
+        current,
+        ..
+    } = handle.subscribe_with_replay_snapshot(cursor.map(ReplayCursor::from_recorded));
+    let replies = handle.route_replies(attach_id);
+    // A relay publishes its record only once the client is welcomed, under a
+    // nick.
+    let Some(shown_nick) = shown_nick else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the attachment's record shows its client no nick",
+        ));
+    };
+    let mut downstream_session = IrcSessionState::with_names(names);
+    downstream_session.replace(&IrcSessionSnapshot {
+        nick: shown_nick,
+        channels: shown_channels,
+    });
+    downstream_session.features.isupport = shown_isupport;
+    let audience = JoinAudience {
+        handle,
+        caps,
+        account,
+        attach_id,
+    };
+    let mut untold = UntoldChannels::default();
+    let position = replay.position();
+    if replay.resumed {
+        replay_to(
             &mut write,
             &mut downstream_session,
-            &current,
+            replay,
+            &features,
             audience,
             &mut untold,
+            None,
         )
         .await?;
+    } else {
+        write
+            .write_all(
+                b":*bnc* NOTICE * :the server restarted, and lines said meanwhile may be \
+                  missing here; CHATHISTORY pages them\r\n",
+            )
+            .await?;
+    }
+    catch_up(
+        &mut write,
+        &mut downstream_session,
+        &current,
+        audience,
+        &mut untold,
+    )
+    .await?;
+    // What the network says of itself now, as a change to what this client
+    // was told.
+    let now = serve::welcome_isupport(&features, handle.history().is_some());
+    let changes = serve::isupport_changes(&downstream_session.features.isupport, &now);
+    let nick = downstream_session.downstream_nick().to_string();
+    for line in serve::isupport_lines(server_name, &nick, &changes) {
+        write.write_all(line.as_bytes()).await?;
+        write.write_all(b"\r\n").await?;
+    }
+    downstream_session.features.isupport = now;
+    let runtime = handle.runtime_snapshot();
+    let mut told_revision = status_revision;
+    if accept_status_revision(&mut told_revision, runtime.status_revision) {
+        write
+            .write_all(attach_status_notice(&runtime).as_bytes())
+            .await?;
+        write.write_all(b"\r\n").await?;
+    }
+    write.flush().await?;
+    relay_live(LiveAttachment {
+        write,
+        client_lines,
+        handle,
+        caps,
+        authority,
+        greeting,
+        liveness,
+        shutdown,
+        events,
+        replies,
+        downstream_session,
+        status_revision: told_revision,
+        attach_id,
+        cursor: position,
+        pending: Vec::new(),
+        held: holding.and_then(|holding| AttachHeld::new(holding, &greeting, account)),
+        _attachment: attachment,
+    })
+    .await
+}
+
+/// The network's stop signal, once its history is loaded; `None`, the client
+/// told, when it is removed before or meanwhile.
+async fn network_to_attach<W>(
+    handle: &NetworkHandle,
+    write: &mut W,
+) -> std::io::Result<Option<tokio::sync::watch::Receiver<bool>>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    // Detach the client if the network is removed. The broadcast does not close
+    // on its own (the registry's `NetworkHandle` keeps an events sender), so
+    // without this an attached client would linger on a stopped network — its
+    // upstream gone but the session still open.
+    let shutdown = handle.shutdown.subscribe();
+    // The network may have been removed *between* the caller resolving this
+    // handle and here (the same account's own API can delete/replace it, and the
+    // handshake/upgrade before attach is a wide window). A `watch::Receiver`
+    // subscribed after the shutdown was signalled treats that value as already
+    // seen, so `changed()` below would never fire and the client would linger
+    // forever on a dead network. Check the current value once, up front.
+    if *shutdown.borrow() || !handle.wait_for_history().await {
+        write
+            .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
+            .await?;
+        write.flush().await?;
+        return Ok(None);
+    }
+    Ok(Some(shutdown))
+}
+
+/// Play `replay` to the client: everything buffered while detached, in
+/// order, with tags the client didn't negotiate stripped. Where an upstream
+/// session began, the client is reconciled to it as a client attached then
+/// was. A message of a conversation `read_positions` says the account has read
+/// past is not replayed; how many were not is the answer.
+async fn replay_to<W>(
+    write: &mut W,
+    downstream_session: &mut IrcSessionState,
+    replay: Replay,
+    features: &UpstreamFeatures,
+    audience: JoinAudience<'_>,
+    untold: &mut UntoldChannels,
+    read_positions: Option<&ReadPositions>,
+) -> std::io::Result<usize>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let Replay {
+        lines, boundaries, ..
+    } = replay;
+    let mut boundaries = boundaries.into_iter().peekable();
+    let mut already_read = 0usize;
+    for (index, entry) in lines.into_iter().enumerate() {
+        while let Some((_, began)) = boundaries.next_if(|(at, _)| *at == index) {
+            let began =
+                IrcSessionState::at(&began, downstream_session.names.clone(), features.clone());
+            reconcile(write, downstream_session, &began, audience, untold).await?;
+        }
+        // A message of a conversation the account has read past is not
+        // replayed: its client already showed it. Only messages have a
+        // conversation, so nothing that changes membership is skipped.
+        let own_nick = downstream_session.nick.clone();
+        if read_positions.is_some_and(|positions| {
+            positions.has_read(&entry.line, own_nick.as_deref(), &downstream_session.names)
+        }) {
+            already_read += 1;
+            continue;
+        }
+        let (line, change) = downstream_session.mirror(&entry.line);
+        // A channel joined in the replay is told its topic and members once
+        // the replay is over, as the session knows them then: the backlog
+        // keeps no member list ([`told_live_only`]).
+        for channel in &change.joined {
+            untold.untold(
+                downstream_session.names.fold(channel.as_str()),
+                channel.as_str().to_string(),
+            );
+        }
+        if let Some(line) = filter_tags(line, audience.caps) {
+            write.write_all(line.as_bytes()).await?;
+            write.write_all(b"\r\n").await?;
+        }
+    }
+    for (_, began) in boundaries {
+        let began = IrcSessionState::at(&began, downstream_session.names.clone(), features.clone());
+        reconcile(write, downstream_session, &began, audience, untold).await?;
+    }
+    Ok(already_read)
+}
+
+/// Bring the client to the session as it is now: every channel it was shown
+/// joined without its topic and members is told them, as the session knows
+/// them.
+async fn catch_up<W>(
+    write: &mut W,
+    downstream_session: &mut IrcSessionState,
+    current: &IrcSessionState,
+    audience: JoinAudience<'_>,
+    untold: &mut UntoldChannels,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    if current.nick.is_some() {
+        reconcile(write, downstream_session, current, audience, untold).await?;
     }
     untold
-        .tell(&mut write, &downstream_session, Some(&current), audience)
+        .tell(write, downstream_session, Some(current), audience)
         .await?;
-    write.flush().await?;
+    write.flush().await
+}
 
+/// What an attachment, welcomed and caught up, relays until it ends.
+struct LiveAttachment<'a> {
+    write: e6irc_edge::peer_write::DeadlineWriter<e6irc_edge::link::LineWriter>,
+    client_lines: ClientLines,
+    handle: &'a NetworkHandle,
+    caps: AttachCaps,
+    authority: AccountLease,
+    greeting: Greeting<'a>,
+    liveness: std::time::Duration,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    events: tokio::sync::broadcast::Receiver<DriverEvent>,
+    replies: ReplyRoute,
+    downstream_session: IrcSessionState,
+    status_revision: u64,
+    attach_id: u64,
+    /// The ring position the client has been sent everything through.
+    cursor: ReplayCursor,
+    /// What the client sent before the relay began.
+    pending: Vec<e6irc_proto::framing::LineEvent>,
+    held: Option<AttachHeld>,
+    _attachment: NetworkAttachment,
+}
+
+/// What an attachment gives its edge to hold (link version 2): its record,
+/// republished whenever what it has shown its client, or read through,
+/// changes.
+pub(crate) struct AttachHeld {
+    record: crate::core::record::AttachRecord,
+    format: crate::core::RecordFormatCell,
+    origin: crate::core::record::ClockOrigin,
+    revision: u64,
+    last: Option<bytes::Bytes>,
+}
+
+impl AttachHeld {
+    /// The record of an attachment whose registration named its identity; an
+    /// attachment started without one (a test's) holds none.
+    fn new(holding: AttachHolding, greeting: &Greeting<'_>, account: &str) -> Option<Self> {
+        let AttachHolding { format, identity } = holding;
+        let (credential, shared) = identity?;
+        Some(Self {
+            record: crate::core::record::AttachRecord {
+                account: account.to_owned(),
+                credential,
+                shared,
+                network: greeting.network.to_owned(),
+                requested_nick: greeting.requested_nick.to_owned(),
+                caps: 0,
+                cursor: None,
+                shown_nick: None,
+                shown_channels: Vec::new(),
+                shown_isupport: Vec::new(),
+                status_revision: 0,
+            },
+            format,
+            origin: crate::core::record::ClockOrigin::of(
+                crate::net::wall_clock(),
+                crate::net::mono_clock(),
+            ),
+            revision: 0,
+            last: None,
+        })
+    }
+
+    /// Republish the record as `live` stands, after what it has written, when
+    /// it changed.
+    fn publish(&mut self, live: &LiveAttachment<'_>) {
+        let shown = live.downstream_session.snapshot();
+        self.record.caps = live.caps.bits();
+        self.record.cursor = Some(live.cursor.recorded());
+        self.record.shown_nick = shown.as_ref().map(|shown| shown.nick.clone());
+        self.record.shown_channels = shown.map(|shown| shown.channels).unwrap_or_default();
+        self.record
+            .shown_isupport
+            .clone_from(&live.downstream_session.features.isupport);
+        self.record.status_revision = live.status_revision;
+        let body = self
+            .record
+            .encode(self.format.get(), self.origin)
+            .expect("an attachment's record is within every body bound");
+        if self.last.as_ref() == Some(&body) {
+            return;
+        }
+        self.revision += 1;
+        live.write
+            .get_ref()
+            .link()
+            .hold_record(self.revision, body.clone());
+        self.last = Some(body);
+    }
+}
+
+/// An attachment whose edge holds it for the next core: the body format its
+/// record is written in, and — once its registration has said them — what
+/// the record names beside what the relay knows: the credential, and whether
+/// the network is the shared one.
+pub(crate) struct AttachHolding {
+    format: crate::core::RecordFormatCell,
+    identity: Option<(crate::identity::CredentialId, bool)>,
+}
+
+impl AttachHolding {
+    pub(crate) fn unnamed(format: crate::core::RecordFormatCell) -> Self {
+        Self {
+            format,
+            identity: None,
+        }
+    }
+}
+
+impl AttachLink {
+    /// Name what the record holds of the registration: the credential that
+    /// authenticated the client, and whether its network is the shared one.
+    pub(crate) fn name_holding(&mut self, credential: crate::identity::CredentialId, shared: bool) {
+        if let Some(holding) = &mut self.holding {
+            holding.identity = Some((credential, shared));
+        }
+    }
+}
+
+/// Relay an attachment until it ends: the network's lines to the client, the
+/// client's to the network, the answers to its own commands, its liveness,
+/// and its authority's end.
+async fn relay_live(mut live: LiveAttachment<'_>) -> std::io::Result<AttachEnd> {
+    use tokio::io::AsyncWriteExt;
+
+    let account = live.authority.account().to_string();
+    let account = account.as_str();
+    let handle = live.handle;
+    let attach_id = live.attach_id;
+    let greeting = live.greeting;
+    let audience = JoinAudience {
+        handle,
+        caps: live.caps,
+        account,
+        attach_id,
+    };
     let attachment = Attachment {
         handle,
         account,
         id: attach_id,
     };
-    let ClientInput { pending } = input;
-    for event in pending {
+    for event in std::mem::take(&mut live.pending) {
         if let Some(end) = client_event(
-            &mut write,
+            &mut live.write,
             event,
             &attachment,
-            &mut caps,
-            &downstream_session,
+            &mut live.caps,
+            &live.downstream_session,
         )
         .await?
         {
             return Ok(end);
         }
     }
+    let mut held = live.held.take();
     let mut parsed = Vec::new();
     // Anything the client sends shows it is there; only its silence is timed,
     // and lines written *to* it prove nothing about a half-open socket.
-    let mut client_silence = SilenceDeadline::new(liveness);
+    let mut client_silence = SilenceDeadline::new(live.liveness);
     let mut awaiting_pong = false;
     loop {
+        if let Some(held) = &mut held {
+            held.publish(&live);
+        }
+        let LiveAttachment {
+            write,
+            client_lines,
+            caps,
+            authority,
+            shutdown,
+            events,
+            replies,
+            downstream_session,
+            status_revision,
+            cursor,
+            ..
+        } = &mut live;
+        let caps_now = *caps;
         tokio::select! {
             // The account's authority or the credential ended: tell the
             // client and detach.
             revocation = authority.revoked() => {
-                return detach_revoked(&mut write, revocation).await;
+                return detach_revoked(write, revocation).await;
             }
             // Network removed/replaced: tell the client and detach.
             res = shutdown.changed() => {
@@ -6993,7 +7514,7 @@ async fn relay_attached(
                     // account's networks, and both can be ready here at once:
                     // the network stopped because the authority ended.
                     if let Some(revocation) = authority.revocation() {
-                        return detach_revoked(&mut write, revocation).await;
+                        return detach_revoked(write, revocation).await;
                     }
                     write
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
@@ -7004,25 +7525,31 @@ async fn relay_attached(
             }
             // The upstream's answer to this client's own command.
             line = replies.recv() => {
-                write_filtered_line(&mut write, &line, caps).await?;
+                write_filtered_line(write, &line, caps_now).await?;
             }
             // Upstream -> client.
             ev = events.recv() => match ev {
                 Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
+                    if let DriverEvent::Line(entry) | DriverEvent::Notice(entry) = &event {
+                        cursor.seq = entry.seq;
+                    }
                     let line = event.display_line().expect("display event carries a line");
                     let (line, _) = downstream_session.mirror(line);
-                    write_filtered_line(&mut write, line, caps).await?;
+                    write_filtered_line(write, line, caps_now).await?;
                 }
                 Ok(DriverEvent::Echo { line, origin }) => {
+                    // The echo took a ring position whether or not this
+                    // client is sent it, so a resume never replays it.
+                    cursor.seq = line.seq;
                     // The originator's own echo reaches it only when it
                     // negotiated echo-message — the same contract a real
                     // server has. Every other attached client always gets it.
-                    if origin != attach_id || caps.echo_message {
-                        write_filtered_line(&mut write, &line.line, caps).await?;
+                    if origin != attach_id || caps_now.echo_message {
+                        write_filtered_line(write, &line.line, caps_now).await?;
                     }
                 }
                 Ok(DriverEvent::Status { status, revision }) => {
-                    if !accept_status_revision(&mut status_revision, revision) {
+                    if !accept_status_revision(status_revision, revision) {
                         continue;
                     }
                     write.write_all(status_notice(status).as_bytes()).await?;
@@ -7037,10 +7564,10 @@ async fn relay_attached(
                         UpstreamFeatures::default(),
                     );
                     let mut untold = UntoldChannels::default();
-                    reconcile(&mut write, &mut downstream_session, &began, audience, &mut untold)
+                    reconcile(write, downstream_session, &began, audience, &mut untold)
                         .await?;
                     untold
-                        .tell(&mut write, &downstream_session, None, audience)
+                        .tell(write, downstream_session, None, audience)
                         .await?;
                     write.flush().await?;
                 }
@@ -7071,7 +7598,7 @@ async fn relay_attached(
                     timestamp,
                     origin,
                 }) => {
-                    if caps.read_marker
+                    if caps_now.read_marker
                         && origin != attach_id
                         && e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&marker_account, account)
                     {
@@ -7118,7 +7645,7 @@ async fn relay_attached(
                     awaiting_pong = false;
                     client_silence.restart();
                     for event in parsed.drain(..) {
-                        if let Some(end) = client_event(&mut write, event, &attachment, &mut caps, &downstream_session).await? {
+                        if let Some(end) = client_event(write, event, &attachment, caps, downstream_session).await? {
                             return Ok(end);
                         }
                     }
@@ -7893,6 +8420,7 @@ mod tests {
             line: line.into(),
             stored_at: stored_at.into(),
             own_nick,
+            seq: None,
         }
     }
 
@@ -11256,6 +11784,67 @@ mod tests {
         // The next line in evicts what retention no longer keeps.
         ring.push(format!("@time={} :a!a@h PRIVMSG #c :newest", at(0)));
         assert_eq!(ring.entries.len(), 2, "the stale line was evicted");
+    }
+
+    /// Each capability has its own bit in an attachment's record, so every
+    /// combination comes back as it went.
+    #[test]
+    fn attach_capabilities_round_trip_through_their_bits() {
+        for bits in 0..(1u16 << 10) {
+            assert_eq!(AttachCaps::from_bits(bits).bits(), bits);
+        }
+    }
+
+    /// A ring whose last stop stored every line continues its epoch: each
+    /// restored line has the position it had, so a cursor from before the
+    /// restart resumes exactly; a line the driver said before the restore
+    /// moves past them, and its persistence is told where it moved. Stored
+    /// positions that do not fit the claim change nothing.
+    #[test]
+    fn a_ring_continues_its_stored_epoch_after_a_clean_stop() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.emit_line(":a!a@h PRIVMSG #c :said before the restore".into());
+        let (fresh_epoch, said_at) = handle.ring_position();
+        let stored = |text: &str, seq| crate::db::StoredBacklogLine {
+            line: format!(":a!a@h PRIVMSG #c :{text}"),
+            stored_at: "2026-01-01T00:00:00.000Z".into(),
+            own_nick: crate::db::StoredOwnNick::NoNick,
+            seq: Some(seq),
+        };
+        let misfit = handle
+            .continue_ring(7, 100, vec![stored("late", 101)])
+            .expect_err("a position past the claim");
+        assert_eq!(misfit.len(), 1);
+        assert_eq!(handle.ring_position(), (fresh_epoch, said_at));
+
+        let renumbered = handle
+            .continue_ring(
+                7,
+                100,
+                vec![stored("one", 98), stored("two", 99), stored("three", 100)],
+            )
+            .expect("the positions fit");
+        assert_eq!(renumbered.now(said_at), 101);
+        assert_eq!(renumbered.now(200), 200, "a later line did not move");
+        assert_eq!(handle.ring_position(), (7, 101));
+        let before_restart = ReplayCursor { epoch: 7, seq: 99 };
+        let replay = handle
+            .buffer
+            .lock()
+            .expect("buffer")
+            .replay_after(Some(before_restart));
+        assert!(replay.resumed);
+        assert_eq!(
+            replayed(&replay),
+            [
+                ":a!a@h PRIVMSG #c :three",
+                ":a!a@h PRIVMSG #c :said before the restore"
+            ]
+        );
+        assert_eq!(
+            replay.lines.iter().map(|line| line.seq).collect::<Vec<_>>(),
+            [100, 101]
+        );
     }
 
     fn replayed(replay: &Replay) -> Vec<String> {

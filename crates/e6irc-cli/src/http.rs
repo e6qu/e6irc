@@ -72,21 +72,37 @@ fn verification_uri(value: &str) -> io::Result<&str> {
     Ok(value)
 }
 
+/// The one spelling of the API origin `base` names: scheme and host in lower
+/// case, the scheme's default port left out. Every origin comparison — a
+/// cached token with the origin it is sent to — is of these, so
+/// `https://IRC.example:443` is the origin that issued a token cached for
+/// `https://irc.example`. A user name or password in the URL is refused: it
+/// would go out as a second credential beside the bearer token.
 fn normalized_base(base: &str) -> io::Result<String> {
-    let base = base.trim_end_matches('/');
-    let parsed = reqwest::Url::parse(base).map_err(invalid_input)?;
+    let parsed = reqwest::Url::parse(base.trim_end_matches('/')).map_err(invalid_input)?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || parsed.path() != "/"
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "API base must be an http(s) origin without a path, query, or fragment",
+            "API base must be an http(s) origin without credentials, a path, a query, or a \
+             fragment",
         ));
     }
-    Ok(base.to_owned())
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// The HTTP method `name` names. Methods are case-sensitive on the wire, and
+/// `get` is not `GET` but an unknown method the server refuses: every method
+/// the API serves is a standard upper-case one, so the name is taken in any
+/// case.
+fn request_method(name: &str) -> io::Result<Method> {
+    Method::from_bytes(name.to_ascii_uppercase().as_bytes()).map_err(invalid_input)
 }
 
 fn api_base(requested: Option<&str>, cached: Option<&CachedToken>) -> io::Result<String> {
@@ -374,7 +390,7 @@ pub async fn api(
             None => load_token(&default_token_path()?),
         })?;
     let pinned = token_may_cross(&base, token.is_some(), transport.cleartext).await?;
-    let method = Method::from_bytes(method.as_bytes()).map_err(invalid_input)?;
+    let method = request_method(method)?;
     let mut request = client(pinned.as_ref(), transport.response_timeout)?
         .request(method, endpoint(&base, path)?);
     if let Some(token) = token {
@@ -573,6 +589,44 @@ mod tests {
         );
     }
 
+    /// `e6irc api get /api/v1/me` means GET: sent as typed it is an unknown
+    /// method, and the server's 405 says nothing of why.
+    #[test]
+    fn a_method_is_taken_in_any_case() {
+        assert_eq!(request_method("get").unwrap(), Method::GET);
+        assert_eq!(request_method("Delete").unwrap(), Method::DELETE);
+        assert_eq!(request_method("PATCH").unwrap(), Method::PATCH);
+        assert!(request_method("NOT A METHOD").is_err());
+    }
+
+    /// Every RFC 8628 answer that ends the poll ends it with its own error:
+    /// a denied or expired grant, or a code the client does not know.
+    #[test]
+    fn a_device_poll_that_cannot_succeed_fails_by_name() {
+        for (body, kind, said) in [
+            (
+                r#"{"error":"access_denied"}"#,
+                io::ErrorKind::PermissionDenied,
+                "denied",
+            ),
+            (
+                r#"{"error":"expired_token"}"#,
+                io::ErrorKind::TimedOut,
+                "expired",
+            ),
+            (
+                r#"{"error":"invalid_grant"}"#,
+                io::ErrorKind::Other,
+                "invalid_grant",
+            ),
+        ] {
+            let error = device_poll_failure(StatusCode::BAD_REQUEST, body.as_bytes())
+                .expect_err("the poll ends");
+            assert_eq!(error.kind(), kind, "{body}");
+            assert!(error.to_string().contains(said), "{error}");
+        }
+    }
+
     #[test]
     fn an_api_body_is_neutralized_for_a_terminal_and_exact_for_a_program() {
         let body = "{\n  \"name\": \"x\u{1b}[2J\u{9b}y\u{7f}\"\r\n}\n".as_bytes();
@@ -587,15 +641,22 @@ mod tests {
 
     #[test]
     fn origins_and_paths_are_not_ambiguous() {
-        assert_eq!(
-            normalized_base("https://irc.example/").unwrap(),
-            "https://irc.example"
-        );
+        for (spelling, origin) in [
+            ("https://irc.example/", "https://irc.example"),
+            ("HTTPS://IRC.Example:443", "https://irc.example"),
+            ("http://irc.example:80/", "http://irc.example"),
+            ("http://irc.example:8080", "http://irc.example:8080"),
+            ("http://[::1]:8080/", "http://[::1]:8080"),
+        ] {
+            assert_eq!(normalized_base(spelling).unwrap(), origin, "{spelling}");
+        }
         for invalid in [
             "irc.example",
             "ftp://irc.example",
             "https://irc.example/path",
             "https://irc.example/?query",
+            "https://user@irc.example",
+            "https://user:secret@irc.example",
         ] {
             assert!(normalized_base(invalid).is_err(), "{invalid}");
         }
@@ -670,6 +731,11 @@ mod tests {
             )
         );
         assert!(api_origin_and_token(Some("https://other.example"), None, cache).is_err());
+        // Another spelling of the issuing origin is that origin.
+        assert_eq!(
+            api_origin_and_token(Some("https://IRC.example:443/"), None, cache).unwrap(),
+            ("https://irc.example".to_owned(), Some("cached".to_owned()))
+        );
         assert!(api_origin_and_token(None, Some("explicit".into()), || Ok(None)).is_err());
     }
 

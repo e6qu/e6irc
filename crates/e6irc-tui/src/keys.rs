@@ -19,7 +19,7 @@ pub enum KeyOutcome {
 /// The key bindings, shown in the hint bar. Buffer switching has three
 /// spellings because terminals disagree about modifiers: macOS Terminal sends
 /// Option-Left as `ESC b` (Alt-b), and some terminals send no Alt at all.
-pub const HINT: &str = " switch: Alt-←/→ Alt-b/f Ctrl-P/N · scroll: PgUp/PgDn · latest: Ctrl-End · clear: Esc · help: /help · quit: /quit Ctrl-C";
+pub const HINT: &str = " switch: Alt-←/→ Alt-b/f Ctrl-P/N · scroll: PgUp/PgDn · latest: Ctrl-End · nick: Tab · clear: Esc · help: /help · quit: /quit Ctrl-C";
 
 /// Apply one key to `app`.
 pub fn dispatch(app: &mut App, key: KeyEvent) -> KeyOutcome {
@@ -31,7 +31,13 @@ pub fn dispatch(app: &mut App, key: KeyEvent) -> KeyOutcome {
     // The Alt Graph key arrives as Control+Alt on some platforms: the
     // character it produces is text, not a binding.
     let alt_graph = alt && control;
+    if key.code != KeyCode::Tab {
+        app.end_completion();
+    }
     match key.code {
+        KeyCode::Tab => {
+            app.complete_nick();
+        }
         KeyCode::Left if alt => app.prev_buffer(),
         KeyCode::Right if alt => app.next_buffer(),
         KeyCode::Char('b' | 'B') if alt && !alt_graph => app.prev_buffer(),
@@ -165,9 +171,32 @@ mod tests {
         assert_eq!(outbound.line(), "PRIVMSG #a :hi");
     }
 
+    /// Tab completes a nick and pressed again offers the next; any other key
+    /// ends the cycle, so the next Tab completes the word then typed.
+    #[test]
+    fn tab_completes_a_nick_until_another_key() {
+        let mut app = test_app("#a", "me");
+        app.on_message(&e6irc_client::OwnedMessage::from(
+            &e6irc_proto::message::Message::parse(":srv 353 me = #a :bea bob").unwrap(),
+        ));
+        let press = |app: &mut App, code| dispatch(app, key(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input(), "bea: ");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input(), "bob: ");
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.input(),
+            "bob: bea ",
+            "a new completion, not the old cycle"
+        );
+    }
+
     #[test]
     fn the_hint_names_every_switching_key() {
-        for binding in ["Alt-←/→", "Alt-b/f", "Ctrl-P/N", "Esc", "Ctrl-C"] {
+        for binding in ["Alt-←/→", "Alt-b/f", "Ctrl-P/N", "Tab", "Esc", "Ctrl-C"] {
             assert!(HINT.contains(binding), "{binding}");
         }
     }

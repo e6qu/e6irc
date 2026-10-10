@@ -185,6 +185,17 @@ pub struct ShutdownHandle {
     lease: Option<ServingLease>,
 }
 
+/// What a stop asks for (DESIGN §19.3, D16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopMode {
+    /// Hand the clients over: in edge mode the core cuts its links and the
+    /// edges hold every session for the next core. A process with no edge
+    /// holds its own clients, and closes them.
+    Handover,
+    /// Close every client, with the core's own `ERROR`.
+    Final,
+}
+
 /// How graceful shutdown ended, so `main` can pick an honest exit code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShutdownOutcome {
@@ -231,16 +242,29 @@ impl ShutdownHandle {
     /// deliver that and close, then wait for the DB worker to flush its
     /// buffered history, and last give the serving lease back. Every step is
     /// bounded; returns once the lease is given back or its timeout elapses.
-    pub async fn run(self) -> ShutdownOutcome {
-        self.run_within(ShutdownBudget {
-            core_stop: SHUTDOWN_CORE_STOP_TIMEOUT,
-            driver_stop: SHUTDOWN_DRIVER_STOP_TIMEOUT,
-            connection_drain: SHUTDOWN_CONNECTION_DRAIN_TIMEOUT,
-        })
+    ///
+    /// A [`StopMode::Handover`] in edge mode cuts the links first (DESIGN
+    /// §19.3): the edges hold every session, and the core tells no client
+    /// anything; the drivers, the core, the flush and the lease follow as
+    /// ever.
+    pub async fn run(self, mode: StopMode) -> ShutdownOutcome {
+        self.run_within(
+            mode,
+            ShutdownBudget {
+                core_stop: SHUTDOWN_CORE_STOP_TIMEOUT,
+                driver_stop: SHUTDOWN_DRIVER_STOP_TIMEOUT,
+                connection_drain: SHUTDOWN_CONNECTION_DRAIN_TIMEOUT,
+            },
+        )
         .await
     }
 
-    async fn run_within(mut self, budget: ShutdownBudget) -> ShutdownOutcome {
+    /// Whether a handover hands anything over: the process is in edge mode.
+    pub fn hands_over(&self) -> bool {
+        self.edge_links.is_some()
+    }
+
+    async fn run_within(mut self, mode: StopMode, budget: ShutdownBudget) -> ShutdownOutcome {
         let ShutdownBudget {
             core_stop: core_stop_timeout,
             driver_stop: driver_stop_timeout,
@@ -254,6 +278,29 @@ impl ShutdownHandle {
         if let Some(listener) = &self.bnc_listener {
             listener.stop().await;
         }
+        // 1b. A handover cuts the links now, before anything tells a client
+        //     goodbye: the edges hold every session for the next core, and
+        //     nothing the core does from here reaches them.
+        let handed_over = match (&self.edge_links, mode) {
+            (Some(links), StopMode::Handover) => {
+                let cut = new_cut();
+                let epoch = self
+                    .lease
+                    .as_ref()
+                    .map_or(0, |lease| u64::try_from(lease.epoch()).unwrap_or(0));
+                let handover = links.cut(cut, epoch).await;
+                eprintln!(
+                    "e6ircd: handed over to the next core: cut {:#x}, {} edges hold the \
+                     sessions ({} closed as unsettled, {} that no edge holds closed)",
+                    cut.get(),
+                    handover.edges.len(),
+                    handover.unsettled,
+                    handover.unheld
+                );
+                true
+            }
+            _ => false,
+        };
         // 2. Stop the bouncer drivers, all at once, before the core: an
         //    attached client is told the network went away by its driver, and
         //    the upstream hears a goodbye instead of a reset. The drivers'
@@ -331,7 +378,9 @@ impl ShutdownHandle {
         //    runtime would cancel the writes. In edge mode each link is one
         //    of these: it sends what its sessions were last given, then
         //    closes, and the edge delivers it.
-        if let Some(links) = self.edge_links.take() {
+        if let Some(links) = self.edge_links.take()
+            && !handed_over
+        {
             links.end_links();
         }
         let unclosed = self
@@ -362,6 +411,20 @@ impl ShutdownHandle {
             give_back_lease(lease, "shutting down").await;
         }
         core_failure.unwrap_or(flush)
+    }
+}
+
+/// A cut's identifier: random, so no two cuts share one.
+fn new_cut() -> e6irc_link::CutId {
+    use aws_lc_rs::rand::SecureRandom;
+    loop {
+        let mut bytes = [0u8; 8];
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .expect("the system random number generator");
+        if let Some(cut) = e6irc_link::CutId::new(u64::from_le_bytes(bytes)) {
+            return cut;
+        }
     }
 }
 
@@ -544,27 +607,48 @@ fn spawn_bnc_listener(
 }
 
 /// The attach logic as a session of the core link reaches it: each session
-/// opened is served by `bouncer::bnc_serve`, whichever edge accepted it.
+/// opened is served by `bouncer::bnc_serve`, whichever edge accepted it, and
+/// each a rebuild resumes by `bouncer::bnc_resume`.
 fn attach_port(
     registry: Arc<crate::bouncer::Registry>,
     pool: sqlx::PgPool,
     server_name: String,
     telemetry: Arc<Telemetry>,
 ) -> crate::bouncer::AttachPort {
-    crate::bouncer::AttachPort::new(move |link, client| {
-        let registry = registry.clone();
-        let pool = pool.clone();
-        let server_name = server_name.clone();
-        let telemetry = telemetry.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
-            {
-                telemetry.record_error(ErrorKind::Bouncer);
-                eprintln!("bnc connection from {client} failed: {e}");
-            }
-        });
-    })
+    let resume = {
+        let (registry, server_name, telemetry) =
+            (registry.clone(), server_name.clone(), telemetry.clone());
+        move |link, client, record| {
+            let registry = registry.clone();
+            let server_name = server_name.clone();
+            let telemetry = telemetry.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::bouncer::bnc_resume(link, registry, &server_name, client, record).await
+                {
+                    telemetry.record_error(ErrorKind::Bouncer);
+                    eprintln!("bnc attachment of {client} failed after a restart: {e}");
+                }
+            });
+        }
+    };
+    crate::bouncer::AttachPort::new(
+        move |link, client| {
+            let registry = registry.clone();
+            let pool = pool.clone();
+            let server_name = server_name.clone();
+            let telemetry = telemetry.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
+                {
+                    telemetry.record_error(ErrorKind::Bouncer);
+                    eprintln!("bnc connection from {client} failed: {e}");
+                }
+            });
+        },
+        resume,
+    )
 }
 
 /// Unix-epoch milliseconds. Message timestamps are stamped from this, and
@@ -585,7 +669,7 @@ pub(crate) fn wall_clock() -> e6irc_proto::time::Millis {
 /// on it can neither mass-close live connections on a forward jump nor freeze
 /// on a backward one. The epoch is arbitrary (process start); only differences
 /// are meaningful, which is all the timers ever take.
-fn mono_clock() -> e6irc_proto::time::MonoMillis {
+pub(crate) fn mono_clock() -> e6irc_proto::time::MonoMillis {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
@@ -1043,6 +1127,11 @@ async fn serve(
             .map_err(io::Error::other)?;
     let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders)
         .with_command_flood(command_flood);
+    // In edge mode the edges may hold sessions for this core to rebuild: the
+    // core's own sessions wait until the link server knows (DESIGN §19.3).
+    if config.edge_link.is_some() {
+        core_tx.directories().held.rebuilt.pending();
+    }
     // Followed live from here on (`CoreIngress::adopt_live_settings`).
     core_tx
         .set_anti_spam_exit_message_time_seconds(config.limits.anti_spam_exit_message_time_seconds);
@@ -1091,6 +1180,27 @@ async fn serve(
     }
 
     let next_conn = Arc::new(connection_ids(config.edge_link.is_some())?);
+
+    // The body format the shards write for their edges (D11): the stored
+    // one, followed live, so `e6ircd records advance` takes effect at once.
+    if let (Some(pool), Some(database)) = (&pool, &config.database) {
+        let format = core_tx.directories().held.format;
+        format.set(read_record_format(pool).await?);
+        listeners.push(supervise_listener(
+            "record-format follower",
+            tokio::spawn(crate::db::follow_announcements(
+                database.url.clone(),
+                crate::db::RECORD_FORMAT_CHANNEL,
+                "e6ircd: record-format follower",
+                None,
+                RecordFormatFollower {
+                    pool: pool.clone(),
+                    format,
+                },
+            )),
+            critical_tx.clone(),
+        ));
+    }
 
     // An account's authority changed by another process (`e6ircd
     // recover-administrator`, a hand-written row) is followed here (DESIGN
@@ -1715,8 +1825,21 @@ async fn serve(
                 edges: mode.edges.clone(),
                 pool: pool.clone(),
                 http: app_state.as_ref().map(crate::http::LinkRouters::for_state),
+                pending_cut: match &pool {
+                    Some(pool) => pending_cut(pool).await?,
+                    None => None,
+                },
             },
         ));
+        // The shards' replicas reach the edges hosting each channel's members.
+        let routes: Arc<dyn crate::core::ReplicaSink> =
+            Arc::new(crate::edge_link::ReplicaRoutes(mode.edges.clone()));
+        if core_tx.directories().held.replicas.set(routes).is_err() {
+            unreachable!("one link server routes the replicas");
+        }
+        // The edges holding the last core's sessions are rebuilt once they
+        // have uploaded, or once the wait is over.
+        tokio::spawn(server.clone().wait_for_rebuild());
         eprintln!(
             "e6ircd: edge mode: edges link at {}",
             edge_link_addr.expect("bound above")
@@ -1799,6 +1922,67 @@ async fn serve(
             lease: lease.take(),
         },
     })
+}
+
+/// The body format the stored settings say the cores write, when this release
+/// writes it; one this release does not write refuses the start, loudly: a
+/// format advanced past this release's is one it cannot read back.
+async fn read_record_format(pool: &sqlx::PgPool) -> io::Result<crate::core::record::RecordFormat> {
+    let number = crate::db::roster::written_record_format(pool)
+        .await
+        .map_err(io::Error::other)?;
+    crate::core::record::RecordFormat::read(number).ok_or_else(|| {
+        io::Error::other(format!(
+            "the stored record format is {number}, which this release does not write (it \
+             writes {} and {}); run the release that advanced it",
+            crate::core::record::RecordFormat::PREVIOUS.number(),
+            crate::core::record::RecordFormat::NEWEST.number()
+        ))
+    })
+}
+
+/// Follows the stored record format, so every core writes the one advanced to.
+struct RecordFormatFollower {
+    pool: sqlx::PgPool,
+    format: crate::core::RecordFormatCell,
+}
+
+impl crate::db::Follower for RecordFormatFollower {
+    async fn on_change(&mut self, _: crate::db::Announcement) -> Result<(), String> {
+        let format = read_record_format(&self.pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        if format != self.format.get() {
+            eprintln!(
+                "e6ircd: writing record format {} from now on",
+                format.number()
+            );
+        }
+        self.format.set(format);
+        Ok(())
+    }
+}
+
+/// The cut the roster says the edges hold, which this core rebuilds.
+async fn pending_cut(pool: &sqlx::PgPool) -> io::Result<Option<crate::edge_link::PendingCut>> {
+    let Some((cut, edges)) = crate::db::roster::pending_cut(pool)
+        .await
+        .map_err(io::Error::other)?
+    else {
+        return Ok(None);
+    };
+    let cut = e6irc_link::CutId::new(cut)
+        .ok_or_else(|| io::Error::other("the roster names cut 0, which no core makes"))?;
+    let edges = edges
+        .iter()
+        .map(|edge| e6irc_link::EdgeName::new(edge).map_err(io::Error::other))
+        .collect::<io::Result<Vec<_>>>()?;
+    eprintln!(
+        "e6ircd: the roster says {} edges hold cut {:#x}; this core rebuilds their sessions",
+        edges.len(),
+        cut.get()
+    );
+    Ok(Some(crate::edge_link::PendingCut { cut, edges }))
 }
 
 /// Edge mode's state shared by the HTTP service and the link listener.
@@ -1940,6 +2124,7 @@ mod tests {
             conn: ConnId(1),
             peer,
             transport: crate::core::ConnectionTransport::Tcp,
+            tls: None,
             task: ConnectionTasks::default().task(),
         }
     }
@@ -2232,7 +2417,7 @@ mod tests {
         let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
         handle.bnc_registry = Some(registry.clone());
-        assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
+        assert_eq!(handle.run(StopMode::Final).await, ShutdownOutcome::Flushed);
         // The goodbye was sent before `run` returned; the upstream may see
         // the close a moment later on its own task, so wait for it (bounded).
         // The test still holds the registry, so only the driver closing its
@@ -2262,7 +2447,9 @@ mod tests {
         let mut core_workers = tokio::task::JoinSet::new();
         core_workers.spawn(async { panic!("shard failure under test") });
         core_workers.spawn(async {});
-        let outcome = shutdown_handle(core_workers, flushed.clone()).run().await;
+        let outcome = shutdown_handle(core_workers, flushed.clone())
+            .run(StopMode::Final)
+            .await;
         assert_eq!(outcome, ShutdownOutcome::CorePanicked);
         assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -2275,7 +2462,10 @@ mod tests {
         let mut core_workers = tokio::task::JoinSet::new();
         core_workers.spawn(std::future::pending());
         let outcome = shutdown_handle(core_workers, flushed.clone())
-            .run_within(budget_with_core_stop(std::time::Duration::from_millis(100)))
+            .run_within(
+                StopMode::Final,
+                budget_with_core_stop(std::time::Duration::from_millis(100)),
+            )
             .await;
         assert_eq!(outcome, ShutdownOutcome::CoreTimedOut);
         assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
@@ -2301,7 +2491,10 @@ mod tests {
         handle.core_tx = Some(CoreIngress::single(core_tx));
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            handle.run_within(budget_with_core_stop(std::time::Duration::from_millis(100))),
+            handle.run_within(
+                StopMode::Final,
+                budget_with_core_stop(std::time::Duration::from_millis(100)),
+            ),
         )
         .await
         .expect("shutdown must not wait on a shard that takes nothing");
@@ -2325,7 +2518,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             marker.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
+        assert_eq!(handle.run(StopMode::Final).await, ShutdownOutcome::Flushed);
         assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
         // One that never ends costs the bound, not forever.
         let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2333,10 +2526,13 @@ mod tests {
         let stuck = handle.connections.task();
         let started = tokio::time::Instant::now();
         let outcome = handle
-            .run_within(ShutdownBudget {
-                connection_drain: std::time::Duration::from_millis(100),
-                ..budget_with_core_stop(SHUTDOWN_CORE_STOP_TIMEOUT)
-            })
+            .run_within(
+                StopMode::Final,
+                ShutdownBudget {
+                    connection_drain: std::time::Duration::from_millis(100),
+                    ..budget_with_core_stop(SHUTDOWN_CORE_STOP_TIMEOUT)
+                },
+            )
             .await;
         assert_eq!(outcome, ShutdownOutcome::Flushed);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -2555,6 +2751,7 @@ mod tests {
                 tx: out_tx,
                 host: "host.test".into(),
                 transport: crate::core::ConnectionTransport::Tcp,
+                tls: None,
             })
             .await
             .expect("open");
