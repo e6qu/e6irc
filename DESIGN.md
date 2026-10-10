@@ -6440,8 +6440,10 @@ phase rewrites.
     attachment, publishes the session once, and relays on — its channels see
     no QUIT and no JOIN, and an attachment no change. A session not yet
     registered, or whose record is unreadable, is not resumed, and its driver
-    registers anew; one no driver takes up within 10 s of the rebuild (its
-    network is gone) is closed. Without an edge to home it on, the cut closes
+    registers anew. The edges' input waits until every such session is taken
+    up, so an attachment's first line meets its network's session; one no
+    driver takes up within 10 s of the rebuild (its network is gone) is
+    closed, and the edges resume. Without an edge to home it on, the cut closes
     it first, loudly, as the server restarting, with every other session no
     edge holds (one on a version 1 link).
   - *Stops* (`control`). `e6ircd stop --handover|--final [--pid <pid>]`

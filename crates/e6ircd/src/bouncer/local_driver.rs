@@ -294,6 +294,7 @@ enum Taken {
         nick: String,
         user: String,
         channels: Vec<String>,
+        restoring: crate::core::local_home::Restoring,
     },
     Opened,
 }
@@ -313,6 +314,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             nick,
             user,
             channels,
+            restoring,
         }) => (
             conn,
             edge,
@@ -320,6 +322,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                 nick,
                 user,
                 channels,
+                restoring,
             },
         ),
         None => {
@@ -351,7 +354,15 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                 nick,
                 user,
                 channels,
-            } => resume_session(session, ends, &mut end, nick, user, channels).await,
+                restoring,
+            } => {
+                let resumed = Resumed {
+                    nick,
+                    user,
+                    channels,
+                };
+                resume_session(session, ends, &mut end, resumed, restoring).await
+            }
             Taken::Opened => drive_session(session, ends, &mut end).await,
         }
     };
@@ -459,15 +470,22 @@ async fn drive_session(
 /// `NAMES`), take the answers into the session's state without anyone seeing
 /// them, and relay on. What the core says meanwhile that is not an answer is
 /// relayed once the state is taken up.
+///
+/// The edges' input waits until `restoring` is dropped: once the session is
+/// taken up, or given up on.
 async fn resume_session(
     session: &LocalSession,
     ends: &mut DriverEnds,
     end: &mut SessionEnd<'_>,
-    nick: String,
-    user: String,
-    channels: Vec<String>,
+    resumed: Resumed,
+    restoring: crate::core::local_home::Restoring,
 ) -> super::SessionOutcome {
     use super::SessionOutcome::Stopped;
+    let Resumed {
+        nick,
+        user,
+        channels,
+    } = resumed;
     let mut lines = CoreLines::new(&session.core.core_tx, end.conn, end.edge);
     let questions = std::iter::once("VERSION".to_owned())
         .chain(
@@ -540,7 +558,16 @@ async fn resume_session(
         }
     }
     ends.connected_across_restart();
+    drop(restoring);
     relay.run(ends, end, deferred).await
+}
+
+/// A resumed session as its driver takes it up: the nick and user it is
+/// registered under, and its channels.
+struct Resumed {
+    nick: String,
+    user: String,
+    channels: Vec<String>,
 }
 
 /// The channel a reply about one names: a topic's (`331`, `332`, `333`) or a
@@ -1371,6 +1398,7 @@ mod tests {
                 nick: "alice".into(),
                 user: "ident".into(),
                 channels: vec!["#room".into()],
+                restoring: session.core.core_tx.directories().held.homes.restoring(),
             },
         );
         let (handle, mut ends) = NetworkHandle::channels(8);

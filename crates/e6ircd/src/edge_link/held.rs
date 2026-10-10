@@ -601,6 +601,15 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
         if let Some(cut) = cut {
             server.roster.clear_cut(cut).await;
         }
+        // The core's own sessions are taken up by their drivers before any
+        // edge's input flows, so an attachment's first line meets its
+        // network's session; one no driver takes up is closed.
+        let homes = server.core_tx.directories().held.homes;
+        server.core_tx.directories().held.rebuilt.done();
+        if rebuilt.local > 0 {
+            homes.restored_within(LOCAL_CLAIM_WAIT).await;
+            close_unclaimed(&server).await;
+        }
         server.rebuild.opened();
         // Every edge linked now — those that uploaded, those held, and any
         // that linked while the rebuild ran — is resumed; one whose stream
@@ -625,10 +634,6 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
                 stream.resume().await;
             }
         }
-        server.core_tx.directories().held.rebuilt.done();
-        if rebuilt.local > 0 {
-            tokio::spawn(close_unclaimed(server.clone()));
-        }
         eprintln!(
             "e6ircd: rebuilt {} sessions ({} of the core's own), {} live chat sockets, {} \
              attachments and {} channels from {} edges in {} ms; every edge is resumed",
@@ -646,8 +651,7 @@ fn spawn_rebuild(server: Arc<LinkServer>) {
 /// Close each session of the core's own that the rebuild resumed and no
 /// driver took up within [`LOCAL_CLAIM_WAIT`]: its network is not this
 /// core's.
-async fn close_unclaimed(server: Arc<LinkServer>) {
-    tokio::time::sleep(LOCAL_CLAIM_WAIT).await;
+async fn close_unclaimed(server: &LinkServer) {
     for (key, resumed) in server.core_tx.directories().held.homes.unclaimed() {
         eprintln!(
             "e6ircd: no local network {key} took up its session {} within {}s of the rebuild; \
@@ -655,7 +659,7 @@ async fn close_unclaimed(server: Arc<LinkServer>) {
             resumed.conn.0,
             LOCAL_CLAIM_WAIT.as_secs()
         );
-        close(&server, resumed.conn, "local network removed").await;
+        close(server, resumed.conn, "local network removed").await;
     }
 }
 
@@ -1028,6 +1032,7 @@ async fn rebuild(server: &Arc<LinkServer>, uploaded: &[Arc<Registration>]) -> Re
                     nick: nick.clone(),
                     user: user.clone(),
                     channels: channel_names.remove(&id).unwrap_or_default(),
+                    restoring: directories.held.homes.restoring(),
                 };
                 (tx, Some((key.clone(), resumed)))
             }

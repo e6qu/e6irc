@@ -62,6 +62,19 @@ pub(crate) struct ResumedLocal {
     pub(crate) user: String,
     /// The channels it is in, as their names are spelled.
     pub(crate) channels: Vec<String>,
+    /// Held until its driver has taken it up — or given up on it, or it is
+    /// closed unclaimed — while the edges' input waits
+    /// ([`LocalHomes::restored_within`]).
+    pub(crate) restoring: Restoring,
+}
+
+/// One session of the core's own being restored: counted while it lives.
+pub(crate) struct Restoring(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Drop for Restoring {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
 }
 
 /// One session's record as the cut homes it.
@@ -74,11 +87,22 @@ pub(crate) struct HomedRecord {
 }
 
 /// The core's own sessions, as held across a cut.
-#[derive(Default)]
 pub(crate) struct LocalHomes {
     /// Whether the core is in edge mode, where its own sessions are homed.
     homing: AtomicBool,
     state: Mutex<Homes>,
+    /// How many sessions a rebuild resumed are not yet taken up.
+    restoring: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+impl Default for LocalHomes {
+    fn default() -> Self {
+        Self {
+            homing: AtomicBool::default(),
+            state: Mutex::default(),
+            restoring: Arc::new(tokio::sync::watch::Sender::new(0)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -196,6 +220,21 @@ impl LocalHomes {
             .expect("local homes")
             .resumed
             .insert(key, resumed);
+    }
+
+    /// Count one session a rebuild resumes until the guard is dropped.
+    pub(crate) fn restoring(&self) -> Restoring {
+        self.restoring.send_modify(|count| *count += 1);
+        Restoring(self.restoring.clone())
+    }
+
+    /// Wait, at most `bound`, until every session a rebuild resumed has been
+    /// taken up by its driver: whether every one was.
+    pub(crate) async fn restored_within(&self, bound: std::time::Duration) -> bool {
+        let mut count = self.restoring.subscribe();
+        tokio::time::timeout(bound, count.wait_for(|count| *count == 0))
+            .await
+            .is_ok()
     }
 
     /// Network `key`'s resumed session, for its driver to take up.
