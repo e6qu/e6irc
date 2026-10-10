@@ -4302,6 +4302,15 @@ impl RingHistory {
     }
 }
 
+/// What a restore from storage put in the ring.
+struct Restored {
+    /// Each row restored, and the position it took.
+    positions: Vec<(i64, u64)>,
+    /// The newest stored position of a line that did not fit, when one did
+    /// not.
+    not_restored: Option<u64>,
+}
+
 /// What [`NetworkHandle::continue_ring`] did to the positions the driver's
 /// lines took before it: each below `below` is `shift` higher now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5766,14 +5775,17 @@ impl NetworkHandle {
     /// and this one does not is left in storage: a network's registration
     /// burst, whose ISUPPORT would undo the bouncer's own when replayed
     /// (§10.4), and whatever is told live only ([`told_live_only`]).
-    pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) {
+    ///
+    /// Each restored row, with the position it took in this ring.
+    pub fn preload_front(&self, older: Vec<crate::db::StoredBacklogLine>) -> Vec<(i64, u64)> {
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         // Each restored line takes the position just below the current
         // oldest: older than everything pushed, in storage order.
         // A new ring: what did not fit is before its oldest line.
         Self::restore_front(&mut buf, older, |buf, _| {
             buf.entries.front().map_or(buf.next_seq, RingEntry::seq) - 1
-        });
+        })
+        .positions
     }
 
     /// Continue the stored ring `epoch`, whose every line through position
@@ -5785,9 +5797,11 @@ impl NetworkHandle {
     /// answer says which events' positions moved, and by how much, so their
     /// persistence stores the positions they have now.
     ///
-    /// The lines back, changing nothing, when they do not fit the claim: a
-    /// line without a position, or positions not rising or past `through`.
-    /// The caller then restores them as a new epoch.
+    /// A line without a position was in no ring of this epoch — its start
+    /// gave every line it restored the position it took
+    /// ([`crate::db::claim_bnc_ring`]) — and is not restored. The lines back,
+    /// changing nothing, when the positions do not fit the claim: not rising,
+    /// or past `through`. The caller then restores them as a new epoch.
     ///
     /// `let_go` is the newest position of the epoch that storage let go of
     /// from among the lines it keeps — a busy conversation's older lines,
@@ -5802,14 +5816,18 @@ impl NetworkHandle {
         let_go: Option<u64>,
     ) -> Result<Renumbered, Vec<crate::db::StoredBacklogLine>> {
         let mut last = 0u64;
-        let fits = older.iter().all(|stored| {
-            let fits = stored.seq.is_some_and(|seq| seq > last && seq <= through);
-            last = stored.seq.unwrap_or(last);
+        let fits = older.iter().filter_map(|stored| stored.seq).all(|seq| {
+            let fits = seq > last && seq <= through;
+            last = seq;
             fits
         });
         if !fits {
             return Err(older);
         }
+        let older: Vec<crate::db::StoredBacklogLine> = older
+            .into_iter()
+            .filter(|stored| stored.seq.is_some())
+            .collect();
         let mut buf = self.buffer.lock().expect("buffer poisoned");
         let renumbered = Renumbered {
             below: buf.next_seq,
@@ -5823,9 +5841,11 @@ impl NetworkHandle {
         }
         buf.next_seq += renumbered.shift;
         buf.epoch = epoch;
+        // Its rows keep the positions they have.
         let not_restored = Self::restore_front(&mut buf, older, |_, stored| {
-            stored.seq.expect("every position checked above")
-        });
+            stored.seq.expect("only lines with a position are restored")
+        })
+        .not_restored;
         buf.let_go_floor = let_go.unwrap_or(0).max(not_restored.unwrap_or(0));
         buf.evicted_through = buf
             .evicted_through
@@ -5841,13 +5861,13 @@ impl NetworkHandle {
     }
 
     /// [`Self::preload_front`]'s restore, each line at the position
-    /// `position` gives it. The answer is the newest position of a line that
-    /// did not fit, when one did not.
+    /// `position` gives it: each row restored, with that position, and the
+    /// newest position of a line that did not fit, when one did not.
     fn restore_front(
         buf: &mut Buffer,
         older: Vec<crate::db::StoredBacklogLine>,
         position: impl Fn(&Buffer, &crate::db::StoredBacklogLine) -> u64,
-    ) -> Option<u64> {
+    ) -> Restored {
         let older: Vec<crate::db::StoredBacklogLine> = older
             .into_iter()
             .filter(|stored| {
@@ -5857,10 +5877,12 @@ impl NetworkHandle {
         let room = buf.cap.saturating_sub(buf.entries.len());
         // The own nicks of the lines restored, newest first.
         let mut restored = Vec::new();
+        let mut positions = Vec::new();
         let mut not_restored = older.iter().rev().nth(room).and_then(|stored| stored.seq);
         for stored in older.iter().rev().take(room) {
             let seq = position(buf, stored);
             let crate::db::StoredBacklogLine {
+                id,
                 line,
                 stored_at,
                 own_nick,
@@ -5887,12 +5909,16 @@ impl NetworkHandle {
             buf.entries
                 .push_front(RingEntry::Line(BufferedLine { seq, line }, share));
             restored.push(own_nick);
+            positions.push((*id, seq));
         }
         if !restored.is_empty() {
             let (names, features) = (buf.names.clone(), buf.features.clone());
             buf.head = restored_head(restored.into_iter().rev(), names, features);
         }
-        not_restored
+        Restored {
+            positions,
+            not_restored,
+        }
     }
 
     /// The most lines the replay buffer holds: the network's `buffer_cap`.
@@ -6341,6 +6367,40 @@ impl DriverEnds {
         self.publish_session(snapshot);
     }
 
+    /// Take up an IRC session that went on while this process was not there —
+    /// the `local` network's, which the core's rebuild resumed (D13): `lines`
+    /// say what a welcome would have of the network, and the session's
+    /// channels as joining them would have. They are taken into the session's
+    /// state and reach neither the backlog nor anyone attached; the session is
+    /// then published once, as it is now, so an attached client that was
+    /// shown it reconciles to no change. What each line changed, in order.
+    pub(crate) fn resume_irc_session(
+        &self,
+        nick: String,
+        lines: Vec<String>,
+    ) -> Result<Vec<SessionChange>, ChannelLimitExceeded> {
+        let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        irc_session.begin(nick);
+        irc_session.in_burst = false;
+        let changes = lines
+            .into_iter()
+            .map(|line| irc_session.observe(&ingest(line)))
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let mut buffer = self.buffer.lock().expect("buffer poisoned");
+            buffer.adopt(&irc_session.names, &irc_session.features);
+        }
+        drop(
+            self.events
+                .send(DriverEvent::Features(irc_session.features.clone())),
+        );
+        let snapshot = irc_session
+            .snapshot()
+            .expect("a begun IRC session has a nick");
+        self.publish_session(snapshot);
+        Ok(changes)
+    }
+
     /// Mark where a session began, in the ring and live, while the caller
     /// holds the session lock: a client replaying past the boundary
     /// reconciles to it exactly as a client attached at the time did.
@@ -6741,6 +6801,25 @@ impl DriverEnds {
         let line = ingest(line);
         self.runtime.record_input(line.len());
         self.publish_echo(line, origin);
+    }
+
+    /// The session this driver took up across a restart is connected, as it
+    /// was before (D13): the state is set and published as any connection's,
+    /// and nothing is said or buffered — the backlog already holds the change
+    /// to connected that the process before recorded.
+    pub(crate) fn connected_across_restart(&self) {
+        let revision = self.runtime.connected();
+        eprintln!(
+            "bnc: {} connected, taken up across a restart",
+            self.runtime.label()
+        );
+        let status = DriverConnectionStatus::Connected;
+        drop(self.events.send(DriverEvent::Status { status, revision }));
+        // The next change is a transition from here.
+        self.buffered_status
+            .lock()
+            .expect("buffered status poisoned")
+            .record(status);
     }
 
     /// Report a connection-state change, updating the sticky connection state
@@ -8899,6 +8978,7 @@ mod tests {
         own_nick: crate::db::StoredOwnNick,
     ) -> crate::db::StoredBacklogLine {
         crate::db::StoredBacklogLine {
+            id: 0,
             line: line.into(),
             stored_at: stored_at.into(),
             own_nick,
@@ -12270,6 +12350,7 @@ mod tests {
         ends.emit_line(":a!a@h PRIVMSG #c :said before the restore".into());
         let (fresh_epoch, said_at) = handle.ring_position();
         let stored = |text: &str, seq| crate::db::StoredBacklogLine {
+            id: 0,
             line: format!(":a!a@h PRIVMSG #c :{text}"),
             stored_at: "2026-01-01T00:00:00.000Z".into(),
             own_nick: crate::db::StoredOwnNick::NoNick,
@@ -12312,6 +12393,80 @@ mod tests {
         );
     }
 
+    /// After a crash a start restores the stored lines into a new epoch at
+    /// new positions, which it stores (`claim_bnc_ring`); a clean restart
+    /// after it continues that epoch with every line where its clients saw
+    /// it, so a cursor between two restored lines resumes exactly. A line
+    /// the new epoch did not restore has no position, and is no line of it.
+    #[test]
+    fn a_ring_restored_after_a_crash_continues_with_its_new_positions() {
+        let stored = |id, text: &str, seq| crate::db::StoredBacklogLine {
+            id,
+            line: format!(":a!a@h PRIVMSG #c :{text}"),
+            stored_at: "2026-01-01T00:00:00.000Z".into(),
+            own_nick: crate::db::StoredOwnNick::NoNick,
+            seq,
+        };
+        // The crashed run's positions, stale in any other epoch.
+        let (first, _) = NetworkHandle::channels(8);
+        let positions = first.preload_front(vec![
+            stored(1, "one", Some(1)),
+            stored(2, "two", Some(2)),
+            stored(3, "three", Some(3)),
+        ]);
+        let (epoch, through) = first.ring_position();
+        assert_eq!(positions.len(), 3);
+        assert!(
+            positions
+                .iter()
+                .all(|(_, seq)| *seq != 1 && *seq <= through),
+            "{positions:?}"
+        );
+        let at = |id| {
+            positions
+                .iter()
+                .find(|(row, _)| *row == id)
+                .map(|(_, seq)| *seq)
+        };
+        assert!(at(1) < at(2) && at(2) < at(3), "{positions:?}");
+        let between = ReplayCursor {
+            epoch,
+            seq: at(2).expect("restored"),
+        };
+
+        // The clean restart reads the rows as the claim stored them.
+        let (second, _) = NetworkHandle::channels(8);
+        second
+            .continue_ring(
+                epoch,
+                through,
+                vec![
+                    stored(0, "never restored", None),
+                    stored(1, "one", at(1)),
+                    stored(2, "two", at(2)),
+                    stored(3, "three", at(3)),
+                ],
+                None,
+            )
+            .expect("the new positions fit the new epoch");
+        let replay = second
+            .buffer
+            .lock()
+            .expect("buffer")
+            .replay_after(Some(between));
+        assert!(replay.resumed);
+        assert_eq!(replayed(&replay), [":a!a@h PRIVMSG #c :three"]);
+        let whole = second.buffer.lock().expect("buffer").replay_after(None);
+        assert_eq!(
+            replayed(&whole),
+            [
+                ":a!a@h PRIVMSG #c :one",
+                ":a!a@h PRIVMSG #c :two",
+                ":a!a@h PRIVMSG #c :three"
+            ]
+        );
+    }
+
     /// A continued ring refuses a cursor before a position storage let go of
     /// from among what it keeps — a busy conversation's line trimmed from
     /// the middle — and honours one after it.
@@ -12319,6 +12474,7 @@ mod tests {
     fn a_continued_ring_refuses_a_cursor_before_a_line_storage_let_go_of() {
         let (handle, _ends) = NetworkHandle::channels(8);
         let stored = |text: &str, seq| crate::db::StoredBacklogLine {
+            id: 0,
             line: format!(":a!a@h PRIVMSG #c :{text}"),
             stored_at: "2026-01-01T00:00:00.000Z".into(),
             own_nick: crate::db::StoredOwnNick::NoNick,

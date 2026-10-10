@@ -389,7 +389,12 @@ fn configured_driver(
             first_dial: super::FirstDial::Immediate,
             nick_regain: super::NickRegainTiming::default(),
         };
-        return Ok(Box::new(super::LocalDriver::new(core.clone(), config)));
+        let home = crate::core::local_home::LocalHomeKey::new(e.owner.as_deref(), &e.name);
+        return Ok(Box::new(super::LocalDriver::new(
+            core.clone(),
+            config,
+            home,
+        )));
     }
     let realname = match e.kind {
         NetworkKind::Irc | NetworkKind::Local => e.realname.clone().ok_or_else(|| {
@@ -1535,52 +1540,55 @@ async fn restore_ring(
             None
         }
     };
-    let renumbered = match crate::db::recent_bnc_backlog(pool, owner, network, restore).await {
-        Ok(lines) => match stored {
-            Some(crate::db::StoredRing {
-                epoch,
-                clean_through: Some(through),
-            }) => match handle.continue_ring(
-                epoch,
-                through,
-                lines,
-                match crate::db::bnc_ring_let_go(pool, owner, network, restore).await {
-                    Ok(let_go) => let_go,
-                    // Unknown: every position stored is taken as let go of,
-                    // so no cursor of the old ring resumes past a gap.
-                    Err(e) => {
-                        eprintln!("bnc: what {owner}/{network} let go of is unreadable: {e}");
-                        Some(through)
+    // A ring of a new epoch restores its lines at new positions, which the
+    // claim stores.
+    let new_epoch = |lines: Vec<crate::db::StoredBacklogLine>| Some(handle.preload_front(lines));
+    let (renumbered, restored) =
+        match crate::db::recent_bnc_backlog(pool, owner, network, restore).await {
+            Ok(lines) => match stored {
+                Some(crate::db::StoredRing {
+                    epoch,
+                    clean_through: Some(through),
+                }) => match handle.continue_ring(
+                    epoch,
+                    through,
+                    lines,
+                    match crate::db::bnc_ring_let_go(pool, owner, network, restore).await {
+                        Ok(let_go) => let_go,
+                        // Unknown: every position stored is taken as let go
+                        // of, so no cursor of the old ring resumes past a gap.
+                        Err(e) => {
+                            eprintln!("bnc: what {owner}/{network} let go of is unreadable: {e}");
+                            Some(through)
+                        }
+                    },
+                ) {
+                    Ok(renumbered) => (Some(renumbered), None),
+                    Err(lines) => {
+                        eprintln!(
+                            "bnc: the stored positions of {owner}/{network} do not fit its \
+                             ring; it begins anew, and clients replay it whole"
+                        );
+                        (None, new_epoch(lines))
                     }
                 },
-            ) {
-                Ok(renumbered) => Some(renumbered),
-                Err(lines) => {
-                    eprintln!(
-                        "bnc: the stored positions of {owner}/{network} do not fit its ring; it \
-                         begins anew, and clients replay it whole"
-                    );
-                    handle.preload_front(lines);
-                    None
-                }
+                Some(crate::db::StoredRing {
+                    clean_through: None,
+                    ..
+                })
+                | None => (None, new_epoch(lines)),
             },
-            Some(crate::db::StoredRing {
-                clean_through: None,
-                ..
-            })
-            | None => {
-                handle.preload_front(lines);
-                None
+            Err(e) => {
+                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                eprintln!("bnc: buffer restore failed for {owner}/{network}: {e}");
+                // A new epoch, restoring nothing: no stored line is in it.
+                (None, Some(Vec::new()))
             }
-        },
-        Err(e) => {
-            handle.record_error(super::NetworkFailure::BacklogStorageFailed);
-            eprintln!("bnc: buffer restore failed for {owner}/{network}: {e}");
-            None
-        }
-    };
+        };
     let (epoch, _) = handle.ring_position();
-    if let Err(e) = crate::db::claim_bnc_ring(pool, owner, network, epoch).await {
+    if let Err(e) =
+        crate::db::claim_bnc_ring(pool, owner, network, epoch, restored.as_deref()).await
+    {
         handle.record_error(super::NetworkFailure::BacklogStorageFailed);
         eprintln!(
             "bnc: could not claim the ring of {owner}/{network}: {e}; its next start begins a \

@@ -570,54 +570,18 @@ fn read_credential(r: &mut BodyReader) -> Result<crate::identity::CredentialId, 
 }
 
 impl SessionRecord {
-    /// The record's body, in `format`, at the writer's `clock`.
+    /// The record's body, in `format`, at the writer's `clock`: every field,
+    /// in the order [`Self::decode`] reads them — whose struct expression
+    /// names each, and whose round trip the tests hold this to.
     pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
-        let Self {
-            directory_key,
-            host,
-            transport,
-            tls,
-            registration,
-            cap_negotiating,
-            cap_302,
-            caps,
-            login,
-            sasl,
-            sasl_verify,
-            credential_attempts,
-            pending_identify,
-            pending_register,
-            nick_held,
-            nick_deadlines,
-            drop_confirmation,
-            away,
-            oper,
-            invisible,
-            wallops,
-            bot,
-            registered_only,
-            last_knock,
-            nick_changes,
-            monitoring,
-            channel_list,
-            channel_names,
-            paced_who,
-            anon_read_markers,
-            idle_since,
-            signon,
-            opened_at,
-            awaiting_pong,
-            last_ping_sent,
-            conversations,
-        } = self;
         body(format, clock, |w| {
-            w.u64(*directory_key);
-            w.text("host", host)?;
-            write_transport(w, *transport);
+            w.u64(self.directory_key);
+            w.text("host", &self.host)?;
+            write_transport(w, self.transport);
             if format >= RecordFormat::V2 {
-                w.w.option(tls.as_ref(), |w, tls| tls.write(w))?;
+                w.w.option(self.tls.as_ref(), |w, tls| tls.write(w))?;
             }
-            match registration {
+            match &self.registration {
                 RecordedRegistration::Registering {
                     nick,
                     user,
@@ -641,10 +605,10 @@ impl SessionRecord {
                     w.text("realname", realname)?;
                 }
             }
-            w.bool(*cap_negotiating);
-            w.bool(*cap_302);
-            w.w.u32(*caps);
-            match login {
+            w.bool(self.cap_negotiating);
+            w.bool(self.cap_302);
+            w.w.u32(self.caps);
+            match &self.login {
                 None => w.w.u8(0),
                 Some(login) => {
                     w.w.u8(1);
@@ -653,23 +617,23 @@ impl SessionRecord {
                     w.opt_mono(login.expires_at);
                 }
             }
-            w.w.u8(match sasl {
+            w.w.u8(match &self.sasl {
                 RecordedSasl::Idle => 0,
                 RecordedSasl::PlainPending => 1,
                 RecordedSasl::BearerPending => 2,
                 RecordedSasl::Verifying => 3,
             });
-            write_label(w, sasl_verify.as_ref())?;
-            w.w.u8(*credential_attempts);
-            write_label(w, pending_identify.as_ref())?;
-            write_label(w, pending_register.as_ref())?;
-            w.opt_text("held nick", nick_held.as_deref())?;
-            w.count("nick deadlines", nick_deadlines.len())?;
-            for (nick, deadline) in nick_deadlines {
+            write_label(w, self.sasl_verify.as_ref())?;
+            w.w.u8(self.credential_attempts);
+            write_label(w, self.pending_identify.as_ref())?;
+            write_label(w, self.pending_register.as_ref())?;
+            w.opt_text("held nick", self.nick_held.as_deref())?;
+            w.count("nick deadlines", self.nick_deadlines.len())?;
+            for (nick, deadline) in &self.nick_deadlines {
                 w.text("clocked nick", nick)?;
                 w.mono(*deadline);
             }
-            match drop_confirmation {
+            match &self.drop_confirmation {
                 None => w.w.u8(0),
                 Some((account, key)) => {
                     w.w.u8(1);
@@ -677,21 +641,21 @@ impl SessionRecord {
                     w.text("drop key", key)?;
                 }
             }
-            w.opt_text("away", away.as_deref())?;
-            w.opt_text("oper", oper.as_deref())?;
-            w.bool(*invisible);
-            w.bool(*wallops);
-            w.bool(*bot);
-            w.bool(*registered_only);
-            w.opt_mono(*last_knock);
-            w.w.u32(nick_changes.0);
-            w.opt_mono(nick_changes.1);
-            w.count("monitoring", monitoring.len())?;
-            for (key, display) in monitoring {
+            w.opt_text("away", self.away.as_deref())?;
+            w.opt_text("oper", self.oper.as_deref())?;
+            w.bool(self.invisible);
+            w.bool(self.wallops);
+            w.bool(self.bot);
+            w.bool(self.registered_only);
+            w.opt_mono(self.last_knock);
+            w.w.u32(self.nick_changes.0);
+            w.opt_mono(self.nick_changes.1);
+            w.count("monitoring", self.monitoring.len())?;
+            for (key, display) in &self.monitoring {
                 w.text("monitored key", key)?;
                 w.text("monitored nick", display)?;
             }
-            for sweep in [channel_list, channel_names] {
+            for sweep in [&self.channel_list, &self.channel_names] {
                 match sweep {
                     None => w.w.u8(0),
                     Some(sweep) => {
@@ -700,8 +664,8 @@ impl SessionRecord {
                     }
                 }
             }
-            w.count("paced WHO replies", paced_who.len())?;
-            for reply in paced_who {
+            w.count("paced WHO replies", self.paced_who.len())?;
+            for reply in &self.paced_who {
                 match &reply.batch {
                     None => w.w.u8(0),
                     Some((label, reference, opened)) => {
@@ -716,18 +680,18 @@ impl SessionRecord {
                     w.w.bytes("paced line", line, MAX_TEXT)?;
                 }
             }
-            w.count("read markers", anon_read_markers.len())?;
-            for (target, at) in anon_read_markers {
+            w.count("read markers", self.anon_read_markers.len())?;
+            for (target, at) in &self.anon_read_markers {
                 w.text("marker target", target)?;
                 w.millis(*at);
             }
-            w.mono(*idle_since);
-            w.millis(*signon);
-            w.mono(*opened_at);
-            w.bool(*awaiting_pong);
-            w.mono(*last_ping_sent);
-            w.count("conversations", conversations.len())?;
-            for ring in conversations {
+            w.mono(self.idle_since);
+            w.millis(self.signon);
+            w.mono(self.opened_at);
+            w.bool(self.awaiting_pong);
+            w.mono(self.last_ping_sent);
+            w.count("conversations", self.conversations.len())?;
+            for ring in &self.conversations {
                 w.text("conversation", &ring.key)?;
                 w.bool(ring.complete);
                 match &ring.shed_through {
@@ -747,207 +711,147 @@ impl SessionRecord {
         })
     }
 
-    /// A record read from `bytes` onto the reader's `clock`.
+    /// A record read from `bytes` onto the reader's `clock`: its fields in
+    /// the order written, which a struct expression evaluates them in.
     pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
         let mut r = BodyReader::new(bytes, clock)?;
-        let directory_key = r.u64("directory key")?;
-        let host = r.text("host")?;
-        let transport = read_transport(&mut r)?;
-        let tls = if r.format >= RecordFormat::V2 {
-            r.r.option("TLS facts", TlsFacts::read)?
-        } else {
-            None
-        };
-        let registration = match r.r.u8("registration")? {
-            0 => RecordedRegistration::Registering {
-                nick: r.opt_text("nick")?,
-                user: r.opt_text("user")?,
-                realname: r.opt_text("realname")?,
-                refused_nick: r.opt_text("refused nick")?,
+        let record = Self {
+            directory_key: r.u64("directory key")?,
+            host: r.text("host")?,
+            transport: read_transport(&mut r)?,
+            tls: if r.format >= RecordFormat::V2 {
+                r.r.option("TLS facts", TlsFacts::read)?
+            } else {
+                None
             },
-            1 => RecordedRegistration::Registered {
-                nick: r.text("nick")?,
-                user: r.text("user")?,
-                realname: r.text("realname")?,
+            registration: match r.r.u8("registration")? {
+                0 => RecordedRegistration::Registering {
+                    nick: r.opt_text("nick")?,
+                    user: r.opt_text("user")?,
+                    realname: r.opt_text("realname")?,
+                    refused_nick: r.opt_text("refused nick")?,
+                },
+                1 => RecordedRegistration::Registered {
+                    nick: r.text("nick")?,
+                    user: r.text("user")?,
+                    realname: r.text("realname")?,
+                },
+                tag => return Err(unknown("registration", tag)),
             },
-            tag => {
-                return Err(DecodeError::UnknownTag {
-                    field: "registration",
-                    tag,
-                }
-                .into());
-            }
-        };
-        let cap_negotiating = r.bool("cap negotiating")?;
-        let cap_302 = r.bool("cap 302")?;
-        let caps = r.r.u32("caps")?;
-        let login = match r.r.u8("login")? {
-            0 => None,
-            1 => Some(RecordedLogin {
-                account: r.text("account")?,
-                credential: read_credential(&mut r)?,
-                expires_at: r.opt_mono("login expiry")?,
-            }),
-            tag => {
-                return Err(DecodeError::UnknownTag {
-                    field: "login",
-                    tag,
-                }
-                .into());
-            }
-        };
-        let sasl = match r.r.u8("sasl")? {
-            0 => RecordedSasl::Idle,
-            1 => RecordedSasl::PlainPending,
-            2 => RecordedSasl::BearerPending,
-            3 => RecordedSasl::Verifying,
-            tag => return Err(DecodeError::UnknownTag { field: "sasl", tag }.into()),
-        };
-        let sasl_verify = read_label(&mut r, "sasl verification")?;
-        let credential_attempts = r.r.u8("credential attempts")?;
-        let pending_identify = read_label(&mut r, "pending identify")?;
-        let pending_register = read_label(&mut r, "pending register")?;
-        let nick_held = r.opt_text("held nick")?;
-        let mut nick_deadlines = Vec::new();
-        for _ in 0..r.count("nick deadlines")? {
-            nick_deadlines.push((r.text("clocked nick")?, r.mono("nick deadline")?));
-        }
-        let drop_confirmation = match r.r.u8("drop confirmation")? {
-            0 => None,
-            1 => Some((r.text("drop account")?, r.text("drop key")?)),
-            tag => {
-                return Err(DecodeError::UnknownTag {
-                    field: "drop confirmation",
-                    tag,
-                }
-                .into());
-            }
-        };
-        let away = r.opt_text("away")?;
-        let oper = r.opt_text("oper")?;
-        let invisible = r.bool("invisible")?;
-        let wallops = r.bool("wallops")?;
-        let bot = r.bool("bot")?;
-        let registered_only = r.bool("registered only")?;
-        let last_knock = r.opt_mono("last knock")?;
-        let nick_changes = (r.r.u32("nick changes")?, r.opt_mono("last nick change")?);
-        let mut monitoring = Vec::new();
-        for _ in 0..r.count("monitoring")? {
-            monitoring.push((r.text("monitored key")?, r.text("monitored nick")?));
-        }
-        let mut sweeps = [None, None];
-        for sweep in &mut sweeps {
-            *sweep = match r.r.u8("sweep present")? {
+            cap_negotiating: r.bool("cap negotiating")?,
+            cap_302: r.bool("cap 302")?,
+            caps: r.r.u32("caps")?,
+            login: match r.r.u8("login")? {
                 0 => None,
-                1 => Some(read_sweep(&mut r)?),
-                tag => {
-                    return Err(DecodeError::UnknownTag {
-                        field: "sweep present",
-                        tag,
-                    }
-                    .into());
-                }
-            };
-        }
-        let [channel_list, channel_names] = sweeps;
-        let mut paced_who = Vec::new();
-        for _ in 0..r.count("paced WHO replies")? {
-            let batch = match r.r.u8("paced batch")? {
+                1 => Some(RecordedLogin {
+                    account: r.text("account")?,
+                    credential: read_credential(&mut r)?,
+                    expires_at: r.opt_mono("login expiry")?,
+                }),
+                tag => return Err(unknown("login", tag)),
+            },
+            sasl: match r.r.u8("sasl")? {
+                0 => RecordedSasl::Idle,
+                1 => RecordedSasl::PlainPending,
+                2 => RecordedSasl::BearerPending,
+                3 => RecordedSasl::Verifying,
+                tag => return Err(unknown("sasl", tag)),
+            },
+            sasl_verify: read_label(&mut r, "sasl verification")?,
+            credential_attempts: r.r.u8("credential attempts")?,
+            pending_identify: read_label(&mut r, "pending identify")?,
+            pending_register: read_label(&mut r, "pending register")?,
+            nick_held: r.opt_text("held nick")?,
+            nick_deadlines: (0..r.count("nick deadlines")?)
+                .map(|_| Ok((r.text("clocked nick")?, r.mono("nick deadline")?)))
+                .collect::<Result<_, DecodeError>>()?,
+            drop_confirmation: match r.r.u8("drop confirmation")? {
                 0 => None,
-                1 => Some((
-                    r.text("paced label")?,
-                    r.text("paced batch")?,
-                    r.bool("paced batch opened")?,
-                )),
-                tag => {
-                    return Err(DecodeError::UnknownTag {
-                        field: "paced batch",
-                        tag,
-                    }
-                    .into());
-                }
-            };
-            let mut lines = Vec::new();
-            for _ in 0..r.count("paced lines")? {
-                lines.push(r.r.bytes("paced line", MAX_TEXT)?);
-            }
-            paced_who.push(RecordedPacedReply { batch, lines });
-        }
-        let mut anon_read_markers = Vec::new();
-        for _ in 0..r.count("read markers")? {
-            anon_read_markers.push((r.text("marker target")?, r.millis("marker")?));
-        }
-        let idle_since = r.mono("idle since")?;
-        let signon = r.millis("signon")?;
-        let opened_at = r.mono("opened at")?;
-        let awaiting_pong = r.bool("awaiting pong")?;
-        let last_ping_sent = r.mono("last ping sent")?;
-        let mut conversations = Vec::new();
-        for _ in 0..r.count("conversations")? {
-            let key = r.text("conversation")?;
-            let complete = r.bool("conversation complete")?;
-            let shed_through = match r.r.u8("shed through")? {
-                0 => None,
-                1 => Some((r.millis("shed through")?, r.text("shed through")?)),
-                tag => {
-                    return Err(DecodeError::UnknownTag {
-                        field: "shed through",
-                        tag,
-                    }
-                    .into());
-                }
-            };
-            let mut entries = Vec::new();
-            for _ in 0..r.count("conversation entries")? {
-                entries.push(read_history_row(&mut r)?);
-            }
-            conversations.push(RecordedRing {
-                key,
-                complete,
-                shed_through,
-                entries,
-            });
-        }
+                1 => Some((r.text("drop account")?, r.text("drop key")?)),
+                tag => return Err(unknown("drop confirmation", tag)),
+            },
+            away: r.opt_text("away")?,
+            oper: r.opt_text("oper")?,
+            invisible: r.bool("invisible")?,
+            wallops: r.bool("wallops")?,
+            bot: r.bool("bot")?,
+            registered_only: r.bool("registered only")?,
+            last_knock: r.opt_mono("last knock")?,
+            nick_changes: (r.r.u32("nick changes")?, r.opt_mono("last nick change")?),
+            monitoring: (0..r.count("monitoring")?)
+                .map(|_| Ok((r.text("monitored key")?, r.text("monitored nick")?)))
+                .collect::<Result<_, DecodeError>>()?,
+            channel_list: read_opt_sweep(&mut r)?,
+            channel_names: read_opt_sweep(&mut r)?,
+            paced_who: (0..r.count("paced WHO replies")?)
+                .map(|_| read_paced_reply(&mut r))
+                .collect::<Result<_, RecordError>>()?,
+            anon_read_markers: (0..r.count("read markers")?)
+                .map(|_| Ok((r.text("marker target")?, r.millis("marker")?)))
+                .collect::<Result<_, DecodeError>>()?,
+            idle_since: r.mono("idle since")?,
+            signon: r.millis("signon")?,
+            opened_at: r.mono("opened at")?,
+            awaiting_pong: r.bool("awaiting pong")?,
+            last_ping_sent: r.mono("last ping sent")?,
+            conversations: (0..r.count("conversations")?)
+                .map(|_| read_ring(&mut r))
+                .collect::<Result<_, RecordError>>()?,
+        };
         r.finish()?;
-        Ok(Self {
-            directory_key,
-            host,
-            transport,
-            tls,
-            registration,
-            cap_negotiating,
-            cap_302,
-            caps,
-            login,
-            sasl,
-            sasl_verify,
-            credential_attempts,
-            pending_identify,
-            pending_register,
-            nick_held,
-            nick_deadlines,
-            drop_confirmation,
-            away,
-            oper,
-            invisible,
-            wallops,
-            bot,
-            registered_only,
-            last_knock,
-            nick_changes,
-            monitoring,
-            channel_list,
-            channel_names,
-            paced_who,
-            anon_read_markers,
-            idle_since,
-            signon,
-            opened_at,
-            awaiting_pong,
-            last_ping_sent,
-            conversations,
-        })
+        Ok(record)
     }
+}
+
+/// A body's tag that names nothing this release writes.
+fn unknown(field: &'static str, tag: u8) -> RecordError {
+    DecodeError::UnknownTag { field, tag }.into()
+}
+
+/// A paced sweep, when one was recorded.
+fn read_opt_sweep(r: &mut BodyReader) -> Result<Option<RecordedSweep>, RecordError> {
+    match r.r.u8("sweep present")? {
+        0 => Ok(None),
+        1 => Ok(Some(read_sweep(r)?)),
+        tag => Err(unknown("sweep present", tag)),
+    }
+}
+
+/// One paced WHO reply: its batch, if any, and its lines.
+fn read_paced_reply(r: &mut BodyReader) -> Result<RecordedPacedReply, RecordError> {
+    let batch = match r.r.u8("paced batch")? {
+        0 => None,
+        1 => Some((
+            r.text("paced label")?,
+            r.text("paced batch")?,
+            r.bool("paced batch opened")?,
+        )),
+        tag => return Err(unknown("paced batch", tag)),
+    };
+    let lines = (0..r.count("paced lines")?)
+        .map(|_| r.r.bytes("paced line", MAX_TEXT))
+        .collect::<Result<_, DecodeError>>()?;
+    Ok(RecordedPacedReply { batch, lines })
+}
+
+/// One conversation's ring.
+fn read_ring(r: &mut BodyReader) -> Result<RecordedRing, RecordError> {
+    let key = r.text("conversation")?;
+    let complete = r.bool("conversation complete")?;
+    let shed_through = match r.r.u8("shed through")? {
+        0 => None,
+        1 => Some((r.millis("shed through")?, r.text("shed through")?)),
+        tag => return Err(unknown("shed through", tag)),
+    };
+    let entries = (0..r.count("conversation entries")?)
+        .map(|_| read_history_row(r))
+        .collect::<Result<_, _>>()?;
+    Ok(RecordedRing {
+        key,
+        complete,
+        shed_through,
+        entries,
+    })
 }
 
 /// One entry of a channel's ban, quiet or exception list.
@@ -1003,24 +907,10 @@ fn read_list(r: &mut BodyReader) -> Result<Vec<RecordedListEntry>, DecodeError> 
 
 impl ChannelState {
     pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
-        let Self {
-            name,
-            created_at,
-            topic,
-            flags,
-            key,
-            limit,
-            bans,
-            quiets,
-            ban_exceptions,
-            invite_exceptions,
-            invited,
-            last_knock,
-        } = self;
         body(format, clock, |w| {
-            w.text("channel name", name)?;
-            w.millis(*created_at);
-            match topic {
+            w.text("channel name", &self.name)?;
+            w.millis(self.created_at);
+            match &self.topic {
                 None => w.w.u8(0),
                 Some((text, set_by, set_at)) => {
                     w.w.u8(1);
@@ -1029,70 +919,57 @@ impl ChannelState {
                     w.u64(*set_at);
                 }
             }
-            w.text("flags", flags)?;
-            w.opt_text("key", key.as_deref())?;
-            w.w.option(limit.as_ref(), |w, limit| {
+            w.text("flags", &self.flags)?;
+            w.opt_text("key", self.key.as_deref())?;
+            w.w.option(self.limit.as_ref(), |w, limit| {
                 w.u32(*limit);
                 Ok(())
             })?;
-            for list in [bans, quiets, ban_exceptions, invite_exceptions] {
+            for list in [
+                &self.bans,
+                &self.quiets,
+                &self.ban_exceptions,
+                &self.invite_exceptions,
+            ] {
                 write_list(w, list)?;
             }
-            w.count("invited", invited.len())?;
-            for conn in invited {
+            w.count("invited", self.invited.len())?;
+            for conn in &self.invited {
                 w.u64(*conn);
             }
-            w.opt_mono(*last_knock);
+            w.opt_mono(self.last_knock);
             Ok(())
         })
     }
 
     pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
         let mut r = BodyReader::new(bytes, clock)?;
-        let name = r.text("channel name")?;
-        let created_at = r.millis("created at")?;
-        let topic = match r.r.u8("topic")? {
-            0 => None,
-            1 => Some((
-                r.text("topic")?,
-                r.text("topic setter")?,
-                r.u64("topic set at")?,
-            )),
-            tag => {
-                return Err(DecodeError::UnknownTag {
-                    field: "topic",
-                    tag,
-                }
-                .into());
-            }
+        let state = Self {
+            name: r.text("channel name")?,
+            created_at: r.millis("created at")?,
+            topic: match r.r.u8("topic")? {
+                0 => None,
+                1 => Some((
+                    r.text("topic")?,
+                    r.text("topic setter")?,
+                    r.u64("topic set at")?,
+                )),
+                tag => return Err(unknown("topic", tag)),
+            },
+            flags: r.text("flags")?,
+            key: r.opt_text("key")?,
+            limit: r.r.option("limit", |r| r.u32("limit"))?,
+            bans: read_list(&mut r)?,
+            quiets: read_list(&mut r)?,
+            ban_exceptions: read_list(&mut r)?,
+            invite_exceptions: read_list(&mut r)?,
+            invited: (0..r.count("invited")?)
+                .map(|_| r.u64("invited"))
+                .collect::<Result<_, DecodeError>>()?,
+            last_knock: r.opt_mono("channel knock")?,
         };
-        let flags = r.text("flags")?;
-        let key = r.opt_text("key")?;
-        let limit = r.r.option("limit", |r| r.u32("limit"))?;
-        let bans = read_list(&mut r)?;
-        let quiets = read_list(&mut r)?;
-        let ban_exceptions = read_list(&mut r)?;
-        let invite_exceptions = read_list(&mut r)?;
-        let mut invited = Vec::new();
-        for _ in 0..r.count("invited")? {
-            invited.push(r.u64("invited")?);
-        }
-        let last_knock = r.opt_mono("channel knock")?;
         r.finish()?;
-        Ok(Self {
-            name,
-            created_at,
-            topic,
-            flags,
-            key,
-            limit,
-            bans,
-            quiets,
-            ban_exceptions,
-            invite_exceptions,
-            invited,
-            last_knock,
-        })
+        Ok(state)
     }
 }
 
@@ -1357,39 +1234,72 @@ impl AttachRecord {
 
     pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
         let mut r = BodyReader::new(bytes, clock)?;
-        let account = r.text("account")?;
-        let credential = read_credential(&mut r)?;
-        let shared = r.bool("shared")?;
+        let texts = |r: &mut BodyReader, field| {
+            (0..r.count(field)?)
+                .map(|_| r.text(field))
+                .collect::<Result<Vec<_>, DecodeError>>()
+        };
+        let record = Self {
+            account: r.text("account")?,
+            credential: read_credential(&mut r)?,
+            shared: r.bool("shared")?,
+            network: r.text("network")?,
+            requested_nick: r.text("requested nick")?,
+            caps: r.r.u16("capabilities")?,
+            cursor: r
+                .r
+                .option("cursor", |r| Ok((r.u64("epoch")?, r.u64("seq")?)))?,
+            shown_nick: r.opt_text("shown nick")?,
+            shown_channels: texts(&mut r, "shown channels")?,
+            shown_isupport: texts(&mut r, "shown ISUPPORT")?,
+            status_revision: r.u64("status revision")?,
+        };
+        r.finish()?;
+        Ok(record)
+    }
+}
+
+/// The most bytes of the session record a [`LocalRecord`] carries: as many
+/// as one body holds.
+const MAX_NESTED_BODY: usize =
+    e6irc_link::held::MAX_BODY_PART * e6irc_link::held::MAX_BODY_PARTS as usize;
+
+/// A session of the core's own homed on an edge across a cut (decision D13):
+/// which `local` bouncer network it is — its owner, none for a shared one,
+/// and its name, each folded — and the session's record as its shard wrote
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRecord {
+    pub owner: Option<String>,
+    pub network: String,
+    /// A [`SessionRecord`] body.
+    pub session: Bytes,
+}
+
+impl LocalRecord {
+    pub fn encode(&self, format: RecordFormat, clock: ClockOrigin) -> Result<Bytes, EncodeError> {
+        let Self {
+            owner,
+            network,
+            session,
+        } = self;
+        body(format, clock, |w| {
+            w.opt_text("owner", owner.as_deref())?;
+            w.text("network", network)?;
+            w.w.bytes("session record", session, MAX_NESTED_BODY)
+        })
+    }
+
+    pub fn decode(bytes: Bytes, clock: ClockOrigin) -> Result<Self, RecordError> {
+        let mut r = BodyReader::new(bytes, clock)?;
+        let owner = r.opt_text("owner")?;
         let network = r.text("network")?;
-        let requested_nick = r.text("requested nick")?;
-        let caps = r.r.u16("capabilities")?;
-        let cursor =
-            r.r.option("cursor", |r| Ok((r.u64("epoch")?, r.u64("seq")?)))?;
-        let shown_nick = r.opt_text("shown nick")?;
-        let mut lists = [Vec::new(), Vec::new()];
-        for (field, list) in ["shown channels", "shown ISUPPORT"]
-            .into_iter()
-            .zip(&mut lists)
-        {
-            for _ in 0..r.count(field)? {
-                list.push(r.text(field)?);
-            }
-        }
-        let [shown_channels, shown_isupport] = lists;
-        let status_revision = r.u64("status revision")?;
+        let session = r.r.bytes("session record", MAX_NESTED_BODY)?;
         r.finish()?;
         Ok(Self {
-            account,
-            credential,
-            shared,
+            owner,
             network,
-            requested_nick,
-            caps,
-            cursor,
-            shown_nick,
-            shown_channels,
-            shown_isupport,
-            status_revision,
+            session,
         })
     }
 }

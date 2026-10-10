@@ -251,6 +251,11 @@ impl Deployment {
     /// Start a core in edge mode, its link on `link` (port 0: any) and HTTP on
     /// any port, with `extra` added to its configuration.
     async fn core(&self, file: &str, link: &str, extra: &str) -> Core {
+        self.core_with(file, link, extra, "").await
+    }
+
+    /// [`Self::core`], with `edge_link` added to its `[edge_link]`.
+    async fn core_with(&self, file: &str, link: &str, extra: &str, edge_link: &str) -> Core {
         let config = self.write(
             file,
             &format!(
@@ -262,6 +267,7 @@ impl Deployment {
                  ca = 'credentials/ca.pem'\n\
                  cert = 'credentials/core.pem'\n\
                  key = 'credentials/core-key.pem'\n\
+                 {edge_link}\n\
                  [http]\n\
                  addr = \"127.0.0.1:0\"\n"
             ),
@@ -703,7 +709,12 @@ async fn a_killed_core_closes_every_session_loudly_and_the_next_core_serves() {
 async fn a_graceful_restart_keeps_every_client_of_every_transport() {
     let deployment = Deployment::new("restart", &["edge-a"]);
     let trusted = deployment.tls_certificate();
-    let mut core = deployment.core("core.toml", "127.0.0.1:0", "").await;
+    // Without a database a core writes the format before the newest unless
+    // told otherwise; the newest carries the TLS facts this test keeps.
+    let newest = "record_format = 2";
+    let mut core = deployment
+        .core_with("core.toml", "127.0.0.1:0", "", newest)
+        .await;
     let link = core.link;
     let mut edge = deployment.edge("edge-a", link, listeners()).await;
     let (plain, tls, web) = addresses(&mut edge).await;
@@ -766,11 +777,17 @@ async fn a_graceful_restart_keeps_every_client_of_every_transport() {
         "{}",
         core.process.said()
     );
-    edge.until("holding 5 sessions for the next core", 1).await;
+    edge.until(
+        "holding 5 sessions and 0 of the core's own for the next core",
+        1,
+    )
+    .await;
     // Sent while no core is there: the edge holds it for the next.
     alice.send("PRIVMSG #zero :during the gap").await;
 
-    let mut next = deployment.core("next.toml", &link.to_string(), "").await;
+    let mut next = deployment
+        .core_with("next.toml", &link.to_string(), "", newest)
+        .await;
     edge.until("uploaded 5 sessions", 1).await;
     next.process.until("rebuilt 5 sessions", 1).await;
 
@@ -882,7 +899,11 @@ async fn a_terminated_core_hands_its_clients_over() {
         "{}",
         core.process.said()
     );
-    edge.until("holding 1 sessions for the next core", 1).await;
+    edge.until(
+        "holding 1 sessions and 0 of the core's own for the next core",
+        1,
+    )
+    .await;
     let _next = deployment.core("next.toml", &link.to_string(), "").await;
     edge.until("uploaded 1 sessions", 1).await;
     alice.send("PING :resumed").await;

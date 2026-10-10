@@ -1700,7 +1700,9 @@ other phase is scheduled in the order below.
   As built (DESIGN §19.1, "Phase 4 as built"): link version 2 with the
   held-state frames, `Hello`'s cut, `Welcome`'s admission and `Open`'s TLS
   facts (shown in WHOIS); record formats 1 and 2 with `e6ircd records
-  advance` and a stored `record_format` every core follows; records of IRC
+  advance` and a stored `record_format` every core follows (a core without a
+  database: `[edge_link] record_format`, the previous format unless stated);
+  records of IRC
   sessions, live chat sockets and bouncer attachments, channel replicas on
   the owner shard's stream, and the cut state; acknowledgement after effect
   with SASL chunks and multiline lines retained; the cut (pause, settle,
@@ -1708,14 +1710,19 @@ other phase is scheduled in the order below.
   gate (roster wait, a one-second wait without a database, late edges
   closing what they hold); re-authorization of every login and address;
   durable ring epochs (migration 0102); `e6ircd stop --handover|--final`
-  through a per-process stop control; and the restart-at-every-step test,
-  run through an edge over real links rather than the `CoreScheduler`. The
-  `local` driver's session is not homed on an edge (D13): it quits before
-  the cut and rejoins after the rebuild. A late edge's sessions are closed,
-  as phase 5's re-admission is not built.
+  through a per-process stop control; the edge's core-absence limit,
+  `[edge] core_absence_limit_seconds` (D12's ten minutes unless stated); the
+  `local` driver's session homed at the cut on an edge that holds it and
+  taken up by its driver after the rebuild without registering again (D13,
+  `Home` and `HomeUpload`); and the restart-at-every-step test, twice in a
+  row after each step, run through an edge over real links rather than the
+  `CoreScheduler`. irctest runs through an edge without a restart in the
+  middle of a test: the restart-at-every-step test is the restart evidence
+  (DESIGN §19.11). A late edge's sessions are closed, as phase 5's
+  re-admission is not built.
 - **Phase 5 — crash takeover.** The rebuild without a cut, catch-up lines,
   `NOTE INPUT_UNCONFIRMED`, the roster wait and late edges, the core-absence
-  limit, resending after a link reset, and the interplay with the
+  limit's close after a crash, resending after a link reset, and the interplay with the
   database-outage hold. *Green because* a crash becomes drop-free, with the
   zero-drop suite's crash scenarios asserting losses equal the reported
   counts.

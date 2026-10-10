@@ -503,6 +503,21 @@ fn an_attachment_record_round_trips_in_both_formats() {
 }
 
 #[test]
+fn a_homed_local_session_record_round_trips_in_both_formats() {
+    for owner in [None, Some("alice".to_owned())] {
+        let record = LocalRecord {
+            owner,
+            network: "local".into(),
+            session: Bytes::from_static(b"a session record body"),
+        };
+        for format in [RecordFormat::PREVIOUS, RecordFormat::NEWEST] {
+            let body = record.encode(format, WRITER).expect("encode");
+            assert_eq!(LocalRecord::decode(body, WRITER), Ok(record.clone()));
+        }
+    }
+}
+
+#[test]
 fn a_live_chat_socket_record_round_trips_in_both_formats() {
     for cursor in [None, Some((0x1234_5678_9abc, 42))] {
         let record = UiRecord {

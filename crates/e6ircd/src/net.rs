@@ -83,6 +83,12 @@ const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// standby's takeover by at most the lease's TTL.
 const SHUTDOWN_LEASE_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long graceful shutdown waits, once it has aborted every listener task,
+/// for the tasks to end and so close their sockets: a core started in this
+/// process on the same address once shutdown returns finds it free. Ending
+/// an aborted task takes the runtime microseconds.
+const SHUTDOWN_LISTENER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How long graceful shutdown waits for every core shard to stop. Stopping is
 /// a drain — each shard serves the others until nothing is passing between
 /// them — and normally takes milliseconds.
@@ -275,6 +281,22 @@ impl ShutdownHandle {
         for listener in &self.listeners {
             listener.abort();
         }
+        let closing = tokio::time::Instant::now() + SHUTDOWN_LISTENER_CLOSE_TIMEOUT;
+        while self
+            .listeners
+            .iter()
+            .any(|listener| !listener.is_finished())
+        {
+            if tokio::time::Instant::now() >= closing {
+                eprintln!(
+                    "e6ircd: a listener task did not end within {}s of being aborted; its \
+                     socket may stay bound until the process exits",
+                    SHUTDOWN_LISTENER_CLOSE_TIMEOUT.as_secs()
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         if let Some(listener) = &self.bnc_listener {
             listener.stop().await;
         }
@@ -291,9 +313,11 @@ impl ShutdownHandle {
                 let handover = links.cut(cut, epoch).await;
                 eprintln!(
                     "e6ircd: handed over to the next core: cut {:#x}, {} edges hold the \
-                     sessions ({} closed as unsettled, {} that no edge holds closed)",
+                     sessions, {} of the core's own homed on one ({} closed as unsettled, {} \
+                     that no edge holds closed)",
                     cut.get(),
                     handover.edges.len(),
+                    handover.homed,
                     handover.unsettled,
                     handover.unheld
                 );
@@ -623,11 +647,16 @@ fn attach_port(
             let server_name = server_name.clone();
             let telemetry = telemetry.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::bouncer::bnc_resume(link, registry, &server_name, client, record).await
+                match crate::bouncer::bnc_resume(link, registry, &server_name, client, record).await
                 {
-                    telemetry.record_error(ErrorKind::Bouncer);
-                    eprintln!("bnc attachment of {client} failed after a restart: {e}");
+                    Ok(()) => {}
+                    // A cut, or a link that ended: the edge holds it, or said
+                    // so.
+                    Err(e) if e6irc_edge::link::EdgeGone::is(&e) => {}
+                    Err(e) => {
+                        telemetry.record_error(ErrorKind::Bouncer);
+                        eprintln!("bnc attachment of {client} failed after a restart: {e}");
+                    }
                 }
             });
         }
@@ -639,11 +668,15 @@ fn attach_port(
             let server_name = server_name.clone();
             let telemetry = telemetry.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await
-                {
-                    telemetry.record_error(ErrorKind::Bouncer);
-                    eprintln!("bnc connection from {client} failed: {e}");
+                match crate::bouncer::bnc_serve(link, registry, &pool, &server_name, client).await {
+                    Ok(()) => {}
+                    // A cut, or a link that ended: the edge holds it, or said
+                    // so.
+                    Err(e) if e6irc_edge::link::EdgeGone::is(&e) => {}
+                    Err(e) => {
+                        telemetry.record_error(ErrorKind::Bouncer);
+                        eprintln!("bnc connection from {client} failed: {e}");
+                    }
                 }
             });
         },
@@ -1129,8 +1162,12 @@ async fn serve(
         .with_command_flood(command_flood);
     // In edge mode the edges may hold sessions for this core to rebuild: the
     // core's own sessions wait until the link server knows (DESIGN §19.3).
+    // Its own sessions — the `local` driver's — are homed on an edge across
+    // a cut (D13).
     if config.edge_link.is_some() {
-        core_tx.directories().held.rebuilt.pending();
+        let held = core_tx.directories().held;
+        held.rebuilt.pending();
+        held.homes.enable();
     }
     // Followed live from here on (`CoreIngress::adopt_live_settings`).
     core_tx
@@ -1182,7 +1219,15 @@ async fn serve(
     let next_conn = Arc::new(connection_ids(config.edge_link.is_some())?);
 
     // The body format the shards write for their edges (D11): the stored
-    // one, followed live, so `e6ircd records advance` takes effect at once.
+    // one, followed live, so `e6ircd records advance` takes effect at once;
+    // without a database, the configured one.
+    if let (Some(edge_link), None) = (&config.edge_link, &config.database) {
+        core_tx
+            .directories()
+            .held
+            .format
+            .set(edge_link.record_format().map_err(io::Error::other)?);
+    }
     if let (Some(pool), Some(database)) = (&pool, &config.database) {
         let format = core_tx.directories().held.format;
         format.set(read_record_format(pool).await?);
@@ -1822,6 +1867,7 @@ async fn serve(
                 },
                 sendq_bytes: config.sendq_bytes,
                 core_tx: core_tx.clone(),
+                next_conn: next_conn.clone(),
                 attach: match (&pool, &bnc_registry) {
                     (Some(pool), Some(registry)) => Some(attach_port(
                         registry.clone(),

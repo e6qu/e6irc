@@ -80,6 +80,7 @@ fn core_config(credentials: &Credentials, link: &str) -> Config {
         edge_link: Some(EdgeLinkConfig {
             addr: link.parse().expect("address"),
             credentials: credentials.core(),
+            record_format: None,
         }),
         ..Config::default()
     }
@@ -834,9 +835,9 @@ fn comparable(line: &str) -> Option<String> {
     (!varies.contains(&numeric)).then(|| line.to_owned())
 }
 
-/// Run [`SCRIPT`] through an edge, gracefully restarting the core after step
-/// `restart_after` (none, when `None`) onto a core with another shard count:
-/// each client's transcript.
+/// Run [`SCRIPT`] through an edge, gracefully restarting the core twice in a
+/// row after step `restart_after` (none, when `None`) — onto a core with
+/// another shard count, then onto a third: each client's transcript.
 async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let credentials = Credentials::new(&format!("steps-{restart_after:?}"), &["edge-a"]);
@@ -915,11 +916,15 @@ async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
             }
         }
         if restart_after == Some(step) {
-            let stopping = core.take().expect("the first core");
-            stopping.shutdown.run(net::StopMode::Handover).await;
-            let mut next = core_config(&credentials, &link.to_string());
-            next.core_workers = 2;
-            core = Some(net::start(next).await.expect("the next core"));
+            // Twice in a row, nothing said between: what the first next core
+            // rebuilt, it hands on whole.
+            for core_workers in [2, 3] {
+                let stopping = core.take().expect("the core before");
+                stopping.shutdown.run(net::StopMode::Handover).await;
+                let mut next = core_config(&credentials, &link.to_string());
+                next.core_workers = core_workers;
+                core = Some(net::start(next).await.expect("the next core"));
+            }
         }
     }
     drop(edge);
@@ -931,9 +936,10 @@ async fn scripted_run(restart_after: Option<usize>) -> [Vec<String>; 2] {
 
 /// Restart at every step (DESIGN §19.11): a scripted two-client conversation
 /// gives the same transcripts, line for line, whether the core runs it alone
-/// or is gracefully restarted after any one of its steps onto a core with
-/// another shard count — registration, channel state, ranks, nick changes,
-/// away, private messages, the monitor list and replies alike.
+/// or is gracefully restarted twice in a row after any one of its steps —
+/// onto a core with another shard count, then a third — registration, channel
+/// state, ranks, nick changes, away, private messages, the monitor list and
+/// replies alike.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_graceful_restart_after_any_step_changes_no_transcript() {
     let baseline = scripted_run(None).await;
@@ -954,16 +960,16 @@ async fn a_graceful_restart_after_any_step_changes_no_transcript() {
     }
 }
 
-/// The `local` driver's session lives in the core itself, so no edge holds it
-/// across a graceful restart: it ends before the cut, loudly — its channel
-/// sees it quit as the server restarting — and joins again on the next core,
-/// never left behind with no session (DESIGN §19.3; homing it on an edge is
-/// D13).
+/// The `local` driver's session lives in the core itself, so a graceful
+/// restart homes it on an edge (D13): the next core rebuilds it and its driver
+/// takes it up instead of registering again. Its channel sees no QUIT and no
+/// JOIN, the attachment on its network is not welcomed again, and lines carry
+/// on both ways through the resumed session.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn a_local_driver_session_quits_before_a_graceful_restart_and_rejoins() {
+async fn a_local_driver_session_survives_a_graceful_restart_unseen() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let url = support::test_db("a_local_driver_session_quits_before_a_restart").await;
+    let url = support::test_db("a_local_driver_session_survives_a_restart").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -1004,14 +1010,18 @@ async fn a_local_driver_session_quits_before_a_graceful_restart_and_rejoins() {
         .expect("connect");
     let (read, mut write) = stream.into_split();
     let mut read = tokio::io::BufReader::new(read);
-    let mut until = async |needle: &str| -> String {
+    // Every line bob reads up to the one holding `needle`.
+    let mut until = async |needle: &str| -> Vec<String> {
         tokio::time::timeout(deadline::HANG, async {
+            let mut seen = Vec::new();
             loop {
                 let mut line = String::new();
                 read.read_line(&mut line).await.expect("read");
                 assert!(!line.is_empty(), "closed before {needle:?}");
-                if line.contains(needle) {
-                    return line;
+                let found = line.contains(needle);
+                seen.push(line);
+                if found {
+                    return seen;
                 }
             }
         })
@@ -1023,18 +1033,100 @@ async fn a_local_driver_session_quits_before_a_graceful_restart_and_rejoins() {
         .await
         .expect("send");
     let names = until(" 353 ").await;
-    if !names.contains("alicelocal") {
+    if !names.concat().contains("alicelocal") {
         until(":alicelocal!").await;
     }
+    let mut attached = e6irc_client::Connection::connect(&edge.attach.to_string())
+        .await
+        .expect("connect to the attach listener");
+    attached
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/home",
+                username: "alice",
+                realname: "Alice",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("attach through the edge");
+    write
+        .write_all(b"PRIVMSG #local :before the restart\r\n")
+        .await
+        .expect("send");
+    attached_until(&mut attached, "before the restart").await;
+
     core.shutdown.run(net::StopMode::Handover).await;
-    let quit = until(" QUIT ").await;
-    assert!(quit.starts_with(":alicelocal!"), "{quit}");
-    assert!(quit.trim_end().ends_with("server restarting"), "{quit}");
     let _next = net::start(local_config(&link.to_string()))
         .await
         .expect("the next core");
-    let joined = until(" JOIN ").await;
-    assert!(joined.starts_with(":alicelocal!"), "{joined}");
+    write
+        .write_all(b"PRIVMSG #local :after the restart\r\n")
+        .await
+        .expect("send");
+    let seen_by_attachment = tokio::time::timeout(deadline::HANG, async {
+        let mut seen = Vec::new();
+        loop {
+            let message = attached
+                .next_message()
+                .await
+                .expect("read")
+                .expect("the attachment stays open");
+            let done = message
+                .params
+                .iter()
+                .any(|param| param == "after the restart");
+            seen.push(message);
+            if done {
+                return seen;
+            }
+        }
+    })
+    .await
+    .expect("the line after the restart reaches the attachment");
+    for message in &seen_by_attachment {
+        assert!(
+            !["ERROR", "001", "JOIN", "PART", "QUIT"].contains(&message.command.as_str()),
+            "the attachment saw the restart: {message:?}"
+        );
+    }
+    attached
+        .send_line("PRIVMSG #local :from the attachment")
+        .await
+        .expect("send");
+    let seen_by_bob = until("from the attachment").await;
+    let said = seen_by_bob.last().expect("the line");
+    assert!(said.starts_with(":alicelocal!"), "{said}");
+    for line in &seen_by_bob {
+        assert!(
+            !line.contains(" QUIT ") && !line.contains(" JOIN "),
+            "the channel saw the restart: {line}"
+        );
+    }
+    write.write_all(b"NAMES #local\r\n").await.expect("send");
+    let names = until(" 366 ").await;
+    assert!(names.concat().contains("alicelocal"), "{names:?}");
+
+    // The resumed session is homed again at the next cut.
+    _next.shutdown.run(net::StopMode::Handover).await;
+    let _third = net::start(local_config(&link.to_string()))
+        .await
+        .expect("the third core");
+    attached
+        .send_line("PRIVMSG #local :after the second restart")
+        .await
+        .expect("send");
+    let seen_by_bob = until("after the second restart").await;
+    let said = seen_by_bob.last().expect("the line");
+    assert!(said.starts_with(":alicelocal!"), "{said}");
+    for line in &seen_by_bob {
+        assert!(
+            !line.contains(" QUIT ") && !line.contains(" JOIN "),
+            "the channel saw the second restart: {line}"
+        );
+    }
 }
 
 /// A SASL exchange that spans a graceful restart completes (DESIGN §19.3):

@@ -1256,6 +1256,114 @@ async fn a_ring_keeps_its_epoch_and_positions_across_a_clean_restart() {
     running_b.shutdown.run(net::StopMode::Final).await;
 }
 
+/// After a crash, a start restores the stored lines into a new ring epoch at
+/// new positions and stores them with its claim; a clean restart then
+/// continues that epoch with every line where its clients saw it. The rows
+/// used to keep the crashed run's positions, so the clean restart put them
+/// back there — where a cursor between them skipped or repeated a line.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_ring_restored_after_a_crash_stores_its_new_positions() {
+    let url = bnc_account_db(
+        "a_ring_restored_after_a_crash_stores_its_new_positions",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let pool = observer_pool(&url).await;
+    // A crashed run: three stored lines at its positions, and a ring claimed
+    // with no clean stop.
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, sent_at, seq)
+         SELECT 'alice', 'up', ':peer!p@host PRIVMSG #lobby :crashed ' || n,
+                to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), n
+         FROM generate_series(1, 3) n",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the stored backlog");
+    sqlx::query(
+        "INSERT INTO bnc_ring_positions (owner, network, epoch, clean_through)
+         VALUES ('alice', 'up', 5, NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the crashed ring");
+    let up = upstream().await;
+    let config = |url: e6ircd::db::DatabaseUrl| {
+        let mut config = bnc_config(up, url);
+        // Nothing live reaches the buffer.
+        config.networks[0].addr = "127.0.0.1:1".into();
+        config
+    };
+    let ring = |pool: sqlx::PgPool| async move {
+        e6ircd::db::bnc_ring(&pool, "alice", "up")
+            .await
+            .expect("the stored ring")
+            .expect("a claimed ring")
+    };
+    let seeded = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT seq FROM bnc_buffer WHERE line LIKE '%:crashed %' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("positions")
+    };
+    let running_a = net::start(config(url.clone())).await.expect("start A");
+    let claimed = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let now = ring(pool.clone()).await;
+            if now.epoch != 5 {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("A claims a new epoch");
+    let restored: Vec<i64> = seeded(pool.clone())
+        .await
+        .into_iter()
+        .map(|seq| seq.expect("a restored line has its position in the new epoch"))
+        .collect();
+    assert_eq!(restored.len(), 3);
+    assert_ne!(restored, [1, 2, 3], "the crashed run's positions were kept");
+    assert!(
+        restored.windows(2).all(|pair| pair[0] < pair[1]),
+        "{restored:?}"
+    );
+
+    running_a.shutdown.run(net::StopMode::Final).await;
+    let stopped = ring(pool.clone()).await;
+    assert_eq!(stopped.epoch, claimed.epoch);
+    let through = stopped
+        .clean_through
+        .expect("a stop that stored every line claims it")
+        .cast_signed();
+    assert!(restored.iter().all(|seq| *seq <= through), "{restored:?}");
+
+    let running_b = net::start(config(url.clone())).await.expect("start B");
+    let continued = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let now = ring(pool.clone()).await;
+            if now.clean_through.is_none() {
+                return now;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("B claims the ring");
+    assert_eq!(continued.epoch, claimed.epoch, "the new epoch continues");
+    assert_eq!(
+        seeded(pool.clone()).await,
+        restored.iter().copied().map(Some).collect::<Vec<_>>(),
+        "every line stays where its clients saw it"
+    );
+    running_b.shutdown.run(net::StopMode::Final).await;
+}
+
 /// A network's whole `buffer_cap` survives a restart. A start used to restore
 /// the newest 1,000 stored lines whatever the network was configured to
 /// replay, so a larger buffer was honoured only until the next restart.

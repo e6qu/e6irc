@@ -781,10 +781,17 @@ registering again.
 at a rebuild the highest revision of a channel's replicas wins.
 
 **Record format** — the numbered layout of a session record, channel
-replica, live chat socket or attachment record and cut state. A release reads
-its own format and the one before, and writes the one before until the
-operator runs `e6ircd records advance`; any other format is refused by number
-and its session closed loudly.
+replica, live chat socket, attachment or homed session record and cut state.
+A release reads its own format and the one before, and writes the one before
+until the operator runs `e6ircd records advance` — a core without a database,
+until its `[edge_link] record_format` names the newer; any other format is
+refused by number and its session closed loudly.
+
+**Homed session** — a session of the core's own, the `local` bouncer
+network's, which no client socket carries: a graceful cut homes it on an edge
+that holds the cut (`Home`), which holds its record for the next core, and
+the network's driver takes the rebuilt session up instead of registering
+again.
 
 **Clock origin** — where a process's monotonic clock started, on the wall
 clock: written into every record so the next core moves each monotonic
@@ -820,8 +827,8 @@ identifiers without asking a core.
 sessions. Clients see no disconnect; their lines are buffered at the edge.
 
 **Core-absence limit** — how long an edge holds paused clients without any
-core (`edge.core_absence_limit`, 10 minutes by default) before closing them
-with an explicit `ERROR`.
+core (`[edge] core_absence_limit_seconds`, 10 minutes by default, from 10
+seconds to an hour) before closing them with an explicit `ERROR`.
 
 **Credit** — the core's grant of shard-queue room to a link stream; an edge
 out of credits stops reading client sockets, which is the client's

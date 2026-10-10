@@ -7911,7 +7911,7 @@ async fn bnc_buffer_trim_keeps_each_conversations_share() {
     .await
     .expect("open buffer");
     let names = e6irc_client::NetworkNames::default();
-    db::claim_bnc_ring(&pool, "owner", "busy", 7)
+    db::claim_bnc_ring(&pool, "owner", "busy", 7, None)
         .await
         .expect("claim");
     let persist = async |line: &str, seq: u64| {
@@ -7941,7 +7941,7 @@ async fn bnc_buffer_trim_keeps_each_conversations_share() {
         Some(5_094),
         "the newest of the busy lines a restore of ten leaves out"
     );
-    db::claim_bnc_ring(&pool, "owner", "busy", 8)
+    db::claim_bnc_ring(&pool, "owner", "busy", 8, Some(&[]))
         .await
         .expect("claim");
     assert_eq!(

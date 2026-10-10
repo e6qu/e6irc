@@ -1015,6 +1015,44 @@ mod tests {
     }
 
     #[test]
+    fn an_edge_holds_a_cut_for_its_configured_core_absence_limit_within_bounds() {
+        let edge = |limit: &str| {
+            toml::from_str::<e6irc_edge::process::EdgeConfig>(&format!(
+                "[edge]\nname = \"edge-a\"\ncore = [\"core.example.test:6680\"]\n\
+                 ca = \"ca.pem\"\ncert = \"edge.pem\"\nkey = \"edge.key\"\n{limit}\
+                 [[listeners]]\naddr = \"127.0.0.1:6667\"\n"
+            ))
+            .expect("an edge configuration")
+        };
+        let unstated = edge("");
+        assert_eq!(
+            unstated.edge.core_absence_limit(),
+            std::time::Duration::from_secs(600),
+            "D12's ten minutes"
+        );
+        assert!(unstated.validate().is_ok());
+        let stated = edge("core_absence_limit_seconds = 90\n");
+        assert_eq!(
+            stated.edge.core_absence_limit(),
+            std::time::Duration::from_secs(90)
+        );
+        assert!(stated.validate().is_ok());
+        for refused in [
+            "core_absence_limit_seconds = 9\n",
+            "core_absence_limit_seconds = 3601\n",
+        ] {
+            let failure = edge(refused)
+                .validate()
+                .expect_err("out of bounds")
+                .to_string();
+            assert!(
+                failure.contains("core_absence_limit_seconds must be between 10 and 3600"),
+                "{failure}"
+            );
+        }
+    }
+
+    #[test]
     fn columns_count_characters_and_offsets_past_the_end_stay_on_the_last_line() {
         assert_eq!(line_and_column("", 0), (1, 1));
         assert_eq!(line_and_column("a = 1\nb = 2", 6), (2, 1));

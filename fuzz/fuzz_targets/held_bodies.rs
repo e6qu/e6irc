@@ -1,7 +1,8 @@
 #![no_main]
 
 //! The bodies an edge holds for the core (`e6ircd::core::record`): a session's
-//! record, a live chat socket's and an attachment's record, a channel's state,
+//! record, a live chat socket's and an attachment's record, a homed local
+//! session's record (and the session record it carries), a channel's state,
 //! a member's entry and the cut state. A core reads them back from an edge —
 //! another process — so for arbitrary bytes:
 //!
@@ -15,8 +16,8 @@
 use bytes::Bytes;
 use e6irc_proto::time::{Millis, MonoMillis};
 use e6ircd::core::record::{
-    AttachRecord, ChannelState, ClockOrigin, CutState, MemberEntry, RecordFormat, SessionRecord,
-    UiRecord,
+    AttachRecord, ChannelState, ClockOrigin, CutState, LocalRecord, MemberEntry, RecordFormat,
+    SessionRecord, UiRecord,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -75,6 +76,14 @@ fuzz_target!(|data: &[u8]| {
             .encode(format, origin)
             .expect("a read attachment record writes");
         assert_eq!(&again[..], data, "{record:?} writes differently");
+    }
+    if let Ok(record) = LocalRecord::decode(bytes.clone(), origin) {
+        let again = record
+            .encode(format, origin)
+            .expect("a read local session record writes");
+        assert_eq!(&again[..], data, "{record:?} writes differently");
+        // The session record it carries reads as any other, or not at all.
+        drop(SessionRecord::decode(record.session, origin));
     }
     if let Ok(state) = CutState::decode(bytes, origin) {
         let again = state

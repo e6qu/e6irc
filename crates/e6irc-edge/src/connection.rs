@@ -165,32 +165,64 @@ pub struct ConnId(pub u64);
 /// identifier.
 #[derive(Debug)]
 pub struct ConnectionIdAllocator {
-    range: std::sync::Mutex<(u64, u64)>,
+    range: std::sync::Mutex<IdRange>,
+}
+
+/// What an allocator counts through: from `start`, `next` up to `end`.
+#[derive(Debug)]
+struct IdRange {
+    start: u64,
+    next: u64,
+    end: u64,
 }
 
 impl ConnectionIdAllocator {
     /// Allocate from `first` up to the top of the identifier space.
     pub fn new(first: NonZeroU64) -> Self {
         Self {
-            range: std::sync::Mutex::new((first.get(), u64::MAX)),
+            range: std::sync::Mutex::new(IdRange {
+                start: first.get(),
+                next: first.get(),
+                end: u64::MAX,
+            }),
         }
     }
 
     /// Start again at `first`, allocating below `end`: an edge's count in the
     /// slot a core just gave it.
     pub fn restart_at(&self, (first, end): (NonZeroU64, u64)) {
-        *self.range.lock().expect("identifier range lock") = (first.get(), end);
+        *self.range.lock().expect("identifier range lock") = IdRange {
+            start: first.get(),
+            next: first.get(),
+            end,
+        };
     }
 
     pub fn allocate(&self) -> Result<ConnId, ConnectionIdExhausted> {
         let mut range = self.range.lock().expect("identifier range lock");
-        let (next, end) = *range;
+        let next = range.next;
         let after = next
             .checked_add(1)
-            .filter(|after| *after <= end)
+            .filter(|after| *after <= range.end)
             .ok_or(ConnectionIdExhausted)?;
-        range.0 = after;
+        range.next = after;
         Ok(ConnId(next))
+    }
+
+    /// Take `id`, which another process gave out — a session a rebuild
+    /// resumes — so this allocator never gives it out: `false`, and nothing
+    /// taken, when it may already have.
+    pub fn claim(&self, id: ConnId) -> bool {
+        let mut range = self.range.lock().expect("identifier range lock");
+        if (range.start..range.next).contains(&id.0) {
+            return false;
+        }
+        if id.0 >= range.next {
+            // Counting resumes past it; an identifier past the end leaves
+            // nothing more to give out.
+            range.next = id.0.saturating_add(1);
+        }
+        true
     }
 }
 
@@ -1124,5 +1156,20 @@ mod tests {
             u64::MAX - 1
         );
         assert!(exhausted.allocate().is_err());
+    }
+
+    #[test]
+    fn a_claimed_identifier_is_never_allocated_and_one_given_out_is_refused() {
+        let allocator =
+            ConnectionIdAllocator::new(NonZeroU64::new(10).expect("non-zero test start"));
+        assert_eq!(allocator.allocate().expect("first identifier").0, 10);
+        assert!(!allocator.claim(ConnId(10)), "given out already");
+        assert!(allocator.claim(ConnId(3)), "below where it counts from");
+        assert!(allocator.claim(ConnId(20)));
+        assert_eq!(allocator.allocate().expect("past the claim").0, 21);
+        assert!(
+            !allocator.claim(ConnId(15)),
+            "passed over, so maybe given out"
+        );
     }
 }

@@ -39,7 +39,8 @@ grep -qx 'LimitCORE=0' "$unit" || {
   exit 1
 }
 
-# The daemon's clean shutdown is sequential: the bouncer drivers say goodbye
+# The daemon's clean shutdown is sequential: its listeners close for up to
+# SHUTDOWN_LISTENER_CLOSE_TIMEOUT, THEN the bouncer drivers say goodbye
 # for up to SHUTDOWN_DRIVER_STOP_TIMEOUT, THEN the core shards drain for up to
 # SHUTDOWN_CORE_STOP_TIMEOUT, THEN the client connections deliver their closing
 # ERROR for up to SHUTDOWN_CONNECTION_DRAIN_TIMEOUT, THEN the database flushes
@@ -52,13 +53,14 @@ drain_seconds="$(sed -n 's/.*const SHUTDOWN_CORE_STOP_TIMEOUT.*from_secs(\([0-9]
 driver_seconds="$(sed -n 's/.*const SHUTDOWN_DRIVER_STOP_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
 connection_seconds="$(sed -n 's/.*const SHUTDOWN_CONNECTION_DRAIN_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
 release_seconds="$(sed -n 's/.*const SHUTDOWN_LEASE_RELEASE_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
-if [ -z "$stop_seconds" ] || [ -z "$flush_seconds" ] || [ -z "$drain_seconds" ] || [ -z "$driver_seconds" ] || [ -z "$connection_seconds" ] || [ -z "$release_seconds" ]; then
-  echo "could not resolve the systemd stop budget or the daemon's driver-stop/drain/connection/flush/lease-release budgets" >&2
+listener_seconds="$(sed -n 's/.*const SHUTDOWN_LISTENER_CLOSE_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
+if [ -z "$stop_seconds" ] || [ -z "$flush_seconds" ] || [ -z "$drain_seconds" ] || [ -z "$driver_seconds" ] || [ -z "$connection_seconds" ] || [ -z "$release_seconds" ] || [ -z "$listener_seconds" ]; then
+  echo "could not resolve the systemd stop budget or the daemon's listener-close/driver-stop/drain/connection/flush/lease-release budgets" >&2
   exit 1
 fi
-budget=$((driver_seconds + drain_seconds + connection_seconds + flush_seconds + release_seconds))
+budget=$((listener_seconds + driver_seconds + drain_seconds + connection_seconds + flush_seconds + release_seconds))
 if [ "$stop_seconds" -le "$budget" ]; then
-  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${driver_seconds}s driver stop plus ${drain_seconds}s core drain plus ${connection_seconds}s connection drain plus ${flush_seconds}s database flush plus ${release_seconds}s lease release (${budget}s)" >&2
+  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${listener_seconds}s listener close plus ${driver_seconds}s driver stop plus ${drain_seconds}s core drain plus ${connection_seconds}s connection drain plus ${flush_seconds}s database flush plus ${release_seconds}s lease release (${budget}s)" >&2
   exit 1
 fi
 

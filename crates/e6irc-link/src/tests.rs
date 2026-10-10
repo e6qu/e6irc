@@ -145,6 +145,7 @@ fn every_edge_frame() -> Vec<EdgeFrame> {
                 closed: Some(ClosedReason::ReadFailed("reset".into())),
             },
         ),
+        EdgeFrame::HomeUpload(session(11)),
         EdgeFrame::Upload(
             session(10),
             Upload {
@@ -263,6 +264,7 @@ fn every_core_frame() -> Vec<CoreFrame> {
             cut: CutId::new(9).expect("cut"),
             epoch: 42,
         }),
+        CoreFrame::Home(session(11)),
     ]
 }
 
@@ -447,7 +449,8 @@ fn every_frame_names_the_version_that_introduced_it() {
             | EdgeFrame::RecordUpload(..)
             | EdgeFrame::ReplicaUpload(_)
             | EdgeFrame::CutUpload(_)
-            | EdgeFrame::UploadDone => 2,
+            | EdgeFrame::UploadDone
+            | EdgeFrame::HomeUpload(_) => 2,
             _ => 1,
         };
         assert_eq!(frame.since(), expected, "{frame:?}");

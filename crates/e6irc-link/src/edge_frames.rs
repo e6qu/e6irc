@@ -25,6 +25,7 @@ const RECORD_UPLOAD: u8 = 0x0b;
 const REPLICA_UPLOAD: u8 = 0x0c;
 const CUT_UPLOAD: u8 = 0x0d;
 const UPLOAD_DONE: u8 = 0x0e;
+const HOME_UPLOAD: u8 = 0x0f;
 
 /// The most listeners an edge reports in its `Hello`.
 pub const MAX_LISTENERS: usize = 64;
@@ -68,6 +69,11 @@ pub enum EdgeFrame {
     CutUpload(CutPart),
     /// Everything this stream held is uploaded.
     UploadDone,
+    /// A session of the core's own it homed here at the cut
+    /// ([`crate::CoreFrame::Home`]): no client is behind it, so the edge
+    /// knows nothing of it but the record that follows in `RecordUpload`
+    /// parts.
+    HomeUpload(SessionId),
 }
 
 impl EdgeFrame {
@@ -88,7 +94,8 @@ impl EdgeFrame {
             | Self::RecordUpload(..)
             | Self::ReplicaUpload(_)
             | Self::CutUpload(_)
-            | Self::UploadDone => 2,
+            | Self::UploadDone
+            | Self::HomeUpload(_) => 2,
         }
     }
 }
@@ -463,6 +470,7 @@ impl crate::sealed::Codec for EdgeFrame {
             Self::ReplicaUpload(_) => (REPLICA_UPLOAD, 0),
             Self::CutUpload(_) => (CUT_UPLOAD, 0),
             Self::UploadDone => (UPLOAD_DONE, 0),
+            Self::HomeUpload(session) => (HOME_UPLOAD, session.get()),
         }
     }
 
@@ -497,7 +505,7 @@ impl crate::sealed::Codec for EdgeFrame {
                 w.u64(*bytes);
                 Ok(())
             }
-            Self::Paused | Self::UploadDone => Ok(()),
+            Self::Paused | Self::UploadDone | Self::HomeUpload(_) => Ok(()),
             Self::Upload(_, upload) => upload.write(w),
             Self::RecordUpload(_, part) => part.write(w),
             Self::ReplicaUpload(replica) => replica.write(w),
@@ -572,6 +580,7 @@ impl crate::sealed::Codec for EdgeFrame {
                 link()?;
                 Self::UploadDone
             }
+            HOME_UPLOAD => Self::HomeUpload(session_id()?),
             kind => return Err(DecodeError::UnknownKind { kind }),
         })
     }

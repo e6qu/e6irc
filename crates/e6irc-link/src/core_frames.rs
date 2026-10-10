@@ -23,6 +23,7 @@ const RECORD: u8 = 0x4c;
 const REPLICA: u8 = 0x4d;
 const CUT_STATE: u8 = 0x4e;
 const CUT: u8 = 0x4f;
+const HOME: u8 = 0x50;
 
 /// The most trusted-proxy ranges a `Welcome` carries.
 pub const MAX_TRUSTED_PROXIES: usize = 1024;
@@ -69,6 +70,11 @@ pub enum CoreFrame {
     /// The stream's last frame: the core stopped gracefully, and the edge
     /// holds its sessions for the next.
     Cut(Cut),
+    /// A session of the core's own — the `local` bouncer network's, which
+    /// no client socket carries (decision D13) — homed on this edge at a cut:
+    /// the edge holds the record that follows, and uploads it to the next
+    /// core (`HomeUpload`). Numbered in slot 0.
+    Home(SessionId),
 }
 
 impl CoreFrame {
@@ -89,7 +95,8 @@ impl CoreFrame {
             | Self::Record(..)
             | Self::Replica(_)
             | Self::CutState(_)
-            | Self::Cut(_) => 2,
+            | Self::Cut(_)
+            | Self::Home(_) => 2,
         }
     }
 }
@@ -168,6 +175,7 @@ impl crate::sealed::Codec for CoreFrame {
             Self::Replica(_) => (REPLICA, 0),
             Self::CutState(_) => (CUT_STATE, 0),
             Self::Cut(_) => (CUT, 0),
+            Self::Home(session) => (HOME, session.get()),
         }
     }
 
@@ -228,7 +236,7 @@ impl crate::sealed::Codec for CoreFrame {
                 w.u32(*amount);
                 Ok(())
             }
-            Self::Pause | Self::Resume => Ok(()),
+            Self::Pause | Self::Resume | Self::Home(_) => Ok(()),
             Self::Ack(_, ack) => ack.write(w),
             Self::Record(_, part) => part.write(w),
             Self::Replica(replica) => replica.write(w),
@@ -342,6 +350,7 @@ impl crate::sealed::Codec for CoreFrame {
                     epoch: r.u64("cut epoch")?,
                 })
             }
+            HOME => Self::Home(session_id()?),
             kind => return Err(DecodeError::UnknownKind { kind }),
         })
     }

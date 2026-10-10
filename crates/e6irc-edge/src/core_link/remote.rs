@@ -26,8 +26,8 @@
 //! input only while it is live: a core's `Pause` stops it (the `Paused`
 //! answer follows every line sent before it), and a link's input starts at
 //! its `Resume`, the retained lines first. A link the core cut on every
-//! stream leaves its sessions held for the next core, for at most
-//! [`HOLD_WAIT`]; the edge presents the cut in its `Hello`, uploads what it
+//! stream leaves its sessions held for the next core, for at most the
+//! core-absence limit ([`Dialing::core_absence_limit`]); the edge presents the cut in its `Hello`, uploads what it
 //! holds when asked to, and serves on at `Resume`, its clients none the
 //! wiser.
 //!
@@ -67,10 +67,6 @@ use crate::peer_write::SendFailure;
 
 /// How long a session opening while no core serves waits for one.
 pub const OPEN_WAIT: Duration = Duration::from_secs(10);
-
-/// How long the edge holds the sessions of a cut for the next core to take
-/// them — the core-absence limit (D12) — before it closes them, loudly.
-pub const HOLD_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// How often an unlinked edge tries the next core address.
 pub const DIAL_INTERVAL: Duration = Duration::from_millis(250);
@@ -145,6 +141,10 @@ pub struct Dialing {
     pub connector: TlsConnector,
     /// What the console shows of this edge's listeners.
     pub listeners: Vec<ListenerReport>,
+    /// How long the edge holds the sessions of a cut for the next core to
+    /// take them — the core-absence limit (D12) — before it closes them,
+    /// loudly.
+    pub core_absence_limit: Duration,
 }
 
 /// The edge's standing with the core: the current link, if any, and the
@@ -180,6 +180,59 @@ struct Holding {
     channels: HashMap<Bytes, HeldChannel>,
     /// The cut state the cutting core sent.
     cut_state: Option<(CutId, Body)>,
+    /// The core's own sessions it homed here at the cut (`Home`, decision
+    /// D13): no client is behind them, only the record held for the next
+    /// core.
+    homed: HashMap<SessionId, HeldRecord>,
+}
+
+/// A session's record as the core sends it in parts: the parts of one
+/// revision gathering now, and the newest whole record.
+#[derive(Default)]
+struct HeldRecord {
+    gathering: Option<(u64, Body)>,
+    whole: Option<(u64, Body)>,
+}
+
+impl HeldRecord {
+    fn gather(&mut self, part: RecordPart) -> Result<(), String> {
+        let RecordPart { revision, part } = part;
+        if part.index == 0 {
+            self.gathering = Some((revision, Body::default()));
+        }
+        let Some((gathering, body)) = &mut self.gathering else {
+            return Err("a record part with no first part".into());
+        };
+        if *gathering != revision {
+            return Err(format!(
+                "a part of record revision {revision} while revision {gathering} gathers"
+            ));
+        }
+        body.gather(part).map_err(|error| error.to_string())?;
+        if body.is_whole() {
+            self.whole = self.gathering.take();
+        }
+        Ok(())
+    }
+
+    /// The newest whole record as the frames that upload it.
+    fn upload(&self, session: SessionId) -> Vec<EdgeFrame> {
+        let Some((revision, body)) = &self.whole else {
+            return Vec::new();
+        };
+        body.parts()
+            .into_iter()
+            .map(|part| {
+                EdgeFrame::RecordUpload(
+                    session,
+                    RecordPart {
+                        revision: *revision,
+                        part,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// A cut the edge holds sessions from.
@@ -251,10 +304,8 @@ struct SessionState {
     /// Input lines sent and not acknowledged, or retained for replay, by
     /// number.
     unacked: VecDeque<(u64, InputLine)>,
-    /// The record's parts gathering now, at their revision.
-    gathering: Option<(u64, Body)>,
-    /// The newest whole record.
-    record: Option<(u64, Body)>,
+    /// The record the core gave the edge to hold.
+    record: HeldRecord,
     /// When the client last sent a line.
     last_input: tokio::time::Instant,
     /// The client's side ended, and why; and whether the core was told.
@@ -296,8 +347,7 @@ impl SessionState {
             next_line: 1,
             acked_through: 0,
             unacked: VecDeque::new(),
-            gathering: None,
-            record: None,
+            record: HeldRecord::default(),
             last_input: tokio::time::Instant::now(),
             closed: None,
             closed_said: false,
@@ -340,23 +390,7 @@ impl SessionState {
     }
 
     fn gather_record(&mut self, part: RecordPart) -> Result<(), String> {
-        let RecordPart { revision, part } = part;
-        if part.index == 0 {
-            self.gathering = Some((revision, Body::default()));
-        }
-        let Some((gathering, body)) = &mut self.gathering else {
-            return Err("a record part with no first part".into());
-        };
-        if *gathering != revision {
-            return Err(format!(
-                "a part of record revision {revision} while revision {gathering} gathers"
-            ));
-        }
-        body.gather(part).map_err(|error| error.to_string())?;
-        if body.is_whole() {
-            self.record = self.gathering.take();
-        }
-        Ok(())
+        self.record.gather(part)
     }
 
     /// Hand the session to the next core, whose send queue is `sendq_bytes`:
@@ -628,8 +662,9 @@ struct LinkStream {
     credit: Semaphore,
     phase: Mutex<Phase>,
     /// Held to send input, and taken whole to pause, so `Paused` follows
-    /// every line sent before it.
-    gate: tokio::sync::RwLock<()>,
+    /// every line sent before it; taken whole, too, from a `Resume` until its
+    /// replay is sent and input flows.
+    gate: Arc<tokio::sync::RwLock<()>>,
     /// The core's `Cut`, once it came.
     cut: Mutex<Option<Cut>>,
 }
@@ -922,7 +957,7 @@ impl RemoteCore {
                              sessions were closed as the server restarting",
                             dialing.edge,
                             held.cut.get(),
-                            HOLD_WAIT.as_secs()
+                            dialing.core_absence_limit.as_secs()
                         );
                         continue;
                     }
@@ -950,14 +985,16 @@ impl RemoteCore {
             self.changed();
             match link.cut() {
                 Some(cut) if link.welcome.version >= 2 => {
-                    let sessions = self.hold(cut, link.welcome.slot);
+                    let (sessions, homed) =
+                        self.hold(cut, link.welcome.slot, dialing.core_absence_limit);
                     eprintln!(
                         "e6ircd edge {}: the core at {} cut the link (cut {:#x}); holding \
-                         {sessions} sessions for the next core, for at most {}s",
+                         {sessions} sessions and {homed} of the core's own for the next core, \
+                         for at most {}s",
                         dialing.edge,
                         link.core,
                         cut.cut.get(),
-                        HOLD_WAIT.as_secs()
+                        dialing.core_absence_limit.as_secs()
                     );
                 }
                 _ => {
@@ -972,8 +1009,9 @@ impl RemoteCore {
         }
     }
 
-    /// Hold every session from `cut` for the next core. How many.
-    fn hold(&self, cut: Cut, slot: Slot) -> usize {
+    /// Hold every session from `cut` for the next core, for at most `limit`:
+    /// how many, and how many of the core's own it homed here.
+    fn hold(&self, cut: Cut, slot: Slot, limit: Duration) -> (usize, usize) {
         let sessions: Vec<Arc<RemoteSession>> = self
             .shared
             .sessions
@@ -992,12 +1030,13 @@ impl RemoteCore {
                 .bytes
                 .close();
         }
-        self.shared.holding.lock().expect("edge holding").cut = Some(HeldCut {
+        let mut holding = self.shared.holding.lock().expect("edge holding");
+        holding.cut = Some(HeldCut {
             cut: cut.cut,
             slot,
-            until: tokio::time::Instant::now() + HOLD_WAIT,
+            until: tokio::time::Instant::now() + limit,
         });
-        sessions.len()
+        (sessions.len(), holding.homed.len())
     }
 
     /// Start serving on a new link: upload what the edge holds when the core
@@ -1160,7 +1199,7 @@ impl RemoteCore {
                     out,
                     credit: Semaphore::new(welcome.terms.line_credit as usize),
                     phase: Mutex::new(Phase::Held),
-                    gate: tokio::sync::RwLock::new(()),
+                    gate: Arc::default(),
                     cut: Mutex::default(),
                 })
             })
@@ -1445,25 +1484,26 @@ impl RemoteCore {
                     ));
                 }
                 CoreFrame::Pause => {
-                    // Every line sent before this goes before `Paused`.
-                    let gate = stream.gate.write().await;
-                    if stream.phase() != Phase::Live {
-                        return Err(invalid("core link: Pause on a stream not live".into()));
-                    }
-                    stream.set_phase(Phase::Paused);
-                    drop(gate);
-                    self.changed();
-                    if stream.out.send(EdgeFrame::Paused).await.is_err() {
-                        return Ok(());
-                    }
+                    // Every line sent before this goes before `Paused` — a
+                    // `Resume`'s replay before it too, which spends credit
+                    // this reader grants: the pause waits on its own.
+                    let task = tokio::spawn(pause(self.clone(), link.clone(), stream.clone()));
+                    link.tasks
+                        .lock()
+                        .expect("link tasks")
+                        .push(task.abort_handle());
                 }
                 CoreFrame::Resume => {
                     if stream.phase() != Phase::Held {
                         return Err(invalid("core link: Resume on a stream not held".into()));
                     }
+                    // Taken before the next frame is read, so a `Pause` after
+                    // this waits for the replay to be sent and input to flow.
+                    let gate = stream.gate.clone().write_owned().await;
                     // Replaying spends credit, which this reader grants: the
                     // replay waits on its own.
-                    let task = tokio::spawn(resume(self.clone(), link.clone(), stream.clone()));
+                    let task =
+                        tokio::spawn(resume(self.clone(), link.clone(), stream.clone(), gate));
                     link.tasks
                         .lock()
                         .expect("link tasks")
@@ -1480,13 +1520,44 @@ impl RemoteCore {
                     }
                 }
                 CoreFrame::Record(session, part) => {
-                    if let Some(remote) = self.session(session) {
-                        remote
+                    let gathered = match self.session(session) {
+                        Some(remote) => remote
                             .state
                             .lock()
                             .expect("session state")
-                            .gather_record(part)
-                            .map_err(|error| invalid(format!("core link: {error}")))?;
+                            .gather_record(part),
+                        None => match self
+                            .shared
+                            .holding
+                            .lock()
+                            .expect("edge holding")
+                            .homed
+                            .get_mut(&session)
+                        {
+                            Some(homed) => homed.gather(part),
+                            // Ended here, and the core has not heard yet.
+                            None => Ok(()),
+                        },
+                    };
+                    gathered.map_err(|error| invalid(format!("core link: {error}")))?;
+                }
+                CoreFrame::Home(session) => {
+                    if session.get() >> e6irc_link::SLOT_SHIFT != 0 {
+                        return Err(invalid(format!(
+                            "core link: session {} homed here is not the core's own",
+                            session.get()
+                        )));
+                    }
+                    let mut holding = self.shared.holding.lock().expect("edge holding");
+                    if holding
+                        .homed
+                        .insert(session, HeldRecord::default())
+                        .is_some()
+                    {
+                        return Err(invalid(format!(
+                            "core link: session {} homed here twice",
+                            session.get()
+                        )));
                     }
                 }
                 CoreFrame::Replica(replica) => self.replica(replica),
@@ -1584,11 +1655,13 @@ impl RemoteCore {
 /// cut state, and `UploadDone` on every stream. The link's input starts at
 /// the core's `Resume`.
 async fn upload_held(core: RemoteCore, link: Arc<Link>, cut: CutId) {
-    let (channels, cut_state) = {
+    let (channels, cut_state, homed) = {
         let mut holding = core.shared.holding.lock().expect("edge holding");
         (
             std::mem::take(&mut holding.channels),
             holding.cut_state.take(),
+            // The next core takes them, and homes them again at its own cut.
+            std::mem::take(&mut holding.homed),
         )
     };
     let sessions: Vec<Arc<RemoteSession>> = core
@@ -1621,17 +1694,7 @@ async fn upload_held(core: RemoteCore, link: Arc<Link>, cut: CutId) {
                     closed: state.closed.clone(),
                 },
             )];
-            if let Some((revision, body)) = &state.record {
-                frames.extend(body.parts().into_iter().map(|part| {
-                    EdgeFrame::RecordUpload(
-                        session.id,
-                        RecordPart {
-                            revision: *revision,
-                            part,
-                        },
-                    )
-                }));
-            }
+            frames.extend(state.record.upload(session.id));
             frames
         };
         let stream = link.stream(session.id);
@@ -1641,6 +1704,14 @@ async fn upload_held(core: RemoteCore, link: Arc<Link>, cut: CutId) {
             }
         }
         uploaded += 1;
+    }
+    for (id, record) in &homed {
+        let stream = link.stream(*id);
+        for frame in std::iter::once(EdgeFrame::HomeUpload(*id)).chain(record.upload(*id)) {
+            if stream.out.send(frame).await.is_err() {
+                return;
+            }
+        }
     }
     let first = &link.streams[0];
     for (channel, held) in &channels {
@@ -1679,7 +1750,9 @@ async fn upload_held(core: RemoteCore, link: Arc<Link>, cut: CutId) {
         }
     }
     eprintln!(
-        "e6ircd edge: uploaded {uploaded} sessions and {} channels held from cut {:#x}",
+        "e6ircd edge: uploaded {uploaded} sessions, {} of the core's own and {} channels held \
+         from cut {:#x}",
+        homed.len(),
         channels.len(),
         cut.get()
     );
@@ -1688,7 +1761,12 @@ async fn upload_held(core: RemoteCore, link: Arc<Link>, cut: CutId) {
 /// Resume a stream the core held: replay each of its sessions' retained
 /// lines, numbered afresh for this link, tell the core of every client that
 /// left while it could not hear, and let input flow.
-async fn resume(core: RemoteCore, link: Arc<Link>, stream: Arc<LinkStream>) {
+async fn resume(
+    core: RemoteCore,
+    link: Arc<Link>,
+    stream: Arc<LinkStream>,
+    gate: tokio::sync::OwnedRwLockWriteGuard<()>,
+) {
     let sessions: Vec<Arc<RemoteSession>> = core
         .shared
         .sessions
@@ -1724,7 +1802,27 @@ async fn resume(core: RemoteCore, link: Arc<Link>, stream: Arc<LinkStream>) {
         }
     }
     stream.set_phase(Phase::Live);
+    drop(gate);
     core.changed();
+}
+
+/// Pause a stream for the core's cut once every line sent before is sent —
+/// a `Resume`'s replay included — and answer `Paused`. A `Pause` on a stream
+/// not live breaks the protocol: the link ends.
+async fn pause(core: RemoteCore, link: Arc<Link>, stream: Arc<LinkStream>) {
+    let gate = stream.gate.write().await;
+    if stream.phase() != Phase::Live {
+        drop(gate);
+        eprintln!("e6ircd edge: core link: Pause on a stream not live; the link ends");
+        link.end();
+        core.changed();
+        return;
+    }
+    stream.set_phase(Phase::Paused);
+    drop(gate);
+    core.changed();
+    // A link that is gone needs no answer.
+    drop(stream.out.send(EdgeFrame::Paused).await);
 }
 
 /// Say a dial failure once, not once per attempt: an unlinked edge tries
