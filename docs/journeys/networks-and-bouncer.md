@@ -71,9 +71,12 @@ constant) rather than keeping a copy of its own.
    account already held on that network, and **Channels to join**. Signing in to
    Libera with existing credentials needs nothing else. OFTC has no SASL
    password login: its catalog entry says so (`authentication:
-   client_certificate`, with `guidance`), and it signs in with a client
-   certificate made on the network's page once saved
+   client_certificate`, with `guidance`). Choosing it shows that guidance,
+   takes the NickServ fields away (a password would be refused on every
+   connection), and links to the network's console page, where its client
+   certificate is made once saved
    ([Sign in to a network with a client certificate](#sign-in-to-a-network-with-a-client-certificate)).
+   Each other network shows its own guidance too.
 4. What a known network already determines — **Name**, **Server**, **Use TLS**,
    **Real name** — sits under **Advanced**. Choosing **Another network…** opens
    it, because the name and server are then the person's to supply; so does any
@@ -213,7 +216,10 @@ it, NickServ's CertFP where it does not.
 
 **Preconditions.** A stored IRC network that uses TLS, a master key, and an
 account on the network's services from which the fingerprint can be
-registered. The OFTC preset says this is how OFTC signs in
+registered. A network the server configuration defines names its certificate
+as two PEM files instead (`client_certificate = { certificate = …, key = … }`,
+deploy/README.md), read and checked when it starts; its pages show the
+fingerprints read-only. The OFTC preset says this is how OFTC signs in
 (`authentication: client_certificate`, with its guidance in the add dialog's
 catalog).
 
@@ -239,6 +245,8 @@ catalog).
 
 **Visible failures and recovery.**
 
+- A configured network whose certificate files do not load, or whose key
+  does not belong to its certificate, fails the start by the file's name.
 - A certificate is presented only over TLS: on a network without TLS the
   controls are disabled and the API answers `409` at the `tls` field, and an
   edit that turns TLS off while a certificate is stored is refused the same
@@ -273,7 +281,13 @@ the handshake; `sasl_external_logs_in_with_the_certificate`,
 and `the_tls_handshake_presents_the_client_certificate` cover the client
 library; `a_network_client_certificate_is_generated_rotated_and_removed` proves
 the API against PostgreSQL (generate, rotate, upload, a mismatched key, the TLS
-rule, removal, audit); `a_sasl_mechanism_the_network_does_not_offer_parks_at_once`,
+rule, removal, audit); `a_configured_client_certificate_is_read_and_checked_at_start`
+and `a_configured_client_certificate_is_two_files_and_needs_tls` the
+configuration's files, and
+`a_configured_network_remembers_its_channels_and_shows_its_certificate` its
+fingerprints in the owner's view; `web/test/visual.spec.js` proves in Chromium
+that choosing OFTC in the add dialog shows its guidance, removes the NickServ
+fields and links to the certificate page; `a_sasl_mechanism_the_network_does_not_offer_parks_at_once`,
 `a_missing_sasl_capability_is_outlasted_then_parked` and
 `an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection` prove the
 refusal schedule. No public network's NickServ `CERT ADD` is exercised in CI.
@@ -284,8 +298,9 @@ refusal schedule. No public network's NickServ `CERT ADD` is exercised in CI.
 always-on session back in them after a redeploy or after editing the network,
 as ZNC and soju keep them, without listing them in autojoin.
 
-**Preconditions.** PostgreSQL, a stored IRC network, and, for a keyed channel's
-key to be kept, a master key.
+**Preconditions.** PostgreSQL, an IRC network — one the account added, or one
+the server configuration defines for it or shares — and, for a keyed
+channel's key to be kept, a master key.
 
 **Flow.**
 
@@ -324,6 +339,9 @@ an edit rejoins under a new nickname, and the API removal parts and forgets.
 `remembered_channels_are_rejoined_by_a_new_driver`,
 `a_kick_stops_the_rejoin_and_says_why` and
 `runtime_joined_channels_are_rejoined_after_reconnect` prove the driver;
+`a_configured_network_remembers_its_channels_and_shows_its_certificate`
+proves the same for a configured network across a restart, and its owner's
+removal; `a_configured_networks_remembered_channels_are_kept_by_owner_and_name`,
 `remembered_channels_and_client_certificates_belong_to_their_network` and
 `secret_rotation_reseals_every_database_secret_atomically` prove the storage.
 

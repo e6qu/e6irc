@@ -1987,7 +1987,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/networks/{name}/remembered-channels/{channel}": {
                 "delete": {
                     "summary": "Stop rejoining one remembered channel",
-                    "description": "The channel is no longer rejoined after a restart or an edit; a session that is in it leaves it. The channel name is matched without regard to ASCII case and must be percent-encoded (`%23` for `#`).",
+                    "description": "The channel is no longer rejoined after a restart or an edit; a session that is in it leaves it. The channel name is matched without regard to ASCII case and must be percent-encoded (`%23` for `#`). Applies to the account's own networks and to the networks the server configuration defines for it.",
                     "security": authenticated,
                     "parameters": [
                         { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
@@ -1996,7 +1996,6 @@ fn operations() -> serde_json::Value {
                     "responses": {
                         "204": { "description": "forgotten" },
                         "404": { "description": "no owner-scoped network with this name, or it does not remember that channel" },
-                        "409": { "description": "the server configuration defines the network" },
                         "503": { "description": "database unavailable" }
                     }
                 }

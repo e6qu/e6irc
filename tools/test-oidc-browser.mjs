@@ -1656,6 +1656,8 @@ try {
             has_sasl_account: false,
             has_sasl_password: false,
             has_server_password: false,
+            client_certificate: null,
+            remembered_channels: [],
             configured: false,
             enabled: true,
             connected: false,

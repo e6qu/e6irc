@@ -378,10 +378,11 @@ preset only fills the add-network form; the request carries the resulting
 fields, never a preset identifier. Each says how the network authenticates an
 account (`sasl`, or `client_certificate` for OFTC) and how to set it up.
 
-**Remembered channel** — a channel a stored IRC network's session was
-confirmed in (the upstream echoed our own `JOIN`), kept in PostgreSQL with its
-key sealed, and rejoined beside the configured autojoin after a process
-restart or an edit of the network. A `PART`, a `KICK` of the session, a rejoin
+**Remembered channel** — a channel an IRC network's session was confirmed in
+(the upstream echoed our own `JOIN`), kept in PostgreSQL with its key sealed —
+by the row of a network an account added, by owner and name for one the
+configuration defines — and rejoined beside the configured autojoin after a
+process restart or an edit of the network. A `PART`, a `KICK` of the session, a rejoin
 the upstream refuses, or its removal from the console forgets it.
 
 **Preflight** — the optional **Test connection** diagnostic

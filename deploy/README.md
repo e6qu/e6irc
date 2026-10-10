@@ -530,6 +530,49 @@ password there, and the driver reconnects with SASL. A host without IPv6 egress
 simply has one address family fewer to be judged by; give the container
 routable IPv6 where the host offers it.
 
+A network configured with a SASL account whose server offers no SASL at all
+(OFTC) is retried for about an hour and then parks (`sasl_unavailable`); one
+whose server offers SASL but none of the mechanisms a password can use parks at
+once (`sasl_mechanism_unavailable`). Either way the repair is to remove the SASL
+account and sign in with a client certificate instead.
+
+### Client certificates and remembered channels
+
+A network an account adds signs in with a client certificate made on its
+console page. A network in the configuration file names one as two PEM files on
+this host, and must use TLS:
+
+```toml
+[[network]]
+kind = "irc"
+name = "oftc"
+owner = "alice"
+addr = "irc.oftc.net:6697"
+tls = true
+nick = "alice"
+username = "alice"
+realname = "Alice"
+autojoin = ["#oftc"]
+buffer_cap = 1000
+client_certificate = { certificate = "/etc/e6irc/oftc-cert.pem", key = "/etc/e6irc/oftc-key.pem" }
+```
+
+The files are read when the network starts, and again when the owner's
+reactivation restarts it; a key that does not belong to the certificate, or a
+file that cannot be read, fails the start and names the file. Keep the key
+readable by the service user alone (mode 0600). To rotate it, replace both
+files and restart. The certificate's SHA-256 and SHA-512 fingerprints are shown
+on the network's console pages; register one with the network's services
+(`/msg NickServ CERT ADD`). The daemon presents the certificate over TLS and
+logs in with SASL EXTERNAL where the network offers it, and otherwise presents
+the certificate alone, which NickServ's CertFP recognises.
+
+Every IRC network, configured or added by an account, remembers the channels
+its session is confirmed in and rejoins them after a restart. The channels are
+stored in PostgreSQL, along with the keys they were joined with, sealed with
+the master key. A configured network's channels are stored by its owner and
+name; a start deletes the rows of networks the configuration no longer defines.
+
 ## SSO endpoints (served by e6ircd)
 
 - `GET /api/v1/auth/oidc/shauth/start` — interactive login

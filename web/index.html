@@ -133,8 +133,15 @@
 
           <label class="field" id="nf-preset-row">
             <span>Network</span>
-            <select id="nf-preset" name="preset"></select>
+            <select id="nf-preset" name="preset" aria-describedby="nf-preset-guidance"></select>
           </label>
+          <!-- How the chosen network signs an account in, from its catalog
+               entry. A network without SASL passwords (OFTC) signs in with a
+               client certificate made on the network's console page. -->
+          <p class="field-note" id="nf-preset-guidance" hidden>
+            <span id="nf-preset-guidance-text"></span>
+            <a id="nf-certificate-link" hidden>Make its client certificate on the network's page after saving.</a>
+          </p>
 
           <label class="field">
             <span>Nickname</span>

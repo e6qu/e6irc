@@ -3495,9 +3495,10 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   (`sasl_unavailable`) is either Solanum while services are down, which clears
   by itself, or a network that has no SASL (OFTC), which never will; nothing on
   the wire tells them apart. It takes the same steps for 18 refusals in a row
-  (`MAX_CONSECUTIVE_OUTLASTED_REFUSALS`, about an hour), longer than services
-  stay down for, and then parks, its summary saying to remove the SASL account
-  or use a client certificate. It used to be retried forever, so an OFTC
+  (`MAX_CONSECUTIVE_OUTLASTED_REFUSALS`: 30 s, 1 m, 2 m, then 4 m steps, about
+  an hour in all on the production floor), longer than services stay down for,
+  and then parks, its summary saying to remove the SASL
+  account or use a client certificate. It used to be retried forever, so an OFTC
   network configured with a password never connected and never said why in a
   way anyone acted on. A `sasl` capability that names its mechanisms and none
   the credentials can use (`sasl_mechanism_unavailable`) is the network's
@@ -3557,8 +3558,14 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   each connection's TLS configuration on an explicit aws-lc-rs provider rather
   than installing the process default, so a library connection made before
   `e6ircd` pins its provider can no longer make the start refuse to. A network
-  the configuration defines has no certificate: one is created and rotated by
-  its owner, and the operator's networks have no owner-side page.
+  the configuration defines names its certificate as files on the host
+  (`client_certificate = { certificate = …, key = … }`, one value holding both,
+  so neither can be configured alone; only for `kind = "irc"` over TLS), read
+  and checked when the network starts and again when its owner's reactivation
+  restarts it: a pair that does not match, or a file that cannot be read,
+  fails the start by name. The operator rotates it by replacing the files and
+  restarting; the owner's and the operator's read-only views show its
+  fingerprints.
   **A ghost of the network's own session is regained.** A session
   the upstream never saw end — the process crashed and a standby took over
   (§18), or the link died without a `QUIT` — keeps the configured nickname
@@ -3670,7 +3677,8 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   live and not rejoined. **The intent outlives the driver** for a network an
   account stores (ZNC and soju keep their channels too): its registry slot runs
   a writer (`bouncer::channel_memory`) that stores the whole set in
-  `bnc_remembered_channels` (migration 0104) after every change, off the
+  `bnc_remembered_channels` (migration 0104; a configured network's in
+  `bnc_configured_remembered_channels`, below) after every change, off the
   driver's path — a database that is away holds no upstream line, the last set
   written stays whole, and the write is retried every 5 s with
   `remembered_channels_storage_failed` told live until it lands. A channel is
@@ -3689,8 +3697,16 @@ announced as `renamed_by_upstream`, as the `irc` driver announces one.
   the same way, and not storing it would make every keyed channel joined from a
   client fail with 475 after a restart and then be forgotten, a silent loss.
   Without a master key nothing can be sealed, so the channel is remembered
-  without its key. A configured network is the operator's declaration: its
-  channels are its autojoin, and it has no row to remember others in.
+  without its key. A network the configuration defines remembers its
+  session's channels too — a redeploy loses no more of what clients joined on
+  it than on an account's own network — keyed as its backlog is, by its
+  folded owner (`*` when shared) and folded name, with keys sealed under that
+  owner's context. A start reads the rows of the networks still configured
+  (and deletes the rest, so a network removed from the configuration leaves
+  nothing behind), a network held by its owner's suspension keeps them in its
+  held slot for the release that restarts it, and its owner removes one through
+  the same list and endpoint as a stored network's (the configuration itself
+  stays the operator's).
   Upstream SASL uses
   credentials stored encrypted (§15) with the strongest password mechanism the
   network offers — SCRAM-SHA-512, then SCRAM-SHA-256 (RFC 5802/7677, the

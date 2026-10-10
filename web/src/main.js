@@ -2220,6 +2220,7 @@ let networkPresets = [];
 // already have opened Advanced and filled a server in.
 function applyPreset({ onlyUntouched = false } = {}) {
   const preset = networkPresets.find((item) => item.id === el("nf-preset").value);
+  showPresetGuidance(preset);
   if (preset) {
     if (!onlyUntouched || !el("nf-name").value) el("nf-name").value = preset.name;
     if (!onlyUntouched || !el("nf-addr").value) el("nf-addr").value = preset.addr;
@@ -2234,6 +2235,28 @@ function applyPreset({ onlyUntouched = false } = {}) {
   if (known("addr")) el("nf-addr").value = "";
   el("nf-advanced").open = true;
   el("nf-name").focus();
+}
+
+// Say how the chosen network signs an account in. A network that signs in
+// with a client certificate has no SASL password login: the account fields
+// are hidden and emptied (a password there would be refused by the network
+// on every connection), and the note points at the network's console page,
+// where its certificate is made once the network exists.
+function showPresetGuidance(preset) {
+  const guidance = el("nf-preset-guidance");
+  if (!guidance) return;
+  const certificate = preset?.authentication === "client_certificate";
+  guidance.hidden = !preset;
+  el("nf-preset-guidance-text").textContent = preset ? `${preset.guidance} ` : "";
+  const link = el("nf-certificate-link");
+  link.hidden = !certificate;
+  link.href = certificate ? `/console/networks/${encodeURIComponent(preset.name)}` : "";
+  const credentials = el("nf-credentials");
+  credentials.hidden = certificate;
+  if (certificate) {
+    el("nf-sasl-account").value = "";
+    el("nf-sasl-password").value = "";
+  }
 }
 
 // The reveal switch changes the input's type, which form.reset() does not
@@ -2354,6 +2377,10 @@ async function openNetworkDialog(name = null) {
     ? "The name of a network cannot be changed."
     : "A short label for this connection.";
   el("nf-preset-row").hidden = editing;
+  // The catalog's guidance is for adding a network; settings show the
+  // account fields whatever network it is.
+  el("nf-preset-guidance").hidden = true;
+  el("nf-credentials").hidden = false;
   // A stored password is never sent back here, so a test on an existing
   // network would judge a connection nobody configured.
   const test = el("nf-test");

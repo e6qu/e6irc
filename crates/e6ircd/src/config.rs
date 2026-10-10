@@ -3114,6 +3114,47 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    /// The deployment guide's example of a configured network with a client
+    /// certificate is a configuration the daemon reads; without TLS, or for a
+    /// bridge, the certificate is refused by name.
+    #[test]
+    fn a_configured_client_certificate_is_two_files_and_needs_tls() {
+        let network = |tls: bool| {
+            format!(
+                r##"[[network]]
+kind = "irc"
+name = "oftc"
+owner = "alice"
+addr = "irc.oftc.net:6697"
+tls = {tls}
+nick = "alice"
+username = "alice"
+realname = "Alice"
+autojoin = ["#oftc"]
+buffer_cap = 1000
+client_certificate = {{ certificate = "/etc/e6irc/oftc-cert.pem", key = "/etc/e6irc/oftc-key.pem" }}
+"##
+            )
+        };
+        let config: Config = toml::from_str(&network(true)).expect("the guide's example");
+        assert_eq!(
+            config.networks[0].client_certificate,
+            Some(ClientCertificateFiles {
+                certificate: "/etc/e6irc/oftc-cert.pem".into(),
+                key: "/etc/e6irc/oftc-key.pem".into(),
+            })
+        );
+        let refused = toml::from_str::<Config>(&network(false))
+            .err()
+            .expect("a certificate without TLS");
+        assert!(refused.to_string().contains("over TLS"), "{refused}");
+        let only_one = network(true).replace(", key = \"/etc/e6irc/oftc-key.pem\"", "");
+        assert!(
+            toml::from_str::<Config>(&only_one).is_err(),
+            "a certificate without its key is not a configuration"
+        );
+    }
     use super::*;
 
     /// A fresh self-signed certificate for `localhost` and its key, written to

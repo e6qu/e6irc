@@ -520,7 +520,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   // A div or span has no role to carry a name, so naming one without giving
   // it a role is refused rather than published as a name nothing reads.
   // A client certificate's fingerprints, read-only, as a disclosure: what the
-  // network's services are told to recognise (NickServ CERT ADD).
+  // network's services are told to recognise (`NickServ CERT ADD`).
   const certificateFingerprints = (certificate) => {
     const details = document.createElement("details");
     details.className = "certificate-fingerprints";

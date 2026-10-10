@@ -9,8 +9,15 @@ const identity = {
   logout_url: "/api/v1/auth/logout",
 };
 const presets = [
-  { id: "libera", label: "Libera Chat", name: "libera", addr: "irc.libera.chat:6697", tls: true },
-  { id: "oftc", label: "OFTC", name: "oftc", addr: "irc.oftc.net:6697", tls: true },
+  {
+    id: "libera", label: "Libera Chat", name: "libera", addr: "irc.libera.chat:6697", tls: true,
+    authentication: "sasl", guidance: "Sign in with your NickServ account and password (SASL).",
+  },
+  {
+    id: "oftc", label: "OFTC", name: "oftc", addr: "irc.oftc.net:6697", tls: true,
+    authentication: "client_certificate",
+    guidance: "OFTC has no SASL password login. Save the network without a NickServ password, generate a client certificate on its page, identify once and send /msg NickServ CERT ADD.",
+  },
 ];
 
 // Stored networks exactly as GET /api/v1/me/networks answers them: the served
@@ -31,7 +38,7 @@ const upstreamRuntime = (state, extra = {}) => ({
 const ircNetwork = (name, extra = {}) => ({
   name, kind: "irc", addr: `irc.${name.toLowerCase()}.example:6697`, tls: true, nick: "viewer",
   username: "viewer", realname: "Viewer", autojoin: [], sasl_account: null, autojoin_keyed: [],
-  has_sasl_account: false, has_sasl_password: false, has_server_password: false, configured: false,
+  has_sasl_account: false, has_sasl_password: false, has_server_password: false, client_certificate: null, remembered_channels: [], configured: false,
   enabled: true, connected: true, runtime: upstreamRuntime("connected"), ...extra,
 });
 // The served OpenAPI document, as crates/e6ircd/src/http/openapi.rs builds it
@@ -325,7 +332,7 @@ test("console bridge editor sends only the fields the contract declares for a br
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   const network = {
     kind: "slack", name: "team", addr: "https://slack.com/api", tls: true, nick: "", username: null, realname: null,
-    autojoin: ["C123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: true, has_sasl_password: true, has_server_password: false, enabled: true, configured: false,
+    autojoin: ["C123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: true, has_sasl_password: true, has_server_password: false, client_certificate: null, remembered_channels: [], enabled: true, configured: false,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network });
   await expect(page.getByRole("button", { name: "Save bridge", exact: true })).toBeVisible();
@@ -361,7 +368,7 @@ test("console network page points at the one settings editor and registers on re
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
-    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true, configured: false,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, client_certificate: null, remembered_channels: [], enabled: true, configured: false,
   };
   const operations = { enabled: true, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
   await mountConsoleRuntime(page, `<main>${detail}</main>`, await consoleStyles(), {
@@ -444,7 +451,7 @@ test("the network page loads the whole stored log into the transcript it already
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "Alice",
-    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true, configured: false,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: false, has_server_password: false, client_certificate: null, remembered_channels: [], enabled: true, configured: false,
   };
   const recent = Array.from({ length: 100 }, (_, index) => `recent ${index}`);
   const whole = Array.from({ length: 400 }, (_, index) => `line ${index}`);
@@ -493,7 +500,7 @@ test("a background refresh never pulls a page out from under a pending confirmat
     "/api/v1/me/networks/libera": {
       name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice",
       username: "alice", realname: "Alice", autojoin: [], sasl_account: null, autojoin_keyed: [],
-      has_sasl_account: false, has_sasl_password: false, has_server_password: false, configured: false,
+      has_sasl_account: false, has_sasl_password: false, has_server_password: false, client_certificate: null, remembered_channels: [], configured: false,
       enabled: true, connected: true,
       runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
     },
@@ -645,7 +652,7 @@ test("a bridge editor that failed to load offers Retry, then the form", async ({
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   const network = {
     kind: "discord", name: "team", addr: "", tls: true, nick: "", username: null, realname: null,
-    autojoin: ["123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, enabled: true, configured: false,
+    autojoin: ["123"], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, client_certificate: null, remembered_channels: [], enabled: true, configured: false,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network }, [
     ["GET", "/api/v1/me/networks/team", "Network registry unavailable"],
@@ -726,7 +733,7 @@ test("each integration platform reads exactly its own bridges, and says when the
   const platform = (kind, name) => `<section class="panel"><h2>${name}</h2><span class="count" data-integration-count="${kind}">—</span><div data-integration-list="${kind}"><p class="empty">Loading ${name} bridges…</p></div></section>`;
   const bridge = (kind, name) => ({
     name, kind, owner: "root", addr: "", tls: true, nick: "", username: null, realname: null, autojoin: [], sasl_account: null,
-    autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, configured: false,
+    autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, client_certificate: null, remembered_channels: [], configured: false,
     enabled: true, connected: false, shared: false, runtime: null,
   });
   await mountConsoleRuntime(page, `<main><div data-api-integrations data-account="root" data-csrf="test-csrf">${platform("matrix", "Matrix")}${platform("discord", "Discord")}${platform("slack", "Slack")}</div></main>`, await consoleStyles(), {
@@ -812,7 +819,7 @@ test("a secondary button-link stays legible under the pointer in both themes", a
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": {
     kind: "discord", name: "team", addr: "", tls: true, nick: "", username: null, realname: null,
-    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, enabled: true, configured: false,
+    autojoin: [], sasl_account: null, autojoin_keyed: [], has_sasl_account: false, has_sasl_password: true, has_server_password: false, client_certificate: null, remembered_channels: [], enabled: true, configured: false,
   } });
   const link = page.getByRole("link", { name: "All integrations" });
   const contrast = () => link.evaluate((node) => {
@@ -2551,4 +2558,46 @@ test("a session snapshot leaves a reader where they scrolled to", async ({ page 
   await expect(page.getByRole("button", { name: "Leave #only" })).toBeVisible();
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   expect(await messages.evaluate((list) => list.scrollTop)).toBe(0);
+});
+
+/// OFTC has no SASL password login: choosing it says so, takes the account
+/// fields away (a password would be refused on every connection), and points
+/// at the network's console page, where its client certificate is made; a
+/// network that takes passwords gives them back.
+test("a network that signs in with a client certificate leads to its certificate page", async ({ page }) => {
+  await mockSession(page, []);
+  let created;
+  await page.route(/\/api\/v1\/me\/networks$/, (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    created = route.request().postDataJSON();
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ name: "oftc", attach: "visual-test/oftc" }),
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  await expect(dialog.locator("#nf-preset-guidance")).toContainText("NickServ account and password");
+  await expect(dialog.locator("#nf-credentials")).toBeVisible();
+  await dialog.locator("#nf-sasl-account").fill("leftover");
+
+  await dialog.locator("#nf-preset").selectOption("oftc");
+  await expect(dialog.locator("#nf-preset-guidance")).toContainText("OFTC has no SASL password login");
+  await expect(dialog.locator("#nf-credentials")).toBeHidden();
+  const link = dialog.getByRole("link", { name: /client certificate/ });
+  await expect(link).toHaveAttribute("href", "/console/networks/oftc");
+  await expectAccessible(page);
+
+  await expect(dialog.locator("#nf-nick")).toHaveValue("visual-test");
+  await dialog.locator("#nf-nick").fill("visual");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect.poll(() => created?.name).toBe("oftc");
+  expect(created.sasl_account ?? null).toBeNull();
+  expect(created.sasl_password ?? null).toBeNull();
+
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  await dialog.locator("#nf-preset").selectOption("libera");
+  await expect(dialog.locator("#nf-credentials")).toBeVisible();
 });
