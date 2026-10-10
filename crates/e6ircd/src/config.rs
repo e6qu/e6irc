@@ -3145,9 +3145,8 @@ client_certificate = {{ certificate = "/etc/e6irc/oftc-cert.pem", key = "/etc/e6
                 key: "/etc/e6irc/oftc-key.pem".into(),
             })
         );
-        let refused = toml::from_str::<Config>(&network(false))
-            .err()
-            .expect("a certificate without TLS");
+        let refused =
+            toml::from_str::<Config>(&network(false)).expect_err("a certificate without TLS");
         assert!(refused.to_string().contains("over TLS"), "{refused}");
         let only_one = network(true).replace(", key = \"/etc/e6irc/oftc-key.pem\"", "");
         assert!(

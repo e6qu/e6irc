@@ -14558,9 +14558,13 @@ async fn a_configured_networks_remembered_channels_are_kept_by_owner_and_name() 
         channel: "#keyed".into(),
         key_sealed: Some(old.seal("sesame", &e6ircd::bouncer::bnc_secret_context("*"))),
     };
-    db::replace_bnc_remembered_channels(&pool, configured(None, "Shared"), &[keyed.clone()])
-        .await
-        .expect("shared");
+    db::replace_bnc_remembered_channels(
+        &pool,
+        configured(None, "Shared"),
+        std::slice::from_ref(&keyed),
+    )
+    .await
+    .expect("shared");
     db::replace_bnc_remembered_channels(
         &pool,
         configured(Some("Alice"), "Up"),
