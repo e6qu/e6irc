@@ -17,6 +17,6 @@
 # No `targets`: every native build and test runs on a runner whose host triple
 # is its target, so the host standard library is the one it needs.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

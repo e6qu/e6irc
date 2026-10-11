@@ -36,7 +36,7 @@ on:
 # tag (tools/check-image-pins.py refuses a Docker Hub reference).
 #   postgres:18-alpine, ghcr.io/dexidp/dex:v2.41.1,
 #   mcr.microsoft.com/playwright:v1.61.1-noble,
-#   matrixconduit/matrix-conduit:v0.9.0   resolved 2026-09-21
+#   matrixconduit/matrix-conduit:v0.10.15 resolved 2026-10-11
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # The checkout is shallow, so fetch main for the guards that read what
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # embed-web (pulled in by --all-features) embeds web/dist, so build
@@ -144,7 +144,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # --all-features includes embed-web, which embeds web/dist.
@@ -180,7 +180,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
@@ -218,7 +218,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       # Each Rust test owns a database created through this administrative URL.
@@ -309,7 +309,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - name: Start dex (mock connector)
@@ -374,7 +374,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - run: python3 tools/test-postgres-recovery.py
@@ -431,7 +431,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd -p e6irc-load
       - run: tools/test-load-smoke.sh
@@ -443,7 +443,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd -p e6irc-tui
       - run: python3 tools/test-tui-pty.py
@@ -455,7 +455,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -484,7 +484,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -516,7 +516,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -564,7 +564,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked -p e6ircd
       - name: Check out pinned irctest
@@ -622,7 +622,7 @@ jobs:
             vendor/tests/irctest/expected-skips-services.txt
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
-  # Conduit v0.9.0 needs a config file, so it is started with docker run
+  # Conduit needs a config file, so it is started with docker run
   # (after checkout) mounting the repo's vendored config.
   matrix-bridge:
     runs-on: ubuntu-24.04
@@ -631,14 +631,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Start Conduit
         run: |
           docker run -d --name conduit -p 16167:6167 \
             -e CONDUIT_CONFIG=/etc/conduit.toml \
             -v "$PWD/vendor/tests/external-oracles/conduit/conduit.toml:/etc/conduit.toml:ro" \
-            mirror.gcr.io/matrixconduit/matrix-conduit:v0.9.0@sha256:4ae051b1b56ee9c1292ffc87653da6078a52310f71aa4fe701c66432159997dd
+            mirror.gcr.io/matrixconduit/matrix-conduit:v0.10.15@sha256:cb4deab33ea1a6da919a0ea99e76be75d6af5936623fd9dde442a17e2d0b320f
           for i in $(seq 1 40); do
             curl -sf http://127.0.0.1:16167/_matrix/client/versions >/dev/null && break
             [ "$i" = 40 ] && { echo "conduit did not become ready"; docker logs conduit; exit 1; }
@@ -655,7 +655,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --locked -p e6irc-queue --release
         env:
@@ -733,7 +733,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Each binary is measured in the profile it ships in: the server in
       # `release`, the clients in `release-client` (release.yml).

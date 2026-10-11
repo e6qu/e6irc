@@ -19,11 +19,10 @@
 # the Dockerfile frontend from Google's Docker Hub mirror (mirror.gcr.io), each
 # at the index digest Docker Hub serves for the tag.
 #   docker/dockerfile:1   resolved 2026-10-10
-#   node:24-bookworm-slim resolved 2026-08-09
-#   rust:1.98.1-bookworm  resolved 2026-09-20 (the same index digest as
-#                         rust:1-bookworm that day)
+#   node:24-bookworm-slim resolved 2026-10-11
+#   rust:1.99.0-bookworm  resolved 2026-10-11
 #   gcr.io/distroless/cc-debian12:nonroot resolved 2026-09-20
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS web-build
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS web-build
 WORKDIR /src/web
 RUN npm install --global pnpm@11.15.1
 COPY web/package.json web/pnpm-lock.yaml ./
@@ -36,7 +35,7 @@ RUN pnpm build
 # first and checked against the compiler the image really carries, and rustup
 # may not fetch another one: a base whose Rust differs from the file fails here
 # instead of downloading the file's release over the digest-pinned one.
-FROM public.ecr.aws/docker/library/rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build
+FROM public.ecr.aws/docker/library/rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS build
 WORKDIR /src
 ENV RUSTUP_AUTO_INSTALL=0
 COPY rust-toolchain.toml ./

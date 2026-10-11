@@ -1,0 +1,26 @@
+name: Image freshness
+
+# Every pinned image is a Docker Hub copy on public.ecr.aws or mirror.gcr.io
+# (tools/check-image-pins.py). tools/check-image-freshness.py compares each
+# pin with what Docker Hub serves now, with a 24-hour quarantine, so a stale
+# pin shows up on a pull request and, through the daily run, on main without
+# one. It needs the network, so it is not a tools/gate.sh step.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image-freshness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare image pins with Docker Hub
+        run: python3 tools/check-image-freshness.py

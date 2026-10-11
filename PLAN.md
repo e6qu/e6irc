@@ -281,7 +281,9 @@ change:
   flushes held output before the closing `ERROR`.
 - **Delivery.** One `ci-ok` job gates every other; a release is published only
   from a commit whose CI run succeeded; every action and base image is pinned
-  to a digest; the runtime image is distroless — the daemon states its own
+  to a digest, and the `Image freshness` workflow (pull requests, main, daily)
+  fails when a pinned image is more than 24 hours behind Docker Hub or its
+  mirror serves another digest; the runtime image is distroless — the daemon states its own
   configuration from the environment (`--config-from-environment`), in memory,
   so the shell entrypoint, its temporary secrets file and its TOML quoting are
   gone; the container has a `HEALTHCHECK` backed by `e6ircd healthcheck`; the systemd unit is hardened; the fuzz lockfile is checked for

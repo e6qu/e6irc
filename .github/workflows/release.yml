@@ -337,7 +337,7 @@ jobs:
       # tools/check-release-toolchain.sh keeps all three equal.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
       # cargo-auditable 0.7.6 (2026-09-13), as in the Dockerfile.
       - run: cargo install cargo-auditable --version 0.7.6 --locked
