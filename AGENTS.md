@@ -192,6 +192,12 @@ mistake, before a single line changes.
       for another base. Each guard's own comment says what it holds; the
       duplication ratchet is fixed by extracting shared logic, never by
       raising the threshold.
+- [ ] `python3 tools/check-image-freshness.py` clean when the change touches
+      an image pin: every pinned image is the digest Docker Hub serves for its
+      tag, with no newer release of the same variant and major version older
+      than 24 hours, and the mirror serves the same digest. It needs the
+      network, so it runs in the `Image freshness` workflow (pull requests,
+      main, and daily) instead of `tools/gate.sh`.
 - [ ] `tools/check-dead-code.sh` clean (no code kept alive only by tests —
       it builds the shipped artifacts with `cfg(test)` off).
 - [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check --locked

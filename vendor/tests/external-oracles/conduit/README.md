@@ -7,12 +7,13 @@ with this directory's `conduit.toml`.
 
 ## Provenance
 
-- **Source / image:** `matrixconduit/matrix-conduit:v0.9.0`
+- **Source / image:** `matrixconduit/matrix-conduit:v0.10.15`
   (https://gitlab.com/famedly/conduit), pulled through Google's Docker Hub
   mirror (`mirror.gcr.io`) and pinned by index digest, the one Docker Hub
   serves — the one
   digest `docker-compose.yml` and ci.yml both name
-  (`tools/check-image-pins.py` holds them to it).
+  (`tools/check-image-pins.py` holds them to it, and
+  `tools/check-image-freshness.py` keeps it current with Docker Hub).
 - **License:** Apache-2.0 (Conduit). Run as a separate container; not
   linked into or distributed with e6irc.
 
